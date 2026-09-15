@@ -1043,14 +1043,61 @@ Mutation(
         "pod, which the API server reports as success",
     ),
     Mutation(
-        "C1-session-pod-gets-an-identity",
+        "C1-session-pod-gets-a-second-token",
         "a2a/gateway/spawn.go",
         ("AutomountServiceAccountToken: ptr.To(false),",
          "AutomountServiceAccountToken: ptr.To(true),"),
         "test_C1_a_session_pod_carries_no_kubernetes_identity",
-        "mount the default ServiceAccount token into a session pod, giving the "
-        "model-directed worker a Kubernetes identity the session fence's rule "
-        "set was written on the assumption it did not have",
+        "automount a SECOND token into a session pod, beside the bus token it "
+        "is supposed to have. A session pod now names a ServiceAccount -- the "
+        "callout resolves a Kubernetes identity, so it has to -- and this is "
+        "the flip that turns that identity from inert into a cluster "
+        "credential: the automounted token carries the API server's default "
+        "audience, so unlike the projected bus token it authenticates against "
+        "the API server, which the session fence's rule set does not account "
+        "for",
+    ),
+    Mutation(
+        "C1-session-token-loses-its-audience",
+        "a2a/gateway/spawn.go",
+        ("Audience:          lib.BusTokenAudience,", ""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "drop the audience from the session pod's projected token. An "
+        "audience-less projection is a default-audience token by another name, "
+        "so automount staying off would stop meaning anything -- and this is "
+        "the quiet version, because the pod keeps exactly one token file at "
+        "exactly the path the worker reads",
+    ),
+    Mutation(
+        "C1-session-account-gets-rbac",
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("""\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
+\t\tSubjects: []rbacv1.Subject{{
+\t\t\tKind:      "ServiceAccount",
+\t\t\tName:      a2aCalloutName(agent),""",
+         """\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
+\t\tSubjects: []rbacv1.Subject{{
+\t\t\tKind:      "ServiceAccount",
+\t\t\tName:      a2aSessionServiceAccountName(agent),"""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "point an RBAC binding at the session ServiceAccount instead of the "
+        "callout's. The session account holds no permissions, which is the "
+        "third thing keeping a session pod's token inert; this is the "
+        "cross-module half, because the account is named by the gateway "
+        "(module a2a) and granted by the operator (module k8s-operator) and no "
+        "Go test in either can see both",
+    ),
+    Mutation(
+        "C1-session-account-gets-rbac-in-the-sibling-file",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("""\t\tSubjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: agent.Namespace}},""",
+         """\t\tSubjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}},"""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "the same grant as the mutation above, in the other file that renders "
+        "A2A RBAC. The scan used to read only the callout's file and to match "
+        "one literal space after `Subjects:`, so a binding added here -- where "
+        "gofmt aligns the field -- passed it twice over. Both halves of that "
+        "hole are what this mutation holds shut",
     ),
     Mutation(
         "harness-fixture-emptied",

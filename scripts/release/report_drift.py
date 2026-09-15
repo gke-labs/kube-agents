@@ -96,7 +96,7 @@ def body_for(env, run_url, totals, actions, destructive):
             " applying it. A plan that destroys what nobody meant to destroy is"
             " usually missing configuration rather than reporting real drift --"
             " check the environment's GitHub variables against"
-            " `docs/site/src/content/docs/deploy/environment-reconcile.md`"
+            " `docs/environment-reconcile.md`"
             " first.",
             "",
         ]

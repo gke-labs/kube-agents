@@ -37,6 +37,8 @@ ROSTER_HISTORY = TESTDATA / "roster-history.json"
 # 2026-09-11, the build-cluster node loss (#1478), and BOOTSTRAP_ADMITTED as
 # hack/ci-eval-pr.sh had it that day.
 LOST_FIXTURE = TESTDATA / "lost-pods-2026-09-11.json.gz"
+# The week ending 2026-09-14 18:20Z: every run green, every run long (#1586).
+SLOW_FIXTURE = TESTDATA / "slow-gate-2026-09-14.json.gz"
 ROSTER_0911 = [
     "reliability-pdb-probe",
     "security-overgrant-probe",
@@ -116,6 +118,11 @@ def data(*runs):
 
 def green_tasks():
     return [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HOLD_OUT, "fff")]
+
+
+def full_tasks():
+    """Eighteen passing cases: a full run in rule 7's sense (SLOW_MIN_TASKS)."""
+    return [task(f"case-{k}", "ppp") for k in range(18)]
 
 
 def broken_tasks(cases):
@@ -672,6 +679,108 @@ class Metrics(unittest.TestCase):
         self.assertEqual(adjudicate(doc, T0)["metrics"]["infra_rep_rate"], round(5 / 9, 3))
 
 
+# --------------------------------------------------------------------------- #
+# Rule 7: slow gate
+# --------------------------------------------------------------------------- #
+
+
+class SlowGate(unittest.TestCase):
+    def week(self, recent, typical=150, baseline=30, recent_end=T0, tasks=None):
+        """`baseline` full runs of `typical` minutes, four hours apart, the
+        newest finishing seven hours before T0; then the `recent` runs
+        (minutes each), ten minutes apart, the last finishing at
+        `recent_end`."""
+        runs = [run(100 + i, i, T0 - timedelta(hours=7 + 4 * i), minutes=typical, tasks=full_tasks()) for i in range(baseline)]
+        runs += [
+            run(200 + i, 50 + i, recent_end - timedelta(minutes=10 * (len(recent) - 1 - i)), minutes=m, tasks=tasks or full_tasks())
+            for i, m in enumerate(recent)
+        ]
+        return data(*runs)
+
+    def test_five_runs_whose_median_is_1_2x_the_weeks_typical_are_slow(self):
+        result = adjudicate(self.week([180, 200, 170, 185, 190]), T0)
+        self.assertEqual(result["state"], "GREEN", "a slow gate is a note, not a state")
+        self.assertEqual(
+            result["slow"],
+            {
+                "since": health.iso(T0),
+                "runs": 5,
+                "min_s": 170 * 60,
+                "median_s": 185 * 60,
+                "max_s": 200 * 60,
+                "baseline_days": 7,
+                "baseline_runs": 30,
+                "baseline_p50_s": 150 * 60,
+                "baseline_p90_s": 150 * 60,
+                "infra_reps": 0,
+            },
+        )
+        self.assertIn("slow gate: last 5 full runs 170–200 min (median 185) against a 7-day typical of 150 min (p90 150); no reps lost", result["evidence"])
+
+    def test_the_median_decides_so_one_straggler_does_not(self):
+        self.assertIsNone(adjudicate(self.week([150, 150, 150, 150, 400]), T0)["slow"])
+        self.assertIsNone(adjudicate(self.week([179] * 5), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([180] * 5), T0)["slow"])
+
+    def test_needs_twenty_full_runs_in_the_baseline_and_five_after_them(self):
+        self.assertIsNone(adjudicate(self.week([200] * 5, baseline=19), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, baseline=20), T0)["slow"])
+        self.assertIsNone(adjudicate(self.week([200] * 4, baseline=0), T0)["slow"])
+
+    def test_only_recent_concluded_full_runs_count(self):
+        # The same five slow runs, the newest finished six hours ago: nobody
+        # is waiting on them.
+        self.assertIsNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=6)), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=5)), T0)["slow"])
+        # Ten cases is a run Prow cut short, not a full run, and an aborted
+        # run concluded nothing: the newest five full runs are then the
+        # baseline's own, at the typical length.
+        short = [task(f"case-{k}", "ppp") for k in range(10)]
+        self.assertIsNone(adjudicate(self.week([200] * 5, tasks=short), T0)["slow"])
+        doc = self.week([200] * 5)
+        for aborted in doc["runs"][-5:]:
+            aborted["result"] = "ABORTED"
+        self.assertIsNone(adjudicate(doc, T0)["slow"])
+
+    def test_an_episode_holds_until_the_median_is_under_1_1x_and_keeps_its_start(self):
+        first = adjudicate(self.week([180] * 5), T0)
+        self.assertIsNotNone(first["slow"])
+        later = T0 + timedelta(hours=1)
+        # 1.15x would not start an episode; it does not end one either.
+        self.assertIsNone(adjudicate(self.week([173] * 5, recent_end=later), later)["slow"])
+        held = adjudicate(self.week([173] * 5, recent_end=later), later, first)
+        self.assertEqual((held["slow"]["since"], held["slow"]["median_s"]), (first["slow"]["since"], 173 * 60))
+        self.assertIsNone(adjudicate(self.week([164] * 5, recent_end=later), later, held)["slow"])
+        # A previous health.json from before the field starts fresh.
+        legacy = {"state": "GREEN", "condition": None, "cause": "", "failing_cases": [], "since": health.iso(T0), "recovering": False}
+        self.assertEqual(adjudicate(self.week([180] * 5), T0, legacy)["slow"]["since"], health.iso(T0))
+
+    def test_a_slow_gate_inside_an_incident_is_not_a_note(self):
+        # Three setup deaths on two pull requests in the last half hour make
+        # the state DEGRADED (rule 3); the same five slow runs are then the
+        # incident's symptom, not a note, and an episode in progress does not
+        # hold across the incident: GREEN afterwards starts one afresh.
+        earlier = T0 - timedelta(hours=1)
+        before = adjudicate(self.week([200] * 5, recent_end=earlier), earlier)
+        self.assertIsNotNone(before["slow"])
+        doc = self.week([200] * 5)
+        doc["runs"] += [run(300 + i, pr, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE") for i, pr in enumerate([1, 1, 2])]
+        degraded = adjudicate(doc, T0, before)
+        self.assertEqual((degraded["state"], degraded["condition"]), ("DEGRADED", "setup_deaths"))
+        self.assertIsNone(degraded["slow"])
+        self.assertFalse(any(line.startswith("slow gate") for line in degraded["evidence"]), degraded["evidence"])
+        later = T0 + timedelta(hours=3)
+        again = adjudicate(self.week([200] * 5, recent_end=later), later, degraded)
+        self.assertEqual((again["state"], again["slow"]["since"]), ("GREEN", health.iso(later)))
+
+    def test_repetitions_lost_in_the_slow_runs_are_counted(self):
+        doc = self.week([200] * 5)
+        doc["runs"][-1]["tasks"][-1] = task("case-17", "eee")
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["slow"]["infra_reps"], 3)
+        self.assertTrue(result["evidence"][-1].endswith("; 3 reps lost to infra"), result["evidence"])
+
+
 class Advice(unittest.TestCase):
     def test_outage_advice_cites_the_tracking_issue_from_case_notes(self):
         notes = {"compliance-rbac-overgrant": {"issues": ["#998", "#1171"]}}
@@ -889,6 +998,73 @@ class LostPodsReplay(unittest.TestCase):
         setup = [line for line in tick["evidence"] if line.startswith("setup/clone failures:")]
         self.assertEqual(setup, ["setup/clone failures: 3 runs under 5 min with no tasks in the last 2h (#1319, #1446, #1471)"])
         self.assertEqual((tick["metrics"]["lost_pods"], tick["metrics"]["setup_deaths"]), (12, 8))
+
+
+class SlowGateReplay(unittest.TestCase):
+    """2026-09-14 (#1586): the published data.json's runs of the week ending
+    18:20Z that day -- the seven days rule 7's baseline needs. Every run of
+    the afternoon was green and three hours long (Vertex latency; the 429s
+    were all retried), so rules 1-3b see nothing. The note appears at 18:00Z,
+    about one run's length after the slowdown began, and never over the quiet
+    09-12/13 weekend before it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = health.load_json(SLOW_FIXTURE)
+        # The roster enters rules 1 and 4 only; rule 7 reads the wall clock.
+        cls.every = list(health.replay(cls.data, timedelta(minutes=30), health.Roster.fixed(ROSTER_0911), start=day("09-07", 18, 0)))
+
+    def tick(self, when):
+        return next(h for now, h in self.every if now == when)
+
+    def test_the_fixture_is_what_trim_produces(self):
+        trimmed = self.data["trimmed"]
+        again = health.trim(self.data, health.parse_iso(trimmed["from"]), health.parse_iso(trimmed["to"]), trimmed["source"])
+        self.assertEqual(again["runs"], self.data["runs"])
+
+    def test_the_quiet_weekend_is_not_slow(self):
+        self.assertEqual([now for now, h in self.every if day("09-12") <= now < day("09-14", 18, 0) and h["slow"]], [])
+
+    def test_09_14_reads_slow_from_18_00z_with_the_days_numbers(self):
+        tick = self.tick(day("09-14", 18, 0))
+        self.assertEqual(tick["state"], "GREEN")
+        self.assertEqual(
+            tick["slow"],
+            {
+                "since": "2026-09-14T18:00:00+00:00",
+                "runs": 5,
+                "min_s": 9161,
+                "median_s": 10984,
+                "max_s": 12836,
+                "baseline_days": 7,
+                "baseline_runs": 264,
+                "baseline_p50_s": 9085,
+                "baseline_p90_s": 11919,
+                "infra_reps": 2,
+            },
+        )
+        self.assertIn("slow gate: last 5 full runs 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to infra", tick["evidence"])
+        self.assertEqual(self.tick(day("09-14", 18, 30))["slow"]["since"], "2026-09-14T18:00:00+00:00", "the episode keeps its start")
+
+    def test_the_replay_timeline_shows_the_note_beside_the_state(self):
+        # `--replay` is how a threshold is re-checked on the next incident,
+        # so the note's edges are entries and the text form names them.
+        entries = health.timeline(self.every)
+        edge = next(e for e in entries if e["slow"] and health.parse_iso(e["at"]) >= day("09-14"))
+        self.assertEqual((edge["at"], edge["state"], edge["slow"]), ("2026-09-14T18:00:00+00:00", "GREEN", {"since": "2026-09-14T18:00:00+00:00", "median_s": 10984, "baseline_p50_s": 9085}))
+        self.assertIn("2026-09-14T18:00:00+00:00  GREEN      (slow since 2026-09-14T18:00:00+00:00: median 183 min against 151)", health.format_timeline([edge]))
+        self.assertTrue(all(e["slow"] is None for e in entries if day("09-12") <= health.parse_iso(e["at"]) < day("09-14", 18, 0)))
+
+    def test_three_runs_above_the_seven_day_p90_would_not_have_fired(self):
+        # The rule the issue proposed, checked at the tick the note appears:
+        # the newest three full runs took 207, 152 and 167 minutes against a
+        # p90 of 198, because 09-08 to 09-11 had been slow days too.
+        now = day("09-14", 18, 0)
+        full = [r for r in health.load_runs(self.data) if r.finished <= now and r.result in ("SUCCESS", "FAILURE") and len(r.tasks) >= health.SLOW_MIN_TASKS]
+        p90 = health.percentile([r.wall_clock.total_seconds() for r in full[:-3] if r.finished > now - health.SLOW_BASELINE], 90)
+        self.assertEqual([int(r.wall_clock.total_seconds() // 60) for r in full[-3:]], [207, 152, 167])
+        self.assertEqual(int(p90 // 60), 198)
+        self.assertFalse(all(r.wall_clock.total_seconds() > p90 for r in full[-3:]))
 
 
 class CommandLine(unittest.TestCase):

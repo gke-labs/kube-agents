@@ -73,7 +73,7 @@ spec:
             # - name: AGENT_SANDBOX_IMAGE
             #   value: "registry.example.com/kube-agents/agent-sandbox:latest"
             # - name: FLUENT_BIT_IMAGE
-            #   value: "registry.example.com/mirror/fluent-bit:5.1.1"
+            #   value: "registry.example.com/mirror/fluent-bit:5.1.2"
             # IMAGE_PULL_SECRETS is the pull identity for those images, as
             # comma-separated names of Secrets that must already exist in each
             # agent's namespace. Needed only for a registry the nodes cannot

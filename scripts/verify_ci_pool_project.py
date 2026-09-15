@@ -2,7 +2,7 @@
 """Pre-flight verification for onboarding a GCP project into the CI evaluation pool.
 
 Validates that a project has completed every prerequisite in
-docs/site/src/content/docs/deploy/ci-pool-projects.md before it is registered in
+docs/ci-pool-projects.md before it is registered in
 the Boskos resource pool in gke-internal/test-infra.
 
 Registering a project that has not finished onboarding does not fail only that
@@ -2049,7 +2049,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             return CheckResult(name, False, "Ledger issues not readable", details=[
                 f"App {LEDGER_APP_ID} cannot see {repo_slug} at all (404). Its installation is "
                 "repository_selection: selected, so add this repository to it -- see section 5.4 "
-                "of deploy/ci-pool-projects.md. (The same 404 covers a repository that does not "
+                "of docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
                 "exist; the check above settles which.)"
             ])
         return CheckResult(name, True, "Not checked", warnings=[

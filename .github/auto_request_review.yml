@@ -14,6 +14,14 @@ reviewers:
       - fatoshoti
       - mateuszklinowski
       - mplakhtiy
+    # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
+    # change under bench/tasks/ or to hack/ci-eval-pr.sh (#1546). Keep the two
+    # lists identical. A mixed pull request routes here alone, so a member who
+    # is not a root approver can clear the case or roster half and the rest
+    # still waits on a root approver's /approve.
+    eval-crew:
+      - jayantid
+      - lapis2002
 
 files:
   # Keys are glob expressions.
@@ -26,6 +34,13 @@ files:
     - waw-leads
   ".github/workflows/staging-deploy.yml":
     - waw-leads
+  # Listed after "**" so the last match sends these to the only approvers
+  # who can clear them. The author is never requested, so eval-crew's own
+  # pull requests fall back to the defaults for their lgtm.
+  "bench/tasks/**":
+    - eval-crew
+  "hack/ci-eval-pr.sh":
+    - eval-crew
 
 options:
   ignore_draft: true

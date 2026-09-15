@@ -56,6 +56,25 @@ every subsequent step on the result, so the job always completes and the check a
 that ran no tests". A change that breaks an operator contract from outside `k8s-operator/**` gets a
 green `Run Controller Tests` that compiled nothing.
 
+**In `a2a/`, the tests that prove the bus's authorization model are the ones that skip.**
+The auth callout's suite has three tiers and only the first runs everywhere. Tests that
+stand up an embedded `nats-server` against a fake clientset need nothing, and that includes
+the end-to-end connect through the callout. Tests that need the `nats` CLI on `PATH` are the
+JetStream-API escape probes.
+Tests that stand up a real API server — the pod-bound token claims, the end-to-end connect
+through the callout, a whole session run under its own derived grants — need
+`KUBEBUILDER_ASSETS`, and they `t.Skip` without it. `make verify` sets neither, so it reports
+green on a change that broke every one of them. `a2a-test.yml` installs both, which is what
+actually gates; locally, run
+
+```
+KUBEBUILDER_ASSETS="$(make -C k8s-operator -s envtest-path)" go test ./...
+```
+
+from `a2a/` before believing a security change in that module. A fourth tier,
+`a2a/worker-adapter/live_test.go` and `a2a/gateway/live_test.go`, needs a real install and is
+gated on `A2A_LIVE_NATS_URL`; nothing automatic runs it.
+
 **`tests/e2e/` is not manual-only.** `rc-scheduler.yml` runs on `cron: "17 */3 * * *"` and
 dispatches `rc-release-pipeline.yml` whenever a new candidate exists, and
 `step-4-tag-validated` depends on the suite. Breaking a test there is not free — it reds the
@@ -83,8 +102,8 @@ in this repository, so this table asserts nothing about either.
 contexts as they stand, gives the command to read them back, and says why that command sees only
 the branch-protection half of the set. `make verify` (the `verify` target in the root `Makefile`) is the
 local answer to the same question — everything a pull request must pass offline, in one target —
-and [`site/src/content/docs/contributing.md`](site/src/content/docs/contributing.md) lists the
-individual targets to run when you have touched a given area.
+and [`pull-request-workflow.md`](pull-request-workflow.md#local-validation-before-committing) lists
+the individual targets to run when you have touched a given area.
 
 Per-tier detail lives with each tier: [`bench/cuj/README.md`](../bench/cuj/README.md) for adding a
 journey, [`tests/integration/README.md`](../tests/integration/README.md) for the seam tier,

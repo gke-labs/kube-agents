@@ -191,6 +191,16 @@ Do not delete a Cluster Agent profile while its cluster still exists.
 Deleting the profile here is the immediate, preferred path. As a backstop, the hourly
 `cluster-agent-reconcile` job auto-prunes any profile whose cluster is definitively gone, so a
 profile missed during teardown is cleaned up on the next reconcile cycle.
+
+## Before recommending GPU/TPU or large-shape capacity
+
+Before recommending capacity for a GPU/TPU or large-shape design, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics:
+verify the regional quota for the exact accelerator metric (e.g. `NVIDIA_A100_GPUS`), then gather
+capacity obtainability advice (`gcloud beta compute advice capacity`) for the requested machine
+shape and count across the region's zones, for the Spot and Flex-Start provisioning models the
+advice API accepts. That skill owns the rules for what to probe and how to report it; follow it
+rather than restating them here.
 """,
     "gke-networking": f"""{FOOTER_MARKER}
 
@@ -234,10 +244,20 @@ table rather than reasoning from memory:
 
 Without `--target-version` it measures each cluster against its own release channel's default and
 prints that baseline per member. Run again during a rollout, it says which members started,
-completed or stalled since the previous run. It reads with `gcloud container` only and changes
-nothing in GCP; the only thing it writes is its own record of each run under
-`/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and checklist for the members it
-flags are this skill's job.
+completed or stalled since the previous run. Without `--readiness` (below) it reads with
+`gcloud container` only and changes nothing in GCP; the only thing it then writes is its own
+record of each run under `/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and
+checklist for the members it flags are this skill's job.
+
+The same script's `--readiness` flag executes three items of this skill's pre-upgrade checklist
+per member, against the same target: PodDisruptionBudgets that would block a node drain
+(`maxUnavailable: 0`, or `minAvailable` demanding every expected pod), maintenance exclusions and
+the maintenance window at a given instant (`--at`, default now), and node-pool version skew
+against the target control plane. Run it before writing the plan and carry its `blocked` rows into
+the checklist rather than asking the operator to check those three by hand. The PDB read costs one
+`get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
+`${{HERMES_HOME:-/opt/data}}/.kubeconfigs/`; an exclusion is reported as holding back automatic
+upgrades only.
 """,
 }
 

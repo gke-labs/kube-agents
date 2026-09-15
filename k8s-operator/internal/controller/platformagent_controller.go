@@ -577,8 +577,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// The mode gate: `next` additionally renders the NATS component and the
-	// A2A gateway; `today` keeps the dark stack dark — including tearing it
+	// The mode gate: `next` additionally renders the A2A stack -- NATS, the
+	// auth callout, the gateway, the provisioning Job; `today` keeps the
+	// dark stack dark — including tearing it
 	// back down after a flip, so `mode` absent renders exactly today's stack
 	// rather than today's stack plus leftovers. Version skew touches NEITHER
 	// branch: renderMode fails closed to today, and letting that reach
@@ -2756,7 +2757,40 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 	return names
 }
 
+// updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
+// Ready=False condition carrying the reason and message. It writes only when
+// something it is about to write differs from what the status already holds.
+//
+// The gate matters because the PlatformAgent watch has no predicate, so every
+// status write re-enqueues the object at once. Without it a CR held on any
+// refusal wrote status on every pass: each requeue tick wrote, the write woke
+// an echo pass through the watch, and the echo wrote again. The chain stopped
+// there only because metav1.Time serializes to the second — the echo's write
+// was byte-identical to the one before it, and the API server drops such an
+// update without an etcd write, a resourceVersion bump or a watch event.
+// Measured, on envtest and on a live install, that was two reconciles and two
+// status-write requests (so two API-server audit entries) per 30s tick, with
+// resourceVersion and lastReconcileTime moving every tick, for as long as the
+// refusal stood (#1392). The comparison is keyed on the phase, the condition's
+// status, reason, message and observedGeneration — everything this function
+// writes except the timestamps. LastReconcileTime is deliberately not in the
+// key: it is stamped with `now`, so including it would make every pass a
+// change; and it is not refreshed on a quiet pass, which is what
+// updateStatusReady does and what the field's own doc says — it is the time of
+// the last status write, not of the last pass.
+// The generation witness is the condition's observedGeneration rather than the
+// top-level field, for the reason updateStatusReady gives: a CRD that predates
+// status.observedGeneration prunes the top-level copy on every write.
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
+	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
+		agent.Status.Phase == "Degraded" &&
+		existing.Status == metav1.ConditionFalse &&
+		existing.Reason == reason &&
+		existing.Message == message &&
+		existing.ObservedGeneration == agent.Generation {
+		return nil
+	}
+
 	agent.Status.Phase = "Degraded"
 	agent.Status.ObservedGeneration = agent.Generation
 	now := metav1.Now()

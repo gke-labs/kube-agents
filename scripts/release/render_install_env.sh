@@ -143,7 +143,7 @@ if [ -n "$missing" ]; then
   # One annotation naming every missing variable at once. Failing on the first
   # one costs a full run per variable, and a strict render of an environment
   # that has never been configured is missing every one of them.
-  echo "::error title=Install configuration is incomplete::Set these on the GitHub environment this job binds to:${missing}. Each one is a setting the composition provisions; running without it would apply a default over the value this environment is already installed with, and terraform would plan to destroy the difference. docs/site/src/content/docs/deploy/environment-reconcile.md lists what each one should be."
+  echo "::error title=Install configuration is incomplete::Set these on the GitHub environment this job binds to:${missing}. Each one is a setting the composition provisions; running without it would apply a default over the value this environment is already installed with, and terraform would plan to destroy the difference. docs/environment-reconcile.md lists what each one should be."
   echo "==> Missing install configuration:${missing}" >&2
   exit 1
 fi

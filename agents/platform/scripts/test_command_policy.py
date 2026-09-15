@@ -1045,6 +1045,57 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_the_obtainability_skill_spellings_reach_their_allowlist_entries(self):
+        # capacity-obtainability's Diagnostics D shows these exactly: the Spot
+        # capacity probe, the Flex-Start variant with a run duration, and the
+        # single-machine-type history read. Same failure class as the stockout SOP's spellings: an entry
+        # whose flags lack arity is unreachable.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--provisioning-model=SPOT",
+              "--instance-selection-machine-types=a2-highgpu-8g",
+              "--target-distribution-shape=ANY", "--size=4",
+              "--region=us-central1", "--format=json"],
+             "capacity probe, Spot"),
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--provisioning-model=FLEX_START",
+              "--instance-selection-machine-types=a2-highgpu-8g",
+              "--target-distribution-shape=ANY", "--size=4",
+              "--region=us-central1", "--max-run-duration=12h",
+              "--format=json"],
+             "capacity probe, Flex-Start"),
+            (["gcloud", "beta", "compute", "advice", "capacity-history",
+              "--provisioning-model=SPOT", "--machine-type=a2-highgpu-8g",
+              "--types=PREEMPTION,PRICE", "--region=us-central1",
+              "--format=json"],
+             "capacity history, single machine type"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_apply_stays_refused_even_as_an_explicit_dry_run(self):
+        # A carve-out for `apply --dry-run=server|client` was tried and
+        # withdrawn: server-side dry run needs the same RBAC as the write, so
+        # it fails under the read-only grant the agent ships with, and the
+        # last-wins parse it needs is one misjudged flag arity away from
+        # admitting a real apply (`--dry-run=server --server-side
+        # --dry-run=none` was allowed by the first attempt). The verb is
+        # refused whole, including the spellings that would not persist.
+        for argv, desc in (
+            (["kubectl", "apply", "--dry-run=server", "-f", "cc.yaml"],
+             "server dry run"),
+            (["kubectl", "apply", "--dry-run=client", "-f", "cc.yaml"],
+             "client dry run"),
+            (["kubectl", "apply", "-f", "cc.yaml", "--dry-run=server",
+              "--server-side", "--dry-run=none"],
+             "boolean flag before a trailing none"),
+            (["kubectl", "apply", "-f", "cc.yaml"], "plain apply"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, desc)
+                self.assertEqual(decision.rule_id, "kubernetes.read-only", desc)
+
     def test_the_writes_one_word_from_the_new_reads_stay_refused(self):
         # Each new entry has a mutating sibling that shares all but the last
         # word. The entries are full paths, so the siblings must still refuse.

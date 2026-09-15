@@ -55,13 +55,49 @@ make dev-rebuild-agent ARGS="platform"
 
 - **[scripts/dev/dev_rebuild_agent.sh](../scripts/dev/dev_rebuild_agent.sh)**:
   - Prompts for or accepts an agent target (`platform`).
-  - Ensures the GCP Artifact Registry repository exists.
+  - Ensures the GCP Artifact Registry repository exists. Clean it up later with
+    [`scripts/dev/teardown_dev_01_gcp_artifact_registry.sh`](../scripts/dev/teardown_dev_01_gcp_artifact_registry.sh).
   - Builds and pushes the updated container image via Google Cloud Build (or locally with `--local`).
   - Automatically updates any running Custom Resources and rolling-restarts Kubernetes Deployments in GKE with the new image.
+
+### Building on a private worker pool
+
+Cloud Build runs on the project's default pool (2 vCPU) unless you point it elsewhere. To use a
+[private pool](https://cloud.google.com/build/docs/private-pools/private-pools-overview) with more
+CPU, export its full resource name:
+
+```bash
+export CLOUD_BUILD_WORKER_POOL=projects/PROJECT/locations/REGION/workerPools/POOL
+```
+
+`dev_rebuild_agent.sh` and `hack/ci-deploy.sh` both read this variable and pass `--worker-pool`
+(along with the pool's region parsed from the name) to `gcloud builds submit`. Leave it unset to use
+the default pool. The worker pool must allow public egress, or image builds fail when pulling base
+images and downloading dependencies.
+
+The two scripts handle the unset case differently. `dev_rebuild_agent.sh` takes the default pool's
+default machine (2 vCPUs), while `hack/ci-deploy.sh` requests `e2-highcpu-8` because it compiles all
+four container images (platform, credential-proxy, sandbox and operator) in a single Cloud Build
+submission ([`deploy/docker/cloudbuild-ci.yaml`](../deploy/docker/cloudbuild-ci.yaml)), with the
+sandbox and operator builds running in parallel alongside the platform-agent and credential-proxy
+builds. Because private worker pools define their own fixed machine types and reject
+`--machine-type`, `hack/ci-deploy.sh` only passes `--machine-type` when `CLOUD_BUILD_WORKER_POOL`
+is unset.
 
 ---
 
 ## Local Development (Fast Iteration)
+
+The operator is a standard Kubebuilder project; `make help` lists every target. `make manifests`
+writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, and `make test` downloads the
+envtest binaries to `bin/` on first run.
+
+`make build`, `make run` and `make test` all run `manifests`, `generate`, `fmt` and `vet` first, so
+generated code and manifests stay in sync automatically. `make install`, `make uninstall` and
+`make deploy` deliberately do not: they apply the manifests exactly as committed, so a deploy ships
+what is in git rather than whatever the local tree happens to regenerate, and leaves no modified
+files behind. Run `make manifests` yourself after changing the API types — CI fails if the committed
+output is stale.
 
 For local development and testing, you can run the operator controller as a local Go process on your machine, while pointing it to a remote GKE or local Kubernetes cluster. This bypasses the need to build and push container images on every code change.
 
@@ -86,7 +122,7 @@ make install
 ```
 
 > [!NOTE]
-> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again. How the build targets and CI keep generated output in sync is covered in the [operator development guide](../docs/site/src/content/docs/operator/development.md).
+> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again (see the note on build targets above).
 
 ### Step 3: Run the Operator Locally
 
@@ -161,8 +197,8 @@ Set the image target URL and run the build/push targets:
 ```bash
 # Replace with your actual registry. The tag must be immutable: `make deploy`
 # refuses a floating tag such as `latest`, because it lets a pod reschedule
-# upgrade the controller past the RBAC applied with it (issue #1009).
-export IMG=us-central1-docker.pkg.dev/ai-platform-1-464114/k8s-harness-poc/kube-agents-operator:$(git rev-parse HEAD)
+# upgrade the controller past the RBAC applied with it.
+export IMG=<your-registry>/kube-agents-operator:$(git rev-parse HEAD)
 
 # Build the image
 make docker-build IMG=$IMG
@@ -178,6 +214,10 @@ Deploy the operator deployment, RBAC permissions, and CRDs into the cluster:
 ```bash
 make deploy IMG=$IMG
 ```
+
+The refused tags and the `ALLOW_MUTABLE_IMG=1` override are on the
+[operator page](../docs/site/src/content/docs/operator/index.md#an-image-ahead-of-its-clusterrole).
+`make undeploy` removes the deployment.
 
 ### Step 3: Verify the Deployment
 
@@ -267,6 +307,33 @@ To uninstall/remove the GitHub integration:
 ```bash
 make undeploy-github
 ```
+
+`make deploy-inference-replay` / `make undeploy-inference-replay` do the same for the inference
+replay proxy. These kustomize copies are the development path for the components the Helm chart
+renders in a stock install.
+
+---
+
+## RBAC Migration & Deprecation Guidelines
+
+When modifying or deprecating RBAC roles or rolebindings in the operator:
+
+1. **Update active role construction:** update the builder functions (`buildPlatformLocalRole`,
+   `buildMinimalPlatformRole`, etc.) to generate the new role definitions.
+2. **Dynamic legacy role cleanup:** never leave old roles or rolebindings orphaned on existing
+   clusters. `reconcileRBAC()` audits every `RoleBinding` in the namespace attached to the agent's
+   ServiceAccount and deletes any non-canonical `kubeagents*` binding.
+3. **Sync controller RBAC annotations:** make sure the `// +kubebuilder:rbac` markers on the
+   reconciler include every permission the operator itself needs to grant or clean up, then run
+   `make manifests` to regenerate `config/rbac/role.yaml`.
+
+---
+
+## Formatting and CI
+
+`prettier.yml` enforces Markdown and YAML formatting (`**/*.{md,yaml,yml}`) in CI; the local
+targets are under `make help`. The workflows that exercise this directory: `k8s-operator-test.yml` runs `make test`, `docker-publish-ghcr.yml` publishes the manager
+image alongside the agent images, and `e2e-gchat-test.yml` is the end-to-end Google Chat test.
 
 ---
 

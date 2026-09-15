@@ -46,6 +46,28 @@ func authenticated(username string, audiences ...string) func(*authnv1.TokenRevi
 	}
 }
 
+// boundToPod answers as the API server does for a projected token minted into
+// a pod's volume: authenticated, plus the pod's name and UID in Extra. The key
+// strings are written out in full here rather than taken from the constants
+// the code under test uses, so that a typo in either is a failing test rather
+// than a matched pair of typos.
+func boundToPod(username, pod, uid string, audiences ...string) func(*authnv1.TokenReview) (*authnv1.TokenReview, error) {
+	return func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		req.Status = authnv1.TokenReviewStatus{
+			Authenticated: true,
+			Audiences:     audiences,
+			User: authnv1.UserInfo{
+				Username: username,
+				Extra: map[string]authnv1.ExtraValue{
+					"authentication.kubernetes.io/pod-name": {pod},
+					"authentication.kubernetes.io/pod-uid":  {uid},
+				},
+			},
+		}
+		return req, nil
+	}
+}
+
 func TestValidateReturnsTheServiceAccountTheClusterVouchesFor(t *testing.T) {
 	c := reviewer(t, authenticated(gatewaySA, testAudience))
 	v, err := NewTokenValidator(c, testAudience)
@@ -56,8 +78,68 @@ func TestValidateReturnsTheServiceAccountTheClusterVouchesFor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	if got != gatewaySA {
-		t.Errorf("Validate = %q, want %q", got, gatewaySA)
+	if got.ServiceAccount != gatewaySA {
+		t.Errorf("Validate = %q, want %q", got.ServiceAccount, gatewaySA)
+	}
+}
+
+// The pod claim, which is what claim narrowing stands on. It is the API
+// server's word about which pod the token was minted into, and the callout
+// derives a session's entire grant set from it, so it is asserted to survive
+// the review rather than assumed to.
+func TestValidateCarriesThePodTheTokenIsBoundTo(t *testing.T) {
+	c := reviewer(t, boundToPod(gatewaySA, "chat-otter-1a2b", "uid-1234", testAudience))
+	v, _ := NewTokenValidator(c, testAudience)
+	got, err := v.Validate(context.Background(), "a-token")
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got.PodName != "chat-otter-1a2b" || got.PodUID != "uid-1234" {
+		t.Errorf("Validate = %+v, want pod chat-otter-1a2b/uid-1234", got)
+	}
+}
+
+// A token bound to no pod authenticates perfectly well — it is what every
+// non-projected ServiceAccount token is. It must simply report no pod, so that
+// a narrowed entry refuses it instead of deriving grants from an empty name.
+func TestValidateReportsNoPodForATokenBoundToNone(t *testing.T) {
+	c := reviewer(t, authenticated(gatewaySA, testAudience))
+	v, _ := NewTokenValidator(c, testAudience)
+	got, err := v.Validate(context.Background(), "a-token")
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got.PodName != "" || got.PodUID != "" {
+		t.Errorf("Validate = %+v, want no pod at all", got)
+	}
+}
+
+// Extra is multi-valued by type. The authenticator writes exactly one value
+// per pod field, so two of them is not a set to pick a winner from — it is a
+// shape this code does not understand, and understanding it wrongly would mean
+// minting a session's grants for whichever pod name sorted first.
+func TestValidateTreatsAMultiValuedPodClaimAsNoClaim(t *testing.T) {
+	c := reviewer(t, func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		req.Status = authnv1.TokenReviewStatus{
+			Authenticated: true,
+			Audiences:     []string{testAudience},
+			User: authnv1.UserInfo{
+				Username: gatewaySA,
+				Extra: map[string]authnv1.ExtraValue{
+					"authentication.kubernetes.io/pod-name": {"chat-otter-1a2b", "chat-badger-9f9f"},
+					"authentication.kubernetes.io/pod-uid":  {"uid-1234"},
+				},
+			},
+		}
+		return req, nil
+	})
+	v, _ := NewTokenValidator(c, testAudience)
+	got, err := v.Validate(context.Background(), "a-token")
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got.PodName != "" {
+		t.Errorf("pod name = %q from a two-valued claim; want none", got.PodName)
 	}
 }
 
@@ -135,10 +217,10 @@ func TestValidateRefuses(t *testing.T) {
 			v, _ := NewTokenValidator(reviewer(t, tc.respond), testAudience)
 			got, err := v.Validate(context.Background(), "a-token")
 			if err == nil {
-				t.Fatalf("Validate returned %q; want a refusal containing %q", got, tc.want)
+				t.Fatalf("Validate returned %+v; want a refusal containing %q", got, tc.want)
 			}
-			if got != "" {
-				t.Errorf("Validate returned username %q alongside an error; it must return none", got)
+			if got != (Attested{}) {
+				t.Errorf("Validate returned %+v alongside an error; it must return nothing usable", got)
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error = %v, want it to contain %q", err, tc.want)

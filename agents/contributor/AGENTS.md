@@ -17,7 +17,7 @@ concern; the `gh` snippets are reference examples, not requirements.
 
 Read this alongside the root [`AGENTS.md`](../../AGENTS.md) (PR hygiene, the
 `kube-agents-bot` review contract, local validation) and
-[`docs/contributing.md`](../../docs/contributing.md) (the CLA). This document
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md) (the CLA). This document
 does not restate them - it only adds the agent-to-agent loop. Root `AGENTS.md`
 is written for an agent working **with** a human user - its "work the findings
 with the user" and "ask the user before acting" clauses assume one is in the

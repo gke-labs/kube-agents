@@ -1,0 +1,11 @@
+# Only ci-eval-pr.sh is owned here: it holds the presubmit rosters (TASKS,
+# NIGHTLY_TASKS, BOOTSTRAP_ADMITTED), so a change to it needs an eval-crew
+# approver and a root approver does not count (no_parent_owners). Every other
+# file under hack/ matches no filter and falls through to the root OWNERS as
+# before. docs/eval-gate-roster.md states the rule.
+filters:
+  'ci-eval-pr\.sh$':
+    approvers:
+    - eval-crew
+options:
+  no_parent_owners: true

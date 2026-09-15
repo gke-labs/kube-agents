@@ -1,11 +1,16 @@
 // The a2a chatops gateway: chat (Discord or Google Chat) in, tasks on the bus out.
 //
-// PLAYGROUND POSTURE: static per-component NATS users instead of the auth
-// callout, bot token as a plain Secret, no exporter, no breaker, gateway
-// sweep as the only janitor. Each has a decided design in
-// docs/designs/spec-nats-deployment.md and spec-chatops-gateway.md; the
-// auth callout is the product path and stage 2 work. Static creds are the
-// playground, not the product.
+// PLAYGROUND POSTURE: bot token as a plain Secret, no exporter, no breaker,
+// gateway sweep as the only janitor. Each has a decided design in
+// docs/designs/spec-nats-deployment.md and spec-chatops-gateway.md.
+//
+// The auth callout is no longer on that list - it is armed, and the sessions
+// this gateway spawns authenticate through it with per-pod grants. The gateway
+// itself is still a static NATS user, and that is sequencing rather than
+// posture: it has a ServiceAccount and a map entry could be rendered for it
+// tomorrow, but this program dials with NATS_USER/NATS_PASSWORD and moving the
+// identity before the program would refuse the gateway at connect on every
+// install.
 package main
 
 import (
@@ -21,18 +26,44 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+const (
+	// exitFailure is the one non-zero exit code this binary has: config,
+	// dial, adapter and run failures all leave through it, each having
+	// logged its own reason at the site that found it.
+	exitFailure = 1
+)
+
 func main() {
+	os.Exit(run())
+}
+
+// run owns what a test cannot: the process logger, the signal context and
+// the exit code. Everything that can fail is in realMain, which returns the
+// error instead of exiting so a test can drive it to each failure.
+func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := realMain(ctx, log); err != nil {
+		return exitFailure
+	}
+	return 0
+}
+
+// realMain is the gateway from configuration to shutdown. Every failure is
+// logged where it is found and then returned; realMain itself logs nothing
+// about the exit, and run maps every error to the same exit code.
+// gateway.FromEnv is the first call, so a configuration error returns before
+// anything is dialed.
+func realMain(ctx context.Context, log *slog.Logger) error {
 	cfg, err := gateway.FromEnv()
 	if err != nil {
 		log.Error("config", "err", err)
-		os.Exit(1)
+		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	natsOpts := []nats.Option{
 		// The gateway user may only subscribe under its own inbox prefix
@@ -50,7 +81,7 @@ func main() {
 	)
 	if err != nil {
 		log.Error("nats connect", "err", err)
-		os.Exit(1)
+		return err
 	}
 	defer client.Close()
 
@@ -64,7 +95,7 @@ func main() {
 	}
 	if err != nil {
 		log.Error("adapter", "backend", cfg.Backend(), "err", err)
-		os.Exit(1)
+		return err
 	}
 
 	gw, err := gateway.New(gateway.Options{
@@ -76,7 +107,7 @@ func main() {
 	})
 	if err != nil {
 		log.Error("gateway", "err", err)
-		os.Exit(1)
+		return err
 	}
 
 	log.Info("a2a gateway starting",
@@ -86,6 +117,7 @@ func main() {
 		"idleTTL", cfg.IdleTTL.String())
 	if err := gw.Run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("gateway exited", "err", err)
-		os.Exit(1)
+		return err
 	}
+	return nil
 }

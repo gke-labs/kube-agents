@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# What this client may be invoked *as*, which is a different list from what the
+# broker may run. `CommandExecutor.ALLOWED_EXECUTABLES` is derived from the
+# forges an install configured, so a forge CLI appears there and only there:
+# the broker is where that CLI runs. The overlap is not an invariant and these
+# two lists are not to be folded together.
 SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
 
 # How long to wait to reach the broker. Bounds the connect only — see
@@ -762,6 +767,47 @@ def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
             raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
         if answer.get("code") == "CONTENT_WORKSPACES_DISABLED":
             raise WorkspaceUnavailable(answer.get("error", "not enabled")) from exc
+        raise WorkspaceRequestError(exc.code, answer) from exc
+
+
+def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
+    """One `POST /v1/vcs/<verb>`.
+
+    Its own function rather than a parameter on `_workspace_call`, because the
+    two namespaces are different protocols that happen to share a transport:
+    every `/v1/vcs/*` call stands alone and holds nothing across a session.
+    Folding them together would put a `handle` argument on routes that have
+    none and invite a caller to hold one.
+
+    Public, unlike its neighbour, because the version-control skill is the
+    caller and it lives outside this module.
+    """
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # Same credential and same opener as `execute`: these routes spend the
+    # broker's forge credential, so a cross-Pod call without the header earns a
+    # 401, and the stock opener would put a total socket timeout on a clone
+    # that legitimately runs for minutes.
+    headers.update(authorization_headers())
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + f"/v1/vcs/{verb}",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with open_broker_request(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            answer = json.load(exc)
+        except (ValueError, TypeError):
+            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+        if answer.get("code") == "VCS_UNAVAILABLE":
+            # A broker too old to have these routes at all. Distinguished from
+            # every other refusal because it is the one a caller cannot fix by
+            # asking differently.
+            raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
         raise WorkspaceRequestError(exc.code, answer) from exc
 
 

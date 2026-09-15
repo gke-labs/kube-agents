@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __BASE__
 <title>__TITLE__</title>
+<link rel="icon" type="image/jpeg" href="__LOGO__">
 <!-- The page's data, inlined by render.py: pages.js boots from these two
      elements, so the page renders whole with no request beyond itself; the
      poll of the published brief.json is a best-effort refresh on top. -->
@@ -31,7 +32,7 @@ __INLINE_HEALTH__
       color-scheme: dark;
       --surface-0:#0a0a0c; --surface-1:#161618; --surface-2:#212126; --line:#27272a; --line-2:#3a3a42;
       --text-primary:#fbfaf7; --text-secondary:#c9ced6; --text-muted:#a9afba;
-      --accent:#8b5cf6; --accent-deep:#6e00ff; --accent-soft:#241740; --accent-link:#c4b5fd; --hl:#f59e0b; --hl-soft:#331f05;
+      --accent:#8b5cf6; --accent-soft:#241740; --accent-link:#c4b5fd; --hl:#f59e0b; --hl-soft:#331f05;
       --good-text:#5fd35f; --good-bg:#14320f; --crit-text:#ef8080; --crit-bg:#3a1515;
       --warn-text:#fcd34d; --warn-bg:#331f05; --ser-text:#f2a380; --ser-bg:#38200f;
       --skip-bg:#212126;
@@ -42,7 +43,7 @@ __INLINE_HEALTH__
     color-scheme: dark;
     --surface-0:#0a0a0c; --surface-1:#161618; --surface-2:#212126; --line:#27272a; --line-2:#3a3a42;
     --text-primary:#fbfaf7; --text-secondary:#c9ced6; --text-muted:#a9afba;
-    --accent:#8b5cf6; --accent-deep:#6e00ff; --accent-soft:#241740; --accent-link:#c4b5fd; --hl:#f59e0b; --hl-soft:#331f05;
+    --accent:#8b5cf6; --accent-soft:#241740; --accent-link:#c4b5fd; --hl:#f59e0b; --hl-soft:#331f05;
     --good-text:#5fd35f; --good-bg:#14320f; --crit-text:#ef8080; --crit-bg:#3a1515;
     --warn-text:#fcd34d; --warn-bg:#331f05; --ser-text:#f2a380; --ser-bg:#38200f;
     --skip-bg:#212126;
@@ -64,8 +65,9 @@ __INLINE_HEALTH__
   .top { position:sticky; top:0; z-index:5; background:var(--surface-1); border-bottom:1px solid var(--line); }
   .top-in { max-width:1120px; margin:0 auto; padding:13px 28px; display:flex; align-items:center; gap:16px; }
   .brand { font-size:15px; font-weight:750; letter-spacing:-.01em; display:flex; align-items:center; gap:9px; }
-  .brand .logo { width:22px; height:22px; border-radius:6px; background:var(--accent-deep,var(--accent)); display:inline-flex;
-    align-items:center; justify-content:center; color:#fff; font-size:12px; font-weight:800; }
+  .brand .logo { width:22px; height:22px; border-radius:6px; background:#fff; display:inline-block; object-fit:cover; }
+  .brand .tag { font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--accent); border:1px solid var(--accent); border-radius:999px; padding:3px 7px; margin-left:2px; }
   .nav { display:flex; gap:20px; margin-left:16px; }
   .nav a { color:var(--text-muted); font-size:13px; font-weight:650; padding:4px 0; border-bottom:2px solid transparent; }
   .nav a.on { color:var(--text-primary); border-bottom-color:var(--accent); }
@@ -301,7 +303,7 @@ __INLINE_HEALTH__
 <body class="viz-root" data-palette="#8b5cf6" data-page="__PAGE__">
 
 <div class="top"><div class="top-in">
-  <span class="brand"><span class="logo">ka</span>evals</span>
+  <span class="brand"><img class="logo" src="__LOGO__" alt="" width="22" height="22">kube-agents <span class="tag">evals</span></span>
   <nav class="nav">
     <a href="index.html" __NAV_BRIEF__>Brief</a><a href="grid.html" __NAV_GRID__>Grid</a><a href="cases.html" __NAV_CASES__>Cases</a><a href="nightly.html" __NAV_NIGHTLY__>Nightly</a>__NAV_RUN__
   </nav>

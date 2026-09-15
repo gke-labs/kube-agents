@@ -291,23 +291,49 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		return "", nil, "", fmt.Errorf("no token presented")
 	}
 
-	serviceAccount, err := s.validator.Validate(ctx, token)
+	att, err := s.validator.Validate(ctx, token)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("token rejected: %w", err)
 	}
 
-	id, ok := m.Lookup(serviceAccount)
+	id, ok := m.Lookup(att.ServiceAccount)
 	if !ok {
 		// The cluster vouches for this identity and this deployment has no
 		// entry for it. Named in the log because it is the single most
 		// likely thing to be wrong after a rename.
-		return "", nil, "", fmt.Errorf("%s is not in the identity map (version %s)", serviceAccount, m.Version)
+		return "", nil, "", fmt.Errorf("%s is not in the identity map (version %s)", att.ServiceAccount, m.Version)
+	}
+
+	grants, user := id.Grants, id.User
+	if id.Narrowing != "" {
+		// A narrowed entry holds no grants; they are built here from what
+		// the cluster attested about this connection specifically. The
+		// default arm cannot be reached through a parsed map — validate
+		// refuses an unknown narrowing — so it exists for the case where
+		// this switch and the map's validation drift apart, and it refuses
+		// rather than falling through to the entry's empty grants, which
+		// would connect a client that then hangs on its first reply.
+		switch id.Narrowing {
+		case NarrowingPod:
+			if err := validSessionName(att.PodName); err != nil {
+				return "", nil, "", fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
+			}
+			if att.PodUID == "" {
+				return "", nil, "", fmt.Errorf("%s narrows on the pod, but the token attests no pod UID", att.ServiceAccount)
+			}
+			// The user is named for the pod, so `connz`, the $SYS
+			// advisories and the line below all say which session —
+			// otherwise every session on the bus is called "session".
+			grants, user = sessionGrants(att.PodName), att.PodName
+		default:
+			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
+		}
 	}
 
 	p := &jwt.Permissions{}
-	p.Pub.Allow.Add(id.Grants.Publish...)
-	p.Sub.Allow.Add(id.Grants.Subscribe...)
-	return id.Account, p, id.User, nil
+	p.Pub.Allow.Add(grants.Publish...)
+	p.Sub.Allow.Add(grants.Subscribe...)
+	return id.Account, p, user, nil
 }
 
 // mint builds the user JWT the server will enforce.

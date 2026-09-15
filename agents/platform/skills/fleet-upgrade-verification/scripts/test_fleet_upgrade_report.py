@@ -754,3 +754,228 @@ class RolloutTrackingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeReadinessCommands(FakeGcloud):
+    """FakeGcloud plus `get-credentials` and `kubectl get`, recording the KUBECONFIG each ran with."""
+
+    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=()):
+        super().__init__(clusters_by_project, config_by_location)
+        self.objects_by_cluster = objects_by_cluster
+        self.failing_kubectl = set(failing_kubectl)
+        self.failing_credentials = set(failing_credentials)
+        self.kubeconfigs = []
+        self.current_cluster = None
+
+    def __call__(self, cmd, timeout=None, env=None):
+        if cmd[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+            self.calls.append(cmd)
+            self.current_cluster = cmd[4]
+            self.kubeconfigs.append(env.get("KUBECONFIG") if env else None)
+            if self.current_cluster in self.failing_credentials:
+                return 1, "", "ERROR: (gcloud.container.clusters.get-credentials) forbidden"
+            return 0, "", ""
+        if cmd[:2] == ["kubectl", "get"]:
+            self.calls.append(cmd)
+            self.kubeconfigs.append(env.get("KUBECONFIG") if env else None)
+            if self.current_cluster in self.failing_kubectl:
+                return 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
+            return 0, json.dumps({"kind": "List", "items": self.objects_by_cluster.get(self.current_cluster, [])}), ""
+        return super().__call__(cmd)
+
+
+def k8s_workload(kind, namespace, name, replicas, labels):
+    return {"kind": kind, "metadata": {"namespace": namespace, "name": name}, "spec": {"replicas": replicas, "template": {"metadata": {"labels": labels}}}}
+
+
+def k8s_pdb(namespace, name, spec, expected):
+    return {"kind": "PodDisruptionBudget", "metadata": {"namespace": namespace, "name": name}, "spec": spec, "status": {"expectedPods": expected, "disruptionsAllowed": 0}}
+
+
+class ReadinessTest(unittest.TestCase):
+    TARGET = "1.35.1-gke.1000"
+    AT = "2026-09-14T15:00:00Z"
+
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
+        self.kubeconfig_dir = os.path.join(tempfile.mkdtemp(), "kubeconfigs")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.kubeconfig_dir), True)
+        blocked = cluster("seeded-b", "us-central1-a", "1.34.11-gke.1000", [("default-pool", "1.34.11-gke.1000")])
+        blocked["maintenancePolicy"] = {
+            "window": {
+                "dailyMaintenanceWindow": {"startTime": "03:00", "duration": "PT4H0M0S"},
+                "maintenanceExclusions": {
+                    "hold-the-minor-lag": {
+                        "startTime": "2026-09-12T14:35:00Z",
+                        "endTime": "2026-12-11T14:35:00Z",
+                        "maintenanceExclusionOptions": {"scope": "NO_MINOR_UPGRADES"},
+                    }
+                },
+            }
+        }
+        ready = cluster("seeded-a", "us-central1-a", self.TARGET, [("default-pool", self.TARGET)])
+        autopilot = cluster("robot-host", "us-central1", self.TARGET, [("nap-1", self.TARGET)])
+        autopilot["autopilot"] = {"enabled": True}
+        autopilot["controlPlaneEndpointsConfig"] = {"dnsEndpointConfig": {"endpoint": "gke-abc.us-central1.gke.goog", "allowExternalTraffic": True}}
+        self.clusters = {"p1": [blocked, ready, autopilot]}
+        self.objects = {
+            "seeded-a": [
+                k8s_workload("Deployment", "shop", "web", 3, {"app": "web"}),
+                k8s_pdb("shop", "web-pdb", {"maxUnavailable": 1, "selector": {"matchLabels": {"app": "web"}}}, 3),
+            ],
+            "robot-host": [
+                k8s_workload("Deployment", "readiness-1411", "pause", 2, {"app": "pause"}),
+                k8s_pdb("readiness-1411", "block-drain", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "pause"}}}, 2),
+                k8s_pdb("readiness-1411", "orphan", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "gone"}}}, 0),
+            ],
+        }
+
+    def _args(self, *extra):
+        return ["--state-dir", self.state_dir, "--project", "p1", "--target-version", self.TARGET, *extra]
+
+    def _run(self, fake, *extra):
+        out_path = os.path.join(tempfile.mkdtemp(), "report.json")
+        stdout = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(stdout):
+            rc = report.main(self._args("--readiness", "--at", self.AT, "--kubeconfig-dir", self.kubeconfig_dir, "--output", out_path, *extra))
+        with open(out_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return rc, stdout.getvalue(), data
+
+    def test_without_readiness_no_credentials_or_kubectl_call_and_no_readiness_key(self):
+        fake = FakeGcloud(self.clusters, {})  # raises on any command it does not know
+        stdout = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(stdout):
+            rc = report.main(self._args())
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertFalse(any(c[3:4] == ["get-credentials"] or c[:1] == ["kubectl"] for c in fake.calls))
+        with patch.object(report, "run_cmd", fake):
+            data = report.build_report(["p1"], self.TARGET)
+        self.assertNotIn("readiness", data)
+        self.assertFalse(any("readiness" in m for m in data["members"]))
+        self.assertNotIn("| readiness |", stdout.getvalue())
+
+    def test_blocking_pdb_exclusion_and_autopilot_skew_in_table_and_json(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
+
+        host = by_name["robot-host"]
+        self.assertEqual(host["status"], "blocked")
+        finding = host["pdbs"]["blocking"][0]
+        self.assertEqual(finding["pdb"], "readiness-1411/block-drain")
+        self.assertEqual(finding["field"], "maxUnavailable: 0")
+        self.assertEqual(finding["workloads"][0], {"kind": "Deployment", "namespace": "readiness-1411", "name": "pause", "replicas": 2})
+        self.assertEqual(host["pdbs"]["orphan"], 1)
+        self.assertFalse(host["skew"]["applicable"])
+        self.assertIn("1 orphan PDB(s)", host["note"])
+
+        b = by_name["seeded-b"]
+        self.assertEqual(b["status"], "blocked")
+        self.assertEqual(b["pdbs"]["blocking"], [])
+        self.assertEqual(b["maintenance"]["blocking_exclusions"], ["hold-the-minor-lag"])
+        self.assertEqual(b["maintenance"]["window"]["state"], "closed")
+        self.assertEqual(b["maintenance"]["window"]["next_opening"], "2026-09-15T03:00Z")
+
+        a = by_name["seeded-a"]
+        self.assertEqual(a["status"], "ready")
+        self.assertEqual(a["skew"]["pools"][0]["verdict"], "ok")
+        self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})
+        self.assertEqual(data["readiness"]["evaluated_at"], "2026-09-14T15:00:00Z")
+
+        lines = text.splitlines()
+        self.assertIn("| " + " | ".join(report.READINESS_COLUMNS) + " |", lines)
+        host_row = next(l for l in lines if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
+        self.assertIn("readiness-1411/block-drain (maxUnavailable: 0; Deployment readiness-1411/pause (2 replicas))", host_row)
+        self.assertIn("no exclusion in effect; no maintenance window", host_row)
+        self.assertIn("n/a (Autopilot", host_row)
+        b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
+        self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
+        self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
+        self.assertIn("Readiness at 2026-09-14T15:00:00Z: 2 blocked, 1 ready, 0 unknown", text)
+        # The version table is still printed first and unchanged in shape.
+        self.assertTrue(lines[0].startswith("| " + " | ".join(report.TABLE_COLUMNS)))
+
+    def test_kubeconfig_per_target_and_dns_endpoint_only_when_allowed(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, _, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        creds = [c for c in fake.calls if c[3:4] == ["get-credentials"]]
+        self.assertEqual(len(creds), 3)
+        by_cluster = {c[4]: c for c in creds}
+        self.assertIn("--dns-endpoint", by_cluster["robot-host"])
+        self.assertNotIn("--dns-endpoint", by_cluster["seeded-a"])
+        self.assertNotIn("--dns-endpoint", by_cluster["seeded-b"])
+        self.assertEqual(by_cluster["seeded-b"][:7], ["gcloud", "container", "clusters", "get-credentials", "seeded-b", "--location=us-central1-a", "--project=p1"])
+        expected = os.path.join(self.kubeconfig_dir, "kubeconfig_p1_seeded-b_us-central1-a.yaml")
+        self.assertIn(expected, fake.kubeconfigs)
+        self.assertTrue(all(k and k.startswith(self.kubeconfig_dir + os.sep) for k in fake.kubeconfigs))
+        self.assertTrue(os.path.isdir(self.kubeconfig_dir))
+        kubectl = [c for c in fake.calls if c[:1] == ["kubectl"]]
+        self.assertEqual(kubectl, [["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]] * 3)
+        self.assertEqual(data["readiness"]["kubeconfig_dir"], self.kubeconfig_dir)
+        self.assertEqual({m["cluster"]: m["readiness"]["kubeconfig"] for m in data["members"]}["seeded-b"], expected)
+
+    def test_dns_endpoint_not_added_when_external_traffic_is_off(self):
+        record = cluster("closed", "us-central1", self.TARGET, [("p", self.TARGET)])
+        record["controlPlaneEndpointsConfig"] = {"dnsEndpointConfig": {"endpoint": "gke-abc.us-central1.gke.goog", "allowExternalTraffic": False}}
+        self.assertEqual(report.dns_endpoint_args(record), [])
+        record["controlPlaneEndpointsConfig"]["dnsEndpointConfig"]["allowExternalTraffic"] = True
+        self.assertEqual(report.dns_endpoint_args(record), ["--dns-endpoint"])
+        del record["controlPlaneEndpointsConfig"]["dnsEndpointConfig"]["endpoint"]
+        self.assertEqual(report.dns_endpoint_args(record), [])
+
+    def test_kubectl_failure_is_an_error_row_exit_1_and_the_others_are_graded(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_kubectl=["seeded-a"])
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
+        self.assertEqual(by_name["seeded-a"]["status"], "unknown")
+        self.assertIsNone(by_name["seeded-a"]["pdbs"])
+        self.assertIn("i/o timeout", by_name["seeded-a"]["read_error"])
+        self.assertEqual(by_name["robot-host"]["status"], "blocked")
+        self.assertEqual(by_name["seeded-b"]["status"], "blocked")
+        self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
+        self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
+        self.assertIn("| read failed |", text)
+        # The version row is unaffected, and the rollout record does not treat the project as unread.
+        self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
+        self.assertEqual(data["rollout"]["missing_members"], [])
+
+    def test_get_credentials_failure_is_an_error_row_and_skips_kubectl(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_credentials=["seeded-b"])
+        rc, _, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        b = next(m for m in data["members"] if m["cluster"] == "seeded-b")["readiness"]
+        # The exclusion still blocks it; the PDB rule alone is unread.
+        self.assertEqual(b["status"], "blocked")
+        self.assertIsNone(b["pdbs"])
+        self.assertIn("forbidden", b["read_error"])
+        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 2)
+
+    def test_unknown_target_grades_the_pdb_rule_and_marks_the_rest_unknown(self):
+        record = cluster("nochannel", "us-central1", "1.34.0-gke.1", [("p", "1.34.0-gke.1")], channel=None)
+        fake = FakeReadinessCommands({"p1": [record]}, {}, {"nochannel": self.objects["seeded-a"]})
+        stdout = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(stdout):
+            rc = report.main(["--state-dir", self.state_dir, "--project", "p1", "--readiness", "--kubeconfig-dir", self.kubeconfig_dir])
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertIn("| unknown | none |", stdout.getvalue())
+        self.assertIn("no target; exclusion scope and skew not graded", stdout.getvalue())
+
+    def test_default_kubeconfig_dir_follows_hermes_home(self):
+        with patch.dict(os.environ, {"HERMES_HOME": "/home/hermes"}):
+            self.assertEqual(report.default_kubeconfig_dir(), "/home/hermes/.kubeconfigs")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(report.default_kubeconfig_dir(), "/opt/data/.kubeconfigs")
+        self.assertEqual(report.kubeconfig_path("/d", "p", "../x", ""), "/d/kubeconfig_p_.._x_unset.yaml")
+
+    def test_bad_at_is_a_usage_error_and_at_needs_readiness(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
+            self.assertEqual(report.main(self._args("--readiness", "--at", "tomorrow", "--kubeconfig-dir", self.kubeconfig_dir)), report.EXIT_USAGE)
+            self.assertEqual(report.main(self._args("--at", self.AT)), report.EXIT_USAGE)
+            self.assertEqual(report.main(self._args("--kubeconfig-dir", self.kubeconfig_dir)), report.EXIT_USAGE)
+        self.assertEqual(fake.calls, [])

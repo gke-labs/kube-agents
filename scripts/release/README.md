@@ -61,15 +61,15 @@ page under "Why there is no `gke-admin` set".
 - `dispatch_release_pipeline.sh`: Starts `release-publish.yml` with `-f schedule_gate=evaluate` when `release-scheduler.yml` evaluates that candidate conditions are satisfied (`should_release=true`). Verifies `gh` CLI presence defensively, emits error annotations on failure, and records the dispatch event into the Job Summary.
 - `record_release_scheduler_skip.sh`: Records a quiet weekly tick into the Job Summary when `release-scheduler.yml` candidate evaluation determines no GA release should be published (e.g. no staging tag present, or zero commits since the latest GA release tag). Because a quiet tick deliberately leaves no `release-publish.yml` run behind, this summary is its only trace, explicitly clarifying that a green scheduler run reflects a clean evaluation and reports nothing about publishing status.
 - `calculate_next_version.sh`: Automatically calculates the next SemVer 2.0 version from Conventional Commits since the latest numeric GA release tag.
-- `verify_release_eligibility.sh`: Release gatekeeper that verifies commit eligibility, checks for a shape-valid staging promotion tag (`staging_<ts>_<sha>`, meaning the full nightly matrix passed on the commit), performs tag collision detection, and verifies all 6 required container images exist in registry. It does not also require `rc_*_validated`: a staging tag is only ever derived from a candidate that carries one, so checking both would leave two gates to keep in step. `skip_staging_validation` with an audit reason is the emergency bypass.
+- `verify_release_eligibility.sh`: Release gatekeeper that verifies commit eligibility, checks for a shape-valid staging promotion tag (`staging_<ts>_<sha>`, meaning the full nightly matrix passed on the commit), performs tag collision detection, and verifies every image in `REQUIRED_RELEASE_IMAGES` (`common.sh`; seven today) exists in registry. It does not also require `rc_*_validated`: a staging tag is only ever derived from a candidate that carries one, so checking both would leave two gates to keep in step. `skip_staging_validation` with an audit reason is the emergency bypass.
 - `tag_ga_release.sh`: Creates and pushes official GA SemVer Git tags (`X.Y.Z`) on a detached HEAD commit stamped with the release version in installer scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), Helm charts (`charts/kube-agents/Chart.yaml`), and Terraform defaults (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`). Note: candidate commits must carry the `^BAKED_RELEASE_VERSION=` placeholder line in root installer scripts, `version`/`appVersion` fields in Helm charts, and `image_tag` defaults in Terraform examples.
 - `promote_release_images.sh`: Promotes verified container images from candidate commit SHA to GA release tag in GHCR without rebuilding.
 - `sign_release_images.sh`: Signs promoted GA release container images in GHCR using Keyless Cosign OIDC.
 - `publish_helm_chart.sh`: Packages, publishes, and signs the official kube-agents Helm chart to GHCR as an OCI artifact. Extracts the chart tree directly from the release commit SHA via `extract_commit_tree`.
-- `generate_release_sbom.sh`: Generates Software Bill of Materials (SBOM) in SPDX 2.3 JSON (`.spdx.json`) and CycloneDX 1.5 JSON (`.cdx.json`) formats using Syft for the staged filesystem bundle and each of the four release container images (`k8s-operator`, `platform-agent`, `credential-proxy`, `replay-proxy`). Staged in an isolated temporary directory and moved atomically into `DIST_DIR`. The `syft` CLI is mandatory in CI (exits 1 if missing or if image SBOM generation fails) and optional locally (warns and skips).
+- `generate_release_sbom.sh`: Generates Software Bill of Materials (SBOM) in SPDX 2.3 JSON (`.spdx.json`) and CycloneDX 1.5 JSON (`.cdx.json`) formats using Syft for the staged filesystem bundle (both formats) and each of the seven release container images in `REQUIRED_RELEASE_IMAGES` (`k8s-operator`, `platform-agent`, `credential-proxy`, `agent-sandbox`, `replay-proxy`, `pubsub-platform`, `gke-stockout-investigator`; SPDX only). Staged in an isolated temporary directory and moved atomically into `DIST_DIR`. The `syft` CLI is mandatory in CI (exits 1 if missing or if image SBOM generation fails) and optional locally (warns and skips).
 - `package_release_bundle.sh`: Assembles self-contained offline distribution archives (`kube-agents-<version>.tar.gz` and `.zip`) for air-gapped environments. Extracts tracked files directly from the resolved release commit via `extract_commit_tree` to ensure dirty or untracked files are never packaged. Stamps `BAKED_RELEASE_VERSION` into root installer scripts, Helm `Chart.yaml`, and Terraform example defaults, writes the `.release-bundle` provenance marker, packages Helm charts, invokes `generate_release_sbom.sh`, sanitizes sensitive files (tokens, credentials, keys, real tfvars while preserving `terraform.tfvars.example`), computes SHA256 checksums into `checksums.txt`, and promotes verified assets atomically into `DIST_DIR`.
 - `sign_release_artifacts.sh`: Signs `checksums.txt` in `DIST_DIR` using Keyless Cosign OIDC, producing `checksums.txt.bundle` to provide verifiable cryptographic supply-chain provenance for all offline distribution archives and SBOMs. The `cosign` CLI is mandatory in CI (exits 1 if missing or signing fails) and skipped with a dry-run warning locally.
-- `publish_github_release.sh`: Publishes official GitHub Releases with auto-generated release notes from Conventional Commits, discovers and attaches all distribution artifacts (`.tar.gz`, `.zip`, `.tgz`, `*.spdx.json`, `*.cdx.json`, `checksums.txt`, `checksums.txt.bundle`) from `DIST_DIR`, and handles idempotent re-runs via `gh release upload --clobber`. The notes start from the previous GA tag, passed explicitly as `--notes-start-tag`: GA tags sit on stamped commits that never return to `main`, and left to pick the start tag itself GitHub started 0.4.0's notes from 0.2.0 and 0.5.0's from the first commit. The tag is `get_previous_ga_tag` from `common.sh`, or `PREVIOUS_VERSION` from the environment for a hand run (`release-publish.yml` sets none). With no lower GA tag the flag is omitted and the script warns: that is the first release, or a checkout that did not fetch its tags, and the script cannot tell them apart locally, so the banner's `Notes Start Tag` line and the warning are the check. It does not call `release_fetch_tags`; like `resolve_release_commit`, it relies on the publish job's `fetch-depth: 0` checkout.
+- `publish_github_release.sh`: Publishes official GitHub Releases with notes GitHub generates (`gh release create --generate-notes`) from the pull requests merged since the previous GA tag, grouped by the label categories in `.github/release.yml` and excluding Dependabot's and anything labelled `duplicate`, `invalid` or `wontfix`; discovers and attaches all distribution artifacts (`.tar.gz`, `.zip`, `.tgz`, `*.spdx.json`, `*.cdx.json`, `checksums.txt`, `checksums.txt.bundle`) from `DIST_DIR`; and handles idempotent re-runs via `gh release upload --clobber`. Those notes and the compare view, not a milestone, are where a release's contents are: `.github/workflows/auto-assign-milestone.yml` still runs after every merge to `main`, but exits without assigning anything when no milestone is open, and none is kept. The notes start from the previous GA tag, passed explicitly as `--notes-start-tag`: GA tags sit on stamped commits that never return to `main`, and left to pick the start tag itself GitHub started 0.4.0's notes from 0.2.0 and 0.5.0's from the first commit. The tag is `get_previous_ga_tag` from `common.sh`, or `PREVIOUS_VERSION` from the environment for a hand run (`release-publish.yml` sets none). With no lower GA tag the flag is omitted and the script warns: that is the first release, or a checkout that did not fetch its tags, and the script cannot tell them apart locally, so the banner's `Notes Start Tag` line and the warning are the check. It does not call `release_fetch_tags`; like `resolve_release_commit`, it relies on the publish job's `fetch-depth: 0` checkout.
 
 ## Pipeline Cadence & Execution Flow
 
@@ -145,7 +145,7 @@ the composition, Helm release, and images together via `upgrade.sh --upgrade-mod
 Similarly, `autopush` receives atomic deploys through `autopush-deploy.yml` whenever container images
 are published to GHCR. Both workflows enforce atomic full upgrades, preventing image drift and
 contention.
-[`environment-reconcile.md`](../../docs/site/src/content/docs/deploy/environment-reconcile.md) is
+[`environment-reconcile.md`](../../docs/environment-reconcile.md) is
 the canonical page for that whole path.
 
 It reuses the RC pipeline's machinery unchanged. `deploy-environment.yml`, `teardown-environment.yml`,
@@ -287,7 +287,7 @@ into a more legible green outcome. Red is left to mean the machinery is broken.
 
 **Every candidate selected for GA release must carry a `staging_<ts>_<sha>` tag produced by the
 nightly pipeline** — whether released by cron or dispatched by hand. `bypass` short-circuits the
-gate job, but two steps later `verify_release_eligibility.sh` verifies staging promotion on the
+gate job, but in the publish job `verify_release_eligibility.sh` verifies staging promotion on the
 candidate commit and exits 1 if unpromoted:
 
 ```
@@ -298,6 +298,84 @@ candidate commit and exits 1 if unpromoted:
 Staging tags exist and are pushed nightly by `nightly-pipeline.yml`. The gate works as designed
 to ensure only thoroughly validated commits reach GA; `skip_staging_validation` with an audit
 reason is strictly the emergency override for hotfixes rather than a way to cut an ordinary release.
+
+### Dispatching a release by hand
+
+Before dispatching:
+
+1. The target commit exists on `main`.
+2. It carries a `staging_<ts>_<sha>` tag from the nightly promotion. An `rc_*_validated` tag is
+   not checked alongside it: a staging tag is only ever derived from a candidate that already
+   carries one.
+3. The seven release images in `REQUIRED_RELEASE_IMAGES` (`common.sh`: `k8s-operator`,
+   `platform-agent`, `credential-proxy`, `agent-sandbox`, `replay-proxy`, `pubsub-platform`,
+   `gke-stockout-investigator`) exist in GHCR under that commit.
+4. `gh`, authenticated with `repo` and `workflow` permissions (`gh auth status`).
+
+Then dispatch `release-publish.yml` from the Actions tab or the CLI:
+
+```bash
+# Standard release: the next version is calculated from Conventional Commits.
+gh workflow run release-publish.yml --repo gke-labs/kube-agents
+
+# A specific staging-promoted commit.
+gh workflow run release-publish.yml --repo gke-labs/kube-agents \
+  -f target_commit="<TARGET_COMMIT_SHA>"
+
+# An explicit version, which is how 0.y.z graduates to 1.0.0.
+gh workflow run release-publish.yml --repo gke-labs/kube-agents \
+  -f explicit_release_version="1.0.0"
+```
+
+A dispatch runs with `schedule_gate=bypass` unless told otherwise, so it publishes without the
+scheduled gate's verdict; `verify_release_eligibility.sh` still enforces staging promotion in the
+publish job. `dry-run` reports the verdict in the job summary and publishes nothing.
+
+### Emergency hotfix
+
+`skip_staging_validation: true` skips the live GKE validation gate and nothing else. It is
+reserved for two situations: a zero-day CVE in a container dependency that needs immediate
+publication, or a production regression where waiting for the next nightly promotion would
+prolong user-facing downtime.
+
+Three invariants hold under the bypass:
+
+1. `verify_release_eligibility.sh` still requires every image in `REQUIRED_RELEASE_IMAGES` to exist
+   in GHCR under `<TARGET_COMMIT>`; an unbuilt commit hard-fails.
+2. `emergency_override_reason` must carry a non-whitespace justification; an empty one aborts the
+   workflow.
+3. The target SemVer tag must not already exist on another commit; a collision aborts the release.
+
+Always pass `target_commit`. Omitting it defaults to the tip of `main` and releases every
+intervening commit without live validation:
+
+```bash
+# Version calculated automatically.
+gh workflow run release-publish.yml --repo gke-labs/kube-agents \
+  -f skip_staging_validation=true \
+  -f emergency_override_reason="CVE-2026-XXXX: critical vulnerability in base container dependencies" \
+  -f target_commit="<HOTFIX_COMMIT_SHA>"
+
+# Explicit version.
+gh workflow run release-publish.yml --repo gke-labs/kube-agents \
+  -f skip_staging_validation=true \
+  -f emergency_override_reason="Critical regression fix for gateway admission deadlock" \
+  -f target_commit="<HOTFIX_COMMIT_SHA>" \
+  -f explicit_release_version="0.3.1"
+```
+
+Afterwards:
+
+1. Confirm the release, its tag and the attached assets with `gh release view <VERSION>`. The
+   promoted images and the OCI chart are not release assets; check them separately, as the
+   scripts do, with `docker manifest inspect ghcr.io/gke-labs/kube-agents/<image>:<VERSION>` and
+   `docker manifest inspect ghcr.io/gke-labs/kube-agents/charts/kube-agents:<VERSION>`.
+2. Dispatch `rc-release-pipeline.yml` against the hotfix commit
+   (`-f commit_sha="<HOTFIX_COMMIT_SHA>"`, the same SHA passed as `target_commit`) so the full
+   GKE E2E suite runs on it. Do not pass the tagged release commit: `tag_ga_release.sh` creates a
+   stamped commit on detached HEAD that has no SHA-tagged images in GHCR, and the RC pipeline's
+   image verification fails on it.
+3. Attach the Actions run URL and the justification to the tracking issue or incident report.
 
 ### Scheduled execution & testing the gate
 

@@ -441,6 +441,14 @@ REFUSED_MARKER_RE = re.compile(
 ACKED_MARKER_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-acked:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
+# A `/remediate` naming a posture `finish` withheld for want of a declared-intent
+# search is neither refused nor acted on: it is answered once with this marker
+# and left standing, so the first run that records the search honours it. The
+# other two markers are permanent; this one is not consulted by anything that
+# decides whether a request is still open.
+DEFERRED_MARKER_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-deferred:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
+)
 # Written into the closing comment of a pull request the *harness* closed, so
 # the audit trail says who closed it. The machine-readable half of the same
 # fact is the `audit:stale-closed` label — see STALE_CLOSED_LABEL.
@@ -545,6 +553,31 @@ MAX_DECLARED_ROWS = 50
 # required: the repository and path a reviewer opens, and the lines that pin
 # the flagged property so the claim can be read off the row.
 DECLARATION_FIELDS = ("repo", "path", "excerpt")
+# The document's record of the declared-intent search (the obtainability SOP's
+# §4a): one `owner/name@sha` per repository the run searched. `finish` compares
+# the slugs against the run record `start` wrote, and a run that performed a
+# declarable check without a complete record has that check's findings withheld
+# — see `withhold_unsearched_postures`. The sha is checked for shape only, so
+# the record makes a skipped step visible rather than impossible.
+DECLARED_INTENT_SEARCHED_KEY = "declared_intent_searched"
+# The slug set `start` prints for the document to account for.
+DECLARED_INTENT_REPOS_KEY = "declared_intent_repos"
+# Where `finish` files what it withheld: on the document, so every renderer
+# derives the same gap from it, and on the JSON line, as the withheld ids.
+POSTURES_WITHHELD_KEY = "postures_withheld"
+# An abbreviated sha is what `git rev-parse --short` prints and a full one is
+# what the broker reports; anything between the two is a sha, anything else is
+# not one.
+MIN_SHA_CHARS = 7
+MAX_SHA_CHARS = 40
+SEARCHED_REPO_RE = re.compile(
+    rf"^(?P<repo>[^@\s]+)@(?P<sha>[0-9a-f]{{{MIN_SHA_CHARS},{MAX_SHA_CHARS}}})\Z"
+)
+# The one declarable slug that also names a fault: `hpa-cannot-scale` is a
+# posture when `min == max` and a fault when the target is dangling, and the
+# validator cannot tell the two apart. The fault is withheld with the postures,
+# and the gap sentence says so.
+DUAL_SHAPE_CHECK = "hpa-cannot-scale"
 
 # `gh pr list` takes a limit, not a cursor. A full page means the oldest
 # remediation branches fell off the end, and a branch that reads as "no pull
@@ -990,6 +1023,26 @@ def audit_declarable_checks(audit_id: str) -> frozenset[str]:
     return frozenset(spec.declarable) if spec else frozenset()
 
 
+def declared_intent_repos(repo: str, context: list[str]) -> list[str]:
+    """The slugs a run's `declared_intent_searched` must account for, in order.
+
+    The GitOps repository first, then every `context_repos` slug that is not
+    it. `get_context_github_repos` returns a slug that is also managed, so
+    without the fold the same repository would be required twice, and a
+    document naming it once would read as incomplete. Compared case-folded,
+    because GitHub slugs are.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for slug in [repo, *context]:
+        text = str(slug).strip()
+        key = text.lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
 def audit_sop(audit_id: str) -> str:
     """The SOP filename that defines this stream's checks."""
     spec = AUDITS.get(audit_id)
@@ -1043,6 +1096,11 @@ def checks_na(cluster: object) -> list[str]:
 
 def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
+
+
+def run_record_path_for(audit_id: str) -> str:
+    """Where `start` records which repositories this run was told to search."""
+    return f"{SCRATCH_DIR}/run_{audit_id}.json"
 
 
 def base_branch() -> str:
@@ -1948,6 +2006,42 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 )
             seen_declared[full_id] = i
 
+    # The record of the declared-intent search: which repositories the step
+    # read, each at the commit it was read at. Shape only, here — whether the
+    # list covers what `start` named is `finish`'s question, answered against
+    # the run record rather than the ConfigMap, and answered by withholding
+    # rather than by exit 2 so a skipped step still publishes the faults. Held
+    # to the `declarable` set the way `declared` is: a stream with no
+    # declared-intent step has nothing to record, and `[]` says the same thing
+    # as an absent key everywhere.
+    searched = data.get(DECLARED_INTENT_SEARCHED_KEY)
+    if searched is not None:
+        if not isinstance(searched, list):
+            raise ValidationError(
+                f"{DECLARED_INTENT_SEARCHED_KEY}: must be a list when present — one "
+                "owner/name@sha string per repository the declared-intent step "
+                "searched — or omit the key"
+            )
+        declarable = audit_declarable_checks(audit_id)
+        import gitops_workspace
+
+        for i, entry in enumerate(searched):
+            where = f"{DECLARED_INTENT_SEARCHED_KEY}[{i}]"
+            if not declarable:
+                raise ValidationError(
+                    f"{where}: the {audit_id} SOP has no declared-intent step, so "
+                    "there is no search to record. Drop the entry, or omit the key"
+                )
+            match = SEARCHED_REPO_RE.match(entry) if isinstance(entry, str) else None
+            if match is None or not gitops_workspace.is_valid_repo_slug(
+                match.group("repo")
+            ):
+                raise ValidationError(
+                    f"{where}: must name the repository and the commit it was read "
+                    f"at as owner/name@sha, the sha {MIN_SHA_CHARS} to "
+                    f"{MAX_SHA_CHARS} lowercase hex characters, got {entry!r}"
+                )
+
     return data
 
 
@@ -2034,7 +2128,152 @@ def coverage_gaps(data: dict) -> list[str]:
         if limitation:
             reasons.append(limitation)
         gaps.append(f"{name}: partially audited — {'; '.join(reasons)}")
+    # The fourth representation of "did not look": posture checks that ran with
+    # no record of the declaration search the SOP puts in front of them. Filed
+    # on the document by `withhold_unsearched_postures`, so this reads it back
+    # the same way every caller does and the ledger body, the clean comment
+    # and both `finish` branches report one sentence.
+    declared_gap = _declared_intent_gap(data)
+    if declared_gap:
+        gaps.append(declared_gap)
     return gaps
+
+
+def declared_intent_applies(data: dict) -> bool:
+    """Whether this document owed the SOP's declared-intent step.
+
+    Keyed on the checks that ran, not on the postures found. A run that ran
+    `no-pdb`, saw a candidate and left it out of `findings` reads exactly like
+    one that searched and found a declaration, and the search record is the
+    only thing that tells them apart — the same laundering path `checks_run`
+    guards against, one field over. A stream with no `declarable` set never
+    owes it, and neither does a run on which none of the four ran: there was
+    no candidate to search for.
+    """
+    declarable = audit_declarable_checks(str(data.get("audit") or ""))
+    if not declarable:
+        return False
+    scope = data.get("scope") or {}
+    return any(
+        check in declarable
+        for cluster in scope.get("clusters") or []
+        for check in checks_ran(cluster)
+    )
+
+
+def searched_repo_slugs(data: dict) -> set[str]:
+    """The case-folded slugs `declared_intent_searched` names, sha stripped."""
+    out: set[str] = set()
+    for entry in data.get(DECLARED_INTENT_SEARCHED_KEY) or []:
+        if isinstance(entry, str):
+            slug = entry.partition("@")[0].strip().lower()
+            if slug:
+                out.add(slug)
+    return out
+
+
+def unsearched_repositories(data: dict, record: dict) -> list[str]:
+    """The repositories `start` named that the document does not say it searched.
+
+    Extra slugs in the document are allowed — a run that searched more than it
+    was told to has not searched less — so this is one-directional.
+    """
+    required = declared_intent_repos(
+        str(record.get("repo", "")), list(record.get("context_repos") or [])
+    )
+    searched = searched_repo_slugs(data)
+    return [slug for slug in required if slug.lower() not in searched]
+
+
+def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
+    """Take the declarable checks' findings out of a run with no complete search.
+
+    The SOP's declared-intent step is the one thing that decides whether a
+    posture is a finding, and nothing in the document used to show whether it
+    ran. A run that skipped it published every posture as a finding — the
+    false positive #1341 is about — and a run that skipped it and found
+    nothing published a clean fleet. Both now go partial: the run owed the
+    step (`declared_intent_applies`) and either `start` left no record or the
+    document's `declared_intent_searched` does not cover every repository the
+    record names. A partial list is no search, per the SOP.
+
+    What goes: every finding whose check is declarable, the dangling-target
+    `hpa-cannot-scale` fault included, because it shares its slug with the
+    `min == max` posture and this side cannot tell them apart. What stays: the
+    faults, and every `declared[]` entry, each of which cites the file it
+    read. The withheld findings are filed on the document under
+    `postures_withheld`, with the repositories not searched, so that
+    `coverage_gaps` — which every renderer and both `finish` branches derive
+    from the document — reports one sentence everywhere and `partial` stays
+    `bool(coverage_gaps)`: the ledger does not close, `resolved` is 0, no
+    stale pull request is retired, and the withheld ids enter no delta block
+    and no remediation pull request.
+
+    Returns the withheld findings; an empty list when nothing was owed or the
+    record is complete.
+    """
+    if not declared_intent_applies(data):
+        return []
+    unsearched: list[str] = []
+    if record is not None:
+        unsearched = unsearched_repositories(data, record)
+        if not unsearched:
+            return []
+    declarable = audit_declarable_checks(str(data.get("audit") or ""))
+    kept: list[dict] = []
+    withheld: list[dict] = []
+    for finding in data.get("findings") or []:
+        target = withheld if str(finding.get("check", "")) in declarable else kept
+        target.append(finding)
+    data["findings"] = kept
+    data[POSTURES_WITHHELD_KEY] = {
+        "findings": withheld,
+        "unsearched": unsearched,
+        "run_record": record is not None,
+    }
+    return withheld
+
+
+def postures_withheld(data: dict) -> list[dict]:
+    """The findings `withhold_unsearched_postures` filed on the document, if any."""
+    held = data.get(POSTURES_WITHHELD_KEY)
+    return list(held.get("findings") or []) if isinstance(held, dict) else []
+
+
+def _declared_intent_gap(data: dict) -> str | None:
+    """One sentence for the withheld postures, or None when nothing was withheld."""
+    held = data.get(POSTURES_WITHHELD_KEY)
+    if not isinstance(held, dict):
+        return None
+    findings = list(held.get("findings") or [])
+    unsearched = [str(slug) for slug in held.get("unsearched") or []]
+    if held.get("run_record"):
+        where = f"repositories not searched: {', '.join(unsearched)}"
+    else:
+        where = "no run record from `start`, so every repository counts as unsearched"
+    if findings:
+        # Redacted here for the reason the skip reasons above are: this string
+        # leaves by the JSON line as well as the renderer.
+        named = redact_secrets(
+            ", ".join(
+                f"{f.get('check', '')} on {f.get('cluster', '')}/"
+                f"{f.get('namespace') or '(cluster)'}/{f.get('object', '')}"
+                for f in findings
+            )
+        )
+        what = f"{len(findings)} posture finding(s) withheld ({named})"
+    else:
+        what = (
+            "posture checks ran with no declared-intent search on record, so a "
+            "candidate left out cannot be told from one never seen"
+        )
+    tail = ""
+    if any(str(f.get("check", "")) == DUAL_SHAPE_CHECK for f in findings):
+        tail = (
+            f"; a dangling-target {DUAL_SHAPE_CHECK} shares its slug with the "
+            "min == max posture and is held back with the postures"
+        )
+    return f"declared intent: {what} — {where}{tail}"
 
 
 class ContainmentError(ValidationError):
@@ -2578,13 +2817,27 @@ def is_machine_author(comment: dict) -> bool:
     )
 
 
+def deferral_reason(target: str) -> str:
+    """Why a `/remediate` on a withheld posture is neither refused nor acted on."""
+    return (
+        f"`{target}` is a posture finding this run held back rather than "
+        "published, because the document recorded no complete declared-intent "
+        "search (see _Declared intent not searched_ on the ledger). The request "
+        "stands: the first run that records the search and still sees the "
+        "posture acts on it, and one that no longer sees it says so"
+    )
+
+
 def parse_remediate_commands(
-    comments: list[dict], findings: list[dict]
+    comments: list[dict], findings: list[dict], withheld: list[dict] | None = None
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
     A refusal is one entry per comment, not per bad target, because the reply is
-    posted once per comment and marked with that comment's node id.
+    posted once per comment and marked with that comment's node id. An entry
+    carrying `deferred: True` is not a refusal: it names a posture `finish`
+    withheld this run, and `reply_to_refusals` answers it on the deferred
+    marker, which nothing reads as "answered", so the request stands.
 
     `accepted_by_comment` exists so a request that *worked* gets an answer too.
     A command that silently succeeds is indistinguishable from one that was
@@ -2604,6 +2857,12 @@ def parse_remediate_commands(
         for fid, finding in by_id.items()
         if (finding.get("remediation") or {}).get("kind") == "manifest"
     }
+    # The postures `finish` took out of `findings` this run. A target among
+    # them is not "not a finding in the current report": it is one the harness
+    # is holding, and a refusal here would carry the permanent marker and a
+    # false reason — the requester would be told their id was a typo, and the
+    # request would never be revisited when the posture returns.
+    withheld_ids = {str(f.get("id", "")) for f in withheld or []}
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -2698,8 +2957,12 @@ def parse_remediate_commands(
             continue
 
         accepted: list[str] = []
+        deferred: list[str] = []
         for raw in matches:
             target = raw.strip().strip("`")
+            if target in withheld_ids:
+                deferred.append(deferral_reason(target))
+                continue
             if not target:
                 # An empty target is not a wildcard. Reading it as one would
                 # open every promotable pull request the cap allows on somebody
@@ -2763,6 +3026,15 @@ def parse_remediate_commands(
         if reasons:
             refusals.append(
                 {"comment_id": node_id, "author": author, "reasons": reasons}
+            )
+        if deferred:
+            refusals.append(
+                {
+                    "comment_id": node_id,
+                    "author": author,
+                    "reasons": deferred,
+                    "deferred": True,
+                }
             )
 
     return RemediateRequests(
@@ -3056,6 +3328,10 @@ def refused_marker(comment_id: str) -> str:
 
 def acked_marker(comment_id: str) -> str:
     return f"<!-- audit-acked:{comment_id} -->"
+
+
+def deferred_marker(comment_id: str) -> str:
+    return f"<!-- audit-deferred:{comment_id} -->"
 
 
 def stale_closed_marker(pr_number: int | str) -> str:
@@ -3593,6 +3869,83 @@ def _render_scope(
     return out
 
 
+def _render_declared_intent_search(data: dict) -> list[str]:
+    """What the declared-intent step searched, or what was withheld for want of it.
+
+    Under Scope, because it is coverage. A complete record is one line naming
+    each `owner/name@sha`, so a reader can see what was read. An incomplete one
+    is a banner and a table of the postures the run held back — named here,
+    as a gap, rather than published as findings or silently dropped, because
+    a withheld posture the ledger never mentions is the laundered clean run
+    this exists to prevent.
+    """
+    out: list[str] = []
+    held = data.get(POSTURES_WITHHELD_KEY)
+    if isinstance(held, dict):
+        findings = list(held.get("findings") or [])
+        unsearched = [str(slug) for slug in held.get("unsearched") or []]
+        if held.get("run_record"):
+            where = "the run did not record a search of " + ", ".join(
+                f"`{_cell(slug)}`" for slug in unsearched
+            )
+        else:
+            where = "`start` left no run record naming the repositories to search"
+        if findings:
+            consequence = (
+                f"{len(findings)} posture finding(s) are withheld from this ledger "
+                "rather than published; they return when a run records a complete "
+                "search."
+            )
+        else:
+            consequence = (
+                "No posture finding was written, and without the search a candidate "
+                "left out cannot be told from one never seen; the ledger stays open "
+                "until a run records a complete search."
+            )
+        out += [
+            "",
+            "### Declared intent not searched",
+            "",
+            "**Coverage is partial.** The declared-intent step ran posture checks "
+            f"but {where}, so a posture this run flagged cannot be told from one a "
+            f"repository declares on purpose. {consequence}",
+        ]
+        if findings:
+            out += [
+                "",
+                "| Check | Cluster | Namespace | Object |",
+                "| ----- | ------- | --------- | ------ |",
+            ]
+            for finding in findings[:MAX_DECLARED_ROWS]:
+                out.append(
+                    f"| `{_cell(str(finding.get('check', '')))}` "
+                    f"| `{_cell(str(finding.get('cluster', '')))}` "
+                    f"| {_cell(str(finding.get('namespace') or '')) or '—'} "
+                    f"| `{_cell(str(finding.get('object', '')))}` |"
+                )
+            if len(findings) > MAX_DECLARED_ROWS:
+                out.append(f"| _…and {len(findings) - MAX_DECLARED_ROWS} more_ |  |  |  |")
+            if any(str(f.get("check", "")) == DUAL_SHAPE_CHECK for f in findings):
+                out += [
+                    "",
+                    f"_A dangling-target `{DUAL_SHAPE_CHECK}` is a fault, but it "
+                    "shares its slug with the `min == max` posture and is held back "
+                    "with the postures._",
+                ]
+        return out
+    searched = [
+        entry
+        for entry in data.get(DECLARED_INTENT_SEARCHED_KEY) or []
+        if isinstance(entry, str)
+    ]
+    if searched:
+        shown = ", ".join(f"`{_cell(entry)}`" for entry in searched[:MAX_DECLARED_ROWS])
+        if len(searched) > MAX_DECLARED_ROWS:
+            shown += f", and {len(searched) - MAX_DECLARED_ROWS} more"
+        out += ["", f"Declared-intent search: {shown}."]
+    return out
+
+
 def _render_findings(
     findings: list[dict],
     budget: int,
@@ -3914,6 +4267,7 @@ def render_issue_body(
 
     fixed: list[str] = _render_header(audit_id)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id)
+    fixed += _render_declared_intent_search(data)
     withheld_section = _render_withheld(list(withheld or []), findings)
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -4101,6 +4455,27 @@ def render_clean_comment(
         out += [f"- {_cell(gap)}" for gap in gaps[:MAX_SCOPE_ROWS]]
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
+
+    # The postures held back for want of a declared-intent search, one per
+    # line. A clean run over a withheld posture is a clean run only because
+    # the harness took the posture out, and on a stream whose ledger is not
+    # rewritten this comment is the one place that says which.
+    withheld = postures_withheld(data)
+    if withheld:
+        out += [
+            "",
+            f"{len(withheld)} posture finding(s) are withheld rather than published, "
+            "because the run recorded no complete declared-intent search:",
+            "",
+        ]
+        for finding in withheld[:MAX_DECLARED_ROWS]:
+            out.append(
+                f"- `{_cell(str(finding.get('check', '')))}` on "
+                f"`{_cell(str(finding.get('object', '')))}` in "
+                f"`{_cell(str(finding.get('cluster', '')))}`"
+            )
+        if len(withheld) > MAX_DECLARED_ROWS:
+            out.append(f"- _…and {len(withheld) - MAX_DECLARED_ROWS} more_")
 
     # A clean run closes the ledger without rewriting it, so this comment is
     # the last place a declared posture is published on the issue tracker:
@@ -4323,6 +4698,25 @@ def render_refusal_comment(refusal: dict, generated_at: datetime) -> str:
     ]
     out += [f"- {reason}" for reason in refusal.get("reasons") or []]
     out += ["", refused_marker(str(refusal.get("comment_id", "")))]
+    return "\n".join(out)
+
+
+def render_deferral_comment(deferral: dict, generated_at: datetime) -> str:
+    """Said once per `/remediate` that names a posture this run withheld.
+
+    Not a refusal: nothing was wrong with the request, and it is not closed by
+    this answer. The marker is the deferred one, which nothing reads as
+    "answered", so the same comment is honoured by the first run that records
+    the declared-intent search.
+    """
+    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    out = [
+        f"@{deferral.get('author', 'someone')} — that `/remediate` was read on "
+        f"{stamp} and is on hold, not refused:",
+        "",
+    ]
+    out += [f"- {reason}" for reason in deferral.get("reasons") or []]
+    out += ["", deferred_marker(str(deferral.get("comment_id", "")))]
     return "\n".join(out)
 
 
@@ -5520,6 +5914,11 @@ def reply_to_refusals(
     cannot be recorded on the command itself.
     """
     for refusal in refusals:
+        if refusal.get("deferred"):
+            reply_to_deferrals(
+                repo, issue_number, [refusal], existing_comments, generated_at
+            )
+            continue
         comment_id = str(refusal.get("comment_id", ""))
         if comment_id and marker_from_harness(
             existing_comments, REFUSED_MARKER_RE, comment_id
@@ -5530,6 +5929,34 @@ def reply_to_refusals(
             issue_number,
             render_refusal_comment(refusal, generated_at),
             what="/remediate refusal",
+        )
+
+
+def reply_to_deferrals(
+    repo: str,
+    issue_number: int,
+    deferrals: list[dict],
+    existing_comments: list[dict],
+    generated_at: datetime,
+) -> None:
+    """Answer each deferred `/remediate` once per hold, on the deferred marker.
+
+    The guard is this marker alone: a comment that was deferred yesterday and
+    is deferred again today is not answered twice, and one that was deferred
+    and is acted on today gets its acknowledgement, because the ack path never
+    looks at this marker.
+    """
+    for deferral in deferrals:
+        comment_id = str(deferral.get("comment_id", ""))
+        if comment_id and marker_from_harness(
+            existing_comments, DEFERRED_MARKER_RE, comment_id
+        ):
+            continue
+        post_comment(
+            repo,
+            issue_number,
+            render_deferral_comment(deferral, generated_at),
+            what="/remediate deferral",
         )
 
 
@@ -5555,6 +5982,48 @@ def ack_remediate_requests(
             render_ack_comment(comment_id, accepted, outcomes, generated_at),
             what="/remediate acknowledgement",
         )
+
+
+def write_run_record(audit_id: str, repo: str, context: list[str]) -> str:
+    """Record which repositories this run's declared-intent step must search.
+
+    Written by `start`, read by `finish`: the comparison is against what this
+    run was told, not against the ConfigMap as it stands at `finish`, so a
+    repository registered mid-run neither fails the run nor gets searched.
+    """
+    path = run_record_path_for(audit_id)
+    Path(path).write_text(
+        json.dumps({"audit": audit_id, "repo": repo, "context_repos": list(context)}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
+    """The record `start` wrote for this stream, or None when there is none usable.
+
+    Missing, unreadable, not the shape `write_run_record` writes, or — when the
+    caller knows which repository it is finishing — written for a different
+    one, all read as "no record", and no record is no search: the run
+    withholds. The repository check is what keeps a multi-repository cron,
+    which runs `start` and `finish` per repository in turn, from measuring
+    repository B's document against a record left behind for A. Nothing here
+    guesses at a repository list the way `finish` would if it fell back to the
+    ConfigMap.
+    """
+    try:
+        data = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("audit") != audit_id:
+        return None
+    recorded = data.get("repo")
+    context = data.get("context_repos")
+    if not isinstance(recorded, str) or not recorded or not isinstance(context, list):
+        return None
+    if repo and recorded.strip().lower() != repo.strip().lower():
+        return None
+    return {"repo": recorded, "context_repos": [str(slug) for slug in context]}
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -5743,6 +6212,12 @@ def context_repos() -> list[str]:
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
+    # Yesterday's run record goes first, before anything below can fail. Every
+    # step from here to the write can raise, and a `start` that died between
+    # them would otherwise leave the previous run's repository list for a
+    # `finish` to measure today's document against.
+    Path(run_record_path_for(audit_id)).unlink(missing_ok=True)
+
     opt_repo = getattr(args, "repo", None)
     repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
@@ -5768,6 +6243,15 @@ def handle_start(args: argparse.Namespace) -> None:
     # publish as if it were fresh.
     findings_path = findings_path_for(audit_id)
     Path(findings_path).unlink(missing_ok=True)
+
+    # The run record: which repositories this run's declared-intent step was
+    # told to search. Written here, after every step that can fail and before
+    # the JSON below is printed, so the record is never newer than the list
+    # the worker was handed; with the unlink at the top, a `start` that did
+    # not get this far leaves no record at all, and `finish` withholds rather
+    # than measuring the document against yesterday's list.
+    context = context_repos()
+    write_run_record(audit_id, repo, context)
 
     print(
         json.dumps(
@@ -5799,7 +6283,14 @@ def handle_start(args: argparse.Namespace) -> None:
                 # never merged into `managed_repos`, so nothing here can be
                 # pushed to or swept. The GitOps clone is searched regardless
                 # and is not repeated in this list unless it was registered.
-                "context_repos": context_repos(),
+                "context_repos": context,
+                # The slug set the document's `declared_intent_searched` must
+                # cover, as `finish` will measure it: the GitOps repository
+                # plus every context slug, folded to one entry each. Printed
+                # so the worker is told the exact list rather than left to
+                # derive it, and so the list it searched is the list the
+                # harness recorded.
+                DECLARED_INTENT_REPOS_KEY: declared_intent_repos(repo, context),
                 # The roster, handed over rather than left to be discovered.
                 #
                 # It is in the SOP, and the SOP is required reading, but "the
@@ -5836,6 +6327,17 @@ def handle_start(args: argparse.Namespace) -> None:
             }
         )
     )
+
+
+def _tree_sha(workspace) -> str:
+    """The commit the broker's tree was read at.
+
+    The branch head when `--branch` named one the remote has, since that is
+    what the broker checked out; the base otherwise. Printed by every read so
+    a content-mode run has the sha its `declared_intent_searched` entry needs
+    without a `git` it does not have.
+    """
+    return workspace.branch_sha or workspace.base_sha
 
 
 def handle_fetch(args: argparse.Namespace) -> None:
@@ -5879,7 +6381,8 @@ def handle_fetch(args: argparse.Namespace) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
             written.append(path)
-    print(json.dumps({"workspace": str(root), "files": written}))
+        sha = _tree_sha(workspace)
+    print(json.dumps({"workspace": str(root), "files": written, "sha": sha}))
 
 
 def handle_list(args: argparse.Namespace) -> None:
@@ -5914,6 +6417,7 @@ def handle_list(args: argparse.Namespace) -> None:
         proxy_endpoint(), repo, branch=args.branch
     ) as workspace:
         entries = workspace.list(args.prefix)
+        sha = _tree_sha(workspace)
     # `truncated` travels with the entries. A listing that stopped at the
     # broker's ceiling looks complete otherwise, and the audit's next move is to
     # read a path — one it saw, or one it inferred from a listing that ended
@@ -5922,6 +6426,7 @@ def handle_list(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "repo": repo,
+                "sha": sha,
                 "entries": entries,
                 "total": entries.total,
                 "truncated": entries.truncated,
@@ -5969,6 +6474,7 @@ def handle_grep(args: argparse.Namespace) -> None:
             regex=args.regex,
             ignore_case=args.ignore_case,
         )
+        sha = _tree_sha(workspace)
     # `truncated` travels with the matches, for the reason it does in `list`: a
     # search that stopped at the broker's ceiling reads as "these are all the
     # hits", and "the repository does not declare that namespace" is the
@@ -5977,6 +6483,7 @@ def handle_grep(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "repo": repo,
+                "sha": sha,
                 "matches": result.get("matches", []),
                 "total": result.get("total", 0),
                 "truncated": result.get("truncated", False),
@@ -6228,8 +6735,27 @@ def handle_remediate(args: argparse.Namespace) -> None:
     """
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
-    findings = list(data["findings"])
     opt_repo = getattr(args, "repo", None)
+    # The same withhold `finish` applies, against the same record. A direct
+    # ask is uncapped, not unfiltered: the ledger says these postures were held
+    # back for want of a declared-intent search, and a pull request for one of
+    # them would contradict it.
+    repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
+    withheld_ids = set(
+        finding_ids(
+            withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
+        )
+    )
+    findings = list(data["findings"])
+    held = [fid for fid in args.finding if fid in withheld_ids]
+    if held:
+        raise ValidationError(
+            f"--finding: {', '.join(held)} withheld — the document recorded no "
+            "complete declared-intent search, so finish holds these posture "
+            "findings back rather than publishing them, and a pull request for "
+            "one would contradict the ledger. Record the search "
+            "(declared_intent_searched) and run finish, then ask again"
+        )
 
     by_id = {str(f.get("id", "")): f for f in findings}
     unknown = [fid for fid in args.finding if fid not in by_id]
@@ -6287,7 +6813,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             )
         return
 
-    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
+    repo = repo_hint or resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -6399,16 +6925,29 @@ def handle_remediate(args: argparse.Namespace) -> None:
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
+    opt_repo = getattr(args, "repo", None)
+    # Once, here, ahead of the dry-run split: both paths then see the same
+    # document, and `coverage_gaps` reads the gap back off it wherever it is
+    # called from. The real run knows which repository it is finishing and
+    # holds the record to it; a dry run resolves nothing and compares only
+    # when `--repo` was given.
+    repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
+    withheld = withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
+    if withheld:
+        log(
+            f"WITHHELD: {len(withheld)} posture finding(s) with no complete "
+            "declared-intent search on record — published as a coverage gap, "
+            f"not as findings: {', '.join(finding_ids(withheld))}"
+        )
     findings = list(data["findings"])
     declared = list(data.get("declared") or [])
     now = datetime.now(timezone.utc)
-    opt_repo = getattr(args, "repo", None)
 
     if args.dry_run:
         _handle_finish_dry_run(audit_id, data, now, repo=opt_repo)
         return
 
-    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
+    repo = repo_hint
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -6475,9 +7014,28 @@ def handle_finish(args: argparse.Namespace) -> None:
             # clean run as its exception: that is the one morning the issue
             # disappears, taking the thread the requester would re-ask on with
             # it.
-            for request in unanswered_remediate_comments(
-                fetch_issue_comments(repo, existing_issue)
-            ):
+            # A request naming a posture this run withheld is not answered
+            # with "no longer reproduces": the harness is holding it, not the
+            # fleet, so it is deferred on its own marker and stays open.
+            withheld_ids = set(finding_ids(withheld))
+            clean_comments = fetch_issue_comments(repo, existing_issue)
+            for request in unanswered_remediate_comments(clean_comments):
+                held = [t for t in request.get("targets") or [] if t in withheld_ids]
+                if held:
+                    reply_to_deferrals(
+                        repo,
+                        existing_issue,
+                        [
+                            {
+                                "comment_id": request.get("comment_id", ""),
+                                "author": request.get("author", "someone"),
+                                "reasons": [deferral_reason(t) for t in held],
+                            }
+                        ],
+                        clean_comments,
+                        now,
+                    )
+                    continue
                 post_comment(
                     repo,
                     existing_issue,
@@ -6599,6 +7157,10 @@ def handle_finish(args: argparse.Namespace) -> None:
                     # would be muted within a week. An on-demand run reports
                     # it because on-demand runs report everything.
                     "declared": len(declared),
+                    # The posture findings held back for want of a complete
+                    # declared-intent search; the gap sentence above names
+                    # them and the repositories not searched.
+                    POSTURES_WITHHELD_KEY: finding_ids(postures_withheld(data)),
                 }
             )
         )
@@ -6618,7 +7180,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     }
 
     ledger_comments = fetch_issue_comments(repo, existing_issue) if existing_issue else []
-    requests = parse_remediate_commands(ledger_comments, findings)
+    requests = parse_remediate_commands(ledger_comments, findings, withheld)
     plan = promotion_candidates(
         findings,
         pr_by_finding,
@@ -6876,6 +7438,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "coverage_gaps": gaps,
                 # Same field as the CLEAN branch; see the note there.
                 "declared": len(declared),
+                POSTURES_WITHHELD_KEY: finding_ids(postures_withheld(data)),
             }
         )
     )

@@ -142,6 +142,12 @@ KNOWN_UNREGISTERED = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "vcs-history-only-fact": (
+        "a repository-history question graded on the answer and on the route "
+        "the worker took to it (the version-control verbs, never a credentialed "
+        "clone or gh from the sandbox); no domains.yaml row describes "
+        "repository access"
+    ),
     "gpu-stress-test-diagnosis": (
         "a chat-prompted post-incident RCA, not the event-fired autoops triage "
         "that incident-triage names; no domains.yaml row describes it"
@@ -189,6 +195,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "report_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     "tool_called": ("tool_names",),
+    "worker_commands": ("required_patterns", "forbidden_patterns"),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

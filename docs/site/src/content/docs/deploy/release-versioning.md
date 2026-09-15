@@ -22,43 +22,34 @@ Every commit and build progresses through five distinct lifecycle tiers:
 | **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).    |
 
 Only a staging-promoted commit is releasable. An `rc_*_validated` tag records the narrow
-three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag that `nightly-pipeline.yml`
-pushes after the full matrix passes
-([`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release)).
-The gate matches that tag's shape rather than the bare `staging_` prefix, because the prefix is
-also a hand-pushable redeploy trigger.
+three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag that the nightly pipeline
+pushes after the full matrix passes.
 
 ## Release cadence
 
 The RC pipeline, the nightly staging promotion, and the GA release all run on schedules,
 with manual dispatches available for overrides and off-schedule releases.
 
-| Step                        | When it runs                                                                                                  | Workflow                                                                                                                          |
-| :-------------------------- | :------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------- |
-| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.   | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
-| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged. | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
-| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it; `release-publish.yml` has no `schedule:`. | `release-scheduler.yml` starts `release-publish.yml` with `schedule_gate=evaluate` when an eligible staging candidate is found.   |
+| Step                        | When it runs                                                                                                  |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------ |
+| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.   |
+| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged. |
+| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it.                                           |
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
 promise. A scheduled GA release ships unattended on Fridays if a new staging-promoted
-candidate exists, or maintainers may dispatch the workflow by hand. The gate that decides whether
-a dispatch publishes, and how the schedulers pick a candidate, are described in
-[`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release),
-which is canonical for both.
+candidate exists, or maintainers may dispatch the workflow by hand.
 
 ### What the next release contains
 
 Generated release notes are the tracking mechanism. GitHub milestones are unused.
 
-Every GA release is created with `gh release create --generate-notes`
-(`scripts/release/publish_github_release.sh`), so GitHub writes the notes from the pull requests
-merged between the previous release tag and the new one, grouped under the label categories in
-`.github/release.yml`: features, bug fixes, security, documentation, infrastructure, and a
-catch-all for anything else. The script names the previous GA tag itself with `--notes-start-tag`
-rather than leaving GitHub to pick one;
-[`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release)
-says why. Dependabot's pull requests, and any labelled `duplicate`, `invalid` or `wontfix`, are
-left out. Read them on
+GitHub writes each release's notes from the pull requests merged between the previous release tag
+and the new one, grouped by label: features, bug fixes, security, documentation, infrastructure,
+and a catch-all for anything else. The grouping is the label-to-category map in
+[`.github/release.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/release.yml),
+so a pull request's labels decide the heading it appears under. Dependabot's pull requests, and any
+labelled `duplicate`, `invalid` or `wontfix`, are left out. Read them on
 [the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
 
 Before it exists, the next release is whatever has merged since the latest GA tag, which
@@ -71,13 +62,9 @@ Before it exists, the next release is whatever has merged since the latest GA ta
 - Replace `main` with the newest `staging_<ts>_<sha>` tag to see what is releasable now; that is
   the commit an ordinary dispatch releases.
 
-`auto-assign-milestone.yml` still runs after every merge to `main`, but it exits without assigning
-anything when the repository has no open milestone, and none is kept, so a milestone is not where
-to look.
-
 ## Automated SemVer 2.0 calculation
 
-When the GA release workflow runs, `scripts/release/calculate_next_version.sh` inspects Conventional Commits in the range `<LATEST_GA_TAG>..<TARGET_COMMIT>` (resolving to the latest staging-promoted commit on the standard automated path, or the specified commit / `HEAD` under emergency bypass):
+When the GA release workflow runs, it inspects Conventional Commits in the range `<LATEST_GA_TAG>..<TARGET_COMMIT>` (resolving to the latest staging-promoted commit on the standard automated path, or the specified commit / `HEAD` under emergency bypass):
 
 <!-- prettier-ignore -->
 | Commit type in release range | Current version | Calculated next version | Precedence and action |
@@ -86,111 +73,31 @@ When the GA release workflow runs, `scripts/release/calculate_next_version.sh` i
 | `feat:` | `0.2.0` | `0.3.0` | Minor bump, Patch resets to 0 |
 | `feat!:`, `fix!:`, `BREAKING CHANGE:` | `0.2.0` | `0.3.0` | Minor bump (SemVer 2.0 Clause 4 in `0.y.z`) |
 | `feat!:`, `fix!:`, `BREAKING CHANGE:` | `1.2.0` | `2.0.0` | Major bump (in `1.x.x`+) |
-| _(No new commits in release range)_ | `0.2.0` | `0.2.0` | No changes (`skip_release=true`) |
+| _(No new commits in release range)_ | `0.2.0` | `0.2.0` | No changes; the eligibility check then skips the release (`skip_release=true`) |
 
 ### SemVer 2.0 Clause 4 and the 1.0.0 manual governance rule
 
 During initial development (`0.y.z`), any breaking change increments `MINOR` (`0.2.1` -> `0.3.0`) and resets `PATCH` to 0, per [SemVer 2.0 Clause 4](https://semver.org/#spec-item-4).
 
-The automated version calculator never promotes `0.y.z` to `1.0.0` on its own. Declaring API stability and graduating to `1.0.0` is a manual governance decision by project maintainers, triggered explicitly through the `explicit_release_version: "1.0.0"` workflow input.
+The automated version calculator never promotes `0.y.z` to `1.0.0` on its own. Declaring API stability and graduating to `1.0.0` is a manual governance decision by project maintainers, who publish that release with an explicit version.
 
 Once `1.0.0` is established, the automated calculator resumes standard SemVer rules: breaking changes bump `MAJOR`, new features bump `MINOR`, and bug fixes bump `PATCH`.
 
-## Cutting a GA release
+## Who cuts a release
 
-### Prerequisites
-
-Before triggering a production release:
-
-1. Target commit must exist on the `main` branch.
-2. Target commit must carry a `staging_<ts>_<sha>` tag created by the nightly promotion pipeline ([`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release)). An `rc_*_validated` tag is not checked alongside it: a staging tag is only ever derived from a candidate that already carries one.
-3. All four required container images (`k8s-operator`, `platform-agent`, `credential-proxy`, `replay-proxy`) must exist in GHCR under `<TARGET_COMMIT>`.
-4. GitHub CLI (`gh`) version 2.40.0 or newer installed and authenticated with `repo` and `workflow` permissions (`gh auth status`).
-
-### Triggering the release workflow
-
-Execute `.github/workflows/release-publish.yml` from the GitHub Actions web interface or via the GitHub CLI:
-
-```bash
-# Standard automated release (SemVer calculated automatically from Conventional Commits):
-gh workflow run release-publish.yml --repo gke-labs/kube-agents
-
-# Releasing a specific staging-promoted commit:
-gh workflow run release-publish.yml --repo gke-labs/kube-agents \
-  -f target_commit="<TARGET_COMMIT_SHA>"
-
-# Manual version override (e.g. promoting 0.y.z to 1.0.0):
-gh workflow run release-publish.yml --repo gke-labs/kube-agents \
-  -f explicit_release_version="1.0.0"
-```
-
-Scheduled releases are automated weekly on Fridays at 05:17 UTC via
-`.github/workflows/release-scheduler.yml` using the decoupled trigger pattern.
-The publishing workflow itself (`release-publish.yml`) has no `schedule:` and is dispatch-only:
-when the scheduler finds an eligible staging-promoted candidate, it dispatches the workflow with
-`schedule_gate=evaluate`. In pre-1.0 initial development (`0.y.z`), breaking changes bump minor
-under SemVer Clause 4 and release unattended. Once `1.0.0` is cut, a breaking change halts the
-scheduled evaluation with an error annotation so maintainers can publish the major release by hand.
-Manual releases and emergency bypasses remain supported on `release-publish.yml` using
-`schedule_gate=bypass` (the default). `dry-run` reports the verdict in the job summary and
-publishes nothing.
-[`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release) is
-canonical for that gate; [Release cadence](#release-cadence) above states when each step runs.
-
-## Emergency hotfix runbook
-
-The release gatekeeper enforces staging promotion (`staging_<ts>_<sha>`, the full nightly GKE E2E matrix) by default. In emergency situations, maintainers can bypass the live GKE validation gate while preserving all cryptographic and build integrity invariants.
-
-### Eligibility criteria
-
-Emergency gate bypass (`skip_staging_validation: true`) is strictly reserved for two scenarios: zero-day CVE vulnerabilities in container dependencies requiring immediate publication, or critical production regressions where waiting for the next nightly promotion or cluster provisioning would prolong user-facing downtime.
-
-### Enforced security invariants
-
-Even during an emergency bypass, the pipeline enforces three hard safety barriers:
-
-1. `scripts/release/verify_release_eligibility.sh` checks that all four container images (`k8s-operator`, `platform-agent`, `credential-proxy`, `replay-proxy`) exist in GHCR under `<TARGET_COMMIT>`. Releases of unbuilt commits hard-fail.
-2. `emergency_override_reason` must contain a non-whitespace justification; empty or whitespace-only reasons abort the workflow (`exit 1`).
-3. Target SemVer tags must not already exist on another commit; tag collisions abort the release.
-
-### Executing an emergency hotfix
-
-To publish an emergency release via the GitHub CLI. Always specify `target_commit` to pin the exact hotfix commit SHA; omitting `target_commit` causes the workflow to default to the tip of `main` (`HEAD`), releasing all intervening commits without prior GKE E2E validation:
-
-```bash
-# Emergency release from a specific commit SHA (version calculated automatically):
-gh workflow run release-publish.yml --repo gke-labs/kube-agents \
-  -f skip_staging_validation=true \
-  -f emergency_override_reason="CVE-2026-XXXX: Critical vulnerability in base container dependencies" \
-  -f target_commit="<HOTFIX_COMMIT_SHA>"
-
-# Emergency release from a specific commit SHA with explicit SemVer override:
-gh workflow run release-publish.yml --repo gke-labs/kube-agents \
-  -f skip_staging_validation=true \
-  -f emergency_override_reason="Critical regression fix for gateway admission deadlock" \
-  -f target_commit="<HOTFIX_COMMIT_SHA>" \
-  -f explicit_release_version="0.3.1"
-```
-
-### Post-release reconciliation
-
-After an emergency publication, complete these three reconciliation steps:
-
-1. Confirm the published release tag, container images in GHCR, and signed Helm OCI chart via `gh release view <VERSION>`.
-2. Manually trigger `.github/workflows/rc-release-pipeline.yml` against the hotfix commit (`-f commit_sha="<HOTFIX_COMMIT_SHA>"`, matching the SHA passed as `target_commit`) to run the full GKE E2E suite and ensure the fix validates cleanly on live infrastructure. Do not pass the tagged release commit: `tag_ga_release.sh` creates a stamped release commit on detached HEAD that lacks SHA-tagged container images in GHCR, causing the RC pipeline's image verification step to fail.
-3. Attach the GitHub Actions run URL and emergency justification to the corresponding tracking issue or incident report.
+Maintainers do, on the Friday schedule above or by hand. An emergency hotfix can skip the live-cluster validation gate — reserved for a zero-day vulnerability in a container dependency or a regression prolonging user-facing downtime — but never the build-integrity guarantees below: the images must already exist for the commit, a written justification is required, and a version tag that already points at another commit aborts the release. The dispatch commands, the bypass, and the post-release reconciliation are the maintainers' runbook in [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
 
 ## Clean promotion and artifact guarantees
 
 The release publish workflow enforces byte-for-byte fidelity with tested candidate binaries across seven layers:
 
-1. Container images are compiled only once on push to `main`. `scripts/release/promote_release_images.sh` retags existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR using `docker buildx imagetools create`.
-2. Promoted container images in GHCR are cryptographically signed using Keyless Cosign via GitHub Actions OIDC tokens (`scripts/release/sign_release_images.sh`).
-3. `scripts/release/publish_helm_chart.sh` packages `charts/kube-agents` at version `X.Y.Z` (matching `appVersion`), pushes the OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and signs the OCI manifest via Cosign.
-4. `scripts/release/tag_ga_release.sh` creates a single-parent release commit on detached HEAD, stamps `BAKED_RELEASE_VERSION="X.Y.Z"` into root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), updates Helm chart versions (`charts/kube-agents/Chart.yaml`), stamps Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`), and tags the stamped commit.
-5. `verify_local_source_ref` in `install.sh` and `upgrade.sh` verifies that unversioned source directories match `BAKED_RELEASE_VERSION` and that Git checkouts match the requested tag commit SHA, halting execution if local scripts diverge from container images.
-6. `scripts/release/package_release_bundle.sh` stages an offline release bundle directly from the tagged release commit using `git archive`, writes the `.release-bundle` provenance marker, and packages both `.tar.gz` and `.zip` archives.
-7. `scripts/release/generate_release_sbom.sh` uses Syft to generate Software Bill of Materials (SBOMs) in both SPDX 2.3 JSON and CycloneDX 1.5 JSON formats for filesystem assets and OCI container images, published alongside `checksums.txt` containing SHA256 checksums for all release assets.
+1. Container images are compiled only once on push to `main`. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
+2. Promoted container images in GHCR are cryptographically signed using Keyless Cosign via GitHub Actions OIDC tokens.
+3. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed via Cosign.
+4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`), and the tag is placed on that stamped commit.
+5. `install.sh` and `upgrade.sh` verify that unversioned source directories match `BAKED_RELEASE_VERSION` and that Git checkouts match the requested tag's commit, halting if local scripts diverge from the container images.
+6. The offline release bundle is staged directly from the tagged release commit with `git archive`, carries the `.release-bundle` provenance marker, and is packaged as both `.tar.gz` and `.zip`.
+7. Software Bills of Materials are generated with Syft — SPDX 2.3 JSON and CycloneDX 1.5 JSON for the filesystem bundle, SPDX 2.3 JSON for each container image — and published alongside `checksums.txt` with SHA256 checksums for every release asset.
 
 ## Offline distribution bundles and SBOMs
 
@@ -203,7 +110,7 @@ Each GA release attaches the following distribution artifacts to the GitHub Rele
 - `kube-agents-<VERSION>.tar.gz` and `kube-agents-<VERSION>.zip`: Complete, self-contained offline distribution bundles containing Terraform provisioning modules (`terraform/`), Kubernetes operator manifests (`k8s-operator/`), deployment configs (`deploy/`), Helm charts (`charts/`), utility scripts (`scripts/`), examples (`examples/`), installer scripts (`install.sh`, `upgrade.sh`, `uninstall.sh`), and the mirrored image catalog (`images.json`). Tracked example files (`terraform.tfvars.example`) are preserved, while sensitive tokens and local caches are sanitized.
 - `kube-agents-<VERSION>.tgz`: Packaged Helm chart with matching `version` and `appVersion`.
 - `kube-agents-<VERSION>.spdx.json` and `kube-agents-<VERSION>.cdx.json`: Software Bill of Materials (SBOM) for the filesystem bundle in SPDX 2.3 and CycloneDX 1.5 JSON formats.
-- `k8s-operator-<VERSION>.spdx.json`, `platform-agent-<VERSION>.spdx.json`, `credential-proxy-<VERSION>.spdx.json`, `replay-proxy-<VERSION>.spdx.json`: Container image SBOMs in SPDX 2.3 JSON format generated by Syft for each of the four release images.
+- `<image>-<VERSION>.spdx.json` for each of the seven release images (`k8s-operator`, `platform-agent`, `credential-proxy`, `agent-sandbox`, `replay-proxy`, `pubsub-platform`, `gke-stockout-investigator`): Container image SBOMs in SPDX 2.3 JSON format generated by Syft.
 - `checksums.txt`: SHA256 cryptographic checksums covering all distribution tarballs, zips, charts, and SBOM JSON files.
 - `checksums.txt.bundle`: Keyless Cosign signature bundle attesting to the provenance and authenticity of `checksums.txt` signed via GitHub Actions OIDC.
 

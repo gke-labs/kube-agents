@@ -1,5 +1,5 @@
 {
-  "version": "5aacb1bd321669b3",
+  "version": "c9d0e6f571c76efa",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -34,6 +34,16 @@
           "_INBOX.provision.>"
         ]
       }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-session",
+      "user": "session",
+      "account": "APP",
+      "grants": {
+        "publish": null,
+        "subscribe": null
+      },
+      "narrowing": "pod"
     }
   ]
 }

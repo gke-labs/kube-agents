@@ -9,13 +9,21 @@ metadata:
     app.kubernetes.io/part-of: kube-agents
     app.kubernetes.io/managed-by: kustomize
 spec:
+  # The operator labels gateway pods `<CR name>-gateway`, so this is the one object in the
+  # overlay that depends on the agent being named `platform-agent`: the NetworkPolicies beside
+  # it select `app.kubernetes.io/name`, which the operator stamps as the constant
+  # `platform-agent` whatever the CR is called. Rename the agent and this line needs the same
+  # rename; they do not. `app: platform-agent` -- what this was -- matches no pod on any install.
   selector:
-    app: platform-agent
+    app: platform-agent-gateway
   ports:
     - name: api
       protocol: TCP
       port: 8642
-      targetPort: 8642
+      # 8643, not 8642: the credential proxy's authenticated listener is what callers reach.
+      # Hermes on 8642 binds loopback inside the sandbox and validates a different key, so a
+      # Service targeting it answers nothing. reference/credential-isolation.md is canonical.
+      targetPort: 8643
     - name: dashboard
       protocol: TCP
       port: 9119

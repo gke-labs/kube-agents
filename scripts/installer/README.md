@@ -127,6 +127,23 @@ project decides what an install gets for saying nothing. Full precedence:
 install.defaults.env  →  an exported environment variable  →  install.env  →  a command-line flag
 ```
 
+That precedence has a sharp edge on an install that already exists. A key missing from
+`install.env` is not "leave it as it is": it resolves to the default, the default is written
+into `terraform.tfvars`, and `upgrade.sh --upgrade-mode=full` then plans the destruction of
+whatever the default does not mention. `ENABLE_GVISOR` absent destroys the gVisor node pool
+on a Standard cluster (`write_tfvars_from_state` falls back to `false` for that key, not to
+`install.defaults.env`'s `true`); `MEMORY` absent destroys the Hindsight API and its Postgres;
+`ENABLE_GKE_BACKUP_PLAN` absent destroys the backup plan; `ENABLE_STOCKOUT_INVESTIGATOR`
+absent destroys the stockout log sink, its alerts topic and subscription, and their IAM
+grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
+composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent removes the
+Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
+and drops the custom roles.
+The file `install.sh` writes at the end of a first install carries every one of these, so
+the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
+`./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
+configuration first and real drift second.
+
 Loading the input first is also what fixes non-interactive re-runs (#1060). Every
 `PARAM_X="${VAR:-}"` seed already knew how to inherit from the environment; giving it a
 file to inherit from makes inheritance the default path rather than something each flag

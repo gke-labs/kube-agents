@@ -2723,9 +2723,9 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
 
     def test_matches_the_repair_block_on_the_prerequisites_page(self):
         page = (
-            checker._ROOT / "docs" / "site" / "src" / "content" / "docs" / "deploy" / "ci-pool-projects.md"
+            checker._ROOT / "docs" / "ci-pool-projects.md"
         ).read_text()
-        documented = self._loop_roles(page, "deploy/ci-pool-projects.md")
+        documented = self._loop_roles(page, "docs/ci-pool-projects.md")
         self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
 
 

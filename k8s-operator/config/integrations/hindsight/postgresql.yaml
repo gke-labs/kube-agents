@@ -36,6 +36,23 @@ spec:
         app.kubernetes.io/name: hindsight
         app.kubernetes.io/component: postgresql
     spec:
+      # Kept in step with charts/kube-agents/templates/hindsight.yaml, which
+      # owns the rationale, and asserted by
+      # tests/test_workload_security_context.py. The entrypoint would start as
+      # root and drop to postgres (uid 999) itself; starting as 999 skips that
+      # path, and its chmod 700 on $PGDATA still runs on every start. Writable
+      # paths under the read-only root: the run emptyDir at /var/run/postgresql
+      # (socket and pid), the tmp emptyDir at /tmp, and PGDATA on the PVC. A
+      # write failure elsewhere gets one more emptyDir at that path, named
+      # here; never readOnlyRootFilesystem: false.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgresql
           # pgvector supplies the vector extension Hindsight's embeddings need.
@@ -46,6 +63,12 @@ spec:
           # install redirect it — and images.json is also where the constraints on
           # the tag are written, so read them there before changing it.
           image: ${HINDSIGHT_POSTGRES_IMAGE}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: postgresql
               containerPort: 5432
@@ -110,6 +133,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

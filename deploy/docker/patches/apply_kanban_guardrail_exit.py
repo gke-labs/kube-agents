@@ -1,6 +1,6 @@
 """Stop kanban workers leaking out of ``run_conversation`` without a board write.
 
-Two anchored edits, one per file:
+Five anchored edits across three files:
 
 1. ``agent/conversation_loop.py`` — the tool-guardrail halt branch breaks out of
    the agent loop from inside the tool-call branch, jumping over the kanban
@@ -8,16 +8,28 @@ Two anchored edits, one per file:
    branch. Nudge the worker to finish on the board before taking that break.
 2. ``agent/turn_finalizer.py`` — a backstop in ``finalize_turn``, the single
    funnel every ``break`` in the loop passes through, for the six sibling exits
-   that leak the same way and for the halt path when its nudges are spent.
+   that leak the same way and for the halt path when its nudges are spent. A
+   retries-exhausted exit whose last failure was a rate limit is blocked with
+   the provider's text instead of being charged a ``timed_out``.
+3. ``agent/conversation_loop.py`` again — the retry loop's error handler stashes
+   its last classified failure ``(reason, summary)`` on the agent, which is how
+   edit 2 tells a 429 exhaustion from the other retries-exhausted exits.
+4. ``cli.py`` — the kanban worker's exit-code block, where a ``failed`` result
+   with ``failure_reason="rate_limit"`` becomes exit 75: block the card there,
+   with the provider's text, before the process leaves. Only the fully-quiet
+   ``-Q`` path (goal-mode workers) reaches that block.
+5. ``cli.py`` again — ``chat()``, where the non-quiet ``chat -q`` path every
+   normal worker takes last holds the failed result. Same block; whichever of
+   the two runs second finds the card already moved.
 
-Both inserts mirror code that is already in the file: edit 1 copies the shape of
+The inserts mirror code that is already in the file: edit 1 copies the shape of
 the stop guard's local-import + ``try``/``except`` at
 ``conversation_loop.py``'s "Kanban worker terminal-tool stop guard", and edit 2
 copies the ``_record_task_failure`` call the iteration-budget block directly
-above it already makes. Neither is idempotent — a second run fails on the
-anchor count, which is the intent.
+above it already makes. None is idempotent — every insert sits next to its
+anchor rather than consuming it, so a marker check refuses the second run.
 
-See the module docstring in kanban_guardrail_exit.py for the incident.
+See the module docstring in kanban_guardrail_exit.py for the incidents.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ import patchlib
 
 LOOP_RELATIVE = "agent/conversation_loop.py"
 FINALIZER_RELATIVE = "agent/turn_finalizer.py"
+CLI_RELATIVE = "cli.py"
 
 # The two inner lines are each unique in the file on their own; anchoring on the
 # whole block additionally pins the insertion point to just after the assistant
@@ -140,19 +153,27 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt break and six 
             from hermes_cli import kanban_db as _kb
             from hermes_cli.kanban_guardrail_exit import (
                 record_missing_terminal_call as _kanban_record_missing_terminal,
+                worker_run_id as _kube_worker_run_id,
             )
 
+            # A retry loop that ended on a 429 blocks the card with the
+            # provider's text (block_task, kind=transient) instead of being
+            # charged a timed_out; the error handler's stash says which.
             if _kanban_record_missing_terminal(
                 task_id=_kanban_task_id,
                 turn_exit_reason=_turn_exit_reason,
                 connect=_kb.connect,
                 record_failure=_kb._record_task_failure,
+                block_task=_kb.block_task,
+                last_api_failure=getattr(agent, "_kube_last_api_failure", None),
+                run_id=_kube_worker_run_id(),
             ):
                 logger.info(
-                    "recorded missing-terminal-call failure for task %s "
-                    "(turn_exit_reason=%s)",
+                    "recorded missing-terminal-call outcome for task %s "
+                    "(turn_exit_reason=%s, last_api_failure=%s)",
                     _kanban_task_id,
                     _turn_exit_reason,
+                    getattr(agent, "_kube_last_api_failure", None),
                 )
         except Exception:
             logger.warning(
@@ -163,7 +184,104 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt break and six 
 
 '''
 
-# Both inserts sit next to their anchor rather than consuming it, so the anchor
+# The one call that classifies an API error in the retry loop's handler. The
+# stash has to land right after it: ``classified`` is the verdict, and the
+# terminal branch that would otherwise be the only place to record it is not
+# reached when the loop leaves through its ``while`` condition instead.
+CLASSIFY_ANCHOR = (
+    "                classified = classify_api_error(\n"
+    "                    api_error,\n"
+    '                    provider=getattr(agent, "provider", "") or "",\n'
+    '                    model=getattr(agent, "model", "") or "",\n'
+    "                    approx_tokens=approx_tokens,\n"
+    "                    context_length=_ctx_len,\n"
+    "                    num_messages=len(api_messages) if api_messages else 0,\n"
+    "                )\n"
+)
+
+CLASSIFY_INSERT = '''                # kube-agents patch: keep the last classified failure where
+                # finalize_turn can read it, so a retry loop that ends with no
+                # response after a 429 blocks the card with the provider's text
+                # instead of being charged a timed_out like the other
+                # retries-exhausted exits. See hermes_cli/kanban_guardrail_exit.py.
+                try:
+                    agent._kube_last_api_failure = (
+                        classified.reason.value,
+                        agent._summarize_api_error(api_error),
+                    )
+                except Exception:
+                    agent._kube_last_api_failure = None
+
+'''
+
+# The kanban worker's exit-code block: the three lines that turn a ``failed``
+# result into exit 1 and, for a rate limit, into KANBAN_RATE_LIMIT_EXIT_CODE.
+# The block goes ahead of them so the card is closed before the process is.
+CLI_ANCHOR = (
+    "                        _exit_code = 0\n"
+    '                        if isinstance(result, dict) and result.get("failed"):\n'
+    "                            _exit_code = 1\n"
+)
+
+CLI_INSERT = '''                        # kube-agents patch: a worker whose 429 retries are
+                        # exhausted returns failed=True with
+                        # failure_reason="rate_limit" and exits 75 below, and
+                        # its card is left running for the reaper to classify.
+                        # Block it here, with the provider's text as the reason,
+                        # so the board carries the cause whatever the reaper
+                        # makes of the exit. See hermes_cli/kanban_guardrail_exit.py.
+                        try:
+                            from hermes_cli.kanban_guardrail_exit import (
+                                block_rate_limited_worker as _kube_block_rate_limited,
+                            )
+
+                            if _kube_block_rate_limited(result):
+                                logger.info(
+                                    "blocked kanban task %s: provider rate limit "
+                                    "exhausted the API retries",
+                                    os.environ.get("HERMES_KANBAN_TASK", ""),
+                                )
+                        except Exception:
+                            logger.debug(
+                                "kanban rate-limit block failed", exc_info=True
+                            )
+'''
+
+# The one place ``chat()`` reads the failed result's ``failure_reason``: the
+# billing call-to-action under the response panel. A normal kanban worker
+# (``hermes ... chat -q``, no ``-Q``) ends its turn here and then returns
+# through ``_print_exit_summary`` with exit 0, so this is the last point at
+# which its 429 result is in hand.
+CHAT_ANCHOR = (
+    '                if result and result.get("failure_reason") == "billing":\n'
+)
+
+CHAT_INSERT = '''                # kube-agents patch: the non-quiet single-query path every
+                # normal kanban worker takes (`hermes ... chat -q`) never
+                # reaches the exit-code block, so this is where its failed
+                # result is last in hand. Block the card here on a 429
+                # exhaustion; the exit-code site covers the -Q path and finds
+                # nothing left to do when this ran first.
+                # See hermes_cli/kanban_guardrail_exit.py.
+                if result and os.environ.get("HERMES_KANBAN_TASK"):
+                    try:
+                        from hermes_cli.kanban_guardrail_exit import (
+                            block_rate_limited_worker as _kube_block_rate_limited_chat,
+                        )
+
+                        if _kube_block_rate_limited_chat(result):
+                            logger.info(
+                                "blocked kanban task %s: provider rate limit "
+                                "exhausted the API retries",
+                                os.environ.get("HERMES_KANBAN_TASK", ""),
+                            )
+                    except Exception:
+                        logger.debug(
+                            "kanban rate-limit block failed", exc_info=True
+                        )
+'''
+
+# Every insert sits next to its anchor rather than consuming it, so the anchor
 # count alone cannot tell a fresh file from an already-patched one. These
 # markers can: each appears only in the inserted text.
 EDITS = (
@@ -180,6 +298,27 @@ EDITS = (
         FINALIZER_ANCHOR,
         FINALIZER_INSERT + FINALIZER_ANCHOR,
         "_kanban_should_record_missing",
+    ),
+    (
+        LOOP_RELATIVE,
+        "last classified API failure stash",
+        CLASSIFY_ANCHOR,
+        CLASSIFY_ANCHOR + CLASSIFY_INSERT,
+        "_kube_last_api_failure",
+    ),
+    (
+        CLI_RELATIVE,
+        "rate-limited worker exit block",
+        CLI_ANCHOR,
+        CLI_INSERT + CLI_ANCHOR,
+        "_kube_block_rate_limited(",
+    ),
+    (
+        CLI_RELATIVE,
+        "rate-limited worker chat() block",
+        CHAT_ANCHOR,
+        CHAT_INSERT + CHAT_ANCHOR,
+        "_kube_block_rate_limited_chat",
     ),
 )
 

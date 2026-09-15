@@ -110,9 +110,8 @@ lists, rebase onto `upstream/main` and re-read those files before you write more
 have already read about them may no longer be true. Nothing listed, and being behind is a
 merge-conflict risk to settle later, not a reason to stop.
 
-This subsection is the canonical statement of the requirement; the site's
-[contributing guide](docs/site/src/content/docs/contributing.md) summarises it — change this
-first, then reconcile that to it.
+This subsection is the canonical statement of the requirement; [`CONTRIBUTING.md`](CONTRIBUTING.md)
+points here rather than restating it.
 
 ### Check whether someone is already doing it
 
@@ -277,10 +276,10 @@ Agents with a user in the loop follow this file.
   This bullet and [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md) are together
   the canonical statement — the requirement here, the mechanics there (why the clean context has
   to be a real one, what to do when your harness will not spawn one, and the disposition every
-  finding owes). The site's [contributing guide](docs/site/src/content/docs/contributing.md) and
-  the comment in [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise
-  the pair — change this bullet or `pre_pr_review.md`, whichever owns what you are changing, then
-  reconcile the summaries to it.
+  finding owes). The comment in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarises the pair —
+  change this bullet or `pre_pr_review.md`, whichever owns what you are changing, then reconcile
+  the summary to it.
 - **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
   (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
@@ -297,11 +296,10 @@ Agents with a user in the loop follow this file.
   [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md) are together the canonical
   statement — the requirement here, the mechanics there (what to name and observe, how to prove
   the mechanism rather than a coincidence, the screenshot and shared-install lease rules, and what
-  to write when the change cannot reach an installation at all). The site's
-  [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
-  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise the pair —
+  to write when the change cannot reach an installation at all). The comment in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarises the pair —
   change this bullet or `pre_pr_review.md`, whichever owns what you are changing, then reconcile
-  the summaries to it.
+  the summary to it.
 - **Keep these sections current, not chronological.** **Self-Review** and **Live validation** tell
   a reviewer at a glance what has been reviewed and exercised against the branch as it stands. A
   second pass — after review findings, after a rebase — folds into what is there rather than being
@@ -402,12 +400,12 @@ Three things to do with it:
   as though the reason were not there wastes both of you.
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
-start another review** — an active branch would otherwise pay for a re-read on every push. To get a
-fresh review of the current commit, comment `/review` on a line of its own (repository owners,
-members, and collaborators only) — that pass is the strict one, only what the bot is certain of,
-while `/review all` re-reads at the width of the automatic first review and includes findings it
-believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
-outranks both.
+start another review**, with one exception: a branch the bot last said does not merge gets one after
+the next push. For a fresh review of the current commit, comment `/review` on a line of its own
+(owners, members, and collaborators only): the strict pass, what the bot is certain of plus any
+high-severity finding just under that bar, marked as such. `/review all` re-reads at the first
+review's width and adds findings it believes are real without being sure. The `agent:ignore` label
+opts a pull request out and outranks both.
 
 **A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
 run alongside its review — `success` when it found nothing, `neutral` when it did — and
@@ -428,13 +426,13 @@ one-line "no findings" is a result rather than silence; a review that never arri
 bot, not a verdict, and the workflow doc says how long to wait and which trigger replaces the pass
 you lost.
 
-Then work the findings **with** the user rather than acting on them unilaterally: summarise each
-one, say whether you think it should be fixed, pushed back on, or deferred, and let the user decide
-before you change code. The bot is a reviewer, not an authority — but a finding you disagree with
-gets answered in its thread, not silently dropped. After pushing fixes, remember that the push alone
-does not re-trigger anything: ask the user whether to comment `/review` for another pass — `/review`
-to confirm the fixes against a strict read, `/review all` when the branch changed enough that it
-deserves a first-review-width look again.
+Then work the findings **with** the user rather than acting on them alone: summarise each one, say
+whether you think it should be fixed, pushed back on, or deferred, and let the user decide before
+you change code. The bot is a reviewer, not an authority — but a finding you disagree with gets
+answered in its thread, not dropped. After pushing fixes, remember that the push alone re-triggers
+nothing: ask the user whether to comment `/review` for another pass — `/review` to confirm the fixes
+against a strict read, `/review all` when the branch changed enough that it deserves a
+first-review-width look.
 
 Pushing fixes is also what makes the pull request body stale. Fixes that answer a finding, and any
 live test you re-ran to confirm them, belong in **Self-Review** and **Live validation** — folded

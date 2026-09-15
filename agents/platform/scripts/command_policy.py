@@ -70,7 +70,11 @@ _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # `diff` is absent deliberately. It is non-mutating, but it works by issuing a
 # server-side dry-run write, so it needs write RBAC to succeed at all. Allowing
 # it under a read-only grant would buy a confusing failure rather than a
-# capability.
+# capability. `apply --dry-run=server` is absent for the same reason, and for
+# one more: kubectl resolves a repeated flag last-wins, so admitting `apply`
+# on the strength of one `--dry-run=` token means parsing every apply flag's
+# arity correctly forever -- one boolean flag misread as value-taking and a
+# trailing `--dry-run=none` becomes a real write through the carve-out.
 #
 # `config view` is absent deliberately, and this one is a disclosure rather than
 # a mutation. `kubectl config view` prints `token: REDACTED`, but
@@ -409,6 +413,9 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--instance-selection-machine-types", "--size", "--types", "--zones",
         "--machine-type", "--provisioning-model", "--target-distribution-shape",
         "--instance-selection",
+        # capacity-obtainability's Flex-Start capacity probe adds a run duration.
+        # Without the arity entry the allowlisted command is unreachable.
+        "--max-run-duration",
         # `compute routers list` scopes by --regions (plural), the router
         # analogue of the --zones trap above.
         "--regions",

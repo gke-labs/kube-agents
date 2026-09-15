@@ -2757,7 +2757,10 @@ def test_artifacts_are_read_before_the_card_state_is_purged(
     KubeAgentsHarness().run("Find the root cause.")
 
     kinds = ["purge" if "rm -rf" in s else "read" for s in no_cluster_exec]
-    assert kinds == ["read", "purge"]
+    # Two reads: the artifact listing, then the card's worker log (for the
+    # worker_commands check); the purge comes after both.
+    assert kinds == ["read", "read", "purge"]
+    assert harness._LOGS_DIR in no_cluster_exec[1]
 
 
 def test_a_run_that_delegates_nothing_touches_no_pod(
@@ -2785,7 +2788,10 @@ def test_a_path_outside_the_cards_own_directory_is_not_read(
 
     def _shell(script: str, timeout: float) -> str:
         if "head -c" in script:
-            reads.append(script)
+            # The card's own worker log is read on purpose (worker_commands);
+            # everything else that reaches `head -c` came off the listing.
+            if harness._LOGS_DIR not in script:
+                reads.append(script)
             return "contents"
         return f"{harness._ATTACHMENTS_DIR}/t_other/leak.md\n/etc/passwd\n"
 

@@ -46,9 +46,11 @@ import (
 //   - **The callout's own RBAC**, exercised as the callout rather than as an
 //     admin: it does the TokenReview through its own ServiceAccount.
 //
-// A pod is a token delivery mechanism, not the thing under test. What is under
-// test is token to TokenReview to grants to a publish that is accepted or
-// refused, and none of that needs a kubelet.
+// A pod is a token delivery mechanism here, not the thing under test: what is
+// under test in this file is token to TokenReview to grants to a publish that
+// is accepted or refused, and none of that needs a kubelet. The pod itself
+// became load-bearing with claim narrowing, and is measured separately in
+// envtest_session_test.go.
 //
 // Skipped without KUBEBUILDER_ASSETS; `make test` in k8s-operator installs the
 // binaries, and the a2a workflow runs without them.
@@ -101,7 +103,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: envtestNamespace}}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("namespace: %v", err)
 	}
-	for _, sa := range []string{provisionSAName, secondSAName, strangerSAName, "a2a-callout"} {
+	for _, sa := range []string{provisionSAName, secondSAName, sessionSAName, strangerSAName, "a2a-callout"} {
 		if _, err := admin.CoreV1().ServiceAccounts(envtestNamespace).Create(ctx,
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: sa}}, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("serviceaccount %s: %v", sa, err)

@@ -101,7 +101,7 @@ spec:
             - name: AGENT_SANDBOX_IMAGE
               value: "ghcr.io/gke-labs/kube-agents/agent-sandbox:v0.1.0"
             - name: FLUENT_BIT_IMAGE
-              value: "docker.io/fluent/fluent-bit:5.1.1"
+              value: "docker.io/fluent/fluent-bit:5.1.2"
             - name: GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:
@@ -110,7 +110,7 @@ spec:
 """
 
 _EXPECTED = [
-    "docker.io/fluent/fluent-bit:5.1.1",
+    "docker.io/fluent/fluent-bit:5.1.2",
     "ghcr.io/gke-labs/kube-agents/agent-sandbox:v0.1.0",
     "ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0",
     "ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0",

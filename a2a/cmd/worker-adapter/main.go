@@ -4,8 +4,16 @@
 //
 // Env contract, matching what the gateway's spawner sets: TASK_ID, PROFILE,
 // NATS_URL are the spec trio; A2A_SESSION carries the session addressee for
-// gateway-spawned pods; NATS_USER/NATS_PASSWORD are the playground's static
-// bus credentials. Everything else is tuning with defaults.
+// gateway-spawned pods.
+//
+// Bus auth has two shapes. A2A_POD_NAME present means the pod carries a
+// projected ServiceAccount token and the adapter authenticates with it, as a
+// principal the callout mints for this pod alone. Absent, it falls back to
+// NATS_USER/NATS_PASSWORD, the static credential. No spawner sets that pair
+// for a worker any more; it is the by-hand path against a bus with no callout.
+// The spawner sets A2A_POD_NAME and the token volume together, which is what
+// makes the switch a property of the pod rather than a flag someone can
+// half-set.
 //
 // Exit codes: 0 completed (or nothing to do), 1 failed, 2 rejected,
 // 3 canceled, 143 evicted (SIGTERM).
@@ -79,6 +87,8 @@ func run() int {
 		NATSURL:        natsURL,
 		NATSUser:       os.Getenv("NATS_USER"),
 		NATSPassword:   os.Getenv("NATS_PASSWORD"),
+		BusTokenFile:   busTokenFile(),
+		PodName:        os.Getenv(lib.EnvPodName),
 		TaskID:         taskID,
 		Profile:        profile,
 		Session:        os.Getenv("A2A_SESSION"),
@@ -172,13 +182,40 @@ func harnessCommand() []string {
 	return argv
 }
 
+// busTokenFile is where the adapter reads its bus credential, or "" for the
+// static-credential path.
+//
+// Keyed on A2A_POD_NAME rather than on the file existing, because the two
+// arrive together from the same pod spec and a missing file with the env set
+// is a mount that failed — which should refuse at connect naming the path,
+// not fall back to a credential this pod was deliberately not given.
+func busTokenFile() string {
+	if os.Getenv(lib.EnvPodName) == "" {
+		return ""
+	}
+	if p := os.Getenv(lib.EnvBusTokenFile); p != "" {
+		return p
+	}
+	return lib.BusTokenPath
+}
+
 // busCredentialEnv names the pod env the harness must not inherit. The
 // adapter is the only thing in this pod with any business talking to the bus,
-// and the worker user is shared across every session pod: its password
-// publishes task events for any addressee and subscribes to a2a.tasks.>. The
-// harness is a model-directed subprocess with Read in its tool surface and
-// /proc/self/environ readable at its own UID, so anything left in its
-// environment is a prompt injection away from the artifact stream.
+// and the harness is a model-directed subprocess with Read in its tool
+// surface, so anything left in its environment is a prompt injection away
+// from the bus.
+//
+// This list is no longer the defence it was, and it is worth being exact
+// about why. It never worked: the adapter is PID 1 and the harness is its
+// child at the same UID, so /proc/1/environ hands the harness the adapter's
+// environment whatever this list says (gke-labs#1270). What closed that hole
+// is the credential changing shape — a projected token, bound to this pod,
+// good only for this session's own subjects. The list stays as tidiness, and
+// as defence in depth on the by-hand static-credential path above.
+//
+// NATS_PASSWORD and NATS_USER stay listed even though the spawner no longer
+// sets them. A name is removed from a list like this when it can never appear
+// again, not when the current renderer stopped emitting it.
 var busCredentialEnv = []string{"NATS_PASSWORD", "NATS_USER", "NATS_URL"}
 
 // harnessEnv is the subprocess environment: the pod env minus the bus

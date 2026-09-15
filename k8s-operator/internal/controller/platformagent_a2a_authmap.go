@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,6 +66,14 @@ const (
 	// map " reads as a truncated log line rather than as a thing that was
 	// looked for and not found.
 	a2aAuthMapVersionUnknown = "(unknown)"
+
+	// The shape of a ServiceAccount username as the Kubernetes TokenReview
+	// API returns it, and as the callout keys its map on:
+	// system:serviceaccount:<namespace>:<name>. Duplicated from the callout
+	// (a2a/authcallout/identitymap.go) because the modules cannot import
+	// each other; see validateA2AAuthMapIdentities.
+	a2aServiceAccountPrefix = "system:serviceaccount:"
+	a2aServiceAccountFields = 4
 )
 
 // a2aAuthMapName is the ConfigMap holding the identity map.
@@ -90,6 +99,12 @@ type a2aAuthMapIdentity struct {
 	User           string           `json:"user"`
 	Account        string           `json:"account"`
 	Grants         a2aAuthMapGrants `json:"grants"`
+
+	// Narrowing is omitted for the ordinary principals, so adding it changed
+	// no existing entry's bytes and therefore no existing version. Where it
+	// is set, the callout ignores Grants entirely and derives them from the
+	// claim it attested — and refuses the map if Grants is not empty.
+	Narrowing string `json:"narrowing,omitempty"`
 }
 
 type a2aAuthMapDocument struct {
@@ -117,7 +132,30 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent) (a2aAuthMapDocument, e
 				Publish:   id.publish,
 				Subscribe: id.subscribe,
 			},
+			Narrowing: id.narrowing,
 		})
+	}
+
+	// Refuse here what the callout would refuse there.
+	//
+	// Without this the operator is the one component that cannot tell it
+	// failed. The callout rejects a bad map at parse and KEEPS SERVING THE
+	// PREVIOUS ONE — deliberately, so a bad edit does not black out the bus —
+	// and its readiness probe stays green because it is still serving
+	// something. The Deployment therefore stays fully Ready, and
+	// setBusCredentialsReady, which reads replica counts, sets
+	// BusCredentialsReady=True with the version THIS reconcile rendered. The
+	// operator then reports it is serving a map the callout threw away, and
+	// keeps reporting it, for as long as the bad entry is in the CRD. Every
+	// other identity change queued behind it is silently dropped too, because
+	// the callout refuses the map whole.
+	//
+	// So the invariant is enforced at both ends. The callout's copy is the
+	// enforcement point and cannot be removed; this one exists so the failure
+	// surfaces as a reconcile error naming the offending entry, at the moment
+	// it is introduced, instead of as a condition that quietly lies.
+	if err := validateA2AAuthMapIdentities(identities); err != nil {
+		return a2aAuthMapDocument{}, err
 	}
 
 	// Digest the identities in render order. a2aIdentities() is a fixed
@@ -191,4 +229,72 @@ func encodeA2AJSON(v any, indent string) ([]byte, error) {
 	// value is used, so strip it here to keep the digest and the file body
 	// deciding their own trailing bytes.
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// validateA2AAuthMapIdentities is the operator's copy of the callout's
+// ParseIdentityMap checks (a2a/authcallout/identitymap.go, Identity.validate
+// and IdentityMap.validate). The two modules cannot import each other, so this
+// is a duplicate by necessity; TestTheRenderedMapSatisfiesTheCalloutsOwnRules
+// and the shared fixture are what keep it from drifting.
+//
+// Each rule is the callout's, with the callout's reason:
+//
+//   - An empty map would refuse every connection on a callout that reports
+//     itself perfectly healthy.
+//   - A narrowed entry MUST carry no grants. If it could carry both, one map
+//     edit -- or one code path that forgot to narrow -- would hand every
+//     session pod whatever was written there, which is the shared `worker`
+//     credential reborn. This is the rule most likely to be tripped by an
+//     ordinary-looking edit to sessionIdentity, and the reason this function
+//     exists.
+//   - An entry with no grants and no narrowing produces a client that connects
+//     and then hangs on its first reply, which is the hardest failure in this
+//     system to read from the outside.
+//   - The account becomes the audience of the user JWT the callout signs, so
+//     it decides which account a connection lands in. Only APP is mintable;
+//     SYS above all is not.
+//   - Duplicate ServiceAccounts make the grant set a function of map order,
+//     and duplicate users re-create the shared-credential problem and collide
+//     on each other's inbox prefix.
+func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
+	if len(identities) == 0 {
+		return fmt.Errorf("the rendered identity map serves no identities; the callout would refuse it and every bus connection with it")
+	}
+	seenSA := make(map[string]bool, len(identities))
+	seenUser := make(map[string]bool, len(identities))
+	for i, id := range identities {
+		if !strings.HasPrefix(id.ServiceAccount, a2aServiceAccountPrefix) ||
+			len(strings.Split(id.ServiceAccount, ":")) != a2aServiceAccountFields {
+			return fmt.Errorf("identity %d: serviceAccount %q is not %s<namespace>:<name>", i, id.ServiceAccount, a2aServiceAccountPrefix)
+		}
+		if id.User == "" {
+			return fmt.Errorf("identity %d: serviceAccount %q has no user", i, id.ServiceAccount)
+		}
+		if id.Account != a2aAccountApp {
+			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (only %q is mintable)", i, id.User, id.Account, a2aAccountApp)
+		}
+		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+		switch id.Narrowing {
+		case "":
+			if !hasGrants {
+				return fmt.Errorf("identity %d: user %q has no grants and does not narrow, so it would connect and then hang on its first reply", i, id.User)
+			}
+		case a2aNarrowingPod:
+			if hasGrants {
+				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
+					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			}
+		default:
+			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)
+		}
+		if seenSA[id.ServiceAccount] {
+			return fmt.Errorf("identity %d: duplicate serviceAccount %q", i, id.ServiceAccount)
+		}
+		if seenUser[id.User] {
+			return fmt.Errorf("identity %d: duplicate user %q", i, id.User)
+		}
+		seenSA[id.ServiceAccount] = true
+		seenUser[id.User] = true
+	}
+	return nil
 }

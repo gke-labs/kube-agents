@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"strconv"
 	"time"
 
@@ -35,7 +36,10 @@ const (
 	// above the adapter's task deadline. The adapter's contract is that its
 	// deadline sits BELOW the pod's, so the failure is the adapter's to
 	// report — the pod deadline only fires for a wedged adapter, handing it
-	// to Sweep instead of letting it hold its bus credential indefinitely.
+	// to Sweep instead of letting it run indefinitely. It bounds the process,
+	// not the credential: a bus connection the adapter already opened outlives
+	// the pod by up to the callout's grant TTL, for the reason set out on
+	// busTokenExpirationSeconds below.
 	// The grace covers what the adapter's clock does not: the image pull
 	// before the process starts (activeDeadlineSeconds runs from pod start)
 	// plus the adapter's own shutdown-and-publish window at its deadline.
@@ -47,6 +51,36 @@ const (
 	// primerCap bounds the rehydration-primer annotation, well under the
 	// object annotation budget.
 	primerCap = 8192
+	// busTokenExpirationSeconds is how long the kubelet mints the session's
+	// bus token for before rotating it. One hour is the API server's own
+	// floor — ask for less and it is silently rounded up — and the kubelet
+	// refreshes at 80% of it, so a session outliving its token is a case the
+	// client's re-read on reconnect already handles.
+	//
+	// The lifetime is not the revocation story, and neither the lifetime nor
+	// the pod binding revokes an established connection. Two clocks, and it
+	// matters which one a claim is about:
+	//
+	//   - A NEW connection. The pod binding governs this one. Once the pod
+	//     object is gone the API server stops authenticating the token, so a
+	//     stolen token buys nothing; measured at about ten seconds behind the
+	//     delete, the TokenReview success cache rather than the hour below.
+	//   - An ALREADY-OPEN connection. Nothing above touches it. The callout
+	//     is consulted once, at CONNECT, and the grants it issued live in a
+	//     signed user JWT the server holds for that connection; the server
+	//     closes it when that JWT expires and at no other time. That is the
+	//     callout's grant TTL — an hour less jitter, not this token's hour —
+	//     and authcallout's TestANarrowedMapDoesNotReachAnEstablishedConnection
+	//     pins the behaviour.
+	//
+	// So a harness that opens a second bus connection before its task ends
+	// keeps that connection's grants for up to the grant TTL after the pod is
+	// reaped. What bounds the damage is that those grants are this session's
+	// own subjects and nothing else, which is the change #1270 asked for; what
+	// does NOT bound it is the pod lifecycle. Shortening the exposure means
+	// shortening the callout's grant TTL, and that is the knob to reach for.
+	busTokenExpirationSeconds = 3600
+
 	// workerRunAsUser is the arbitrary non-root UID session pods run as.
 	workerRunAsUser = 1000
 	// Worker requests: the harness spike's per-session footprint, and what
@@ -77,9 +111,12 @@ const (
 // honest until integration.
 var sessionNameAnimals = []string{"otter", "badger", "heron", "lynx", "marten", "puffin", "stoat", "vole"}
 
-// spawner is the session-pod half of the lifecycle. It stays dark behind
-// SpawnSessions until W4's worker image exists; the gateway pod gets its
-// service-account token with that change, not before.
+// spawner is the session-pod half of the lifecycle, dark behind
+// SpawnSessions. What it creates is a pod holding a projected bus token: the
+// credential a session authenticates with is minted by the API server against
+// this pod object, so the pod IS the identity and Delete below is the closest
+// thing to revocation the fabric has (bounded by the callout's grant TTL for
+// a connection already open - see busTokenExpirationSeconds).
 type spawner interface {
 	// Spawn creates the session pod for a task and returns the pod name.
 	Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string) (string, error)
@@ -183,11 +220,17 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 // running the headless harness behind the worker adapter (W4's image).
 // Model auth, as shipped (spec-chatops-gateway.md, amended 8/31): the
 // worker talks to the install's own LiteLLM, in-namespace, with no per-pod
-// credential at all — no ServiceAccount, no Workload Identity. Its bus
-// credential is the static worker user, injected as env, until the
-// deployment spec's auth callout arms; direct Vertex via WI stays the
+// credential at all — no Workload Identity. Direct Vertex via WI stays the
 // target, and arming it is a policy change as well as an IAM one (the
 // session egress fence encodes the shipped path).
+//
+// Its BUS credential is per session, and that is the change gke-labs#1270
+// asked for. The pod runs as a no-RBAC ServiceAccount shared by every
+// session and gets a projected token bound to itself; the callout reads the
+// pod name the API server attests and mints grants for that session's
+// subjects and no others. Two sessions running side by side hold different
+// credentials, and neither holds the static `worker` user that could speak
+// for the whole task plane.
 func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string) (string, error) {
 	name := rec.BusSession
 	// The gateway Deployment owns its sessions: when it goes — cleanupA2A on
@@ -221,7 +264,16 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:                corev1.RestartPolicyNever,
+			RestartPolicy: corev1.RestartPolicyNever,
+			// The session ServiceAccount, which holds no RBAC at all: it
+			// exists so the kubelet can mint the bus token below against an
+			// identity the callout's map is keyed on.
+			ServiceAccountName: s.cfg.SessionServiceAccount,
+			// Still false, and now more load-bearing than before. Automount
+			// would add a SECOND token to the pod — default-audience, not
+			// pod-bound, and usable against the API server. The projected
+			// volume below is the only credential a session gets, and it is
+			// good for one thing.
 			AutomountServiceAccountToken: ptr.To(false),
 			// The adapter's deadline sits below this by construction (its
 			// contract, and podDeadlineGrace's comment): a healthy adapter
@@ -241,17 +293,22 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// The worker env contract (launch-card constants):
 					// TASK_ID/PROFILE/NATS_URL. PROFILE names the
 					// AgentProfile — the addressee is the bus session name,
-					// which is not a profile. Bus creds ride alongside; how
-					// W4 wants them delivered is its call to revise.
+					// which is not a profile. No bus credential rides here any
+					// more: it is the projected token mounted below, which is
+					// the whole of gke-labs#1270.
 					{Name: "TASK_ID", Value: taskID},
 					{Name: "PROFILE", Value: rec.Profile},
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},
-					{Name: "NATS_USER", Value: "worker"},
-					{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.NATSCredsSecret},
-						Key:                  "worker-password",
-					}}},
 					{Name: "A2A_SESSION", Value: rec.BusSession},
+					// The pod's own name, from the kubelet rather than from
+					// us. It equals A2A_SESSION by construction above, and
+					// the adapter checks that rather than trusting either:
+					// the callout derives this session's grants from the pod
+					// name the API server attested, so a client that pinned
+					// its inbox to the other name would hang on every reply.
+					{Name: lib.EnvPodName, ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+					}},
 					// The adapter's half of the deadline contract, rendered
 					// from the same config the pod deadline above is sized
 					// from — one number, two enforcement layers, no drift.
@@ -263,17 +320,50 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 						corev1.ResourceMemory: resource.MustParse(workerMemoryRequest),
 					},
 				},
-				VolumeMounts: []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch"}},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "scratch", MountPath: "/scratch"},
+					{Name: "bus-token", MountPath: path.Dir(lib.BusTokenPath), ReadOnly: true},
+				},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: ptr.To(false),
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
 			}},
-			Volumes: []corev1.Volume{{
-				Name:         "scratch",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-			}},
+			Volumes: []corev1.Volume{
+				{
+					Name:         "scratch",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				},
+				// The bus credential, as a pod-bound token rather than a
+				// shared password.
+				//
+				// Being a file is NOT what fixes gke-labs#1270, and reading
+				// it that way would be a false sense of safety: the harness
+				// runs at the same UID in the same pod, so it can read this
+				// file as easily as it could read /proc/1/environ. What
+				// changes is what the credential is worth. It is
+				// audience-bound, so it is not a cluster credential; it is
+				// bound by the kubelet to this pod, so the callout can tell
+				// this session from the one beside it on the same account;
+				// and the grants minted from it cover this session's own
+				// subjects and nothing else. A harness that reads it holds
+				// exactly the authority it already had by being the session.
+				// The shared `worker` password it replaces spoke for the
+				// whole task plane.
+				{
+					Name: "bus-token",
+					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+						Sources: []corev1.VolumeProjection{{
+							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+								Audience:          lib.BusTokenAudience,
+								ExpirationSeconds: ptr.To(int64(busTokenExpirationSeconds)),
+								Path:              path.Base(lib.BusTokenPath),
+							},
+						}},
+					}},
+				},
+			},
 		},
 	}
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})

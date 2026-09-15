@@ -1,5 +1,5 @@
 """post_health.py posts on a transition, stays silent otherwise, digests once a
-day, renders the five approved message shapes, and never lets the token, the
+day, renders the six approved message shapes, and never lets the token, the
 space or the webhook URL reach a log.
 
 Times in messages are Toronto time ("7:30 AM ET"); T0 is 12:00Z, which is
@@ -53,6 +53,7 @@ def health(state="GREEN", cause="", cases=(), since="2026-09-04T03:30:00+00:00",
         "advice": "",
         "recovering": False,
         "stale": False,
+        "slow": None,
         "metrics": {
             "window_hours": 24,
             "full_runs": 31,
@@ -71,6 +72,17 @@ def health(state="GREEN", cause="", cases=(), since="2026-09-04T03:30:00+00:00",
         },
         "generated_at": "2026-09-04T12:00:00+00:00",
     }
+
+
+def slow_note(since="2026-09-14T18:00:00+00:00", infra_reps=2):
+    """health.py's rule-7 note as it read at 18:00Z on 2026-09-14 (#1586)."""
+    return {"since": since, "runs": 5, "min_s": 9161, "median_s": 10984, "max_s": 12836, "baseline_days": 7, "baseline_runs": 264, "baseline_p50_s": 9085, "baseline_p90_s": 11919, "infra_reps": infra_reps}
+
+
+def slow(**note):
+    doc = health()
+    doc["slow"] = slow_note(**note)
+    return doc
 
 
 def outage(cases=TRIO, since="2026-09-08T09:00:00+00:00", prs=(1246, 1238, 608, 1150, 1226, 1275), issues=()):
@@ -278,6 +290,16 @@ class Shapes(RunHarness):
         self.assertEqual(self.opener.texts[0], "⚪ *Smoke gate: no fresh data since 1:55 AM ET* — the health bot can't see recent runs. Someone check the refresh job.")
         self.tick(health(), T0.replace(minute=15))
         self.assertEqual(self.opener.texts[1], "⚪ *Smoke gate: fresh data again* — refreshed 8:00 AM ET; the gate reads GREEN.")
+
+    def test_slow(self):
+        self.tick(slow(), T0)
+        self.assertEqual(
+            self.opener.texts[0],
+            "🐢 *Smoke gate: slow* — the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s."
+            " Not a break, and /retest won't make yours faster.\n"
+            f"{URL}#view=agent",
+        )
+        self.assertEqual(self.recorded()["state"], "GREEN", "the note moves no state")
 
     def test_times_are_toronto_and_dst_correct(self):
         clock = post_health.clock
@@ -533,6 +555,60 @@ class Digest(RunHarness):
         doc["metrics"]["wall_clock_p50_s"] = None
         self.tick(doc, self.at(DIGEST_UTC, 5))
         self.assertIn("typical run n/a", self.opener.texts[0])
+
+    def test_digest_carries_the_slow_line_while_it_lasts(self):
+        self.tick(slow(), T0.replace(hour=7))  # the note itself
+        self.tick(slow(), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
+            "🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s.",
+        )
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
+        self.assertEqual(len(self.opener.texts), 3, "clearing is not a message")
+        self.assertNotIn("Slow since", self.opener.texts[2])
+
+
+# --------------------------------------------------------------------------- #
+# The slow note
+# --------------------------------------------------------------------------- #
+
+
+class SlowNote(RunHarness):
+    def test_posted_once_per_episode_and_again_after_it_clears(self):
+        # Morning ticks, clear of the 12:40-13:20Z digest window.
+        self.tick(slow(), self.at(10))
+        self.tick(slow(), self.at(10, 15))
+        self.tick(slow(), self.at(10, 30))
+        self.assertEqual(len(self.opener.requests), 1, "one note for the episode")
+        self.assertTrue(self.recorded()["slow"])
+        self.tick(health(), self.at(10, 45))
+        self.assertEqual(len(self.opener.requests), 1, "clearing is not news")
+        self.assertFalse(self.recorded()["slow"])
+        self.tick(slow(infra_reps=0), self.at(15))
+        self.assertEqual(len(self.opener.requests), 2, "a new episode is")
+        self.assertIn("; no reps lost.", self.opener.texts[1])
+
+    def test_a_failed_note_is_retried_next_tick(self):
+        self.tick(health(), T0)
+        rc, err = self.tick(slow(), T0.replace(minute=15), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(rc, 1)
+        self.assertIn("failed to post: slow", err)
+        self.assertFalse(self.recorded()["slow"], "not told yet")
+        self.tick(slow(), T0.replace(minute=30))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertTrue(self.recorded()["slow"])
+
+    def test_a_note_that_vanishes_with_the_state_is_told_again_when_green_returns(self):
+        # health.py computes the note for GREEN ticks only, so an incident
+        # takes it away; the state file follows it down silently and the
+        # note after the recovery is a new episode, told once more.
+        self.tick(slow(), self.at(10))
+        self.tick(outage(), self.at(10, 15))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🐢", "🔴"])
+        self.assertEqual((self.recorded()["state"], self.recorded()["slow"]), ("OUTAGE", False))
+        self.tick(slow(), self.at(10, 30))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "🐢"])
+        self.assertTrue(self.recorded()["slow"])
 
 
 # --------------------------------------------------------------------------- #

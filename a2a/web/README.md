@@ -65,9 +65,9 @@ the same).
 
 `dev/nats.conf` mirrors the operator's rendered config on the points that
 matter: the ws listener and the `web` user's exact grant list. Mirrored from
-the operator's render in
-`k8s-operator/internal/controller/platformagent_a2a_manifests.go` —
-re-mirror if that render moves, and re-run the live suite against it.
+`webIdentity()` in
+`k8s-operator/internal/controller/platformagent_a2a_identities.go` —
+re-mirror if that list moves, and re-run the live suite against it.
 
 ```sh
 nats-server -c dev/nats.conf     # terminal 1

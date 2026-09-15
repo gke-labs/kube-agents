@@ -97,6 +97,9 @@ func TestBusCredentialsReadyTracksTheCallout(t *testing.T) {
 	}
 	dep.Status.Replicas = 2
 	dep.Status.ReadyReplicas = 2
+	// On the current pod template too: ready on the PREVIOUS one is a
+	// different state, and the condition distinguishes them.
+	dep.Status.UpdatedReplicas = 2
 	if err := cl.Status().Update(ctx, dep); err != nil {
 		t.Fatalf("update callout status: %v", err)
 	}
@@ -152,6 +155,7 @@ func TestTheBusConditionMessageNamesOnlyWhatItCanKnow(t *testing.T) {
 				ObservedGeneration: observed,
 				Replicas:           ready,
 				ReadyReplicas:      ready,
+				UpdatedReplicas:    ready,
 			},
 		}
 	}
@@ -468,6 +472,9 @@ func TestBusCredentialsReadyIsNotLeftStaleByARefusalAboveTheBusStep(t *testing.T
 	}
 	dep.Status.Replicas = 2
 	dep.Status.ReadyReplicas = 2
+	// On the current pod template too: ready on the PREVIOUS one is a
+	// different state, and the condition distinguishes them.
+	dep.Status.UpdatedReplicas = 2
 	if err := cl.Status().Update(ctx, dep); err != nil {
 		t.Fatalf("update callout status: %v", err)
 	}
@@ -543,6 +550,7 @@ func TestBusCredentialsReadyReadsTheDesiredReplicaCountNotThePodsThatExist(t *te
 		desired    int32
 		replicas   int32
 		ready      int32
+		updated    int32
 		generation int64
 		observed   int64
 		want       metav1.ConditionStatus
@@ -550,28 +558,50 @@ func TestBusCredentialsReadyReadsTheDesiredReplicaCountNotThePodsThatExist(t *te
 		why        string
 	}{
 		{
-			name: "a surging rollout is not an outage",
-			// maxSurge:1 over two ready pods. Nothing is degraded.
-			desired: 2, replicas: 3, ready: 2, generation: 4, observed: 4,
+			name: "a surging rollout, once the new pods are the ready ones",
+			// maxSurge:1, the last old pod draining. Nothing is degraded.
+			desired: 2, replicas: 3, ready: 2, updated: 2, generation: 4, observed: 4,
 			want: metav1.ConditionTrue, wantReason: busCredsReasonServing,
-			why: "every desired replica is ready; the third pod is the surge",
+			why: "every desired replica is ready ON THE CURRENT SPEC; the third pod is the surge",
+		},
+		{
+			name: "a surging rollout whose new pod is not up yet",
+			// Same three pods, one step earlier: the two ready ones are the
+			// OLD pods, still serving whatever map they last accepted.
+			desired: 2, replicas: 3, ready: 2, updated: 1, generation: 4, observed: 4,
+			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
+			why: "the ready replicas are on the previous spec, so they are not serving this map version",
+		},
+		{
+			name: "a roll wedged on a callout that cannot parse the map",
+			// Indistinguishable from the row above by Deployment status
+			// alone, and deliberately so: the operator cannot tell a slow
+			// roll from one that will never finish, and not-serving is the
+			// safe answer to both. This is the shape of the upgrade skew --
+			// old pods ready and serving a stale map, the new pod failing
+			// its readiness probe on `unknown field`, MaxUnavailable 0
+			// holding the old ones up indefinitely. Before UpdatedReplicas
+			// was part of the question this row read True.
+			desired: 2, replicas: 3, ready: 2, updated: 1, generation: 9, observed: 9,
+			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
+			why: "a stuck roll must not report the version its new pods are refusing",
 		},
 		{
 			name: "one pod up out of two wanted is not serving",
 			// The window a fresh install and a lost pod both pass through.
-			desired: 2, replicas: 1, ready: 1, generation: 4, observed: 4,
+			desired: 2, replicas: 1, ready: 1, updated: 1, generation: 4, observed: 4,
 			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
 			why: "half the callout is a single point of failure in front of every new connection",
 		},
 		{
 			name:    "steady state, both replicas ready",
-			desired: 2, replicas: 2, ready: 2, generation: 4, observed: 4,
+			desired: 2, replicas: 2, ready: 2, updated: 2, generation: 4, observed: 4,
 			want: metav1.ConditionTrue, wantReason: busCredsReasonServing,
 			why: "the state the condition exists to report",
 		},
 		{
 			name:    "no pod ready at all",
-			desired: 2, replicas: 2, ready: 0, generation: 4, observed: 4,
+			desired: 2, replicas: 2, ready: 0, updated: 2, generation: 4, observed: 4,
 			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
 			why: "the bus accepts no new client",
 		},
@@ -580,7 +610,7 @@ func TestBusCredentialsReadyReadsTheDesiredReplicaCountNotThePodsThatExist(t *te
 			// Status still describes the previous spec. Reporting Serving
 			// off it is the stale read this whole file was written against:
 			// the counts are true of a Deployment that no longer exists.
-			desired: 2, replicas: 2, ready: 2, generation: 5, observed: 4,
+			desired: 2, replicas: 2, ready: 2, updated: 2, generation: 5, observed: 4,
 			want: metav1.ConditionFalse, wantReason: busCredsReasonUnavailable,
 			why: "these counts belong to the spec before the roll",
 		},
@@ -608,6 +638,7 @@ func TestBusCredentialsReadyReadsTheDesiredReplicaCountNotThePodsThatExist(t *te
 					ObservedGeneration: tc.observed,
 					Replicas:           tc.replicas,
 					ReadyReplicas:      tc.ready,
+					UpdatedReplicas:    tc.updated,
 				},
 			}
 			if err := r.setBusCredentialsReady(context.Background(), cr, dep, false, "v-under-test"); err != nil {

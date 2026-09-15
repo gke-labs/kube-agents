@@ -46,13 +46,35 @@ func NewTokenValidator(client kubernetes.Interface, audience string) (*TokenVali
 	return &TokenValidator{client: client, audience: audience}, nil
 }
 
-// Validate returns the ServiceAccount username the token authenticates as, in
-// the system:serviceaccount:<namespace>:<name> form the identity map is keyed
-// by. Every failure is an error and no failure returns a username: a caller
-// that ignores the error must not be able to end up with a usable identity.
-func (v *TokenValidator) Validate(ctx context.Context, token string) (string, error) {
+// Attested is what the cluster vouched for about one presented token.
+//
+// The pod fields are the API server's, not the client's. When a token is minted
+// into a pod's projected volume it carries a bound-object reference, and the
+// ServiceAccount token authenticator writes that pod's name and UID onto the
+// review as Extra fields. A client cannot set them, and the API server stops
+// authenticating the token once the pod object is gone. They are what makes one
+// credential distinguishable from another when many pods share a
+// ServiceAccount, which is the whole of claim narrowing; see session.go.
+type Attested struct {
+	// ServiceAccount is the full TokenReview username, in the
+	// system:serviceaccount:<namespace>:<name> form the identity map is
+	// keyed by.
+	ServiceAccount string
+
+	// PodName and PodUID are empty when the token is bound to no pod — a
+	// legacy Secret-based token, or one minted with no boundObjectRef. An
+	// entry that narrows on the pod refuses such a token rather than
+	// falling back to whatever the map holds for it.
+	PodName string
+	PodUID  string
+}
+
+// Validate returns what the cluster vouches for about the token. Every failure
+// is an error and no failure returns an identity: a caller that ignores the
+// error must not be able to end up with a usable one.
+func (v *TokenValidator) Validate(ctx context.Context, token string) (Attested, error) {
 	if token == "" {
-		return "", fmt.Errorf("no token presented")
+		return Attested{}, fmt.Errorf("no token presented")
 	}
 
 	review, err := v.client.AuthenticationV1().TokenReviews().Create(ctx, &authnv1.TokenReview{
@@ -67,14 +89,14 @@ func (v *TokenValidator) Validate(ctx context.Context, token string) (string, er
 		// callout being unable to decide. Both end in a refused
 		// connection, but they are different operational events and the
 		// error text has to let 3 AM tell them apart.
-		return "", fmt.Errorf("TokenReview call failed: %w", err)
+		return Attested{}, fmt.Errorf("TokenReview call failed: %w", err)
 	}
 
 	if !review.Status.Authenticated {
 		if msg := review.Status.Error; msg != "" {
-			return "", fmt.Errorf("token not authenticated: %s", msg)
+			return Attested{}, fmt.Errorf("token not authenticated: %s", msg)
 		}
-		return "", fmt.Errorf("token not authenticated")
+		return Attested{}, fmt.Errorf("token not authenticated")
 	}
 
 	// Checked rather than assumed. The API server returns the intersection
@@ -84,7 +106,7 @@ func (v *TokenValidator) Validate(ctx context.Context, token string) (string, er
 	// the hole the audience binding exists to close, so it is asserted
 	// here rather than inferred from Authenticated alone.
 	if !slices.Contains(review.Status.Audiences, v.audience) {
-		return "", fmt.Errorf("token authenticated but not for audience %q (got %v)", v.audience, review.Status.Audiences)
+		return Attested{}, fmt.Errorf("token authenticated but not for audience %q (got %v)", v.audience, review.Status.Audiences)
 	}
 
 	username := review.Status.User.Username
@@ -93,8 +115,24 @@ func (v *TokenValidator) Validate(ctx context.Context, token string) (string, er
 		// A human or a node authenticating to the bus is not something
 		// this deployment has a meaning for, and mapping one would mean
 		// the map's keys were no longer all the same kind of thing.
-		return "", fmt.Errorf("authenticated as %q, which is not a ServiceAccount", username)
+		return Attested{}, fmt.Errorf("authenticated as %q, which is not a ServiceAccount", username)
 	}
 
-	return username, nil
+	return Attested{
+		ServiceAccount: username,
+		PodName:        extraOne(review.Status.User.Extra, extraPodName),
+		PodUID:         extraOne(review.Status.User.Extra, extraPodUID),
+	}, nil
+}
+
+// extraOne reads a single-valued Extra field, and treats anything else as
+// absent. Extra is multi-valued by type; the pod fields are written by the
+// authenticator as exactly one value each, so a field carrying two of them is
+// not something to pick a winner from.
+func extraOne(extra map[string]authnv1.ExtraValue, key string) string {
+	v, ok := extra[key]
+	if !ok || len(v) != 1 {
+		return ""
+	}
+	return v[0]
 }

@@ -182,8 +182,10 @@ telemetry:
   # The namespace the NetworkPolicy opens OTLP egress to. Derived from otlpEndpoint when
   # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it for an
   # in-cluster collector whose host does not (an IP literal, a bare Service name).
-  # Leave it empty for an external endpoint, which then has to be a public host on
-  # port 443 — the chart README's "Telemetry" section says why.
+  # Must be a namespace name (a lowercase RFC 1123 label); with litellm.otel=true
+  # anything else fails the render. Leave it empty for an external endpoint, which
+  # then has to be a public host on port 443 — the chart README's "Telemetry"
+  # section says why.
   collectorNamespace: ""
 
 litellm:
@@ -457,7 +459,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.1"
+    tag: "5.1.2"
 
 # The shell sandbox StatefulSet the operator renders beside every agent pod.
 # Same shape as fluentBit above and for the same reason: the chart never renders
@@ -482,7 +484,9 @@ platformAgent:
   # telemetry.collectorNamespace stamps
   # kubeagents.x-k8s.io/otlp-collector-namespace. When the chart stamps a key,
   # an entry here that disagrees with it fails the render; otherwise the entry
-  # passes through untouched.
+  # passes through, except that with litellm.otel=true an otlp-collector-namespace
+  # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
+  # render too.
   annotations: {}
   harness:
     # Required — the install fails fast when these are left empty.
@@ -630,7 +634,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.2"
+      tag: "1.36.4"
     # How long to wait for the finalizer to clear.
     timeout: 120s
     # Bounds the Job itself (image pull, scheduling) above that wait.

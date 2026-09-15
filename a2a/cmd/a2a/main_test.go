@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +59,39 @@ func TestTopicNameRejectsAmbiguity(t *testing.T) {
 		if _, err := topicName(pre, fs, "test"); err == nil {
 			t.Errorf("expected %v to be refused", args)
 		}
+	}
+}
+
+// run's argument handling decides the command before anything dials the bus,
+// so each case below is refused or answered without NATS_URL being set.
+func TestRunArgumentHandling(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantNil bool
+		want    string
+	}{
+		{"no args", nil, false, "no command"},
+		{"help", []string{"help"}, true, ""},
+		{"unknown command", []string{"bogus"}, false, "bogus"},
+		{"topics without subcommand", []string{"topics"}, false, "topics: no subcommand"},
+		{"topics unknown subcommand", []string{"topics", "bogus"}, false, "bogus"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := run(tc.args)
+			if tc.wantNil {
+				if err != nil {
+					t.Fatalf("run(%v) = %v, want nil", tc.args, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("run(%v) = nil, want an error naming %q", tc.args, tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("run(%v) error %q, want it to name %q", tc.args, err, tc.want)
+			}
+		})
 	}
 }

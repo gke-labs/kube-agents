@@ -80,18 +80,14 @@ _DEGRADED_PERSISTENCE_SECONDS = 120
 # has finished linking plugins.
 #
 # On the RC's single-replica gateway it does. platform-agent carries
-# ReadinessProbe: agentAPIProbe(15, 3) (platformagent_manifests.go:2927, added by #674), and
+# ReadinessProbe: agentAPIProbe(15, 3) (platformagent_manifests.go:3701, added by #674), and
 # deploy/shared/profile_plugins.py runs at entrypoint step 2.65 before `exec "$@"`, so a pod
 # that answers the probe has already linked them.
 #
-# Under leader election it does not. replicas > 1 sets ENABLE_LEADER_ELECTION (:1848-1853),
-# and agentAPIProbe then exits 0 on connection-refused (:2773) so a standby can report Ready
+# Under leader election it does not. replicas > 1 sets ENABLE_LEADER_ELECTION (:2178), and
+# agentAPIProbe then exits 0 on connection-refused (:3545) so a standby can report Ready
 # without serving — which means Ready no longer implies the entrypoint reached `exec`. The
 # window is for that configuration.
-#
-# Older comments here and at tests/e2e/operator/agentplugins_e2e_test.py:1212-1226 say the
-# platform-agent container has no readiness probe at all. That was true before #674 and is
-# not now; the sibling still needs correcting.
 _SKILL_MOUNT_TIMEOUT_SECONDS = 120
 
 # What _kubectl reports for a call that never answered. 124 is what `timeout(1)` uses, and
@@ -934,13 +930,24 @@ def test_stockout_scenario(
             pytest.skip(f"Scenario {scenario_slug} not included in STOCKOUT_SCENARIOS='{selected_scenarios}'")
 
     if "gpu" in scenario_slug.lower():
-        # Check if the cluster has any GPU accelerators or nodepools
-        res_gpu = subprocess.run(
-            ["kubectl", "get", "nodes", "-o", "jsonpath={.items[*].status.allocatable}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+        # Check if the cluster has any GPU accelerators or nodepools.
+        #
+        # Through _kubectl, and with the exit code read, because empty stdout is not
+        # evidence of absence: a non-zero exit produces one too, so testing the output
+        # alone reported "this cluster has no GPU nodes" whenever the API server refused
+        # the call, and skipped the GPU scenarios on it. A timeout was never that case --
+        # the raw call passed timeout=5 with no handler, so it raised TimeoutExpired and
+        # errored the test. It now goes through the wrapper's default budget with
+        # fail_on_timeout, which reports the same thing in the suite's own words.
+        res_gpu = _kubectl(
+            "get", "nodes", "-o", "jsonpath={.items[*].status.allocatable}",
+            fail_on_timeout=True,
         )
+        if res_gpu.returncode != 0:
+            pytest.fail(
+                f"Failed to reach cluster when checking for GPU nodes on '{gke_cluster_name}': "
+                f"{res_gpu.stderr.strip() or f'kubectl exited {res_gpu.returncode}'}"
+            )
         if "nvidia.com/gpu" not in res_gpu.stdout:
             pytest.skip(f"Cluster '{gke_cluster_name}' has no GPU nodes (nvidia.com/gpu); skipping GPU scenario '{scenario_slug}'.")
 

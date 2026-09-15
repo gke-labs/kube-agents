@@ -42,18 +42,18 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 		t.Fatal("the rendered map serves no identities")
 	}
 
-	// The principals the operator renders for the callout, as of A1. This is
-	// a deliberate duplicate of the operator's list: if the two disagree,
-	// one of them changed without the other being considered, and for this
+	// The principals the operator renders for the callout. This is a
+	// deliberate duplicate of the operator's list: if the two disagree, one
+	// of them changed without the other being considered, and for this
 	// particular list that means a workload either lost its grants or
 	// silently gained some.
 	//
-	// One name, because the provisioning Job is the only workload the
-	// operator renders an a2a-bus token for. The platform agent pod is not
-	// here: its only bus client is the Hermes bridge sidecar, which
-	// authenticates as static `worker`, so a principal keyed on the agent
-	// ServiceAccount would be a grant nothing can present.
-	want := map[string]bool{"provision": true}
+	// Two names: the provisioning Job, and now the session pod, which is the
+	// second workload the operator renders an a2a-bus token for. The platform
+	// agent pod is still not here: its only bus client is the Hermes bridge
+	// sidecar, which authenticates as static `worker`, so a principal keyed on
+	// the agent ServiceAccount would be a grant nothing can present.
+	want := map[string]bool{"provision": true, "session": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)
@@ -103,10 +103,56 @@ func TestEveryRenderedPrincipalIsUsable(t *testing.T) {
 			t.Errorf("%q resolves to %q", id.ServiceAccount, found.User)
 		}
 
+		if id.Narrowing != "" {
+			// A narrowed entry is usable by construction rather than by
+			// its rendered lists: it has none, and the callout builds
+			// them at mint time from the claim it attested. Asserting
+			// the inbox grant here would assert the opposite of what
+			// this entry must be. The derivation is what has to hold the
+			// property instead, so check it at its source.
+			if len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0 {
+				t.Errorf("%q narrows on %q but the operator rendered grants for it", id.User, id.Narrowing)
+			}
+			derived := sessionGrants("chat-otter-1a2b")
+			inbox := "_INBOX.chat-otter-1a2b.>"
+			if !contains(derived.Subscribe, inbox) || !contains(derived.Publish, inbox) {
+				t.Errorf("%q derives grants that do not cover its own inbox %s; every reply it waits on would time out", id.User, inbox)
+			}
+			continue
+		}
+
 		inbox := "_INBOX." + id.User + ".>"
 		if !contains(id.Grants.Subscribe, inbox) {
 			t.Errorf("%q cannot subscribe to %s; every reply it waits on would time out", id.User, inbox)
 		}
+	}
+}
+
+// The narrowed entry the operator renders must be one this build knows how to
+// narrow. A map from a newer operator naming a narrowing this callout does not
+// implement is refused wholesale at parse — correct, and it takes the whole bus
+// dark to new connections, so it is worth failing in CI instead.
+func TestEveryRenderedNarrowingIsOneThisCalloutImplements(t *testing.T) {
+	raw, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("reading the operator's rendered map: %v", err)
+	}
+	m, err := ParseIdentityMap(raw)
+	if err != nil {
+		t.Fatalf("ParseIdentityMap: %v", err)
+	}
+	found := false
+	for _, id := range m.Identities {
+		if id.Narrowing == "" {
+			continue
+		}
+		found = true
+		if id.Narrowing != NarrowingPod {
+			t.Errorf("%q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
+		}
+	}
+	if !found {
+		t.Error("the operator renders no narrowed principal; session pods would be back on a shared credential")
 	}
 }
 

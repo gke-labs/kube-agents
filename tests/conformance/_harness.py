@@ -260,6 +260,14 @@ SOURCES: dict[str, Source] = {
             "def redact_text(",
         ),
     ),
+    # The operator half of C1's identity check. The spawner names a session
+    # ServiceAccount; this file is where that account is built and where every
+    # RBAC binding the A2A stack renders lives, so it is what decides whether
+    # the name the spawner uses authorises anything.
+    "a2a_callout_rbac": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
+    ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
         "scripts/sync-upstream-skills.py",

@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -54,11 +55,11 @@ const (
 	envtestHarnessCluster  = "envtest-cluster"
 )
 
-// startEnvtest boots an API server carrying the operator's CRDs and hands back
-// a direct, uncached client to it. Skips — loudly, naming the variable — when
-// the binaries are not configured, because envtest cannot start without them
-// and a silent skip here would leave this file looking like coverage it is not.
-func startEnvtest(t *testing.T) (client.Client, *runtime.Scheme) {
+// startEnvtestConfig boots an API server carrying the operator's CRDs and hands
+// back its connection config. Skips — loudly, naming the variable — when the
+// binaries are not configured, because envtest cannot start without them and a
+// silent skip here would leave this file looking like coverage it is not.
+func startEnvtestConfig(t *testing.T) (*rest.Config, *runtime.Scheme) {
 	t.Helper()
 	if os.Getenv(envtestAssetsEnvVar) == "" {
 		t.Skipf("%s is unset: run through `make -C k8s-operator test`, or export it from `bin/setup-envtest use -p path`", envtestAssetsEnvVar)
@@ -76,7 +77,14 @@ func startEnvtest(t *testing.T) (client.Client, *runtime.Scheme) {
 			t.Errorf("envtest stop: %v", err)
 		}
 	})
-	scheme := setupScheme()
+	return cfg, setupScheme()
+}
+
+// startEnvtest is startEnvtestConfig plus a direct, uncached client to the
+// server it started.
+func startEnvtest(t *testing.T) (client.Client, *runtime.Scheme) {
+	t.Helper()
+	cfg, scheme := startEnvtestConfig(t)
 	cl, err := client.New(cfg, client.Options{Scheme: scheme})
 	if err != nil {
 		t.Fatalf("envtest client: %v", err)

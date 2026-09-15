@@ -11,35 +11,24 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-One set of images is deliberately absent: the four the A2A `next` stack pulls — NATS, nats-box,
-the gateway and the session worker. The inventory documents what a supported install pulls, and
-`spec.mode: next` is an unsupported dev toggle, so those pins live as defaults on the operator's
-`A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_GATEWAY_IMAGE` and `A2A_WORKER_IMAGE` env vars
-instead. They join this inventory when the stack graduates; until then a mirrored or air-gapped
-install that flips `next` has to override all four.
+One set of images is deliberately absent: the five the A2A `next` stack pulls — NATS, nats-box,
+the gateway, the session worker and the auth callout. The inventory documents what a supported
+install pulls, and `spec.mode: next` is an unsupported dev toggle, so those pins live as defaults
+on the operator's `A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_GATEWAY_IMAGE`,
+`A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` env vars instead. They join this inventory when the
+stack graduates; until then a mirrored or air-gapped install that flips `next` has to override
+all five — and missing the callout is the expensive one to miss, since nothing authenticates to
+the bus without it.
 
-The exemption covers those four published images, not the bases they are built from. `golang` and
+The exemption covers those five published images, not the bases they are built from. `golang` and
 `node` in the build-time table below carry `a2a/Dockerfile.gateway` and `a2a/Dockerfile.worker`
 alongside every other builder, because an override of `A2A_WORKER_IMAGE` names an image someone
 still has to build, and a build in a mirrored environment has to resolve its bases like any other.
 
-A bump starts here but rarely ends here. Several images keep a second copy that this file is the
-source for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
-`make images-check` is what holds them in step. It covers every image the chart renders, on a
-default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
-bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
-`k8s-operator/go.mod`; the fluent-bit fallback baked into the operator binary; the example
-manifests; and the kustomize integrations, which it requires to name a variable this file owns
-rather than a literal.
-
-Two copies it does not reach, where a stale pin passes every check. Hindsight's images sit behind
-`hindsight.enabled` — unset by default, and then following
-`platformAgent.harness.memory.provider`, which no render turns on — so their pins in
-`charts/kube-agents/values.yaml` are unguarded. And cert-manager's version is set again in
-`terraform/examples/full-install/variables.tf`, which no check reads.
-
-Bump the pin here, run `make images-check` and `make docs-generate`, then grep the tree for the old
-version before opening the pull request.
+Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
+`ARG` default, a compiled constant in the operator — and `make images-check` holds them in step with
+this file. How to bump a pin is in
+[`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md#local-validation-before-committing).
 
 <!-- BEGIN GENERATED: container-images -->
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->
@@ -66,8 +55,8 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
 | `litellm` | `ghcr.io/berriai/litellm` | `v1.98.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
-| `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.1` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
-| `k8s` | `docker.io/alpine/k8s` | `1.36.2` | — | The chart's pre-delete cleanup hook Job. |
+| `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.2` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
+| `k8s` | `docker.io/alpine/k8s` | `1.36.4` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
 | `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
@@ -96,16 +85,13 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Built and published via GitHub Actions workflows on push to `main` (tagged with commit SHA and `:latest`). Production SemVer release tags (`X.Y.Z`) are promoted from validated commit images by the release publishing workflow without rebuilding.
+Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, tagged with the commit SHA and `:latest`. The same push also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — every image except `k8s-operator` — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
 
 ### `platform-agent`
 
 The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus two profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint, and the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`.
 
-- **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
-- **Also to GAR**: [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
-
-There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. `kubectl`, `gcloud`, `gh`, `git`, `helm` and `yq` are all in the `agent-sandbox` image, which is where the agent's shell runs; so are the credential-proxy shims — symlinks to a client that forwards a command to the broker holding the credential — which used to stand in for the first four here. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service.
+There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. `kubectl`, `gcloud`, `gh`, `git`, `helm` and `yq` are all in the `agent-sandbox` image, which is where the agent's shell runs; so are the credential-proxy shims — symlinks to a client that forwards a command to the broker holding the credential. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service.
 
 What is installed is the debugging set the agent's own processes use: `curl`, `jq`, `dnsutils`, `iputils-ping`, `patch`, `wget`, `nano`, `vim`.
 
@@ -117,22 +103,15 @@ A late build step precompiles the Python tree — `/opt/hermes`, its venv, and t
 
 The Envoy-based credential broker runtime, which runs as the `envoy-credential-proxy` container in its own `<name>-credential-proxy` Deployment. The same image also runs the gateway pod's `agent-api-auth` sidecar, with `CREDENTIAL_PROXY_ROLE=api-proxy` starting neither Envoy nor the executor there. Built from the `credential-proxy` target of the same [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile), on the shared `agent-base` stage rather than on `platform`: it adds the real `gcloud`, `kubectl`, `gh` and `git` that the sandbox image deliberately lacks, the `envoy` binary and its config, and `/opt/defaults/scripts`, which is where `start-services.sh` finds `credential_proxy.py`. It carries none of what the `platform` stage adds on top — no kube-agents personas, skills, cron entries or profile templates — because nothing that runs from this image reads them.
 
-Building it from `agent-base` is also what keeps a one-file agent change cheap. While it was `FROM platform`, editing anything under `agents/*/scripts/` invalidated the `platform` layer that copies them and every layer after it in both images, so the sidecar paid for a full rebuild of a chain whose output it did not use.
-
-- **Published by**: [`docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml) and [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
+Building it from `agent-base` rather than `platform` is also what keeps a one-file agent change cheap. The stage copies `agents/*/scripts/` itself, so an edit there still rebuilds that copy and the layers after it — but no longer the whole `platform` chain, whose output the sidecar does not use.
 
 ### `replay-proxy`
 
 The inference replay proxy used for record/replay of model traffic. Built from [`examples/inference-replay/replay-proxy/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/examples/inference-replay/replay-proxy/Dockerfile).
 
-- **Published by**: [`docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml) and [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
-
 ### `k8s-operator`
 
-The Kubebuilder-generated operator manager image.
-
-- **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
-- **Build**: `k8s-operator/Dockerfile` (`make docker-build IMG=...`)
+The Kubebuilder-generated operator manager image. Built from `k8s-operator/Dockerfile` (`make docker-build IMG=...`).
 
 ## Container entrypoint
 
@@ -150,7 +129,7 @@ An unrecognised value falls back to `auto` and logs a warning rather than guessi
 
 The operator sets the variable explicitly on every container it builds — `owner` on the gateway, `skip` on the dashboard — so `auto` never runs under a `PlatformAgent`. Auto-detection exists for deployments with no operator to ask: Compose, plain manifests, `docker run`. Set it by hand in those if the owning container's own argv does not contain `gateway`. Above one replica the operator's gateway is itself such a case: it runs `leader_elect.py`, which starts `hermes gateway run` as a child process, so the word never appears in the container's own arguments.
 
-Every case in that table is verified against the built image on each pull request, by the `entrypoint-gate-test` Dockerfile stage (`deploy/shared/entrypoint_gate_check.sh`). It runs the real entrypoint once per case against a scratch `$PLATFORM_AGENT_HOME` and checks the decision the gate announces against what it then writes to disk. That pairing is the point: the host-side unit tests in `tests/test_docker_entrypoint.py` cover the same table, but on a host every step below the gate is guarded on `/opt/defaults` or `/opt/hermes` and does nothing, so they can only prove which branch was taken. The script is not shipped in the runtime image, but it is safe to pipe into a running pod when diagnosing one:
+A Dockerfile stage built on every pull request, `entrypoint-gate-test`, verifies every case in that table against the real entrypoint (`deploy/shared/entrypoint_gate_check.sh`): it runs the entrypoint once per case against a scratch `$PLATFORM_AGENT_HOME` and checks the decision the gate announces against what it then writes to disk. A build that targets a runtime image does not run it. The script is not shipped in the runtime image, but it is safe to pipe into a running pod when diagnosing one:
 
 ```bash
 kubectl exec -i deploy/platform-agent-gateway -c platform-agent -- \
@@ -158,8 +137,6 @@ kubectl exec -i deploy/platform-agent-gateway -c platform-agent -- \
 ```
 
 Confining it takes more than a scratch `$PLATFORM_AGENT_HOME`, because two of the setup's effects are not derived from it. Step 4 points `$HOME/.hermes/plugins/hermes_otel/config.yaml` at the config it generates — `hermes-otel` resolves its config below `~/.hermes` whatever `HERMES_HOME` says — and `$HOME` in the gateway is `/opt/data/home`, on the data PVC. Step 5 starts the Session KV server on port 8699, which is pod-wide and scoped by nothing. So each case also gets a scratch `$HOME`, and the server it spawns is killed by its scratch path as the case returns. The run ends by asserting both: that the pod's real compat symlink is byte-for-byte what it was, and that no process from the run is still alive.
-
-CI then runs the same script a second time, as a container under `docker run --read-only --tmpfs /tmp`. The build stage above cannot cover that: a build layer is writable by definition, so it proves the entrypoint works and not that it works without writing to the root filesystem. The operator sets `readOnlyRootFilesystem` on every container it builds, which turns any such write into `EROFS`, and the entrypoint's first step runs a script this repository does not own — so the second run is what keeps an upstream change to `stage2-hook.sh` from reaching a cluster as a pod that will not start.
 
 One thing the entrypoint does can stop the container rather than warn. Before the setup copies anything to the data volume — in the container that owns the shared state, since a `skip` container has already `exec`ed the command by this point — it checks each skill tree baked into the image (`/opt/hermes/skills`, `/opt/platform-template/skills`, `/opt/cluster-template/skills`) against the SHA-256 manifest the build wrote into it, and exits non-zero if a tree no longer matches — naming the offending file on stderr, with both digests when its content is what changed. Almost every other step here degrades with a `WARN` — the exception is step 1, which runs upstream's `stage2-hook.sh` and inherits `set -e` from the script. This one is a deliberate exception, for the reason [Security &amp; IAM](/kube-agents/reference/security-and-iam/#change-control--safety) gives. A pod crash-looping with `does not match the manifest baked beside it at build time` is reporting a corrupted or altered image, not a misconfiguration: reinstate the image the manifest belongs to rather than looking for a setting to change.
 
@@ -183,7 +160,7 @@ ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
 FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 ```
 
-The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-platform` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
+The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-agents` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
 
@@ -283,7 +260,7 @@ unreachable. Each takes a full reference rather than a shared prefix, because th
 layout does not preserve the original paths:
 
 ```bash
-make docker-build-platform \
+make docker-build-agents \
   HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent \
   GOLANG_IMAGE=registry.example.com/mirror/golang \
   ENVOY_IMAGE=registry.example.com/mirror/envoy
@@ -341,8 +318,4 @@ yourself from the mirror and set `enable_cert_manager = false`.
 
 ## Local builds
 
-For development iteration, `make dev-rebuild-agent` (from `k8s-operator/`) is the fast path — it builds and pushes to a dev Artifact Registry repo and restarts the Deployment. See [Development](/kube-agents/operator/development/#fast-agent-iteration-dev-only).
-
-## CI
-
-Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens on push to `main` (tagged with commit SHA and `:latest`). Production SemVer tags (`X.Y.Z`) are promoted from validated commit images via the release publishing workflow ([`.github/workflows/release-publish.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/release-publish.yml)) without rebuilding.
+`make docker-build` at the repository root builds the agent, credential-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy` and `make docker-build-sandbox` build one. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.

@@ -341,15 +341,15 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 	cfg := &Config{
 		// The spawned pods dial the bus in-cluster; only this process rides
 		// the port-forward.
-		NATSURL:          envOr("A2A_LIVE_INCLUSTER_NATS_URL", "nats://platform-agent-a2a-nats."+ns+".svc:4222"),
-		PrincipalMapPath: mapFile,
-		DefaultAddressee: "platform",
-		MaxSessions:      2,
-		IdleTTL:          30 * time.Minute,
-		AttributionSalt:  []byte("live-test-salt"),
-		Namespace:        ns,
-		WorkerImage:      envOr("A2A_LIVE_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
-		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
+		NATSURL:               envOr("A2A_LIVE_INCLUSTER_NATS_URL", "nats://platform-agent-a2a-nats."+ns+".svc:4222"),
+		PrincipalMapPath:      mapFile,
+		DefaultAddressee:      "platform",
+		MaxSessions:           2,
+		IdleTTL:               30 * time.Minute,
+		AttributionSalt:       []byte("live-test-salt"),
+		Namespace:             ns,
+		WorkerImage:           envOr("A2A_LIVE_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
+		SessionServiceAccount: envOr("A2A_SESSION_SERVICE_ACCOUNT", "agent-a2a-session"),
 	}
 	adapter := newFakeAdapter()
 	sp := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
@@ -586,14 +586,14 @@ func TestLiveDetachedDelegateSupervisorTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &Config{
-		NATSURL:          envOr("A2A_LIVE_INCLUSTER_NATS_URL", "nats://platform-agent-a2a-nats."+ns+".svc:4222"),
-		PrincipalMapPath: mapFile,
-		DefaultAddressee: "platform",
-		IdleTTL:          30 * time.Minute,
-		AttributionSalt:  []byte("live-test-salt"),
-		Namespace:        ns,
-		WorkerImage:      envOr("A2A_LIVE_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
-		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
+		NATSURL:               envOr("A2A_LIVE_INCLUSTER_NATS_URL", "nats://platform-agent-a2a-nats."+ns+".svc:4222"),
+		PrincipalMapPath:      mapFile,
+		DefaultAddressee:      "platform",
+		IdleTTL:               30 * time.Minute,
+		AttributionSalt:       []byte("live-test-salt"),
+		Namespace:             ns,
+		WorkerImage:           envOr("A2A_LIVE_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
+		SessionServiceAccount: envOr("A2A_SESSION_SERVICE_ACCOUNT", "agent-a2a-session"),
 	}
 	// With A2A_LIVE_OWNER_DEPLOYMENT set (the deployed gateway's own
 	// Deployment), the spawner resolves the real owner and every pod this

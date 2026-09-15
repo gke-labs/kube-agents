@@ -765,3 +765,119 @@ exec sleep 60
 		t.Fatalf("terminal %+v", last)
 	}
 }
+
+// TestSteerSurvivesTheInConsumerBeingDropped is the run the review round of
+// 2026-09-14 asked for and could not perform: kill the steer/cancel consumer
+// mid-task, then steer.
+//
+// It is a regression test for a defect this branch introduced. The adapter
+// used ordered consumers, which nats.go resets by itself on
+// ErrConsumerDeleted, ErrNoHeartbeat and reconnect. Per-session credentials
+// made named consumers necessary -- an ordered consumer's <prefix>_<serial>
+// name cannot be pinned by an exact MSG.NEXT grant, see sessionConsumer -- and
+// named consumers get the opposite treatment from the library: pull.go
+// classifies ErrConsumerDeleted as terminal, and with no ConsumeErrHandler it
+// stops the subscription and returns without logging anything. The task then
+// runs to its deadline with every steer and every cancel unread on a stream
+// that is holding them perfectly well.
+//
+// Deleting the consumer is how the test provokes it, because it is the exact
+// signal the two real causes produce and it is deterministic: these consumers
+// are MemoryStorage with Replicas 1, so a nats-server restart destroys them,
+// and InactiveThreshold is five seconds, so any longer disconnect reaps them.
+//
+// The assertion is that the steer still reaches the harness. Before the
+// supervisor in consumeIn, the stub read nothing after the prompt and the task
+// completed with turns=1 -- green-looking, and wrong.
+func TestSteerSurvivesTheInConsumerBeingDropped(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-lynx-e5f6", "task-steer-recreate"
+	origin := submit(t, c, session, taskID, "opening prompt")
+
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"stub-recreate"}'
+read first || exit 1
+count=1
+all="$first"
+while read -t 5 line; do
+  count=$((count+1))
+  all="$all $line"
+done
+steers=$(printf '%s' "$all" | grep -o STEERWORD | wc -l | tr -d ' ')
+i=1
+while [ "$i" -lt "$count" ]; do
+  echo '{"type":"result","subtype":"success","result":"interim turn"}'
+  i=$((i+1))
+done
+printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "$count" "$steers"
+`)
+	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
+	waitState(t, c, session, taskID, lib.StateWorking)
+
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// The consumer has to exist before deleting it means anything; without
+	// this the test could race the adapter's own creation and pass for the
+	// wrong reason.
+	name := lib.SessionConsumerName(session, lib.SessionConsumerIn)
+	var seen bool
+	for range 100 {
+		if _, err := js.Consumer(ctx, lib.TasksStream, name); err == nil {
+			seen = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !seen {
+		t.Fatalf("in consumer %q never appeared; the test cannot drop what was never created", name)
+	}
+	if err := js.DeleteConsumer(ctx, lib.TasksStream, name); err != nil {
+		t.Fatalf("delete in consumer: %v", err)
+	}
+
+	// Publish the steer only after the delete has landed, so it is genuinely
+	// addressed to a consumer that does not exist -- the message sits in
+	// TASKS with nothing reading it until the supervisor rebuilds.
+	steerPayload, err := json.Marshal(lib.Message{
+		Role: "user", Parts: []lib.Part{{Kind: "text", Text: "STEERWORD make it about NATS"}},
+		MessageID: "msg-steer-recreate", TaskID: taskID, ContextID: origin.ContextID,
+	})
+	if err != nil {
+		t.Fatalf("steer payload: %v", err)
+	}
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty, steerPayload,
+		lib.WithTo(lib.Party{Session: session}))
+	if err != nil {
+		t.Fatalf("steer envelope: %v", err)
+	}
+	raw, err := json.Marshal(steer)
+	if err != nil {
+		t.Fatalf("steer marshal: %v", err)
+	}
+	if _, err := js.Publish(ctx, lib.TaskInSubject(session, taskID), raw,
+		jetstream.WithMsgID(steer.EnvelopeID)); err != nil {
+		t.Fatalf("steer publish: %v", err)
+	}
+
+	out := waitOutcome(t, done, 90*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	task := foldTask(t, c, session, taskID)
+	if got := artifactText(task, lib.ArtifactResult); got != "turns=2 steers=1" {
+		t.Fatalf("the steer did not survive the consumer being dropped: result artifact %q, want %q.\n"+
+			"turns=1 means the recreated consumer never delivered it, which is the silent-death defect.",
+			got, "turns=2 steers=1")
+	}
+}

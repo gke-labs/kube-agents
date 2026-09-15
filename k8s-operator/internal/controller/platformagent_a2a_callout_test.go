@@ -456,3 +456,110 @@ func TestTheCalloutClusterRoleBindingNameIsNamespaceQualified(t *testing.T) {
 		}
 	}
 }
+
+// The session identity, end to end through the reconciler.
+//
+// Three separate renders have to agree or every spawned session is refused at
+// connect: the ServiceAccount object, the gateway env that names it to the
+// spawner, and the callout's map keyed on it. They are produced in three files,
+// so agreement is asserted here rather than assumed.
+func TestTheSessionIdentityIsRenderedUnderNextAndRemovedUnderToday(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+
+	const saName = "test-agent-a2a-session"
+	sa := &corev1.ServiceAccount{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: saName, Namespace: "test-ns"}, sa); err != nil {
+		t.Fatalf("session ServiceAccount not rendered under next: %v", err)
+	}
+
+	// No RBAC, and this is a security property rather than tidiness: the
+	// workload running as this identity is the one executing model output,
+	// and its token exists to be presented to NATS. A Role reaching it would
+	// hand that workload the API server.
+	bindings := &rbacv1.RoleBindingList{}
+	if err := cl.List(ctx, bindings, client.InNamespace("test-ns")); err != nil {
+		t.Fatalf("listing RoleBindings: %v", err)
+	}
+	for _, rb := range bindings.Items {
+		for _, s := range rb.Subjects {
+			if s.Kind == "ServiceAccount" && s.Name == saName {
+				t.Errorf("RoleBinding %q binds the session ServiceAccount to %q; a session pod holds no API-server rights",
+					rb.Name, rb.RoleRef.Name)
+			}
+		}
+	}
+	crbs := &rbacv1.ClusterRoleBindingList{}
+	if err := cl.List(ctx, crbs); err != nil {
+		t.Fatalf("listing ClusterRoleBindings: %v", err)
+	}
+	for _, crb := range crbs.Items {
+		for _, s := range crb.Subjects {
+			if s.Kind == "ServiceAccount" && s.Name == saName {
+				t.Errorf("ClusterRoleBinding %q binds the session ServiceAccount to %q", crb.Name, crb.RoleRef.Name)
+			}
+		}
+	}
+
+	// The gateway is told the name, rather than baking a default that is
+	// wrong on every renamed CR.
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-gateway", Namespace: "test-ns"}, dep); err != nil {
+		t.Fatalf("gateway Deployment: %v", err)
+	}
+	var got string
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "A2A_SESSION_SERVICE_ACCOUNT" {
+			got = e.Value
+		}
+	}
+	if got != saName {
+		t.Errorf("A2A_SESSION_SERVICE_ACCOUNT = %q, want %q; the spawner would name a ServiceAccount that does not exist", got, saName)
+	}
+
+	// And the callout's map is keyed on exactly that ServiceAccount.
+	authMap := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap", Namespace: "test-ns"}, authMap); err != nil {
+		t.Fatalf("identity map: %v", err)
+	}
+	wantKey := `"serviceAccount": "system:serviceaccount:test-ns:` + saName + `"`
+	if !strings.Contains(authMap.Data["identities.json"], wantKey) {
+		t.Errorf("the identity map is not keyed on the session ServiceAccount; looked for %s", wantKey)
+	}
+	if !strings.Contains(authMap.Data["identities.json"], `"narrowing": "pod"`) {
+		t.Error("the rendered map carries no pod narrowing; the session entry would be an entry with no grants and no way to get any")
+	}
+
+	// Flip to today: the identity goes with everything else. Leaving it
+	// behind would leave a mintable bus identity in a namespace with no bus.
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after flip: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: saName, Namespace: "test-ns"}, &corev1.ServiceAccount{}); !errors.IsNotFound(err) {
+		t.Errorf("the session ServiceAccount survived the flip to today (err=%v)", err)
+	}
+}

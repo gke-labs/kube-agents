@@ -1574,8 +1574,8 @@ agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_ser
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
-`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py` and
-`cluster_preflight.sh` — the entry points an agent is told to run, plus the transitive
+`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`
+and `stall_report.py` — the entry points an agent is told to run, plus the transitive
 closure of what they import.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An
@@ -1956,14 +1956,16 @@ None of them blocks the work above. All three are recorded here so the dead ends
 are not re-walked.
 
 **Reaching `kanban.db`.** Two scripts touch the board.
-[`kanban_board_health.py`](../../agents/chat/scripts/kanban_board_health.py) never
-opens the file — it shells out to `hermes kanban diagnostics --json`, and says at line
-29 that opening `/opt/data/kanban.db` from an agent shell is what the persona forbids.
+[`kanban_board_health.py`](../../agents/platform/scripts/kanban_board_health.py) opens
+it read-only (`mode=ro`) for its invariant and blocked-card queries and shells out to
+`hermes kanban diagnostics --json` for the rule engine; its docstring records that a
+read-write open of `/opt/data/kanban.db` from an agent shell is what the persona forbids.
 [`kanban_notify_propagate.py`](../../agents/platform/scripts/kanban_notify_propagate.py)
-does open it, `sqlite3.connect` at line 63 — and `SOUL.md:61` tells the agent to run it
-from the shell. That is coherent today, where `SOUL.md:66`'s ban on touching the board
-is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not survive
-the move.
+does open it, `sqlite3.connect` at line 63 — and the Platform Agent's `SOUL.md` (§0, the
+sub-card paragraph under _Show your progress_; §6's fan-out bullet repeats it) tells the
+agent to run it from the shell. That is coherent today, where §0's ban on touching the
+board is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not
+survive the move.
 
 Mounting `kanban.db` into the sandbox is ruled out. It would hand the shell exactly the
 write path that the rule exists to close, after a worker used that path on 2026-08-07

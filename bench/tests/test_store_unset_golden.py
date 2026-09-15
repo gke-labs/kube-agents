@@ -33,8 +33,9 @@ regeneration -- after which the golden would pin whatever HEAD does and the
 
 Two things are normalised, and nothing else: the absolute fixture path inside
 ``run_dir`` (the checkout moves; the record does not), and the additive
-``admission_source`` key, which the store-unset presubmit never displays and
-which did not exist when the golden was captured.
+per-case keys -- ``admission_source``, ``admission_mode``, ``record_verdict``
+-- which the store-unset presubmit never displays and which did not exist
+when the golden was captured.
 
 Regenerate with ``BENCH_UPDATE_GOLDEN=1 uv run pytest tests/test_store_unset_golden.py``
 and read the diff: it IS the behaviour change you are about to ship.
@@ -57,7 +58,7 @@ SHIPPED_VERSIONS = {"fleet": 1, "verifiers": 1}
 JUDGE = "gemini-3.1-pro-preview"
 PATH_TOKEN = "<FIXTURE_RUNS>"
 #: Additive since the golden was captured; popped before comparing.
-ADDITIVE_KEYS = ("admission_source",)
+ADDITIVE_KEYS = ("admission_source", "admission_mode", "record_verdict")
 UPDATE_ENV = "BENCH_UPDATE_GOLDEN"
 
 
@@ -70,6 +71,7 @@ def _clean_env(monkeypatch):
         "EVAL_AGGREGATE_MARGIN",
         "EVAL_AGGREGATE_MIN_SCORED",
         "EVAL_AGGREGATE_ARMED",
+        "EVAL_ADMISSION_MODE",
         "EVAL_ADMISSION_RATE",
         "EVAL_ADMISSION_MIN_RUNS",
         "EVAL_JUDGED_MARGIN",

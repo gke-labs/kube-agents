@@ -4,10 +4,11 @@
 > version key, admission, reset and rung 6 are implemented in `bench/kube_agents_bench/` and
 > covered by `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been
 > validated end to end against a real bucket in a personal dev project (see
-> [What has been validated, and where](#what-has-been-validated-and-where)), but the production
-> bucket and its IAM grants do not exist yet, and the nightly job that writes to it is still an
-> open pull request in `oss-test-infra`. The dashboard's
-> table and views are checked in as `bench/dashboard/` and have been run against that same bucket;
+> [What has been validated, and where](#what-has-been-validated-and-where)); the production bucket
+> exists, and the nightly job that appends to it, `ci-kube-agents-eval-nightly`, is merged in
+> `oss-test-infra` with its store export armed (see [The job definition](#the-job-definition)). The
+> dashboard's table and views are checked in as `bench/dashboard/` and have been run against that
+> same bucket;
 > what is not built is the Looker Studio front end over them.
 
 **Scope:** How the eval scorer decides, where its results are stored, how a baseline is
@@ -302,10 +303,13 @@ set — and if the two job types can run as different service accounts, withhold
 `objectCreator` from the presubmit's makes it structural rather than conventional. That is the
 strongest of the three guards, because it survives a careless edit to either of the others.
 
-#### Two conditions that guard depends on, neither of which holds today
+#### Two conditions that guard depends on
 
-Both were checked rather than assumed, and until they hold, the paragraph above describes an
-intention and the two software guards are the only real ones.
+Both were checked rather than assumed, and both have held since 2026-09-14: the bucket is in
+`kube-agents-prow` with the grants [Provisioning it](#provisioning-it) lists, and the periodic runs
+as `eval-baseline-recorder` ([oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682),
+armed by [#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698)). Until then
+the paragraph above described an intention and the two software guards were the only real ones.
 
 **1. The bucket must not live in an evaluation-pool project.** This is why
 [Provisioning it](#provisioning-it) below says `PROJECT=kube-agents-prow`.
@@ -323,13 +327,13 @@ one lease is not where the next run looks.
 `projectIamAdmin` there. So in that project, and only in that project, the
 `objectViewer`/`objectCreator` split is a real boundary.
 
-**2. The two jobs must run as different service accounts.** They do not: the presubmit and the
-nightly as proposed both declare `serviceAccountName: prowjob-default-sa`. One identity cannot hold
-`objectCreator` for one job and withhold it from the other, so the split is unimplementable until
-the nightly gets a dedicated account. That is not a reviewer's preference; it is what the guard is
-made of — which is why creating `eval-baseline-recorder` is step 2 of
-[Provisioning it](#provisioning-it) rather than a follow-up, and why the change that arms the store
-must name it on the periodic in the same diff.
+**2. The two jobs must run as different service accounts.** They do: the presubmit declares
+`serviceAccountName: prowjob-default-sa` and the nightly `eval-baseline-recorder`. As first
+proposed both declared `prowjob-default-sa`, and one identity cannot hold `objectCreator` for one
+job and withhold it from the other, so the split was unimplementable until the nightly got a
+dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
+why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a
+follow-up, and why the change that armed the store named it on the periodic in the same diff.
 
 **Who can grant this.** `kube-agents-prow` has a single `roles/owner`, who is also one of its two
 `storage.admin` holders, so the bucket, the service account and all three grants are one person's
@@ -351,9 +355,9 @@ own.
 ### Provisioning it
 
 Three things to create, in this order. The service account is not optional and is not a tidiness
-preference — see [the two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today)
-— because the presubmit and the nightly share one identity today, and one identity cannot both hold
-and be denied `objectCreator`.
+preference — see [the two conditions](#two-conditions-that-guard-depends-on)
+— because the presubmit and the nightly as first proposed shared one identity, and one identity
+cannot both hold and be denied `objectCreator`.
 
 ```bash
 BUCKET=kube-agents-evals-bench          # globally unique; the name is not the project
@@ -421,7 +425,7 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
 this bucket, and withholding `objectCreator` genuinely withholds it. In `kube-agents-evals` the
 same account holds `roles/storage.admin` and `roles/resourcemanager.projectIamAdmin`, which would
 make all three grants decorative;
-[Two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today) above is the
+[Two conditions](#two-conditions-that-guard-depends-on) above is the
 long form.
 
 All three steps are one ask of one person in one project: the sole `roles/owner` on
@@ -478,8 +482,8 @@ The backend has been exercised end to end against a real bucket
 | A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
 | A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
 
-What remains unvalidated is the part no local run can reach: the nightly Prow job, which is still an
-open pull request against `oss-test-infra`.
+What no local run can reach is the nightly Prow job's own append. Its nights are the validation,
+read through the dashboard's Nightly report (`scripts/eval_dashboard/nightly.py`).
 
 **Why a file per batch instead of one growing file per case.** GCS objects are immutable; there is
 no append. Growing one `<case>.jsonl` means download, concatenate, re-upload — an overwrite, which
@@ -707,10 +711,9 @@ does.
 
 ### The job that writes it
 
-This is the piece that is written but not landed, and nothing appends until it lands. It is a change to
-**`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow config lives, per
-`hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not to this repo, which is why no amount of
-work here can close the loop. What it has to be:
+It lives in **`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow config lives, per
+`hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not in this repo, which is why no change
+here can alter its schedule, budget or identity. What it has to be:
 
 | Requirement                                                   | Why                                                                                                                                                                                                                                                                                       |
 | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -764,10 +767,13 @@ More repetitions on the recording side is strictly better evidence.
 #### The job definition
 
 It is `ci-kube-agents-eval-nightly` in
-`prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml` of `oss-test-infra`, open there as
-pull requests; [gke-labs/kube-agents#1448](https://github.com/gke-labs/kube-agents/issues/1448)
-tracks them, the provisioning they wait on, and the merge order. The YAML is not reproduced here — a
-copy in a second repository is a copy that goes stale, and the shape below is the part that matters.
+`prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml` of `oss-test-infra`:
+[oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682) added it and
+[oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698) armed its store
+export. Its schedule, budget and fan-out are the decisions recorded on
+[gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
+reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
+the part that matters.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, `PULL_PULL_SHA` from the checkout (the
@@ -789,56 +795,75 @@ merge-rate data:
   keep it saturated. Concurrent runs cannot corrupt each other. The nightly holds at 1 so a run that
   overruns its night cannot overlap the next.
 - **`optional` is a presubmit-only field** and must not appear. It is Tide's "does this gate the
-  merge" flag, and a periodic gates nothing. The substantive point is carried by the TestGrid alert
-  instead: a silently failing recorder stops the store filling, and an empty store reads as a
-  legitimate green to every presubmit, because an unadmitted case cannot fire the quality rungs.
-  Nothing degrades visibly, so alerting is a requirement, not a nicety.
+  merge" flag, and a periodic gates nothing. The substantive point is carried by the eval
+  dashboard's Nightly report and the 9 AM ET digest instead (`scripts/eval_dashboard/nightly.py`,
+  `post_health.py`; the merged job creates no TestGrid test group): a silently failing recorder
+  stops the store filling, and an empty store reads as a legitimate green to every presubmit,
+  because an unadmitted case cannot fire the quality rungs. Nothing degrades visibly in the gate,
+  so a missing or truncated night has to say so somewhere a person looks every morning, and the
+  digest line is that place.
 - **The cluster is `build-kube-agents`**, the image is pinned (`kubekins-e2e:latest-1.32`), secrets
   are mounted volumes rather than presets, and `PROJECT_ID` is not static — Boskos supplies it per
   run.
 
-Two numbers in it are starting points rather than measurements: the repetition count (the script's
-default 3 unless the job sets `EVAL_REPETITIONS`) and the timeout. The binding constraint on both is that
-`gpu-stress-test-diagnosis` re-applies its OpenTofu GPU stack on **every** repetition, so the cost
-per repetition is not the ~90s of agent time the fixtures show. Tune them from the first few runs.
+Three numbers in it are priced rather than measured. The repetition count is the script's default 3
+unless the job sets `EVAL_REPETITIONS`. The timeout is `480m`, not the presubmit's `360m`: the
+twenty-six-task matrix prices at ~532–552 serial minutes at three repetitions (the `NIGHTLY_TASKS`
+comment in `hack/ci-eval-pr.sh`), and the presubmit realised only ~1.15× on whole-job wall clock
+against its serial matrix estimate on 2026-09-10 (the periodic's timeout comment; the fixed
+provision-and-deploy term is inside that figure, which is why it sits far below the unit-loop
+speed-ups measured under [Open items](#open-items)), at which the night projects to ~470–490
+minutes — `360m` would truncate most
+nights, and the job gates nothing, so a long night costs a lease and nothing else. The fan-out is
+`EVAL_TASK_PARALLELISM=6`, wider than the presubmit's 4, because the nightly is alone on the model
+quota at its hour. The binding constraint on the first two is that `gpu-stress-test-diagnosis`
+re-applies its OpenTofu GPU stack on **every** repetition, so the cost per repetition is not the ~90s
+of agent time the fixtures show. Confirm all three on the first three nights' measured wall clock and
+record the result on #1491; the dashboard's Nightly report carries each night's wall clock and
+whether the deadline cut it short.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is
 not an open question: it has to be a dedicated one, or the read/write split cannot be expressed at
-all. `serviceAccountName: eval-baseline-recorder` is a required edit before the store export is
-uncommented on the periodic — see
-[Two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today).
+all. The periodic runs as `eval-baseline-recorder`, and its store export is armed only because it
+does — see
+[Two conditions](#two-conditions-that-guard-depends-on).
 
-The shape, with the harness elided (the alert row in the table above is a requirement the job as
-proposed does not yet meet — it is read through the eval dashboard instead):
+The shape, with the harness elided (the alert row in the table above is met through the eval
+dashboard's Nightly report and the 9 AM digest rather than a TestGrid tab, so the job creates no test
+group):
 
 ```yaml
 # GoogleCloudPlatform/oss-test-infra:
 #   prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml
 periodics:
   - name: ci-kube-agents-eval-nightly
-    # 08:00 UTC: the pool's low-traffic hour, clear of the working day's
-    # presubmit herd and of the repo's 02:00 UTC GitHub Actions nightly.
-    cron: "0 8 * * *"
+    # 00:00 UTC (8 PM EDT, 7 PM EST): after the working day's presubmit herd
+    # in the team's Eastern time zone, so the nightly's lease and model-quota
+    # draw do not contend with pull requests, and the night is over before
+    # the next morning's 9 AM ET digest reports it.
+    cron: "0 0 * * *"
     # A periodic has no ref of its own. base_ref is a branch, not a pin: Prow
     # resolves it at trigger time, so every run is main's latest commit.
     extra_refs:
       - org: gke-labs
         repo: kube-agents
         base_ref: main
+        workdir: true
     annotations:
-      testgrid-dashboards: googleoss-kube-agents
-      testgrid-tab-name: nightly-eval-baseline
-      testgrid-alert-email: <owner alias>
-      testgrid-num-failures-to-alert: "2"
+      # No TestGrid tab: the run is read through the eval dashboard's
+      # Nightly report and the 9 AM digest, not a second UI.
+      testgrid-create-test-group: "false"
     # Scheduling, not safety -- Boskos leasing makes concurrency safe. This is
     # so a run that overruns its night cannot overlap the next.
     max_concurrency: 1
     cluster: build-kube-agents
     decorate: true
     decoration_config:
-      # The presubmit's budget for a bigger matrix: a starting point, like the
-      # repetition count; tune both from real nights.
-      timeout: 360m
+      # Eight hours, not the presubmit's 360m: the twenty-six-task matrix
+      # prices at ~532-552min serial at three repetitions, and the presubmit's
+      # fan-out realised ~1.15x, which 360m would truncate most nights. Priced,
+      # not measured; confirm on the first three nights (kube-agents#1491).
+      timeout: 480m
       grace_period: 5m
     spec:
       # NOT prowjob-default-sa, which is what the presubmit runs as. The
@@ -856,6 +881,9 @@ periodics:
               # the presubmit matrix on this value. Without it the job records
               # the presubmit matrix only.
               export EVAL_TIER="nightly"
+              # Wider fan-out than the presubmit's 4: the nightly runs alone on
+              # the model quota at this hour (see the timeout comment above).
+              export EVAL_TASK_PARALLELISM="6"
               # A periodic has no PULL_PULL_SHA, and ci-deploy.sh falls back to
               # the literal "latest", so every night would tag its build
               # pr-local-latest. extra_refs has already checked out main's
@@ -883,17 +911,21 @@ Neither role includes the other, and neither carries `storage.objects.delete`, s
 append-only by construction. The `gcloud` is in [Provisioning it](#provisioning-it).
 
 It must be a **dedicated** GSA, `eval-baseline-recorder@kube-agents-prow`, and that is not a
-preference. Both jobs run as `prowjob-default-sa` today; granting creator to that shared identity
-grants it to the presubmit too, and one account cannot simultaneously hold and be denied a role.
-So the defence-in-depth the layout is built on — presubmit gets `objectViewer` only, and "a pull
-request never writes" survives a careless edit to the shell — is not merely weaker on a shared
-account, it does not exist.
+preference. Had both jobs kept running as `prowjob-default-sa`, granting creator to that shared
+identity would have granted it to the presubmit too, and one account cannot simultaneously hold and
+be denied a role. So the defence-in-depth the layout is built on — presubmit gets `objectViewer`
+only, and "a pull request never writes" survives a careless edit to the shell — is not merely
+weaker on a shared account, it does not exist there.
 
-The cost is real: a new GSA, a new KSA in whichever namespace `build-kube-agents` runs these pods
-in, and the Workload Identity binding between them — infrastructure this repository does not own,
-so all of it is the `kube-agents-prow` owner's to create. Until it does exist, "a pull request never
-writes" rests on the two guards in the code, `JOB_TYPE` and `PULL_NUMBER`, and the store export
-must stay commented out on the periodic rather than arm it pointed at the shared account.
+The cost was real: a new GSA, a new KSA in `test-pods` (the namespace `build-kube-agents` runs
+these pods in), and the Workload Identity binding between them — infrastructure this repository
+does not own, all of it the `kube-agents-prow` owner's to create, and all of it in place since
+2026-09-14: the recorder holds `objectViewer` and `objectCreator` on the bucket, `prowjob-default-sa`
+holds `objectViewer` only, and the recorder carries the `workloadIdentityUser` binding for
+`test-pods/eval-baseline-recorder` (read back with `gcloud storage buckets get-iam-policy` and
+`gcloud iam service-accounts get-iam-policy`). Until it existed, "a pull request never writes"
+rested on the two guards in the code, `JOB_TYPE` and `PULL_NUMBER`, and the store export stayed
+commented out on the periodic rather than arm it pointed at the shared account.
 
 ### The four pre-admission states
 
@@ -909,7 +941,7 @@ Reported distinctly, because only one of them is a problem with the case:
 The middle two are the store filling up, which is the ordinary state of a new case and of every
 case after a version bump. During that window nothing is admitted on evidence, so for an unlisted
 case rung 4 cannot fire and rung 6 is silent — a legitimate green, not a broken gate. A listed case
-rides the bridge meanwhile; [Bootstrap](#bootstrap) below says what that arms.
+blocks meanwhile; [The roster, and the mode](#the-roster-and-the-mode) below says what that arms.
 
 ## Resetting a baseline
 
@@ -932,26 +964,39 @@ There is deliberately no "reset this baseline" command. Every legitimate reset i
 new evidence, and a button that discards evidence is a button that gets pressed when the gate is
 inconvenient.
 
-### Bootstrap
+### The roster, and the mode
 
-`BOOTSTRAP_ADMITTED` names cases that keep blocking before screening exists for them. It is a
-bridge, not a destination: a bootstrap-admitted case has no full window at the current key, so it
-arms rung 4 by fiat. While the store holds nothing for it at that key it also leaves rung 6 quiet
-and contributes nothing to `main`'s side of the aggregate; once the nightly has appended a partial
-window (`collecting`), that evidence feeds both, and the list still decides admission until the
-window is full.
+`BOOTSTRAP_ADMITTED` names the cases that block. A listed case arms rung 4 by the list's say-so.
+While the store holds nothing for it at the current key it also leaves rung 6 quiet and contributes
+nothing to `main`'s side of the aggregate; once the nightly has appended a partial window
+(`collecting`), that evidence feeds both.
 
-**The record governs once it holds a full window.** `BaselineStore.admission()` consults the store
-before the list: with at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key, the pooled rate
-decides either way, and a listed case screened at 12/21 is turned away with a reason that says the
-record overrides the list. The list is consulted only in the first three pre-admission states
-above (nothing at this key, stale, collecting), and when the store holds anything for a listed
-case its state is appended to the reason, so the log says how far it is from being judged on
-evidence. Every verdict carries `admission_source` — `record`, `bootstrap` or `neither` — and the
-markdown renders it per case once a store is configured or the record has decided any case; with
-the store unset what the shell displays is unchanged (the per-case JSON gains that one key), which
-`bench/tests/test_store_unset_golden.py` pins. The switch-over criteria for deleting the list are in
-[`docs/eval-gate-roster.md`](../eval-gate-roster.md).
+**Who decides is `EVAL_ADMISSION_MODE`, and the roster is the default.** The record is computed
+first in either mode — `BaselineStore.record_verdict()` returns one of five states, `would-admit`
+and `would-demote` for a full window (at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key,
+above or below the bar) and the three pre-admission states above — and `BaselineStore.admission()`
+then applies the mode:
+
+- `roster` (default; decided 2026-09-14 on
+  [gke-labs/kube-agents#1493](https://github.com/gke-labs/kube-agents/issues/1493)): the list
+  decides outright. A listed case at 12/21 stays admitted and its reason says the record would
+  demote it; an unlisted case at 21/21 stays out and its reason says the record would admit it and
+  that the roster decides. The record informs a roster edit, which is a reviewed diff — the point of
+  the mode is that nothing the nightly appends changes which cases block.
+- `record`: the record governs once it holds a full window. A listed case screened at 12/21 is
+  turned away with a reason that says the record overrides the list, and an unlisted case at 21/21
+  is admitted. The list is consulted only in the three pre-admission states, and when the store
+  holds anything for a listed case its state is appended to the reason.
+
+Any other value is exit 2 from `bench-gate case`, and `hack/ci-eval-pr.sh` refuses it before a task
+runs: a typo that fell back to `roster` would look like a working switch.
+
+Every per-case hand-off carries `admission_source` (`record`, `bootstrap` or `neither`),
+`record_verdict` (the five states) and `admission_mode`, and the markdown renders the first two per
+case as **Admitted by** and **Record says** once a store is configured or the record holds a full
+window for any case. With the store unset what the shell displays is unchanged (the per-case JSON
+gains those three keys), which `bench/tests/test_store_unset_golden.py` pins. What the record has
+to show before anyone switches the mode is in [`docs/eval-gate-roster.md`](../eval-gate-roster.md).
 
 **A name in it that matches no graded case is reported, loudly.** It is a free-text environment
 variable holding case ids, and its whole job is to keep something blocking — so a typo, or a rename
@@ -960,7 +1005,7 @@ exactly the way it would have if the list were right. `bench-gate suite` therefo
 list against the ids it actually graded and prints every unmatched name on stderr and as a banner
 in the markdown verdict. It is a warning rather than a red: the list is also legitimately allowed
 to name a case that is deactivated in the `TASKS` array or skipped on a given run, and redding for
-that would make the bridge harder to hold than the thing it bridges.
+that would make the roster harder to hold than the thing it protects.
 
 ## How "judged scores below main's baseline" is determined
 
@@ -1137,7 +1182,8 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
   **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
   now runs the matrix as a bounded parallel fan-out of (task, repetition) units
-  (`EVAL_TASK_PARALLELISM`, default 4; tofu-stack units and repetitions of one task still serialize
+  (`EVAL_TASK_PARALLELISM`, default 4, the presubmit's; the nightly periodic exports 6; tofu-stack
+  units and repetitions of one task still serialize
   among themselves). Wall clock is therefore fixed cost + roughly invocations ÷ realised
   parallelism, where "realised" is capped by the leased project's model quota — measured on a
   quota-constrained dev install: 16 units serial 3240s, parallelism 4 in 1022s with six units lost
@@ -1210,16 +1256,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `EVAL_REPETITIONS=1` with rungs 4–6 explicitly reported as unarmed, or a smaller matrix — not a
   three-repetition ladder fed one repetition.
 
-- The bucket does not exist (`gs://kube-agents-evals-bench` returns 404), so the GCS backend is
-  dormant and the local backend is the default. **Ask the `kube-agents-prow` project owner** — a
-  single `roles/owner` holds it — for three things, all in that project and none of them optional:
-  the bucket; a dedicated `eval-baseline-recorder` service account with its Workload Identity
-  binding; and the grants, `objectViewer` + `objectCreator` on the recorder, `objectViewer` only on
-  `prowjob-default-sa`. `prowjob-default-sa` holds **zero** project-level roles in
-  `kube-agents-prow` today, which is exactly why the bucket goes there and not in a pool project
-  where it already holds `storage.admin`. Commands in [Provisioning it](#provisioning-it),
-  reasoning in
-  [Two conditions that guard depends on](#two-conditions-that-guard-depends-on-neither-of-which-holds-today).
+- Provisioned, 2026-09-14: `gs://kube-agents-evals-bench` exists in `kube-agents-prow`, the
+  `eval-baseline-recorder` service account carries its Workload Identity binding, and the grants
+  are `objectViewer` + `objectCreator` on the recorder and `objectViewer` only on
+  `prowjob-default-sa` — so the GCS backend is live on both Prow jobs and the local backend is the
+  default only off Prow. `prowjob-default-sa` holds **zero** project-level roles in
+  `kube-agents-prow`, which is exactly why the bucket went there and not in a pool project where
+  it already holds `storage.admin`. Commands in [Provisioning it](#provisioning-it), reasoning in
+  [Two conditions that guard depends on](#two-conditions-that-guard-depends-on). What remains
+  open is the evidence itself: the `evidence/` prefix is empty until the first night appends.
 - **Switching the store on is two Prow exports, not one, and the presubmit's is the one that gets
   forgotten.** `EVAL_BASELINE_STORE` is the single variable for both directions: the nightly sets
   it and appends (`objectViewer` + `objectCreator`), and the presubmit must set it too and only
@@ -1227,14 +1272,13 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   finds nothing admitted, and reports a **legitimate green** with rung 4, rung 6 and the aggregate
   all inert — the rate-based half of this design, silently absent, with no signal that it is
   missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
-  looks like a working gate. Neither export exists on `master` yet; both wait on the bucket.
-- No Prow job yet appends for `hack/ci-eval-pr.sh` (job config lives in
-  `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
-  admitted. The job is written — see [The job that writes it](#the-job-that-writes-it) — and runs
-  the script's default repetitions and the presubmit's `360m`, both starting points to tune from
-  the first real nights; `serviceAccountName: eval-baseline-recorder` must exist before the store
-  export arms. [gke-labs/kube-agents#1448](https://github.com/gke-labs/kube-agents/issues/1448)
-  carries the pull requests and their order.
+  looks like a working gate. Both exports exist since
+  [oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698).
+- The nightly periodic's three numbers — the script's default repetitions, the `480m` timeout and
+  `EVAL_TASK_PARALLELISM=6` — are priced, not measured;
+  [The job definition](#the-job-definition) says from what. Confirm them on the first three nights'
+  wall clock and record the result on
+  [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491).
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked

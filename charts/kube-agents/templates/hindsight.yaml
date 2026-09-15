@@ -77,7 +77,10 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       securityContext:
+        runAsNonRoot: true
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
           image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.api.image.repository "tag" .Values.hindsight.api.image.tag "root" .) }}
@@ -214,6 +217,36 @@ spec:
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}
       {{- end }}
+      # The image's entrypoint starts as root and drops to postgres (uid 999)
+      # itself; starting as 999 skips that path, and 999 is the owner the root
+      # entrypoint already gave every existing data volume. The entrypoint
+      # still runs chmod 700 on $PGDATA on every start, which keeps the data
+      # directory's mode check passing after fsGroup adds group bits, and
+      # OnRootMismatch relabels an existing volume once rather than walking it
+      # on every start. A fresh volume depends on that fsGroup pass: its root
+      # arrives root-owned, and only the kubelet's relabel lets uid 999 create
+      # PGDATA inside it. GKE's Persistent Disk CSI driver applies fsGroup to
+      # ReadWriteOnce volumes; under a StorageClass whose driver reports
+      # fsGroupPolicy None, the entrypoint's mkdir fails with EACCES before
+      # initdb runs, where the old root entrypoint would have chowned the
+      # directory itself. Kept in step with
+      # k8s-operator/config/integrations/hindsight/postgresql.yaml and
+      # asserted by tests/test_workload_security_context.py;
+      # docs/designs/memory.md summarises the posture of both Hindsight pods.
+      # Writable paths
+      # under the read-only root: the run emptyDir at /var/run/postgresql
+      # (socket and pid, used by the entrypoint's temporary init server and
+      # the pg_isready probe), the tmp emptyDir at /tmp, and PGDATA on the
+      # PVC. If a write elsewhere fails, add one more emptyDir at that path
+      # and name it here; do not set readOnlyRootFilesystem: false.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgresql
           # pgvector supplies the vector extension Hindsight's embeddings need.
@@ -225,6 +258,12 @@ spec:
           # the constraints on it in images.json, which is where they live.
           image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.postgresql.image.repository "tag" .Values.hindsight.postgresql.image.tag "name" "hindsight-postgresql" "root" .) }}
           imagePullPolicy: {{ .Values.hindsight.postgresql.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: postgresql
               containerPort: 5432
@@ -280,6 +319,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

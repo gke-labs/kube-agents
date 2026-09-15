@@ -9,6 +9,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# The human-readable transcript written beside the JSONL record.
+TRANSCRIPT_FILENAME = "conversation.txt"
+# Column width of the transcript's rules and message boxes.
+TRANSCRIPT_WIDTH = 78
+# Longest rendering of one evidence request/analysis or artifact manifest;
+# the JSONL beside the transcript holds the untruncated value.
+EVIDENCE_PREVIEW_LINES = 40
+ARTIFACT_PREVIEW_LINES = 60
+
 
 @dataclass
 class EvidenceLog:
@@ -31,6 +40,98 @@ class EvidenceLog:
         directory: Path = Path("/tmp"),
     ) -> EvidenceLog:
         return cls(Path(tempfile.mkdtemp(prefix=prefix, dir=directory)))
+
+    def write_transcript(self, request: str, interaction: dict[str, Any]) -> Path:
+        """Write the run as a conversation, the way the portal's Chat tab shows it.
+
+        The Chat tab renders a turn per message — the operator's prompt, then
+        the agent's reply — and lists the delegated work beneath it as
+        `assignee · status` cards. A reader comparing a run against the UI
+        should not have to translate, so this file uses the same two-part
+        shape. The JSONL beside it stays the machine record.
+        """
+
+        def block(role: str, subtitle: str, body: str) -> list[str]:
+            head = f"{role}" + (f"  ({subtitle})" if subtitle else "")
+            top = f"┌─ {head} "
+            return [
+                top + "─" * max(0, TRANSCRIPT_WIDTH - len(top)),
+                *[f"│ {line}" for line in (body or "(empty)").splitlines()],
+                "└" + "─" * (TRANSCRIPT_WIDTH - 1),
+                "",
+            ]
+
+        agent = str(interaction.get("agentId") or "agent")
+        profile = str(interaction.get("profile") or "")
+        status = str(interaction.get("status") or "unknown")
+        lines = [
+            "CHAT",
+            "=" * TRANSCRIPT_WIDTH,
+            "",
+            *block("USER", str(interaction.get("sessionId") or ""), request.strip()),
+            *block(
+                f"ASSISTANT · {agent}",
+                f"{profile} · {status}",
+                str(interaction.get("output") or "").strip()
+                or "Completed without a text response.",
+            ),
+        ]
+
+        def mapping(value: Any) -> dict[str, Any]:
+            return value if isinstance(value, dict) else {}
+
+        def mappings(value: Any) -> list[dict[str, Any]]:
+            return [item for item in (value or []) if isinstance(item, dict)]
+
+        tasks = mappings(interaction.get("tasks"))
+        if tasks:
+            lines += ["AGENT WORK", "=" * TRANSCRIPT_WIDTH, ""]
+        for task in tasks:
+            lines.append(
+                f"  {task.get('assignee', 'unassigned')} · {task.get('status')}"
+                f"  ({task.get('taskId')}, run {task.get('runCount')})"
+            )
+            lines.append(f"    {task.get('title') or ''}")
+            if task.get("summary"):
+                lines.append(f"    ✓ {task['summary']}")
+            elif task.get("error"):
+                lines.append(f"    ✗ {task['error']}")
+            for item in mappings(task.get("evidence")):
+                details = mapping(item.get("details"))
+                lines.append(
+                    f"    · evidence {item.get('type')} [{item.get('status')}]"
+                    f" — {details.get('apiMethod') or 'unknown method'}"
+                )
+                for label, value in (
+                    ("request", details.get("request")),
+                    ("analysis", details.get("analysis")),
+                ):
+                    rendered = json.dumps(value or {}, indent=2, sort_keys=True)
+                    lines += [
+                        f"        {label}:",
+                        *[
+                            f"        {row}"
+                            for row in rendered.splitlines()[:EVIDENCE_PREVIEW_LINES]
+                        ],
+                    ]
+            for item in mappings(task.get("artifacts")):
+                manifest = mapping(item.get("manifest"))
+                rendered = json.dumps(manifest, indent=2, sort_keys=True)
+                lines.append(f"    · artifact {item.get('type')}")
+                lines += [
+                    f"        {row}"
+                    for row in rendered.splitlines()[:ARTIFACT_PREVIEW_LINES]
+                ]
+            if task.get("result"):
+                lines += [
+                    "    · report delivered to the user (also folded into the "
+                    "reply above)",
+                ]
+            lines.append("")
+
+        path = self.root / TRANSCRIPT_FILENAME
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
 
     def record(self, event: str, data: Any) -> None:
         self._sequence += 1

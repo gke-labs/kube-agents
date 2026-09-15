@@ -50,6 +50,7 @@ from devops_bench.verification.spec import VerificationEntry, parse_node
 
 from kube_agents_bench import transcript, verifiers
 from kube_agents_bench.verifiers import (
+    WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
@@ -144,6 +145,78 @@ def test_empty_stash_is_error_not_fail():
     assert res.status == "error"
     assert not res.success
     assert "no transcript" in res.reason
+
+
+# ---------------------------------------------------------- worker_commands
+
+
+def _stash_commands(commands: list[str] | None) -> None:
+    rows = None if commands is None else [{"task": "t_1", "command": c} for c in commands]
+    transcript.set("ok", _TRAJECTORY, worker_commands=rows)
+
+
+def test_worker_commands_required_pattern_matched_passes():
+    _stash_commands(["python3 /opt/defaults/skills/version-control/scripts/vcs.py clone acme/infra", "cat README.md"])
+    v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py\s+clone"])
+    res = v.verify(5.0)
+    assert res.status == "pass" and res.success
+    assert "2 worker command(s)" in res.reason
+
+
+def test_worker_commands_forbidden_pattern_names_the_command():
+    _stash_commands(["gh api repos/acme/infra/commits", "cat README.md"])
+    v = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"(^|&&|;|\|)\s*gh\s"])
+    res = v.verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "gh api repos/acme/infra/commits" in res.reason
+
+
+def test_worker_commands_forbidden_matches_after_a_shell_join():
+    _stash_commands(["cd /tmp && git clone https://github.com/acme/infra"])
+    v = WorkerCommandsVerifier(
+        type="worker_commands", forbidden_patterns=[r"(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+
+def test_worker_commands_absolute_local_git_is_not_the_bare_name():
+    _stash_commands(["/opt/vcs/libexec/git log -3", "python3 vcs.py clone acme/infra"])
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_patterns=[r"vcs\.py\s+clone"],
+        forbidden_patterns=[r"(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b"],
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_worker_commands_missing_required_fails_and_counts():
+    _stash_commands(["cat README.md"])
+    v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py"])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "1 command(s)" in res.reason
+
+
+def test_worker_commands_nothing_captured_is_error_not_fail():
+    _stash_commands(None)
+    v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py"])
+    res = v.verify(5.0)
+    assert res.status == "error" and not res.success
+    assert "no delegated worker" in res.reason
+
+
+def test_worker_commands_empty_stash_is_error():
+    res = WorkerCommandsVerifier(type="worker_commands", required_patterns=["x"]).verify(5.0)
+    assert res.status == "error"
+
+
+def test_worker_commands_rejects_a_pattern_that_does_not_compile():
+    with pytest.raises(Exception):
+        WorkerCommandsVerifier(type="worker_commands", required_patterns=["("])
+
+
+def test_worker_commands_is_registered_under_its_type():
+    assert "worker_commands" in VERIFIERS
 
 
 # ------------------------------------------- report_contains: normalization

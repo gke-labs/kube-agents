@@ -352,6 +352,18 @@ neither means what it looks like:
   (`forget_unmanaged_cluster_kms`) rather than let the apply schedule the key's
   versions for destruction under the live cluster.
 
+### Applying over a Pub/Sub topic that already exists
+
+`lifecycle.sh apply` adopts a pre-existing Google Chat Pub/Sub topic and
+subscription rather than failing with `Error 409: Resource already exists`, the
+way it already adopts KMS key rings (`adopt_pubsub`, beside `adopt_kms`).
+Configuring the Chat app in the Cloud console creates the topic before the
+installer runs, so this is reachable on a first install, not only on a
+re-apply. Every Pub/Sub IAM binding in the
+[`chat-pubsub`](../../modules/chat-pubsub/main.tf) module is keyed on its
+parent's `.id`, never its `.name`, so a replaced topic takes its bindings into
+the plan with it instead of leaving a green apply over an empty policy.
+
 ### The `image_tag` rule
 
 `image_tag` (default `latest` on `main`) overrides both the operator and platform-agent

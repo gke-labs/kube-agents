@@ -89,7 +89,10 @@ slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
 is added. The non-empty-glob guard lives with C4's SHA-pin sweep; the group-B
 allowlists are guarded differently — a holder appearing or vanishing moves a
-set the test compares exactly.
+set the test compares exactly. C4 is the invariant; its stricter form, which
+also requires the version comment beside each SHA and a digest on a `docker://`
+ref, and the fork-guard check on every auto-triggered credentialed workflow,
+run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.
 
 ## Invariant → test → bucket → historical attack
 

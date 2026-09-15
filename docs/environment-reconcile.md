@@ -1,19 +1,13 @@
----
-title: Reconciling the long-lived environments
-description: How autopush and staging are kept in step with terraform/examples/full-install, what each one has to be configured with, and what to do when a drift report opens.
-sidebar:
-  order: 8
----
+# Reconciling the long-lived environments
 
-:::note[For maintainers of this repository]
-This page is about the environments **kube-agents itself** runs its CI against —
-`autopush`, `staging`, `rc` and `nightly`, in Google-owned GCP projects. Nothing
-here is something you configure on your own install; for that, see the
-[Quick start](/kube-agents/install/quickstart-gke/). It sits in the published docs
-alongside [CI pool project prerequisites](/kube-agents/deploy/ci-pool-projects/)
-and [release versioning](/kube-agents/deploy/release-versioning/), which have the
-same audience.
-:::
+A maintainer runbook for the environments **kube-agents itself** runs its CI
+against — `autopush`, `staging`, `rc` and `nightly`. Nothing here is something a
+user configures on their own install. It covers how `autopush` and `staging` are
+kept in step with `terraform/examples/full-install`, what each one has to be
+configured with, and what to do when a drift report opens.
+[`scripts/release/README.md`](../scripts/release/README.md) documents the
+scripts these workflows run; [`ci-pool-projects.md`](ci-pool-projects.md) is the
+runbook for the presubmit's project pool.
 
 `autopush` and `staging` are long-lived: they are installed once and then kept
 running, and people live-test pull requests against them. `rc` and `nightly` are
@@ -63,14 +57,15 @@ Long-lived environments are reconciled and deployed atomically using `./upgrade.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
 
 A deploy takes the live-test lease before it applies anything (see
-[`docs/designs/live-test-lease.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/live-test-lease.md)).
+[`designs/live-test-lease.md`](designs/live-test-lease.md)).
 Because automated release deploys must not silently drop candidate releases or report
 success on an unapplied commit, lease contention fails loudly (`lease_policy: fail`)
 rather than deferring silently.
 
-Run one by hand with `Shared: Reconcile Environment` (`mode: apply`), or locally
-against your own install with `./upgrade.sh --plan` to see what a reconcile
-would change.
+Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). Locally,
+`./upgrade.sh --plan` against any install shows what a reconcile would change;
+[`terraform/examples/full-install/README.md`](../terraform/examples/full-install/README.md#asking-what-an-apply-would-change)
+documents it.
 
 ## The rebuild button
 
@@ -105,26 +100,29 @@ is written into `terraform.tfvars`, and `terraform apply` then plans the
 destruction of whatever the default does not mention. On an environment that is
 rebuilt every run that costs a feature; on one that has been up for a month it
 takes the gVisor node pool, the Hindsight database, or the Pub/Sub topic behind
-Google Chat with it.
+Google Chat with it. The same hazard applies to a hand-maintained `install.env`
+on any install, keyed on the `install.env` names in the table's second column;
+[`scripts/installer/README.md`](../scripts/installer/README.md#the-install-configuration-installenv)
+states it for users.
 
 Required for a **plan** as much as for an apply: the reconcile renders `--strict`
 before it branches on the mode, so until an environment carries all twelve the daily
 drift report goes red on it rather than reporting no drift.
 
-| GitHub variable                 | install.env key                 | Notes                                                       |
-| ------------------------------- | ------------------------------- | ----------------------------------------------------------- |
-| `GCP_PROJECT_ID`                | `PROJECT_ID`                    | Required everywhere, including for a plan                   |
-| `GCP_REGION`                    | `REGION`                        | Required everywhere                                         |
-| `GKE_CLUSTER_NAME`              | `CLUSTER_NAME`                  | Required everywhere                                         |
-| `GOOGLE_CHAT_ENABLED`           | `GOOGLE_CHAT_ENABLED`           | `false` removes the topic and subscription                  |
-| `MODEL_PROVIDER`                | `MODEL_PROVIDER`                | Absent falls back to `gemini`                               |
-| `PLATFORM_AGENT_PERMISSION_SET` | `PLATFORM_AGENT_PERMISSION_SET` | Absent falls back to `read-only` and drops the custom roles |
-| `ENABLE_GVISOR`                 | `ENABLE_GVISOR`                 | Absent destroys the gVisor node pool on Standard            |
-| `MEMORY_PROVIDER`               | `MEMORY`                        | Absent destroys the Hindsight API and its Postgres          |
-| `USER_PROFILE_ENABLED`          | `USER_PROFILE_ENABLED`          | Absent resets it                                            |
-| `ENABLE_GKE_BACKUP_PLAN`        | `ENABLE_GKE_BACKUP_PLAN`        | Absent destroys the backup plan                             |
-| `ENABLE_PUBSUB_PLATFORM`        | `ENABLE_PUBSUB_PLATFORM`        | Absent destroys Pub/Sub topic, subscription, and IAM grants |
-| `ENABLE_STOCKOUT_INVESTIGATOR`  | `ENABLE_STOCKOUT_INVESTIGATOR`  | Absent destroys log sink and stockout alerts topic/sub      |
+| GitHub variable                 | install.env key                 | Notes                                                                                                                                               |
+| ------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GCP_PROJECT_ID`                | `PROJECT_ID`                    | Required everywhere, including for a plan                                                                                                           |
+| `GCP_REGION`                    | `REGION`                        | Required everywhere                                                                                                                                 |
+| `GKE_CLUSTER_NAME`              | `CLUSTER_NAME`                  | Required everywhere                                                                                                                                 |
+| `GOOGLE_CHAT_ENABLED`           | `GOOGLE_CHAT_ENABLED`           | `false` removes the topic and subscription                                                                                                          |
+| `MODEL_PROVIDER`                | `MODEL_PROVIDER`                | Absent falls back to `gemini`                                                                                                                       |
+| `PLATFORM_AGENT_PERMISSION_SET` | `PLATFORM_AGENT_PERMISSION_SET` | Absent falls back to `read-only` and drops the custom roles                                                                                         |
+| `ENABLE_GVISOR`                 | `ENABLE_GVISOR`                 | Absent destroys the gVisor node pool on Standard                                                                                                    |
+| `MEMORY_PROVIDER`               | `MEMORY`                        | Absent destroys the Hindsight API and its Postgres                                                                                                  |
+| `USER_PROFILE_ENABLED`          | `USER_PROFILE_ENABLED`          | Absent resets it                                                                                                                                    |
+| `ENABLE_GKE_BACKUP_PLAN`        | `ENABLE_GKE_BACKUP_PLAN`        | Absent destroys the backup plan                                                                                                                     |
+| `ENABLE_PUBSUB_PLATFORM`        | `ENABLE_PUBSUB_PLATFORM`        | Absent removes the adapter plugin unless `ENABLE_STOCKOUT_INVESTIGATOR` keeps it; the Pub/Sub API it enabled stays on and nothing else is destroyed |
+| `ENABLE_STOCKOUT_INVESTIGATOR`  | `ENABLE_STOCKOUT_INVESTIGATOR`  | Absent destroys log sink and stockout alerts topic/sub                                                                                              |
 
 Required when the integration they belong to is switched on, because an empty
 allowlist is not "no opinion" — the operator reads an absent list as allow-all,
@@ -176,8 +174,7 @@ combination renders `enable_github_minter = false` — which on an environment
 that already has a minter is an apply that destroys it. Both paths refuse that
 rather than proceeding: the strict render stops the reconcile, and
 `provision_environment.sh` stops the rebuild above its teardown. An environment
-carrying `GH_APP_ID` alone, which is how `autopush` was configured, has to
-either gain the other two or drop the secret.
+carrying `GH_APP_ID` alone has to either gain the other two or drop the secret.
 
 The reconcile additionally checks that the minter's KMS signing key has an
 enabled version, because that is the other way `enable_github_minter` flips to
@@ -203,18 +200,15 @@ cluster and everything on it.
 
 ## Applying repeatedly against an environment that exists
 
-A scheduled reconcile is the only thing in this project that applies to the same
-environment over and over; `rc` and `nightly` destroy theirs first and so never
-exercise it. Two properties of the composition matter only on that path, and
+The in-place reconcile — the daily plan and the applies `Autopush: Deploy` and
+`Staging: Deploy` drive through `reconcile-environment.yml` — is the only thing in
+this project that applies to the same environment over and over; `rc` and
+`nightly` destroy theirs first and so never exercise it. Two properties of the composition matter only on that path, and
 both are covered by comments in the source rather than restated here:
 
-- `lifecycle.sh apply` adopts a pre-existing Pub/Sub topic and subscription
-  rather than failing with `Error 409: Resource already exists`, the way it
-  already adopts KMS key rings. Configuring the Google Chat app in the Cloud
-  console creates the topic before the installer runs, so this is reachable on a
-  first install too. See `adopt_pubsub` in
-  [`lifecycle.sh`](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/lifecycle.sh).
-- Every Pub/Sub IAM binding is keyed on its parent's `.id`, never its `.name`,
-  so a replaced topic takes its bindings into the plan with it instead of
-  leaving a green apply over an empty policy. See
-  [`terraform/modules/chat-pubsub/main.tf`](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/chat-pubsub/main.tf).
+- `lifecycle.sh apply` adopts a pre-existing Google Chat Pub/Sub topic and
+  subscription instead of 409ing on them.
+- The `chat-pubsub` module's IAM bindings follow a replaced topic into the plan.
+
+Both are documented in the composition's README under
+[Applying over a Pub/Sub topic that already exists](../terraform/examples/full-install/README.md#applying-over-a-pubsub-topic-that-already-exists).

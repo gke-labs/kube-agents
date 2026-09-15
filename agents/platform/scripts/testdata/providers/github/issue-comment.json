@@ -1,0 +1,21 @@
+{
+  "payload": {
+    "number": 719,
+    "body": "Confirmed on staging."
+  },
+  "responses": [
+    {
+      "id": 55512309,
+      "user": {
+        "login": "kube-agents[bot]",
+        "id": 210943,
+        "type": "Bot"
+      },
+      "body": "Rolled out and the drain no longer drops events.",
+      "created_at": "2026-08-30T09:20:44Z",
+      "updated_at": "2026-08-30T09:20:44Z",
+      "html_url": "https://github.com/acme/infra/issues/719#issuecomment-55512309",
+      "author_association": "CONTRIBUTOR"
+    }
+  ]
+}

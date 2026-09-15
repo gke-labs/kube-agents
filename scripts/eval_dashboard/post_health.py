@@ -26,6 +26,13 @@ at all (health.json's `fixture_state.unknown`, the bot's grant missing), the
 space is told once, and once more when the scan sees the fleet again. That
 is never a drift. The digest carries one line on the latest scan.
 
+A fifth, one line and once per episode: when health.json carries a `slow`
+note (the gate's green runs are taking far longer than usual, #1586), the
+space hears it the first tick it appears and not again until it has cleared
+and come back; the digest repeats the line while it lasts. It is not a state
+change -- nothing is broken and /retest does not help -- so it moves nothing
+else.
+
 Every time a reader sees is on the reader's clock: America/Toronto, written
 "7:30 AM ET", never UTC (the deep links and the state file keep ISO UTC).
 The digest hour is a Toronto hour too, and "once a day" is a Toronto day.
@@ -104,14 +111,18 @@ FIXTURE_STATE_KEY = "fixture_state"
 # The 24h window health.py reports metrics over, for a health.json that
 # predates the `window_hours` field.
 DEFAULT_WINDOW_HOURS = 24
+# The trailing window health.py's slow-gate note measures "usual" over, for
+# a note without `baseline_days`.
+DEFAULT_SLOW_BASELINE_DAYS = 7
 
 # The kinds of message this script sends.
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
+KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
 KIND_DIGEST = "digest"  # the daily numbers
 KIND_FIXTURE_SCAN = "fixture_scan"  # the fleet scan sees nothing, or sees again
-TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_FIXTURE_SCAN)
+TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_SLOW, KIND_FIXTURE_SCAN)
 
 # Where the message goes. The space is a resource name, the token a bearer
 # credential minted by the workflow; the webhook is the legacy alternative.
@@ -287,6 +298,11 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
         kinds.append(KIND_STALE)
     if fixture_unknown(health) != bool((prev or {}).get("fixture_unknown")):
         kinds.append(KIND_FIXTURE_SCAN)
+
+    # The slow note goes out when the note appears, not when it clears: the
+    # digest carries it while it lasts, and "back to normal" is not news.
+    if health.get("slow") and not (prev or {}).get("slow"):
+        kinds.append(KIND_SLOW)
 
     if in_digest_window(now, digest_hour, tz) and (prev or {}).get("last_digest_date") != local_date(now, tz):
         kinds.append(KIND_DIGEST)
@@ -512,6 +528,36 @@ def render_stale(health: dict) -> str:
     return f"⚪ *Smoke gate: fresh data again* — refreshed {refreshed}; the gate reads {health.get('state', '?')}."
 
 
+def minutes_text(seconds) -> str:
+    return "?" if seconds is None else str(int(seconds // 60))
+
+
+def slow_text(slow: dict) -> str:
+    """The numbers behind a slow gate, in minutes, as one clause: "the last
+    5 full runs took 152–213 min (median 183) against a 7-day typical of
+    151 min (p90 198); 2 reps lost to 429s"."""
+    lost = f"{slow['infra_reps']} reps lost to 429s" if slow.get("infra_reps") else "no reps lost"
+    return (
+        f"the last {slow.get('runs', 0)} full runs took {minutes_text(slow.get('min_s'))}–{minutes_text(slow.get('max_s'))} min"
+        f" (median {minutes_text(slow.get('median_s'))}) against a {slow.get('baseline_days', DEFAULT_SLOW_BASELINE_DAYS)}-day typical"
+        f" of {minutes_text(slow.get('baseline_p50_s'))} min (p90 {minutes_text(slow.get('baseline_p90_s'))}); {lost}"
+    )
+
+
+def render_slow(health: dict) -> str:
+    slow = health.get("slow") or {}
+    return "\n".join(
+        [
+            f"🐢 *Smoke gate: slow* — {slow_text(slow)}. Not a break, and /retest won't make yours faster.",
+            # No `since`: the Brief resolves a `since` to an incident, and the
+            # note's start is a GREEN tick that names none, so the page would
+            # show a synthetic past incident. The bare agent view is the
+            # healthy headline, which carries the same sentence.
+            dashboard_link(DASHBOARD_VIEW_AGENT),
+        ]
+    )
+
+
 def render_fixture_scan(health: dict) -> str:
     block = fixture_state_of(health)
     when = clock(parse_iso(block.get("scanned_at")))
@@ -605,6 +651,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
         # The window is measured from the data's horizon, so during a stall
         # these are the same numbers every morning; say so every morning.
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
+    if health.get("slow"):
+        lines.append(f"🐢 Slow since {clock(parse_iso(health['slow'].get('since')))}: {slow_text(health['slow'])}.")
     if data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
         lines.append(NIGHTLY_URL)
@@ -624,6 +672,8 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_stale(health)
     if kind == KIND_FIXTURE_SCAN:
         return render_fixture_scan(health)
+    if kind == KIND_SLOW:
+        return render_slow(health)
     return render_change(health, prev, issue)
 
 
@@ -767,7 +817,9 @@ def run(
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
     # posted next tick, and a stale flip posted mid-OUTAGE does not swallow a
-    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issues
+    # case that joined inside OUTAGE_REPOST_INTERVAL. The slow bit follows
+    # the note down silently (a cleared note is not posted) and up only once
+    # the note has gone out, so a failed one is retried. The tracking issues
     # ride along while the recorded state is not GREEN -- `issue` for the
     # current condition, `issues` for every one this episode filed or
     # adopted -- and are dropped by the recovery; health.py reads them back
@@ -775,6 +827,7 @@ def run(
     told_state = KIND_CHANGE in sent or KIND_RECOVERY in sent
     told_stale = KIND_STALE in sent
     told_fixture = KIND_FIXTURE_SCAN in sent
+    told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,
         # fresh start is not announced later as a change.
@@ -794,6 +847,7 @@ def run(
         "issues": carried if source.get("state") not in (None, GREEN) else [],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "fixture_unknown": fixture_unknown(health) if told_fixture else bool(before.get("fixture_unknown")),
+        "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),

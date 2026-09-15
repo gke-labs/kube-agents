@@ -70,6 +70,7 @@ def _clean_env(monkeypatch):
         "DETERMINISTIC_CORRECTNESS_FLOOR",
         "EVAL_AGGREGATE_MARGIN",
         "EVAL_AGGREGATE_ARMED",
+        "EVAL_ADMISSION_MODE",
         "EVAL_ADMISSION_RATE",
         "EVAL_ADMISSION_MIN_RUNS",
         "EVAL_JUDGED_MARGIN",
@@ -624,8 +625,12 @@ def test_an_empty_store_collects_and_then_admits(kanban_task, tmp_path, monkeypa
     recorder runs at the default three repetitions. If pooling were removed
     this test hangs at "collecting" forever, which is the state the store
     would really have shipped in.
+
+    Record mode: under the default roster mode the record would say the same
+    at each step but decide nothing (test_admission_sources.py covers that).
     """
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("EVAL_ADMISSION_MODE", "record")
     store = store_with(tmp_path)
     out = tmp_path / "case.json"
     greens = [FIXTURE_RUNS / n for n in (GREEN_RUNS + GREEN_RUNS[:1])]
@@ -650,8 +655,12 @@ def test_the_suite_aggregate_comes_from_the_store_not_a_flag(
     kanban_task, tmp_path, monkeypatch, capsys
 ):
     """The rule was built and never armed: `--baseline-rate` was a flag the
-    shell did not pass, so main's side of the comparison was always None."""
+    shell did not pass, so main's side of the comparison was always None.
+
+    Record mode, so the 21/21 window admits the case with no list; the
+    aggregate itself is mode-blind and pools whatever is admitted."""
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("EVAL_ADMISSION_MODE", "record")
     store = store_with(
         tmp_path, *[
             baseline_line("agent-kanban-smoke", runs=3, passes=3, at=f"2026-08-0{i + 1}T00:00:00Z")

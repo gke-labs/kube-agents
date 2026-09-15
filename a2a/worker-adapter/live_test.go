@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,6 +34,8 @@ import (
 //	A2A_LIVE_KUBE_CONTEXT      pin --context on every kubectl call
 //	A2A_LIVE_NAMESPACE         default kubeagents-system
 //	A2A_LIVE_WORKER_IMAGE      default worker-next:latest in the a2a-demo registry
+//	A2A_LIVE_SESSION_SA        default platform-agent-a2a-session; the KSA the
+//	                           session pod authenticates to the bus as
 func TestLiveWorkerPodOnInstall(t *testing.T) {
 	url := os.Getenv("A2A_LIVE_NATS_URL")
 	if url == "" {
@@ -200,25 +203,43 @@ sleep 90
 		}
 	})
 
-	// The bus credential must not reach the harness, demonstrated rather than
-	// read off the code. The harness here is a script that reports what its
-	// own environment holds, through the same result channel a real harness
-	// uses, so the assertion runs against what the subprocess actually got.
+	// What the harness can and cannot reach, reported by the harness itself
+	// through the same result channel a real one uses, so every assertion
+	// below runs against what the subprocess actually got rather than against
+	// what the code is supposed to hand it.
 	//
-	// A marker rides in the pod env beside the password, which is what makes
-	// this a demonstration rather than an absence: the marker arriving proves
-	// the pod env reached the harness at all, so the password being missing
-	// is the filter working and not an empty environment.
-	t.Run("TheBusCredentialDoesNotReachTheHarness", func(t *testing.T) {
+	// Four things at once, and they are not all the same kind of claim:
+	//
+	//   - The marker arrives. That is what makes the rest a demonstration
+	//     rather than an absence: the pod env reached the harness at all, so
+	//     a name being missing is a filter and not an empty environment.
+	//   - NATS_URL is in the pod env and is missing from the harness env.
+	//     This is the withholding mechanism itself under live test, and it is
+	//     the only one of these a filter bug could break.
+	//   - NATS_PASSWORD is missing because the pod no longer carries one at
+	//     all. That is gke-labs#1270's statement, and it is a pod-shape fact:
+	//     this run would report the same thing if the filter were deleted.
+	//   - The token file IS readable, asserted on purpose. The harness runs
+	//     at the session pod's UID, so it can read the projected token as
+	//     easily as it could read /proc/1/environ. Pinning that here keeps
+	//     anyone from later reading "it is a file now" as a boundary. What
+	//     changed is not reachability, it is what the credential is worth:
+	//     the token authorises this pod's own subjects and nothing else,
+	//     which is what the callout suite proves and item 10 shows live.
+	t.Run("TheHarnessSeesNoBusEnvAndTheTokenFileIsNotAFence", func(t *testing.T) {
 		session := "chat-live-" + liveSuffix(6)
 		taskID := "task-live-" + liveSuffix(8)
 		script := `echo '{"type":"system","subtype":"init","session_id":"live-env"}'
 read first || exit 1
 SAW_PASSWORD=absent
 if [ -n "${NATS_PASSWORD:-}" ]; then SAW_PASSWORD=PRESENT; fi
+SAW_URL=absent
+if [ -n "${NATS_URL:-}" ]; then SAW_URL=PRESENT; fi
 SAW_MARKER=absent
 if [ -n "${A2A_LIVE_ENV_MARKER:-}" ]; then SAW_MARKER="$A2A_LIVE_ENV_MARKER"; fi
-printf '{"type":"result","subtype":"success","result":"password=%s marker=%s"}\n' "$SAW_PASSWORD" "$SAW_MARKER"
+SAW_TOKEN=unreadable
+if [ -r ` + lib.BusTokenPath + ` ]; then SAW_TOKEN=readable; fi
+printf '{"type":"result","subtype":"success","result":"password=%s url=%s marker=%s token=%s"}\n' "$SAW_PASSWORD" "$SAW_URL" "$SAW_MARKER" "$SAW_TOKEN"
 `
 
 		liveSubmit(t, ctx, c, session, taskID, "report your environment")
@@ -229,10 +250,17 @@ printf '{"type":"result","subtype":"success","result":"password=%s marker=%s"}\n
 		t.Logf("the harness reported: %s", result)
 
 		if !strings.Contains(result, "marker=live-marker-ok") {
-			t.Errorf("the marker did not reach the harness (%q), so this run proves nothing about the password", result)
+			t.Errorf("the marker did not reach the harness (%q), so this run proves nothing about what was filtered", result)
+		}
+		if !strings.Contains(result, "url=absent") {
+			t.Errorf("the adapter passed its bus address to the harness: %q", result)
 		}
 		if !strings.Contains(result, "password=absent") {
-			t.Errorf("the bus credential reached the harness: %q", result)
+			t.Errorf("a bus password reached the harness, so something is still injecting one: %q", result)
+		}
+		if !strings.Contains(result, "token=readable") {
+			t.Errorf("the harness could not read %s (%q); either the pod shape changed or this test is no longer describing the real exposure",
+				lib.BusTokenPath, result)
 		}
 	})
 
@@ -317,14 +345,15 @@ func livePod(t *testing.T, kubeContext, namespace, image, session, taskID string
 // window it tests - between the adapter choosing its deliverable and the
 // harness exiting - is a fraction of a second behind the real model and
 // cannot be aimed at from outside the pod. Everything else stays real: the
-// install, the bus, the deny-by-default grants, the worker credential, and
-// the adapter binary out of the shipped image.
+// install, the bus, the deny-by-default grants, the session's own pod-bound
+// credential, and the adapter binary out of the shipped image.
 //
 // The script arrives by ConfigMap rather than through A2A_HARNESS_CMD
 // directly because that variable is split with strings.Fields, which no
 // amount of quoting survives.
 func livePodWithScript(t *testing.T, kubeContext, namespace, image, session, taskID, script string) {
 	t.Helper()
+	sessionSA := envOr("A2A_LIVE_SESSION_SA", "platform-agent-a2a-session")
 	var extra, scriptObjects, scriptMount, scriptVolume string
 	if script != "" {
 		var indented strings.Builder
@@ -361,6 +390,7 @@ metadata:
     a2a.kubeagents.dev/addressee: %s
 spec:
   restartPolicy: Never
+  serviceAccountName: %s
   automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
@@ -375,15 +405,12 @@ spec:
           value: chat
         - name: NATS_URL
           value: nats://platform-agent-a2a-nats.%s.svc:4222
-        - name: NATS_USER
-          value: worker
-        - name: NATS_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: platform-agent-a2a-nats-creds
-              key: worker-password
         - name: A2A_SESSION
           value: %s
+        - name: %s
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: A2A_LIVE_ENV_MARKER
           value: live-marker-ok%s
       resources:
@@ -393,16 +420,28 @@ spec:
         capabilities: { drop: ["ALL"] }
       volumeMounts:
         - name: scratch
-          mountPath: /scratch%s
+          mountPath: /scratch
+        - name: bus-token
+          mountPath: %s
+          readOnly: true%s
   volumes:
     - name: scratch
-      emptyDir: {}%s
-`, session, namespace, taskID, session, image, taskID, namespace, session, extra, scriptMount, scriptVolume)
-	path := filepath.Join(t.TempDir(), "pod.yaml")
-	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+      emptyDir: {}
+    - name: bus-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: %s
+              expirationSeconds: 3600
+              path: %s%s
+`, session, namespace, taskID, session, sessionSA, image, taskID, namespace, session,
+		lib.EnvPodName, extra, path.Dir(lib.BusTokenPath), scriptMount,
+		lib.BusTokenAudience, path.Base(lib.BusTokenPath), scriptVolume)
+	manifestPath := filepath.Join(t.TempDir(), "pod.yaml")
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("kubectl", "--context", kubeContext, "-n", namespace, "apply", "-f", path).CombinedOutput()
+	out, err := exec.Command("kubectl", "--context", kubeContext, "-n", namespace, "apply", "-f", manifestPath).CombinedOutput()
 	if err != nil {
 		t.Fatalf("pod apply: %v\n%s", err, out)
 	}

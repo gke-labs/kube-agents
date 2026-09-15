@@ -23,9 +23,33 @@ import (
 // env (spec-subagent-profiles.md: "Env is minimal" - the task content itself
 // is fetched from the stream, never passed through the pod spec).
 type Config struct {
-	NATSURL      string
+	NATSURL string
+
+	// NATSUser/NATSPassword are the static-credential path. Nothing in this
+	// repo spawns a worker with them any more — the gateway's spawner is the
+	// only thing that creates a session pod, and it stopped: that is
+	// gke-labs#1270, and BusTokenFile is what replaced them. The path stays
+	// for a run by hand against a bus with no callout in front of it, which
+	// is still a bus this deployment renders. When the last static user goes
+	// from nats.conf, these go with it.
 	NATSUser     string
 	NATSPassword string
+
+	// BusTokenFile is the projected ServiceAccount token the pod
+	// authenticates with, audience-bound to the bus and bound by the kubelet
+	// to this pod. Set, it wins over NATSUser: the callout derives this
+	// session's grants from the pod the API server attests, so the identity
+	// is the pod rather than anything this process was told.
+	BusTokenFile string
+
+	// PodName is the pod's own name from the downward API, and under the
+	// callout it is the identity: the NATS user is named for it and the
+	// grants — subjects, consumer names, inbox prefix — are all built from
+	// it. It equals Session by construction (the gateway names the pod after
+	// the bus session), and the adapter checks that rather than trusting
+	// either, because a mismatch is silent: the connection succeeds and
+	// every reply goes to an inbox the grants do not cover.
+	PodName string
 
 	// TaskID names the one task this process exists for.
 	TaskID string
@@ -60,6 +84,31 @@ func (c Config) Addressee() string {
 	return c.Profile
 }
 
+// validate refuses a configuration whose failure mode is a hang.
+//
+// Both checks here are for combinations that connect successfully and then go
+// quiet, which is the hardest thing in this system to diagnose from the
+// outside: a wrong inbox prefix means every JetStream call and every request
+// waits out its timeout with no error anywhere.
+func (c Config) validate() error {
+	if c.BusTokenFile == "" {
+		return nil
+	}
+	if c.PodName == "" {
+		return fmt.Errorf("a bus token file is set but %s is not; the inbox prefix the callout grants is named for the pod, and without it every reply times out", lib.EnvPodName)
+	}
+	// Empty is the same failure as mismatched, and quieter: Addressee falls
+	// back to Profile, so the adapter publishes as `chat` while its grants are
+	// derived from the pod. The spawner always sets A2A_SESSION, which is why
+	// this is defence in depth rather than a live bug -- but it is the one
+	// combination where the wrong addressee is a default rather than a typo.
+	if c.Session != c.PodName {
+		return fmt.Errorf("%s is %q but A2A_SESSION is %q; the callout derives this session's grants from the pod name, so publishing as %q would be refused and replies would never arrive",
+			lib.EnvPodName, c.PodName, c.Session, c.Addressee())
+	}
+	return nil
+}
+
 func (c *Config) applyDefaults() {
 	if c.TaskDeadline <= 0 {
 		c.TaskDeadline = defaultTaskDeadline
@@ -90,6 +139,31 @@ const (
 	// two numbers that must agree, which is exactly why each one is named.
 	defaultTaskDeadline = 30 * time.Minute
 	defaultKillGrace    = 10 * time.Second
+
+	// consumerInactiveThreshold reaps a session's named consumers when the
+	// pod goes. Named consumers replaced ordered ones (see sessionConsumer),
+	// and a named ephemeral is only ephemeral because of this: without it a
+	// reaped session leaves three consumers on TASKS forever, and the
+	// successor incarnation — which mints a fresh name — leaves three more.
+	//
+	// nats.go's ordered consumers use five seconds and the same number is
+	// used here, but NOT because the threshold only fires after the pod is
+	// gone -- an earlier version of this comment claimed that and it is not
+	// true. A disconnect longer than five seconds reaps these consumers with
+	// the adapter still very much alive, and because they are MemoryStorage
+	// with Replicas 1 a nats-server restart destroys them outright. Both are
+	// routine. What makes the short threshold safe is not that the window
+	// never opens; it is that consumeIn supervises its own consumer and
+	// rebuilds it when it does.
+	consumerInactiveThreshold = 5 * time.Second
+
+	// inRecreateAttempts and inRecreateBackoff bound the in consumer's
+	// recovery after the server drops it. Five seconds apart for a minute is
+	// sized against the thing being waited for -- a nats-server restart, not
+	// a network blip -- and against the alternative, which is a task that
+	// runs to its 30-minute deadline with steer and cancel silently dead.
+	inRecreateAttempts = 12
+	inRecreateBackoff  = 5 * time.Second
 
 	// originFetchDeadline bounds the wait for the submitting envelope; a pod
 	// that starts before its own task message is the case it exists for.
@@ -151,6 +225,9 @@ type adapter struct {
 // "Evicted").
 func Run(ctx context.Context, cfg Config) (Result, error) {
 	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		return Result{}, err
+	}
 	log := cfg.Logger
 	a := &adapter{cfg: cfg, log: log, appended: map[string]bool{}}
 	a.from = lib.Party{Session: cfg.Addressee(), AgentType: "claude-code", Profile: cfg.Profile}
@@ -158,13 +235,47 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// Two connections, the bridge's split: the lib client owns validated
 	// publishes and replay-fold; the raw JetStream handle owns the ordered
 	// consumers the lib doesn't expose (origin fetch, live in-subject).
-	natsOpts := []nats.Option{nats.Name("worker-adapter-" + cfg.Addressee())}
-	if cfg.NATSUser != "" {
+	natsOpts := []nats.Option{
+		nats.Name("worker-adapter-" + cfg.Addressee()),
+		// Permission violations are asynchronous, and under the callout that
+		// makes them nearly invisible: a refused $JS.API publish gets no
+		// reply, so the JetStream call does not fail — it waits out its
+		// context while the actual reason sits unread on the error handler.
+		// The first symptom is a task that does nothing for thirty seconds
+		// and then reports a deadline, which names the wrong problem.
+		//
+		// This does not fix the wait. It makes the reason appear at the
+		// moment of refusal, naming the subject, which is the difference
+		// between "the bus is slow" and "this session was not granted
+		// CONSUMER.CREATE on that name".
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			subject := ""
+			if sub != nil {
+				subject = sub.Subject
+			}
+			if errors.Is(err, nats.ErrPermissionViolation) || errors.Is(err, nats.ErrAuthorization) {
+				log.Error("the bus refused this session", "err", err, "subject", subject,
+					"session", cfg.Addressee(), "pod", cfg.PodName)
+				return
+			}
+			log.Warn("nats async error", "err", err, "subject", subject)
+		}),
+	}
+	switch {
+	case cfg.BusTokenFile != "":
+		// The per-session credential. The inbox owner is the pod name, which
+		// validate() has already checked against A2A_SESSION.
+		tokenOpts, err := lib.KSATokenNATSOptions(cfg.BusTokenFile, cfg.PodName)
+		if err != nil {
+			return Result{}, err
+		}
+		natsOpts = append(natsOpts, tokenOpts...)
+	case cfg.NATSUser != "":
 		natsOpts = append(natsOpts,
 			nats.UserInfo(cfg.NATSUser, cfg.NATSPassword),
-			// Push-delivery JS API replies ride the per-user inbox prefix;
-			// without this every JS call times out under the deny-by-default
-			// grants — measured on the install, not inferred.
+			// JS API replies ride the per-user inbox prefix; without this
+			// every JS call times out under the deny-by-default grants —
+			// measured on the install, not inferred.
 			nats.CustomInboxPrefix("_INBOX."+cfg.NATSUser))
 	}
 	c, err := lib.Connect(ctx, cfg.NATSURL, lib.WithLogger(log), lib.WithNATSOptions(natsOpts...))
@@ -197,23 +308,20 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// re-run (the dispatcher rule, worn by the executor while there is no
 	// dispatcher). Nothing is published.
 	skipSubmitted := false
-	switch task, err := c.TasksGet(ctx, cfg.Addressee(), cfg.TaskID); {
-	case err == nil && task.Final:
+	switch prior, err := a.priorEvents(ctx); {
+	case err != nil:
+		return Result{}, fmt.Errorf("terminal check for %s: %w", cfg.TaskID, err)
+	case prior != nil && prior.Final:
 		log.Warn("task already terminal on the stream; refusing to re-run",
-			"task", cfg.TaskID, "state", task.State)
+			"task", cfg.TaskID, "state", prior.State)
 		return Result{}, nil
-	case err == nil:
+	case prior != nil:
 		// Events exist but no terminal: a predecessor incarnation died
 		// mid-task and the supervisor has not swept it yet. Publishing a
 		// second submitted would lie about the lifecycle; resume at working.
 		log.Warn("task has prior non-final events; resuming without submitted",
-			"task", cfg.TaskID, "state", task.State)
+			"task", cfg.TaskID, "state", prior.State)
 		skipSubmitted = true
-	default:
-		var a2aErr *lib.A2AError
-		if !errors.As(err, &a2aErr) || a2aErr.Code != lib.CodeTaskNotFound {
-			return Result{}, fmt.Errorf("terminal check for %s: %w", cfg.TaskID, err)
-		}
 	}
 
 	exec, err := c.NewTaskExecution(origin, a.from, cfg.Addressee())
@@ -682,6 +790,108 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	return err
 }
 
+// sessionConsumer creates one of the adapter's three consumers, by name.
+//
+// Named, not ordered, and the reason is a permission rather than a preference.
+// Under per-session credentials a consumer name is a subject token in the
+// grant $JS.API.CONSUMER.MSG.NEXT.TASKS.<name>, and a wildcard there would let
+// any session pull from — or delete — any consumer on the stream whose name it
+// could guess, the gateway's own gateway-relay durable included. So the grant
+// pins exact names, and nats.go's ordered consumers cannot be used: the library
+// names them <prefix>_<serial>, which no exact grant can cover.
+//
+// The filter subject rides the CREATE subject when exactly one is set
+// (nats.go's apiConsumerCreateWithFilterSubjectT), which is what lets the
+// callout pin the filter into the grant itself — so a consumer this session is
+// allowed to create can only ever read this session's own subjects. Setting
+// FilterSubjects (plural) instead would move the filter into the request body,
+// where no subject permission can see it. That is not a style choice; it is
+// the difference between a scoped consumer and an unscoped one.
+func (a *adapter) sessionConsumer(ctx context.Context, role, filter string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
+	cfg.Name = lib.SessionConsumerName(a.cfg.Addressee(), role)
+	cfg.FilterSubject = filter
+	cfg.FilterSubjects = nil
+	// Ack-none: the adapter reads a durable stream it does not own and its
+	// own dedup set is what makes delivery exactly once per envelopeId. No
+	// acks also means no $JS.ACK grant, which is one fewer subject a session
+	// can reach.
+	cfg.AckPolicy = jetstream.AckNonePolicy
+	cfg.InactiveThreshold = consumerInactiveThreshold
+	cfg.MemoryStorage = true
+	cfg.Replicas = 1
+	return a.js.CreateOrUpdateConsumer(ctx, lib.TasksStream, cfg)
+}
+
+// priorEvents answers the respawn question — has this task already run? — by
+// folding the executor's own events subject, or nil when there are none.
+//
+// It used to be lib.TasksGet, which is a fuller answer and an unreachable one:
+// TasksGet calls STREAM.INFO and GetLastMsgForSubject, and neither is a
+// subject-scoped operation. STREAM.INFO with a subjects filter enumerates every
+// addressee on the bus and a get-by-subject reads any subject in the stream, so
+// a session able to make those calls could read the whole task plane. The
+// grants withhold both. What is reachable is a consumer on this session's own
+// events subject, which is where the answer was all along.
+//
+// The fold itself is lib.FoldTask, behind the same poison screens the replay
+// path uses: one hostile or foreign write on the subject must not turn a
+// perfectly runnable task into a boot failure.
+func (a *adapter) priorEvents(ctx context.Context) (*lib.Task, error) {
+	subject := lib.TaskEventsSubject(a.cfg.Addressee(), a.cfg.TaskID)
+	name := lib.SessionConsumerName(a.cfg.Addressee(), lib.SessionConsumerEvents)
+	cons, err := a.sessionConsumer(ctx, lib.SessionConsumerEvents, subject, jetstream.ConsumerConfig{
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("events consumer on %s: %w", subject, err)
+	}
+	// Best effort: the inactivity threshold reaps it anyway, and a delete
+	// that fails must not fail the task.
+	defer func() { _ = a.js.DeleteConsumer(ctx, lib.TasksStream, name) }()
+
+	// FetchNoWait drains what the stream holds now and stops. A task still
+	// emitting is not a case here: this runs before the adapter has published
+	// anything, so whatever is present belongs to a predecessor.
+	var events []*lib.Envelope
+	for {
+		batch, err := cons.FetchNoWait(originFetchBatch)
+		if err != nil {
+			return nil, fmt.Errorf("events fetch on %s: %w", subject, err)
+		}
+		n := 0
+		for msg := range batch.Messages() {
+			n++
+			env, perr := lib.ParseEnvelope(msg.Data())
+			switch {
+			case perr != nil:
+				a.log.Error("respawn check skipping unparseable event", "subject", subject, "err", perr)
+			case env.Kind != lib.KindStatusUpdate && env.Kind != lib.KindArtifactUpdate:
+				a.log.Error("respawn check skipping non-event kind", "subject", subject, "kind", env.Kind)
+			case env.TaskID != a.cfg.TaskID:
+				a.log.Error("respawn check skipping event for another task", "subject", subject, "taskId", env.TaskID)
+			case env.To != nil && env.To.Session != a.cfg.Addressee():
+				a.log.Error("respawn check skipping to/addressee mismatch", "subject", subject, "to", env.To.Session)
+			default:
+				events = append(events, env)
+			}
+		}
+		if err := batch.Error(); err != nil {
+			return nil, fmt.Errorf("events batch on %s: %w", subject, err)
+		}
+		if n < originFetchBatch {
+			break
+		}
+	}
+	if len(events) == 0 {
+		return nil, nil
+	}
+	task, err := lib.FoldTask(a.cfg.TaskID, events)
+	if err != nil {
+		return nil, fmt.Errorf("folding prior events for %s: %w", a.cfg.TaskID, err)
+	}
+	return task, nil
+}
+
 // fetchOrigin reads the task's originating kind:message envelope off the
 // TASKS stream by subject and returns it with its stream sequence.
 func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error) {
@@ -690,9 +900,8 @@ func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error
 	// One consumer for the whole wait. Creating it per iteration left up to
 	// sixty ephemeral consumers on TASKS behind a slow pod start, each living
 	// until its inactivity threshold.
-	cons, consErr := a.js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{subject},
-		DeliverPolicy:  jetstream.DeliverAllPolicy,
+	cons, consErr := a.sessionConsumer(ctx, lib.SessionConsumerOrigin, subject, jetstream.ConsumerConfig{
+		DeliverPolicy: jetstream.DeliverAllPolicy,
 	})
 	for {
 		if consErr == nil {
@@ -727,32 +936,193 @@ func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error
 		case <-time.After(originFetchPoll):
 		}
 		if consErr != nil {
-			cons, consErr = a.js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{
-				FilterSubjects: []string{subject},
-				DeliverPolicy:  jetstream.DeliverAllPolicy,
+			cons, consErr = a.sessionConsumer(ctx, lib.SessionConsumerOrigin, subject, jetstream.ConsumerConfig{
+				DeliverPolicy: jetstream.DeliverAllPolicy,
 			})
 		}
 	}
 }
 
-// consumeIn opens the executor's ephemeral consumer on the task's in subject
-// just after the submission - the dual-reader rule's executor half. Steers
-// (kind:message) and cancel land here. Delivery to the harness is exactly
-// once per envelopeId (assertion 21): the ordered consumer replays without
-// acks, and the dedup set absorbs republished duplicates.
+// consumeIn opens the executor's consumer on the task's in subject just after
+// the submission - the dual-reader rule's executor half. Steers (kind:message)
+// and cancel land here. Delivery to the harness is exactly once per envelopeId
+// (assertion 21): the consumer reads without acks, and the dedup set absorbs
+// republished duplicates, including the ones a reconnect replays.
+//
+// It supervises its own consumer, which a named consumer needs and an ordered
+// one does not. sessionConsumer explains why these cannot be ordered; the cost
+// of that is here. nats.go's ordered consumers reset themselves on
+// ErrConsumerDeleted, ErrNoHeartbeat and reconnect (ordered.go), recreating at
+// the last delivered sequence. A named pull consumer gets the opposite
+// treatment: pull.go classifies ErrConsumerDeleted as terminal and, with no
+// ConsumeErrHandler set, calls Stop() on the subscription and returns --
+// silently, with nothing logged and nothing closed that the caller can select
+// on. The raw nats.Conn reconnects, the harness keeps running to TaskDeadline,
+// and every steer and cancel published meanwhile sits unread in TASKS while
+// finalize publishes a clean terminal over the top. A lost cancel that looks
+// like a completed task is the worst shape this failure could take.
+//
+// It is not an exotic case. These consumers are MemoryStorage with Replicas 1,
+// so a nats-server restart destroys them outright, and InactiveThreshold is
+// five seconds, so any disconnect longer than that reaps them without one.
+// Server restarts are routine by spec-nats-deployment.md, and NR-4 wants the
+// recreate-or-bind decision after a reconnect made explicitly. This is that
+// decision: recreate, from the sequence after the last message actually
+// handled, so nothing between the old consumer's death and the new one's start
+// is skipped. Redelivery across the seam is what the dedup set is for.
 func (a *adapter) consumeIn(ctx context.Context, startSeq uint64, originEnvelopeID string, steerCh chan<- string, cancelCh chan<- struct{}) (func(), error) {
 	subject := lib.TaskInSubject(a.cfg.Addressee(), a.cfg.TaskID)
-	cons, err := a.js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{subject},
-		DeliverPolicy:  jetstream.DeliverByStartSequencePolicy,
-		OptStartSeq:    startSeq,
+	seen := map[string]bool{originEnvelopeID: true}
+	var seenMu sync.Mutex
+	// nextSeq is the resume point: one past the last message handled, so a
+	// recreate picks up where the dead consumer left off rather than at the
+	// task's start. Guarded because the supervisor reads it while the
+	// Consume callback writes it.
+	var seqMu sync.Mutex
+	nextSeq := startSeq
+	handler := func(msg jetstream.Msg) {
+		if md, mdErr := msg.Metadata(); mdErr == nil {
+			seqMu.Lock()
+			if md.Sequence.Stream >= nextSeq {
+				nextSeq = md.Sequence.Stream + 1
+			}
+			seqMu.Unlock()
+		}
+		a.handleInMsg(msg, subject, seen, &seenMu, steerCh, cancelCh)
+	}
+
+	// The first consumer is created synchronously: a task whose in subject
+	// cannot be opened at all has not started, and the caller needs that as
+	// an error rather than as a goroutine that fails later.
+	cons, err := a.sessionConsumer(ctx, lib.SessionConsumerIn, subject, jetstream.ConsumerConfig{
+		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:   nextSeq,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("in consumer: %w", err)
 	}
-	seen := map[string]bool{originEnvelopeID: true}
-	var seenMu sync.Mutex
-	cc, err := cons.Consume(func(msg jetstream.Msg) {
+
+	superCtx, stopSuper := context.WithCancel(ctx)
+	// Buffered by one: the error handler must never block the nats.go
+	// callback it runs on, and only the first terminal error of a given
+	// consumer matters -- the supervisor replaces the whole thing.
+	dead := make(chan error, 1)
+	errHandler := func(_ jetstream.ConsumeContext, cErr error) {
+		// Non-terminal errors reach here too (missed heartbeats that
+		// recovered, leadership changes). They are worth a line and not a
+		// recreate; only the terminal ones take the consumer down, and
+		// pull.go has already stopped the subscription by the time we see
+		// one, so the supervisor's job is to notice, not to race it.
+		if errors.Is(cErr, jetstream.ErrConsumerDeleted) || errors.Is(cErr, jetstream.ErrConsumerNotFound) ||
+			errors.Is(cErr, jetstream.ErrNoHeartbeat) || errors.Is(cErr, nats.ErrNoResponders) {
+			select {
+			case dead <- cErr:
+			default:
+			}
+			return
+		}
+		a.log.Warn("in consumer reported a non-terminal error", "task", a.cfg.TaskID, "err", cErr)
+	}
+
+	cc, err := cons.Consume(handler, jetstream.ConsumeErrHandler(errHandler))
+	if err != nil {
+		stopSuper()
+		return nil, fmt.Errorf("consume in subject: %w", err)
+	}
+
+	var ccMu sync.Mutex
+	current := cc
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-superCtx.Done():
+				return
+			case cErr := <-dead:
+				seqMu.Lock()
+				resume := nextSeq
+				seqMu.Unlock()
+				// Loud on purpose. The silence is the defect; a steer
+				// dropped while this recovers must at least be findable
+				// afterwards.
+				a.log.Error("in consumer died; recreating",
+					"task", a.cfg.TaskID, "resumeSeq", resume, "err", cErr)
+				ccMu.Lock()
+				current.Stop()
+				ccMu.Unlock()
+				next, rErr := a.recreateIn(superCtx, subject, resume, handler, errHandler)
+				if rErr != nil {
+					if superCtx.Err() != nil {
+						return
+					}
+					// Nothing left to try that would not be a second
+					// implementation of the retry above it. Say so once,
+					// at the level that says steers are gone.
+					a.log.Error("in consumer could not be recreated; steer and cancel are dead for this task",
+						"task", a.cfg.TaskID, "err", rErr)
+					return
+				}
+				ccMu.Lock()
+				current = next
+				ccMu.Unlock()
+				a.log.Info("in consumer recreated", "task", a.cfg.TaskID, "resumeSeq", resume)
+			}
+		}
+	}()
+
+	return func() {
+		stopSuper()
+		<-done
+		ccMu.Lock()
+		current.Stop()
+		ccMu.Unlock()
+	}, nil
+}
+
+// recreateIn rebuilds the in consumer after the server dropped it, retrying
+// while the task is still running.
+//
+// The retry budget is the reconnect budget: a consumer is most often lost
+// because the server went away, so the first several attempts are expected to
+// fail with no responders and the useful behaviour is to keep asking until the
+// bus is back. It is bounded rather than infinite so that a permission change
+// mid-task -- a revoked CONSUMER.CREATE grant -- produces a log line and a
+// stop instead of a goroutine hammering the bus for the rest of the deadline.
+func (a *adapter) recreateIn(ctx context.Context, subject string, resume uint64, handler jetstream.MessageHandler, errHandler jetstream.ConsumeErrHandlerFunc) (jetstream.ConsumeContext, error) {
+	var lastErr error
+	for attempt := range inRecreateAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(inRecreateBackoff):
+			}
+		}
+		cons, err := a.sessionConsumer(ctx, lib.SessionConsumerIn, subject, jetstream.ConsumerConfig{
+			DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+			OptStartSeq:   resume,
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		cc, err := cons.Consume(handler, jetstream.ConsumeErrHandler(errHandler))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return cc, nil
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", inRecreateAttempts, lastErr)
+}
+
+// handleInMsg is the body of the in subject's Consume callback, lifted out so
+// that the consumer can be recreated around it without the handler being
+// rebuilt: the dedup set has to survive the recreate, or a redelivered steer
+// is applied twice.
+func (a *adapter) handleInMsg(msg jetstream.Msg, subject string, seen map[string]bool, seenMu *sync.Mutex, steerCh chan<- string, cancelCh chan<- struct{}) {
+	{
 		env, err := lib.ParseEnvelope(msg.Data())
 		if err != nil {
 			a.log.Error("a2a envelope rejected on in subject", "subject", subject, "err", err)
@@ -802,11 +1172,7 @@ func (a *adapter) consumeIn(ctx context.Context, startSeq uint64, originEnvelope
 		default:
 			a.log.Warn("unexpected kind on in subject", "kind", env.Kind)
 		}
-	})
-	if err != nil {
-		return nil, fmt.Errorf("consume in subject: %w", err)
 	}
-	return cc.Stop, nil
 }
 
 // promptFromOrigin joins the submission's text parts into the opening

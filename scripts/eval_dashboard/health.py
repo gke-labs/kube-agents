@@ -15,13 +15,16 @@ written health.json in -- and, when the hourly seeded-fleet scan has
 published one, fixture-state.json (scripts/eval_dashboard/fixture_state.py)
 -- health.json out::
 
-    {state, since, cause, failing_cases, evidence, advice, metrics, generated_at}
+    {state, since, cause, failing_cases, evidence, advice, slow, metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
 constants below -- each names the incident it was tuned on -- and the state
 machine that applies hysteresis to them is `transition`. The previous state
 is an input (`--prev`) rather than something remembered, so the scheduled
-job that runs this is stateless between ticks.
+job that runs this is stateless between ticks. `slow` is the one finding
+that is not a state: a gate whose green runs take far longer than usual
+(rule 7, #1586) is a note the poster sends once and the Brief shows, while
+the state stays what the rules above say.
 
 The credibility test is the replay: `--replay` walks a data.json as if the
 job had run every `--step` and prints the state timeline, and
@@ -268,6 +271,37 @@ EVIDENCE_MAX_PRS = 6
 # risk in the other direction).
 TRANSITION_MIN_RUNS = 3
 RECOVERY_GREEN_RUNS = 3
+
+# --- Rule 7: slow gate -> a note beside the state, never a state (#1586) ------
+# Incident: on 2026-09-14 Vertex latency (per call p90 21 s, p99 84 s in a
+# sampled run; every 429 retried successfully) stretched full runs from a
+# typical 150 minutes to 175-215 while all of them stayed green. Rules 1-3b
+# see nothing: no repetition was lost, no case was shared, and the 23 runs in
+# flight never reach this module, which reads finished runs only. So the
+# slowness is a note in health.json (`slow`), posted once per episode and
+# shown on the Brief, and the state stays whatever the rules say: nothing is
+# broken and /retest does not help.
+#
+# The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
+# concluded run of at least SLOW_MIN_TASKS cases (the presubmit runs 18; a
+# run Prow cut short at its ceiling recorded fewer and is not one) -- all of
+# them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
+# of the full runs of the trailing SLOW_BASELINE before them, given at least
+# SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue
+# proposed: replayed over the published data.json, "three consecutive runs
+# above the seven-day p90" never fired on 2026-09-14 (the p90 stood at 198
+# minutes because 09-08 to 09-11 had been slow too, and 3 of the day's 12
+# finished runs cleared it), while the 1.2x median fired from 18:00Z and
+# stayed quiet over 09-06 to 09-09 and the 09-12/13 weekend. Once slow, the
+# note holds until the median is back under SLOW_CLEAR_FACTOR, so a ratio
+# hovering at the bar is one episode rather than a note every tick.
+SLOW_RUNS = 5
+SLOW_WINDOW = timedelta(hours=6)
+SLOW_MIN_TASKS = 15
+SLOW_BASELINE = timedelta(days=7)
+SLOW_BASELINE_MIN_RUNS = 20
+SLOW_FACTOR = 1.2
+SLOW_CLEAR_FACTOR = 1.1
 
 # --- Roster ------------------------------------------------------------------
 # The admitted roster is the source of truth for what can red a pull request
@@ -871,6 +905,53 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     return out
 
 
+def slow_gate(full_runs, now: datetime, prev: dict | None) -> dict | None:
+    """Rule 7: the note's numbers while the gate is slow, else None.
+
+    `prev` is the previous tick's note (health.json's `slow`); an episode in
+    progress keeps its `since` and clears at SLOW_CLEAR_FACTOR rather than
+    SLOW_FACTOR. Wall clock is the run's finish minus its start, the same
+    measure as the digest's p50/p90.
+    """
+    concluded = [
+        run
+        for run in full_runs
+        if run.result in (RUN_SUCCESS, RUN_FAILURE) and len(run.tasks) >= SLOW_MIN_TASKS and run.wall_clock
+    ]
+    recent = concluded[-SLOW_RUNS:]
+    if len(recent) < SLOW_RUNS or recent[0].finished <= now - SLOW_WINDOW:
+        return None
+    baseline = [run.wall_clock.total_seconds() for run in concluded[:-SLOW_RUNS] if run.finished > now - SLOW_BASELINE]
+    if len(baseline) < SLOW_BASELINE_MIN_RUNS:
+        return None
+    typical = percentile(baseline, 50)
+    walls = [run.wall_clock.total_seconds() for run in recent]
+    median = percentile(walls, 50)
+    if median < (SLOW_CLEAR_FACTOR if prev else SLOW_FACTOR) * typical:
+        return None
+    return {
+        "since": (prev or {}).get("since") or iso(now),
+        "runs": len(recent),
+        "min_s": int(min(walls)),
+        "median_s": int(median),
+        "max_s": int(max(walls)),
+        "baseline_days": SLOW_BASELINE.days,
+        "baseline_runs": len(baseline),
+        "baseline_p50_s": int(typical),
+        "baseline_p90_s": int(percentile(baseline, 90)),
+        "infra_reps": sum(run.storm_reps for run in recent),
+    }
+
+
+def slow_evidence(slow: dict) -> str:
+    lost = f"{slow['infra_reps']} reps lost to infra" if slow["infra_reps"] else "no reps lost"
+    return (
+        f"slow gate: last {slow['runs']} full runs {slow['min_s'] // 60}–{slow['max_s'] // 60} min"
+        f" (median {slow['median_s'] // 60}) against a {slow['baseline_days']}-day typical of"
+        f" {slow['baseline_p50_s'] // 60} min (p90 {slow['baseline_p90_s'] // 60}); {lost}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Advice
 # --------------------------------------------------------------------------- #
@@ -1212,6 +1293,16 @@ def adjudicate(
     advice = advice_for(
         decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue, incident
     )
+    # Rule 7 rides beside the state, and only a GREEN one: inside a storm
+    # or an outage the long runs are the incident's symptom (429 retries
+    # stretch a run), and a note saying "not a break, /retest won't help"
+    # beside advice to retest after the storm would contradict it. The
+    # previous note is the only memory it needs; a health.json from before
+    # the field, or from a non-GREEN tick, has none, so an episode that
+    # outlasts an incident starts afresh when GREEN returns.
+    slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None) if decided["state"] == GREEN else None
+    if slow:
+        evidence.append(slow_evidence(slow))
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])
@@ -1236,6 +1327,7 @@ def adjudicate(
         "recovering": decided["recovering"],
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
+        "slow": slow,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),
@@ -1292,17 +1384,19 @@ def replay(data: dict, step: timedelta, roster: Roster, start: datetime | None =
 
 
 def timeline(ticks, every: bool = False) -> list[dict]:
-    """The state changes in a replay: [{at, state, cause, failing_cases}].
+    """The state changes in a replay: [{at, state, cause, failing_cases, slow}].
 
     A change is a new state, a new condition, or a new set of failing
-    cases within an OUTAGE -- the things the poster reacts to. A storm
-    window's bounds move every tick and are detail, not a change. `every`
-    keeps all ticks.
+    cases within an OUTAGE -- the things the poster reacts to -- and the
+    slow note (rule 7) appearing or clearing, since the poster reacts to
+    that too. A storm window's bounds move every tick and are detail, not
+    a change. `every` keeps all ticks.
     """
     out = []
     last = None
     for now, health in ticks:
-        key = (health["state"], health["condition"], tuple(health["failing_cases"]))
+        slow = health.get("slow") or None
+        key = (health["state"], health["condition"], tuple(health["failing_cases"]), bool(slow))
         if every or key != last:
             out.append(
                 {
@@ -1312,6 +1406,7 @@ def timeline(ticks, every: bool = False) -> list[dict]:
                     "cause": health["cause"],
                     "failing_cases": health["failing_cases"],
                     "recovering": health["recovering"],
+                    "slow": {"since": slow["since"], "median_s": slow["median_s"], "baseline_p50_s": slow["baseline_p50_s"]} if slow else None,
                 }
             )
             last = key
@@ -1322,6 +1417,9 @@ def format_timeline(entries: list[dict]) -> str:
     lines = []
     for entry in entries:
         flag = " (recovering)" if entry["recovering"] else ""
+        slow = entry.get("slow")
+        if slow:
+            flag += f" (slow since {slow['since']}: median {slow['median_s'] // 60} min against {slow['baseline_p50_s'] // 60})"
         lines.append(f"{entry['at']}  {entry['state']:<8}  {entry['cause']}{flag}")
     return "\n".join(lines)
 

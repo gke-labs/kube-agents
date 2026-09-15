@@ -3,9 +3,11 @@
 // exists, and the thing the platform agent's a2a-topics skill shells out to.
 //
 // Playground posture: credentials are a static per-role NATS user in the
-// environment, because that is what the operator renders under mode: next.
-// The product answer is the auth callout minting a user per agent identity;
-// the subject grants this dials into are already the real ones.
+// environment. Not because the callout is future work - it is armed, and
+// session pods authenticate through it - but because this is a CLI, usually
+// hand-run at a port-forward by someone who has no pod and therefore no
+// projected token to present. The subject grants it dials into are the real
+// ones either way.
 package main
 
 import (

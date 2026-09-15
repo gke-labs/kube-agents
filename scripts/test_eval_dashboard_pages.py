@@ -193,6 +193,16 @@ class HealthInputsTest(unittest.TestCase):
         self.assertIsNone(full["since"])
         self.assertEqual(full["tracking_issues"], ["#1278"])
         self.assertEqual(full["incident"]["prs"], [1275, 1246])
+        # The slow-gate note: the five fields the Brief's sentence reads,
+        # each defaulted; the rest of the note is not carried.
+        self.assertIsNone(minimal["slow"])
+        note = {"since": "2026-09-14T18:00:00+00:00", "runs": 5, "median_s": 10984, "baseline_p50_s": 9085, "baseline_days": 7, "max_s": 12836, "infra_reps": 2}
+        self.assertEqual(
+            render.normalize_health(health_doc("GREEN", slow=note))["slow"],
+            {"since": "2026-09-14T18:00:00+00:00", "runs": 5, "median_s": 10984, "baseline_p50_s": 9085, "baseline_days": 7},
+        )
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
 
     def test_load_health_degrades_on_absent_or_broken_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -356,6 +366,13 @@ class RenderedFilesTest(unittest.TestCase):
             self.assertNotIn("__PAGES_JS__", index)
             self.assertNotIn("__INLINE_", index)
             self.assertNotIn("__BASE__", index)
+            # The logo is inlined twice, tab and header, so the page still
+            # makes no request beyond itself.
+            logo = render.logo_data_uri()
+            self.assertTrue(logo.startswith("data:image/jpeg;base64,/9j/"))
+            self.assertIn(f'<link rel="icon" type="image/jpeg" href="{logo}">', index)
+            self.assertIn(f'<img class="logo" src="{logo}" alt=""', index)
+            self.assertNotIn("__LOGO__", index)
             run_page = (out / "run.html").read_text()
             self.assertIn('data-page="run"', run_page)
             for name in ("grid.html", "cases.html", "nightly.html"):
@@ -413,8 +430,19 @@ class RenderedFilesTest(unittest.TestCase):
             out = render_to(pathlib.Path(tmp) / "bare", data, extra_args=["--public-url"])
             self.assertIn('<base href="https://storage.cloud.google.com/kube-agents-dashboards/evals/">', (out / "index.html").read_text())
             self.assertEqual(render.PUBLISHED_SITE + "/index.html", render.post_health.DASHBOARD_URL)
+            # A gs:// target derives <base href> using the published dashboard host.
+            out = render_to(pathlib.Path(tmp) / "gcs", data, extra_args=["--public-url", "gs://staging-bucket/test-evals/"])
+            self.assertIn('<base href="https://storage.cloud.google.com/staging-bucket/test-evals/">', (out / "index.html").read_text())
         self.assertEqual(render.base_html(None), "")
         self.assertEqual(render.base_html('https://h/"><script>'), '<base href="https://h/&quot;&gt;&lt;script&gt;/">')
+        self.assertEqual(
+            render.base_html("gs://staging-bucket/test-evals"),
+            '<base href="https://storage.cloud.google.com/staging-bucket/test-evals/">',
+        )
+        self.assertEqual(
+            render.base_html("gs://staging-bucket/test-evals/"),
+            '<base href="https://storage.cloud.google.com/staging-bucket/test-evals/">',
+        )
 
     def test_hostile_data_never_escapes_the_script_block(self):
         data = load_fixture()
@@ -571,6 +599,27 @@ class BrowserTest(unittest.TestCase):
         # the text post_health.dashboard_link writes for the same incident.
         self.assertIn('href="index.html#since=2026-09-07T14:00:00Z&amp;until=2026-09-08T01:00:00Z&amp;cases=' + ",".join(CRASHLOOP_TRIO) + '&amp;view=gate"', app)
         self.assertNotIn("index.html?", app)
+
+    def test_healthy_brief_says_when_the_gate_is_slow(self):
+        # health.py's rule-7 note (#1586), dated 8:00 AM ET on the page's
+        # Tuesday: one sentence in the healthy headline, nothing else moves.
+        note = {"since": "2026-09-08T12:00:00+00:00", "runs": 5, "min_s": 9161, "median_s": 10984, "max_s": 12836,
+                "baseline_days": 7, "baseline_runs": 264, "baseline_p50_s": 9085, "baseline_p90_s": 11919, "infra_reps": 2}
+        out = render_to(pathlib.Path(self.tmp.name) / "slow", self.data, health=health_doc("GREEN", slow=note))
+        app = dom_text(out / "index.html")
+        self.assertIn("Smoke gate is healthy", app)
+        sentence = "Runs are slow since Tue 8:00 AM ET: the last 5 full runs took a median of 183 min against a 7-day typical of 151. Nothing is broken; /retest won't make yours faster."
+        self.assertIn(sentence, app)
+        # The 🐢 message's own link lands on this headline, not on a
+        # synthetic past incident: a `since` at the note's GREEN start would.
+        fragment = "#" + render.post_health.render_slow(health_doc("GREEN", slow=note)).rsplit("#", 1)[1]
+        self.assertEqual(fragment, "#view=agent")
+        linked = dom_text(out / "index.html", fragment=fragment)
+        self.assertIn("Smoke gate is healthy", linked)
+        self.assertIn(sentence, linked)
+        self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
+        control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notslow", self.data, health=health_doc("GREEN")) / "index.html")
+        self.assertNotIn("Runs are slow", control)
 
     def test_healthy_brief_without_any_health_files(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohealth", self.data)

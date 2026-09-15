@@ -4,3 +4,10 @@ aliases:
     - fatoshoti
     - mateuszklinowski
     - mplakhtiy
+  # Who approves what runs and what blocks in the presubmit eval gate: the
+  # TASKS / NIGHTLY_TASKS / BOOTSTRAP_ADMITTED rosters in hack/ci-eval-pr.sh
+  # (hack/OWNERS) and the cases under bench/tasks/ (bench/tasks/OWNERS).
+  # Membership is Jayanti's to set (#1546).
+  eval-crew:
+    - jayantid
+    - lapis2002

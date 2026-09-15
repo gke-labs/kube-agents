@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu). Both are opt-in and default to disabled.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu). Both are opt-in and default to disabled.
 
 Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
@@ -42,10 +42,6 @@ Unlike Slack's, this one is not covered by `/sethome`. That command writes the *
 A card that also produced a file gets the file's contents pasted into the thread rather than attached: Chat's `media.upload` refuses app authentication, so an install reaching Chat through the credential proxy can never produce a native attachment. Text deliverables under a size ceiling are posted as message text, split across messages where they have to be; anything else — a PDF, an image, an oversize file — gets a notice naming the path the agent wrote it to instead. Which formats and what ceiling are in [`agents/platform/scripts/google_chat_relay_patch.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/google_chat_relay_patch.py).
 
 The agent has to declare the file for any of that to happen. Its terminal and file tools run in a separate sandbox pod, so a file it writes is on a volume the gateway cannot read; only paths the card names in its `artifacts` list get copied across to the gateway for delivery, and only for as long as the delivery takes. Four ceilings apply to that copy — 8 MiB per file, 16 files per card, 16 MiB across the card, and a two-minute deadline for the lot — and a file that exceeds one is skipped with a warning in the gateway log while the rest of the card still delivers. Paths under the sandbox's credential and system directories are refused outright. [`agents/platform/scripts/sandbox_artifact_patch.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/sandbox_artifact_patch.py) holds the limits and the denied prefixes.
-
-### E2E coverage
-
-The Google Chat path has an end-to-end integration test suite in [`tests/e2e/`](https://github.com/gke-labs/kube-agents/tree/main/tests/e2e). It runs a real Chat message through the deployed agent and asserts a valid reply, giving CI a signal on the full stack.
 
 ### Session metadata
 
@@ -104,7 +100,7 @@ Both jobs fire every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agent
 ## What's not here
 
 - **No web UI.** Chat is the primary surface.
-- **No CLI beyond port-forwarding to the Hermes API.** For debug you can `kubectl port-forward` to the agent pod and use the Hermes CLI directly — note the pod hosts several profiles, so a bare `hermes` command talks to the locked-down Planning Agent; use `hermes -p platform` to reach the Platform Agent (or `hermes -p <cluster-profile>` for a Cluster Agent). This isn't a user-facing pattern.
+- **No CLI beyond the Hermes CLI inside the pod.** For debug, `kubectl exec` into the agent pod and run the Hermes CLI there — note the pod hosts several profiles, so a bare `hermes` command talks to the locked-down Planning Agent; use `hermes -p platform` to reach the Platform Agent (or `hermes -p <cluster-profile>` for a Cluster Agent). `kubectl port-forward` is not a way in on a GKE Sandbox (gVisor) node pool, which is the install default: the forward is established in the host-side netns and cannot see a listener inside the sandbox — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical on that. This isn't a user-facing pattern.
 - **No email, PagerDuty, or generic webhook ingress.** Chat channels only.
 
 ## Where to go next

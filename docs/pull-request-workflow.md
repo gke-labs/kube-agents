@@ -122,6 +122,10 @@ that failure is why this step has previously been skipped rather than run.
 docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .
 ```
 
+`make docker-build-platform` runs the same build and supplies `HERMES_AGENT_TAG` from `tags.env`,
+the build argument the Dockerfile has no default for and the `Docker Build` CI job passes from the
+same file.
+
 Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE
 nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
 
@@ -139,7 +143,43 @@ ensure compilation succeeds.
 
 **A2A module code.** If you modify `a2a/`, run `go vet ./...` and `go test -race ./...` inside that
 directory — what the `A2A Module Tests` CI job runs. The conformance suite starts an embedded
-JetStream server, so no cluster or credentials are needed.
+JetStream server, so no cluster or credentials are needed. The CI job additionally installs the
+envtest binaries and the `nats` CLI; without them the auth callout's API-server and CLI cases skip
+and the run still reports green. To match it, run with
+`KUBEBUILDER_ASSETS="$(make -C ../k8s-operator -s envtest-path)"` — the path is relative to
+`a2a/`, and getting it wrong makes the substitution empty and the cases skip exactly as if it had
+not been set.
+
+**Image pins.** `images.json` is the source of truth for every image an install pulls, but a bump
+starts there and rarely ends there. Several images keep a second copy that the file is the source
+for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
+`make images-check` is what holds them in step. It covers every image the chart renders, on a
+default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
+bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
+`k8s-operator/go.mod`; the fluent-bit fallback baked into the operator binary; the example
+manifests; and the kustomize integrations, which it requires to name a variable the file owns
+rather than a literal. Two copies it does not reach, where a stale pin passes every check:
+Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
+`platformAgent.harness.memory.provider`, which no render turns on — so their pins in
+`charts/kube-agents/values.yaml` are unguarded; and cert-manager's version is set again in
+`terraform/examples/full-install/variables.tf`, which no check reads. So: bump the pin in
+`images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
+version before opening the pull request.
+
+**Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
+and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
+loop while you work:
+
+- `make validate` — the `Validate Repo Structure` job; fails if skills live under
+  `agents/*/defaults/skills/` instead of `agents/*/skills/`.
+- `make -C k8s-operator test` — manifests, generate, fmt, vet, the envtest download, the
+  operator's Python tests, then `go test`; what the `Operator Tests` job runs.
+- `make test-integration` — the seam tier only, for a component another one talks to across a
+  process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
+  Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints
+  `OK`. [`tests/integration/README.md`](../tests/integration/README.md) is the tier's contract;
+  [`testing-map.md`](testing-map.md) says which suite runs where.
+- `make docs-check`, plus `cd docs/site && npm ci && npm run build` if you touched `docs/site/`.
 
 ## The automated review
 
@@ -165,7 +205,8 @@ Poll on a schedule rather than continuously — nothing is worth checking in the
 once a minute. Expect the review by 15 minutes; at 30 with nothing posted, stop waiting and tell the
 user the bot dropped this one. Nothing retries on its own, so ask whether to spend a trigger — and
 say which: a review that goes missing was a first-review-width one, so `/review all` is what replaces
-it, and `/review` narrows the retry to what the bot is certain of.
+it, and `/review` narrows the retry to what the bot is certain of (plus any marked high-severity near
+miss).
 
 Two things make a wait read wrong:
 
@@ -282,15 +323,24 @@ The two labels are the two people:
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root, [`k8s-operator/OWNERS`](../k8s-operator/OWNERS)
-  for the operator, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `waw-leads`. An approver's
+  for the operator, [`bench/tasks/OWNERS`](../bench/tasks/OWNERS) for the eval cases and
+  [`hack/OWNERS`](../hack/OWNERS) for `hack/ci-eval-pr.sh` alone, with
+  [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `waw-leads` and `eval-crew`. The last two name
+  only `eval-crew` and set `no_parent_owners`, so a root approver's `/approve` does not clear
+  a change to a case or to the presubmit roster (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
   change from someone in `OWNERS` starts with the `approved` half already satisfied and waits only
   on the `lgtm` (#1075).
 
-Everyone `.github/auto_request_review.yml` can assign is also an `OWNERS` approver, so the reviewer
-the bot's green check summons is always someone who can clear both labels in one action. That is a
-property of two lists agreeing today, not a guarantee either file makes.
+Everyone `.github/auto_request_review.yml` can assign is an `OWNERS` approver for what it assigns
+them: its `bench/tasks/**` and `hack/ci-eval-pr.sh` entries send a change there to its own
+`eval-crew` group, so the reviewer the bot's green check summons can clear both labels in one
+action. Not every `eval-crew` member is a root approver, so a change that also touches root-owned
+paths still waits on a root approver's `/approve` after that review. The bot never requests the
+author, so a member's own case or roster change goes to the rest of the group, with the author's
+`approved` already on it (#1075). That is a property of two lists agreeing today — the alias in
+`OWNERS_ALIASES` and the group in the bot's config — not a guarantee either file makes.
 
 Before any of that, a pull request from an author Prow does not already trust is labelled
 `needs-ok-to-test`, and its Prow presubmits hold until a member comments `/ok-to-test`. It gates

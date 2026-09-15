@@ -138,6 +138,14 @@ To test the full autonomous triage loop against a live Platform Agent in Kuberne
    kubectl -n kubeagents-system port-forward deployment/platform-agent-gateway 8699:8699
    ```
 
+   This step needs an ordinary node pool. On a GKE Sandbox (gVisor) pool — the install default — the
+   forward is established in the host-side CNI netns while the Session KV server's loopback listener
+   lives in the sandbox's own network stack, so the connection is refused;
+   [PlatformAgent CRD](../../../docs/site/src/content/docs/operator/platformagent-crd.md#specharness)
+   is canonical on the constraint, and
+   [`scripts/exec_tunnel.py`](../../../scripts/exec_tunnel.py) relays the same port through
+   `kubectl exec`, which does enter the sandbox.
+
 2. Run the watcher with live-mode flags (`--token-env` and `--owner` are required in per-incident mode when not using `--dry-run`):
 
    ```bash

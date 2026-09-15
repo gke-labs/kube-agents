@@ -83,25 +83,34 @@ Deliberately NOT checked:
 - *cards stranded in ``ready``, stuck in ``blocked``, or failing repeatedly.*
   All three are strictly worse restatements of ``_rule_stranded_in_ready``,
   ``_rule_stuck_in_blocked`` and ``_rule_repeated_failures``, which are
-  event-keyed and config-derived. They arrive through (2) or not at all.
+  event-keyed and config-derived. They arrive through (2) or not at all — and
+  ``stuck_in_blocked`` always does, floor or no floor (see below).
 
-Not scheduled, on purpose. This ships as an operator/diagnostic tool rather
-than a cron job because the roster it belongs on would not carry its output to
-a human. It reads the board at ``$HERMES_HOME/kanban.db``, which is the Chat
-Agent's — so the Chat Agent's roster
-(``agents/chat/defaults/cron/jobs.json``) is where it would go, and all four
-jobs there declare ``deliver: local``, which
-``cron/scheduler.py::_resolve_delivery_targets`` resolves to an empty target
-list. A scheduled run would put these lines in the execution ledger and stop.
-The Platform Agent's roster is the one whose jobs declare ``deliver: "all"``,
-but that profile has its own cron store and no board to check. A health check
-whose output goes somewhere nobody reads is worse than none, because it reads
-as coverage. The script is written to the ``no_agent`` contract anyway (stdout
-is the whole message, silence means healthy, exit status is always 0), so
-registering it is a one-line roster addition the day there is a channel to
-send it to.
+Scheduled since #656, as ``kanban-board-health`` on the Platform Agent's roster
+(``agents/platform/cron/jobs.json``, ``deliver: "chat"``, daily). It shipped
+unscheduled because the roster it belonged on could not carry its output to a
+human: the Chat Agent's jobs deliver ``local``, which the scheduler resolves to
+no target, and the Platform Agent's profile had no board of its own. Two things
+changed. ``deliver: "chat"`` now relays a job's stdout through a Chat Agent turn
+into the home channel (``docs/designs/cron-report-relay.md``), and the board
+was never per-profile: it is the agent home's ``kanban.db``, which a
+platform-roster job reaches through ``PLATFORM_AGENT_HOME``
+(``gitops_workspace.agent_home``), not ``$HERMES_HOME``, which under that roster
+is ``profiles/platform`` and holds no board. What forced the change was a
+triage card that sat ``blocked`` with ``result = NULL`` for weeks because
+nothing periodically asked (#656).
 
-Run on demand:  HERMES_HOME=/opt/data python3 kanban_board_health.py
+``stuck_in_blocked`` is therefore reported whatever the severity floor says: a
+worker or operator block is sticky, nothing retries it until a human acts, and
+a card nobody is looking at is the one finding this check exists for. The rule
+is stateless and a card still blocked is named once a day until someone
+unblocks, comments on, or archives it, which is the intended nag. Each such
+line carries the card's kind, reason and age, read here from the board, and the
+two operator commands, because the CLI's JSON has neither the kind nor the
+reason and a line that names a stuck card without saying how to move it is a
+line the room learns to skip.
+
+Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 """
 
 import json
@@ -112,12 +121,39 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Severity floor handed to `hermes kanban diagnostics`. "error" on purpose: the
-# engine's warning-tier rules are useful to pull on demand but too chatty to
-# push every 15 minutes on first rollout. Override with KANBAN_HEALTH_SEVERITY.
+# A sibling in the shared scripts directory: the agent home is `PLATFORM_AGENT_HOME`,
+# never `HERMES_HOME`, which under the platform roster names the profile home.
+import gitops_workspace
+
+# Severity floor applied to what `hermes kanban diagnostics` returns. "error" on
+# purpose: the engine's warning-tier rules are useful to pull on demand but too
+# chatty to push into chat daily, with the one exception named below. Override
+# with KANBAN_HEALTH_SEVERITY.
 DEFAULT_SEVERITY = "error"
 SEVERITY_ENV = "KANBAN_HEALTH_SEVERITY"
 SEVERITIES = ("warning", "error", "critical")
+# Rule kinds reported whatever the floor says. `stuck_in_blocked` is a warning
+# in the engine, and it is the finding #656 was about: a sticky block that no
+# retry will ever clear, waiting for a human nobody has told.
+ALWAYS_REPORT_KINDS = frozenset({"stuck_in_blocked"})
+ALWAYS_REPORT_ENV = "KANBAN_HEALTH_ALWAYS_REPORT"
+STUCK_IN_BLOCKED = "stuck_in_blocked"
+# The engine is asked for everything and filtered here, so the always-report
+# kinds reach this script whatever the floor.
+ENGINE_SEVERITY = SEVERITIES[0]
+# Where the board lives, for tests and hand runs; otherwise the agent home.
+HOME_ENV = "KANBAN_HEALTH_HOME"
+# Rendering. The engine's `detail` runs to several paragraphs; chat gets its
+# first line, clipped, and the rest stays behind `hermes kanban diagnostics`.
+DETAIL_MAX_CHARS = 200
+REASON_MAX_CHARS = 200
+HOURS_PER_DAY = 24
+AGE_IN_HOURS_BELOW_H = 48
+NO_KIND = "no kind"
+# Pinned to the board file this run read, the way `diagnostics_lines` pins the
+# engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
+UNBLOCK_COMMAND = 'HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban unblock --reason "<why>" {task_id}'
+ARCHIVE_COMMAND = "HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban archive {task_id}"
 
 # The CLI opens the board through Hermes' own connection and may run an
 # idempotent migration; 60s is generous for a board of this size and still well
@@ -149,9 +185,29 @@ GHOST_CLAIMS_SQL = """
      ORDER BY id
 """
 
+# What the engine's JSON does not carry about a blocked card: its kind, and
+# the reason the last `blocked` event recorded (`kanban_db.block_task` writes
+# `{"reason": ..., "kind": ...}` as the event payload).
+BLOCKED_TASKS_SQL = """
+    SELECT id, title, assignee, block_kind
+      FROM tasks
+     WHERE status = 'blocked'
+"""
+BLOCKED_EVENTS_SQL = """
+    SELECT task_id, payload
+      FROM task_events
+     WHERE kind = 'blocked'
+     ORDER BY created_at, id
+"""
 
-def hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+def agent_home() -> Path:
+    """The volume root that holds `kanban.db`.
+
+    Not `HERMES_HOME`: under the platform roster that is `profiles/platform`, a
+    directory with no board. `HOME_ENV` overrides for tests and hand runs.
+    """
+    return Path(os.environ.get(HOME_ENV) or gitops_workspace.agent_home())
 
 
 def board_path(home: Path) -> Path:
@@ -198,6 +254,67 @@ def read_only_connection(db: Path) -> sqlite3.Connection:
     return conn
 
 
+def blocked_context(conn: sqlite3.Connection) -> dict:
+    """kind, reason, title and assignee per blocked card, or {} on an unmigrated board."""
+    try:
+        tasks = {
+            row["id"]: {"title": row["title"] or "", "assignee": row["assignee"] or "", "kind": row["block_kind"], "reason": ""}
+            for row in conn.execute(BLOCKED_TASKS_SQL)
+        }
+        for row in conn.execute(BLOCKED_EVENTS_SQL):
+            if row["task_id"] not in tasks:
+                continue
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except ValueError:
+                payload = {}
+            if isinstance(payload, dict):
+                # Events arrive oldest first, so the last one wins for both fields.
+                tasks[row["task_id"]]["reason"] = str(payload.get("reason") or tasks[row["task_id"]]["reason"])
+                if payload.get("kind"):
+                    tasks[row["task_id"]]["kind"] = payload["kind"]
+    except sqlite3.OperationalError:
+        return {}
+    return tasks
+
+
+def first_line(text: str, limit: int) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()[:limit]
+    return ""
+
+
+def render_age(age_hours) -> str:
+    try:
+        hours = float(age_hours)
+    except (TypeError, ValueError):
+        return "?"
+    if hours < AGE_IN_HOURS_BELOW_H:
+        return f"{int(hours)}h"
+    return f"{int(hours // HOURS_PER_DAY)}d"
+
+
+def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home: Path) -> list:
+    """One stuck card: the board's kind and reason, the CLI's title and assignee as fallback."""
+    info = context.get(task_id) or {}
+    kind = info.get("kind") or NO_KIND
+    assignee = info.get("assignee") or entry.get("assignee") or "?"
+    title = info.get("title") or entry.get("title") or ""
+    reason = " ".join((info.get("reason") or "").split())[:REASON_MAX_CHARS]
+    age = render_age((diag.get("data") or {}).get("age_hours"))
+    head = f"  - {task_id} ({assignee}, {kind}, blocked {age})"
+    if title:
+        head += f": {title}"
+    if reason:
+        head += f' — "{reason}"'
+    return [
+        head,
+        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=task_id)}",
+        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=task_id)}",
+    ]
+
+
 def invariant_violations(conn: sqlite3.Connection) -> list:
     """Rows that no code path in kanban_db.py can produce. Empty when healthy."""
     lines = []
@@ -217,6 +334,18 @@ def invariant_violations(conn: sqlite3.Connection) -> list:
 def severity_floor(env=None) -> str:
     value = ((env if env is not None else os.environ).get(SEVERITY_ENV) or "").strip().lower()
     return value if value in SEVERITIES else DEFAULT_SEVERITY
+
+
+def always_report_kinds(env=None) -> frozenset:
+    raw = ((env if env is not None else os.environ).get(ALWAYS_REPORT_ENV) or "").strip()
+    if not raw:
+        return ALWAYS_REPORT_KINDS
+    return frozenset(k.strip() for k in raw.split(",") if k.strip())
+
+
+def clears_floor(severity: str, floor: str) -> bool:
+    known = severity in SEVERITIES
+    return not known or SEVERITIES.index(severity) >= SEVERITIES.index(floor)
 
 
 def _default_runner(argv, env, timeout):
@@ -241,12 +370,18 @@ def _parse_diagnostics_json(out: str):
 
 
 def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
-                      binary=None, env=None) -> list:
+                      binary=None, env=None, context=None, always=ALWAYS_REPORT_KINDS) -> list:
     """Ask the shipped rule engine. Returns rendered lines; empty when clean.
 
     ``--json`` returns before the human-table branch of ``_cmd_diagnostics``, so
     a clean board prints ``[]`` rather than "No active diagnostics on this
     board." — which is why nothing here has to pattern-match prose.
+
+    The engine is asked for every severity and the floor is applied here, so a
+    kind in ``always`` (``stuck_in_blocked`` by default) is reported however low
+    the engine grades it. Stuck cards are rendered from ``context`` (see
+    ``blocked_context``) under their own heading; everything else keeps the
+    engine's own title and detail.
     """
     try:
         exe = str(binary) if binary else str(hermes_bin())
@@ -262,7 +397,7 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     # would then be reporting on different databases. HERMES_KANBAN_DB has the
     # highest precedence, so setting it also neutralises anything inherited.
     child_env["HERMES_KANBAN_DB"] = str(board_path(home))
-    argv = [exe, "kanban", "diagnostics", "--json", "--severity", severity]
+    argv = [exe, "kanban", "diagnostics", "--json", "--severity", ENGINE_SEVERITY]
     try:
         code, out, err = runner(argv, child_env, DIAGNOSTICS_TIMEOUT_SECONDS)
     except Exception as exc:  # timeout, OSError, anything the runner raises
@@ -283,6 +418,7 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
         return [f"  diagnostics unavailable: CLI returned "
                 f"{type(entries).__name__}, expected a JSON list"]
     lines = []
+    stuck = []
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
@@ -291,12 +427,24 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
         for diag in entry.get("diagnostics") or []:
             if not isinstance(diag, dict):
                 continue
+            kind = diag.get("kind")
+            if kind == STUCK_IN_BLOCKED and kind in always:
+                stuck.extend(stuck_card_lines(task_id, diag, context or {}, entry, home))
+                continue
+            if not clears_floor(str(diag.get("severity", "")), severity) and kind not in always:
+                continue
             parts = [f"  [{diag.get('severity', '?')}] {task_id} ({status}): "
                      f"{diag.get('title', diag.get('kind', 'diagnostic'))}"]
-            detail = (diag.get("detail") or "").strip()
+            detail = first_line((diag.get("detail") or ""), DETAIL_MAX_CHARS)
             if detail:
                 parts.append(f" - {detail}")
             lines.append("".join(parts))
+    if stuck:
+        lines.append(
+            "Cards blocked with no one looking (a worker or operator block is sticky: "
+            "nothing retries it until a human acts):"
+        )
+        lines.extend(stuck)
     return lines
 
 
@@ -311,6 +459,7 @@ def report(home: Path, *, env=None, **kwargs) -> list:
     conn = read_only_connection(db)
     try:
         violations = invariant_violations(conn)
+        context = blocked_context(conn)
     finally:
         conn.close()
     if violations:
@@ -318,7 +467,9 @@ def report(home: Path, *, env=None, **kwargs) -> list:
             "Board invariant violations (a direct write to kanban.db is the usual cause):"
         )
         lines.extend(violations)
-    diags = diagnostics_lines(home, severity_floor(env), env=env, **kwargs)
+    diags = diagnostics_lines(
+        home, severity_floor(env), env=env, context=context, always=always_report_kinds(env), **kwargs
+    )
     if diags:
         lines.append("Active kanban diagnostics:")
         lines.extend(diags)
@@ -326,7 +477,7 @@ def report(home: Path, *, env=None, **kwargs) -> list:
 
 
 def main(argv=None) -> int:
-    home = hermes_home()
+    home = agent_home()
     try:
         lines = report(home)
     except sqlite3.Error as exc:

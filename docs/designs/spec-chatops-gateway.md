@@ -202,12 +202,15 @@ shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests; egr
 fenced (8/31) to DNS, the bus, and LiteLLM - the deployment spec owns the policy),
 running the headless harness behind a thin shim that bridges bus envelopes to the CLI's
 stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
-the install's own LiteLLM, in-namespace, with no per-pod credential at all - the
-spawned pod carries no ServiceAccount and no Workload Identity. Its bus credential is
-the static worker user, injected as env. The auth callout does not reach it and arming
-the callout did not change it: a session pod carries no ServiceAccount and no projected
-token for the callout to resolve, so this closes when each session gets a principal of
-its own rather than when the callout arms. The deployment spec owns the reasoning. Direct Vertex via WI
+the install's own LiteLLM, in-namespace, with no _cloud_ credential at all - the spawned
+pod has no Workload Identity. **Amended 9/8:** it does now carry a ServiceAccount and a
+bus credential of its own. The static `worker` password is gone from the pod entirely; in
+its place is a projected ServiceAccount token, audience-bound to the bus and bound by the
+kubelet to this pod, which the auth callout resolves into grants derived from the attested
+pod name - this task's events, this session's three consumers, this session's inbox. The
+harness can still read that credential, because it runs at the same UID in the same pod;
+what changed is that reading it buys the authority the harness already had (gke-labs#1270).
+The deployment spec owns the reasoning. Direct Vertex via WI
 stays the target, and arming it is a policy change as well as an IAM one: the session
 egress fence encodes the shipped path (no 443, no metadata route), which is where a
 piecemeal flip fails loudly instead of silently widening. Cold start is 5-10s; the

@@ -124,6 +124,12 @@ type clientOptions struct {
 	name     string
 	logger   *slog.Logger
 	natsOpts []nats.Option
+	// err is set by an option that was handed something it cannot use, and
+	// surfaced by Connect before any dial. Options have no return value, and
+	// a misconfigured credential that fell through to the server would come
+	// back as an Authorization Violation — the one error in this system that
+	// names nothing about its cause.
+	err error
 }
 
 // WithName names the connection for server-side observability.
@@ -149,6 +155,9 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 	c := &Client{url: url}
 	for _, opt := range opts {
 		opt(&c.opts)
+	}
+	if c.opts.err != nil {
+		return nil, c.opts.err
 	}
 	c.log = c.opts.logger
 	if c.log == nil {

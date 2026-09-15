@@ -49,11 +49,14 @@ from typing import Any, Sequence
 
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
+    RECORD_WOULD_ADMIT,
+    RECORD_WOULD_DEMOTE,
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
     StoreUnreachable,
     VersionKey,
+    admission_mode,
     append_record,
     load_versions,
     utc_now,
@@ -84,18 +87,24 @@ _DEFAULT_BASELINE_DIR = "baselines"
 AGGREGATE_ARMED_ENV = "EVAL_AGGREGATE_ARMED"
 _TRUTHY = frozenset({"1", "true", "yes"})
 
-#: The verdict table's admission column, shown once a store is configured OR
-#: the record decided any case this run -- which covers evidence landed by
-#: hand into the checked-in directory with no store configured. With an empty
-#: store the column could only ever read "bootstrap" or "none" -- exactly
-#: what the BOOTSTRAP_ADMITTED list already says -- and leaving it out then
-#: keeps the store-unset verdict byte-identical to what the presubmit
-#: produced before.
+#: The verdict table's two evidence columns, shown together once a store is
+#: configured OR the record holds a full window for any case this run --
+#: which covers evidence landed by hand into the checked-in directory with no
+#: store configured. "Admitted by" names who decided; "Record says" is the
+#: store's own verdict on the case (would-admit, would-demote, collecting,
+#: stale, none), which in roster mode is the one thing the verdict says about
+#: the evidence and what a roster edit cites. With an empty store the columns
+#: could only ever read "bootstrap"/"none" and "none" -- exactly what the
+#: BOOTSTRAP_ADMITTED list already says -- and leaving them out then keeps the
+#: store-unset verdict byte-identical to what the presubmit produced before.
 ADMISSION_COLUMN = "Admitted by"
 ADMISSION_CELL_NONE = "none"
 ADMISSION_CELL_RECORD_REFUSED = "record: not admitted"
 #: An admitted case whose hand-off predates `admission_source` (hand-authored).
 ADMISSION_CELL_UNKNOWN = "--"
+RECORD_COLUMN = "Record says"
+#: A hand-off that predates `record_verdict`.
+RECORD_CELL_UNKNOWN = "--"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -157,8 +166,18 @@ def _aggregate_armed() -> bool:
 
 
 def _record_decided(cases: list[dict[str, Any]]) -> bool:
-    """Whether the evidence store admitted or refused any case this run."""
-    return any(c.get("admission_source") == ADMITTED_BY_RECORD for c in cases)
+    """Whether the store held a full window for any case this run.
+
+    In record mode that is a case the record admitted or refused; in roster
+    mode it is a case the record WOULD have, which is just as worth a column.
+    The ``admission_source`` check covers a hand-off written before
+    ``record_verdict`` existed.
+    """
+    return any(
+        c.get("record_verdict") in (RECORD_WOULD_ADMIT, RECORD_WOULD_DEMOTE)
+        or c.get("admission_source") == ADMITTED_BY_RECORD
+        for c in cases
+    )
 
 
 def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | None]:
@@ -269,9 +288,19 @@ def _cmd_case(args: argparse.Namespace) -> int:
         print(f"WARNING: baseline store {degraded}", file=sys.stderr)
         print("WARNING: grading with no baseline; nothing can be admitted.", file=sys.stderr)
 
+    # Who decides: the roster (default) or the record. A misspelled mode is
+    # exit 2, like a bad VERSIONS.json -- defaulting would make a typo look
+    # like a working switch. The shell validates it too, before any task
+    # runs, so this is the second guard rather than the one that fires.
+    try:
+        mode = admission_mode()
+    except ValueError as exc:
+        print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
+        return 2
+
     bar = AdmissionBar.from_env()
     decision = store.admission(
-        spec.case_id, key, bar=bar, bootstrap=_bootstrap_admitted()
+        spec.case_id, key, bar=bar, bootstrap=_bootstrap_admitted(), mode=mode
     )
     admitted, admission_reason = decision.admitted, decision.reason
 
@@ -297,10 +326,15 @@ def _cmd_case(args: argparse.Namespace) -> int:
 
     payload = verdict.to_dict()
     payload["admission_reason"] = admission_reason
-    # Who decided: record, bootstrap or neither. The suite renders it per case
-    # once a store is configured or the record decided any case, so a reader
-    # can tell a case the evidence admitted from one still riding the bridge.
+    # Who decided (record, bootstrap or neither), under which mode, and what
+    # the record says regardless (would-admit, would-demote, collecting,
+    # stale, none). The suite renders the first and last per case once a
+    # store is configured or the record holds a full window for any case, so
+    # a reader can tell a case the evidence would admit from one it would
+    # demote -- which in roster mode is what a roster edit cites.
     payload["admission_source"] = decision.source
+    payload["admission_mode"] = mode
+    payload["record_verdict"] = decision.record
     payload["version_key"] = key.to_dict() if key else None
     payload["baseline_judged"] = baseline_judged
     payload["baseline_runs"] = evidence.runs if evidence else 0
@@ -344,6 +378,11 @@ def _admitted_by(case: dict[str, Any]) -> str:
     return ADMISSION_CELL_NONE
 
 
+def _record_says(case: dict[str, Any]) -> str:
+    """The record column's cell: the store's own verdict on the case."""
+    return str(case.get("record_verdict") or RECORD_CELL_UNKNOWN)
+
+
 def _markdown(
     verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
 ) -> str:
@@ -366,8 +405,8 @@ def _markdown(
         lines += ["### Why it is red", ""]
         lines += [f"- {r}" for r in verdict.reasons]
         lines += [""]
-    extra_header = f" {ADMISSION_COLUMN} |" if admission_column else ""
-    extra_rule = " --- |" if admission_column else ""
+    extra_header = f" {ADMISSION_COLUMN} | {RECORD_COLUMN} |" if admission_column else ""
+    extra_rule = " --- | --- |" if admission_column else ""
     lines += [
         f"| Case | Domain | Verdict |{extra_header} Passes | Detail |",
         f"| --- | --- | --- |{extra_rule} --- | --- |",
@@ -380,7 +419,9 @@ def _markdown(
         # A verifier's reason can contain a pipe (a required-phrase list, a
         # kubectl selector), which would silently split the table cell.
         detail = str(case.get("reason") or "").replace("|", "\\|")
-        extra_cell = f" {_admitted_by(case)} |" if admission_column else ""
+        extra_cell = (
+            f" {_admitted_by(case)} | {_record_says(case)} |" if admission_column else ""
+        )
         lines.append(
             f"| `{case.get('case')}` | {case.get('domain') or '--'} | {mark} "
             f"(rung {int(rung)}) |{extra_cell} {case.get('passes')}/{scored} | {detail} |"
@@ -470,7 +511,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         armed=_aggregate_armed(),
     )
 
-    # BOOTSTRAP_ADMITTED is hand-edited in the Prow job config, and a
+    # BOOTSTRAP_ADMITTED is hand-edited in hack/ci-eval-pr.sh, and a
     # misspelling there does not fail -- it silently un-arms the case it was
     # written to keep blocking. `crashloop-debug` for
     # `cluster-agent-crashloop-debug` reads as a working entry and gates

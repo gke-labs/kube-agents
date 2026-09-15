@@ -1,0 +1,172 @@
+# COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
+# registers it pending activation. Same hold as upgrades-fleet-version-table
+# and upgrades-fleet-rollout-stall, the skill's Phase-1 and Phase-2 cases: the
+# maintainer's call on #1343 keeps them out until #1254 is closed, the open
+# issue on the sibling probe upgrades-lagging-master-probe where a delegated
+# run's acknowledgement is graded as the final answer on unrelated pull
+# requests (the #1010 family that docs/eval-gate-roster.md holds two other
+# cases out on). This case reads the same final answer over the same fixture,
+# so it cannot be watched to both pass and fail until then; it stays
+# `validated: false` and commented out. Uncomment the TASKS line when #1254 is
+# closed; nothing here changes.
+#
+# The Phase-3 case for the fleet-upgrade-verification skill (#1343 criterion
+# 3, #1411): not which members lag (upgrades-fleet-version-table asks that)
+# but WHY a member cannot take the upgrade, which is what the script's
+# `--readiness` table adds: per member, drain-blocking PodDisruptionBudgets,
+# maintenance exclusions and the window at the instant, and node-pool skew
+# against the target. The seeded fleet plants no drain-blocking PDB (the
+# reliability plant is a workload with NO PDB, and the capacity plant's PDB is
+# a safe maxUnavailable: 1), so what this case observes is the maintenance
+# rule: seeded-b's exclusion, in effect, at a scope that covers exactly the
+# upgrade its version row says it needs. The report is graded, not the tool
+# path: an agent that reads the maintenance policy any other way and reports
+# the same finding passes.
+#
+# Planted defect required: the seeded fleet's slot-b cluster held one minor
+# version behind the REGULAR channel default, enrolled in REGULAR, held
+# between reconciles by the maintenance exclusion `hold-the-minor-lag` at
+# scope NO_MINOR_UPGRADES (role version-laggard, bench/tf/fleet/fixtures.json;
+# bench/tf/fleet/main.tf re-stamps the exclusion's window from now on every
+# apply). The version NUMBERS move with the channel, so nothing here asserts a
+# version — only that the exclusion is named, with its scope, as what holds
+# the minor upgrade.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container and kubectl get and writes only its own record and per-member
+# kubeconfig files on the sandbox volume; no audit helper, no GitOps-repo
+# write). Eligible tier: presubmit once #1254 is closed.
+#
+# No deterministic mutation safeguard, documented: the planted defect is a
+# GKE maintenance policy, a GKE-level facet rather than a Kubernetes object,
+# and the version-laggard role probes no objects, so a fleet_resource_property
+# check has nothing to ground on. The fleet's scheduled reconcile owns the
+# defect's integrity. Same documented residual as upgrades-fleet-version-table.
+id: upgrades-fleet-readiness-exclusion
+name: Fleet upgrade readiness names the maintenance exclusion holding the laggard
+prompt: >-
+  For every cluster in this project, check whether it is ready to take the
+  upgrade to its release channel's default version, and tell me per cluster
+  what would stop the upgrade: a PodDisruptionBudget that would block a node
+  drain, a maintenance exclusion or window, or node pools too far behind. Read
+  the state; do not change, upgrade, or remove anything.
+expected_output: >-
+  The per-cluster version table and, after it, a readiness table read during
+  this run: per cluster a verdict (ready, blocked or unknown), its
+  drain-blocking PodDisruptionBudgets, its maintenance exclusions and window,
+  and its node-pool skew against the target. seeded-b is reported as blocked,
+  naming its maintenance exclusion hold-the-minor-lag with scope
+  NO_MINOR_UPGRADES and its end time, and stating that the exclusion holds
+  back the automatic minor upgrade to its REGULAR channel default (a manual
+  upgrade is not subject to it). The other members are graded against the
+  same rule and are not reported as blocked by an exclusion; no cluster is
+  reported as having a drain-blocking PodDisruptionBudget, since none exists
+  in the fleet. It says what an operator would have to change and does not
+  propose deleting the exclusion. It recommends (not performs) the upgrade
+  path. It cites no CVE identifiers, because it has no vulnerability feed. No
+  mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - version-laggard
+
+# report_contains: a chat prompt, so the reply is what is graded. Four
+# objectives, one for each thing the reply must do: name the laggard, name the
+# exclusion, name its scope, say what it holds; and one thing it must not do.
+# Split so a red says which.
+verification_spec:
+  - name: the-report-names-the-lagging-member
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      # "seeded-b" is a rendering of slot b under the prefix's default, the same
+      # contract upgrades-fleet-version-table carries: it survives the default
+      # prefix and breaks loudly if the prefix changes. The prompt does not say
+      # it; the report has to find it.
+      required_phrases: ["seeded-b"]
+  - name: the-report-names-the-exclusion-and-its-scope
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The exclusion's name and scope as the maintenance policy spells them
+      # (bench/tf/fleet/main.tf). Both are on the cluster record; neither is in
+      # the prompt.
+      required_phrases: ["hold-the-minor-lag", "NO_MINOR_UPGRADES"]
+  - name: the-report-says-the-exclusion-holds-the-upgrade
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The verdict as the script's readiness cell states it ("blocks
+      # auto-upgrade to <target>"), plus prose spellings of the same claim.
+      # Not the bare word "blocked": a version table on main already carries
+      # "lagging", and an agent could write "blocked" of anything. What main
+      # cannot produce without the maintenance rule is the exclusion named as
+      # the thing holding the upgrade. The "excludes exactly", "defers
+      # automatic" and "in effect" spellings were added after the first
+      # green run on 2026-09-14 (#1411), whose report wrote "excludes exactly
+      # the 1.34 -> 1.35 minor this cluster needs ... defers **automatic**
+      # upgrades only" and failed only this check; the markdown bold splits
+      # the plain phrase, hence the starred variant.
+      any_of_phrases:
+        [
+          "blocks auto-upgrade",
+          "blocks the auto-upgrade",
+          "blocks automatic upgrade",
+          "blocking auto-upgrade",
+          "blocking automatic upgrade",
+          "holds back automatic upgrade",
+          "holds back the automatic upgrade",
+          "holds the minor upgrade",
+          "holding the minor upgrade",
+          "blocks the minor upgrade",
+          "blocking the minor upgrade",
+          "prevents the minor upgrade",
+          "prevents automatic upgrade",
+          "prevents the automatic upgrade",
+          "exclusion blocks",
+          "exclusion is blocking",
+          "exclusion prevents",
+          "exclusion holds",
+          "blocked by the exclusion",
+          "blocked by the maintenance exclusion",
+          "blocked by a maintenance exclusion",
+          "held by the exclusion",
+          "held by the maintenance exclusion",
+          "held by hold-the-minor-lag",
+          "blocked by hold-the-minor-lag",
+          "excludes exactly the",
+          "excludes the minor",
+          "excludes minor upgrades",
+          "minor upgrade is excluded",
+          "minor upgrades are excluded",
+          "holds back the minor",
+          "defers automatic",
+          "defers the automatic",
+          "defers **automatic**",
+          "deferring automatic",
+          "in effect now",
+          "in effect until",
+          "currently in effect",
+          "is in effect",
+        ]
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

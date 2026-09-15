@@ -214,7 +214,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             sandbox-credential-cleanup={_GHCR}/platform-agent:{_TAG}
             envoy-credential-proxy={_GHCR}/credential-proxy:{_TAG}
             platform-agent={_GHCR}/platform-agent:{_TAG}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.1
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -224,7 +224,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         result = self._run(
             f"""
             platform-agent={_GHCR}/platform-agent:{_TAG}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.1
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -238,7 +238,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             sandbox-credential-cleanup={_MIRROR}/platform-agent:{_TAG}
             envoy-credential-proxy={_MIRROR}/credential-proxy:{_TAG}
             platform-agent={_MIRROR}/platform-agent:{_TAG}
-            fluent-bit={_MIRROR}/fluent-bit:5.1.1
+            fluent-bit={_MIRROR}/fluent-bit:5.1.2
             """
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -252,7 +252,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             sandbox-credential-cleanup={_GHCR}/platform-agent:{_OLD}
             envoy-credential-proxy={_GHCR}/credential-proxy:{_OLD}
             platform-agent={_GHCR}/platform-agent:{_OLD}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.1
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
             """,
             cr_image=f"{_GHCR}/platform-agent:{_OLD}",
         )
@@ -332,7 +332,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
             f"""
             platform-agent={_GHCR}/platform-agent:{_TAG}
             envoy-credential-proxy={_GHCR}/credential-proxy:{_OLD}
-            fluent-bit=docker.io/fluent/fluent-bit:5.1.1
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
             """
         )
         self.assertEqual(result.returncode, 1)
@@ -346,7 +346,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
 
     def test_it_fails_when_no_release_image_is_present(self):
         # An unrecognisable read-back is not a pass.
-        result = self._run("fluent-bit=docker.io/fluent/fluent-bit:5.1.1")
+        result = self._run("fluent-bit=docker.io/fluent/fluent-bit:5.1.2")
         self.assertEqual(result.returncode, 1)
         self.assertIn("Found no first-party release image", result.stdout)
 

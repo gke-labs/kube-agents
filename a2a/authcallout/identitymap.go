@@ -73,6 +73,15 @@ type Identity struct {
 	Account string `json:"account"`
 
 	Grants Grants `json:"grants"`
+
+	// Narrowing, when set, means this entry's grants are not in the map at
+	// all: they are derived at mint time from a claim the API server
+	// attested about the particular workload connecting. NarrowingPod is
+	// the only value this callout implements. Such an entry MUST carry no
+	// grants, and the map is refused if it does — see session.go for why an
+	// entry that could hold real grants AND be narrowed is one skipped code
+	// path away from handing every session everything.
+	Narrowing string `json:"narrowing,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -107,7 +116,8 @@ func (m *IdentityMap) validate() error {
 		return fmt.Errorf("identity map has no version")
 	}
 	// An empty map is never intentional. The operator always renders at
-	// least the agent and the provisioner, so zero entries means the render
+	// least the provisioner and the session principal, so zero entries
+	// means the render
 	// produced nothing — and serving it would refuse every
 	// connection on a callout that reports itself perfectly healthy. Refuse
 	// it here so the previous map keeps serving and the reason is logged.
@@ -159,12 +169,30 @@ func (id Identity) validate() error {
 		return fmt.Errorf("user %q names account %q, which this callout will not mint into (allowed: %v)",
 			id.User, id.Account, mintableAccounts)
 	}
-	// An entry granting nothing at all is almost certainly a render bug,
-	// and serving it produces a client that connects and then hangs on its
-	// first reply — the hardest failure in this system to read from the
-	// outside. Refuse the map instead.
-	if len(id.Grants.Publish) == 0 && len(id.Grants.Subscribe) == 0 {
-		return fmt.Errorf("user %q has no grants", id.User)
+	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+	switch id.Narrowing {
+	case "":
+		// An entry granting nothing at all is almost certainly a render
+		// bug, and serving it produces a client that connects and then
+		// hangs on its first reply — the hardest failure in this system to
+		// read from the outside. Refuse the map instead.
+		if !hasGrants {
+			return fmt.Errorf("user %q has no grants", id.User)
+		}
+	case NarrowingPod:
+		// The fail-closed shape, and the reason narrowing is a field
+		// rather than a convention. If a narrowed entry could also carry
+		// grants, then one map edit — or one code path that forgot to
+		// narrow — would hand every session pod whatever was written
+		// there, which is the shared `worker` credential reborn under a
+		// new name. An entry that is unusable without its claim cannot be
+		// widened by editing the map alone.
+		if hasGrants {
+			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
+				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+		}
+	default:
+		return fmt.Errorf("user %q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
 	}
 	return nil
 }

@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run. Read-only against GCP, from gcloud container reads, keeping only its own record of each run; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, maintenance exclusions and windows, and node-pool version skew. Read-only against GCP and the clusters, from gcloud container and kubectl get reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -10,8 +10,11 @@ pool" with a table read from the fleet, not from memory. Use it when a user asks
 upgrade has reached every cluster, which members are behind a target, or how far the fleet is
 from a release-channel default. Run it again during a rollout and it also says, per member, what
 changed since the previous run and which members have stopped moving (see "Track a rollout across
-runs"). For upgrade plans, runbooks and checklists, use the `gke-upgrades` skill; it links back
-here when the question is one this table answers.
+runs"). With `--readiness` it also says, per member, what would stop the upgrade: a
+PodDisruptionBudget that blocks every node drain, a maintenance exclusion or window, or node pools
+too far below the target (see "Check upgrade readiness"). For upgrade plans, runbooks and
+checklists, use the `gke-upgrades` skill; it links back here when the question is one this table
+answers.
 
 "Version skew" here is the gap between a member's versions and the target. It is not
 configuration drift: the fleet-consistency audit compares a cluster's configuration against its
@@ -23,6 +26,7 @@ Neither reads versions against a target.
 ```bash
 ./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
   [--project <project>]... [--target-version <version>] [--rollout-in-progress] \
+  [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
   --output /opt/data/scratch/fleet_versions.json
 ```
 
@@ -37,13 +41,16 @@ Neither reads versions against a target.
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
   status, and the `rollout` block described below.
-- `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below.
+- `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
+  `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
 The script runs `gcloud container clusters list`, `gcloud container get-server-config` and
-`gcloud config get-value project`, each with a 60-second timeout. It changes nothing in GCP;
-the only thing it writes is its own record under `/opt/data/state/fleet-upgrade-verification/`
-and the `--output` file. A failed or timed-out read is listed under the table and sets exit code
-1; the other projects and locations are still reported.
+`gcloud config get-value project`, each with a 60-second timeout, and with `--readiness` one
+`gcloud container clusters get-credentials` and one `kubectl get` per member. It changes nothing
+in GCP or in any cluster; the only things it writes are its own record under
+`/opt/data/state/fleet-upgrade-verification/`, the per-member kubeconfig files `--readiness`
+needs, and the `--output` file. A failed or timed-out read is listed under the table and sets
+exit code 1; the other projects, locations and members are still reported.
 
 ## Read the table
 
@@ -124,6 +131,68 @@ printed. In the JSON, each member carries `progress`, `unchanged_since` and
 timestamps, whether the rollout counted as active and why, a count per progress value, and the
 members missing this run.
 
+## Check upgrade readiness
+
+`--readiness` adds a second table after the version table, one row per member, graded against
+the same target as the member's version row, and a `readiness` object per member in the JSON
+(`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
+count per verdict). Without the flag nothing changes. Three rules, each derived from a governance
+SOP check and named beside it; the maintenance rule departs from its SOP where the two differ,
+and says so below:
+
+- **Drain-blocking PDBs** (`obtainability_audit_sop.md` §3.4). For each member the script runs
+  `gcloud container clusters get-credentials` into a kubeconfig of its own under
+  `${HERMES_HOME:-/opt/data}/.kubeconfigs/` (`kubeconfig_<project>_<cluster>_<location>.yaml`, one file per
+  target so concurrent reads never share a current-context; `--kubeconfig-dir` moves the
+  directory), adding `--dns-endpoint` when the cluster record says its DNS endpoint accepts
+  external traffic, then one `kubectl get pdb,deploy,statefulset -A -o json`. A PDB is matched to
+  the Deployments and StatefulSets in its namespace whose pod-template labels satisfy its
+  selector (`matchLabels` and `matchExpressions`), and it blocks every drain when
+  `maxUnavailable` is `0` or `0%`, or when `minAvailable` demands every expected pod: an integer
+  at or above the pods the controller expects, or a percentage that rounds up to them the way
+  the disruption controller rounds (`100%` always; `90%` on nine replicas too). The expected
+  count is the matched workloads' replica total, or the PDB's `status.expectedPods` when that is
+  larger, as it is when the selector also covers pods of a kind the read does not include. The
+  cell names the PDB as `namespace/name`, the offending field and the workloads with their
+  replica counts; each JSON finding carries `expected_pods` and `disruptions_allowed`, from the
+  PDB's `status.expectedPods` and `status.disruptionsAllowed`, as corroboration. Skipped and
+  counted in the note rather than graded: a PDB whose matched workloads are scaled to zero, an
+  orphan matching no workload and covering no pod, and a PDB that covers pods of a kind the read
+  does not include (a bare ReplicaSet, a custom controller), which is noted so it is never
+  silently `ready`. DaemonSets are never matched: a drain deletes their pods rather than evicting
+  them.
+- **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an
+  RFC 3339 instant, by default now. An exclusion in effect blocks when its scope covers the upgrade
+  the target needs: `NO_UPGRADES` (the default when the record carries no scope) always;
+  `NO_MINOR_UPGRADES` when the target is a minor above the control plane or a pool;
+  `NO_MINOR_OR_NODE_UPGRADES` when it is a minor above the control plane or any pool is below the
+  target. This grades the scope against the target, which the SOP's `blocking-exclusion` check
+  does not: that check never flags `NO_MINOR_UPGRADES` and adds a 30-day threshold, so the two
+  disagree on a cluster whose `NO_MINOR_UPGRADES` exclusion holds exactly the minor upgrade its
+  target needs, and this table is the one that reads it as a blocker. The cell says
+  `blocks auto-upgrade`, because that is what an exclusion holds back: an
+  operator running `gcloud container clusters upgrade` by hand is not subject to it. An exclusion
+  in effect whose scope does not cover the upgrade (a patch-only target under
+  `NO_MINOR_UPGRADES`) is reported and not a blocker. The maintenance window is reported as
+  `open` (with when it closes) or `closed` (with the next opening) at the instant, for a
+  `dailyMaintenanceWindow` or a `recurringWindow` whose recurrence is `FREQ=DAILY` or
+  `FREQ=WEEKLY` with a plain `BYDAY` list; any other recurrence is `not evaluated`, never a
+  verdict. The window is informational: a closed window delays automatic maintenance, it does not
+  block a manual upgrade. No window is reported as such.
+- **Node-pool skew** (§3.2). Per pool, the target control plane's minor minus the pool's minor:
+  more than 2, or a different major, blocks the control-plane upgrade until the pool moves
+  (GKE keeps nodes within two minors of the control plane); exactly 2 is at the ceiling and
+  goes in the note. Autopilot members read `n/a`, as the SOP's `pool-skew` check does.
+
+A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
+nothing blocked but a rule could not be evaluated (the cluster read failed, there is no target,
+an exclusion's scope or a pool's version was unreadable); `ready` only when every rule was
+evaluated and none blocks. A failed `get-credentials` or `kubectl get` is listed under the table
+as a read failure for that member and sets exit code 1, like a failed gcloud read; the member's
+maintenance and skew rules are still graded, and the other members are unaffected. `--at` with a
+value that is not RFC 3339, or `--at` or `--kubeconfig-dir` without `--readiness`, is a usage
+error (exit 2).
+
 ## Report
 
 Paste the table into the reply, then name the lagging members with both versions and the gap,
@@ -131,6 +200,11 @@ and the patch-behind members separately. When the run printed a Rollout progress
 it too and name each `stalled` member with its elapsed time and the previous run's time, as an
 observation rather than a fault: a member whose wave has not been scheduled yet reads the same
 as one that is stuck, and the elapsed time is what lets the user tell them apart. A first-run
-baseline line means there is nothing to compare yet; say when to run again. Recommend the
-upgrade path; do not run it. Cite no CVE identifiers: there is no vulnerability feed here, and
-every finding is version currency.
+baseline line means there is nothing to compare yet; say when to run again. When the run printed
+a readiness table, paste it too and name each `blocked` member with what blocks it as the table
+states it: the PDB by `namespace/name` with its field and workload, the exclusion by name with
+its scope and end time and that it holds back automatic upgrades only, the pool with its skew.
+Say what the operator has to change before the upgrade can proceed; do not change it, and do not
+propose deleting an exclusion. Recommend the upgrade path; do not run it. Cite no CVE
+identifiers: there is no vulnerability feed here, and every finding is version currency or
+readiness.

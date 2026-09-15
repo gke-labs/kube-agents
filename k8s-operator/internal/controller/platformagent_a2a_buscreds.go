@@ -48,14 +48,31 @@ import (
 //
 // **What it does not assert**, so nobody reads more into it than it carries: it
 // does not confirm that a named replica has observed a named map version. The
-// gap is the sub-second window after a re-render in which a ready replica may
-// still be serving the previous map. That is acceptable while the identity set
-// changes only when the operator re-renders it — which is A1's situation, where
-// the identities are fixed at install. It stops being acceptable when profiles
-// arrive at runtime and identities become dynamic: at that point this has to
-// become a per-replica check of the served version against the rendered one,
-// and the callout's status endpoint already exposes exactly what such a check
-// would read.
+// message names the version this reconcile RENDERED, not one any replica
+// reported serving, and nothing here reads the callout's /status. That is
+// acceptable while the identity set changes only when the operator re-renders
+// it — which is A1's situation, where the identities are fixed at install. It
+// stops being acceptable when profiles arrive at runtime and identities become
+// dynamic: at that point this has to become a per-replica check of the served
+// version against the rendered one, and the callout's status endpoint already
+// exposes exactly what such a check would read.
+//
+// Two failure shapes fit in that gap, and they are not the same size:
+//
+//   - The benign one, and the only one this comment used to name: the
+//     sub-second window after a re-render in which a ready replica is still
+//     serving the previous map. It closes by itself on the next informer event.
+//   - The one that does NOT close by itself: a map the callout REFUSES at
+//     parse. It keeps serving the previous map on purpose, so its probe stays
+//     green, so the Deployment stays Ready, so this sets True and names a
+//     version that was never served — permanently, and while silently dropping
+//     every other identity change in the same map. renderA2AAuthMap now runs
+//     the callout's own validation before writing the ConfigMap, so the
+//     reconcile fails with the offending entry named instead of reaching this
+//     function at all. That closes the shape the operator can see. A map the
+//     callout refuses for a reason the operator's copy does not know about
+//     would still land here, which is the residual argument for the
+//     per-replica check above.
 //
 // Rolling the callout pods on every map change would close the gap and was
 // rejected: the callout is on the connection path, so a rolling restart is a
@@ -159,6 +176,28 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 	// file is written against, arriving through the Deployment instead of
 	// through the reconcile.
 	observed := dep.Status.ObservedGeneration >= dep.Generation
+	// Ready is not enough: a ready replica may be ready on the PREVIOUS pod
+	// template, still serving the previous map. UpdatedReplicas counts the
+	// ones running the current template, so requiring both is the difference
+	// between "two pods are up" and "two pods are up on the spec that renders
+	// this map version".
+	//
+	// This is what makes the identity-map schema annotation load-bearing. A
+	// callout too old to parse the rendered map refuses it, and a pod that
+	// refuses its first map never becomes ready -- but MaxUnavailable 0 keeps
+	// the old ready pods up while the new one fails, so ReadyReplicas alone
+	// stays at the desired count for as long as the roll is wedged, and the
+	// condition would go on naming a version no replica ever accepted. That
+	// is the failure this file exists to prevent, arriving through a stuck
+	// rollout instead of a stale read.
+	//
+	// The cost is that a HEALTHY roll now reports False for its duration
+	// rather than True throughout. That is the honest answer and not a
+	// regression in meaning: while the roll is in flight some replicas are
+	// still serving the old map, so "serving identity map <new>" is not yet
+	// true of the callout as a whole. The ObservedGeneration branch below
+	// already reports a roll that way; this extends it to the rest of one.
+	updated := dep.Status.UpdatedReplicas >= desired
 
 	condition := metav1.Condition{Type: busCredentialsReadyCondition, LastTransitionTime: metav1.Now()}
 	switch {
@@ -166,7 +205,7 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = busCredsReasonAbsent
 		condition.Message = "the auth callout is not deployed; nothing can authenticate to the bus"
-	case observed && dep.Status.ReadyReplicas > 0 && dep.Status.ReadyReplicas >= desired:
+	case observed && updated && dep.Status.ReadyReplicas > 0 && dep.Status.ReadyReplicas >= desired:
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = busCredsReasonServing
 		condition.Message = "the auth callout is serving identity map " + mapVersion
@@ -185,9 +224,17 @@ func (r *PlatformAgentReconciler) setBusCredentialsReady(ctx context.Context, ag
 		// every new connection is the first thing someone will want to size:
 		// one replica of two is a degraded rollout, zero of two is the bus
 		// accepting no new client at all.
+		// Ready and updated are reported separately because they fail for
+		// different reasons and want different responses: short of ready is
+		// a callout that is not up, while ready but short of updated is a
+		// callout that is up on the wrong spec -- most often one whose new
+		// pods cannot parse the map this version renders, which no amount of
+		// waiting resolves.
 		condition.Message = fmt.Sprintf(
-			"the auth callout has %d of %d replicas ready; new connections to the bus may be refused",
-			dep.Status.ReadyReplicas, desired)
+			"the auth callout has %d of %d replicas ready and %d of %d on the current spec; "+
+				"new connections to the bus may be refused, and any that succeed are "+
+				"authorized against whichever map the serving replicas last accepted",
+			dep.Status.ReadyReplicas, desired, dep.Status.UpdatedReplicas, desired)
 	}
 
 	// Only when something changed. This runs on every exit from every

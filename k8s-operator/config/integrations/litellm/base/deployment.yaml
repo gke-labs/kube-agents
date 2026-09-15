@@ -27,6 +27,20 @@ spec:
         # the pod template itself change, which is what triggers the rollout.
         kubeagents.x-k8s.io/model-config: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
     spec:
+      # Kept in step with charts/kube-agents/templates/litellm.yaml, which owns
+      # the rationale, and asserted by tests/test_workload_security_context.py.
+      # The image runs as root by default; this pins the gateway to uid 1000 on
+      # a read-only root filesystem. The one writable path is the tmp emptyDir
+      # at /tmp, which HOME also points at. A write failure elsewhere gets one
+      # more emptyDir at that path, named here; never
+      # readOnlyRootFilesystem: false.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: litellm-container
           # Substituted by the deploy-litellm target; the pin lives in
@@ -34,6 +48,12 @@ spec:
           # disagree about which LiteLLM version to copy.
           image: ${LITELLM_IMAGE}
           args: ["--config", "/app/config.yaml", "--port", "8080"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           resources:
             requests:
               cpu: "100m"
@@ -42,6 +62,9 @@ spec:
               cpu: "500m"
               memory: "2Gi"
           env:
+            # See the pod securityContext above: the only writable directory.
+            - name: HOME
+              value: /tmp
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -101,7 +124,11 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
+        - name: tmp
+          emptyDir: {}

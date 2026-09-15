@@ -74,7 +74,7 @@
       "name": "fluent-bit",
       "origin": "third-party",
       "repository": "docker.io/fluent/fluent-bit",
-      "tag": "5.1.1",
+      "tag": "5.1.2",
       "override": "FLUENT_BIT_IMAGE",
       "pulledBy": "The logging sidecar the operator injects into every agent pod.",
       "description": "Ships agent container logs off the pod."
@@ -83,7 +83,7 @@
       "name": "k8s",
       "origin": "third-party",
       "repository": "docker.io/alpine/k8s",
-      "tag": "1.36.2",
+      "tag": "1.36.4",
       "pulledBy": "The chart's pre-delete cleanup hook Job.",
       "description": "alpine/k8s — kubectl plus a shell, for the hook that deletes the PlatformAgent CR before Helm removes the operator. The name is the trailing path segment because the chart renders this one: kube-agents.imageRepository rewrites onto <prefix>/<trailing name>, which has to be the destination mirror_images.sh writes (<prefix>/<name>)."
     },

@@ -1330,11 +1330,14 @@ def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
     """Run a probe in the agent container until its output contains `expect`.
 
     Rolling out is not the same as being ready to assert against. The platform-agent
-    container has no readiness probe — the pod's readiness comes from the credential-proxy
-    sidecar — so `kubectl rollout status` returns while the entrypoint may still be
-    syncing files, scaffolding the platform profile, or linking plugins. A single-shot
-    probe against that window passes or fails on timing, which in a suite this slow reads
-    as a flaky product rather than a flaky test.
+    container does carry probes — a StartupProbe and a ReadinessProbe, both `agentAPIProbe`
+    in `platformagent_manifests.go`, which curl the Hermes API on pod loopback — and on a
+    single-replica gateway a Ready pod has therefore finished the entrypoint's file sync,
+    profile scaffolding, and plugin linking, all of which run before `exec`. Under leader
+    election it has not: that probe exits 0 on connection-refused when
+    ENABLE_LEADER_ELECTION is true, so a standby reports Ready without serving. Polling
+    covers that configuration, and costs one exec where a single-replica gateway has
+    already settled.
 
     Every probe must print a token for both outcomes, so "not yet" and "the exec broke"
     stay distinguishable. The two tokens must not be substrings of one another: this

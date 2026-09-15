@@ -6,11 +6,11 @@
 # first; see the Usage section of README.md.
 #
 # Fill both values for the ONE project being onboarded. The project-to-repo
-# mapping lives in gitops_repo_for_project() in hack/ci-deploy.sh and is
-# documented in docs/site/src/content/docs/deploy/ci-pool-projects.md; the
-# values below are the first pool project, shown as a worked example.
-project_id  = "kube-agents-evals"
-gitops_repo = "gke-agentic/kube-agents-evals-infra"
+# mapping lives in gitops_repo_for_project() in hack/ci-deploy.sh; read this
+# project's pair out of there. docs/ci-pool-projects.md is the onboarding
+# runbook.
+project_id  = "<pool-project-id>"
+gitops_repo = "<org>/<pool-project-id>-infra"
 
 # Defaults match hack/ci-env.sh; override only if that file changes.
 # location  = "us-central1"

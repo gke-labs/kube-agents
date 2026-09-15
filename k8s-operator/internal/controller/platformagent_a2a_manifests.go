@@ -25,11 +25,15 @@ package controller
 // streams, retention, and the account layout; subjects come from the payload
 // spec (docs/designs/spec-a2a-payloads.md).
 //
-// PLAYGROUND POSTURE (stage 1): static per-component NATS users instead of
-// the auth callout, single-node R1 JetStream (production: 3-node R3), no
-// audit exporter, no breaker, gateway sweep as the only janitor. Each has a
-// decided design in the specs; none gates letting people play. Static creds
-// are the playground, not the product.
+// PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
+// R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
+// has a decided design in the specs; none gates letting people play.
+//
+// Authentication came off that list. The auth callout is armed, and the
+// identities that have a ServiceAccount and a client that presents it — the
+// session pods above all — authenticate through it. The static users that
+// remain are enumerated in a2aPostureComment below, which travels onto the
+// cluster in the rendered config; keep the two in step.
 
 import (
 	"context"
@@ -56,6 +60,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -68,6 +73,19 @@ const (
 	// a2aComponentLabel distinguishes the pieces for targeted cleanup — the
 	// provision Job's name carries a content hash, so deletion goes by label.
 	a2aComponentLabel = "kubeagents.x-k8s.io/a2a-component"
+
+	// a2aProvisionComponent is the a2aComponentLabel value the provision Job
+	// carries, and the selector both sweeps of it (deleteA2AProvisionJobs)
+	// list by. The builder's a2aLabels call spells the same value; the two
+	// are pinned together by TestReconcileA2ADeletesSupersededProvisionJobs.
+	a2aProvisionComponent = "provision"
+
+	// The merge patch applyA2AGatewayDeployment sends when the apply of the
+	// gateway's Recreate strategy is refused over the rollingUpdate block the
+	// API server defaulted onto a gateway applied before the strategy was set.
+	// Both keys in one patch: nulling the block alone leaves the type at
+	// RollingUpdate, and the server defaults the block straight back.
+	a2aGatewayRecreateStrategyPatch = `{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}`
 
 	// The LiteLLM ports the session fence grants, for the reason
 	// buildAgentEgressNetworkPolicy's LiteLLM rule states in full: a Pod
@@ -112,14 +130,16 @@ const (
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
 	//
-	// None of the four A2A images are in images.json, deliberately: the
-	// inventory documents what a SUPPORTED install pulls, and mode next is an
+	// None of the A2A images are in images.json, deliberately: the inventory
+	// documents what a SUPPORTED install pulls, and mode next is an
 	// unsupported dev toggle. That exemption is graduation debt alongside the
 	// registry move — a mirrored or air-gapped install that flips next must
-	// override all four via the env vars until then.
+	// override every one of them via the env vars until then. There are five
+	// now: NATS, provision, gateway, worker, and the auth callout
+	// (A2A_CALLOUT_IMAGE, in platformagent_a2a_callout.go).
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
 
-	// The session-pod image, on the same terms as the three above. The
+	// The session-pod image, on the same terms as the others. The
 	// gateway binary carries this same default of its own (gateway/config.go),
 	// which is what a gateway run outside the operator falls back to; the
 	// operator renders the env unconditionally so that the override exists
@@ -200,10 +220,17 @@ const (
 # Authentication is NOT on that list any more. The auth callout is armed: a
 # client presents a projected Kubernetes ServiceAccount token, the callout
 # validates it against the cluster with a TokenReview, and answers with the
-# permission set the operator mapped that identity to. The users that remain
-# static below are the ones with nothing to present - a browser, a session pod
-# that carries no ServiceAccount, an operator at a port-forward, the callout
-# itself - and each says so where it is defined.`
+# permission set the operator mapped that identity to. Session pods go through
+# it, and a session's grants are derived from the pod the API server attested
+# rather than read from a map, so two sessions on one account cannot reach each
+# other.
+#
+# The users that remain static below are of two kinds, and each says which it
+# is where it is defined. Some have nothing to present: a browser, an operator
+# at a port-forward, the callout itself, which cannot authenticate through
+# itself. The rest have a ServiceAccount and could move tomorrow, but no client
+# that sends a token yet - moving the identity before the program that uses it
+# would refuse the workload at connect.`
 )
 
 func a2aNATSImage() string {
@@ -259,6 +286,17 @@ func a2aNATSClientURL(agent *agentv1alpha1.PlatformAgent) string {
 // authenticate to NATS, not to talk to the API server.
 func a2aProvisionServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-provision"
+}
+
+// Spawned session pods run as their own ServiceAccount so the callout has an
+// identity to resolve them by, and so the projected token they carry is bound
+// to their own pod. It holds no RBAC at all, and that is the security property:
+// the token's whole purpose is to be presented to NATS, and a session pod that
+// could reach the API server with it would have gained something no session
+// needs. One ServiceAccount is shared by every session — the pod claim is what
+// separates them, not the account. See sessionIdentity.
+func a2aSessionServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-session"
 }
 
 // a2aLabels returns the common labels with part-of overridden to a2a-next and
@@ -777,11 +815,19 @@ authorization {
     #
     # This is a bypass and not a fallback — a listed user with a wrong
     # password is refused statically and never reaches the callout at all.
-    # Every name here is a principal that cannot present a ServiceAccount
-    # token: the callout itself (it cannot authenticate through itself), the
-    # session workers (a session pod carries no Kubernetes identity yet), the
-    # browser-facing read user (a browser never can), and the operator's own
-    # $SYS login.
+    # The list is the callout itself, which cannot authenticate through
+    # itself, plus every identity marked STATIC above. The session entry is
+    # absent exactly because it is not one: a session pod presents a
+    # pod-bound ServiceAccount token and the callout scopes it to its own
+    # task, so worker is no longer the credential a session holds. Do not
+    # read this list as the session path.
+    #
+    # A name is here for one of two reasons, and each identity's own comment
+    # above says which. It can hold no projected token at all — the browser
+    # read user, the $SYS login held by a person, the seed tooling that is
+    # applied rather than run. Or it could and has not moved yet: the
+    # agent-side workloads still on worker, and gateway. The first group is
+    # permanent; the second is the remaining migration.
     auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
   }
 }
@@ -990,10 +1036,21 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 //	            selector matches after the ClusterIP translation, so the port
 //	            that must be granted is the container's.
 //
-// There is no API-server rule, no 443 and no metadata rule beyond DNS, because
-// a session pod carries no ServiceAccount and no Workload Identity (spawn.go
-// sets AutomountServiceAccountToken: false and names none). A worker that
-// needs the internet is a design change, not a policy widening.
+// There is no API-server rule, no 443 and no metadata rule beyond DNS, and the
+// reason changed with per-session credentials without the policy changing.
+//
+// A session pod now DOES carry a ServiceAccount and a Kubernetes token — the
+// projected bus token, audience-bound to the bus and bound by the kubelet to
+// this pod. What it does not carry is a route to the API server, and this
+// policy is what withholds it. The kubelet delivers the token through the
+// volume, so the credential arrives without the pod ever dialling anything;
+// AutomountServiceAccountToken stays false in spawn.go so no second,
+// default-audience token rides along; and the session ServiceAccount holds no
+// RBAC and no Workload Identity annotation, so the token would buy nothing
+// even if a route existed. Three independent reasons, which is deliberate:
+// this is the pod that executes model output.
+//
+// A worker that needs the internet is a design change, not a policy widening.
 //
 // PolicyTypes carries Ingress with no rules on purpose: nothing dials a
 // session pod, so a listener in a worker is an accident and an accident should
@@ -1271,18 +1328,23 @@ echo "a2a provisioning complete"
 //
 // The digest covers everything this function renders into the spec: the
 // script, the image, the uid and security contexts, env, volumes, mounts,
-// backoffLimit and the TTL. A superseded Job is not deleted here, and how it
-// leaves depends on how far it got. A completed one leaves by TTL; one whose
+// backoffLimit and the TTL. What becomes of the generation the render has
+// moved past depends on how far that generation got, and one case is why the
+// rename on its own is not enough. A completed one leaves by TTL; one whose
 // pod ran and failed runs out its backoffLimit and then leaves by TTL; one
 // whose pod never ran — an unpullable image, an unschedulable pod, an
 // admission refusal — has no terminal condition for the TTL to start from
-// and stays until the mode flips or the agent is deleted, holding one slot
-// in the namespace pod quota the whole time. That last case is the image
-// override scenario this digest exists for, so deleting superseded
-// generations by label is owed, not merely nice. What holds today: the
-// status scan in reconcileA2A reads the current name only, so a stale
-// failure does not park the phase, and cleanupA2A deletes by label, so a
-// mode flip removes every generation at once.
+// and would sit in Pending until the mode flips or the agent is deleted,
+// holding one slot in the namespace pod quota the whole time. That last case
+// is the image override scenario this digest exists for, and it is why
+// reconcileA2A sweeps superseded generations by label, keeping only the
+// current render's name (deleteA2AProvisionJobs), after ensuring the Job this
+// function builds rather than before it — so a reconcile leaves N+1 of them
+// for a moment, never zero. Two things hold alongside that sweep: the status
+// scan in reconcileA2A reads the current name only, so a Failed condition on
+// a generation the sweep is about to remove never reaches the phase, and
+// cleanupA2A calls the same function keeping nothing, so a mode flip removes
+// every generation at once.
 //
 // What the digest does not cover is what is on the bus. Creation is
 // create-only convergence: the script's `info || add` lines make re-runs
@@ -1533,10 +1595,10 @@ func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 }
 
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
-// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager;
-// the program itself arrives in its own PR). It is expected to crash-loop until
-// the gateway image is reachable and the discord-bot Secret is created — both
-// are optional references so the render never blocks the rest of the stack.
+// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager).
+// It is expected to crash-loop until the gateway image is reachable and the
+// discord-bot Secret is created — both are optional references so the render
+// never blocks the rest of the stack.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")
@@ -1551,6 +1613,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(1)),
+			// Recreate, as the credential proxy is, rather than the
+			// RollingUpdate default: at one replica that default resolves
+			// maxUnavailable to 0, so a roll needs a surge Pod and stalls
+			// for good under a namespace ResourceQuota with no headroom
+			// (#977, #1267). maxUnavailable: 1 is not the fix here --
+			// gateway.FromEnv refuses a second backend because two gateways
+			// on one relay durable split event deliveries, so two instances
+			// overlapping during a roll is the wrong shape. Recreate stops
+			// the old one before the new one starts; the gap is the one
+			// the single-backend rule already implies.
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
@@ -1609,18 +1682,6 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// when it matches the gateway's own default, so
 							// the operator-side override reaches it.
 							{Name: "A2A_WORKER_IMAGE", Value: a2aWorkerImage()},
-							// The Secret the spawner projects the bus
-							// password from. The gateway's baked default
-							// spells it for a CR named platform-agent, so on
-							// any install that renames the CR every session
-							// pod would wedge in CreateContainerConfigError
-							// on a Secret that does not exist — and wedge
-							// silently, because a pod that never runs never
-							// reaches a terminal phase for the sweeper to
-							// find, holding its session slot until the
-							// deadline. Same travel-together rule as the
-							// namespace and the owner.
-							{Name: "A2A_NATS_CREDS_SECRET", Value: a2aNATSName(agent) + "-creds"},
 							// The namespace from the downward API, not a baked
 							// default: the boot-time owner resolution below
 							// reads the gateway's own Deployment in THIS
@@ -1644,6 +1705,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// or anything else — deletes the gateway. The
 							// Role above grants the one get this needs.
 							{Name: "A2A_OWNER_DEPLOYMENT", Value: name},
+							// The identity spawned sessions run as. Rendered
+							// rather than baked for the same reason as the
+							// creds Secret above: the gateway's default spells
+							// it for a CR named platform-agent, and on a
+							// renamed CR every session pod would fail to
+							// schedule against a ServiceAccount that does not
+							// exist. The callout's map is keyed on this exact
+							// name, so the render and the spawner must agree
+							// or every session is refused at connect.
+							{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
 						},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
@@ -1815,7 +1886,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
 	// spec-digested name; a changed render — script or pod spec — is a new
-	// name and a fresh run, and the superseded Job is left to its TTL.
+	// name and a fresh run. The superseded generation is swept below rather
+	// than left to its TTL, for the reason the sweep's own comment gives.
 	job := buildA2AProvisionJob(agent)
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err
@@ -1846,6 +1918,23 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		}
 	}
 
+	// Superseded generations go now, not by TTL. A Job whose name the render
+	// has moved past leaves on its own only if it reached a terminal
+	// condition: a completed one by TTL, one whose pod ran and failed by
+	// backoffLimit and then TTL. One whose pod never ran — an unpullable
+	// image, an unschedulable pod, an admission refusal — has no condition
+	// for the TTL to start from and would sit in Pending until a mode flip
+	// or agent deletion, holding one slot of the namespace pod quota the
+	// whole time (#1389). An unpullable image is the likely way to get there
+	// once the name tracks the pod spec (#1347), and a bad script is the way
+	// today. The sweep runs after the current Job is ensured above, never
+	// before it: a reconcile leaves N+1 provision Jobs for a moment, never
+	// zero. The status scan above read the current name only, so a Failed
+	// on a generation deleted here never reached the phase.
+	if err := r.deleteA2AProvisionJobs(ctx, agent, job.Name); err != nil {
+		return state, fmt.Errorf("failed to delete superseded A2A provision Jobs: %w", err)
+	}
+
 	// Identity before workload: the gateway pod must not start before the
 	// ServiceAccount its pod spec names exists.
 	for _, obj := range []client.Object{
@@ -1865,11 +1954,54 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
-	if err := r.applyManaged(ctx, agent, dep); err != nil {
+	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
 	return state, nil
+}
+
+// applyA2AGatewayDeployment applies the gateway Deployment and, when the API
+// server refuses the apply as Invalid, clears the strategy in place and applies
+// again.
+//
+// A gateway Deployment applied before the builder set Recreate named no
+// strategy, so the server defaulted a rollingUpdate block onto the live object.
+// No field manager owns that block, so a server-side apply of `type: Recreate`
+// leaves it in place and is refused with "spec.strategy.rollingUpdate:
+// Forbidden: may not be specified when strategy type is 'Recreate'" -- on every
+// reconcile, since ForceOwnership only settles conflicts between managers and
+// this block has none. The apply would fail forever and take the rest of the
+// reconcile with it.
+//
+// A merge patch, not the delete-and-recreate the credential broker uses for
+// its immutable selector (applyCredentialProxyDeployment). Every session pod
+// the gateway spawns carries an ownerReference to this Deployment, by UID
+// (A2A_OWNER_DEPLOYMENT; a2a/gateway/spawn.go resolveOwner), so deleting the
+// object would hand every in-flight session to the garbage collector along
+// with the gateway pod. The patch keeps the object and its UID, and a strategy
+// change alone touches no pod template, so nothing rolls: the gateway pod and
+// its sessions run on. The same move clearForeignPDBBudgetField makes for a
+// field on the PodDisruptionBudget that another manager left behind.
+//
+// Invalid is checked once, not by parsing the message: the strategy is the one
+// field this render changed on a live gateway, and a refusal the patch does not
+// cure comes back from the second apply as the error it is.
+func (r *PlatformAgentReconciler) applyA2AGatewayDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) error {
+	err := r.applyManaged(ctx, agent, dep)
+	if !errors.IsInvalid(err) {
+		return err
+	}
+
+	logf.FromContext(ctx).Info("the A2A gateway Deployment carries a rollingUpdate block no manager owns; clearing it in place",
+		"deployment", dep.Name, "reason", err.Error())
+
+	live := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: dep.Name, Namespace: dep.Namespace}}
+	patch := client.RawPatch(types.MergePatchType, []byte(a2aGatewayRecreateStrategyPatch))
+	if patchErr := r.Patch(ctx, live, patch); patchErr != nil {
+		return fmt.Errorf("failed to clear the strategy of the A2A gateway Deployment %s/%s: %w", dep.Namespace, dep.Name, patchErr)
+	}
+	return r.applyManaged(ctx, agent, dep)
 }
 
 // a2aTeardownEntry is one namespaced object cleanupA2A removes, with the reader
@@ -1903,6 +2035,11 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aProvisionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The session identity. Removed on a flip to today alongside the
+		// session fence below: with the gateway gone nothing spawns pods that
+		// would mount a token for it, and leaving it behind would leave a
+		// mintable bus identity in a namespace that no longer runs a bus.
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
@@ -2033,18 +2170,44 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		return err
 	}
 
-	// Provision Jobs carry a spec digest in the name, one per generation
-	// that has been rendered here; find them all by label.
+	// Provision Jobs carry a content hash in the name, one per generation
+	// that has been rendered here; a mode flip removes every generation.
+	return r.deleteA2AProvisionJobs(ctx, agent, "")
+}
+
+// deleteA2AProvisionJobs deletes this agent's provision Jobs, found by label
+// because their names carry a content hash, except the one named keep. Two
+// callers: reconcileA2A passes the current render's name so superseded
+// generations go, and cleanupA2A passes "" so a mode flip clears them all.
+// One function so the two sweeps cannot drift apart in what they select.
+//
+// The List is uncached (a2aReader) for the reason that function gives, and
+// on the reconcile path it is a standing cost paid once per reconcile of a
+// next install — the same shape as the Job Get that precedes it. Sweeping
+// only on the pass that created a new generation would be cheaper and would
+// miss two cases: an install whose superseded Jobs predate this sweep, which
+// never sees a create again under the current name, and a pass whose create
+// succeeded and whose sweep then failed.
+//
+// Background propagation, for the same reason cleanupA2A always used it: the
+// pod is what holds the quota slot, and Background hands it to the garbage
+// collector the moment the Job is gone rather than pinning the Job under a
+// foregroundDeletion finalizer until the pod has left — which would put the
+// same Job back in this List on the next pass. A Job already carrying a
+// deletionTimestamp is skipped for that reason too. The IsControlledBy guard
+// is cleanupA2A's: a Job somebody labelled to look like ours, but which this
+// agent does not own, is not ours to delete.
+func (r *PlatformAgentReconciler) deleteA2AProvisionJobs(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep string) error {
 	var jobs batchv1.JobList
 	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
-		a2aComponentLabel: "provision",
+		a2aComponentLabel: a2aProvisionComponent,
 		labelInstance:     instanceLabel(agent.Namespace, agent.Name),
 	}); err != nil {
 		return err
 	}
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
-		if !metav1.IsControlledBy(job, agent) {
+		if job.Name == keep || job.DeletionTimestamp != nil || !metav1.IsControlledBy(job, agent) {
 			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))); err != nil {

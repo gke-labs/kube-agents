@@ -48,6 +48,52 @@ import (
 // contract are what make that acceptable at this stage. A hardened HA callout
 // is production posture, not part of the dev toggle.
 
+// a2aIdentityMapSchemaAnnotation carries a2aIdentityMapSchema onto the callout
+// pod template.
+const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-schema"
+
+// a2aIdentityMapSchema is the version of the rendered identity map's SHAPE, not
+// of its contents. It is on the callout's pod template, so a release that
+// changes the shape rolls the callout exactly once.
+//
+// Why it has to exist. The callout parses with DisallowUnknownFields, on
+// purpose: a key it does not recognise is a grant or a narrowing it cannot
+// enforce, and serving the map anyway would enforce less than the operator
+// rendered. The cost of that strictness is that the two cannot skew across a
+// field addition -- and nothing else in this Deployment's spec changes when the
+// map does, so on an upgrade where the callout image reference is unchanged
+// (the default is a mutable tag) the old pods are never rolled. They refuse
+// every new map on the unknown field, keep serving the last one they accepted,
+// keep their readiness probe green, and BusCredentialsReady goes on reporting
+// True while naming a version no replica has. Measured on a2a-next-dev,
+// 2026-09-14: operator upgraded alone, callout generation unchanged at 8, CR
+// claiming `6ce6662285534d95` while both replicas served `c3017a17889c5f45`
+// with `lastError: unknown field "narrowing"`, and every session refused with
+// "platform-agent-a2a-session is not in the identity map".
+//
+// What rolling buys is not that the new pods can read the map -- with a
+// mutable tag they pull a binary that can, but that is the registry's doing,
+// not ours. It is that a pod which refuses its FIRST map has no previous one to
+// fall back on, so Store.Ready is false, /readyz answers 503 `no identity map:
+// ...`, the Deployment never goes Available and the rollout stops with the
+// reason on the pod. The silent case only exists because the refusing replica
+// was already serving something. Rolling removes the fallback, and with it the
+// silence.
+//
+// Rolling the callout on every map CHANGE was considered and rejected -- see
+// platformagent_a2a_buscreds.go, the callout is on the connection path and a
+// restart is a window where new connections fail. This is the narrow version of
+// that trade: once per release that changes the map's shape, never for a
+// routine identity edit. A bounded window during an upgrade is worth a
+// permanent one after it.
+//
+// Bump this when the rendered map gains, renames or removes a field, and add
+// the new key set to a2aIdentityMapSchemaKeys in the test beside it.
+//
+//	1 -> serviceAccount, user, account, grants
+//	2 -> adds narrowing
+const a2aIdentityMapSchema = "2"
+
 const (
 	defaultA2ACalloutImage = "us-east4-docker.pkg.dev/bnaylor-kagents-dev/kube-agents/a2a-authcallout:dev"
 	a2aCalloutImageEnvVar  = "A2A_CALLOUT_IMAGE"
@@ -280,7 +326,14 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 				},
 			},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: podLabels,
+					// Not a config hash: this changes when the map's
+					// SHAPE does, not when its contents do.
+					Annotations: map[string]string{
+						a2aIdentityMapSchemaAnnotation: a2aIdentityMapSchema,
+					},
+				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           name,
 					AutomountServiceAccountToken: ptr.To(true),
@@ -409,6 +462,11 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 		// The provision Job's identity, applied here so it exists before the
 		// Job that mounts a token for it.
 		buildA2AProvisionServiceAccount(agent),
+		// The session identity, applied here so it exists before the gateway
+		// can spawn a pod that names it. A pod naming a missing ServiceAccount
+		// is rejected by the API server, which the gateway would surface as a
+		// failed spawn rather than as a misconfiguration.
+		buildA2ASessionServiceAccount(agent),
 		buildA2ACalloutRole(agent),
 		buildA2ACalloutRoleBinding(agent),
 		buildA2ACalloutDeployment(agent),
@@ -434,6 +492,22 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 		}
 	}
 	return nil
+}
+
+// buildA2ASessionServiceAccount is the identity every spawned session pod runs
+// as. Like the provisioner's it holds no RBAC — the token exists so the auth
+// callout has something to resolve, not so the pod can talk to the API server —
+// and here that matters more, because the workload running under it is the one
+// executing model output.
+func buildA2ASessionServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aSessionServiceAccountName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "session"),
+		},
+	}
 }
 
 // buildA2AProvisionServiceAccount is the provision Job's identity. It holds no
