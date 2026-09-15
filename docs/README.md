@@ -147,6 +147,7 @@ identifier appears, add its source here.
 | Go toolchain version | `k8s-operator/go.mod` (and `a2a/go.mod`, kept in step) |
 | The drift audit subscription's name | `subscription_name` in `terraform/modules/drift-pubsub/variables.tf`, mirrored by `defaultSubscriptionName` in `k8s-operator/cmd/drift-detector/main.go` |
 | A2A wire constants: protocol version, stream names, size thresholds, token grammar | `a2a/lib/envelope.go` and `a2a/lib/topics.go` |
+| A2A subject grammar: the task subject classes (`in`, `events`, `supervisor`), their constructors and the parse that recovers addressee, taskId and class | `a2a/lib/client.go` |
 | The A2A gateway process's env (backend selection, gchat relay and allowlist, display mode, addressee) | `a2a/gateway/config.go` (`FromEnv`) |
 | Credential-proxy relay env vars, audiences, and route roles | reader `agents/platform/scripts/credential_proxy.py` (`serve`, `build_authenticator`, `ROUTE_ROLES`); the audience values are written by `k8s-operator/internal/controller/platformagent_broker_split.go` |
 | The bus principal set: every NATS user the A2A fabric issues or renders, which are static and which authenticate through the callout, and the subject grants each one gets | `k8s-operator/internal/controller/platformagent_a2a_identities.go` (the rendered map and the surviving static users) and `a2a/authcallout/session.go` (the per-session grants, which are in no map) |

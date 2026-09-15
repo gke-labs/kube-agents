@@ -117,30 +117,53 @@ func (t *Task) mergeArtifact(u ArtifactUpdate) {
 	t.Artifacts = append(t.Artifacts, u.Artifact)
 }
 
-// TasksGet replays the task's events subject from sequence 1 on an ephemeral
-// ordered consumer and folds the result — the durability payoff: no live
-// executor required.
+// TaskReplaySubjects is the pair tasks/get folds, in one stream order: the
+// executor's events and the supervisor's terminal, if it wrote one.
+func TaskReplaySubjects(addressee, taskID string) []string {
+	return []string{TaskEventsSubject(addressee, taskID), TaskSupervisorSubject(addressee, taskID)}
+}
+
+// TasksGet replays the task's events and supervisor subjects from sequence 1
+// on an ephemeral ordered consumer and folds the result — the durability
+// payoff: no live executor required. The two subjects share the TASKS stream
+// sequence, so the ordered consumer supplies their total order and the fold
+// needs no merge: a supervisor terminal that raced an executor's own lands
+// wherever the stream put it, and whichever came second is the post-final
+// drop.
 func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task, error) {
 	_, js := c.conn()
-	subject := TaskEventsSubject(addressee, taskID)
+	subjects := TaskReplaySubjects(addressee, taskID)
 	stream, err := js.Stream(ctx, TasksStream)
 	if err != nil {
 		return nil, fmt.Errorf("stream %s: %w", TasksStream, err)
 	}
 	// Snapshot the replay horizon first: fold what the stream holds now, and
 	// terminate deterministically even while the task is still emitting.
-	last, err := stream.GetLastMsgForSubject(ctx, subject)
-	if err != nil {
-		if errors.Is(err, jetstream.ErrMsgNotFound) {
-			// No events in the retention window: the A2A answer is
-			// TaskNotFound, not an empty Task indistinguishable from a broken
-			// one.
-			return nil, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
+	// GetLastMsgForSubject is single-subject, so the horizon is the later of
+	// the two, and a task exists if either subject holds a message.
+	var last uint64
+	found := false
+	for _, subject := range subjects {
+		msg, err := stream.GetLastMsgForSubject(ctx, subject)
+		if err != nil {
+			if errors.Is(err, jetstream.ErrMsgNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("replay horizon for %s: %w", taskID, err)
 		}
-		return nil, fmt.Errorf("replay horizon for %s: %w", taskID, err)
+		found = true
+		if msg.Sequence > last {
+			last = msg.Sequence
+		}
+	}
+	if !found {
+		// No events in the retention window: the A2A answer is
+		// TaskNotFound, not an empty Task indistinguishable from a broken
+		// one.
+		return nil, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
 	}
 	cons, err := js.OrderedConsumer(ctx, TasksStream, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{subject},
+		FilterSubjects: subjects,
 		DeliverPolicy:  jetstream.DeliverAllPolicy,
 	})
 	if err != nil {
@@ -168,33 +191,37 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		if err != nil {
 			return nil, fmt.Errorf("replay metadata for %s: %w", taskID, err)
 		}
+		subject := msg.Subject()
 		env, err := ParseEnvelope(msg.Data())
 		if err != nil {
 			// A hostile or foreign write must not revoke tasks/get for the
 			// task: the live path terms poison and keeps going, so replay
 			// skips it the same way rather than failing the whole fold.
 			c.log.Error("a2a replay skipping unparseable event", "subject", subject, "err", err)
-		} else if env.Kind != KindStatusUpdate && env.Kind != KindArtifactUpdate {
-			// Replay-only screen, not live parity: the live path delivers a
-			// foreign kind on .events to the handler, where FoldTask surfaces
-			// it as a ProtocolError. Replay's job is narrower - one foreign
-			// write must not revoke tasks/get for the task.
-			c.log.Error("a2a replay skipping non-event kind", "subject", subject, "kind", env.Kind)
-		} else if env.TaskID != taskID {
-			// The fourth poison class: a valid event for another task on this
-			// subject. FoldTask would hard-error on it; the screen drops it so
-			// one foreign write cannot revoke tasks/get (payload-level taskId
-			// mismatches never get this far - ParseEnvelope refuses them).
-			c.log.Error("a2a replay skipping event for another task", "subject", subject, "taskId", env.TaskID)
-		} else if env.To != nil && env.To.Session != addressee {
-			c.log.Error("a2a replay skipping to/addressee mismatch", "subject", subject, "to", env.To.Session)
+		} else if aerr := CheckSubjectAgreement(subject, env, c.opts.agreement); aerr != nil && !IsAdvisoryDisagreement(aerr) {
+			// A relocated envelope - the wrong kind for the class, another
+			// task's id, a writer the subject does not imply - carries no
+			// identity and does not fold. Replay's job is narrower than the
+			// live path's: FoldTask would hard-error on a foreign kind or
+			// taskId, and one foreign write must not revoke tasks/get for
+			// the task, so the screen drops it and counts it instead.
+			c.protocolViolations.Add(1)
+			c.log.Error("a2a replay skipping envelope that disagrees with its subject", "subject", subject, "err", aerr)
 		} else {
+			if aerr != nil {
+				// The advisory `…events` writer check: a pre-split
+				// supervisor terminal, or a forged one. Counted, folded,
+				// and attributed to the subject's principal - never to
+				// its `from`.
+				c.protocolViolations.Add(1)
+				c.log.Warn("a2a replay folding envelope whose writer disagrees with its subject (advisory)", "subject", subject, "err", aerr)
+			}
 			events = append(events, env)
 		}
 		// Two exits: the snapshotted horizon, or nothing left pending — the
 		// horizon message itself may have aged out between snapshot and
 		// replay, and waiting for it then would block forever.
-		if meta.Sequence.Stream >= last.Sequence || meta.NumPending == 0 {
+		if meta.Sequence.Stream >= last || meta.NumPending == 0 {
 			break
 		}
 	}

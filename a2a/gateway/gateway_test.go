@@ -182,7 +182,7 @@ func startRig(t *testing.T) *rig {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
@@ -964,7 +964,7 @@ func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions i
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}

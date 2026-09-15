@@ -77,6 +77,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	client, err := lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
+		lib.WithAgreementPolicy(gateway.SupervisorAgreement(cfg)),
 		lib.WithNATSOptions(natsOpts...),
 	)
 	if err != nil {

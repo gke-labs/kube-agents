@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -324,5 +325,89 @@ func TestNoSessionPrincipalSharesTheWorkerCredential(t *testing.T) {
 		if id.user == "session" && id.credsKey == "worker-password" {
 			t.Fatal("the session principal was given the worker password back")
 		}
+	}
+}
+
+// The task plane's writer sets, as the render grants them. Subject-derived
+// identity is decision-grade on a subject exactly where the principals whose
+// grants reach it are the ones the subject names, so this is asserted over
+// every rendered principal's publish list with the same matcher the server
+// applies, not over the one entry that changed.
+//
+//   - `…supervisor` has one writer, the gateway, which is the supervisor for
+//     the chat sessions it spawns. The dispatcher's janitor inherits the token
+//     at stage 3 and will appear here when it does.
+//   - The gateway holds no publish on `…events`. The executor's subject has one
+//     writer class, and a supervisor terminal there is exactly what a hostile
+//     executor would forge.
+//   - The gateway reads both, because its relay folds the pair.
+//
+// What is NOT asserted, and why: that `…events` has no writer beyond the
+// executor. The static `worker` still holds `a2a.tasks.*.*.events` for every
+// addressee until A5 retires it (gke-labs#1316), and that gap is recorded as a
+// known violation in tests/conformance rather than papered over here.
+func TestTheSupervisorSubjectHasExactlyOneWriterAndItIsNotAnEventsWriter(t *testing.T) {
+	const (
+		supervisorProbe = "a2a.tasks.chat-otter-1a2b.task-0001.supervisor"
+		eventsProbe     = "a2a.tasks.chat-otter-1a2b.task-0001.events"
+	)
+	var supervisorWriters []string
+	for _, id := range a2aIdentities(identityTestAgent()) {
+		for _, grant := range id.publish {
+			if subjectMatches(grant, supervisorProbe) {
+				supervisorWriters = append(supervisorWriters, id.user)
+				break
+			}
+		}
+		if id.user != "gateway" {
+			continue
+		}
+		for _, grant := range id.publish {
+			if subjectMatches(grant, eventsProbe) {
+				t.Errorf("the gateway's publish grant %q reaches an executor's events subject; the supervisor split moved its terminal off that subject", grant)
+			}
+		}
+		for _, probe := range []string{supervisorProbe, eventsProbe} {
+			if !slices.ContainsFunc(id.subscribe, func(grant string) bool { return subjectMatches(grant, probe) }) {
+				t.Errorf("the gateway cannot subscribe to %s; its relay folds both task-event subjects", probe)
+			}
+		}
+	}
+	if !slices.Equal(supervisorWriters, []string{"gateway"}) {
+		t.Errorf("principals whose publish grants reach %s: %v, want exactly [gateway]", supervisorProbe, supervisorWriters)
+	}
+}
+
+// The `…events` writer-class check ships advisory and must be tightenable
+// without a new gateway image, one retention window after an install takes
+// the supervisor split. That makes the rendered env var the mechanism, so it
+// is rendered explicitly at its default and honours the controller override.
+func TestTheEventsWriterCheckIsTightenedByConfigNotByCode(t *testing.T) {
+	agent := a2aTestAgent()
+	strictEnv := func() *corev1.EnvVar {
+		t.Helper()
+		dep := buildA2AGatewayDeployment(agent)
+		for i := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e := &dep.Spec.Template.Spec.Containers[0].Env[i]; e.Name == "A2A_STRICT_EVENTS_WRITER" {
+				return e
+			}
+		}
+		return nil
+	}
+	e := strictEnv()
+	if e == nil {
+		t.Fatal("the gateway Deployment does not render A2A_STRICT_EVENTS_WRITER; the advisory check has no flip")
+	}
+	if e.Value != "false" {
+		t.Errorf("A2A_STRICT_EVENTS_WRITER defaults to %q, want \"false\" - a strict default refuses pre-split supervisor terminals", e.Value)
+	}
+	t.Setenv("A2A_STRICT_EVENTS_WRITER", "true")
+	if got := strictEnv().Value; got != "true" {
+		t.Errorf("the controller override did not reach the gateway: %q", got)
+	}
+	// Anything that is not exactly "true" relaxes rather than tightens.
+	t.Setenv("A2A_STRICT_EVENTS_WRITER", "TRUE")
+	if got := strictEnv().Value; got != "false" {
+		t.Errorf("a near-miss value tightened the check: %q", got)
 	}
 }

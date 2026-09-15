@@ -153,8 +153,19 @@ const (
 	// wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar  = "A2A_WORKER_IMAGE"
-	defaultA2AWorkerImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
+	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+
+	// a2aStrictEventsWriterEnvVar is read from the CONTROLLER's environment
+	// and rendered onto the gateway, the same override shape as the worker
+	// image above. It exists so that tightening the `…events` writer-class
+	// agreement check from advisory to refusal is an operator action rather
+	// than a code change: the check must stay advisory for one TASKS
+	// retention window after an install takes the supervisor subject split,
+	// because until then the stream still holds supervisor terminals written
+	// on `…events` before it, and refusing those folds every recent task
+	// non-terminal. A flip that needed a new image would not get made.
+	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
+	defaultA2AWorkerImage       = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
 
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
@@ -266,6 +277,16 @@ func a2aWorkerImage() string {
 		return override
 	}
 	return defaultA2AWorkerImage
+}
+
+// a2aStrictEventsWriter renders "false" for anything but an explicit "true",
+// so a typo relaxes rather than tightens - the safe direction here, because
+// the tight setting is the one that can refuse legitimate history.
+func a2aStrictEventsWriter() string {
+	if os.Getenv(a2aStrictEventsWriterEnvVar) == "true" {
+		return "true"
+	}
+	return "false"
 }
 
 func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string    { return agent.Name + "-a2a-nats" }
@@ -1689,6 +1710,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// when it matches the gateway's own default, so
 							// the operator-side override reaches it.
 							{Name: "A2A_WORKER_IMAGE", Value: a2aWorkerImage()},
+							// Rendered explicitly at its default, like
+							// A2A_MAX_SESSIONS above: a reader of the live
+							// Deployment can see which posture the events
+							// writer-class check is in without knowing the
+							// gateway binary's default, and the flip after
+							// the retention window is an edit to a value
+							// that is already there.
+							{Name: a2aStrictEventsWriterEnvVar, Value: a2aStrictEventsWriter()},
 							// The namespace from the downward API, not a baked
 							// default: the boot-time owner resolution below
 							// reads the gateway's own Deployment in THIS

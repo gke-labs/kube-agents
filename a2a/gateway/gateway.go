@@ -43,11 +43,35 @@ const (
 	correlationIDHexWidth = 12
 )
 
-// gatewayParty is the gateway's own identity in from — routing and display
-// only, never an authorization input. Its supervisor events carry it so
-// replay always distinguishes "the worker said failed" from "the supervisor
-// declared it dead".
+// gatewayParty is the gateway's own identity in from. Never the source of
+// authority: what makes a supervisor terminal the supervisor's is the subject
+// it is published on (`…supervisor`, which only the gateway's grant reaches),
+// and from is checked for agreement with that subject by every consumer -
+// a terminal on `…supervisor` whose from is not this party is a protocol
+// error, and so is one on an executor's `…events` wearing it. That is how
+// replay distinguishes "the worker said failed" from "the supervisor declared
+// it dead" without trusting a field the publisher writes.
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
+
+// SupervisorAgreement is the envelope-subject agreement policy for the
+// gateway's own consumers, and the one main hands the bus client so that
+// tasks/get replay and the relay agree about who the supervisor is. The
+// gateway is the supervisor for every session it spawned, so the
+// `…supervisor` writer check is exact rather than the negative form.
+//
+// The strict flag is config, not code, on purpose. The `…events` writer-class
+// check ships advisory because for one TASKS retention window after an
+// install takes the supervisor split the stream still holds legitimate
+// supervisor terminals on `…events`. Tightening it is then a Deployment env
+// change (A2A_STRICT_EVENTS_WRITER=true) an operator can make - and revert -
+// without an image, which is what makes "flip it 72h later" an instruction
+// someone can actually carry out.
+func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
+	return lib.AgreementPolicy{
+		Supervisor:         gatewayParty.Session,
+		StrictEventsWriter: cfg != nil && cfg.StrictEventsWriter,
+	}
+}
 
 // Gateway wires the adapter, the session manager, and the bus client.
 type Gateway struct {
@@ -206,11 +230,21 @@ func New(o Options) (*Gateway, error) {
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
+	// Both task-event subjects, one durable: the executors' events and the
+	// terminals this gateway synthesizes as supervisor, which it relays to
+	// the requester and retires the task on exactly like an executor's own.
+	// Two filter subjects put the filter in the request body, which the
+	// gateway's unscoped consumer-create grant permits and a session's
+	// pinned grant would not; the durable already exists on every install
+	// with the single filter, and rebinding it to the pair is an update the
+	// server accepts (lib's rebind test).
+	agreement := SupervisorAgreement(g.cfg)
 	sub, err := g.client.SubscribeDurable(ctx, lib.SubscribeConfig{
-		Stream:  lib.TasksStream,
-		Subject: "a2a.tasks.*.*.events",
-		Durable: g.relayDurable,
-		Session: gatewayParty.Session,
+		Stream:    lib.TasksStream,
+		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
+		Durable:   g.relayDurable,
+		Session:   gatewayParty.Session,
+		Agreement: &agreement,
 	}, func(env *lib.Envelope) { g.relayEvent(ctx, env) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)

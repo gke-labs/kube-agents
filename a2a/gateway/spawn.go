@@ -520,10 +520,12 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 // `failed` for an executor that died mid-work, `canceled` where the task
 // had detached — a worker that exits or wedges after a `stop` reaches here
 // routinely, and an unconditional `failed` would report broken for every
-// task a user stopped. The synthesized event carries the gateway's identity
-// in from, so replay always distinguishes "the worker said failed" from
-// "the supervisor declared it dead". (The dispatcher's janitor is the other
-// half, for profile-addressed tasks — stage 3.)
+// task a user stopped. The synthesized event goes on the task's
+// `…supervisor` subject, which only the gateway's grant reaches, so replay
+// distinguishes "the worker said failed" from "the supervisor declared it
+// dead" by where the bytes are rather than by what from says. (The
+// dispatcher's janitor is the other half, for profile-addressed tasks —
+// stage 3, and it inherits the token.)
 func (g *Gateway) sweepLoop(ctx context.Context) {
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
@@ -671,7 +673,10 @@ func (g *Gateway) releaseIncarnation(ctx context.Context, o orphanPod) {
 // publishSupervisorTerminal writes a task's terminal event on behalf of the
 // gateway as supervisor — `failed` for an executor that died mid-work,
 // `canceled` where the supervisor is finishing a cancel already on the
-// stream (the callers own that choice).
+// stream (the callers own that choice). On the task's `…supervisor` subject,
+// never its `…events`: the executor's subject has one writer, and a
+// supervisor terminal there is exactly the shape a hostile executor would
+// forge.
 func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, taskID, contextID, correlationID string, state lib.TaskState, note string) error {
 	if correlationID == "" {
 		// The record should always carry it; a missing one still gets a
@@ -698,5 +703,5 @@ func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, task
 	if err != nil {
 		return err
 	}
-	return g.client.Publish(ctx, lib.TaskEventsSubject(addressee, taskID), env)
+	return g.client.Publish(ctx, lib.TaskSupervisorSubject(addressee, taskID), env)
 }

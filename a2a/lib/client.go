@@ -24,10 +24,34 @@ func TaskInSubject(addressee, taskID string) string {
 }
 
 // TaskEventsSubject is where the executor publishes status and artifact
-// updates for a task.
+// updates for a task. The executor and nobody else: since the supervisor
+// split, a supervisor's synthesized terminal goes on TaskSupervisorSubject,
+// so this subject's writer set is the addressee's own principal and its
+// identity is subject-derived.
 func TaskEventsSubject(addressee, taskID string) string {
-	return fmt.Sprintf("a2a.tasks.%s.%s.events", addressee, taskID)
+	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassEvents)
 }
+
+// TaskSupervisorSubject is where a task's supervisor - the gateway for the
+// chat sessions it spawned, the dispatcher's janitor for profile-addressed
+// tasks once it exists - publishes the terminal it synthesizes for an executor
+// that died, or that it is tearing down on a requester's cancel. Its own token,
+// so that both it and `…events` are single-writer: before the split the two
+// shared `…events`, and a hostile executor could publish a terminal carrying
+// the supervisor's `from` that replay could not tell from the real thing. The
+// token is the same count as `events`, so every `a2a.tasks.*.*.<class>`
+// pattern and the TASKS stream filter behave identically and the pair share
+// one stream sequence. tasks/get folds both in that order.
+func TaskSupervisorSubject(addressee, taskID string) string {
+	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
+}
+
+// The task-subject classes: the last token of a2a.tasks.{addressee}.{taskId}.
+const (
+	TaskClassIn         = "in"
+	TaskClassEvents     = "events"
+	TaskClassSupervisor = "supervisor"
+)
 
 // agentsPrefix is the directory plane: a2a.agents.{profile}.
 const agentsPrefix = "a2a.agents."
@@ -40,7 +64,8 @@ func AgentSubject(profile string) string {
 }
 
 // ParseTaskSubject splits a task subject into its addressee, taskId, and
-// class ("in" or "events"). ok is false for any other subject shape.
+// class (TaskClassIn, TaskClassEvents or TaskClassSupervisor). ok is false for
+// any other subject shape.
 func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool) {
 	rest, found := strings.CutPrefix(subject, "a2a.tasks.")
 	if !found {
@@ -50,10 +75,11 @@ func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool)
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
 		return "", "", "", false
 	}
-	if parts[2] != "in" && parts[2] != "events" {
-		return "", "", "", false
+	switch parts[2] {
+	case TaskClassIn, TaskClassEvents, TaskClassSupervisor:
+		return parts[0], parts[1], parts[2], true
 	}
-	return parts[0], parts[1], parts[2], true
+	return "", "", "", false
 }
 
 // dialTimeout bounds one connection attempt's TCP and auth handshake;
@@ -65,6 +91,10 @@ const dialTimeout = 10 * time.Second
 const (
 	backoffBase = 200 * time.Millisecond
 	backoffCap  = 5 * time.Second
+
+	// subscribeBindWindow bounds how long the FIRST bind of a durable retries
+	// before the error reaches the caller; see durableSub.startWithRetry.
+	subscribeBindWindow = 45 * time.Second
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -107,7 +137,9 @@ type Client struct {
 	// health.
 	rebuilds atomic.Int64
 	// protocolViolations counts surfaced-and-dropped protocol errors (poison
-	// envelopes, to/addressee mismatches, post-final events).
+	// envelopes, envelope-subject disagreements, post-final events). Advisory
+	// disagreements count here too: they are the one protocol error this
+	// client sees and does not refuse.
 	protocolViolations atomic.Int64
 }
 
@@ -121,9 +153,10 @@ func (c *Client) ProtocolViolations() int64 {
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	name     string
-	logger   *slog.Logger
-	natsOpts []nats.Option
+	name      string
+	logger    *slog.Logger
+	natsOpts  []nats.Option
+	agreement AgreementPolicy
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come
@@ -140,6 +173,14 @@ func WithName(name string) ClientOption {
 // WithLogger routes the connection-event log lines NR-3 requires.
 func WithLogger(l *slog.Logger) ClientOption {
 	return func(o *clientOptions) { o.logger = l }
+}
+
+// WithAgreementPolicy sets the envelope-subject agreement policy this client
+// applies at delivery (see CheckSubjectAgreement). A supervisor passes its own
+// session name so the `…supervisor` writer check is exact rather than the
+// negative form.
+func WithAgreementPolicy(p AgreementPolicy) ClientOption {
+	return func(o *clientOptions) { o.agreement = p }
 }
 
 // WithNATSOptions appends raw nats.go options (reconnect tuning in tests).
@@ -347,23 +388,28 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 	if err := env.ValidateEmit(); err != nil {
 		return err
 	}
-	// 0.4: the envelope's to MUST agree with the subject's addressee token; a
-	// mismatch is a protocol error, refused at the source. Task-subject tokens
-	// must also be dot-free DNS-1123 labels - dots change the token count.
+	// Task-subject tokens must be dot-free DNS-1123 labels - dots change the
+	// token count under every wildcard filter.
 	if strings.HasPrefix(subject, "a2a.tasks.") {
 		addressee, taskID, _, ok := ParseTaskSubject(subject)
 		if !ok || !validDNS1123Label(addressee) || !validDNS1123Label(taskID) {
 			return &ProtocolError{Msg: fmt.Sprintf("malformed task subject %q: addressee and taskId must be dot-free DNS-1123 labels", subject)}
 		}
-		if env.To != nil && env.To.Session != addressee {
-			return &ProtocolError{Msg: fmt.Sprintf("envelope to %q disagrees with subject addressee %q", env.To.Session, addressee)}
+	}
+	// The envelope must agree with the subject it is published on - kind,
+	// taskId, `to` on `…in`, and the writer the subject implies - refused at
+	// the source for the same reason a consumer refuses it at delivery: one
+	// event published onto another task's subject would fold into the wrong
+	// task's history, and a supervisor's `from` on an executor's subject is
+	// the forgery the subject split exists to make visible. The one advisory
+	// check (the `…events` writer class, until the split is a retention
+	// window old) is counted here rather than refused.
+	if err := CheckSubjectAgreement(subject, env, c.opts.agreement); err != nil {
+		if !IsAdvisoryDisagreement(err) {
+			return &ProtocolError{Msg: err.Error()}
 		}
-		// Same rule for the taskId: one event published onto another task's
-		// subject would fold into the wrong task's history, so the
-		// disagreement is refused at the source like the to/addressee one.
-		if env.TaskID != taskID {
-			return &ProtocolError{Msg: fmt.Sprintf("envelope taskId %q disagrees with subject taskId %q", env.TaskID, taskID)}
-		}
+		c.protocolViolations.Add(1)
+		c.log.Warn("a2a publish disagrees with its subject (advisory)", "subject", subject, "err", err)
 	}
 	// The topic plane has the same shape of rule: dot-free tokens, and the
 	// artifact's name is the topic the subject names (assertion 16).
@@ -408,12 +454,30 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 
 // SubscribeConfig describes a durable subscription.
 type SubscribeConfig struct {
-	Stream  string
-	Subject string
-	Durable string
+	Stream string
+	// Subject is the consumer's filter. Exactly one of Subject and Subjects
+	// is set. A single subject rides the CONSUMER.CREATE request subject,
+	// which is what lets a connect-time grant pin it; several move the filter
+	// into the request body, which only a principal holding the unscoped
+	// consumer-create grant can send - the gateway's relay reads
+	// `…events` and `…supervisor` together that way.
+	Subject  string
+	Subjects []string
+	Durable  string
 	// Session is this consumer's own session name; envelopes addressed to
 	// another session are ignored per assertion 4.
 	Session string
+	// Agreement overrides the client's envelope-subject agreement policy for
+	// this consumer. nil uses the client's.
+	Agreement *AgreementPolicy
+}
+
+// filterSubjects is the consumer's filter set, however it was spelled.
+func (cfg SubscribeConfig) filterSubjects() []string {
+	if cfg.Subject != "" {
+		return []string{cfg.Subject}
+	}
+	return cfg.Subjects
 }
 
 // Subscription is a live durable subscription.
@@ -429,8 +493,10 @@ func (c *Client) SubscribeDurable(ctx context.Context, cfg SubscribeConfig, hand
 	switch {
 	case cfg.Stream == "":
 		return nil, fmt.Errorf("SubscribeConfig.Stream is required")
-	case cfg.Subject == "":
-		return nil, fmt.Errorf("SubscribeConfig.Subject is required")
+	case cfg.Subject == "" && len(cfg.Subjects) == 0:
+		return nil, fmt.Errorf("SubscribeConfig.Subject or Subjects is required")
+	case cfg.Subject != "" && len(cfg.Subjects) > 0:
+		return nil, fmt.Errorf("SubscribeConfig.Subject and Subjects are exclusive")
 	case cfg.Durable == "":
 		return nil, fmt.Errorf("SubscribeConfig.Durable is required")
 	case cfg.Session == "":
@@ -445,11 +511,50 @@ func (c *Client) SubscribeDurable(ctx context.Context, cfg SubscribeConfig, hand
 	c.subs = append(c.subs, s)
 	js := c.js
 	c.mu.Unlock()
-	if err := s.start(ctx, js); err != nil {
+	if err := s.startWithRetry(ctx, js); err != nil {
 		s.Stop()
 		return nil, err
 	}
 	return s, nil
+}
+
+// startWithRetry is the first bind's version of what resubscribe does for
+// every later one. A nats-server that has just restarted accepts client
+// connections before it has finished recovering a stream's consumers - it
+// logs "Server is ready" ahead of "Recovering N consumers for stream" - and a
+// bind landing in that window can be answered against state the server has
+// not caught up to. Observed live: a gateway rolled alongside its server
+// exited at Run four milliseconds after connecting, ten seconds into the
+// server's restart, reporting that its two-filter relay consumer was
+// unsupported; the same bind succeeded unchanged thirty seconds later, and
+// the same single-to-multi filter update succeeds every time against that
+// server once it is settled.
+//
+// Bounded, unlike the rebuild path's retry: there the process is already up
+// and serving and giving up would leave it silently deaf, while here a
+// consumer config the server will never accept must still fail the process
+// rather than hang it. Every attempt is logged, so the delay is never silent.
+func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
+	deadline := time.Now().Add(subscribeBindWindow)
+	for attempt := 1; ; attempt++ {
+		err := s.start(ctx, js)
+		if err == nil {
+			if attempt > 1 {
+				s.c.log.Info("durable bound after retry", "durable", s.cfg.Durable, "attempts", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
+			return err
+		}
+		s.c.log.Warn("durable bind failed; retrying",
+			"durable", s.cfg.Durable, "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(fullJitterBackoff(attempt)):
+		}
+	}
 }
 
 type durableSub struct {
@@ -467,11 +572,16 @@ type durableSub struct {
 // Called at subscribe time and again by rebuild with a fresh js; it holds no
 // reference to any prior connection's objects.
 func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
-	cons, err := js.CreateOrUpdateConsumer(ctx, s.cfg.Stream, jetstream.ConsumerConfig{
-		Durable:       s.cfg.Durable,
-		FilterSubject: s.cfg.Subject,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-	})
+	consCfg := jetstream.ConsumerConfig{
+		Durable:   s.cfg.Durable,
+		AckPolicy: jetstream.AckExplicitPolicy,
+	}
+	if filters := s.cfg.filterSubjects(); len(filters) == 1 {
+		consCfg.FilterSubject = filters[0]
+	} else {
+		consCfg.FilterSubjects = filters
+	}
+	cons, err := js.CreateOrUpdateConsumer(ctx, s.cfg.Stream, consCfg)
 	if err != nil {
 		return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
 	}
@@ -500,15 +610,23 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 		_ = msg.Term()
 		return
 	}
-	// Assertion 4 (0.4 clause): an envelope whose to disagrees with its
-	// subject's addressee token is a protocol error — surfaced and terminated
-	// like any poison, never passed through to the application.
-	if addressee, _, _, ok := ParseTaskSubject(msg.Subject()); ok && env.To != nil && env.To.Session != addressee {
+	// Envelope-subject agreement (assertion 4's to/addressee clause, and the
+	// kind, taskId and writer-class checks that make the subject's identity
+	// decision-grade): a disagreement is a protocol error - surfaced and
+	// terminated like any poison, never passed through to the application.
+	// The advisory writer check is counted and the envelope still delivered.
+	policy := s.c.opts.agreement
+	if s.cfg.Agreement != nil {
+		policy = *s.cfg.Agreement
+	}
+	if err := CheckSubjectAgreement(msg.Subject(), env, policy); err != nil {
 		s.c.protocolViolations.Add(1)
-		s.c.log.Error("a2a envelope rejected", "subject", msg.Subject(),
-			"err", fmt.Sprintf("to %q disagrees with subject addressee %q", env.To.Session, addressee))
-		_ = msg.Term()
-		return
+		if !IsAdvisoryDisagreement(err) {
+			s.c.log.Error("a2a envelope rejected", "subject", msg.Subject(), "err", err)
+			_ = msg.Term()
+			return
+		}
+		s.c.log.Warn("a2a envelope disagrees with its subject (advisory)", "subject", msg.Subject(), "err", err)
 	}
 	// Assertion 4: a wildcard consumer ignores envelopes addressed elsewhere.
 	if env.To != nil && env.To.Session != s.cfg.Session {

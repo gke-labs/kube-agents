@@ -15,11 +15,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// eventsEnvelopes replays everything on an addressee's events subjects —
-// the supervisor tests read the stream, not the gateway's memory, because
-// the property under test is what replay sees. Error-returning (no
-// *testing.T) so the fake spawner's onDelete hook can call it from the
-// gateway's own goroutine.
+// eventsEnvelopes replays everything on an addressee's events and supervisor
+// subjects, in stream order — the supervisor tests read the stream, not the
+// gateway's memory, because the property under test is what replay sees, and
+// since the split replay is the pair. Error-returning (no *testing.T) so the
+// fake spawner's onDelete hook can call it from the gateway's own goroutine.
 func eventsEnvelopes(url, addressee string) ([]*lib.Envelope, error) {
 	nc, err := nats.Connect(url)
 	if err != nil {
@@ -33,7 +33,10 @@ func eventsEnvelopes(url, addressee string) ([]*lib.Envelope, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cons, err := js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{fmt.Sprintf("a2a.tasks.%s.*.events", addressee)},
+		FilterSubjects: []string{
+			fmt.Sprintf("a2a.tasks.%s.*.%s", addressee, lib.TaskClassEvents),
+			fmt.Sprintf("a2a.tasks.%s.*.%s", addressee, lib.TaskClassSupervisor),
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -490,5 +493,128 @@ func TestAskBoundClearsOnlyTheCopy(t *testing.T) {
 	fresh, err := r.g.reg.Get(context.Background(), young.Key)
 	if err != nil || fresh == nil || fresh.ActiveTask == nil || fresh.ActiveTask.Ask != "the fresh ask" {
 		t.Fatalf("young ask must stay: %+v (err=%v)", fresh, err)
+	}
+}
+
+// subjectEnvelopes replays one exact subject - the test below needs to know
+// WHICH of the pair a terminal landed on, which eventsEnvelopes deliberately
+// erases.
+func subjectEnvelopes(t *testing.T, url, subject string) []*lib.Envelope {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cons, err := js.OrderedConsumer(ctx, lib.TasksStream, jetstream.OrderedConsumerConfig{FilterSubjects: []string{subject}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := cons.Messages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Stop()
+	var out []*lib.Envelope
+	for {
+		it2, cancel2 := context.WithTimeout(ctx, 300*time.Millisecond)
+		msg, err := fetchNext(it2, it)
+		cancel2()
+		if err != nil {
+			break
+		}
+		if env, err := lib.ParseEnvelope(msg.Data()); err == nil {
+			out = append(out, env)
+		}
+	}
+	return out
+}
+
+// TestSupervisorTerminalLandsOnTheSupervisorSubjectAndStillRelays: the
+// split, end to end inside the gateway. A swept orphan's terminal is
+// published on the task's `…supervisor` subject and nowhere near its
+// `…events` - the executor's subject keeps one writer - and the relay, which
+// now reads both subjects on one durable, renders it to the room and
+// retires the active task exactly as it would an executor's own terminal.
+// The record starts with the task active so the retirement is observable.
+func TestSupervisorTerminalLandsOnTheSupervisorSubjectAndStillRelays(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-split1"
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-split1", Kind: "group",
+		Addressee: "chat-vole-s1", BusSession: "chat-vole-s1", PodName: "chat-vole-s1",
+		SessionRouted: true, Profile: "chat", LastActivity: time.Now().UTC(),
+		ActiveTask: &ActiveTask{TaskID: "task-split1", CorrelationID: "corr-split1"},
+		Tasks:      []TaskRef{{ID: "task-split1", Addressee: "chat-vole-s1"}},
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.g.reg.IndexTask(context.Background(), "task-split1", conv); err != nil {
+		t.Fatal(err)
+	}
+	// The executor got as far as working before it died.
+	origin, err := lib.NewMessageEnvelope(gatewayParty, "task-split1", "ctx-split1", "corr-split1",
+		json.RawMessage(`{"role":"user","parts":[{"kind":"text","text":"x"}],"messageId":"m1","taskId":"task-split1","contextId":"ctx-split1"}`),
+		lib.WithTo(lib.Party{Session: "chat-vole-s1"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := r.execFor(t, origin, "chat-vole-s1")
+	for _, st := range []lib.TaskState{lib.StateSubmitted, lib.StateWorking} {
+		if err := exec.PublishStatus(context.Background(), st, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spawn.setOrphans([]orphanPod{{PodName: "chat-vole-s1", SessionKey: conv, Addressee: "chat-vole-s1",
+		TaskID: "task-split1", ContextID: "ctx-split1", CorrelationID: "corr-split1"}})
+
+	r.g.sweepOnce(context.Background())
+
+	events := subjectEnvelopes(t, r.url, lib.TaskEventsSubject("chat-vole-s1", "task-split1"))
+	for _, env := range events {
+		if env.From.Session == gatewayParty.Session {
+			t.Fatalf("the gateway wrote on the executor's events subject: %+v", env)
+		}
+	}
+	if len(events) != 2 {
+		t.Fatalf("events subject holds %d envelopes, want the executor's two and nothing else", len(events))
+	}
+	sup := subjectEnvelopes(t, r.url, lib.TaskSupervisorSubject("chat-vole-s1", "task-split1"))
+	if len(sup) != 1 || sup[0].From.Session != gatewayParty.Session {
+		t.Fatalf("supervisor subject = %+v, want exactly the gateway's terminal", sup)
+	}
+	var s lib.StatusUpdate
+	if err := json.Unmarshal(sup[0].Payload, &s); err != nil || !s.Final || s.Status.State != lib.StateFailed {
+		t.Fatalf("supervisor terminal = %+v (%v), want final failed", s, err)
+	}
+
+	// The relay reads the supervisor subject: the room hears about it and
+	// the task is retired.
+	waitFor(t, "failure posted from the supervisor subject", func() bool {
+		for _, text := range r.adapter.postTexts() {
+			if strings.Contains(text, "failed") {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, "active task retired by the relayed supervisor terminal", func() bool {
+		fresh, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && fresh != nil && fresh.ActiveTask == nil
+	})
+	// And tasks/get sees one fold across the pair.
+	task, err := r.client.TasksGet(context.Background(), "chat-vole-s1", "task-split1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != lib.StateFailed || !task.Final || len(task.StatusHistory) != 3 {
+		t.Fatalf("tasks/get = %s final=%v history=%v, want failed after submitted, working", task.State, task.Final, task.StatusHistory)
 	}
 }

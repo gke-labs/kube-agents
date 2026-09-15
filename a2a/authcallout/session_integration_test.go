@@ -193,6 +193,16 @@ func TestASessionIsRefusedEverythingBeyondItsOwnTask(t *testing.T) {
 		// steer or a cancel from the user to itself.
 		lib.TaskInSubject(podA, "task-1"): true,
 
+		// Writing its own supervisor subject. That token exists so that "the
+		// supervisor declared it dead" can only be written by the supervisor:
+		// an executor that could reach it could end its own task and have
+		// the record read as infrastructure rather than as itself. Its own
+		// `…events` stays open to it (the positive test above), and the
+		// other session's `…supervisor` is refused with everything else of
+		// that session's.
+		lib.TaskSupervisorSubject(podA, "task-1"): true,
+		lib.TaskSupervisorSubject(podB, "task-2"): true,
+
 		// Planes it has no business on at all.
 		"a2a.topics.anything":  true,
 		"a2a.agents.some-prof": true,

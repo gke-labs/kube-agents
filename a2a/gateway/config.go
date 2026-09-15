@@ -196,6 +196,15 @@ type Config struct {
 	// earlier and in one place.
 	SessionServiceAccount string
 
+	// StrictEventsWriter makes the `…events` writer-class agreement check a
+	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
+	// It ships false: for one TASKS retention window after an install takes
+	// the supervisor subject split, the stream still holds supervisor
+	// terminals written on `…events` before it, and refusing those folds
+	// every recent task non-terminal. Flip it no earlier than one retention
+	// window (72h at the dev default) after the split reaches the install.
+	StrictEventsWriter bool
+
 	// MaxSessions caps how many session pods run concurrently, gateway-wide
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
 	// threads are free, so the principal map bounds WHO can spawn and this
@@ -239,6 +248,7 @@ func FromEnv() (*Config, error) {
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
 
 		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
+		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
