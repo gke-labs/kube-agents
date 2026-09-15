@@ -1376,9 +1376,10 @@ def restart_agent_pod() -> None:
     raise AssertionError(f"agent pod {old} was not replaced within 240s")
 
 
-def reconcile_and_wait() -> None:
+def reconcile_and_wait(gen_before: int | None = None) -> None:
     """Give the operator a reconcile, then wait for the agent Deployment to settle."""
-    gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+    if gen_before is None:
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
     # min_gen must be gen_before + 1: passing the current generation satisfies the
     # >= check immediately and the helper returns without waiting for anything.
     wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
@@ -1763,6 +1764,7 @@ def step17_verify_link_self_heals_over_a_stale_directory(plugin_image: str) -> N
 
     link = profile_plugin_link(TARGET_PROFILE, TARGETED_PLUGIN_CR_NAME)
     try:
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         apply_kubectl_manifest(f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentPlugin
 metadata:
@@ -1773,7 +1775,7 @@ spec:
   image: {plugin_image}
   targetProfile: {TARGET_PROFILE}
 """)
-        reconcile_and_wait()
+        reconcile_and_wait(gen_before)
 
         # Recreate the pre-upgrade shape: the link replaced by the empty directory the
         # kubelet used to leave on the PVC.
@@ -1795,8 +1797,9 @@ spec:
             f"the healed link must resolve to the mounted plugin: {reachable.stdout}{reachable.stderr}"
         )
         log("Verified startup replaced the stale directory with a working link.")
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE])
-        reconcile_and_wait()
+        reconcile_and_wait(gen_before)
     finally:
         run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
