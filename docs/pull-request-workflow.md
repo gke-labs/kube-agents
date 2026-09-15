@@ -322,10 +322,9 @@ The two labels are the two people:
   `trusted_team_for_sticky_lgtm: Googlers` is configured, which means a push after the label lands
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
-  the changed paths — [`OWNERS`](../OWNERS) at the root, [`k8s-operator/OWNERS`](../k8s-operator/OWNERS)
-  for the operator, [`bench/tasks/OWNERS`](../bench/tasks/OWNERS) for the eval cases and
-  [`hack/OWNERS`](../hack/OWNERS) for `hack/ci-eval-pr.sh` alone, with
-  [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `waw-leads` and `eval-crew`. The last two name
+  the changed paths — [`OWNERS`](../OWNERS) at the root, [`bench/tasks/OWNERS`](../bench/tasks/OWNERS)
+  for the eval cases and [`hack/OWNERS`](../hack/OWNERS) for `hack/ci-eval-pr.sh` alone, with
+  [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last two name
   only `eval-crew` and set `no_parent_owners`, so a root approver's `/approve` does not clear
   a change to a case or to the presubmit roster (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one

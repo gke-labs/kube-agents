@@ -541,6 +541,18 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             f"{OWNER_MAINTAINERS!r}"
         )
 
+    # The expected-fail marker. bench-gate inverts a marked case's verdict,
+    # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses
+    # anything but a YAML boolean -- after the cluster lease. A quoted "false"
+    # is a string, which is truthy, so a permissive read would flip the case
+    # into expected-fail on a typo; catch the shape here, in a second.
+    if "expected_fail" in spec and not isinstance(spec["expected_fail"], bool):
+        problems.append(
+            f"'expected_fail:' {spec['expected_fail']!r} is not a YAML boolean; "
+            "write a bare true or false. A quoted value is a string, which "
+            "bench-gate refuses at spec-load time, after the lease"
+        )
+
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
     # name or project id -- see docs/designs/bench-fleet-catalog.md.
     fixtures = spec.get("fixtures")

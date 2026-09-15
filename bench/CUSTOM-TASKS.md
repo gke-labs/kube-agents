@@ -222,10 +222,13 @@ one; [CONTRIBUTING.md](CONTRIBUTING.md) says what the owner commits to.
 
 A task may also carry a top-level `expected_fail: true`, which inverts the presubmit's verdict for
 it: failing is the declared outcome, and _passing_ every repetition is what reports. That is the
-eval-driven-development marker — write the case for a gap before the fix exists, land it
-expected-fail, and the flip to `false` shows up in the diff that closes the gap. It defaults to
-`false`, so no existing task needs the field, and like `domain:` it is read by `bench-gate` rather
-than by devops-bench.
+eval-driven-development marker for a gap whose fix is not yours to make — land the case red and
+marked, and the owner's fix flips the marker in the diff that closes the gap; a case for your own
+change goes red to green inside one pull request and never carries it
+([`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md)). It
+defaults to `false`, so no existing task needs the field, and like `domain:` it is read by
+`bench-gate` rather than by devops-bench. It must be a bare YAML boolean; the validator rejects a
+quoted one, which is a string and truthy.
 
 A new task must also be registered: the presubmit runs only what the `TASKS` array in
 `hack/ci-eval-pr.sh` names, the nightly adds what `NIGHTLY_TASKS` names (appended when

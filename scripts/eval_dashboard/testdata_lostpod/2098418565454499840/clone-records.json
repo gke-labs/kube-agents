@@ -1,0 +1,79 @@
+[
+  {
+    "refs": {
+      "org": "",
+      "repo": ""
+    }
+  },
+  {
+    "refs": {
+      "org": "gke-labs",
+      "repo": "kube-agents",
+      "base_ref": "main",
+      "base_sha": "57efd2d15e193067c5a8276d0e53d3dcf4750ba1",
+      "pulls": [
+        {
+          "number": 1446,
+          "author": "jayantid",
+          "sha": "fd4420b2325c6d2fbdd18e3f979e8874c056366d",
+          "title": "feat(dashboard): collect the nightly tier and keep it out of the gate's verdicts"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "PWD=/  mkdir -p /home/prow/go/src/github.com/gke-labs/kube-agents",
+        "duration": 1597893
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git init",
+        "output": "hint: Using 'master' as the name for the initial branch. This default branch name\nhint: is subject to change. To configure the initial branch name to use in all\nhint: of your new repositories, which w\n[... git transcript trimmed for the fixture ...]",
+        "duration": 4828000
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git config user.name ci-robot",
+        "duration": 1827785
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git config user.email ci-robot@k8s.io",
+        "duration": 1775747
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git fetch https://github.com/gke-labs/kube-agents.git --tags --prune",
+        "output": "From https://github.com/gke-labs/kube-agents\n * branch              HEAD                       -> FETCH_HEAD\n * [new tag]           0.1.0                      -> 0.1.0\n * [new tag]           0.2.0    \n[... git transcript trimmed for the fixture ...]",
+        "duration": 4035138613
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git fetch https://github.com/gke-labs/kube-agents.git 57efd2d15e193067c5a8276d0e53d3dcf4750ba1",
+        "output": "From https://github.com/gke-labs/kube-agents\n * branch              57efd2d15e193067c5a8276d0e53d3dcf4750ba1 -> FETCH_HEAD\n",
+        "duration": 389149706
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git checkout 57efd2d15e193067c5a8276d0e53d3dcf4750ba1",
+        "output": "Note: switching to '57efd2d15e193067c5a8276d0e53d3dcf4750ba1'.\n\nYou are in 'detached HEAD' state. You can look around, make experimental\nchanges and commit them, and you can discard any commits you ma\n[... git transcript trimmed for the fixture ...]",
+        "duration": 374924659
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git branch --force main 57efd2d15e193067c5a8276d0e53d3dcf4750ba1",
+        "duration": 2615122
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git checkout main",
+        "output": "Switched to branch 'main'\n",
+        "duration": 167007654
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git fetch https://github.com/gke-labs/kube-agents.git fd4420b2325c6d2fbdd18e3f979e8874c056366d",
+        "output": "From https://github.com/gke-labs/kube-agents\n * branch              fd4420b2325c6d2fbdd18e3f979e8874c056366d -> FETCH_HEAD\n",
+        "duration": 581623821
+      },
+      {
+        "command": "PWD=/home/prow/go/src/github.com/gke-labs/kube-agents GIT_AUTHOR_DATE=1789136866 GIT_COMMITTER_DATE=1789136866 git merge --no-ff fd4420b2325c6d2fbdd18e3f979e8874c056366d",
+        "output": "Auto-merging .github/workflows/ci-health.yml\nCONFLICT (content): Merge conflict in .github/workflows/ci-health.yml\nAuto-merging docs/ci-health.md\nAuto-merging docs/eval-gate-roster.md\nAuto-merging hac\n[... git transcript trimmed for the fixture ...]",
+        "error": "exit status 1",
+        "duration": 246952549
+      }
+    ],
+    "failed": true
+  }
+]

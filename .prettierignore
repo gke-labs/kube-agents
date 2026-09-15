@@ -32,3 +32,10 @@ agents/*/skills/gke-*/**
 # `.md`/`.yaml`/`.yml` and never sees JSON; this entry stops a wider local
 # invocation from rewriting them by accident.
 bench/tests/fixtures/runs/**/*.json
+
+# The fleet-upgrade-verification skill's removal table: one removed apiVersion
+# per line, which is the form a reviewer diffs against the upstream migration
+# guide. Prettier would spread each entry over six lines. CI's prettier job
+# filters to `.md`/`.yaml`/`.yml` and never sees JSON; this entry stops a wider
+# local invocation from rewriting it by accident.
+agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json

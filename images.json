@@ -65,7 +65,7 @@
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
-      "tag": "v1.98.0",
+      "tag": "v1.100.0",
       "override": "LITELLM_IMAGE",
       "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
       "description": "The model gateway the agent's baked default endpoint points at."
@@ -78,6 +78,24 @@
       "override": "FLUENT_BIT_IMAGE",
       "pulledBy": "The logging sidecar the operator injects into every agent pod.",
       "description": "Ships agent container logs off the pod."
+    },
+    {
+      "name": "nats",
+      "origin": "third-party",
+      "repository": "docker.io/library/nats",
+      "tag": "2.10-alpine",
+      "override": "A2A_NATS_IMAGE",
+      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing on a default install.",
+      "description": "The JetStream bus behind the A2A next stack. The pin is the operator's compiled default; the env var is the only override, since the chart does not set it."
+    },
+    {
+      "name": "nats-box",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/nats-box",
+      "tag": "0.14.5",
+      "override": "A2A_PROVISION_IMAGE",
+      "pulledBy": "The provision Job the operator runs against that NATS under spec.mode: next, and nothing on a default install.",
+      "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats."
     },
     {
       "name": "k8s",

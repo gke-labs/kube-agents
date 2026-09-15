@@ -51,6 +51,14 @@ module "drift_pubsub" {
   cluster_names = ["platform-agent-host", "prod-us-east4"]
 ```
 
-`subscription_id` is the output to feed the detector; it is the fully-qualified path its `--subscription` flag expects.
+`subscription_id` is the output to feed the detector's `--subscription` flag, alongside `--project`:
+
+```bash
+drift-detector --project my-gcp-project --subscription "$(terraform output -raw subscription_id)"
+```
+
+The flag takes either form — this fully-qualified path, or the bare `subscription_name`, which it
+qualifies with `--project`. `--project` is required either way, because the detector's credentials
+are resolved against it.
 
 See the [Release versioning & promotion guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

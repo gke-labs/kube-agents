@@ -1187,8 +1187,9 @@ class TestHowTheBuildEnded(unittest.TestCase):
     2026-09-11 (#1478): PR 1118's, whose node went NotReady two hours in and
     which has no build-log.txt at all, and PR 1446's, a clone failure (a
     merge conflict) that has a log and a pod whose last event is Started.
-    podinfo.json is trimmed to the pod record and events; the values are
-    the real ones."""
+    podinfo.json is trimmed to the pod record and events, and PR 1446's
+    clone-records.json has its `git fetch` progress output cut; every value
+    either parser reads is the real one."""
 
     def runs(self):
         return {run["build_id"]: run for run in collect.runs_from_dir(LOSTPOD_TESTDATA)}
@@ -1226,8 +1227,9 @@ class TestHowTheBuildEnded(unittest.TestCase):
 
         run = collect.build_run(BUILD_998_FULL, reader)
         self.assertNotIn("podinfo.json", asked)
+        self.assertNotIn("clone-records.json", asked)
         self.assertIs(run["has_build_log"], True)
-        self.assertFalse({"pod_phase", "pod_node", "pod_last_event"} & set(run))
+        self.assertFalse({"pod_phase", "pod_node", "pod_last_event", "merge_conflict"} & set(run))
 
     def test_a_zero_task_failure_reads_podinfo_once(self):
         for build in (BUILD_1118_LOST, BUILD_1446_CLONE_FAILED):
@@ -1240,6 +1242,33 @@ class TestHowTheBuildEnded(unittest.TestCase):
 
             collect.build_run(build, reader)
             self.assertEqual(asked.count("podinfo.json"), 1, build)
+            # The lost pod uploaded nothing, so the second read is skipped.
+            self.assertEqual(asked.count("clone-records.json"), 0 if build == BUILD_1118_LOST else 1, build)
+
+    def test_pr_1446_would_not_merge_into_main(self):
+        self.assertIs(self.runs()[BUILD_1446_CLONE_FAILED]["merge_conflict"], True)
+        self.assertNotIn("merge_conflict", self.runs()[BUILD_1118_LOST])
+
+    def test_only_the_merge_command_makes_a_conflict(self):
+        real = json.loads((LOSTPOD_TESTDATA / BUILD_1446_CLONE_FAILED / "clone-records.json").read_text())
+        self.assertIs(collect.parse_clone_records(json.dumps(real)), True)
+
+        def mutate(**changes):
+            doc = json.loads(json.dumps(real))
+            record = doc[1]
+            record.update(changes)
+            return collect.parse_clone_records(json.dumps(doc))
+
+        merge = [c for c in real[1]["commands"] if c.get("error")][0]
+        fetch = dict(merge, command=merge["command"].replace(" git merge ", " git fetch "))
+        self.assertIs(mutate(commands=[fetch]), False, "a fetch that failed is the pool's problem")
+        self.assertIs(mutate(pulls=[], refs={"org": "gke-labs", "repo": "kube-agents"}), False, "no pull request, no conflict")
+        self.assertIs(mutate(failed=False), False)
+        self.assertIs(mutate(commands=[dict(merge, error=None)]), False, "the merge command ran and did not fail")
+        self.assertIs(mutate(commands=[dict(merge, output="fatal: write error: No space left on device")]), False, "a merge that failed on a full disk is the pool's problem")
+        self.assertIsNone(collect.parse_clone_records(None))
+        self.assertIsNone(collect.parse_clone_records("not json"))
+        self.assertIsNone(collect.parse_clone_records('{"refs": {}}'), "a document that is not a list")
 
     def test_a_failed_log_read_on_a_pod_that_uploaded_is_not_a_lost_pod(self):
         # PR 998's real red run, with only the build-log read failing: the

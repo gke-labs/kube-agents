@@ -258,6 +258,11 @@ the checklist rather than asking the operator to check those three by hand. The 
 `get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
 `${{HERMES_HOME:-/opt/data}}/.kubeconfigs/`; an exclusion is reported as holding back automatic
 upgrades only.
+
+When the checklist's deprecated-API item comes up, the same skill's `api_deprecation_scan.py` scans
+the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
+its replacement and the commit it read; run it with `--target-version` and the version report's
+`--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
 """,
 }
 

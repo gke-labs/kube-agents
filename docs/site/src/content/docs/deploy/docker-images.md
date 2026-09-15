@@ -11,19 +11,21 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-One set of images is deliberately absent: the five the A2A `next` stack pulls — NATS, nats-box,
-the gateway, the session worker and the auth callout. The inventory documents what a supported
-install pulls, and `spec.mode: next` is an unsupported dev toggle, so those pins live as defaults
-on the operator's `A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_GATEWAY_IMAGE`,
-`A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` env vars instead. They join this inventory when the
-stack graduates; until then a mirrored or air-gapped install that flips `next` has to override
-all five — and missing the callout is the expensive one to miss, since nothing authenticates to
-the bus without it.
+The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker and the auth callout.
+The last three are deliberately absent: this repo builds them, and today publishes them only from
+a dev registry, off the release pipeline, so until the stack graduates their pins live as defaults
+on the operator's `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` env vars, and a
+mirrored or air-gapped install that flips `next` has to override each of them. That graduation
+decision is still open. NATS and nats-box are ordinary third-party pins and are in the table below
+as `nats` and `nats-box`, so `make mirror-images` copies them. The chart does not set their env
+vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at the
+copies by hand.
 
-The exemption covers those five published images, not the bases they are built from. `golang` and
-`node` in the build-time table below carry `a2a/Dockerfile.gateway` and `a2a/Dockerfile.worker`
-alongside every other builder, because an override of `A2A_WORKER_IMAGE` names an image someone
-still has to build, and a build in a mirrored environment has to resolve its bases like any other.
+The exemption covers those published images, not the bases they are built from. `golang`, `node`
+and `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
+`a2a/Dockerfile.gateway` and `a2a/Dockerfile.worker` alongside every other builder, because an
+override of `A2A_WORKER_IMAGE` names an image someone still has to build, and a build in a
+mirrored environment has to resolve its bases like any other.
 
 Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
 `ARG` default, a compiled constant in the operator — and `make images-check` holds them in step with
@@ -54,8 +56,10 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
-| `litellm` | `ghcr.io/berriai/litellm` | `v1.98.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
+| `litellm` | `ghcr.io/berriai/litellm` | `v1.100.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.2` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
+| `nats` | `docker.io/library/nats` | `2.10-alpine` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders under spec.mode: next, and nothing on a default install. |
+| `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS under spec.mode: next, and nothing on a default install. |
 | `k8s` | `docker.io/alpine/k8s` | `1.36.4` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |

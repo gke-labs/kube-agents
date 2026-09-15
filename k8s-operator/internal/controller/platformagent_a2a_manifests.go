@@ -120,6 +120,13 @@ const (
 	// agree, so they read from one name rather than four string literals.
 	a2aProvisionWritablePath = "/tmp"
 
+	// The two third-party pins. images.json carries both (as `nats` and
+	// `nats-box`), and hack/check-image-inventory.sh holds these constants
+	// to it on the normalised reference, so a bump starts there. The short
+	// Docker Hub spelling stays: it is the string the operator renders, and
+	// qualifying it to docker.io/library/... would change the pod template
+	// on every running next install, rolling the NATS pod and minting a new
+	// provision Job for the same image.
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
 	defaultA2ANATSImage     = "nats:2.10-alpine"
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
@@ -130,16 +137,16 @@ const (
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
 	//
-	// None of the A2A images are in images.json, deliberately: the inventory
-	// documents what a SUPPORTED install pulls, and mode next is an
-	// unsupported dev toggle. That exemption is graduation debt alongside the
-	// registry move — a mirrored or air-gapped install that flips next must
-	// override every one of them via the env vars until then. There are five
-	// now: NATS, provision, gateway, worker, and the auth callout
-	// (A2A_CALLOUT_IMAGE, in platformagent_a2a_callout.go).
+	// The first-party A2A images — this one, the worker below and the auth
+	// callout (A2A_CALLOUT_IMAGE, platformagent_a2a_callout.go) — are not in
+	// images.json, deliberately: this repo builds them and publishes them
+	// only from that dev registry, off the release pipeline the inventory's
+	// first-party entries are copied from. That exemption is graduation debt
+	// alongside the registry move (#1557) — a mirrored or air-gapped install
+	// that flips next must override each of them via the env vars until then.
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
 
-	// The session-pod image, on the same terms as the others. The
+	// The session-pod image, on the same terms as the gateway above. The
 	// gateway binary carries this same default of its own (gateway/config.go),
 	// which is what a gateway run outside the operator falls back to; the
 	// operator renders the env unconditionally so that the override exists

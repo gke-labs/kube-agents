@@ -44,8 +44,10 @@ Required: an empty section is not an answer. Three forms, by what the change tou
   validation. Name the case (new or existing); the red run against `main` (install and commit,
   the failing check and its reason, one line of the agent's report); the three green runs
   against this branch; where the case is registered. Mechanics:
-  .agents/rules/eval_driven_development.md. "No cluster" is not an answer: every contributor
-  has a dev project.
+  .agents/rules/eval_driven_development.md. A case you file for a gap someone else owns lands
+  red and marked `expected_fail: true`; the fix that flips it cites that record (same file,
+  "When the fix is not yours"). "No cluster" is not an answer: every contributor has a dev
+  project.
 - It changes runtime behaviour but not what an agent does (operator, chart, installer, image):
   describe how it was exercised against a real, running kube-agents installation — which
   install (cluster, image tag, operator version), what you did, and what you observed at each

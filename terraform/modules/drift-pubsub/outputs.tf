@@ -9,7 +9,7 @@ output "subscription_name" {
 }
 
 output "subscription_id" {
-  description = "Fully-qualified subscription path (projects/<project>/subscriptions/<name>) — the value the drift detector's --subscription flag takes"
+  description = "Fully-qualified subscription path (projects/<project>/subscriptions/<name>). The drift detector's --subscription flag takes this or the bare subscription_name."
   value       = google_pubsub_subscription.drift_audit.id
 }
 

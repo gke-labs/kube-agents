@@ -259,6 +259,13 @@ class TestEveryTaskIsValid(unittest.TestCase):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
 
+    def test_every_expected_fail_marker_is_a_boolean(self):
+        self._assert_none(
+            "is not a YAML boolean",
+            "These cases carry an 'expected_fail:' that is not a bare true or "
+            "false; bench-gate would refuse it after the cluster lease:",
+        )
+
     def test_no_fixture_carries_a_real_address_or_credential(self):
         # The sanitization scan is tree-level rather than per case, like the
         # fixture-catalogue drift check, so validate_all() does not carry it
@@ -544,6 +551,23 @@ class TestTheRulesReject(unittest.TestCase):
 
     def test_a_login_owner_passes(self):
         self.assertEqual(self._validate(owner="some-one1"), [])
+
+    def test_a_quoted_expected_fail_is_rejected(self):
+        # yaml.safe_dump quotes a string that would otherwise read as a bool,
+        # which is exactly the file a contributor produces by typing quotes.
+        for literal in ("false", "true", "yes"):
+            with self.subTest(literal=literal):
+                self._only("is not a YAML boolean", expected_fail=literal)
+
+    def test_an_expected_fail_that_is_not_a_boolean_is_rejected(self):
+        for value in (1, 0, ["true"]):
+            with self.subTest(value=value):
+                self._only("is not a YAML boolean", expected_fail=value)
+
+    def test_a_bare_boolean_expected_fail_passes(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                self.assertEqual(self._validate(expected_fail=value), [])
 
     def test_an_unknown_fixture_role_is_rejected(self):
         # Deliberately not a plausible-looking slug: `hpa-saturated` used to

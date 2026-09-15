@@ -820,7 +820,26 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("This run is green", app)
         app = dom_text(self.run_page, query="build=2096985236955992064")
         self.assertIn("died during setup", app)
-        self.assertIn("Retest.", app)
+        # The bold lead is the `do`'s own first sentence, not a prefix (#1608).
+        self.assertIn("<b>Retest.</b> If it dies the same way again", app)
+
+    def test_pr_view_conflicted_merge_says_rebase(self):
+        # #1608: classify.py gives the run a rebase `do`, and this page is the
+        # only surface that shows it. The generic unmeasured branch used to
+        # catch the run and send the author to a build log for an image build
+        # that never started.
+        data = load_fixture()
+        data["generated_at"] = NOW
+        for run in data["runs"]:
+            if str(run.get("build_id")) == SETUP_DEATH_BUILD:
+                run["merge_conflict"] = True
+        out = render_to(pathlib.Path(self.tmp.name) / "conflict", data, health=health_doc())
+        app = dom_text(out / "run.html", query=f"build={SETUP_DEATH_BUILD}")
+        self.assertIn("would not merge into main", app)
+        self.assertIn("Rebase on main and push.", app)
+        self.assertIn("A retest re-runs the same conflicted merge.", app)
+        self.assertNotIn("Read the build log", app)
+        self.assertNotIn("died during setup", app)
 
     def test_pr_view_unknown_build(self):
         app = dom_text(self.run_page, query="build=1")

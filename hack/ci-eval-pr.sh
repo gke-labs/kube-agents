@@ -1338,7 +1338,7 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   # autoops-warning-event-triage: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
-  # Five registered scenarios stay commented out, and eight more run in the
+  # Five registered scenarios stay commented out, and eleven more run in the
   # nightly tier only -- NIGHTLY_TASKS below; the task-registration lint
   # reads both arrays. A commented entry here counts as registered, so a
   # line is a promise the scenario exists, not that it runs; the
@@ -1439,11 +1439,13 @@ TASKS=(
   #       the INSTANTANEOUS question (no age gate), so the cost domain is
   #       covered while this SOP-faithful audit waits for its calendar.
   #   A2  chat-routing-fleet-question. AGENT_SERVICE_NAME above is one global
-  #       target, so every entry here reaches the platform agent; this
-  #       scenario needs the chat front door and would fail its delegation
-  #       objective on a correct system until the harness can target an agent
-  #       per task. It costs no domain coverage: the two kanban probes already
-  #       cover chat-and-routing.
+  #       target, and the 2026-08-31 measurement (chat-routing-board-read's
+  #       activating run, build 2094517532634386432) settled that the endpoint
+  #       serves the front-door profile -- the one this scenario needs. So
+  #       what holds it is validation (validated: false, never run), not
+  #       routing; A2 proper -- targeting a profile OTHER than the endpoint's
+  #       -- holds no entry by itself. It costs no domain coverage: the two
+  #       kanban probes already cover chat-and-routing.
   # "./tasks/chat-routing-fleet-question/task.yaml"
   # "./tasks/fleet-cost-idle-pool/task.yaml"
   #
@@ -1475,6 +1477,17 @@ TASKS=(
   # activation run is what validates it.
   # "./tasks/upgrades-fleet-readiness-exclusion/task.yaml"
   #
+  # The deprecation scan of the linked GitOps repository (#1412, the same
+  # skill's Phase-4 case). Same hold as the three above, by the maintainer's
+  # call on the #1412 review: commented out pending #1254. Its eval loop was
+  # not run (`validated: false`): the only install its author could reach
+  # links no GitOps repository, so the scan there reads nothing and a run
+  # there is broken rather than red, and no fleet-linked install was
+  # available to that account. The eval projects link their *-infra
+  # repositories as managed_repos, so once #1254 closes, one observed run on
+  # that fleet is what activation waits on; it needs no change to activate.
+  # "./tasks/upgrades-api-deprecation-clean-repo/task.yaml"
+  #
   # Refusal variant of cluster debugging, and not one of the nine above. Its
   # compliant answer is a pull request on the eval GitOps repo, so it was A1's
   # until A1 closed; A5's residual is the same privilege gap every fleet case
@@ -1497,8 +1510,9 @@ TASKS=(
 # TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
 # chat-routing-fleet-question, fleet-cost-idle-pool,
 # upgrades-fleet-version-table, upgrades-fleet-rollout-stall,
-# upgrades-fleet-readiness-exclusion), because the nightly is what appends to
-# the baseline evidence store (EVAL_BASELINE_STORE below) and
+# upgrades-fleet-readiness-exclusion, upgrades-api-deprecation-clean-repo),
+# because the nightly is what appends to the baseline evidence store
+# (EVAL_BASELINE_STORE below) and
 # a case that can only fail would append nothing but evidence keeping itself
 # unadmitted while spending ~10 minutes of matrix a night doing it.
 #
@@ -1581,6 +1595,19 @@ NIGHTLY_TASKS=(
   # only and earns its record here. The default unit_cost_hint fits the
   # measured runs.
   "./tasks/cluster-agent-stalled-controller-healthy-silence/task.yaml"
+  # #1023's remediation and chat-and-routing second cases, nightly from the
+  # start (2026-09-15) rather than presubmit: the presubmit seats stay with
+  # the probes, and the record the nightly builds here is what a later
+  # BOOTSTRAP_ADMITTED edit cites (#1568). Both measured in the authoring
+  # PR's presubmit runs before the move:
+  #   -- chat-routing-board-read: 9/9 across builds 2094517532634386432,
+  #      2094843196214349824 and 2099539376672346112 (11-94s agent latency;
+  #      the default 200s hint fits).
+  #   -- pdb-remediation-pr: 7/9 across the same builds; the two misses are
+  #      #1097 (delegation slot) and #1590 (submit-suggestion in the
+  #      sandbox). 980-1929s a repetition on 2026-09-14, priced below.
+  "./tasks/chat-routing-board-read/task.yaml"
+  "./tasks/pdb-remediation-pr/task.yaml"
 )
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
@@ -1871,6 +1898,9 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    # Nightly-only. Measured 980-1929s across build 2099539376672346112's
+    # three repetitions (267-559s in August); median of the September run.
+    pdb-remediation-pr) echo 1250 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     # Nightly-only since 2026-09-09. Median of its first three measured
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default

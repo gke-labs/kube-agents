@@ -111,8 +111,8 @@ def glob_to_regex(pattern):
     minimatch runs with its defaults in the action, so `*` and `**` never match
     a path segment that starts with a dot. That is not a detail: `"**"` is the
     catch-all entry in this repository's config, and it does *not* cover
-    `.github/workflows/...`, which is why those files have literal entries of
-    their own.
+    `.github/workflows/...`. A dotfile path reaches a reviewer only through a
+    literal entry naming it, or through the defaults when no glob matches.
     """
     if pattern.startswith("!"):
         raise ValueError(f"negated glob {pattern!r} is not supported")

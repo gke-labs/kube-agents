@@ -41,7 +41,7 @@ locals {
   # controller off its lock, and silently discarding it is hard to defend.
   #
   # Both principal clauses are load-bearing. "^system:" alone leaves the GKE
-  # service agent behind: in the same window container-engine-robot accounted
+  # service agent behind: in the same sample container-engine-robot accounted
   # for 287 lease writes, which would have inflated the surviving stream by 65%.
   # Matching any *.iam.gserviceaccount.com covers it and every future service
   # agent without another edit here.
@@ -153,10 +153,15 @@ resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
 # roles/pubsub.subscriber covers consuming messages but not reading the
 # subscription's own metadata. It grants subscriptions.consume, snapshots.seek,
 # and topics.attachSubscription -- notably not subscriptions.get. A client that
-# confirms the subscription exists before pulling (the Go client's
-# Subscription.Exists, and the chat adapter's _check_subscription_exists) needs
-# viewer as well, and without it fails with a PermissionDenied that reads
-# nothing like a missing grant.
+# confirms the subscription exists before pulling (the chat adapter's
+# _check_subscription_exists) needs viewer as well, and without it fails with a
+# PermissionDenied that reads nothing like a missing grant.
+#
+# The drift detector as built does not make that call: it pulls straight away,
+# so subscriber alone would carry it. Viewer stays because `gcloud pubsub
+# subscriptions describe` needs it and that is the first command anyone runs
+# against an empty topic -- and because a detector that later adopts the
+# adapter's preflight would otherwise fail in that unreadable way.
 resource "google_pubsub_subscription_iam_member" "detector_viewer" {
   project      = var.project_id
   subscription = google_pubsub_subscription.drift_audit.id
