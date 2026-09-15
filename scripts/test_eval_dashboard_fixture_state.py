@@ -345,6 +345,7 @@ class Drift(ScanHarness):
         detail = doc["projects"][PROJECT]["roles"]["no-pdb-workload"]["detail"]
         self.assertTrue(detail[0].startswith("deployment/checkout-gateway status.readyReplicas eq 2: observed 0"), detail)
         self.assertEqual(fixture_state.drift_map(doc), {PROJECT: ["no-pdb-workload"]})
+        self.assertEqual(fixture_state.read_map(doc), {PROJECT: sorted(self.roles)}, "a drifted role was read too")
         self.assertEqual(fixture_state.drift_detail(doc, PROJECT, "no-pdb-workload"), detail)
         self.assertEqual(doc["summary"]["drifted_projects"], 1)
         self.assertIn(f"{PROJECT}: drifted: no-pdb-workload", err)
@@ -415,6 +416,7 @@ class NotChecked(ScanHarness):
         self.assertEqual(self.calls(), [], "nothing ran")
         self.assertIn("kubectl is not on PATH", err.getvalue())
         self.assertEqual(fixture_state.checked_projects(doc), 0)
+        self.assertEqual(fixture_state.read_map(doc), {})
 
     def test_a_runner_that_hangs_is_not_checked_within_the_ceiling(self):
         doc, _ = self.scan(healthy_world(PROJECT), timeout=2, STUB_LIST_SLEEP="10")

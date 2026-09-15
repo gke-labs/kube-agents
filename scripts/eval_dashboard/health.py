@@ -770,7 +770,8 @@ def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
 
     `current` is every project's drifted roles this scan, firing or not;
     `roles` and `projects` are the ones that fire; `drift` is
-    {project: {role: [what the scan observed]}} for those.
+    {project: {role: [what the scan observed]}} for those; `read` is
+    {project: [roles the scan could read there]}, what rule 6's exit checks.
     """
     out = {
         "fires": False,
@@ -782,6 +783,7 @@ def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
         "projects": [],
         "drift": {},
         "current": {},
+        "read": {},
         "checked": 0,
         "total": 0,
         "reason": None,
@@ -811,6 +813,7 @@ def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
     current = fixture_state.drift_map(state_doc)
     previous = fixture_state.previous_drift_map(state_doc)
     out["current"] = current
+    out["read"] = fixture_state.read_map(state_doc)
     role_projects: dict[str, list[str]] = {}
     for project, roles in current.items():
         for role in roles:
@@ -1185,6 +1188,28 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     return not any(carries(run) for run in recent)
 
 
+def fixture_drift_hold(fixture: dict, incident: dict | None) -> str | None:
+    """Rule 6's exit for fixture_drift: why this tick's scan cannot end the
+    incident, or None when it can. Entering took a scan that saw the drift;
+    leaving takes a scan that could see the same roles on the same projects
+    and no longer shows it. A scan that is missing, stale, blind, or that
+    recorded one of the incident's projects as not checked (its runner timed
+    out, the grant went away) shows nothing about the fixture, so the
+    incident holds rather than posting a recovery nothing observed."""
+    if not fixture.get("known"):
+        return "no fixture-state scan was read this tick"
+    if fixture.get("stale"):
+        return "the fixture-state scan is stale"
+    if fixture.get("unknown"):
+        return "the fixture-state scan could check no project"
+    roles = set((incident or {}).get("roles") or [])
+    read = fixture.get("read") or {}
+    unread = sorted(project for project in (incident or {}).get("projects") or [] if not roles <= set(read.get(project, [])))
+    if unread:
+        return f"the fixture-state scan could not read {_project_list(unread)}"
+    return None
+
+
 def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
     """Rule 6: reconcile the raw assessment with the previous state.
 
@@ -1221,11 +1246,14 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
         return _keep(raw_state, assessed["condition"], assessed["cause"], assessed["failing_cases"], now, recovering=False)
     prev_condition = prev.get("condition")
     if prev_condition == FIXTURE_DRIFT:
-        # The scan is the evidence both ways: the hourly scan that no longer
-        # shows the repeated or widespread drift is the recovery, and three
-        # green runs could all have leased healthy projects and say nothing
-        # about the fixture.
-        return _keep(GREEN, None, "", [], now, recovering=False)
+        # The scan is the evidence both ways: the hourly scan that could read
+        # the incident's roles on its projects and no longer shows the
+        # repeated or widespread drift is the recovery (three green runs
+        # could all have leased healthy projects and say nothing about the
+        # fixture), and a scan that could not see them is not.
+        if fixture_drift_hold(assessed["fixture"], prev.get("incident")) is None:
+            return _keep(GREEN, None, "", [], now, recovering=False)
+        return _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
     if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"]):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
@@ -1285,6 +1313,8 @@ def adjudicate(
         )
     elif decided["state"] != assessed["state"] and SEVERITY[assessed["state"]] > SEVERITY[decided["state"]]:
         evidence.append(f"{assessed['state']} condition seen but not yet current; holding {decided['state']}")
+    elif decided["condition"] == FIXTURE_DRIFT and not assessed["fixture"]["fires"]:
+        evidence.append(f"fixture drift held: {fixture_drift_hold(assessed['fixture'], (prev or {}).get('incident'))}; a scan that reads those projects clean ends it")
 
     # A held state (recovering, or a worse condition not yet current) keeps
     # the previous tick's numbers: the assessment's incident describes the

@@ -1271,6 +1271,29 @@ class FixtureDrift(unittest.TestCase):
         one = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, at=later - timedelta(minutes=5)), prev=held, now=later)
         self.assertEqual(one["state"], "GREEN")
 
+    def test_a_scan_that_could_not_see_the_incident_holds_it(self):
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        cases = {
+            "absent": (None, "no fixture-state scan was read this tick"),
+            "stale": (scan(at=later - timedelta(hours=4)), "the fixture-state scan is stale"),
+            "blind": (scan(at=at, checked=set()), "the fixture-state scan could check no project"),
+            "one project not checked": (scan(at=at, checked={project(i) for i in range(1, 31)} - {project(2)}), f"the fixture-state scan could not read {project(2)}"),
+        }
+        for name, (doc, why) in cases.items():
+            with self.subTest(name):
+                held = self.judge(doc, prev=prev, now=later)
+                self.assertEqual((held["state"], held["condition"], held["since"], held["recovering"]), ("DEGRADED", "fixture_drift", health.iso(T0), False))
+                self.assertEqual(held["incident"], prev["incident"], "the held tick keeps the incident it entered with")
+                self.assertIn(f"fixture drift held: {why}; a scan that reads those projects clean ends it", held["evidence"])
+        # A project the incident did not name being unreadable is not a hold.
+        other = self.judge(scan(at=at, checked={project(i) for i in range(1, 31)} - {project(9)}), prev=prev, now=later)
+        self.assertEqual((other["state"], other["condition"]), ("GREEN", None))
+        # The hold is not "recovering": no three-green-runs line is added.
+        self.assertFalse(any("consecutive green runs" in line for line in self.judge(None, prev=prev, now=later)["evidence"]))
+
     def test_the_posters_issue_is_cited_for_the_condition_it_was_filed_for(self):
         firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
         owner = {"number": 1400, "url": "https://github.com/gke-labs/kube-agents/issues/1400", "condition": "fixture_drift"}

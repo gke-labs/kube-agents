@@ -338,10 +338,13 @@ can land inside that window. Three projects at once is the fleet-wide shape
 run-based condition (nothing in the presubmit runs this check and nothing acts on a
 drift, so a drifted fixture reds only the cases that depend on it, on the runs that
 lease those projects; the run-based conditions see that red as it happens, and
-this one names the cause and its owner), and it ends the hour the scan no
-longer shows it — three green runs could all have leased healthy projects and
-say nothing about the fixture. A scan older than 3 hours is ignored with a note
-in the evidence; a scan that could check no project at all (the grant missing,
+this one names the cause and its owner), and it ends the hour a scan that could
+read the incident's roles on the incident's projects no longer shows it — three
+green runs could all have leased healthy projects and say nothing about the
+fixture, and a scan that is missing, stale, blind, or that could not read one of
+those projects holds the condition with a note in the evidence rather than
+posting a recovery nothing observed. A scan older than 3 hours is ignored with a
+note in the evidence; a scan that could check no project at all (the grant missing,
 `kubectl` missing) is `fixture_state.unknown` in `health.json`: the poster says
 so once, and once more when the scan sees the fleet again, and it is never a
 drift. `health.json`'s `fixture_state` block carries the latest scan's time,

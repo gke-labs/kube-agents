@@ -360,6 +360,18 @@ def drift_map(document: dict | None) -> dict[str, list[str]]:
     return out
 
 
+def read_map(document: dict | None) -> dict[str, list[str]]:
+    """{project: [roles the scan read there, healthy or drifted]}, sorted."""
+    out: dict[str, list[str]] = {}
+    projects = (document or {}).get(KEY_PROJECTS) if isinstance(document, dict) else None
+    for project, entry in sorted((projects or {}).items()) if isinstance(projects, dict) else []:
+        roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
+        read = sorted(role for role, verdict in (roles or {}).items() if isinstance(verdict, dict) and verdict.get(KEY_STATE) in (ROLE_HEALTHY, ROLE_DRIFTED))
+        if read:
+            out[project] = read
+    return out
+
+
 def previous_drift_map(document: dict | None) -> dict[str, list[str]]:
     """The drift map the scan before this one carried (`previous.drifted`)."""
     previous = (document or {}).get(KEY_PREVIOUS) if isinstance(document, dict) else None
