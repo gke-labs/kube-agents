@@ -348,7 +348,8 @@ module "chat_pubsub" {
 # and pull subscription, and the sink-writer and detector IAM. Only the two
 # required inputs are passed, so the module's defaults decide the names, the
 # retention and the cluster scope (every GKE cluster in the project). The
-# detector that consumes the subscription is not part of this composition yet.
+# detector that will consume the subscription does not exist yet
+# (docs/designs/drift-detection.md), so nothing reads it.
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0

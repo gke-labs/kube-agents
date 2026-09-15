@@ -585,14 +585,25 @@ fully-qualified path the drift detector's `--subscription` flag takes.
 
 The subscription is the input to the drift detector of
 [`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md),
-which is not part of this composition yet, so nothing consumes it. Turned on
-ahead of the detector, the sink publishes every mutating call on every GKE
-cluster in the project (about 60k messages a day after the module's lease
-filter, per its README) into a subscription that retains them for 31 days and
-never expires: Pub/Sub storage cost and a backlog, not a running feature.
-`lifecycle.sh apply` adopts a topic, subscription or sink of those names left
-behind by an earlier install before applying, the way it adopts the stockout
-trio, so a re-install does not 409 on them.
+which does not exist yet: no code in this repository detects drift, so nothing
+consumes it. Turned on ahead of the detector, the sink publishes every mutating
+call on every GKE cluster in the project (about 60k messages a day after the
+module's lease filter, per its README) into a subscription that retains them
+for 31 days and never expires: Pub/Sub storage cost and a backlog, not a
+running feature. `lifecycle.sh apply` adopts a topic, subscription or sink of
+those names left behind by an earlier install before applying, the way it
+adopts the stockout trio, so a re-install does not 409 on them.
+
+The variable is for a hand-driven apply. The installer front doors
+(`install.sh`, `upgrade.sh`) have no `install.env` key for it and regenerate
+`terraform.tfvars` without it on every run, so on a front-door install a
+`true` written into that file lasts until the next `upgrade.sh`, whose apply
+then plans the sink, topic and subscription (with up to 31 days of retained
+messages) for removal under `-auto-approve`; no guard refuses that the way
+`guard_pubsub_subscription` refuses a Chat rename. Through the front doors,
+set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`, the same
+channel `agent_ksa_name` uses: every front door sources that file with
+`set -a`, and Terraform reads `TF_VAR_*` where the generated file is silent.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
 [INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps):
@@ -647,13 +658,14 @@ make tf-apply       # or: ./terraform/examples/full-install/lifecycle.sh apply
 
 What each one does that raw Terraform cannot:
 
-| Asymmetry                                                                | Handled by                                                                                                                                   |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| KMS key rings and keys can never be deleted, so the next apply 409s      | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
-| The `PlatformAgent` finalizer strands the CR and hangs the namespace     | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
-| A `BackupPlan` cannot be deleted while it owns backups                   | `tf-destroy` purges the plan's backups first                                                                                                 |
-| `deletion_protection = true` cannot be overridden by a destroy alone     | `tf-destroy` applies it as `false`, then destroys                                                                                            |
-| A Pub/Sub topic or subscription that already exists makes the create 409 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
+| Asymmetry                                                                                              | Handled by                                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KMS key rings and keys can never be deleted, so the next apply 409s                                    | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
+| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                   | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
+| A `BackupPlan` cannot be deleted while it owns backups                                                 | `tf-destroy` purges the plan's backups first                                                                                                 |
+| `deletion_protection = true` cannot be overridden by a destroy alone                                   | `tf-destroy` applies it as `false`, then destroys                                                                                            |
+| A Pub/Sub topic or subscription that already exists makes the create 409                               | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
+| The stockout and drift topics, subscriptions and sinks survive a partial teardown and 409 the same way | `tf-apply` imports whichever of them exist by name when their flags are on (`adopt_kms`, alongside the KMS resources)                        |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`
