@@ -1614,6 +1614,10 @@ unit_cost_hint() {
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
+    # Nightly-only since 2026-09-15. Median of its first three measured
+    # repetitions (737/599/1357s, build 2099969322708373504); the 200s
+    # default under-packs it by 3x.
+    incident-triage-oom-event-probe) echo 700 ;;
     *) echo 200 ;;
   esac
 }

@@ -90,5 +90,8 @@ allowlist:
   # tofu-provisioned — the wall-clock floor of the presubmit (#1202 trim
   # addendum). Delete this entry when
   # a non-tofu incident-triage probe activates in presubmit, or when the
-  # coverage contract formally recognizes the nightly tier (#1175).
+  # coverage contract formally recognizes the nightly tier (#1175). That
+  # probe is incident-triage-oom-event-probe (#1023), in
+  # hack/eval/nightly-cases.txt since 2026-09-15; moving its line to the
+  # presubmit file is what deletes this entry.
   - incident-triage

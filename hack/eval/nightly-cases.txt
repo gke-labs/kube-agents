@@ -44,7 +44,9 @@
 # ~63min at its 1250s hint) and the nine this decision moved here, of which
 # eight are deployer: noop and probe-shaped (~200s a repetition, ~10min each
 # at three) and fleet-cost-idle-pool is a full cost audit priced with the
-# 900s audit band (~45min). Thirty-eight cases, ~730-750min serial. The
+# 900s audit band (~45min). 2026-09-16 added incident-triage-oom-event-probe
+# (#1023, ~45min at its measured 737s/599s/1357s). Thirty-nine cases,
+# ~775-795min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
@@ -126,6 +128,20 @@
 #      unit_cost_hint.
 ./tasks/chat-routing-board-read/task.yaml
 ./tasks/pdb-remediation-pr/task.yaml
+
+# #1023's incident-triage second case, nightly from the start (2026-09-15):
+# the presubmit-eligible probe the domains.yaml allowlist entry asks for. The
+# prompt is the watcher's warning payload in the _triage_task_body shape,
+# pointed at the seeded fleet's payments-api crashloop (role
+# crashloop-workload) -- deployer: noop, no infra lock, no watcher or card
+# wait, unlike autoops-warning-event-triage above. It grades the delivery
+# contract (`What to do` plus an option letter or `To authorize:`) that
+# #1101 measured the agent failing and that no presubmit case grades.
+# Measured GREEN 3/3 in the authoring pull request's presubmit (build
+# 2099969322708373504, through a temporary presubmit seat reverted before
+# merge): 737s/599s/1357s a repetition, so it is priced at 700 in
+# unit_cost_hint, not the 200s default.
+./tasks/incident-triage-oom-event-probe/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
