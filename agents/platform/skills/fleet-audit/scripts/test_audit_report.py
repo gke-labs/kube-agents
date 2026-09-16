@@ -5330,7 +5330,7 @@ class DiscoveryTestCase(HarnessTestCase):
     def copy_reply(self, into, sha=SEARCH_SHA, complete=True, mode="content", **extra):
         reply = {"mode": mode, "repo": "acme/terraform-live", "complete": complete, **extra}
         if mode == "content":
-            reply.update({"into": str(into), "sha": sha, "skipped": [], "stopped": None})
+            reply.update({"into": str(into), "sha": sha, "skipped": [], "stopped": None, **extra})
         else:
             reply["workspace"] = str(into)
         return json.dumps(reply) + "\n"
@@ -5477,7 +5477,14 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         copy = self.tmp_path / "copy"
         self.write(copy, "intent.md", note([declaration()]))
         cases = {
-            "complete false": (self.copy_reply(copy, complete=False, stopped="maxBytes"), "copy incomplete"),
+            "stopped at a bound": (
+                self.copy_reply(copy, complete=False, stopped="maxBytes"),
+                "copy stopped at 'maxBytes'",
+            ),
+            "incomplete with nothing named": (
+                self.copy_reply(copy, complete=False),
+                "copy reported incomplete without saying what is missing",
+            ),
             "no json": ("cloning...\n", "clone printed no JSON line"),
             "no sha": (self.copy_reply(copy, sha=""), "no commit sha for the copy"),
             "no such tree": (self.copy_reply(self.tmp_path / "missing"), "clone named"),
@@ -5491,6 +5498,64 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
                 self.assertIn(f"WARNING: acme/terraform-live: {expected}", self.err)
                 self.assertEqual(self.filed(), [])
                 self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_skipped_file_that_is_not_a_searched_note_does_not_cost_the_repository(self):
+        # The broker never sends a file over its per-file ceiling, and a
+        # repository that vendors one CRD bundle would otherwise never be
+        # searched. A skipped file that is not a note under the searched
+        # paths could not have carried a declaration.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        skipped = [
+            {"path": "crds/bundle.yaml", "reason": "tooLarge"},
+            {"path": "README.md", "reason": "tooLarge"},
+            {"path": "docs/link.md", "reason": "symlink"},
+        ]
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=skipped
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual([e["path"] for e in self.filed()], ["intent/api.md"])
+        self.assertIn("3 file(s) the broker did not send lie outside the searched notes", self.err)
+
+    def test_a_skipped_note_under_the_searched_paths_costs_the_repository_its_entry(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "intent/big.md", "reason": "tooLarge"}]
+        )
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+        # And with no bound at all, a skipped note anywhere is a note not read.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "elsewhere/x.md", "reason": "tooLarge"}]
+        )
+        (copy / ".kube-agents" / "intent.yaml").unlink()
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+
+    def test_a_skipped_intent_file_means_the_whole_tree_and_says_so(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "anywhere/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": ".kube-agents/intent.yaml", "reason": "tooLarge"}]
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        self.assertIn("did not send .kube-agents/intent.yaml, so the search bound is unknown", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["anywhere/api.md"])
 
     def test_a_clone_that_exits_non_zero_is_not_searched_and_does_not_end_the_run(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"

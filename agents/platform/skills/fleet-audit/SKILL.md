@@ -223,7 +223,8 @@ was read). It files what it found at `declarations_path` and lists each reposito
 completely as `owner/name@sha`. `finish` unions that list into the document's and moves every
 finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
 from `declared_intent_searched` is one the harness could not read; stderr says why, and the SOP
-says what the worker does about it. On every other stream the three are empty.
+says what the worker does about it. On every other stream the two lists are empty and the file at
+`declarations_path` holds none.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 
@@ -696,8 +697,8 @@ What `finish` does with it:
 - **It is owed whenever a declarable check ran.** Keyed on `checks_run`, not on the postures in
   `findings`, for the reason above: a candidate left out without a search reads exactly like one a
   declaration covered. A run on which none of the four checks ran anywhere owes nothing.
-- **Anything less is no search, and the postures are withheld.** No key, a list missing a
-  repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
+- **Anything less is no search, and the postures are withheld.** A union of the worker's list and
+  `start`'s that misses a repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
   declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
   shares its slug with the `min == max` posture, and adds one `coverage_gaps` sentence naming each
   withheld entry and the repositories not searched. The faults publish; `declared[]` entries publish.

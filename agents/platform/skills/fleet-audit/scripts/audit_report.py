@@ -614,6 +614,7 @@ DUAL_SHAPE_CHECK = "hpa-cannot-scale"
 # whole format: no body text is scanned, so a note that merely mentions a
 # workload declares nothing.
 DECLARATIONS_KEY = "declarations"
+DECLARATIONS_PATH_KEY = "declarations_path"
 DECLARED_INTENT_SOURCES_KEY = "declared_intent_sources"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
@@ -7017,11 +7018,19 @@ def _head_sha(tree: Path) -> str:
 
 
 class _Copy(NamedTuple):
-    """One repository copy: the tree to read, its commit, and the scratch to remove."""
+    """One repository copy: the tree to read, its commit, the scratch to remove, and what is missing.
+
+    `skipped` is every path the broker listed and did not send (a file over
+    its per-file ceiling, a symlink). Whether that makes the copy one the
+    harness may call searched is decided once the search bound is known: a
+    skipped `crds.yaml` costs a note nothing, a skipped note under the
+    searched paths costs the repository its entry.
+    """
 
     tree: Path
     sha: str
     into: Path
+    skipped: tuple[str, ...] = ()
 
 
 def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> _Copy | None:
@@ -7029,10 +7038,13 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
 
     None, with a warning, whenever the copy is not one the harness may call
     searched: the script exited non-zero, printed something other than its
-    JSON line, reported `complete: false` (a bound stopped it or it skipped a
-    file), or gave no sha the validator would accept. In directory mode the
-    script ignores `--into` and names the leased checkout it made instead, so
-    the tree to read and the scratch to remove are two different paths.
+    JSON line, was stopped by a bound (`stopped` set: the listing was cut and
+    what lies past the cut is unknown), or gave no sha the validator would
+    accept. A copy the broker merely skipped files from is returned with the
+    skipped paths, because whether any of them was a note under the searched
+    paths is the caller's question. In directory mode the script ignores
+    `--into` and names the leased checkout it made instead, so the tree to
+    read and the scratch to remove are two different paths.
     """
     cmd = [
         sys.executable,
@@ -7061,11 +7073,18 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
     if not isinstance(reply, dict):
         log(f"WARNING: {slug}: clone printed no JSON line; not searched.")
         return None
-    if reply.get("complete") is not True:
+    skipped = tuple(
+        str(entry.get("path") if isinstance(entry, dict) else entry)
+        for entry in reply.get("skipped") or []
+    )
+    if reply.get("stopped"):
         log(
-            f"WARNING: {slug}: copy incomplete (stopped: {reply.get('stopped')!r}, "
-            f"skipped: {len(reply.get('skipped') or [])}); not searched."
+            f"WARNING: {slug}: copy stopped at {reply.get('stopped')!r}; the rest "
+            "of the tree was never listed, so it is not searched."
         )
+        return None
+    if reply.get("complete") is not True and not skipped:
+        log(f"WARNING: {slug}: copy reported incomplete without saying what is missing; not searched.")
         return None
     if reply.get("mode") == CLONE_MODE_DIRECTORY:
         tree = Path(str(reply.get("workspace") or ""))
@@ -7079,7 +7098,7 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
     if _searched_entry(slug, sha) is None:
         log(f"WARNING: {slug}: no commit sha for the copy; not searched.")
         return None
-    return _Copy(tree, sha, into)
+    return _Copy(tree, sha, into, skipped)
 
 
 def discover_declarations(
@@ -7120,6 +7139,7 @@ def discover_declarations(
         # branch it will publish against.
         ref = None if is_gitops else refs.get(slug.lower())
         into: Path | None = None
+        skipped: tuple[str, ...] = ()
         try:
             if is_gitops and not content_mode():
                 tree, sha = root, _head_sha(root)
@@ -7131,8 +7151,33 @@ def discover_declarations(
                 copied = _clone_for_search(slug, ref, audit_id, into)
                 if copied is None:
                     continue
-                tree, sha = copied.tree, copied.sha
+                tree, sha, skipped = copied.tree, copied.sha, copied.skipped
+            if INTENT_FILE in skipped:
+                log(
+                    f"WARNING: {slug}: the broker did not send {INTENT_FILE}, so the "
+                    "search bound is unknown and the whole tree is searched."
+                )
             found, prefixes = search_tree(tree, repo=slug, declarable=declarable)
+            # The copy's gaps, judged against the bound that was applied: a
+            # skipped file that is not a note under the searched paths could
+            # not have carried a declaration, and a skipped note could have.
+            missed = [
+                path
+                for path in skipped
+                if path.endswith(NOTE_SUFFIX) and _under_prefixes(path, prefixes)
+            ]
+            if missed:
+                log(
+                    f"WARNING: {slug}: the broker did not send {len(missed)} note(s) "
+                    f"under the searched paths ({', '.join(missed[:MAX_HINT_IDS])}); "
+                    "not searched."
+                )
+                continue
+            if skipped:
+                log(
+                    f"{slug}: {len(skipped)} file(s) the broker did not send lie outside "
+                    "the searched notes; the search counts as complete."
+                )
         except Exception as exc:  # noqa: BLE001 — one repository must not end the run
             log(f"WARNING: {slug}: declared-intent search failed ({exc}); not searched.")
             continue
@@ -7281,7 +7326,7 @@ def handle_start(args: argparse.Namespace) -> None:
                 # itself.
                 DECLARED_INTENT_SEARCHED_KEY: searched,
                 DECLARED_INTENT_SOURCES_KEY: sources,
-                "declarations_path": declarations_path,
+                DECLARATIONS_PATH_KEY: declarations_path,
                 # The roster, handed over rather than left to be discovered.
                 #
                 # It is in the SOP, and the SOP is required reading, but "the

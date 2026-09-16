@@ -803,9 +803,11 @@ cluster's `checks_not_applicable`, which is what keeps a check the cluster's sha
 reading as a check nobody ran.
 
 The fourth is fleet-wide and comes from `withhold_unsearched_postures`, which `finish` runs once,
-right after the document loads and before the dry-run split. When any cluster's `checks_run` names a
-declarable check and the document's `declared_intent_searched` does not cover every repository in
-`start`'s run record — or `start` left none — it takes every finding whose check is declarable out
+after the document loads and `start`'s search record and declarations have been folded into it
+(the `start` section above), and before the dry-run split. When any cluster's `checks_run` names a
+declarable check and the document's `declared_intent_searched` — the worker's list with the run
+record's `searched` unioned in — does not cover every repository in `start`'s run record, or
+`start` left none, it takes every finding whose check is declarable out
 of `findings`, the dangling-target `hpa-cannot-scale` fault included (the validator cannot tell it
 from the `min == max` posture), and files them on the document under `postures_withheld`. Every
 caller of `coverage_gaps` then derives the same sentence — each withheld entry, the repositories not

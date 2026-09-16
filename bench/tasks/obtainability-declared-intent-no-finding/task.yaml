@@ -14,9 +14,12 @@
 # repository work this case can carry:
 #   1. The declaration. Each eval project's GitOps repo
 #      (gke-agentic/<project>-infra, hack/ci-deploy.sh gitops_repo_for_project)
-#      needs a knowledge/ note naming seeded-reliability/Deployment/
-#      checkout-gateway and the check slug no-pdb, committed by an account
-#      with write access to those repositories. None carries one today.
+#      needs an OKF note under knowledge/ (a path its .kube-agents/intent.yaml
+#      names, or the whole tree without one) whose `declares:` frontmatter
+#      carries {check: no-pdb, namespace: seeded-reliability, object:
+#      Deployment/checkout-gateway} — the harness reads the frontmatter, not
+#      the prose — committed by an account with write access to those
+#      repositories. None carries one today.
 #   2. A fixture of its own. checkout-gateway's missing budget is the planted
 #      defect five ACTIVE cases grade (reliability-pdb-probe,
 #      obtainability-remediation-proposal, obtainability-pdb-semantics,
