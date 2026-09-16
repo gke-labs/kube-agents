@@ -156,6 +156,7 @@ branch. It prints exactly one JSON line:
   "declared_intent_repos": ["acme/fleet", "acme/terraform-live"],
   "declared_intent_searched": [],
   "declared_intent_sources": [],
+  "declared_intent_unsearched": [],
   "declarations_path": "/opt/data/scratch/declarations_compliance-audit.json",
   "sop": "governance/compliance_audit_sop.md",
   "checks": ["privileged-container", "host-namespace", "…"],
@@ -221,13 +222,15 @@ frontmatter in OKF notes, within the paths each repository's `.kube-agents/inten
 (`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree
 was read). In content mode the copy is bounded the same way: `.kube-agents/` first, then only the
 named paths, so the sibling script's file and byte caps count notes rather than manifests; a
-repository with no usable intent file is copied whole under those caps. `start` files what it found
+repository with no usable intent file, or whose file names a path with nothing behind it, is copied
+whole under those caps. `start` files what it found
 at `declarations_path` and lists each repository it read completely — every note under the
 searched paths arrived and was read; one the broker withheld or the harness could not decode costs
 the repository its entry — as `owner/name@sha`. `finish` unions that list into the document's and
 moves every finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
-from `declared_intent_searched` is one the harness could not read; stderr says why, and the SOP
-says what the worker does about it. On every other stream the two lists are empty and the file at
+from `declared_intent_searched` is one the harness could not read; `declared_intent_unsearched`
+lists each as `{repo, ref}`, stderr says why, and the SOP says what the worker does about it — its
+own copy at that `ref`. On every other stream the three lists are empty and the file at
 `declarations_path` holds none.
 
 ### Step 2 — Inspect the fleet (reasoning phase)

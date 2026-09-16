@@ -161,7 +161,12 @@ GITHUB_REPO_TYPE = "github"
 #: URL and drops the ref, with a warning; the repository is still read, at HEAD.
 CONTEXT_REF_KEY = "ref"
 _REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}\Z")
-_REF_FORBIDDEN_SUBSTRINGS = ("..", "/.", "//", "@{")
+# `git check-ref-format`'s rules, the ones the shape regex above leaves open:
+# no `..`, no component starting with `.`, no empty component, no `@{`, and
+# no component ending in `.lock` — `.lock/` catches one in the middle, the
+# suffix below one at the end; `git clone --branch foo.lock/bar` exits 128,
+# which would leave the repository unsearched rather than read at HEAD.
+_REF_FORBIDDEN_SUBSTRINGS = ("..", "/.", "//", "@{", ".lock/")
 _REF_FORBIDDEN_SUFFIXES = ("/", ".", ".lock")
 
 Runner = Callable[..., object]

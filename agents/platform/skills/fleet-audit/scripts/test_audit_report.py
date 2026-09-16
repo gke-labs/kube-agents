@@ -3662,6 +3662,7 @@ class TestStart(HarnessTestCase):
                 # than by leaving the keys out.
                 "declared_intent_searched": [],
                 "declared_intent_sources": [],
+                "declared_intent_unsearched": [],
                 "declarations_path": str(
                     self.tmp_path / "declarations_compliance-audit.json"
                 ),
@@ -5160,6 +5161,51 @@ class TestDeclarationParsing(unittest.TestCase):
         entries, _ = parse(note([declaration(namespace="", obj="Node/pool-a")]))
         self.assertEqual(entries[0]["namespace"], "")
 
+    def test_whitespace_around_the_slash_is_a_hand_typed_kind_name(self):
+        # The join is an exact lookup against the finding's `Kind/name`, so an
+        # item that passed the shape check with the spaces kept would match
+        # nothing and the posture would publish under a note that covers it.
+        for spelling in ("Deployment / checkout-gateway", "Deployment/ checkout-gateway", " Deployment /checkout-gateway "):
+            with self.subTest(spelling=spelling):
+                entries, err = parse(note([declaration(obj=spelling)]))
+                self.assertEqual(err, "")
+                self.assertEqual([e["object"] for e in entries], ["Deployment/checkout-gateway"])
+        # Whitespace where a side should be is still a missing side.
+        for bad in ("Deployment/ ", " /api", "Deployment / "):
+            with self.subTest(bad=bad):
+                entries, err = parse(note([declaration(obj=bad)]))
+                self.assertEqual(entries, [])
+                self.assertIn("object must be Kind/name", err)
+
+    def test_an_indented_delimiter_inside_a_block_scalar_does_not_close_the_frontmatter(self):
+        # YAML's document markers start at column 0; an indented `---` in a
+        # `notes: |` block is content. Closing the frontmatter there handed
+        # PyYAML the prefix and dropped every `declares:` item after it, with
+        # the note read and the repository counted as searched.
+        text = (
+            "---\n"
+            "type: runbook\n"
+            "title: DB\n"
+            "notes: |\n"
+            "  Step 1:\n"
+            "  ---\n"
+            "  Step 2:\n"
+            "  ...\n"
+            "declares:\n"
+            "  - check: no-pdb\n"
+            "    namespace: default\n"
+            "    object: Deployment/api\n"
+            "---\n"
+            "# Body\n"
+        )
+        entries, err = parse(text)
+        self.assertEqual(err, "")
+        self.assertEqual([(e["check"], e["object"], e["excerpt"]) for e in entries], [("no-pdb", "Deployment/api", "DB")])
+        # Trailing whitespace on the delimiter is still the delimiter; leading
+        # whitespace on the opening line is not frontmatter at all.
+        self.assertEqual(audit_report.split_frontmatter("---  \ntype: x\n---\t\nbody\n"), "type: x")
+        self.assertIsNone(audit_report.split_frontmatter("  ---\ntype: x\n---\n"))
+
     def test_notes_that_are_not_declarations_yield_nothing_quietly(self):
         for text in (
             "# No frontmatter\n\nDeployment/checkout-gateway no-pdb\n",
@@ -5491,6 +5537,32 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         )
         self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
 
+    def test_a_named_path_with_nothing_behind_it_means_the_whole_tree_and_says_so(self):
+        # `knowlege/` is the typo the shape check cannot see: it passed, the
+        # walk found nothing under it, and the repository was credited with a
+        # complete search while every note under `knowledge/` went unread.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - knowlege/\n  - docs/\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}])
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "knowledge/checkout.md"])
+        self.assertIn(
+            "WARNING: acme/fleet:.kube-agents/intent.yaml: `knowlege` names nothing in the "
+            "repository at this commit; searching the whole tree.",
+            self.err,
+        )
+        # A symlinked prefix is never followed, so it too has nothing behind it.
+        (self.workspace / ".kube-agents" / "intent.yaml").write_text("paths: [linked/]\n", encoding="utf-8")
+        (self.workspace / "linked").symlink_to(self.workspace / "knowledge", target_is_directory=True)
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_sources"][0]["paths"], [])
+        self.assertIn("`linked` names nothing", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "knowledge/checkout.md"])
+
     def test_a_note_saved_with_a_byte_order_mark_still_declares(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         target = self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
@@ -5509,6 +5581,8 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         payload = self.start()
         self.assertEqual(payload["declared_intent_searched"], [])
         self.assertEqual(payload["declared_intent_sources"], [])
+        # The GitOps repository's pin is never honoured, so none is handed over.
+        self.assertEqual(payload["declared_intent_unsearched"], [{"repo": "acme/fleet", "ref": None}])
         self.assertEqual(self.filed(), [])
         self.assertIn("WARNING: acme/fleet: no commit sha for the checkout; not searched", self.err)
 
@@ -5560,6 +5634,7 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
             payload["declared_intent_sources"][1],
             {"repo": "acme/terraform-live", "ref": "release-2026", "paths": ["intent"]},
         )
+        self.assertEqual(payload["declared_intent_unsearched"], [])
         calls = self.clone_calls()
         self.assertEqual([c[c.index("--ref") + 1] for c in calls], ["release-2026"] * 2)
         # The bound is read from the first copy and the second fetches only it.
@@ -5752,6 +5827,42 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         payload = self.start()
         self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
 
+    def test_a_content_mode_copy_of_a_path_with_nothing_behind_it_fetches_the_whole_tree(self):
+        # The bounded copy of a misspelt prefix comes back empty and complete
+        # at the same sha, which read as a search that found nothing. The
+        # bound is unusable, as a misspelt file is, so the whole tree is
+        # fetched under the caps and read.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "knowledge/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/api.md"])
+        self.assertIn("`intent` names nothing in the repository at this commit; searching the whole tree", self.err)
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual(
+            [c[c.index("--prefix") + 1] if "--prefix" in c else None for c in calls],
+            [".kube-agents", "intent", None],
+        )
+        self.assertIn("--force", calls[2])
+        self.assertEqual(self.temp_dirs(), [])
+        # A prefix the broker skipped a file under is a prefix the repository
+        # has: the bound stands, and the skipped note costs the entry as before.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "intent/big.md", "reason": "tooLarge"}]
+        )
+        self.out = ""
+        self.err = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertNotIn("names nothing", self.err)
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+        self.assertEqual(len([c for c in self.clone_calls() if "acme/terraform-live" in c]), 3 + 2)
+
     def test_a_skipped_intent_file_means_the_whole_tree_and_says_so(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         self.context("acme/terraform-live")
@@ -5769,10 +5880,17 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
     def test_a_clone_that_exits_non_zero_is_not_searched_and_does_not_end_the_run(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         self.harness.failures = {"--repo acme/terraform-live": 1}
-        self.context("acme/terraform-live")
+        self.context("acme/terraform-live", ref="release-2026")
         payload = self.start()
         self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
-        self.assertIn("WARNING: acme/terraform-live: clone exited 1; not searched", self.err)
+        self.assertIn("WARNING: acme/terraform-live: clone at release-2026 exited 1; not searched", self.err)
+        # The worker's own copy needs the pin: the entry names it, because
+        # `context_repos` is slugs and `declared_intent_sources` lists only
+        # what was searched, so nowhere else in the payload carries it.
+        self.assertEqual(
+            payload["declared_intent_unsearched"],
+            [{"repo": "acme/terraform-live", "ref": "release-2026"}],
+        )
         self.assertEqual(self.temp_dirs(), [])
 
     def test_yesterdays_declarations_are_cleared_before_anything_can_fail(self):

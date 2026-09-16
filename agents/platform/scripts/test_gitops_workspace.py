@@ -1066,8 +1066,10 @@ class TestContextRepos(WorkspaceTestCase):
 
     def test_a_ref_that_is_not_a_branch_name_is_dropped_with_a_warning(self):
         # A leading dash is an option to `git`; the rest are shapes a ref
-        # cannot take. The repository is still read, at HEAD.
-        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "a/.b", "with space", "a@{1}"):
+        # cannot take — `foo.lock/bar` among them, a `.lock` component git
+        # refuses in the middle of a name as it does at the end. The
+        # repository is still read, at HEAD.
+        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "foo.lock/bar", "a/.b", "with space", "a@{1}"):
             with self.subTest(ref=bad):
                 context = json.dumps(
                     [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": bad}]

@@ -623,6 +623,10 @@ DUAL_SHAPE_POSTURE_SEVERITY = "major"
 DECLARATIONS_KEY = "declarations"
 DECLARATIONS_PATH_KEY = "declarations_path"
 DECLARED_INTENT_SOURCES_KEY = "declared_intent_sources"
+# What `start` hands the worker for each repository it owes and could not
+# read: the slug and the `ref` the entry pins, so the worker's own copy reads
+# the branch the administrator configured rather than the remote's HEAD.
+DECLARED_INTENT_UNSEARCHED_KEY = "declared_intent_unsearched"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
 FRONTMATTER_DELIMITER = "---"
@@ -642,7 +646,11 @@ HEADING_RE = re.compile(r"^#{1,6}[ \t]+(?P<text>\S.*?)[ \t#]*$", re.M)
 # prefixes held to the remediation-path rules (a trailing `/` allowed, because
 # they are prefixes). Absent or invalid reads as the whole tree, said on
 # stderr, because a bound that fails closed would let a typo hide every
-# declaration in the repository.
+# declaration in the repository. A prefix with nothing behind it at the
+# commit read — `knowlege/` for a tree whose notes live under `knowledge/`,
+# or a directory renamed since the file was written — is the same typo in a
+# well-formed path, and is treated the same way rather than credited as a
+# search that found nothing.
 INTENT_FILE = ".kube-agents/intent.yaml"
 INTENT_PATHS_KEY = "paths"
 # The directory a content-mode copy fetches first, so the bound is known before
@@ -2469,12 +2477,18 @@ def _split_note(text: str) -> tuple[str, str] | None:
     A leading UTF-8 byte-order mark is not part of the first line: without
     this a note saved by an editor that writes one would be read, counted
     as searched and declare nothing, with no warning anywhere.
+
+    A delimiter starts at column 0. YAML's document markers do, and an
+    indented `---` or `...` inside a block scalar (`notes: |` holding a
+    horizontal rule) is content; closing the frontmatter there would hand
+    PyYAML a truncated prefix and drop every `declares:` item after it,
+    with the note read and the repository counted as searched.
     """
     lines = normalise_newlines(text).lstrip(UTF8_BOM).split("\n")
-    if not lines or lines[0].strip() != FRONTMATTER_DELIMITER:
+    if not lines or lines[0].rstrip() != FRONTMATTER_DELIMITER:
         return None
     for index in range(1, len(lines)):
-        if lines[index].strip() in FRONTMATTER_END_DELIMITERS:
+        if lines[index].rstrip() in FRONTMATTER_END_DELIMITERS:
             return "\n".join(lines[1:index]), "\n".join(lines[index + 1 :])
     return None
 
@@ -2560,11 +2574,16 @@ def parse_declarations(
                 "justify; skipped."
             )
             continue
-        obj = item["object"].strip()
-        kind, _, name = obj.partition("/")
+        raw_object = item["object"].strip()
+        # Each side of the slash on its own: `Deployment / api` is a hand-typed
+        # spelling of `Deployment/api`, and the join is an exact lookup against
+        # the finding's `Kind/name`, so the whitespace would not fail the item
+        # here but silently match nothing there.
+        kind, _, name = (part.strip() for part in raw_object.partition("/"))
         if not kind or not name or "/" in name:
-            log(f"WARNING: {item_where}: object must be Kind/name, got {obj!r}; skipped.")
+            log(f"WARNING: {item_where}: object must be Kind/name, got {raw_object!r}; skipped.")
             continue
+        obj = f"{kind}/{name}"
         entry = {
             "check": check,
             "namespace": item["namespace"].strip(),
@@ -2657,6 +2676,31 @@ def _under_prefixes(path: str, prefixes: list[str]) -> bool:
     return not prefixes or any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
+def _unmatched_prefixes(tree: Path, prefixes: list[str], skipped: tuple[str, ...] = ()) -> list[str]:
+    """The prefixes in `prefixes` with nothing behind them in the copy at `tree`.
+
+    A prefix is matched when it names a file or directory in the copy — not
+    through a symlink, which the walk never follows — or when the broker
+    reported skipping a file under it, which is a file the repository has
+    even though the copy does not. Git tracks no empty directory, so a
+    prefix that matches nothing names nothing at this commit.
+    """
+    out: list[str] = []
+    for prefix in prefixes:
+        target = tree / prefix
+        if target.is_symlink() or not target.exists():
+            if not any(_under_prefixes(path, [prefix]) for path in skipped):
+                out.append(prefix)
+    return out
+
+
+def _whole_tree_for_unmatched(repo: str, unmatched: list[str]) -> None:
+    log(
+        f"WARNING: {repo}:{INTENT_FILE}: {', '.join(f'`{p}`' for p in unmatched)} "
+        "names nothing in the repository at this commit; searching the whole tree."
+    )
+
+
 def _bounds_searched_notes(rel: str, prefixes: list[str]) -> bool:
     """Whether a directory the walk could not enter may hold a searched note.
 
@@ -2724,6 +2768,12 @@ def search_tree(
     """
     if prefixes is None:
         prefixes = read_intent_paths(tree, repo)
+        # A content-mode copy checked this before it fetched; a whole tree
+        # is checked here, against the same copy the walk will read.
+        unmatched = _unmatched_prefixes(tree, prefixes)
+        if unmatched:
+            _whole_tree_for_unmatched(repo, unmatched)
+            prefixes = []
     notes, unread = note_paths(tree, prefixes)
     found: list[dict] = []
     for rel in notes:
@@ -7221,7 +7271,8 @@ def _clone_step(
         cmd.append("--force")
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
-        log(f"WARNING: {slug}: clone exited {result.returncode}; not searched.")
+        at = f" at {ref}" if ref else ""
+        log(f"WARNING: {slug}: clone{at} exited {result.returncode}; not searched.")
         return None
     lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
     try:
@@ -7295,10 +7346,11 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
         prefixes: list[str] = []
     else:
         prefixes = read_intent_paths(tree, slug)
-    for prefix in prefixes or [None]:
+
+    def fetch(prefix: str | None) -> bool:
         step = _clone_step(slug, ref, audit_id, into, prefix=prefix, force=True)
         if step is None:
-            return None
+            return False
         step_sha = str(step.get("sha") or "")
         if step_sha != sha:
             log(
@@ -7306,8 +7358,23 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
                 f"{step_sha[:MIN_SHA_CHARS] or 'no sha'}, not {sha[:MIN_SHA_CHARS]}: the "
                 "repository moved between copies; not searched."
             )
-            return None
+            return False
         skipped.update(dict.fromkeys(step["skipped"]))
+        return True
+
+    for prefix in prefixes or [None]:
+        if not fetch(prefix):
+            return None
+    # A named path the copy has nothing under, and the broker skipped nothing
+    # under, names nothing at this commit: the bound is unusable, as a
+    # misspelt one is, and the whole tree is fetched under the caps the bound
+    # existed to avoid — visible on stderr rather than credited as a search.
+    unmatched = _unmatched_prefixes(tree, prefixes, tuple(skipped))
+    if unmatched:
+        _whole_tree_for_unmatched(slug, unmatched)
+        prefixes = []
+        if not fetch(None):
+            return None
     return _Copy(tree, sha, into, tuple(skipped), prefixes)
 
 
@@ -7414,6 +7481,32 @@ def discover_declarations(
             f"{len(found)} declaration(s)."
         )
     return declarations, searched, sources
+
+
+def unsearched_intent_entries(
+    audit_id: str, repo: str, context: list[dict], searched: list[str]
+) -> list[dict]:
+    """`[{repo, ref}]` for each repository the step owes that `searched` does not credit.
+
+    The list the worker has to copy itself, each with the `ref` the harness
+    was configured to read (None for the GitOps repository, whose pin is
+    never honoured, and for an entry without one): the only other place the
+    pin is printed lists repositories that were searched, and a worker that
+    cannot see it clones HEAD and records a branch the administrator did
+    not ask to be read. Empty on a stream with no declared-intent step,
+    which owes no search.
+    """
+    if not audit_declarable_checks(audit_id):
+        return []
+    refs = {entry["repo"].lower(): entry.get("ref") for entry in context}
+    have = {entry.partition("@")[0].strip().lower() for entry in searched}
+    out: list[dict] = []
+    for slug in declared_intent_repos(repo, [entry["repo"] for entry in context]):
+        if slug.lower() in have:
+            continue
+        is_gitops = slug.lower() == repo.strip().lower()
+        out.append({"repo": slug, "ref": None if is_gitops else refs.get(slug.lower())})
+    return out
 
 
 def handle_start(args: argparse.Namespace) -> None:
@@ -7544,6 +7637,15 @@ def handle_start(args: argparse.Namespace) -> None:
                 # itself.
                 DECLARED_INTENT_SEARCHED_KEY: searched,
                 DECLARED_INTENT_SOURCES_KEY: sources,
+                # The complement, as `{repo, ref}`: what the worker copies
+                # itself, at the branch the entry pins. Printed because the
+                # pin appears nowhere else the worker can read — `context_repos`
+                # above is slugs, `declared_intent_sources` lists only what was
+                # searched — and a worker that cannot see it clones HEAD and
+                # records a branch the administrator did not ask to be read.
+                DECLARED_INTENT_UNSEARCHED_KEY: unsearched_intent_entries(
+                    audit_id, repo, context_entries, searched
+                ),
                 DECLARATIONS_PATH_KEY: declarations_path,
                 # The roster, handed over rather than left to be discovered.
                 #
