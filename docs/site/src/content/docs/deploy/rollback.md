@@ -7,10 +7,17 @@ sidebar:
 
 A rollback is an upgrade run from the older release's own checkout. There is no rollback flag:
 `upgrade.sh` refuses to run unless the sources it runs from are the exact commit `--image-tag`
-names, so a move to `N-1` always runs `N-1`'s copy of the script, `N-1`'s chart and `N-1`'s CRDs
-against your install. Two of its three modes do that by Helm alone and never run Terraform; the
-third re-applies `N-1`'s Terraform composition. The supported rollback is the Helm-only pair below.
-The full mode is the GCP-level revert, and it needs a plan read first.
+names, so a move to `N-1` from a checkout or a release bundle runs `N-1`'s copy of the script,
+`N-1`'s chart and `N-1`'s CRDs against your install. Two of its three modes do that by Helm alone
+and never run Terraform; the third re-applies `N-1`'s Terraform composition. The supported
+rollback is the Helm-only pair below. The full mode is the GCP-level revert, and it needs a plan
+read first.
+
+Because the script that runs is `N-1`'s, its timeouts and Helm flags are `N-1`'s too, and this
+page says where the published releases differ. The `curl | bash` one-liner is the exception: it
+runs the published script and fetches only `N-1`'s chart, CRDs and installer library, so a
+rollback done that way has the current script's behaviour against `N-1`'s chart. This page
+describes the checkout.
 
 ## Before you start
 
@@ -50,7 +57,7 @@ about, and the next two sections say what happens to each kind of thing.
 
 ## The rollback
 
-From the `N-1` checkout, operator first, then harness:
+From the `N-1` checkout, a dry run, then operator and harness back to back:
 
 ```bash
 ./upgrade.sh --dry-run --upgrade-mode=operator --image-tag <N-1>
@@ -58,61 +65,87 @@ From the `N-1` checkout, operator first, then harness:
 ./upgrade.sh --upgrade-mode=harness --image-tag <N-1>
 ```
 
-The operator step applies `N-1`'s CRDs to the cluster with a server-side apply, then runs one
-`helm upgrade` on the existing release with `N-1`'s chart, re-tagging the operator image. From
-that point `N-1`'s operator, working from `N-1`'s schema, is reconciling the `PlatformAgent`. The
-harness step is a second `helm upgrade` with the same chart re-tagging the agent image (on
-releases that ship the shell sandbox, the sandbox image with it), followed by a wait for the
-rollout. Operator first because the CRD schema and the controller have to agree before the agent
-that the controller renders is replaced; harness first would put `N-1`'s agent under `N`'s
-operator for the length of a rollout.
+`--dry-run` prints the target and the image references the step would apply, from the
+configuration alone, and contacts nothing. It refuses a checkout at the wrong commit, as the real
+run does, and only warns about uncommitted changes, which the real run refuses.
 
-Each step waits for its rollout and fails when the wait times out: two minutes for the operator,
-fifteen for the agent. A timeout is not a signal to run the step again. Read the pod first:
+The operator step applies `N-1`'s CRDs to the cluster with a server-side apply, then runs one
+`helm upgrade` on the existing release with `N-1`'s chart, re-tagging the operator image. `N-1`'s
+operator then reconciles the `PlatformAgent` from `N-1`'s schema, and its first pass re-renders
+the agent Deployment with `N-1`'s spec, rolling the pod wherever that spec differs, still on `N`'s
+image, because the agent tag in the release's values has not moved yet. The harness step is a
+second `helm upgrade` with the same chart re-tagging the agent image (on releases that ship the
+shell sandbox, the sandbox image with it), followed by a wait for the rollout. Operator first
+because the CRD schema and the controller have to agree before the agent the controller renders
+is replaced. Between the two commands `N`'s agent image runs under `N-1`'s Deployment spec,
+without whatever `N`'s operator had added to it, which is why the pair is run back to back rather
+than a step at a time.
+
+Each step's `helm upgrade` waits up to ten minutes for the objects the chart renders, the
+controller Deployment among them. A timeout there leaves the release `failed`, which the next run
+does not un-stick on its own: the current script un-sticks a `pending-*` release alone, and
+`0.4.0`'s un-sticks nothing. After Helm returns, the script waits with `kubectl rollout status`
+for the rollouts the chart does not cover, the agent Deployment first, and those waits are
+`N-1`'s: the current script gives the agent fifteen minutes in the namespace `install.env` names,
+while `0.4.0`'s gives it two minutes in `kubeagents-system` whatever `NAMESPACE` says. So on a
+slow image pull, or on an install in another namespace, `0.4.0`'s harness step can report a
+failure after both Helm moves have succeeded. A timeout is not a signal to run the step again.
+Read the rollout yourself first:
 
 ```bash
 kubectl get pods -n kubeagents-system
+kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system
 kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
 ```
-
-`--dry-run` prints the target and the image references the step would apply, from the
-configuration alone, and contacts nothing. It runs from the same checkout, so it also exercises
-the source check.
 
 ## What the two steps change
 
 - The Helm release: `N-1`'s chart version, two new revisions in `helm history`.
 - The operator and agent images, at tag `N-1`; the sandbox image too when `N-1`'s chart has it.
 - The CRD schema, now `N-1`'s.
-- Every object the chart renders, including the `PlatformAgent` resource. Objects `N`'s chart
-  rendered and `N-1`'s does not are deleted by the upgrade; that is Helm's ordinary behaviour.
+- Every object the chart renders, including the `PlatformAgent` resource, re-rendered from
+  `N-1`'s templates. Objects `N`'s chart rendered and `N-1`'s does not are deleted by the upgrade;
+  that is Helm's ordinary behaviour.
+- Which values those templates are rendered with depends on the script. From `0.5.0` on the
+  re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the values the
+  install set on top. `0.4.0` and earlier use `--reuse-values`, which keeps every value `N`'s
+  release computed, defaults included, so a chart default `N` changed stays at `N`'s value after a
+  rollback to `0.4.0` even though the chart version reads `0.4.0`.
 
 ## What they leave as it is
 
 Terraform state and every GCP resource. The Helm-only modes write nothing to state, so it keeps
 recording `N` as the installed tag. `./upgrade.sh --plan` with no `--image-tag` plans at the tag
-state records and therefore reports the rollback as no drift; the state and the cluster disagree
-until the next `--upgrade-mode=full`, which re-applies whatever tag it is given. The
-`terraform.tfvars` in the `N-1` checkout is regenerated on every run and is not a record of
-anything.
+state records, so the re-tag is not in its report; run from the `N-1` checkout it still lists
+every composition difference between `N-1` and `N`, which is the next section's subject. The state
+and the cluster disagree on the tag until the next `--upgrade-mode=full`, which re-applies
+whatever tag it is given. The `terraform.tfvars` in the `N-1` checkout is regenerated on every run
+and is not a record of anything.
 
 Secrets. The script never rewrites a Secret value that exists. A key that `N-1`'s script knows and
 finds missing is generated and added, which is what a forward upgrade does too.
 
 Objects `N`'s operator created that `N-1`'s operator does not know. The operator only reconciles
-what its own release renders, so an object introduced by a later release keeps running, on `N`'s
+what its own release renders, so an object introduced by a later release stays in place, on `N`'s
 image, unmanaged, until the next forward upgrade re-adopts it. The shell sandbox is the current
-example: rolling back to a release whose chart has no `agentSandbox` values (0.4.0 and earlier)
-leaves the `platform-agent-shell` StatefulSet in place on `N`'s image, and that release's harness
-step re-tags the agent alone.
+example: rolling back to a release whose chart has no `agentSandbox` values (`0.4.0` and earlier)
+leaves the `platform-agent-shell` StatefulSet behind, and that release's harness step re-tags the
+agent alone. It keeps running until its pod next restarts: the same Helm move deleted the
+`platform-agent-shell-authorized-keys` Secret it mounts, because `0.4.0`'s chart does not render
+it, so the replacement pod stays in `ContainerCreating`. That is harmless to the `0.4.0` agent,
+which has no sandbox, and the next forward upgrade renders the Secret again.
 
 Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the API server prunes
 them from the stored object, and `N-1`'s chart does not render them. The Helm values that produced
-them survive in the release, so a later forward upgrade renders them again.
+them stay in the release's recorded values, which a later forward upgrade renders again, and which
+the schema refusal below also turns on.
 
-The agent's persistent volume. The harness step rolls the pod, and the volume follows it. Files
-`N`'s agent wrote there stay, and `N-1`'s image syncs its own defaults over the paths it owns at
-start-up, as on any restart.
+The agent's persistent volume. The harness step rolls the pod, and the volume follows it. At
+start-up the image copies its defaults onto the volume with `cp -ru`, which skips any file the
+volume holds that is newer than the image's, so the skills, procedures and cron definitions `N`'s
+image seeded stay at `N`'s copy; only the short list the entrypoint force-syncs (the default
+profile's own files and the shared scripts) follows `N-1`'s image. A skill `N` added that calls a
+tool `N-1`'s image does not carry therefore fails when used rather than disappearing.
 
 ## Reverting GCP resources too
 
@@ -130,6 +163,14 @@ resources hold in front of you, not a rollback step; the composition on `N` may 
 resource that now carries data. The plan's exit code follows Terraform's: `0` for no changes,
 `2` for changes, `1` for an error.
 
+The composition refuses some of those destructions itself: its `lifecycle.sh` exits before
+`terraform apply` when the regenerated configuration disagrees with state on the cluster, the
+agent's service account, the CMEK key, the release namespace, the Pub/Sub subscription or the
+minter key. That refusal comes after the full mode's CRD apply, so it leaves `N-1`'s CRDs in
+place, like the schema refusal below. How to read a `destroy` line in the plan, as missing
+configuration first and real drift second, is in the
+[installer README](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md).
+
 ## Checking the result
 
 ```bash
@@ -145,25 +186,36 @@ helm history kube-agents -n kubeagents-system
 
 Both images end in `:<N-1>`, the `Ready` condition reads `True`, the gateway pod is `Running`,
 and the newest Helm revision is `deployed` at chart version `N-1`, with the operator step's
-revision `superseded` just before it. `kubeagents-system` is
-the default namespace; an install that set `NAMESPACE` in `install.env` uses that one.
-`platform-agent` is the chart's default `platformAgent.name` value.
+revision `superseded` just before it. `kubeagents-system` is the default namespace; an install
+that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the chart's default
+`platformAgent.name` value.
 
 ## When a rollback is refused
 
-Each refusal happens before anything on the cluster moves.
+The first two refusals happen before anything on the cluster moves. The third does not.
 
 - **The sources do not match the tag.** The checkout's `HEAD` is not the tag's commit, the tree
   has uncommitted changes, or the bundle's baked version is not the `--image-tag` given. Start
   again from a clean checkout or bundle of `N-1`.
-- **No install configuration.** Neither `install.env` beside the script nor
-  `KUBE_AGENTS_INSTALL_ENV` was found. Supply the install's own file; a fresh one written from
-  memory re-renders the `PlatformAgent` with whatever it forgets.
-- **`N` introduced a new API version of the CRD and objects were stored in it.** The API server
-  rejects a CRD whose `spec.versions` drops a version that is still listed in
-  `status.storedVersions`, so the operator step fails at the CRD apply. Every published release
-  serves `v1alpha1` alone, so this refusal is a future one; it is here so that the day it happens
-  the error is recognised as the rollback boundary it is.
+- **No install configuration.** Neither `install.env` beside the script, nor
+  `KUBE_AGENTS_INSTALL_ENV`, nor a legacy `k8s-operator/scripts/vars.sh` was found. Supply the
+  install's own file; a fresh one written from memory re-renders the `PlatformAgent` with whatever
+  it forgets.
+- **`N-1`'s chart carries a values schema and `N` added a chart value.** Every release after
+  `0.5.0` ships a `values.schema.json` that closes each level of the chart's values, and the
+  re-tag reuses the values the release recorded, so a key `N`'s install set that `N-1`'s chart
+  does not declare fails Helm's schema check. Helm checks before it renders, so the release keeps
+  its last revision, but in the operator step the CRD apply has already run: put `N`'s CRDs back
+  from the `N` checkout with the same command the script uses,
+  `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. The re-tag has no
+  flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
+  one pair published today, `0.5.0` to `0.4.0`, is not affected: `0.4.0`'s chart has no schema.
+
+A further refusal is a future one. The API server rejects a CRD whose `spec.versions` drops a
+version still listed in `status.storedVersions`, so if `N` introduced a new API version of the
+`PlatformAgent` CRD and objects were stored in it, the operator step fails at the CRD apply,
+before anything moves. Every published release serves `v1alpha1` alone; it is here so that the
+day it happens the error is recognised as the rollback boundary it is.
 
 Two things this page does not do. `helm rollback kube-agents <revision>` reverts the chart and
 values to an earlier revision without applying that revision's CRDs and without the source check,
