@@ -25,8 +25,11 @@ STEP = "Fetch the pool-pressure artifact"
 ARTIFACT = "work/pool-pressure.json"
 LOGS = "gs://fake-prow/logs/ci-kube-agents-pool-pressure"
 BUILD = "2099957253191766016"
-# What the periodic publishes, cut to the fields health.py reads.
+EARLIER = "2099957253191766015"
+# What the periodic publishes, cut to the fields health.py reads. Two of them,
+# so a test can say which build was read.
 READING = {"verdict": "OK", "window_end": "2026-09-15T20:23:27Z"}
+EARLIER_READING = {"verdict": "OK", "window_end": "2026-09-15T19:22:11Z"}
 
 
 def step_script() -> str:
@@ -39,11 +42,12 @@ def step_script() -> str:
 
 
 class PoolFetchStepTest(unittest.TestCase):
-    def run_step(self, pointer=BUILD, artifact=READING, raw=None, finished=True):
+    def run_step(self, pointer=BUILD, artifact=READING, raw=None, finished=True, builds=(EARLIER, BUILD)):
         """The step against a stub gsutil. `pointer` None means latest-build.txt
         is unreadable, `artifact` None means the copy fails, `raw` is bytes
-        copied verbatim -- what a crashed periodic leaves behind -- and
-        `finished` False is a build still running."""
+        copied verbatim -- what a crashed periodic leaves behind, `finished`
+        False is a build still running, and `builds` is what the log prefix
+        holds, which is how far back the fallback can reach."""
         box = tempfile.TemporaryDirectory()
         self.addCleanup(box.cleanup)
         tmp = pathlib.Path(box.name)
@@ -56,6 +60,11 @@ class PoolFetchStepTest(unittest.TestCase):
             payload = tmp / "payload.json"
             payload.write_text(json.dumps(artifact) if raw is None else raw)
             copy = f'cat "{payload}" > "${{@: -1}}"'
+        earlier = tmp / "earlier.json"
+        earlier.write_text(json.dumps(EARLIER_READING))
+        # `gsutil ls` on the prefix, the way the fallback reads it: the build
+        # directories plus the pointer object, which the step has to skip.
+        listing = "".join(f"{LOGS}/{b}/\\n" for b in builds)
         # Matched on the verb and the object it names, so the step asking for
         # the wrong path falls through to exit 2 rather than being answered.
         (bin_dir / "gsutil").write_text(
@@ -63,8 +72,10 @@ class PoolFetchStepTest(unittest.TestCase):
             "shift  # -q\n"
             'case "$1 $2" in\n'
             f'  "cat {LOGS}/latest-build.txt") {cat} ;;\n'
+            f'  "ls {LOGS}/") printf "{LOGS}/latest-build.txt\\n{listing}" ;;\n'
             f'  "stat {LOGS}/{BUILD}/finished.json") exit {0 if finished else 1} ;;\n'
             f'  "cp {LOGS}/{BUILD}/artifacts/pool-pressure.json") {copy} ;;\n'
+            f'  "cp {LOGS}/{EARLIER}/artifacts/pool-pressure.json") cat "{earlier}" > "${{@: -1}}" ;;\n'
             '  *) echo "unexpected gsutil call: $*" >&2; exit 2 ;;\n'
             "esac\n"
         )
@@ -89,14 +100,22 @@ class PoolFetchStepTest(unittest.TestCase):
         self.assertIsNone(self.run_step(pointer=None))
         self.assertIsNone(self.run_step(pointer=""))
 
-    def test_a_build_still_running_writes_nothing(self):
+    def test_a_build_still_running_reads_the_build_before_it(self):
         """The pointer moves at job start, so a tick landing inside the ~8
         minutes the periodic takes sees a build with no artifact yet. Reading
-        that as a stopped job is a false alert roughly once an hour."""
-        self.assertIsNone(
+        that as a stopped job is a false alert roughly once an hour, and
+        skipping the tick drops the note from health.json, the Brief and the
+        digest. The previous build's reading is an hour old at most."""
+        self.assertEqual(
+            EARLIER_READING,
             self.run_step(finished=False),
-            "a periodic still running must not read as one that stopped",
+            "a running build must fall back to the last finished one",
         )
+
+    def test_a_first_build_still_running_writes_nothing(self):
+        """Nothing to fall back to, which is the same silence as no pointer:
+        the periodic has never published."""
+        self.assertIsNone(self.run_step(finished=False, builds=(BUILD,)))
 
     def test_a_pointer_to_a_build_that_published_nothing_writes_a_reading_less_document(self):
         """The dead-man's switch. health.py reads a document with no

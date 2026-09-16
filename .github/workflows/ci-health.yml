@@ -273,9 +273,17 @@ jobs:
           [ -n "$build" ] || exit 0
           # The pointer moves at job start, so for the ~8 minutes the periodic
           # runs it names a build with no artifact. finished.json lands with
-          # the artifact: absent means "still running", and a tick that skips
-          # beats one that calls the job stopped.
-          gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json" || exit 0
+          # the artifact, so its absence means "still running" -- and the build
+          # before it holds a reading at most an hour old, well inside
+          # POOL_STALE_AFTER. Skipping instead would drop the note from
+          # health.json, the Brief and the digest for that tick.
+          if ! gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json"; then
+            # Compared as Python ints, not by sort or awk: a build id is 19
+            # digits, which a float rounds until neighbouring builds collide.
+            build=$(gsutil -q ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; prior=[i for i in ids if i < int(sys.argv[1])]; print(max(prior) if prior else "")' "$build")
+            # Nothing before it: the periodic's first build is still running.
+            [ -n "$build" ] || exit 0
+          fi
           # The periodic opens the file with a shell redirect before it runs,
           # so a crash publishes a 0-byte object that copies fine. Parsing is
           # the only check that catches it, and it costs nothing on the object
