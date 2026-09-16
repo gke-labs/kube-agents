@@ -597,16 +597,22 @@ def _upgrades_verdict(report: str) -> str:
 def test_the_shipped_list_accepts_the_reports_it_was_widened_for(report):
     """Both read the versions, state the lag and recommend the upgrade.
 
-    The old seven rejected both on wording alone. `**not** on the current
-    default` only matches after _normalize strips the emphasis, so a raw
-    substring match would fail this case and be wrong to.
+    The old seven rejected both on wording alone. Read through `parse_node` on
+    the shipped check rather than a hand-built verifier, so the phrase list
+    and the normalization it is matched under are both the production ones.
     """
     assert _upgrades_verdict(report) == "pass"
 
 
 @pytest.mark.parametrize("report", _WRONG_ANSWERS.values(), ids=_WRONG_ANSWERS.keys())
 def test_the_shipped_list_still_fails_the_maintenance_exclusion_excuse(report):
-    """The direction that matters: widening must not buy a wrong answer a pass."""
+    """Both recorded wrong answers, pinned as written.
+
+    Not the general property, which does not hold: these phrases match a
+    description of the gap, so a report that words the gap and still calls the
+    cluster current passes -- as it already does on the old seven via "behind".
+    What this pins is that no widening rescues these two.
+    """
     assert _upgrades_verdict(report) == "fail"
 
 
@@ -622,6 +628,20 @@ def test_a_phrase_that_rescues_a_wrong_answer_stays_out_of_the_list(phrase):
     assert phrase not in shipped
     for name, report in _WRONG_ANSWERS.items():
         assert verifiers._normalize(phrase) in verifiers._normalize(report), name
+
+
+def test_the_channel_absence_phrase_keeps_its_preposition():
+    """"aged out" alone sits inside "managed outage" -- the "of" is the anchor.
+
+    Same discipline the check's own comment claims for "lag" in "flag": the
+    phrase has to be unusable as a substring of ordinary prose.
+    """
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert "aged out" not in shipped
+    assert "aged out of" in shipped
+    for innocent in ("a Google-managed outage window", "damaged outside the window"):
+        assert "aged out" in verifiers._normalize(innocent)
+        assert "aged out of" not in verifiers._normalize(innocent)
 
 
 def test_forbidden_phrase_is_normalized_too():

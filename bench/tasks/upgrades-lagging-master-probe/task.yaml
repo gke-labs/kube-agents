@@ -88,17 +88,16 @@ verification_spec:
       # "folder" (see upgrade-readiness-lagging-cluster's spec history), so
       # neither bare form appears here.
       #
-      # Measured over 117 repetitions on eight pool projects (#1254): the
-      # first seven caught 87, the full list 108. Of the 30 misses, 23 were
-      # correct answers failed on wording alone, and the additions are what
-      # they said. Wording tracks the fleet -- the first seven score 6/13 on
-      # -12 and 15/15 on -23 -- so the list is broad, not tuned to one fleet.
+      # Measured over 117 repetitions on eight pool projects (#1254 is the
+      # record, not the fix): the first seven caught 87, all fifteen 108, and
+      # all 21 rescues are correct answers that failed on wording alone.
       #
-      # Every addition carries the negative verdict, so it can only match an
-      # answer saying the cluster is NOT on the default. That keeps the two
-      # recorded wrong answers failing, which read the versions right and
-      # called the cluster current anyway. "channel default" and bare "older
-      # than" score higher but rescue those two, so both stay out.
+      # These match a DESCRIPTION of the gap, not the verdict, so a report
+      # that words the gap and still calls the cluster current passes. Not
+      # new -- "behind" does it too -- and narrowing costs 15 of the 21
+      # rescues without closing it. The composed verdict is the judge's.
+      # "channel default" and bare "older than" stay out: they match the two
+      # recorded wrong answers as written.
       any_of_phrases: [
           "behind",
           "lagging",
@@ -108,9 +107,10 @@ verification_spec:
           "one minor",
           "newer version",
           # The lag as absence from the channel's list, for fleets whose
-          # planted version has aged out of REGULAR entirely.
+          # planted version has aged out of REGULAR entirely. The "of" is
+          # load-bearing: bare "aged out" sits inside "managed outage".
           "no longer offered",
-          "aged out",
+          "aged out of",
           "not a valid version",
           # The lag as the question negated, and the largest miss: "not on the
           # current default" carries nine of the 21 rescues.

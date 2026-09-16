@@ -87,9 +87,11 @@ verification_spec:
     check:
       type: report_contains
       # The finding, not a version number: the planted versions move with the
-      # channel. The same any_of spellings as upgrades-lagging-master-probe,
-      # chosen against substring collisions ("lag" in "flag", "older" in
-      # "folder"), plus the status word the skill's table prints.
+      # channel. These were upgrades-lagging-master-probe's spellings until
+      # that case was widened to fifteen on its measured record (#1254); this
+      # case has no record of its own yet, so it keeps the seven. Chosen
+      # against substring collisions ("lag" in "flag", "older" in "folder"),
+      # plus the status word the skill's table prints.
       any_of_phrases:
         [
           "behind",
