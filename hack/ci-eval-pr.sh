@@ -42,28 +42,38 @@ readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
-# A push that changes only inert files re-runs this whole job and aborts the
+# A push that changes nothing the eval measures re-runs this whole job and
+# aborts the
 # run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
 # skip_if_only_changed filter cannot help: it sees the PR's whole diff against
 # the base, not the delta since the last green build. This step applies the
 # same kind of path predicate to the DELTAS instead: find this PR's newest
 # green build in the job history on GCS, recover that build's head and base
-# SHAs, and if everything that changed since -- on the PR side AND on main's
-# side -- matches the inert list, reuse the green verdict and exit 0 before
-# any cluster work.
+# SHAs, and if nothing that changed since -- on the PR side AND on main's
+# side -- is a path the eval measures, reuse the green verdict and exit 0
+# before any cluster work.
 #
-# FAIL-CLOSED THROUGHOUT: every doubt -- no history, unreadable GCS, an
-# unparsable record, a commit the checkout does not have, any file escaping
-# the inert list -- is one log line and a full run. The first run on a PR has
+# FAIL-CLOSED ON THE EVIDENCE: every doubt about the green being reused --
+# no history, unreadable GCS, an unparsable record, a commit the checkout
+# does not have -- is one log line and a full run. The first run on a PR has
 # no green history, so it is always a full run. EVAL_SKIP_REVALIDATION=1 is
 # the escape hatch: it forces a full run for debugging a suspect reuse.
 #
+# The PREDICATE is not fail-closed in the same sense, and the difference
+# matters: a path nobody has classified does not match the allowlist, so it
+# permits the skip rather than forcing the run. That is the cost of stating
+# what matters instead of what is safe, and what pays for it is
+# tests/test_eval_runtime_paths.py, which reds when a Dockerfile COPY, a new
+# top-level entry, or a new scripts/ entry on the eval path is missing from
+# the list.
+#
 # One asymmetry is deliberate: the NEWEST GREEN wins, so a newer red full run
-# at inert distance from an older green is overridden on the next inert
-# trigger. That is the same judgement a passing /retest would render -- an
-# inert delta cannot feed the eval, so the red was flake or infrastructure by
-# construction -- but it does mean reproducing such a red needs either a
-# non-inert push or EVAL_SKIP_REVALIDATION=1 in the job env.
+# an unmeasured distance from an older green is overridden on the next
+# unmeasured trigger. That is the same judgement a passing /retest would
+# render -- a delta the eval does not measure cannot feed it, so the red was
+# flake or infrastructure by construction -- but it does mean reproducing
+# such a red needs either a measured push or EVAL_SKIP_REVALIDATION=1 in the
+# job env.
 #
 # What it saves, honestly: the Boskos lease, ci-deploy.sh and ci-teardown.sh
 # run BEFORE and AFTER this script in the Prow job wrapper, so a revalidated
@@ -75,7 +85,7 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # Trust surface. For the SELF case, subsumption: a pull request that wants
 # its own context green can already edit this script to `exit 0` -- its own
 # code IS the job -- and a PR that edits the revalidation logic touches
-# hack/, which is not inert, so its own run goes full. That argument does
+# hack/, which the eval measures, so its own run goes full. That argument does
 # NOT cover the CROSS-PR case: the job history under gs://kube-agents-prow
 # is written by pod utilities that may share the test container's identity,
 # so a hostile PR's run could conceivably plant a fabricated "green" record
@@ -95,16 +105,29 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # tolerates that shape -- aborted runs produce taskless builds today -- and
 # keys nothing on this job exiting through its normal tail.
 
-# The inert-path predicate. This list may be STRICTER than the Prow yaml's
-# skip_if_only_changed (prow/prowjobs/gke-labs/kube-agents/
-# kube-agents-presubmits.yaml in GoogleCloudPlatform/oss-test-infra), and it
-# deliberately lives here rather than being fetched from there: the worst
-# case of the two diverging is an unnecessary full run, never a wrongly
-# skipped one. Keep it root-anchored -- `docs-evil.go` must not match the
-# docs/ branch, `bench/OWNERS` must not match the OWNERS one, and a .md file
-# below the root (agents/**/*.md is prompt content shipped in the image)
-# must still run the eval.
-readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
+# What the eval measures: the prompts and plugin specs (agents/,
+# agentplugins/), the image and what goes into it (deploy/, k8s-operator/ and
+# a2a/ for the binaries COPYed in, tags.env, .dockerignore, .gcloudignore),
+# the deployed config (charts/, images.json, install.defaults.env), the
+# harness that grades (bench/), the driver (hack/), and the scripts/ entries
+# those drivers reach. A delta touching none of them cannot change what the
+# agent does, how it is deployed, or how it is graded, so the green still
+# holds.
+#
+# Inverted from the inert-path denylist it replaces, which had to be widened
+# by hand per harmless directory and so never grew past docs/, .github/,
+# examples/ and root markdown. The cost of stating what matters instead is
+# that this fails OPEN: a path nobody added permits the skip.
+# tests/test_eval_runtime_paths.py pays for that, deriving from the
+# Dockerfiles and the drivers what belongs here and redding when it is missing.
+#
+# That also makes this LOOSER than Prow's skip_if_only_changed
+# (kube-agents-presubmits.yaml in GoogleCloudPlatform/oss-test-infra), by
+# design: that filter decides whether to START the job from the whole diff,
+# this decides whether the matrix has anything new to measure since the last
+# green, so a terraform/ or tests/ delta starts the job and then revalidates.
+# Keep it root-anchored -- agents-notes.md is not agents/.
+readonly REVALIDATION_RUNTIME_PATHS='^(agents/|agentplugins/|deploy/|k8s-operator/|a2a/|charts/|bench/|hack/|(images\.json|tags\.env|install\.defaults\.env|\.dockerignore|\.gcloudignore)$|scripts/(release|eval_dashboard|installer)/|scripts/eval_rosters\.py$)'
 # Where the job history lives and how a human opens a build from the log.
 readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
 readonly REVALIDATION_JOB_NAME="pull-kube-agents-smoke-test"
@@ -128,7 +151,7 @@ _revalidation_print_delta() { # <label> <range> <files-or-empty>
   if [ -n "${3}" ]; then
     printf '%s\n' "${3}" | sed 's/^/    /'
   else
-    echo "    (empty -- identical trees, trivially inert)"
+    echo "    (empty -- identical trees, nothing to measure)"
   fi
 }
 
@@ -275,10 +298,10 @@ sys.exit(1)
   done
 
   # --no-renames is load-bearing: with rename detection (git's default) a
-  # `git mv hack/tool.sh docs/tool.md` lists ONLY the inert destination, and
-  # the deletion of the non-inert source becomes invisible to the predicate.
-  # Disabling it makes every rename a delete + add, so the non-inert side
-  # always surfaces.
+  # `git mv hack/tool.sh docs/tool.md` lists ONLY the unmeasured destination,
+  # and the deletion of the measured source becomes invisible to the
+  # predicate. Disabling it makes every rename a delete + add, so the measured
+  # side always surfaces.
   local head_delta base_delta
   if ! head_delta="$(git -C "${repo_dir}" diff --no-renames --name-only "${prev_head}" "${PULL_PULL_SHA}" 2>/dev/null)"; then
     echo "Step 0: full run: git diff ${prev_head}..${PULL_PULL_SHA} failed"
@@ -289,22 +312,22 @@ sys.exit(1)
     return 1
   fi
 
-  # The predicate: EVERY file in BOTH deltas matches the inert list. An empty
-  # delta (identical SHAs) is trivially inert -- nothing changed on that side.
+  # The predicate: NO file in EITHER delta is one the eval measures. An empty
+  # delta (identical SHAs) satisfies it trivially -- nothing changed there.
   local survivors
-  survivors="$(printf '%s\n%s\n' "${head_delta}" "${base_delta}" | grep -v '^$' | grep -Ev "${REVALIDATION_INERT_PATHS}" || true)"
+  survivors="$(printf '%s\n%s\n' "${head_delta}" "${base_delta}" | grep -v '^$' | grep -E "${REVALIDATION_RUNTIME_PATHS}" || true)"
   if [ -n "${survivors}" ]; then
-    echo "Step 0: full run: files outside REVALIDATION_INERT_PATHS changed since green build ${prev_green}:"
+    echo "Step 0: full run: files the eval measures changed since green build ${prev_green}:"
     printf '%s\n' "${survivors}" | sed 's/^/    /'
     return 1
   fi
 
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${prev_green} -- every change since is inert, skipping the eval matrix ==="
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${prev_green} -- nothing the eval measures changed, skipping the eval matrix ==="
   echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${PULL_NUMBER}/${REVALIDATION_JOB_NAME}/${prev_green}"
   echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
   _revalidation_print_delta "head delta" "${prev_head}..${PULL_PULL_SHA}" "${head_delta}"
   _revalidation_print_delta "base delta" "${prev_base}..${PULL_BASE_SHA}" "${base_delta}"
-  echo "Predicate: every file above matches REVALIDATION_INERT_PATHS ${REVALIDATION_INERT_PATHS}"
+  echo "Predicate: no file above matches REVALIDATION_RUNTIME_PATHS ${REVALIDATION_RUNTIME_PATHS}"
   return 0
 }
 

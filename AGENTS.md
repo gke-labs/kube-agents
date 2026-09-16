@@ -353,7 +353,7 @@ Agents with a user in the loop follow this file.
 
 `pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` — every active case,
 three repetitions each — and has blocked merges since 2026-09-02 (oss-test-infra#2677). It takes
-1.5 to 3.5 hours against a 360-minute ceiling, and a push restarts it unless only inert paths
+1.5 to 3.5 hours against a 360-minute ceiling, and a push restarts it unless nothing the eval measures
 changed (step 0), so open the pull request early and batch changes. Another pull request merging
 usually does not — the green status is re-pinned to `main`'s new head.
 
