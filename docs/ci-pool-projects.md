@@ -370,9 +370,12 @@ Onboard when the rolling p50 wait goes over 15 minutes or the rolling p95 over 4
 python3 scripts/pool_pressure.py                 # the last seven days
 python3 scripts/pool_pressure.py --json          # the same run as data
 python3 scripts/pool_pressure.py --as-of 2026-08-27 --window-days 1   # replay a past day
+python3 scripts/pool_pressure.py --junit "${ARTIFACTS}/junit_pool_pressure.xml"   # the same run, as a TestGrid row per number
 ```
 
 It exits 0 within threshold, 1 on a breach, and 2 when it could not measure — which is not a green run. Nothing it does provisions anything; `hack/pool_pressure_cron.sh` runs it on a schedule and hands a breach to a notifier, and it too only reports.
+
+`--junit <path>` writes the same findings as a JUnit file, one `<testcase>` per row, for the `ci-kube-agents-pool-pressure` periodic's TestGrid tab. The tab's `testgrid-in-cell-metric: value` annotation names a JUnit property, and where a row carries one TestGrid prints the number in the cell and graphs it over time, so the tab answers "is the queue getting worse" without opening a build log. The five rows are `pool pressure within threshold`, `setup p50 minutes`, `setup p95 minutes`, `longest live queue minutes` and `free pool projects`. Only the first can fail, and it fails exactly when the exit code is non-zero, with the verdict and cause in the failure message; TestGrid counts consecutive failures per row, so a metric row that could also fail would alert about a breach the verdict row is already alerting about. A number the run could not measure is a skipped row carrying the source's error, never a zero. The row names are a published interface — TestGrid keys a row's history on its name — and `scripts/test_pool_pressure.py` pins all five as literals. The exit code is unchanged, and a file that cannot be written is reported on stderr without changing it.
 
 ### What "wait" means here
 

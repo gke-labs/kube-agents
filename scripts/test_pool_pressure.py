@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -811,6 +812,174 @@ class JsonOutput(unittest.TestCase):
         self.assertEqual([], payload["cause_text"])
 
 
+class JunitOutput(unittest.TestCase):
+    """The --junit file is what the TestGrid tab reads, so it is an interface.
+
+    Its `testgrid-in-cell-metric: value` annotation prints and graphs the
+    `value` property per row. Two shapes are pinned here because each would
+    mislead quietly: a metric row that can fail double-alerts beside the
+    verdict row, and a zero written for a number that was not measured graphs
+    as a healthy reading.
+    """
+
+    def _junit(self, **kwargs):
+        """measure() with --junit, returning (exit_code, parsed <testsuite>)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "junit_pool_pressure.xml")
+            code, _ = run(junit_path=path, **kwargs)
+            root = ET.parse(path).getroot()
+        return code, root
+
+    @staticmethod
+    def _rows(root):
+        return {case.get("name"): case for case in root.findall("testcase")}
+
+    @staticmethod
+    def _value(case):
+        prop = case.find(f"properties/property[@name='{pp.JUNIT_METRIC_PROPERTY}']")
+        return None if prop is None else prop.get("value")
+
+    def test_the_file_is_a_testsuite_of_the_five_rows_in_order(self):
+        _, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        self.assertEqual("testsuite", root.tag)
+        self.assertEqual(pp.JUNIT_SUITE_NAME, root.get("name"))
+        self.assertEqual(list(pp.JUNIT_ROW_NAMES),
+                         [case.get("name") for case in root.findall("testcase")])
+        self.assertEqual("5", root.get("tests"))
+
+    def test_a_breach_fails_the_verdict_row_and_carries_the_numbers(self):
+        code, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        failure = rows[pp.JUNIT_ROW_VERDICT].find("failure")
+        self.assertIsNotNone(failure)
+        self.assertEqual("BREACH (CAPACITY)", failure.get("message"))
+        self.assertIn("Every project was leased", failure.text)
+        self.assertEqual("9.9", self._value(rows[pp.JUNIT_ROW_P50]))
+        self.assertEqual("168.7", self._value(rows[pp.JUNIT_ROW_P95]))
+        self.assertEqual("150.0", self._value(rows[pp.JUNIT_ROW_QUEUE]))
+        self.assertEqual("0", self._value(rows[pp.JUNIT_ROW_FREE]))
+        self.assertEqual("1", root.get("failures"))
+
+    def test_the_numbers_are_the_json_payloads(self):
+        """One run, two renderings. The tab and the alert must not disagree."""
+        _, out = run(as_json=True, from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        payload = json.loads(out)
+        _, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(str(payload["trend"]["p50_minutes"]), self._value(rows[pp.JUNIT_ROW_P50]))
+        self.assertEqual(str(payload["trend"]["p95_minutes"]), self._value(rows[pp.JUNIT_ROW_P95]))
+        self.assertEqual(str(max(r["minutes"] for r in payload["queue"]["waiting_runs"])),
+                         self._value(rows[pp.JUNIT_ROW_QUEUE]))
+        self.assertEqual(str(payload["pool"]["free"]), self._value(rows[pp.JUNIT_ROW_FREE]))
+
+    def test_only_the_verdict_row_can_fail(self):
+        """TestGrid counts consecutive failures per row. A metric row that
+        failed too would alert about the breach the verdict row already is."""
+        _, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        for name, case in self._rows(root).items():
+            if name != pp.JUNIT_ROW_VERDICT:
+                self.assertIsNone(case.find("failure"), name)
+                self.assertIsNone(case.find("error"), name)
+
+    def test_a_quiet_day_passes_with_an_empty_queue_as_a_measured_zero(self):
+        code, root = self._junit(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_OK, code)
+        self.assertIsNone(rows[pp.JUNIT_ROW_VERDICT].find("failure"))
+        self.assertEqual("0", root.get("failures"))
+        self.assertEqual("5", self._value(rows[pp.JUNIT_ROW_FREE]))
+        # Deck was read and nothing was waiting: a number, not a skip.
+        self.assertIsNone(rows[pp.JUNIT_ROW_QUEUE].find("skipped"))
+        self.assertEqual(0.0, float(self._value(rows[pp.JUNIT_ROW_QUEUE])))
+
+    def test_an_unmeasurable_run_fails_the_verdict_and_skips_the_setup_rows(self):
+        """Exit 2 is red on the tab too, and the percentiles of a sweep that
+        could not read are skipped rather than graphed as zero."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code, root = self._junit(from_dir=tmp, as_of=QUIET_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_UNMEASURED, code)
+        failure = rows[pp.JUNIT_ROW_VERDICT].find("failure")
+        self.assertIsNotNone(failure)
+        self.assertEqual(pp.VERDICT_UNMEASURED, failure.get("message"))
+        self.assertTrue(failure.text)
+        for name in (pp.JUNIT_ROW_P50, pp.JUNIT_ROW_P95):
+            self.assertIsNotNone(rows[name].find("skipped"), name)
+            self.assertIsNone(self._value(rows[name]), name)
+
+    def test_an_unread_source_skips_its_rows_with_the_reason(self):
+        """`prowjobs/` alone: the trend reads, Deck and Boskos do not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink(os.path.join(BREACH_DIR, "prowjobs"), os.path.join(tmp, "prowjobs"))
+            code, root = self._junit(from_dir=tmp, as_of=BREACH_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIsNone(rows[pp.JUNIT_ROW_P50].find("skipped"))
+        self.assertIsNotNone(self._value(rows[pp.JUNIT_ROW_P50]))
+        queue_skip = rows[pp.JUNIT_ROW_QUEUE].find("skipped")
+        pool_skip = rows[pp.JUNIT_ROW_FREE].find("skipped")
+        self.assertIsNotNone(queue_skip)
+        self.assertIsNotNone(pool_skip)
+        self.assertIn("deck.json", queue_skip.get("message"))
+        self.assertIn("boskos.json", pool_skip.get("message"))
+        self.assertIsNone(self._value(rows[pp.JUNIT_ROW_QUEUE]))
+        self.assertIsNone(self._value(rows[pp.JUNIT_ROW_FREE]))
+        self.assertEqual("2", root.get("skipped"))
+        self.assertEqual("BREACH (UNKNOWN)",
+                         rows[pp.JUNIT_ROW_VERDICT].find("failure").get("message"))
+
+    def test_a_window_with_no_runs_skips_the_setup_rows_rather_than_writing_zero(self):
+        """The sweep read GCS and found nothing. Its percentiles are 0.0, which
+        would graph as an instant queue on a day nothing ran."""
+        code, root = self._junit(from_dir=QUIET_DIR,
+                                 as_of=datetime(2020, 1, 1, tzinfo=timezone.utc),
+                                 window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_OK, code)
+        self.assertIsNone(rows[pp.JUNIT_ROW_VERDICT].find("failure"))
+        for name in (pp.JUNIT_ROW_P50, pp.JUNIT_ROW_P95):
+            skipped = rows[name].find("skipped")
+            self.assertIsNotNone(skipped, name)
+            self.assertEqual(pp.JUNIT_NO_RUNS_MESSAGE, skipped.get("message"))
+            self.assertIsNone(self._value(rows[name]), name)
+
+    def test_the_verdict_row_names_the_cause_when_a_breach_has_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs", "deck.json"):
+                os.symlink(os.path.join(BREACH_DIR, name), os.path.join(tmp, name))
+            _, root = self._junit(from_dir=tmp, as_of=BREACH_AS_OF, window_days=1)
+        failure = self._rows(root)[pp.JUNIT_ROW_VERDICT].find("failure")
+        self.assertEqual(f"{pp.VERDICT_BREACH} ({pp.CAUSE_UNKNOWN})", failure.get("message"))
+        self.assertIn("Cause unknown", failure.text)
+
+    def test_without_the_flag_no_file_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
+            self.assertEqual([], os.listdir(tmp))
+
+    def test_a_write_that_fails_is_reported_and_leaves_the_exit_code_alone(self):
+        """The exit code is the verdict, and the tab still shows pass/fail
+        from the job status when the file is missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "not-a-directory")
+            with open(blocker, "w") as fh:
+                fh.write("")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code, out = run(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1,
+                                junit_path=os.path.join(blocker, "junit.xml"))
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("THRESHOLD BREACHED", out)
+        self.assertIn("could not write --junit file", err.getvalue())
+
+    def test_the_parent_directory_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "artifacts", "junit_pool_pressure.xml")
+            run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1, junit_path=path)
+            self.assertEqual("testsuite", ET.parse(path).getroot().tag)
+
+
 class CommandLine(unittest.TestCase):
     def _main(self, argv):
         """main() with argv patched, returning (exit_code, stdout, stderr)."""
@@ -868,6 +1037,20 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(pp.EXIT_OK, code)
         self.assertIn("p95 > 600.0", out)
 
+    def test_junit_is_reachable_from_the_command_line(self):
+        """The periodic's job line passes it, and the exit code it reads is
+        the same with the flag as without."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "junit_pool_pressure.xml")
+            argv = ["--from-dir", BREACH_DIR, "--as-of", "2026-08-27", "--window-days", "1"]
+            without, _, _ = self._main(argv)
+            code, out, _ = self._main(argv + ["--junit", path, "--json"])
+            root = ET.parse(path).getroot()
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertEqual(without, code)
+        self.assertEqual("BREACH", json.loads(out)["verdict"])
+        self.assertEqual(pp.JUNIT_SUITE_NAME, root.get("name"))
+
 
 class PublishedInterface(unittest.TestCase):
     """The values other things hardcode.
@@ -900,6 +1083,23 @@ class PublishedInterface(unittest.TestCase):
         onboards the next project. Changing either is a policy change."""
         self.assertEqual(15, pp.DEFAULT_P50_THRESHOLD_MINUTES)
         self.assertEqual(45, pp.DEFAULT_P95_THRESHOLD_MINUTES)
+
+    def test_the_junit_row_names(self):
+        """TestGrid keys a row's history on its name, so renaming one starts a
+        new row and abandons the old one's. The property name is the periodic's
+        `testgrid-in-cell-metric` annotation, set in oss-test-infra."""
+        self.assertEqual("pool-pressure", pp.JUNIT_SUITE_NAME)
+        self.assertEqual("value", pp.JUNIT_METRIC_PROPERTY)
+        self.assertEqual("pool pressure within threshold", pp.JUNIT_ROW_VERDICT)
+        self.assertEqual("setup p50 minutes", pp.JUNIT_ROW_P50)
+        self.assertEqual("setup p95 minutes", pp.JUNIT_ROW_P95)
+        self.assertEqual("longest live queue minutes", pp.JUNIT_ROW_QUEUE)
+        self.assertEqual("free pool projects", pp.JUNIT_ROW_FREE)
+        self.assertEqual(
+            ("pool pressure within threshold", "setup p50 minutes", "setup p95 minutes",
+             "longest live queue minutes", "free pool projects"),
+            pp.JUNIT_ROW_NAMES,
+        )
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -284,6 +285,35 @@ EXIT_UNMEASURED = 2
 # argparse exits 2 on a bad command line, which would be indistinguishable from
 # a run that could not measure. 64 is EX_USAGE from sysexits.h.
 EXIT_USAGE = 64
+
+# The --junit file, one <testcase> per row, is what the TestGrid tab reads: its
+# `testgrid-in-cell-metric: value` annotation names a JUnit property, and where
+# a case carries one TestGrid prints the number in the cell and graphs it over
+# time. Row names are a published interface -- TestGrid keys a row's history on
+# the name, so renaming one starts a new row and abandons the old one's history.
+# Only the verdict row can fail: TestGrid counts consecutive failures per row,
+# so a metric row that could also fail would alert about the breach the verdict
+# row is already alerting about. A number the run could not measure is a
+# skipped row, never a zero, because a zero graphs as a healthy reading.
+JUNIT_SUITE_NAME = "pool-pressure"
+JUNIT_METRIC_PROPERTY = "value"
+JUNIT_ROW_VERDICT = "pool pressure within threshold"
+JUNIT_ROW_P50 = "setup p50 minutes"
+JUNIT_ROW_P95 = "setup p95 minutes"
+JUNIT_ROW_QUEUE = "longest live queue minutes"
+JUNIT_ROW_FREE = "free pool projects"
+JUNIT_ROW_NAMES = (
+    JUNIT_ROW_VERDICT,
+    JUNIT_ROW_P50,
+    JUNIT_ROW_P95,
+    JUNIT_ROW_QUEUE,
+    JUNIT_ROW_FREE,
+)
+# The setup rows' skip message when the sweep read GCS and found no runs; the
+# trend source carries no error string in that case.
+JUNIT_NO_RUNS_MESSAGE = "no runs were created in the window"
+JUNIT_ENCODING = "utf-8"
+JUNIT_INDENT = "  "
 
 
 def _gap(start: Optional[datetime], end: Optional[datetime]) -> Optional[float]:
@@ -1556,6 +1586,84 @@ def cause(
     ] + _cap_at_pool_caveat(pool_state, concurrency)
 
 
+def _junit_case(suite: ET.Element, name: str) -> ET.Element:
+    return ET.SubElement(suite, "testcase", name=name, classname=JUNIT_SUITE_NAME)
+
+
+def _junit_value(case: ET.Element, value) -> None:
+    properties = ET.SubElement(case, "properties")
+    ET.SubElement(
+        properties, "property", name=JUNIT_METRIC_PROPERTY, value=str(value)
+    )
+
+
+def _junit_skip(case: ET.Element, message: Optional[str]) -> None:
+    ET.SubElement(case, "skipped", message=message or SEGMENT_UNMEASURED)
+
+
+def junit_report(summary: dict) -> str:
+    """The run as JUnit, one <testcase> per row, from the same data --json emits.
+
+    Five rows in a fixed order. The verdict row fails exactly when the run exits
+    non-zero -- a breach and an unmeasured run both -- with the cause in the
+    message so a red cell reads without opening the build log. The four metric
+    rows never fail; each carries its number as the property TestGrid graphs, or
+    is skipped with the source's error when the number was not measured.
+    """
+    trend = summary["trend"]
+    queue = summary["queue"]
+    pool = summary["pool"]
+
+    suite = ET.Element("testsuite", name=JUNIT_SUITE_NAME)
+
+    verdict = _junit_case(suite, JUNIT_ROW_VERDICT)
+    if summary["exit_code"] != EXIT_OK:
+        message = summary["verdict"]
+        if summary["cause"]:
+            message += f" ({summary['cause']})"
+        failure = ET.SubElement(verdict, "failure", message=message)
+        failure.text = "\n".join(summary["cause_text"]) or (trend["error"] or "")
+
+    # A window the sweep read and found empty has percentiles of zero, which
+    # would graph as an instant queue on a day nothing ran.
+    setup_measured = trend["read"] and trend["runs"] > 0
+    setup_skip = trend["error"] if not trend["read"] else JUNIT_NO_RUNS_MESSAGE
+    for name, key in ((JUNIT_ROW_P50, "p50_minutes"), (JUNIT_ROW_P95, "p95_minutes")):
+        case = _junit_case(suite, name)
+        if setup_measured:
+            _junit_value(case, trend[key])
+        else:
+            _junit_skip(case, setup_skip)
+
+    # An empty queue is a measured zero: Deck was read and nothing was waiting.
+    live = _junit_case(suite, JUNIT_ROW_QUEUE)
+    if queue["read"]:
+        _junit_value(
+            live, max((run["minutes"] for run in queue["waiting_runs"]), default=0.0)
+        )
+    else:
+        _junit_skip(live, queue["error"])
+
+    free = _junit_case(suite, JUNIT_ROW_FREE)
+    if pool["read"]:
+        _junit_value(free, pool["free"])
+    else:
+        _junit_skip(free, pool["error"])
+
+    suite.set("tests", str(len(suite)))
+    suite.set("failures", str(len(suite.findall("testcase/failure"))))
+    suite.set("skipped", str(len(suite.findall("testcase/skipped"))))
+    ET.indent(suite, space=JUNIT_INDENT)
+    return ET.tostring(suite, encoding="unicode", xml_declaration=True) + "\n"
+
+
+def write_junit(path: str, summary: dict) -> None:
+    """Write junit_report() to `path`, creating the directory above it."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(junit_report(summary), encoding=JUNIT_ENCODING)
+
+
 class _Parser(argparse.ArgumentParser):
     """An ArgumentParser that exits EXIT_USAGE rather than argparse's own 2."""
 
@@ -1576,6 +1684,7 @@ def measure(
     from_dir: Optional[str] = None,
     as_json: bool = False,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+    junit_path: Optional[str] = None,
 ) -> int:
     window_end = as_of or datetime.now(timezone.utc)
     window_start = window_end - timedelta(days=window_days)
@@ -1602,6 +1711,15 @@ def measure(
         live,
         pool,
     )
+
+    # Written before the report is printed, and a write that fails is reported
+    # rather than raised: the exit code is the verdict, and the tab still shows
+    # pass/fail from the job status when the file is missing.
+    if junit_path is not None:
+        try:
+            write_junit(junit_path, summary)
+        except OSError as exc:
+            print(f"could not write --junit file {junit_path}: {exc}", file=sys.stderr)
 
     if as_json:
         # The rendered report travels inside the payload rather than beside it.
@@ -1711,6 +1829,18 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--junit",
+        default=None,
+        metavar="PATH",
+        help=(
+            "also write the findings as a JUnit file at this path, one test case "
+            "per row, for TestGrid's in-cell metric. Only the verdict row can "
+            "fail, and it fails exactly when the exit code is non-zero; a number "
+            "the run could not measure is a skipped row rather than a zero. The "
+            "exit code is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--from-dir",
         default=None,
         help=(
@@ -1752,6 +1882,7 @@ def main() -> int:
         from_dir=args.from_dir,
         as_json=args.json,
         deadline_seconds=args.deadline_seconds,
+        junit_path=args.junit,
     )
 
 
