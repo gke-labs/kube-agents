@@ -27,7 +27,7 @@ Create the repo under an organization, or transfer an existing one into it. A fr
 
 ## Single-organization scoping boundary
 
-Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered in the `gitops-state` ConfigMap must belong to this primary organization.
+Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization. The ConfigMap's `context_repos` key is not minted for: the policy is synced from `managed_repos` only, so a context repository is readable only if it needs no token.
 
 ## Setup checklist
 
@@ -50,9 +50,7 @@ The installer (`install.sh`) collects these in its GitOps interview and saves th
 - `GITOPS_REPO` — repo name.
 
   These were `GITHUB_ORG` / `GITHUB_REPO`, which still work for one release with a
-  deprecation warning. They were renamed because `GH_ORG` / `GH_REPO` name the _release_
-  repository on the rc and nightly environments, and `tests/e2e/.env` uses `GITHUB_ORG` /
-  `GITHUB_REPO` for the repository a test acts on — three repositories sharing two names.
+  deprecation warning.
 
 - `GITHUB_PEM_PATH` — absolute path to the `.pem` file. If provided, the installer auto-imports it to KMS via the Minty CLI. If omitted, deployment proceeds but Minty fails readiness until the key is imported manually.
 

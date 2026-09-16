@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -130,6 +131,9 @@ const (
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
 	gitopsStateConfigMapSuffix         = "-gitops-state"
 	managedReposConfigMapKey           = "managed_repos"
+
+	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
+	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
 )
 
 var missingShellMessageMarkers = []string{
@@ -232,6 +236,18 @@ type PlatformAgentReconciler struct {
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+//
+// The A2A auth callout also verifies callers with a TokenReview, and under mode next the
+// operator binds it to the built-in system:auth-delegator ClusterRole. RBAC escalation
+// prevention refuses that binding unless the operator either holds every permission in the
+// role it is granting or holds `bind` on that role by name. It holds tokenreviews/create
+// above but not subjectaccessreviews/create, which system:auth-delegator also carries — so
+// without this line the binding is refused at runtime and the callout never gets TokenReview,
+// on every install that turns next on. Measured against a real API server, not inferred:
+// without it, "attempting to grant RBAC permissions not currently held"; with it, allowed.
+// `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
+// confers none of its permissions on the operator itself.
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
 // `get` and nothing else on secrets, and checkShellSandboxKeys is the only caller. It asks
 // whether the sandbox's authorized-keys Secret exists so the status can say so; it never reads
 // a value out of one, and the operator creates that Secret nowhere. The read goes through
@@ -242,7 +258,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
-func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
 
 	instance := &agentv1alpha1.PlatformAgent{}
@@ -323,6 +339,45 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.Info("Unrecognized spec.mode; rendering today's stack and reporting Degraded", "error", modeErr.Error())
 	}
 
+	// 2d. BusCredentialsReady, written on the way out rather than at a point in
+	// the sequence below.
+	//
+	// It was at the bottom, under everything, which meant a reconcile that
+	// parked Degraded above it neither wrote it nor cleared it. Moving it up to
+	// just after the bus step fixed two of those parks and left four: the
+	// refusals of today's stack at 9b, 9c, 10 and 11e all return above the bus
+	// step, and the bus step cannot move above them because it renders on top
+	// of what they withhold. There is no position in the sequence that works,
+	// so this is not a position in the sequence.
+	//
+	// Skipping the write is worse than it sounds, and the reason is
+	// updateStatusDegraded: it writes Ready alone and preserves every other
+	// condition, so the last BusCredentialsReady stands unchallenged for as
+	// long as the refusal does. The CR reports a callout serving a named map
+	// version through a Deployment that may since have lost every replica.
+	//
+	// Version skew is the one case with nothing to say. renderMode fails closed
+	// to today while cleanupA2A is deliberately not run (see the mode gate
+	// below), so the bus a newer CRD rendered is still standing; clearing the
+	// condition would report it gone, and rewriting it would claim this binary
+	// knows what it describes. Both are worse than leaving it.
+	busCredsMapVersion := ""
+	if modeErr == nil {
+		wantNext := renderMode(instance, "nats") == ModeNext
+		defer func() {
+			if err := r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion); err != nil {
+				if retErr == nil {
+					retErr = err
+					return
+				}
+				// The reconcile is already failing and will requeue. Losing
+				// this write is not what to report about that pass, but it is
+				// not nothing either: the condition is a pass behind.
+				log.Error(err, "could not write BusCredentialsReady")
+			}
+		}()
+	}
+
 	// 3. Reconcile Service Account (with Workload Identity annotation)
 	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
 		return ctrl.Result{}, err
@@ -382,11 +437,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// the same hazard and take the same rescue.
 	if msg := validateExtraVolumeMounts(instance); msg != "" {
 		log.Info(msg)
-		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
-		if statusErr := r.updateStatusDegraded(ctx, instance, "ForbiddenVolumeMount", msg); statusErr != nil {
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
 		}
 		return ctrl.Result{}, nil
 	}
@@ -400,11 +456,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// whatever it is already running rather than being half-reconfigured.
 	if reason, msg := validateShellSandbox(instance); reason != "" {
 		log.Info(msg)
-		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
 		}
 		return ctrl.Result{}, nil
 	}
@@ -418,11 +475,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// only the sandbox one.
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
-			if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
-				return ctrl.Result{}, err
-			}
+			guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
 			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
 				return ctrl.Result{}, statusErr
+			}
+			if guardrailErr != nil {
+				return ctrl.Result{}, guardrailErr
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
@@ -473,15 +531,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// behind a Degraded status that names only the allowlist. The gateway
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
-		//
-		// Steps 9b, 9c, and 10 take the same rescue for the same reason: all
-		// refusal paths maintain the agent Pod's network guardrails before
-		// returning.
-		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
+		// Steps 9b, 9c, 10, and this one take the same rescue: reconcile network
+		// guardrails via reconcileAgentNetworkGuardrails, recording Degraded status
+		// before returning any guardrail error so neither the agent gateway policy
+		// nor the litellm policy is stranded when reconciliation pauses at Degraded.
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -511,12 +570,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, instance, netpolProf); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// The mode gate: `next` additionally renders the NATS component and the
-	// A2A gateway; `today` keeps the dark stack dark — including tearing it
+	// The mode gate: `next` additionally renders the A2A stack -- NATS, the
+	// auth callout, the gateway, the provisioning Job; `today` keeps the
+	// dark stack dark — including tearing it
 	// back down after a flip, so `mode` absent renders exactly today's stack
 	// rather than today's stack plus leftovers. Version skew touches NEITHER
 	// branch: renderMode fails closed to today, and letting that reach
@@ -524,7 +587,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// bus that a newer CRD's mode legitimately rendered. Skew is a status
 	// problem (below), not a rendering instruction.
 	var a2aState a2aProvisionState
-	a2aNext := modeErr == nil && renderMode(instance, "nats") == ModeNext
+	a2aNext := a2aStackRendering(instance)
 	if a2aNext {
 		if a2aState, err = r.reconcileA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
@@ -533,6 +596,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.cleanupA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// The version this pass rendered, for the deferred write at 2d. Empty on
+	// every path that did not get here, where the write reads it back off the
+	// ConfigMap the callout watches instead.
+	if a2aNext {
+		busCredsMapVersion = a2aState.AuthMapVersion
 	}
 
 	// 9. Update status phase. While the mode is unrecognized the phase is
@@ -653,6 +723,41 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		}
 		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
 			return ctrl.Result{}, err
+		}
+
+		// The auth callout's ClusterRoleBinding, which nothing else reclaims.
+		//
+		// It is cluster-scoped, so it carries no owner reference — the garbage
+		// collector treats a cluster-scoped object owned by a namespaced one as
+		// an orphan and deletes it immediately, which is worse than leaking it.
+		// cleanupAgentRBAC's two label sweeps do not reach it either: the first
+		// selects agent-name/agent-namespace labels that commonLabels does not
+		// set, the second selects part-of=kube-agents which a2aLabels overrides
+		// to a2a-next, and both then require a kubeagents-prefixed name.
+		//
+		// Left behind, it is a standing grant of tokenreviews/create and
+		// subjectaccessreviews/create to a ServiceAccount name in a namespace,
+		// surviving the workload it was minted for — so anyone who can later
+		// create a ServiceAccount of that name inherits it. cleanupA2A reaps it
+		// on a mode flip; this is the other way the stack can go away.
+		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
+		// is absent or terminating. litellm-policy is owned by Deployment/litellm (via OwnerReference)
+		// so that deleting PlatformAgent does not strip NetworkPolicy protection while LiteLLM
+		// is still running. When Deployment/litellm is deleted (e.g. helm uninstall), Kubernetes
+		// garbage collection cleans up litellm-policy automatically.
+		var litellmDep appsv1.Deployment
+		depErr := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: litellmDeploymentName}, &litellmDep)
+		if depErr != nil && !errors.IsNotFound(depErr) {
+			return ctrl.Result{}, fmt.Errorf("failed to get LiteLLM deployment during deletion cleanup: %w", depErr)
+		}
+		if errors.IsNotFound(depErr) || (depErr == nil && litellmDep.DeletionTimestamp != nil) {
+			if err := r.deleteManagedLiteLLMPolicy(ctx, agent); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 
 		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
@@ -1257,6 +1362,16 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 // its copy only on a path where spec.networkPolicy is provably set, while this runs
 // on every reconcile, including the common CR that omits the block entirely.
 func (r *PlatformAgentReconciler) shellSandboxDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
+	return r.ungatedDNSClusterIPs(ctx, agent)
+}
+
+// ungatedDNSClusterIPs runs the DNS resolution ladder with
+// spec.networkPolicy.enabled lifted, for the policies that render whatever
+// that flag says. Shared by the sandbox policy and the A2A session fence:
+// both are policies the flag does not withhold, so both need the documented
+// dnsClusterIPs override to survive it, and one copy of that rule is one
+// place to correct it.
+func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
 	if agent.Spec.NetworkPolicy == nil || agent.Spec.NetworkPolicy.Enabled == nil {
 		return r.resolveNetpolProfile(ctx, agent).DNSClusterIPs
 	}
@@ -1535,15 +1650,10 @@ func (r *PlatformAgentReconciler) deleteIfManaged(ctx context.Context, object cl
 	return client.IgnoreNotFound(r.Delete(ctx, object))
 }
 
-const (
-	// reasonRuntimeClassNotFound indicates that the requested RuntimeClass was not found in the cluster.
-	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
-
-	// reasonEgressAllowlistRefused refuses the contents of an egress policy: the
-	// policy is fine and still gets rendered, minus the destinations that were
-	// refused.
-	reasonEgressAllowlistRefused = "EgressAllowlistRefused"
-)
+// reasonEgressAllowlistRefused refuses the contents of an egress policy: the
+// policy is fine and still gets rendered, minus the destinations that were
+// refused.
+const reasonEgressAllowlistRefused = "EgressAllowlistRefused"
 
 // validateEgressPolicy returns a Degraded reason and message when
 // spec.security.egressPolicy asks for something the operator cannot honestly
@@ -1589,18 +1699,53 @@ func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string
 // egress. That the CR reads Degraded at the time makes it worse rather than
 // better: the status names one bad CIDR while the Pod's egress is wide open.
 //
-// Both policies are reconciled whatever the refusal was (steps 9b, 9c, 10, 11e).
+// All of the policies are reconciled whatever the refusal was (steps 9b, 9c, 10,
+// 11e).
 // <name>-gateway-netpol is the Pod's baseline, it predates spec.security.egressPolicy,
 // and no refusal is an objection to it; <name>-sandbox-metadata-deny is the refused policy
 // itself, and the builder has already dropped the offending destination, so
-// what is left to render is a good policy minus one rule.
+// what is left to render is a good policy minus one rule. Under spec.mode: next
+// the A2A fences join them, for the reason reconcileA2ANetworkFences states: they
+// are applied from reconcileA2A, which every path here returns before reaching,
+// and the session fence is the whole of what confines a session pod. litellm-policy
+// rides along too, after the agent's own: it selects a different Pod, so a failure
+// on its side (a transient Get on Deployment/litellm, say) must not cost the
+// agent's guardrails a requeue cycle. Every step runs even when an earlier one
+// fails, and the errors are joined so none of them is hidden.
 func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
 	netpolProf := r.resolveNetpolProfile(ctx, agent)
+	var errs []error
 	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
-		return err
+		errs = append(errs, err)
 	}
-	return r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf), otlpEndpoint)
+	if err := r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf), otlpEndpoint); err != nil {
+		errs = append(errs, err)
+	}
+	if a2aStackRendering(agent) {
+		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf); err != nil {
+		errs = append(errs, err)
+	}
+	return goerrors.Join(errs...)
+}
+
+// a2aStackRendering is the gate reconcileA2A sits behind, as a predicate rather
+// than an expression at its one call site, because the refusal paths above have
+// to ask the same question and two spellings of it would be two things to keep
+// true. resolveMode and renderMode are both pure functions of the CR, so asking
+// twice in one reconcile costs nothing and cannot disagree.
+//
+// modeErr is part of the gate, not noise beside it: an unrecognised spec.mode is
+// the version skew described at the call site, and skew deliberately renders
+// neither branch. A refusal during a freeze must not start asserting fences the
+// unfrozen path would not have touched.
+func a2aStackRendering(agent *agentv1alpha1.PlatformAgent) bool {
+	_, modeErr := resolveMode(agent)
+	return modeErr == nil && renderMode(agent, "nats") == ModeNext
 }
 
 // agentEgressDNSClusterIPs is the resolved cluster DNS VIP list for the agent
@@ -2612,7 +2757,40 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 	return names
 }
 
+// updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
+// Ready=False condition carrying the reason and message. It writes only when
+// something it is about to write differs from what the status already holds.
+//
+// The gate matters because the PlatformAgent watch has no predicate, so every
+// status write re-enqueues the object at once. Without it a CR held on any
+// refusal wrote status on every pass: each requeue tick wrote, the write woke
+// an echo pass through the watch, and the echo wrote again. The chain stopped
+// there only because metav1.Time serializes to the second — the echo's write
+// was byte-identical to the one before it, and the API server drops such an
+// update without an etcd write, a resourceVersion bump or a watch event.
+// Measured, on envtest and on a live install, that was two reconciles and two
+// status-write requests (so two API-server audit entries) per 30s tick, with
+// resourceVersion and lastReconcileTime moving every tick, for as long as the
+// refusal stood (#1392). The comparison is keyed on the phase, the condition's
+// status, reason, message and observedGeneration — everything this function
+// writes except the timestamps. LastReconcileTime is deliberately not in the
+// key: it is stamped with `now`, so including it would make every pass a
+// change; and it is not refreshed on a quiet pass, which is what
+// updateStatusReady does and what the field's own doc says — it is the time of
+// the last status write, not of the last pass.
+// The generation witness is the condition's observedGeneration rather than the
+// top-level field, for the reason updateStatusReady gives: a CRD that predates
+// status.observedGeneration prunes the top-level copy on every write.
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
+	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
+		agent.Status.Phase == "Degraded" &&
+		existing.Status == metav1.ConditionFalse &&
+		existing.Reason == reason &&
+		existing.Message == message &&
+		existing.ObservedGeneration == agent.Generation {
+		return nil
+	}
+
 	agent.Status.Phase = "Degraded"
 	agent.Status.ObservedGeneration = agent.Generation
 	now := metav1.Now()
@@ -2662,6 +2840,20 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&policyv1.PodDisruptionBudget{})
 
+	enqueueAgentsInNamespace := func(ctx context.Context, namespace string) []reconcile.Request {
+		var list agentv1alpha1.PlatformAgentList
+		if err := mgr.GetClient().List(ctx, &list, client.InNamespace(namespace)); err != nil {
+			return nil
+		}
+		var reqs []reconcile.Request
+		for _, agent := range list.Items {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name},
+			})
+		}
+		return reqs
+	}
+
 	// Only register AgentPlugin watch if CRD exists in cluster RESTMapper
 	gvk := agentv1alpha1.GroupVersion.WithKind("AgentPlugin")
 	if mgr != nil && mgr.GetRESTMapper() != nil {
@@ -2678,17 +2870,7 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 							{NamespacedName: types.NamespacedName{Namespace: ext.Namespace, Name: ext.Spec.AgentRef}},
 						}
 					}
-					var list agentv1alpha1.PlatformAgentList
-					if err := mgr.GetClient().List(ctx, &list, client.InNamespace(ext.Namespace)); err != nil {
-						return nil
-					}
-					var reqs []reconcile.Request
-					for _, agent := range list.Items {
-						reqs = append(reqs, reconcile.Request{
-							NamespacedName: types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name},
-						})
-					}
-					return reqs
+					return enqueueAgentsInNamespace(ctx, ext.Namespace)
 				}),
 				// Status writes on AgentPlugin come from this controller. Without a
 				// generation filter each of those writes would re-enqueue the agent that
@@ -2742,6 +2924,26 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 				return nil
 			}),
+		).
+		Watches(
+			&networkingv1.NetworkPolicy{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				if obj.GetName() != litellmNetworkPolicyName {
+					return nil
+				}
+				return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+			}),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+		).
+		Watches(
+			&appsv1.Deployment{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				if obj.GetName() != litellmDeploymentName {
+					return nil
+				}
+				return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+			}),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		Named("platformagent").
 		Complete(r)

@@ -1,0 +1,7 @@
+exit 0
+Task agent-kanban-smoke Result: [UNSTABLE] passed 0 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe'] [OutcomeScore=0.5 OutcomeValidity=0.9 ToolInvocation=0.6]
+  rep 2: fail -- VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe'] [OutcomeScore=0.5 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 3: fail -- VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe'] [OutcomeScore=0.5 OutcomeValidity=0.2 ToolInvocation=0.6]
+  admission: no screening evidence for this case yet

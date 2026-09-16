@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, and what takes
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
 # `capacity` off the coverage allowlist in docs/designs/domains.yaml.
 #
 # A PROBE, not the audit. The full stockout-prevention sweep exists and is
@@ -9,7 +9,11 @@
 # answered from observed evidence and graded on the reply. Full audit SOP
 # fidelity lives in the fleet-audits canary (compliance-rbac-overgrant, 606s
 # measured 2026-08-26) and in the future nightly tier, where
-# stockout-pinned-pool is parked. Expected cost bracket: ~150-350s.
+# stockout-pinned-pool is parked. Cost: the ~150-350s bracket the probes
+# were promised is not what this one costs. Measured over its 1155 presubmit
+# repetitions from 2026-09-04 to 2026-09-15 (after #1174): median 540s, p10
+# 248s, p90 1318s, the ~2960s maxima being AGENT_DELEGATION_TIMEOUT plus
+# grading; hack/ci-eval-pr.sh's unit_cost_hint carries the median.
 #
 # Planted defect required: a node pool named "pinned-inference-pool" on the
 # seeded fleet, single zone, node autoscaling capped at its current size,
@@ -85,16 +89,49 @@ verification_spec:
       # "maxreplicas" also matches "maxReplicas: 10" and ".spec.maxReplicas".
       # A bare "10" is not usable: it is a substring of timestamps, CPU
       # millis and percentages on every report there has ever been.
+      #
+      # Widened 2026-09-15 (#1023) from the delivered answers of all 1155
+      # presubmit repetitions since #1174 (385 runs, 30 pool projects): the
+      # first eight phrases passed 959; 196 failed this check, and 106 of
+      # those were correct answers -- the ceiling read as 10 -- failed on
+      # wording alone. The agent's commonest spelling is kubectl's own HPA
+      # column, MAXPODS (71 of the 106), then "replica ceiling (maxpods) of
+      # 10", where the parenthetical breaks "ceiling of 10". Every added
+      # phrase carries the field name or the value 10; no repetition in the
+      # sample states a ceiling other than 10, and the 88 that stay failed
+      # never state one (63 give no value at all, 19 are the delegation
+      # receipt, 6 are one-off wordings). Residual: "maxpods" is a substring
+      # of GKE's maxPodsPerNode and "max pods" of "max pods per node"; no
+      # reply in the sample mentions either, and a reply that stated only
+      # the node figure would still have to name the pool and keep the cap.
+      #
+      # | sampled reps | this check | rep (all checks) | runs 3/3 |
+      # |---|---|---|---|
+      # | before | 959 / 1155 | 954 / 1155 | 233 / 385 |
+      # | after  | 1067 / 1155 | 1060 / 1155 | 320 / 385 |
       any_of_phrases:
         [
           "maxReplicas",
-          "max replicas",
+          "max replica",
+          "maximum replica",
+          "maxpods",
+          "max pods",
+          "maximum pods",
           "maximum of 10",
           "max of 10",
           "cap of 10",
           "capped at 10",
           "ceiling of 10",
+          "ceiling is 10",
+          "ceiling: 10",
+          "ceiling set to 10",
+          "ceiling is set to 10",
+          "ceiling sits at 10",
+          "ceiling configured to 10",
+          "ceiling is configured to 10",
+          "scale up to 10",
           "10 replicas",
+          "10 pods",
         ]
   # Cluster-state safeguard: the pool's node-pool config is GKE-level, but
   # the HPA half of the planted defect is a cluster object -- and raising its

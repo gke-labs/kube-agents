@@ -152,10 +152,12 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		found++
 		fmt.Fprintf(&b, "\n--- task %s (%s)\n", task.ID, task.State)
 		if art := task.Artifact(lib.ArtifactResult); art != nil {
-			text := joinTextParts(art.Parts)
-			if len(text) > primerTaskResultCap {
-				text = text[:primerTaskResultCap] + "…"
-			}
+			// truncateRunes, not a byte cut: the primer is annotated onto
+			// the next pod and marshalled to JSON on the way, where invalid
+			// UTF-8 becomes U+FFFD rather than an error. spawn.go's outer
+			// truncateRunes only guards the primer's tail; a byte cut here
+			// lands mid-transcript and survives it.
+			text := truncateRunes(joinTextParts(art.Parts), primerTaskResultCap)
 			b.WriteString(text)
 			b.WriteString("\n")
 		}

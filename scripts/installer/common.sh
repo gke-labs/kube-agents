@@ -43,6 +43,7 @@ else
   C_GREEN='\033[92m'
   C_YELLOW='\033[93m'
   C_MAGENTA='\033[95m'
+  # shellcheck disable=SC2034 # palette entry read by the scripts that source this file
   C_BLUE='\033[94m'
   C_RED='\033[91m'
   C_RESET='\033[0m'
@@ -622,7 +623,18 @@ ensure_teardown_state() {
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+      local state_sub="" state_rc=0
+      state_sub="$(tf_state_chat_subscription_name "${PROJECT_ID:-}" "${CLUSTER_NAME:-}")" || state_rc=$?
+      if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+        print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
+      fi
+      if [ -n "$state_sub" ]; then
+        CHAT_SUB_NAME="$state_sub"
+        export CHAT_SUB_NAME
+      elif [ -z "${CHAT_SUB_NAME:-}" ] || [ "$CHAT_SUB_NAME" = "$DEFAULT_CHAT_SUB_NAME" ]; then
+        CHAT_SUB_NAME="$(derive_chat_sub_name "$CHAT_TOPIC_NAME")"
+        export CHAT_SUB_NAME
+      fi
     else
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
       export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"

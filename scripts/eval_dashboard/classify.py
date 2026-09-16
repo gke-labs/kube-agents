@@ -3,7 +3,7 @@
 which are the pull request's.
 
 The gate comment on a pull request, the dashboard's PR view
-(``run.html?build=<id>``) and the incident brief all answer the same
+(``run.html#build=<id>``) and the incident brief all answer the same
 question about a red run -- "is this mine?" -- and they must answer it the
 same way, so the rules live here once. ``classify_run`` is the whole
 interface::
@@ -26,7 +26,7 @@ health.json document in force when the run finished (state, condition,
 failing_cases are read; anything else is ignored); ``now`` anchors the
 30-day pass rate and defaults to the run's finish. Every rule below is a
 module constant with the incident it was tuned on; the vocabulary
-(``shared_break`` / ``storm`` / ``setup_deaths``, storm-classified
+(``shared_break`` / ``storm`` / ``setup_deaths`` / ``lost_pods``, storm-classified
 repetitions, collapsed cases) is the CI health adjudicator's, restated here
 so this module has no dependency beyond the standard library.
 
@@ -43,16 +43,44 @@ Per failed admitted case, in priority order:
 * ``None`` -- nothing above fits; the page says it cannot tell.
 
 ``setup`` is a run-level class: no tasks, a FAILURE verdict, under
-SETUP_DEATH_MAX_DURATION (#1172). Such a run has no cases to classify.
+SETUP_DEATH_MAX_DURATION (#1172). A lost pod -- the same zero-task FAILURE
+at any duration, with a NodeNotReady pod event or no build log at all
+(``is_lost_pod``, #1478) -- shares the class with its own headline and
+``do``. A conflicted merge (``is_merge_conflict``, #1608) is the same shape
+again and is neither: it is the branch's own, so it is ``red`` and the
+``do`` is a rebase rather than a retest. None of the three has cases to
+classify.
 
-Only stdlib.
+``runs`` may carry the nightly periodic's runs beside the presubmit's
+(SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
+presubmit only: a nightly has no pull request, so it is never "another PR"
+for the shared rule, never one of the passes the only-this-PR rule needs,
+and never in the 30-day pass rate. What it is good for is separate and
+additive: ``nightly_failed_recent`` per case says whether the newest
+nightly run inside NIGHTLY_RECENT_WINDOW of this run also failed the case
+outright -- evidence the case is broken on main, which is the reader's
+next question after "is this mine?".
+
+Only stdlib, plus the sibling ``tiers`` module.
 """
 
 from __future__ import annotations
 
 import pathlib
 import re
+import sys
 from datetime import datetime, timedelta, timezone
+
+try:
+    from . import tiers
+except ImportError:  # imported by path (render.py run as a script)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import tiers
+try:
+    import eval_rosters
+except ImportError:  # run as a script: scripts/ is not on sys.path yet
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import eval_rosters
 
 # --- Shared break (#1269, #1278; #1171 a week earlier) -----------------------
 # Other pull requests' runs are looked at when they finished inside this
@@ -96,7 +124,7 @@ SETUP_DEATH_MAX_DURATION = timedelta(minutes=5)
 
 # --- Pass rate ---------------------------------------------------------------
 # The per-case pass rate the PR view quotes is over runs started inside
-# this many days before `now`, run-level events excluded as on the legacy
+# this many days before `now`, run-level events excluded as on the Cases
 # page (a broken run's failures are the run's, not the cases').
 PASS_RATE_DAYS = 30
 RUN_EVENT_FAIL_FRACTION = 0.8
@@ -107,11 +135,20 @@ REP_RESULTS = ("pass", "fail", "infra")
 RUN_CACHE_MAX = 4096
 RATE_CACHE_MAX = 8
 
+# --- The nightly beside the verdict ---------------------------------------------
+# The newest nightly run that graded the case and finished within this long
+# of the run being classified, on either side: a night is one build, so two
+# days always covers the nearest one when the periodic is running at all.
+NIGHTLY_RECENT_WINDOW = timedelta(days=2)
+
 # --- Vocabulary shared with health.json ---------------------------------------
 STATE_GREEN = "GREEN"
 CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_STORM = "storm"
 CONDITION_SETUP_DEATHS = "setup_deaths"
+CONDITION_LOST_PODS = "lost_pods"
+# The pod event health.py's rule 3b reads (runs[].pod_last_event).
+POD_EVENT_NODE_NOT_READY = "NodeNotReady"
 RUN_SUCCESS = "SUCCESS"
 RUN_FAILURE = "FAILURE"
 RUN_ABORTED = "ABORTED"
@@ -131,11 +168,10 @@ VERDICT_INFRA = "infra"
 # --- Roster -------------------------------------------------------------------
 # Only an admitted case reds a pull request (AGENTS.md, "The behavioural
 # presubmit gate"); a hold-out failing is reported but never blamed. Read
-# from the checkout; when the script is missing every case counts as
-# admitted, which over-reports rather than hides.
+# from the checkout's hack/eval/blocking-roster.txt; when the file is missing
+# every case counts as admitted, which over-reports rather than hides.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-CI_EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
-ROSTER_RE = re.compile(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}]*)\}"')
+BLOCKING_ROSTER_FILE = eval_rosters.BLOCKING_ROSTER_FILE
 
 # The grader prefixes every reason with its score; the reader wants the
 # check name and what was missing.
@@ -147,6 +183,8 @@ DO_SHARED = "Nothing. This failure is the gate's; retest once the brief says it 
 DO_STORM = "Retest after the storm clears; a run started inside it loses repetitions to 429s."
 DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the problem."
 DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
+DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
+DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
 DO_PASSED = ""
@@ -279,11 +317,30 @@ def run_length(run: dict) -> timedelta | None:
     return None
 
 
+def is_lost_pod(run: dict) -> bool:
+    """health.py's rule 3b unit: a zero-task FAILURE whose pod's last event
+    was NodeNotReady or that has no build log at all (SCHEMA.md, optional
+    run fields; absent is unknown and never one)."""
+    return (
+        not run_tasks(run)
+        and str(run.get("result") or "").upper() == RUN_FAILURE
+        and (run.get("pod_last_event") == POD_EVENT_NODE_NOT_READY or run.get("has_build_log") is False)
+    )
+
+
+def is_merge_conflict(run: dict) -> bool:
+    """A zero-task FAILURE the collector recorded as a clone that could not
+    merge the pull request into its base (SCHEMA.md, `merge_conflict`)."""
+    return not run_tasks(run) and str(run.get("result") or "").upper() == RUN_FAILURE and run.get("merge_conflict") is True
+
+
 def is_setup_death(run: dict) -> bool:
     length = run_length(run)
     return (
         not run_tasks(run)
         and str(run.get("result") or "").upper() == RUN_FAILURE
+        and not is_lost_pod(run)
+        and not is_merge_conflict(run)
         and length is not None
         and length < SETUP_DEATH_MAX_DURATION
     )
@@ -333,15 +390,15 @@ def excerpt_of(task: dict) -> str | None:
 _ROSTER_CACHE: dict[str, frozenset | None] = {}
 
 
-def admitted_cases(script: pathlib.Path = CI_EVAL_SCRIPT) -> frozenset | None:
-    """BOOTSTRAP_ADMITTED from hack/ci-eval-pr.sh; None when unreadable."""
-    key = str(script)
+def admitted_cases(roster_file: pathlib.Path = BLOCKING_ROSTER_FILE) -> frozenset | None:
+    """The blocking roster from hack/eval/blocking-roster.txt; None when unreadable."""
+    key = str(roster_file)
     if key not in _ROSTER_CACHE:
         roster = None
         try:
-            match = ROSTER_RE.search(script.read_text())
-            if match:
-                roster = frozenset(name for name in match.group(1).split(",") if name)
+            names = eval_rosters.parse_blocking_roster(roster_file.read_text())
+            if names:
+                roster = frozenset(names)
         except OSError:
             roster = None
         _ROSTER_CACHE[key] = roster
@@ -382,6 +439,49 @@ def case_pass_rates(runs: list[dict], now: datetime) -> dict[str, float | None]:
         _RATE_CACHE.clear()
     _RATE_CACHE[key] = (runs, rates)
     return rates
+
+
+# The tier split of a runs list, memoized like _RATE_CACHE: the filtered
+# lists have to be the SAME objects from one classify_run to the next, or
+# the pass-rate memo keyed on their identity misses on every run of a
+# whole data.json.
+_TIER_CACHE: dict[tuple, tuple[list, list, list]] = {}
+
+
+def split_tiers(runs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(presubmit runs, nightly runs) of `runs`, stable across calls."""
+    key = (id(runs), len(runs))
+    hit = _TIER_CACHE.get(key)
+    if hit is not None and hit[0] is runs:
+        return hit[1], hit[2]
+    gate = tiers.presubmit_runs(runs)
+    nightly = tiers.nightly_runs(runs)
+    if len(_TIER_CACHE) >= RATE_CACHE_MAX:
+        _TIER_CACHE.clear()
+    _TIER_CACHE[key] = (runs, gate, nightly)
+    return gate, nightly
+
+
+def nightly_failed_recent(case: str, run: dict, nightly: list[dict]) -> bool | None:
+    """Whether the newest nightly run within NIGHTLY_RECENT_WINDOW of `run`
+    that graded `case` failed it on every graded repetition. None when no
+    nightly graded it in the window (or the run has no finish time). A night
+    that was a run-level event -- nearly everything failed -- says nothing
+    about one case and is skipped, as the pages skip it in per-case rates."""
+    finish = run_finish(run)
+    if finish is None:
+        return None
+    newest = None
+    for other in nightly:
+        when = run_finish(other)
+        if when is None or abs(when - finish) > NIGHTLY_RECENT_WINDOW or is_run_event(other):
+            continue
+        outcome = _run_facts(other)["outcomes"].get(case)
+        if outcome not in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED):
+            continue
+        if newest is None or when > newest[0]:
+            newest = (when, outcome)
+    return None if newest is None else newest[1] == OUTCOME_FAILED
 
 
 # --------------------------------------------------------------------------- #
@@ -447,7 +547,7 @@ def _health_fields(health_at: dict | None) -> tuple[str | None, str | None, set]
     return state, condition, named
 
 
-def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset | None, health_at: dict | None, rates: dict, run_storm: bool) -> dict:
+def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset | None, health_at: dict | None, rates: dict, run_storm: bool, nightly: list[dict] = ()) -> dict:
     name = str(task.get("name"))
     counts = rep_counts(task)
     outcome = outcome_of(counts)
@@ -484,6 +584,7 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         # Additive detail the pages show; the keys above are the contract.
         "admitted": is_admitted,
         "reps": counts,
+        "nightly_failed_recent": nightly_failed_recent(name, run, nightly),
     }
 
 
@@ -588,6 +689,30 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         result = str(run.get("result") or "").upper()
         length = run_length(run)
         minutes = int(length.total_seconds() // 60) if length is not None else None
+        if is_lost_pod(run):
+            when = f" {minutes} minutes in" if minutes is not None else ""
+            node = run.get("pod_node")
+            return dict(
+                base,
+                headline=f"The build node running this job went away{when}.",
+                lede=f"The Prow build cluster lost {node if node else 'the node'} mid-run; nothing was graded and nothing about this change is implied."
+                + ("" if condition != CONDITION_LOST_PODS else " Other PRs lost their runs the same way right now."),
+                verdict=VERDICT_INFRA,
+                setup_death=False,
+                cls=CLS_SETUP,
+                do=DO_LOST_POD,
+                matches_incident=condition == CONDITION_LOST_PODS,
+            )
+        if is_merge_conflict(run):
+            return dict(
+                base,
+                headline="The branch would not merge into main, so nothing ran.",
+                lede="clonerefs hit a conflict merging this pull request into its base; the gate never started and nothing about the change is implied.",
+                verdict=VERDICT_RED,
+                setup_death=False,
+                cls=CLS_ONLY_THIS_PR,
+                do=DO_MERGE_CONFLICT,
+            )
         if is_setup_death(run):
             return dict(
                 base,
@@ -616,10 +741,13 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
             do="Read the build log; the failure is before the eval loop.",
         )
 
-    others = _other_pr_runs(run, runs)
-    rates = case_pass_rates(runs, anchor)
+    # The gate's runs are what every rule compares against; the nightly's
+    # only feed the per-case nightly_failed_recent note.
+    gate, nightly = split_tiers(runs)
+    others = _other_pr_runs(run, gate)
+    rates = case_pass_rates(gate, anchor)
     run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
-    cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm) for t in tasks]
+    cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
     cases = [c for c in cases if c["outcome"] is not None]
 
     failed_names = {c["case"] for c in cases if c["outcome"] == OUTCOME_FAILED and c["admitted"]}

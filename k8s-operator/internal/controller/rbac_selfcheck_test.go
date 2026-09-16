@@ -84,13 +84,30 @@ func denyPDBPatch(attrs *authorizationv1.ResourceAttributes) bool {
 	return attrs.Group == "policy" && attrs.Resource == "poddisruptionbudgets" && attrs.Verb == "patch"
 }
 
+// permissionKey identifies one grant for comparison. resourceNames is part of
+// that identity rather than decoration on it: a rule scoped to one name
+// authorizes strictly less than the same (verb, resource) unscoped, and a
+// SelfSubjectAccessReview that omits the name asks for the unscoped form. Key
+// without the names and the two sides match while the probe asks the API
+// server a question role.yaml does not answer -- which is the live failure
+// that put the Name field on requiredPermission in the first place.
+func permissionKey(verb, group, resource string, names []string) string {
+	key := describePermission(verb, group, resource)
+	if len(names) == 0 {
+		return key
+	}
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	return key + " [" + strings.Join(sorted, ",") + "]"
+}
+
 func permissionSet(rules []rbacv1.PolicyRule) map[string]struct{} {
 	set := map[string]struct{}{}
 	for _, rule := range rules {
 		for _, group := range rule.APIGroups {
 			for _, resource := range rule.Resources {
 				for _, verb := range rule.Verbs {
-					set[describePermission(verb, group, resource)] = struct{}{}
+					set[permissionKey(verb, group, resource, rule.ResourceNames)] = struct{}{}
 				}
 			}
 		}
@@ -125,15 +142,23 @@ func TestRequiredPermissionsMatchTheGeneratedRole(t *testing.T) {
 	}
 	generated := permissionSet(role.Rules)
 
-	var declared []rbacv1.PolicyRule
-	for _, permission := range requiredPermissions {
-		declared = append(declared, rbacv1.PolicyRule{
-			APIGroups: []string{permission.Group},
-			Resources: permission.Resources,
-			Verbs:     permission.Verbs,
-		})
+	// Built from the flattened tuples rather than from requiredPermissions,
+	// because the tuples are what probeRBAC actually puts on the wire. A
+	// scoping that is declared but dropped in flattenRequiredPermissions
+	// would satisfy a comparison against the declaration and still send the
+	// unscoped review.
+	probed := map[string]struct{}{}
+	for _, tuple := range flattenRequiredPermissions() {
+		resource := tuple.resource
+		if tuple.subresource != "" {
+			resource += rbacSubresourceSeparator + tuple.subresource
+		}
+		var names []string
+		if tuple.name != "" {
+			names = []string{tuple.name}
+		}
+		probed[permissionKey(tuple.verb, tuple.group, resource, names)] = struct{}{}
 	}
-	probed := permissionSet(declared)
 
 	if missing := sortedDifference(generated, probed); len(missing) > 0 {
 		t.Errorf("role.yaml grants permissions the self-check does not probe; add them to requiredPermissions in rbac_selfcheck.go:\n  %s",
@@ -159,6 +184,49 @@ func TestProbeRBACNamesEachDeniedPermission(t *testing.T) {
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("denied = %v, want %v", denied, want)
+	}
+}
+
+// TestTheScopedBindProbeCarriesItsResourceName is the regression test for a
+// live failure: the operator reported RBACIncomplete for `bind clusterroles`
+// against a cluster whose ClusterRole granted exactly that, because the grant
+// is scoped by resourceNames and the probe asked the unscoped question. RBAC
+// does not widen a scoped grant to cover an unscoped request, so the API
+// server answered "no" truthfully and the operator called it a shortfall.
+//
+// The authorizer here models that rule rather than asserting on the tuple:
+// a review for clusterroles/bind is allowed only when it names the role the
+// grant is scoped to. Drop Name from the review and this goes red the way the
+// cluster did.
+func TestTheScopedBindProbeCarriesItsResourceName(t *testing.T) {
+	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
+		if attrs.Group != "rbac.authorization.k8s.io" || attrs.Resource != "clusterroles" || attrs.Verb != "bind" {
+			return false
+		}
+		return attrs.Name != a2aAuthDelegatorRole
+	}}
+	denied, err := probeRBAC(context.Background(), authorizer.reviews())
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if len(denied) != 0 {
+		t.Fatalf("a grant of bind on %s, probed correctly, must report nothing denied; got %v",
+			a2aAuthDelegatorRole, denied)
+	}
+
+	// And the scoping is a real bound, not an artifact of the fake always
+	// saying yes: bind over any other role is still refused.
+	var found bool
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.resource == "clusterroles" && tuple.verb == "bind" {
+			found = true
+			if tuple.name != a2aAuthDelegatorRole {
+				t.Errorf("the bind probe names %q, want %q", tuple.name, a2aAuthDelegatorRole)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no clusterroles/bind tuple in the probe; the auth callout's grant is unprobed")
 	}
 }
 

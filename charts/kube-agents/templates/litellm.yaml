@@ -98,6 +98,7 @@
 {{- $quotedCallbacks = append $quotedCallbacks (quote .) }}
 {{- end }}
 {{- $callbacks := printf "[%s]" (join ", " $quotedCallbacks) }}
+{{- include "kube-agents.litellmOTLPPortCheck" . }}
 {{- /*
   Rendered once here and used twice below — as the ConfigMap body and as the
   input to the Deployment's checksum. Three aliases for one upstream model,
@@ -190,14 +191,43 @@ spec:
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}
       {{- end }}
+      # The pinned image declares User root, so without this the gateway runs
+      # as root on a writable root filesystem. The fields are the ones the
+      # operator and github-minter already carry (each with its own uid; the
+      # Hindsight API has the pod-level half), kept in step with
+      # k8s-operator/config/integrations/litellm/base/deployment.yaml and
+      # asserted by tests/test_workload_security_context.py. The one writable
+      # path is the tmp emptyDir at /tmp; HOME points there too, because uid
+      # 1000 has no passwd entry in the image and the tokenizer and library
+      # caches follow HOME. Nothing else needs to be writable: the chart sets
+      # no DATABASE_URL, so Prisma never runs, and the proxy only logs a
+      # warning when its UI directory under /app is read-only. If the
+      # container still fails on a write elsewhere, add one more emptyDir at
+      # that path and name it here; do not set readOnlyRootFilesystem: false.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: litellm-container
           image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
           imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
           args: ["--config", "/app/config.yaml", "--port", "8080"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           resources:
             {{- toYaml .Values.litellm.resources | nindent 12 }}
           env:
+            # See the pod securityContext above: the only writable directory.
+            - name: HOME
+              value: /tmp
             {{- if eq $provider "vertex_ai" }}
             - name: VERTEXAI_PROJECT
               value: {{ $vertexProject | quote }}
@@ -299,10 +329,14 @@ spec:
               mountPath: /app/litellm_redaction_callback.py
               subPath: litellm_redaction_callback.py
             {{- end }}
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -323,7 +357,7 @@ spec:
       port: 80
       targetPort: 8080
   type: ClusterIP
-{{- if .Values.litellm.networkPolicy }}
+{{- if and .Values.litellm.networkPolicy (not (and .Values.platformAgent.enabled .Values.operator.enabled)) }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -333,6 +367,15 @@ metadata:
   labels:
     app.kubernetes.io/name: litellm
     {{- include "kube-agents.labels" . | nindent 4 }}
+  {{- /*
+    No helm.sh/resource-policy: keep here. Helm reads that annotation off the
+    live object at prune time, so the documented `kubectl annotate` step before
+    a static-to-dynamic upgrade already carries the policy across. Stamped in
+    the template it would also make `helm uninstall` and
+    `litellm.networkPolicy: false` leave the policy behind, and a kept object
+    still carrying the old release's ownership metadata blocks a reinstall
+    under a different release name.
+  */}}
 spec:
   egress:
     - ports:
@@ -403,6 +446,11 @@ spec:
             cidr: 169.254.169.252/32
         - ipBlock:
             cidr: 169.254.169.254/32
+    {{- /*
+      Empty for an external endpoint with litellm.otel on: the exporter leaves over the
+      port-443 rule above, as it does under the operator's copy, and no rule is emitted.
+    */}}
+    {{- with include "kube-agents.otlpCollectorNamespace" . }}
     - ports:
         - port: 4317
           protocol: TCP
@@ -411,7 +459,8 @@ spec:
       to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ include "kube-agents.otlpCollectorNamespace" . }}
+              kubernetes.io/metadata.name: {{ . }}
+    {{- end }}
   ingress:
     - from:
         - podSelector: {}

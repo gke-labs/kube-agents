@@ -79,24 +79,24 @@ Nothing here overrides configuration: an operator who sets rung 1 or 2 gets that
 
 ### Helm
 
-Discovery only covers the agents. LiteLLM's exporter and the LiteLLM NetworkPolicy are rendered by Helm, before any reconcile has happened, so one chart value drives all three:
+Discovery only covers the agents. LiteLLM's exporter is rendered by Helm, while its NetworkPolicy is managed by the operator on default installs (or rendered by Helm when either `platformAgent.enabled` or `operator.enabled` is false), so one chart value drives all three:
 
 ```yaml
 telemetry:
   otlpEndpoint: "http://otel-collector.otel-collector.svc.cluster.local:4318"
-  collectorNamespace: "" # only needed if the namespace can't be read off the host
+  collectorNamespace: "" # for an in-cluster collector whose host does not name its namespace
 ```
 
-| `telemetry.otlpEndpoint` | PlatformAgent CR              | LiteLLM env (only when `litellm.otel=true`) | NetworkPolicy egress namespace                 |
-| ------------------------ | ----------------------------- | ------------------------------------------- | ---------------------------------------------- |
-| `""` (default)           | field omitted                 | managed collector                           | `gke-managed-otel`                             |
-| set                      | `spec.telemetry.otlpEndpoint` | the value                                   | derived from the host, or `collectorNamespace` |
+| `telemetry.otlpEndpoint` | PlatformAgent CR              | LiteLLM env (only when `litellm.otel=true`) | NetworkPolicy egress namespace                                                |
+| ------------------------ | ----------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------- |
+| `""` (default)           | field omitted                 | managed collector                           | `gke-managed-otel`                                                            |
+| set                      | `spec.telemetry.otlpEndpoint` | the value                                   | derived from the host, or `collectorNamespace`; external endpoints: see below |
 
-Empty means "do not decide here". The operator can act on that; Helm cannot, so it keeps the shipping default. Setting the value therefore also pins the agents — a release can never have the agent discover collector A while LiteLLM exports to B and the policy opens egress only to B's namespace.
+Empty means "do not decide here". When `platformAgent.enabled: true` and `operator.enabled: true` (the default), the operator dynamically manages the agent's NetworkPolicy using runtime collector discovery, while LiteLLM's exporter and NetworkPolicy default to the GKE Managed OpenTelemetry collector (`gke-managed-otel`). When either is false, Helm renders a static `litellm-policy` with the shipping default. Setting the value explicitly pins both the agent and LiteLLM together — a release can never have the agent discover collector A while LiteLLM exports to B and the policy opens egress only to B's namespace.
 
 `litellm.otel` stays a separate switch, and it defaults to **off**. Naming a collector does not turn the LiteLLM otel callback on, because that callback aborts every LLM request on DNS failure — too severe to flip as a side effect. So on a default install `telemetry.otlpEndpoint` moves the agents and the egress rule; the LiteLLM `OTEL_EXPORTER_OTLP_ENDPOINT` variable does not exist until you also set `litellm.otel=true`.
 
-The namespace is read off the endpoint host when it names an in-cluster Service (`<svc>.<ns>` or `<svc>.<ns>.svc…`). A vendor endpoint or a bare hostname has no namespace to read, and what happens then depends on that same switch: with `litellm.otel=true` the render **fails**, rather than emitting a policy that blocks the export you just configured — set `telemetry.collectorNamespace`, or `litellm.networkPolicy=false` if the policy is managed elsewhere. With the callback off there is no LiteLLM export for the rule to block, so the rule keeps `gke-managed-otel` and the install proceeds.
+The namespace is read off the endpoint host when it names an in-cluster Service (`<svc>.<ns>` or `<svc>.<ns>.svc…`). A vendor endpoint or a bare hostname has no namespace to read, and with `litellm.otel=true` both renders — the operator's on the default install, Helm's static copy when `operator.enabled` or `platformAgent.enabled` is false — emit no OTLP egress rule for it (unless `telemetry.collectorNamespace` names one). The exporter then leaves over the policy's port-443 rule, which excepts private ranges, so the endpoint has to be a public host on port 443: an external endpoint on any other port fails the render because the exporter would be blocked, and so do the shapes the render can recognise as in-cluster or private on 443 (an IP literal inside a range that render's 443 rule excepts — the RFC 1918 blocks on both, plus CGNAT, link-local, and the unique-local, link-local and multicast IPv6 ranges on the operator's — a single-label hostname, and on the static render any IPv6 literal, whose 443 rule is IPv4-only), and so does an endpoint the render cannot read a port off (a scheme other than lowercase `http://` or `https://`, or userinfo, a query, or a fragment in the authority); a DNS name that happens to resolve to private address space is blocked without a render error. `telemetry.collectorNamespace` and the `otlp-collector-namespace` annotation have to be namespace names (lowercase RFC 1123 labels) while the check applies. The check stands aside wherever nothing selects LiteLLM: `litellm.networkPolicy=false`, or on the default install `platformAgent.networkPolicy.enabled=false` or the `enable-litellm-network-policy: "false"` annotation. With the callback off there is no LiteLLM export for a rule to serve: the operator emits none and the static copy keeps `gke-managed-otel`. `telemetry.collectorNamespace` is for an in-cluster collector whose host does not name its namespace (an IP literal, a bare Service name): set it and both renders open 4317/4318 to that namespace and skip the port-443 check.
 
 ### Kustomize and examples
 

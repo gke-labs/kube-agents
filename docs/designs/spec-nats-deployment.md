@@ -111,17 +111,46 @@ holder can mint arbitrary bus users. The capability envelope design
 (`docs/architecture/09-capability-envelope.md`, "one cryptographic key does exist") owns
 that analysis; the callout service inherits its hardening requirements. The callout
 validates the client's KSA token against the cluster's OIDC issuer (audience-bound,
-short-lived, kubelet-rotated) and returns the account and the permission set. Revocation
-is the issuer's problem, and it already solved it. This works on stock Kubernetes; there
+short-lived, kubelet-rotated) and returns the account and the permission set.
+
+Revocation is the issuer's problem for the credential, and the issuer has solved it: a
+projected token is bound to its pod, so the API server stops authenticating it once the
+pod object is gone - measured at about ten seconds behind the delete, which is the
+TokenReview success cache rather than the token's hour. That governs the NEXT connection
+and only the next one. An ALREADY-OPEN connection is not revoked by anything above: the
+callout is consulted once, at CONNECT, and the server holds the grants it issued in a
+signed user JWT until that JWT expires - the callout's grant TTL, an hour less jitter.
+So the bound on a compromised bus client is its grant TTL, not its pod lifetime, and
+shortening that exposure means shortening the grant TTL. Both clocks matter and they are
+not the same clock; a claim about one is not a claim about the other. This works on stock Kubernetes; there
 is no GKE dependency. Concretely, validation is a `TokenReview` call against the local
 API server - zero key handling, works on any conformant cluster - with local JWT
 verification against the API server's `openid/v1/jwks` endpoint as the offline
 alternative.
 
-Stage 1 status (recorded 8/31): the rendered config still authenticates its users
-statically - rendered credentials, deny-by-default grants in `nats.conf`. The callout
-is the design of record, and the residues named in this section as "closed by the
-callout" are open until it arms.
+Status (amended 9/4, the callout armed; amended 9/8, sessions moved): the render now
+carries the `auth_callout` block, and a principal authenticates one of two ways.
+**Through the callout**, by presenting a projected ServiceAccount token: the bus
+provisioning Job, and every spawned session pod. **Statically**, from `nats.conf` and
+listed in `auth_users`: the callout itself, which cannot authenticate through the thing
+it is; the chatops gateway, purely as sequencing, since it has a ServiceAccount and its
+client program lands separately from this render; `web`, because a browser never can;
+`seed`, because the hand-applied seed tooling is applied rather than rendered and
+dropping its user would refuse an object already running; `sys`, a human at a
+port-forward; and the shared `worker`, which is now a shrinking residue rather than the
+session story — no session pod authenticates as it, and what keeps it alive is the seed
+tooling's twin and the agent-side workloads that have not moved, the platform agent pod
+and the Hermes bridge sidecar beside it among them.
+
+Three of those are permanent - the callout, which cannot authenticate through itself;
+`web`, because a browser never can; and `sys`, which is a human rather than a workload -
+and the rest are waiting on something nameable. The single
+source for all of it - the config's APP and `$SYS` static user blocks, the callout's map,
+and the `NATS_USER` a client is handed so it can set its inbox prefix - is
+`platformagent_a2a_identities.go`; before the callout those three lived in a config
+string, a Secret and a container env block with nothing but review connecting them. The
+one static block not in that file is the callout's own, rendered in the AUTH account
+template in `platformagent_a2a_manifests.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or
@@ -135,6 +164,13 @@ without a credential reaching the digest.
 Layout:
 
 - **`$SYS`** - human operators and monitoring only. No agent ever authenticates into it.
+- **`AUTH`** - the auth callout service and nothing else, and the isolation is a boundary
+  rather than tidiness. The server publishes every authorization request into this account
+  and takes the first answer that returns on the reply inbox, and it does **not** check
+  that the answer's outer envelope was signed by the configured issuer (measured; the
+  inner user JWT's signature is checked). So anything able to publish into this account's
+  `$SYS._INBOX.>` and win the race can refuse an authorization - it could not forge a
+  grant without the issuer seed, but it could deny one. Nothing else belongs in here.
 - **One application account per scope.** The account is the tenant boundary and the blast
   radius container. Stage 1 exercises exactly one; the multi-scope split (and any
   cross-account exports) is designed but deliberately unexercised until a second scope
@@ -142,23 +178,30 @@ Layout:
 - **One user per agent identity** inside the account. Permissions are exact subject
   lists, deny by default: publish only to the subjects its role emits on, subscribe only
   to its own addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the
-  shared topics it is granted. The addressee token in the task subjects (payload spec
+  shared topics it is granted. That is an upper bound, not the shape every principal has:
+  a pull-only principal may hold no task-subject subscribe at all, which is what the
+  session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
-  grants are part of being a JetStream client at all: the `$JS.API.>` surface a role's
-  streams and buckets need; `$JS.ACK.<its streams>.>` for explicit acks - an ack is a
-  publish, and missing this grant means every consumer redelivers forever while TCP
-  health stays green, the NR-5 incident class created at connect time; and `$JS.FC.>`
-  for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
+  grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
+  streams and buckets need, enumerated per stream and per verb where the caller set is
+  known (the worker's list is the operator's `a2aWorkerJetStreamGrants`; a user still
+  holding `$JS.API.>` holds playground posture); `$JS.ACK.<its streams>.>` for explicit
+  acks - an ack is a publish, and missing this grant means every consumer redelivers
+  forever while TCP health stays green, the NR-5 incident class created at connect time;
+  and `$JS.FC.>` for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
   is `_INBOX.<user>.>` MUST configure its inbox prefix to match - the client library's
   default random inbox is refused by the user's own grant and every API call times out.
   Both halves were found live (8/26): the provision Job could never succeed and no
   consumer could ever ack until these landed. The ack grant should be scoped per
   stream, for the reason the web section below teaches: an ack subject names a stream
   and a consumer, never the caller, so an unscoped `$JS.ACK.>` lets any holder `+TERM`
-  another principal's in-flight delivery. The stage 1 render still grants the unscoped
-  form to the trusted system users; narrowing it is recorded debt, not a settled shape.
+  another principal's in-flight delivery. That narrowing has landed: every rendered
+  principal's ack grant is scoped to the streams it consumes with explicit ack -
+  `$JS.ACK.TASKS.>` for the gateway and the shared worker - and the principals whose reads
+  are ordered or ack-none hold no ack grant at all. What scoping still cannot express is
+  per-consumer scope inside a granted stream, since NATS wildcards match whole tokens.
 - **Topic publish grants are exact, never namespace wildcards.** Publish grants match
   the provisioned topic list subject-for-subject. A wildcard over a topic namespace
   turns provisioned-only into silent loss - a publish to an unprovisioned topic sails
@@ -197,20 +240,42 @@ Layout:
   distinction** - enumerate the streams, and never hand a browser-facing user
   `$JS.API.>`.
 
-  Residues, all closed by the auth callout and none of them "can read what it shouldn't":
+  Residues, none of them "can read what it shouldn't", and none of them closed by the
+  auth callout - `web` is browser-facing and therefore permanently statically
+  authenticated, so the callout never reaches it:
   durability is a body field, so withholding the legacy `DURABLE.CREATE` subject does not
   prevent a durable - `max_consumers` per stream bounds the cost instead; ack policy is
   the same class of body field, so a hostile holder can create an explicit-ack consumer
   it holds no grant to ack - endless redeliveries, churn against the server, and an
   amplifier for the deliver-subject write below; within the four
   granted streams consumer names are the caller's choice, so `web` can pull a delivery
-  off another reader's consumer or retune it through create-as-update; and a consumer's
+  off another reader's consumer or retune it through create-as-update - a route that
+  reaches the gateway's relay durable from `worker` too, measured on the render: one
+  permitted `$JS.API.CONSUMER.CREATE.TASKS.gateway-relay` retunes its filter subject, and
+  one carrying `inactive_threshold` has the server reap it, ack floor and all, with
+  `CONSUMER.DELETE` refused in the same run; and a consumer's
   deliver subject can aim replay of stored messages at another stream's subject, which is
-  a persisted write, reaching `a2a.agents.>` (the identity plane) as easily as
-  annotations. Per-name scoping is **not** available as a mitigation: NATS wildcards match
-  whole tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing
-  else - measured, not assumed. The real closes are the callout or a separate account
-  with an export/import.
+  a persisted write under the messages' original subjects - not forgery, since a read by
+  subject never sees them, but an eviction lever against the capturing stream. Delivery
+  needs a subscription whose subject is **exactly** the deliver subject - a push consumer
+  registers through `Sublist.registerNotification`, which takes interest only from a match
+  that is byte-equal, so a wildcard subscription covering the deliver subject supplies
+  none - and that splits the streams
+  (measured on 2.10.29 and 2.14.5): the topic streams have literal subjects, so their own
+  ingest is the interest and the write lands unaided; DIRECTORY, TASKS and the buckets
+  have wildcard subjects, so reaching
+  `a2a.agents.>` (the identity plane) takes a principal subscribed to a card subject
+  itself. A watcher on `a2a.agents.>` - exactly `gateway`'s subscribe grant, and inside
+  `web`'s `a2a.>` - is not that principal: measured, DIRECTORY stayed empty.
+  This survives per-stream scoping of any user that may create consumers at all, the
+  worker included; the closure is not holding `CONSUMER.CREATE`, which is a consumer
+  created per task by the dispatcher. Per-name scoping is **not** available as a
+  mitigation _where the caller chooses its own consumer names_: NATS wildcards match whole
+  tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing else -
+  measured, not assumed. The session principal is the case where it does work, and why:
+  its consumer names are derived from the pod the API server attested rather than chosen
+  by the client, so the grant can name them exactly instead of by prefix. The real close is a
+  separate account with an export/import, which stays open.
 
   **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`
   with **no writer in any user's publish list** - the single deliberate exception to the
@@ -225,25 +290,33 @@ Layout:
   cleartext, and the Service is ClusterIP, so nothing outside the cluster reaches it.
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
-  (the agent pod - whose sidecars, the Hermes bridge included, share its labels - the
-  A2A gateway, session pods by the spawner's labels, the provision Job, and the
-  hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
+  (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
+  its labels - the A2A gateway, session pods by the spawner's labels, the provision Job,
+  and the hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and through nothing else in-cluster. The enumeration is today's client
-  list, and it must grow with the components this spec designs: the auth callout
-  service first of all - it is itself a bus client (a system-account subscriber on
-  the connection path), so arming it against the fence as-enumerated refuses the one
-  peer every new connection depends on and takes the fabric dark to new work - then
-  the audit exporter, the janitor, and the metrics scrape (the alert set above is
-  scraped series) each add a peer when they arm, and the NATS pods themselves join the enumeration on
-  their route port the moment the deployment leaves the single-node dev shape - a
-  3-node cluster's servers dial each other, and a fence without the route peer
-  prevents the cluster from ever forming. The topic-grant corollary that two edits
+  list, and it must grow with the components this spec designs. The auth callout was
+  the first, and it landed in the same change that armed the callout rather than after
+  it, for the reason that makes this rule worth having: the callout is itself a bus
+  client sitting on the connection path, so a fence that does not name it refuses the
+  one peer every new connection depends on - and nothing looks broken when that
+  happens, because established connections are already authorized and keep working
+  while the fabric silently accepts no new client. Still owed as they arm: the audit
+  exporter, the janitor, and the metrics scrape (the alert set above is scraped
+  series), and the NATS pods themselves on their route port the moment the deployment
+  leaves the single-node dev shape - a 3-node cluster's servers dial each other, and a
+  fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
-  fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has
-  no other legitimate destination, carrying no ServiceAccount and no Workload
-  Identity; its bus credential is the static worker user until the callout arms). The origin
+  fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
+  other legitimate destination). **Amended 9/8:** a session pod now carries a
+  ServiceAccount and a projected bus token, so the reason for the fence's shape changed
+  while the fence did not. The kubelet delivers that token through a volume, so the
+  credential arrives without the pod dialling anything, and this policy is what withholds
+  the API-server route it would otherwise imply; automount stays off so no second
+  default-audience token rides along; and the session ServiceAccount holds no RBAC and no
+  Workload Identity. The pod that executes model output is the one place three
+  independent reasons is the right number. The origin
   allow-list (`allowed_origins`, not `same_origin`, which can never match a UI on a
   different port) remains the browser-side control: WebSockets are exempt from CORS,
   so for as long as a port-forward runs, any page the operator's browser visits could
@@ -252,34 +325,138 @@ Layout:
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the
-  gateway gets `session-state`, workers get the artifact bucket, nobody gets a bucket
-  their role doesn't name. Miss this and the first oversized artifact dies with an
+  gateway gets `session-state`, the artifact bucket goes to whoever writes artifacts,
+  nobody gets a bucket their role doesn't name. **Amended 9/8:** that last clause now
+  binds the session worker too, and it names none - the derived per-session grant set
+  below has no `$KV` or `$O` subject in it at all. Nothing breaks today, because the
+  worker adapter never offloads: it chunks artifact updates onto its own events
+  subject under the bus message limit (`resultChunkSize`) rather than writing a
+  bucket. What it means is that the bucket path is not available to a session, and
+  that is deliberate rather than an oversight - bucket scoping is the parked question
+  in the next sentence, and granting a session the bucket before scoping it would
+  hand every session every other session's artifacts. Miss this and the first oversized artifact dies with an
   Authorization Violation. Within the artifact bucket, visibility is bucket-wide;
-  per-task artifact scoping is parked with the per-task credentials tightening.
+  per-task artifact scoping is still parked. Per-session credentials landed (9/8) and did
+  not close it: a session's grants are derived from its pod name, which the gateway mints
+  one of per task, so the scope is per incarnation and the KV buckets are not in a
+  session's grant set at all. Scoping the bucket itself is a separate change.
 
 The callout reads an identity-to-permissions map rendered by the operator (**amended
-8/24** for the subagent framework): one entry per `AgentProfile`, rendered from the CR's
-bus grants, plus static entries for the system users - gateway, audit exporter, janitor.
+8/24** for the subagent framework; **amended 9/4** to what ships): one entry per
+callout-authenticated principal, keyed by the ServiceAccount as TokenReview spells it
+(`system:serviceaccount:<namespace>:<name>`), rendered into ConfigMap
+`<agent>-a2a-authmap` under key `identities.json`. **Amended 9/8:** that is now two
+entries - the provisioning Job and the session principal. The agent pod is **not** among
+them: it connects as the static shared `worker`, and a map entry no token can ever match
+authenticates nobody. Nor is the gateway - also a static `nats.conf` user for now - and
+there is no audit exporter or janitor yet. The designed shape is one entry per
+`AgentProfile` rendered from the CR's bus grants, which arrives with the CRD.
+
+The session entry is a different kind of entry and the difference is load-bearing. Every
+session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two
+sessions apart; what can is the pod. A projected token is bound by the kubelet to the pod
+it was issued into, `TokenReview` reports that pod's name and UID in the user's `Extra`
+fields, the API server stops authenticating the token once the pod object is gone, and the
+gateway names the pod after the bus session - so the attested pod name IS the addressee.
+The entry therefore carries `narrowing: "pod"` and **no grants at all**: they are built at
+mint time from the attested name. An entry that both narrowed and carried grants would be
+one skipped code path, or one well-meaning map edit, away from handing every session the
+whole list - the shared `worker` credential reborn under a new name, and it would look
+correct in review. The callout refuses such an entry at parse. No claim, no grants, no
+connection.
+
+A reaped session's credential stops working because the pod object is gone, not because
+the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
+10.1 seconds later, the API server's successful-authentication cache being the delay. The
+one-hour token lifetime is not the revocation story and must not be read as one.
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
 never read the map - the constrained party does not see its own ceiling, it just hits it.
 The callout reads the map through an API informer, not a volume mount: kubelet ConfigMap
 sync lags up to a minute, and the dispatcher can spawn a Job seconds after a profile
 lands - a race that ends in an Authorization Violation for a legitimate worker. The
-ordering is enforced, not hoped for: the operator sets `BusCredentialsReady` on an
-`AgentProfile`'s status only after the callout reports serving the profile's user, and
-the dispatcher does not dispatch before that condition is true. Submissions queue on
-the stream meanwhile; nothing is lost. The callout logs the map version it is serving
-and exposes it at runtime, so "the map says X" is checkable against the running system
-rather than against the rendered object.
+ordering is enforced, not hoped for: the operator sets `BusCredentialsReady` only after
+the callout reports serving, and nothing dispatches before that condition is true.
+Submissions queue on the stream meanwhile; nothing is lost. The callout logs the map
+version it is serving and exposes it at runtime on `/status` and `/readyz`, so "the map
+says X" is checkable against the running system rather than against the rendered object.
 
-The callout service runs in the system account, 2 replicas. It is on the connection
+**What ships today is coarser than that sentence, and the gap is deliberate.** The
+condition is on the `PlatformAgent`, not on an `AgentProfile`, because neither the CRD
+nor the dispatcher exists yet. For the same reason the second half of the sentence -
+"nothing dispatches before that condition is true" - is not yet enforced by anything:
+the operator writes `BusCredentialsReady` and no code in this repository reads it. The
+dispatcher that would is the intended reader, so the condition is deliberately built
+ahead of its consumer rather than being dead code; but until that consumer exists the
+ordering is a published signal an operator can watch, not a gate. **Amended 9/8.** It asserts that the callout Deployment is Available with
+every replica ready - and since the readiness probe answers 503 until a map is being
+served AND the replica is attached to the bus, that means every replica is serving one
+and can be reached to answer with it. The bus half of that probe was added after the
+first version of this paragraph: a replica holding a good map with a dead connection
+answers no authorization request, and it was the one state no health signal represented,
+so the Deployment stayed Available and this condition stayed true while the bus
+authorized nobody. Reasons are `CalloutServing`,
+`CalloutUnavailable` and `CalloutAbsent`, and the message names the rendered map version.
+It does **not** confirm that a named replica has observed a named version: a sub-second
+window after a re-render can report ready while a replica still serves the previous map.
+That is acceptable while the identity set changes only when the operator re-renders it,
+and it stops being acceptable when profiles arrive at runtime - at which point this
+becomes a per-replica version check, which is exactly what the status endpoint already
+exposes. Rolling the callout pods on every map change would close the gap and was
+rejected: the callout is on the connection path, so a rolling restart is a window in
+which new connections fail, which is the thing the informer exists to avoid.
+
+Three numbers in the render are load-bearing and none of them is a preference.
+
+**`max_control_line: 65536`.** A ServiceAccount token travels inside the client's CONNECT
+frame, and the 4096 default bounds that whole frame - measured, the usable room for the
+token is around 3920 bytes once the rest of the CONNECT JSON is counted. A token bound to
+several audiences, from a client with a long name, does not fit. The failure is not
+graceful: the server closes the connection with "Maximum Control Line Exceeded" _before_
+authentication happens, so it reads as the bus refusing a workload rather than as a size
+limit.
+
+**`authorization.timeout: 2`.** A ceiling, not a tuning knob. The server starts a
+first-ping timer on a connection that has not yet authenticated at roughly two seconds,
+and the Go client aborts the connect on a PING where it required a PONG - reporting
+"expected 'PONG', got 'PING'", which names nothing about authorization and sends whoever
+is debugging it to the network layer. A merely _slow_ callout hits this too, so the real
+budget for a TokenReview round trip is under two seconds whatever this number says.
+
+**The token contract.** Audience `a2a-bus`, mounted at `/var/run/secrets/a2a-bus/token`,
+3600s expiry, kubelet-rotated. The audience is the load-bearing part: a TokenReview that
+requests no audience validates against the API server's own, which every ordinary pod's
+default ServiceAccount token already carries - so without the binding the bus would accept
+any readable token in the cluster as proof of that pod's identity. A long-lived client
+MUST re-read the file when it reconnects rather than caching its first read, or it fails
+exactly when the bus restarts, which this spec calls a routine operation.
+
+The callout service runs in its own `AUTH` account - not `$SYS`, despite subscribing to
+a `$SYS.REQ.*` subject - with 2 replicas, joined in a queue group. The queue group is
+not optional above one replica: with a plain subscription every replica answers every
+request and the server silently takes whichever arrives first, which makes authorization
+a latency race whenever a rollout has two policy versions live at once. It is on the connection
 path: if it is down, no _new_ connection succeeds, while established connections
 continue. The blast radius, named honestly: during a callout outage nothing new
 connects, which means no new tasks and no new workers - the fabric is dark to new work,
 not gracefully degraded. Established sessions and the resilience contract below are
 what make that acceptable at this stage; a hardened HA callout is production posture,
 not part of the dev toggle.
+
+**The throughput ceiling, so it is known rather than discovered.** A replica answers
+authorization requests one at a time: the subscription is a queue-group subscription with
+an async handler, the client library dispatches one subscription's callbacks from one
+goroutine, and the handler does its TokenReview round trip inline. Two replicas is
+therefore two authorizations in flight for the whole fabric, and a slow API server sets
+the rate directly: two divided by the TokenReview latency, which is about 20 connections a
+second at a 100ms round trip. The queue behind it is bounded by the same under-two-second
+budget as everything else on this path. Measured, not read off the code, by
+`TestTheCalloutAnswersOneAuthorizationAtATime` in `a2a/authcallout`, which makes the
+TokenReview slow and observes that no two overlap. It is adequate for the connection rate
+this stage has - connections are rare compared to messages - and it is the first thing to
+look at if a fleet reconnecting at once is slow to come back. Raising it means handling
+each request in its own goroutine with a bound, which is a change to make against a
+measurement rather than in advance of one.
 
 ## Observability and audit
 

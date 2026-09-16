@@ -34,7 +34,8 @@ export INSTALL_DIR="/opt/hermes"
 # By pre-exporting AGENT_BROWSER_EXECUTABLE_PATH here, stage2-hook.sh detects
 # [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] is false and cleanly skips writing to /run/s6/.
 if [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] && [ -d "/opt/hermes/.playwright" ]; then
-    export AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    export AGENT_BROWSER_EXECUTABLE_PATH
 fi
 
 # 1. Execute upstream container initialization natively (inherits 100% of upstream updates)
@@ -1115,6 +1116,7 @@ sync_profile_skills() {
     #
     # $_src is NOT shared: it is the read-only image template inside this container,
     # so only the destination side needs this.
+    # shellcheck disable=SC3028 # the next two lines fall back to hostname and $$ where HOSTNAME is unset
     _tag="${HOSTNAME:-}"
     [ -n "$_tag" ] || _tag="$(hostname 2>/dev/null || true)"
     [ -n "$_tag" ] || _tag="$$"
@@ -1556,6 +1558,7 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
     OTEL_COMPAT_CONFIG="$HOME/.hermes/plugins/hermes_otel/config.yaml"
     mkdir -p "$(dirname "$OTEL_COMPAT_CONFIG")"
+    # shellcheck disable=SC3013 # -ef is implemented by dash and busybox ash, the shells this image runs
     if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
         ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
     fi

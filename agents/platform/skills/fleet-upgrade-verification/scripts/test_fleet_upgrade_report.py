@@ -4,10 +4,12 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -333,6 +335,12 @@ class ProjectResolutionTest(unittest.TestCase):
 
 class OutputShapeTest(unittest.TestCase):
     def setUp(self):
+        # main() records every run under DEFAULT_STATE_DIR; keep the tests out of /opt/data.
+        self.state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
+        patcher = patch.object(report, "DEFAULT_STATE_DIR", self.state_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.target = "1.31.0-gke.1"
         self.fake = FakeGcloud(
             {"p1": [
@@ -396,5 +404,578 @@ class OutputShapeTest(unittest.TestCase):
         self.assertEqual(rc, report.EXIT_USAGE)
 
 
+class ElapsedFormatTest(unittest.TestCase):
+    def test_units(self):
+        self.assertEqual(report.format_elapsed(0), "<1m")
+        self.assertEqual(report.format_elapsed(59), "<1m")
+        self.assertEqual(report.format_elapsed(45 * 60), "45m")
+        self.assertEqual(report.format_elapsed(2 * 3600 + 15 * 60), "2h 15m")
+        self.assertEqual(report.format_elapsed(3 * 86400 + 3600), "3d 1h")
+        self.assertEqual(report.format_elapsed(-5), "<1m")
+
+
+class RolloutTrackingTest(unittest.TestCase):
+    """Drives main() run after run against one temp --state-dir with a moving fleet and clock."""
+
+    TARGET = "1.31.4-gke.1183000"
+    OLD = "1.30.5-gke.1355000"
+    T0 = datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
+        self.now = self.T0
+
+    def _clock(self):
+        return self.now
+
+    def _run(self, clusters_by_project, *extra_args, failing_projects=(), projects=("p1",), target=TARGET):
+        fake = FakeGcloud(clusters_by_project, {}, failing_projects=failing_projects)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        argv = ["--state-dir", self.state_dir]
+        for project in projects:
+            argv += ["--project", project]
+        if target:
+            argv += ["--target-version", target]
+        argv += list(extra_args)
+        with patch.object(report, "run_cmd", fake), patch.object(report, "utc_now", self._clock), redirect_stdout(stdout), patch.object(sys, "stderr", stderr):
+            rc = report.main(argv)
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def _state(self, key=TARGET):
+        with open(os.path.join(self.state_dir, key + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _progress_rows(text):
+        rows = {}
+        for line in text.splitlines():
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) == len(report.PROGRESS_COLUMNS) and cells[0] not in ("project", "---"):
+                rows[cells[1]] = cells
+        return rows
+
+    def _fleet(self, a=OLD, b=OLD, c=OLD, d=TARGET, a_status="RUNNING"):
+        return {"p1": [
+            cluster("a", "us-central1", a, [("p", a)], status=a_status),
+            cluster("b", "us-central1", b, [("p", b)]),
+            cluster("c", "us-central1", c, [("p", c)]),
+            cluster("d", "us-central1", d, [("p", d)]),
+        ]}
+
+    def test_first_run_records_a_baseline_and_prints_no_delta(self):
+        rc, out, err = self._run(self._fleet())
+        self.assertEqual(rc, report.EXIT_OK, err)
+        self.assertIn("no previous run for target " + self.TARGET, out)
+        self.assertIn(os.path.join(self.state_dir, self.TARGET + ".json"), out)
+        self.assertEqual(self._progress_rows(out), {})
+        state = self._state()
+        self.assertEqual(state["format_version"], report.STATE_FORMAT_VERSION)
+        self.assertEqual(state["target"], self.TARGET)
+        self.assertEqual(state["recorded_at"], "2026-09-11T10:00:00Z")
+        member = state["members"]["p1/us-central1/a"]
+        self.assertEqual(member, {"control_plane_version": self.OLD, "lowest_node_pool_version": self.OLD, "status": "lagging", "unchanged_since": "2026-09-11T10:00:00Z"})
+        self.assertEqual(state["members"]["p1/us-central1/d"]["status"], "current")
+
+    def test_second_run_shows_the_delta_and_flags_the_stalled_member(self):
+        # The acceptance criterion: one member upgraded between the runs, one moved its
+        # control plane only, one did not move; the member already current stays quiet.
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(hours=2, minutes=15)
+        fleet = self._fleet(a=self.TARGET)
+        fleet["p1"][1]["currentMasterVersion"] = self.TARGET
+        rc, out, err = self._run(fleet)
+        self.assertEqual(rc, report.EXIT_OK, err)
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["a"][6], "completed")
+        self.assertEqual(rows["a"][3], f"{self.OLD} / {self.OLD}")
+        self.assertEqual(rows["a"][4], f"{self.TARGET} / {self.TARGET}")
+        self.assertEqual(rows["b"][6], "started")
+        self.assertEqual(rows["b"][5], "lagging")
+        self.assertEqual(rows["c"][6], "stalled (unchanged for 2h 15m)")
+        self.assertEqual(rows["c"][5], "lagging")
+        self.assertEqual(rows["d"][6], "unchanged")
+        self.assertIn("compared with the run at 2026-09-11T10:00:00Z", out)
+        self.assertIn("1 completed, 1 started, 1 stalled, 1 unchanged, 0 new; rollout active (another member moved since the previous run)", out)
+
+    def test_no_mover_is_unchanged_not_stalled_unless_flagged(self):
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(minutes=30)
+        _, out, _ = self._run(self._fleet())
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["a"][6], "unchanged")
+        self.assertEqual(rows["c"][6], "unchanged")
+        self.assertNotIn("stalled (", out)
+        self.assertIn("nothing is flagged stalled", out)
+        self.now = self.T0 + timedelta(minutes=45)
+        _, out, _ = self._run(self._fleet(), "--rollout-in-progress")
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["a"][6], "stalled (unchanged for 45m)")
+        self.assertEqual(rows["c"][6], "stalled (unchanged for 45m)")
+        self.assertEqual(rows["d"][6], "unchanged", "a current member is never stalled")
+        self.assertIn("rollout active (--rollout-in-progress)", out)
+
+    def test_unchanged_since_is_carried_across_runs_so_elapsed_grows(self):
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(hours=1)
+        self._run(self._fleet(a=self.TARGET))
+        self.assertEqual(self._state()["members"]["p1/us-central1/c"]["unchanged_since"], "2026-09-11T10:00:00Z")
+        self.assertEqual(self._state()["members"]["p1/us-central1/a"]["unchanged_since"], "2026-09-11T11:00:00Z")
+        self.now = self.T0 + timedelta(days=1, hours=3)
+        _, out, _ = self._run(self._fleet(a=self.TARGET, b=self.TARGET))
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["c"][6], "stalled (unchanged for 1d 3h)")
+        self.assertEqual(rows["b"][6], "completed")
+        self.assertEqual(rows["a"][6], "unchanged")
+
+    def test_in_flight_member_is_started_not_stalled(self):
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(hours=1)
+        _, out, _ = self._run(self._fleet(a_status="RECONCILING"), "--rollout-in-progress")
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["a"][6], "started")
+        self.assertEqual(rows["c"][6], "stalled (unchanged for 1h 0m)")
+
+    def test_patch_behind_member_can_stall_but_unknown_cannot(self):
+        fleet = {"p1": [
+            cluster("pb", "us-central1", "1.31.2-gke.1", [("p", "1.31.2-gke.1")]),
+            cluster("unk", "us-central1", "weird", [("p", "weird")]),
+            cluster("mover", "us-central1", self.OLD, [("p", self.OLD)]),
+        ]}
+        self._run(fleet)
+        self.now = self.T0 + timedelta(hours=1)
+        fleet["p1"][2] = cluster("mover", "us-central1", self.TARGET, [("p", self.TARGET)])
+        _, out, _ = self._run(fleet)
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["pb"][6], "stalled (unchanged for 1h 0m)")
+        self.assertEqual(rows["unk"][6], "unchanged")
+        self.assertEqual(rows["mover"][6], "completed")
+
+    def test_status_change_without_a_version_change_restarts_the_clock(self):
+        # Channel-default runs: the default advances under a current member, which is
+        # then patch-behind at the same versions. Not a stall on that run; one on the next.
+        config = {"us-central1": server_config(REGULAR="1.31.0-gke.1")}
+        clusters = [
+            cluster("x", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")]),
+            cluster("mover", "us-central1", "1.30.0-gke.1", [("p", "1.30.0-gke.1")]),
+        ]
+        argv = ["--state-dir", self.state_dir, "--project", "p1"]
+        with patch.object(report, "run_cmd", FakeGcloud({"p1": clusters}, config)), patch.object(report, "utc_now", self._clock), redirect_stdout(io.StringIO()):
+            report.main(argv)
+        self.assertEqual(self._state("channel-default")["members"]["p1/us-central1/x"]["status"], "current")
+        self.now = self.T0 + timedelta(hours=1)
+        config = {"us-central1": server_config(REGULAR="1.31.1-gke.1")}
+        clusters[1] = cluster("mover", "us-central1", "1.31.1-gke.1", [("p", "1.31.1-gke.1")])
+        out = io.StringIO()
+        with patch.object(report, "run_cmd", FakeGcloud({"p1": clusters}, config)), patch.object(report, "utc_now", self._clock), redirect_stdout(out):
+            report.main(argv)
+        rows = self._progress_rows(out.getvalue())
+        self.assertEqual(rows["x"][5], "patch-behind")
+        self.assertEqual(rows["x"][6], "unchanged")
+        self.assertEqual(rows["mover"][6], "completed")
+        self.assertEqual(self._state("channel-default")["members"]["p1/us-central1/x"]["unchanged_since"], "2026-09-11T11:00:00Z")
+        self.now = self.T0 + timedelta(hours=2)
+        out = io.StringIO()
+        with patch.object(report, "run_cmd", FakeGcloud({"p1": clusters}, config)), patch.object(report, "utc_now", self._clock), redirect_stdout(out):
+            report.main(argv + ["--rollout-in-progress"])
+        self.assertEqual(self._progress_rows(out.getvalue())["x"][6], "stalled (unchanged for 1h 0m)")
+
+    def test_a_member_at_the_target_that_changes_version_is_completed_not_started(self):
+        # Channel-default runs: the REGULAR default moves a patch and a current member
+        # follows it in its window. It is current again at new versions: a completed
+        # upgrade, and a mover, not a member that has just started.
+        config = {"us-central1": server_config(REGULAR="1.31.0-gke.1")}
+        clusters = [
+            cluster("x", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")]),
+            cluster("y", "us-central1", "1.30.0-gke.1", [("p", "1.30.0-gke.1")]),
+        ]
+        self._run_channel_default(clusters, config)
+        self.now = self.T0 + timedelta(hours=1)
+        config = {"us-central1": server_config(REGULAR="1.31.1-gke.1")}
+        clusters[0] = cluster("x", "us-central1", "1.31.1-gke.1", [("p", "1.31.1-gke.1")])
+        out = self._run_channel_default(clusters, config)
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["x"][5], "current")
+        self.assertEqual(rows["x"][6], "completed")
+        self.assertEqual(rows["y"][6], "stalled (unchanged for 1h 0m)", "x moving makes the rollout active")
+        self.assertIn("1 completed, 0 started, 1 stalled, 0 unchanged, 0 new", out)
+        # Explicit target: a current member that moves past it is `completed` too, and a
+        # current member that did not move stays `unchanged`.
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(hours=2)
+        rows = self._progress_rows(self._run(self._fleet(d="1.32.0-gke.1"))[1])
+        self.assertEqual((rows["d"][5], rows["d"][6]), ("ahead", "completed"))
+        self.now = self.T0 + timedelta(hours=3)
+        rows = self._progress_rows(self._run(self._fleet(d="1.32.0-gke.1"))[1])
+        self.assertEqual((rows["d"][5], rows["d"][6]), ("ahead", "unchanged"))
+
+    def _run_channel_default(self, clusters, config, *extra_args, failing_locations=()):
+        fake = FakeGcloud({"p1": clusters}, config, failing_locations=failing_locations)
+        out = io.StringIO()
+        with patch.object(report, "run_cmd", fake), patch.object(report, "utc_now", self._clock), redirect_stdout(out):
+            report.main(["--state-dir", self.state_dir, "--project", "p1", *extra_args])
+        return out.getvalue()
+
+    def test_a_failed_server_config_read_is_not_a_move_and_keeps_the_clock(self):
+        # Run 2 cannot grade anyone (get-server-config fails); run 3 must not report the
+        # current member as completed, must not call the rollout active on it, and must
+        # date the lagging member's stall from run 1, not run 3.
+        config = {"us-central1": server_config(REGULAR="1.31.0-gke.1")}
+        clusters = [
+            cluster("x", "us-central1", "1.30.0-gke.1", [("p", "1.30.0-gke.1")]),
+            cluster("y", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")]),
+        ]
+        self._run_channel_default(clusters, config)
+        self.now = self.T0 + timedelta(hours=1)
+        out = self._run_channel_default(clusters, config, failing_locations=["us-central1"])
+        rows = self._progress_rows(out)
+        self.assertEqual((rows["x"][5], rows["x"][6]), ("unknown", "unchanged"))
+        self.assertEqual((rows["y"][5], rows["y"][6]), ("unknown", "unchanged"))
+        self.assertNotIn("rollout active", out)
+        members = self._state("channel-default")["members"]
+        self.assertEqual(members["p1/us-central1/x"]["status"], "lagging", "an ungraded run keeps the last graded status")
+        self.assertEqual(members["p1/us-central1/x"]["unchanged_since"], "2026-09-11T10:00:00Z")
+        self.now = self.T0 + timedelta(hours=2)
+        out = self._run_channel_default(clusters, config)
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["y"][6], "unchanged")
+        self.assertEqual(rows["x"][6], "unchanged")
+        self.assertNotIn("rollout active", out)
+        self.assertEqual(self._state("channel-default")["members"]["p1/us-central1/x"]["unchanged_since"], "2026-09-11T10:00:00Z")
+        self.now = self.T0 + timedelta(hours=3)
+        out = self._run_channel_default(clusters, config, "--rollout-in-progress")
+        self.assertEqual(self._progress_rows(out)["x"][6], "stalled (unchanged for 3h 0m)")
+
+    def test_an_unknown_baseline_yields_completed_only_on_a_version_change(self):
+        config = {"us-central1": server_config(REGULAR="1.31.0-gke.1")}
+        clusters = [
+            cluster("same", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")]),
+            cluster("moved", "us-central1", "1.30.0-gke.1", [("p", "1.30.0-gke.1")]),
+        ]
+        self._run_channel_default(clusters, config, failing_locations=["us-central1"])
+        self.assertEqual(self._state("channel-default")["members"]["p1/us-central1/same"]["status"], "unknown")
+        self.now = self.T0 + timedelta(hours=1)
+        clusters[1] = cluster("moved", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")])
+        rows = self._progress_rows(self._run_channel_default(clusters, config))
+        self.assertEqual(rows["same"][6], "unchanged", "current at the same versions as an ungraded baseline is not a completion")
+        self.assertEqual(rows["moved"][6], "completed")
+
+    def test_a_different_target_reads_a_different_record(self):
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(hours=1)
+        other = "1.32.0-gke.1"
+        _, out, _ = self._run(self._fleet(), target=other)
+        self.assertIn("no previous run for target " + other, out)
+        self.assertEqual(self._progress_rows(out), {})
+        self.assertTrue(os.path.exists(os.path.join(self.state_dir, other + ".json")))
+        self.assertEqual(self._state()["recorded_at"], "2026-09-11T10:00:00Z", "the first target's record is untouched")
+
+    def test_member_missing_after_a_failed_read_is_carried_forward_then_dropped(self):
+        fleet = self._fleet()
+        fleet["p2"] = [cluster("far", "europe-west1", self.OLD, [("p", self.OLD)])]
+        self._run(fleet, projects=("p1", "p2"))
+        self.assertIn("p2/europe-west1/far", self._state()["members"])
+        self.now = self.T0 + timedelta(hours=1)
+        rc, out, _ = self._run(fleet, projects=("p1", "p2"), failing_projects=("p2",))
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertIn("- p2/europe-west1/far: in the previous record, not read this run (clusters list failed for p2); carried forward", out)
+        self.assertNotIn("stalled (", out)
+        self.assertEqual(self._state()["members"]["p2/europe-west1/far"]["unchanged_since"], "2026-09-11T10:00:00Z")
+        # A run scoped to p1 alone did not read p2 either: still carried forward.
+        self.now = self.T0 + timedelta(hours=2)
+        _, out, _ = self._run(fleet, projects=("p1",))
+        self.assertIn("(p2 not in this run's projects); carried forward", out)
+        self.assertIn("p2/europe-west1/far", self._state()["members"])
+        # A clean read of p2 without the cluster: reported once, then gone.
+        self.now = self.T0 + timedelta(hours=3)
+        fleet["p2"] = []
+        _, out, _ = self._run(fleet, projects=("p1", "p2"))
+        self.assertIn("- p2/europe-west1/far: in the previous record, not in this run's cluster list; dropped from the record", out)
+        self.assertNotIn("p2/europe-west1/far", self._state()["members"])
+        self.now = self.T0 + timedelta(hours=4)
+        _, out, _ = self._run(fleet, projects=("p1", "p2"))
+        self.assertNotIn("p2/europe-west1/far", out)
+
+    def test_unwritable_state_dir_exits_partial_with_the_table_printed(self):
+        blocker = os.path.join(self.state_dir, "not-a-dir")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("x")
+        fake = FakeGcloud(self._fleet(), {})
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(stdout), patch.object(sys, "stderr", stderr):
+            rc = report.main(["--state-dir", blocker, "--project", "p1", "--target-version", self.TARGET])
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertIn("| p1 | a | us-central1 |", stdout.getvalue())
+        self.assertIn("failed to write the record", stderr.getvalue())
+
+    def test_corrupt_record_is_reported_and_replaced(self):
+        path = os.path.join(self.state_dir, self.TARGET + ".json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        rc, out, err = self._run(self._fleet())
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertIn("unreadable, starting a new baseline", err)
+        self.assertIn("no previous run for target", out)
+        self.assertEqual(self._state()["format_version"], report.STATE_FORMAT_VERSION)
+
+    def test_json_output_carries_progress_and_rollout(self):
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(hours=1)
+        out_path = os.path.join(self.state_dir, "out", "report.json")
+        rc, _, err = self._run(self._fleet(a=self.TARGET), "--output", out_path)
+        self.assertEqual(rc, report.EXIT_OK, err)
+        with open(out_path, encoding="utf-8") as f:
+            data = json.load(f)
+        by_name = {m["cluster"]: m for m in data["members"]}
+        self.assertEqual(by_name["a"]["progress"], "completed")
+        self.assertEqual(by_name["c"]["progress"], "stalled")
+        self.assertEqual(by_name["c"]["unchanged_since"], "2026-09-11T10:00:00Z")
+        self.assertEqual(by_name["c"]["unchanged_for_seconds"], 3600)
+        self.assertEqual(by_name["a"]["unchanged_for_seconds"], 0)
+        rollout = data["rollout"]
+        self.assertEqual(rollout["state_file"], os.path.join(self.state_dir, self.TARGET + ".json"))
+        self.assertEqual(rollout["previous_run_at"], "2026-09-11T10:00:00Z")
+        self.assertEqual(rollout["recorded_at"], "2026-09-11T11:00:00Z")
+        self.assertTrue(rollout["active"])
+        self.assertEqual(rollout["active_reason"], report.ACTIVE_REASON_MOVERS)
+        self.assertEqual(rollout["summary"], {"completed": 1, "started": 0, "stalled": 2, "unchanged": 1, "new": 0})
+        self.assertEqual(rollout["missing_members"], [])
+
+    def test_first_run_json_has_new_progress_and_no_previous_run(self):
+        out_path = os.path.join(self.state_dir, "report.json")
+        self._run(self._fleet(), "--output", out_path)
+        with open(out_path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual({m["progress"] for m in data["members"]}, {"new"})
+        self.assertIsNone(data["rollout"]["previous_run_at"])
+        self.assertFalse(data["rollout"]["active"])
+        self.assertEqual(data["rollout"]["summary"]["new"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeReadinessCommands(FakeGcloud):
+    """FakeGcloud plus `get-credentials` and `kubectl get`, recording the KUBECONFIG each ran with."""
+
+    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=()):
+        super().__init__(clusters_by_project, config_by_location)
+        self.objects_by_cluster = objects_by_cluster
+        self.failing_kubectl = set(failing_kubectl)
+        self.failing_credentials = set(failing_credentials)
+        self.kubeconfigs = []
+        self.current_cluster = None
+
+    def __call__(self, cmd, timeout=None, env=None):
+        if cmd[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+            self.calls.append(cmd)
+            self.current_cluster = cmd[4]
+            self.kubeconfigs.append(env.get("KUBECONFIG") if env else None)
+            if self.current_cluster in self.failing_credentials:
+                return 1, "", "ERROR: (gcloud.container.clusters.get-credentials) forbidden"
+            return 0, "", ""
+        if cmd[:2] == ["kubectl", "get"]:
+            self.calls.append(cmd)
+            self.kubeconfigs.append(env.get("KUBECONFIG") if env else None)
+            if self.current_cluster in self.failing_kubectl:
+                return 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
+            return 0, json.dumps({"kind": "List", "items": self.objects_by_cluster.get(self.current_cluster, [])}), ""
+        return super().__call__(cmd)
+
+
+def k8s_workload(kind, namespace, name, replicas, labels):
+    return {"kind": kind, "metadata": {"namespace": namespace, "name": name}, "spec": {"replicas": replicas, "template": {"metadata": {"labels": labels}}}}
+
+
+def k8s_pdb(namespace, name, spec, expected):
+    return {"kind": "PodDisruptionBudget", "metadata": {"namespace": namespace, "name": name}, "spec": spec, "status": {"expectedPods": expected, "disruptionsAllowed": 0}}
+
+
+class ReadinessTest(unittest.TestCase):
+    TARGET = "1.35.1-gke.1000"
+    AT = "2026-09-14T15:00:00Z"
+
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
+        self.kubeconfig_dir = os.path.join(tempfile.mkdtemp(), "kubeconfigs")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.kubeconfig_dir), True)
+        blocked = cluster("seeded-b", "us-central1-a", "1.34.11-gke.1000", [("default-pool", "1.34.11-gke.1000")])
+        blocked["maintenancePolicy"] = {
+            "window": {
+                "dailyMaintenanceWindow": {"startTime": "03:00", "duration": "PT4H0M0S"},
+                "maintenanceExclusions": {
+                    "hold-the-minor-lag": {
+                        "startTime": "2026-09-12T14:35:00Z",
+                        "endTime": "2026-12-11T14:35:00Z",
+                        "maintenanceExclusionOptions": {"scope": "NO_MINOR_UPGRADES"},
+                    }
+                },
+            }
+        }
+        ready = cluster("seeded-a", "us-central1-a", self.TARGET, [("default-pool", self.TARGET)])
+        autopilot = cluster("robot-host", "us-central1", self.TARGET, [("nap-1", self.TARGET)])
+        autopilot["autopilot"] = {"enabled": True}
+        autopilot["controlPlaneEndpointsConfig"] = {"dnsEndpointConfig": {"endpoint": "gke-abc.us-central1.gke.goog", "allowExternalTraffic": True}}
+        self.clusters = {"p1": [blocked, ready, autopilot]}
+        self.objects = {
+            "seeded-a": [
+                k8s_workload("Deployment", "shop", "web", 3, {"app": "web"}),
+                k8s_pdb("shop", "web-pdb", {"maxUnavailable": 1, "selector": {"matchLabels": {"app": "web"}}}, 3),
+            ],
+            "robot-host": [
+                k8s_workload("Deployment", "readiness-1411", "pause", 2, {"app": "pause"}),
+                k8s_pdb("readiness-1411", "block-drain", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "pause"}}}, 2),
+                k8s_pdb("readiness-1411", "orphan", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "gone"}}}, 0),
+            ],
+        }
+
+    def _args(self, *extra):
+        return ["--state-dir", self.state_dir, "--project", "p1", "--target-version", self.TARGET, *extra]
+
+    def _run(self, fake, *extra):
+        out_path = os.path.join(tempfile.mkdtemp(), "report.json")
+        stdout = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(stdout):
+            rc = report.main(self._args("--readiness", "--at", self.AT, "--kubeconfig-dir", self.kubeconfig_dir, "--output", out_path, *extra))
+        with open(out_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return rc, stdout.getvalue(), data
+
+    def test_without_readiness_no_credentials_or_kubectl_call_and_no_readiness_key(self):
+        fake = FakeGcloud(self.clusters, {})  # raises on any command it does not know
+        stdout = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(stdout):
+            rc = report.main(self._args())
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertFalse(any(c[3:4] == ["get-credentials"] or c[:1] == ["kubectl"] for c in fake.calls))
+        with patch.object(report, "run_cmd", fake):
+            data = report.build_report(["p1"], self.TARGET)
+        self.assertNotIn("readiness", data)
+        self.assertFalse(any("readiness" in m for m in data["members"]))
+        self.assertNotIn("| readiness |", stdout.getvalue())
+
+    def test_blocking_pdb_exclusion_and_autopilot_skew_in_table_and_json(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
+
+        host = by_name["robot-host"]
+        self.assertEqual(host["status"], "blocked")
+        finding = host["pdbs"]["blocking"][0]
+        self.assertEqual(finding["pdb"], "readiness-1411/block-drain")
+        self.assertEqual(finding["field"], "maxUnavailable: 0")
+        self.assertEqual(finding["workloads"][0], {"kind": "Deployment", "namespace": "readiness-1411", "name": "pause", "replicas": 2})
+        self.assertEqual(host["pdbs"]["orphan"], 1)
+        self.assertFalse(host["skew"]["applicable"])
+        self.assertIn("1 orphan PDB(s)", host["note"])
+
+        b = by_name["seeded-b"]
+        self.assertEqual(b["status"], "blocked")
+        self.assertEqual(b["pdbs"]["blocking"], [])
+        self.assertEqual(b["maintenance"]["blocking_exclusions"], ["hold-the-minor-lag"])
+        self.assertEqual(b["maintenance"]["window"]["state"], "closed")
+        self.assertEqual(b["maintenance"]["window"]["next_opening"], "2026-09-15T03:00Z")
+
+        a = by_name["seeded-a"]
+        self.assertEqual(a["status"], "ready")
+        self.assertEqual(a["skew"]["pools"][0]["verdict"], "ok")
+        self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})
+        self.assertEqual(data["readiness"]["evaluated_at"], "2026-09-14T15:00:00Z")
+
+        lines = text.splitlines()
+        self.assertIn("| " + " | ".join(report.READINESS_COLUMNS) + " |", lines)
+        host_row = next(l for l in lines if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
+        self.assertIn("readiness-1411/block-drain (maxUnavailable: 0; Deployment readiness-1411/pause (2 replicas))", host_row)
+        self.assertIn("no exclusion in effect; no maintenance window", host_row)
+        self.assertIn("n/a (Autopilot", host_row)
+        b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
+        self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
+        self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
+        self.assertIn("Readiness at 2026-09-14T15:00:00Z: 2 blocked, 1 ready, 0 unknown", text)
+        # The version table is still printed first and unchanged in shape.
+        self.assertTrue(lines[0].startswith("| " + " | ".join(report.TABLE_COLUMNS)))
+
+    def test_kubeconfig_per_target_and_dns_endpoint_only_when_allowed(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, _, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        creds = [c for c in fake.calls if c[3:4] == ["get-credentials"]]
+        self.assertEqual(len(creds), 3)
+        by_cluster = {c[4]: c for c in creds}
+        self.assertIn("--dns-endpoint", by_cluster["robot-host"])
+        self.assertNotIn("--dns-endpoint", by_cluster["seeded-a"])
+        self.assertNotIn("--dns-endpoint", by_cluster["seeded-b"])
+        self.assertEqual(by_cluster["seeded-b"][:7], ["gcloud", "container", "clusters", "get-credentials", "seeded-b", "--location=us-central1-a", "--project=p1"])
+        expected = os.path.join(self.kubeconfig_dir, "kubeconfig_p1_seeded-b_us-central1-a.yaml")
+        self.assertIn(expected, fake.kubeconfigs)
+        self.assertTrue(all(k and k.startswith(self.kubeconfig_dir + os.sep) for k in fake.kubeconfigs))
+        self.assertTrue(os.path.isdir(self.kubeconfig_dir))
+        kubectl = [c for c in fake.calls if c[:1] == ["kubectl"]]
+        self.assertEqual(kubectl, [["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]] * 3)
+        self.assertEqual(data["readiness"]["kubeconfig_dir"], self.kubeconfig_dir)
+        self.assertEqual({m["cluster"]: m["readiness"]["kubeconfig"] for m in data["members"]}["seeded-b"], expected)
+
+    def test_dns_endpoint_not_added_when_external_traffic_is_off(self):
+        record = cluster("closed", "us-central1", self.TARGET, [("p", self.TARGET)])
+        record["controlPlaneEndpointsConfig"] = {"dnsEndpointConfig": {"endpoint": "gke-abc.us-central1.gke.goog", "allowExternalTraffic": False}}
+        self.assertEqual(report.dns_endpoint_args(record), [])
+        record["controlPlaneEndpointsConfig"]["dnsEndpointConfig"]["allowExternalTraffic"] = True
+        self.assertEqual(report.dns_endpoint_args(record), ["--dns-endpoint"])
+        del record["controlPlaneEndpointsConfig"]["dnsEndpointConfig"]["endpoint"]
+        self.assertEqual(report.dns_endpoint_args(record), [])
+
+    def test_kubectl_failure_is_an_error_row_exit_1_and_the_others_are_graded(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_kubectl=["seeded-a"])
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
+        self.assertEqual(by_name["seeded-a"]["status"], "unknown")
+        self.assertIsNone(by_name["seeded-a"]["pdbs"])
+        self.assertIn("i/o timeout", by_name["seeded-a"]["read_error"])
+        self.assertEqual(by_name["robot-host"]["status"], "blocked")
+        self.assertEqual(by_name["seeded-b"]["status"], "blocked")
+        self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
+        self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
+        self.assertIn("| read failed |", text)
+        # The version row is unaffected, and the rollout record does not treat the project as unread.
+        self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
+        self.assertEqual(data["rollout"]["missing_members"], [])
+
+    def test_get_credentials_failure_is_an_error_row_and_skips_kubectl(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_credentials=["seeded-b"])
+        rc, _, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        b = next(m for m in data["members"] if m["cluster"] == "seeded-b")["readiness"]
+        # The exclusion still blocks it; the PDB rule alone is unread.
+        self.assertEqual(b["status"], "blocked")
+        self.assertIsNone(b["pdbs"])
+        self.assertIn("forbidden", b["read_error"])
+        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 2)
+
+    def test_unknown_target_grades_the_pdb_rule_and_marks_the_rest_unknown(self):
+        record = cluster("nochannel", "us-central1", "1.34.0-gke.1", [("p", "1.34.0-gke.1")], channel=None)
+        fake = FakeReadinessCommands({"p1": [record]}, {}, {"nochannel": self.objects["seeded-a"]})
+        stdout = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(stdout):
+            rc = report.main(["--state-dir", self.state_dir, "--project", "p1", "--readiness", "--kubeconfig-dir", self.kubeconfig_dir])
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertIn("| unknown | none |", stdout.getvalue())
+        self.assertIn("no target; exclusion scope and skew not graded", stdout.getvalue())
+
+    def test_default_kubeconfig_dir_follows_hermes_home(self):
+        with patch.dict(os.environ, {"HERMES_HOME": "/home/hermes"}):
+            self.assertEqual(report.default_kubeconfig_dir(), "/home/hermes/.kubeconfigs")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(report.default_kubeconfig_dir(), "/opt/data/.kubeconfigs")
+        self.assertEqual(report.kubeconfig_path("/d", "p", "../x", ""), "/d/kubeconfig_p_.._x_unset.yaml")
+
+    def test_bad_at_is_a_usage_error_and_at_needs_readiness(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
+            self.assertEqual(report.main(self._args("--readiness", "--at", "tomorrow", "--kubeconfig-dir", self.kubeconfig_dir)), report.EXIT_USAGE)
+            self.assertEqual(report.main(self._args("--at", self.AT)), report.EXIT_USAGE)
+            self.assertEqual(report.main(self._args("--kubeconfig-dir", self.kubeconfig_dir)), report.EXIT_USAGE)
+        self.assertEqual(fake.calls, [])

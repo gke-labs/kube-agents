@@ -303,14 +303,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/apply_cron_tick_lock_scope
 # stops firing looks exactly like one with nothing to report. The applier
 # widens the CHECK to include 'skipped', migrates the existing ledger in place
 # (table rebuild under BEGIN IMMEDIATE, refused rather than guessed if the DDL
-# is ambiguous), and writes a row at each of the five places the scheduler
+# is ambiguous), and writes a row at each of the seven places the scheduler
 # drops an occurrence today.
 #
 # Upstream also prunes to the newest 1000 terminal rows across ALL jobs, so the
 # minute-ly ticker evicts a daily watchdog's only row inside 17 hours.
 # Retention becomes per job, with a global ceiling and a per-job floor.
 #
-# Must stay AFTER the cron_tick_lock_scope block: two of the seventeen anchors
+# Must stay AFTER the cron_tick_lock_scope block: two of the nineteen anchors
 # are text that patch inserts.
 COPY --chmod=0644 deploy/docker/patches/cron_skip_ledger.py /opt/hermes/tools/cron_skip_ledger.py
 COPY deploy/docker/patches/apply_cron_skip_ledger.py \
@@ -326,6 +326,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/apply_cron_skip_ledger.p
     grep -q "reason=SKIP_ALREADY_RUNNING_ELSEWHERE" /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_INTERPRETER_SHUTDOWN" /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_DISPATCH_CLAIM_REJECTED" /opt/hermes/cron/scheduler.py && \
+    grep -q "reason=SKIP_CREATE_EXECUTION_FAILED" /opt/hermes/cron/scheduler.py && \
+    grep -q "reason=SKIP_FIRE_CLAIM_LOST" /opt/hermes/cron/scheduler.py && \
+    ! grep -q 'error="Fire claim lost' /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_MISSED_WINDOW" /opt/hermes/cron/jobs.py && \
     grep -q "reason=SKIP_ALREADY_RUNNING," /opt/hermes/tools/cronjob_tools.py && \
     grep -q "reason=SKIP_ALREADY_RUNNING_ELSEWHERE" /opt/hermes/tools/cronjob_tools.py && \
@@ -980,16 +983,45 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # rather than a patch -- see the /opt/platform-template/config.yaml assertion
 # further down. It must not ship alone: raising the cap only moves when the bug
 # fires.
-# See the module docstring in deploy/docker/patches/kanban_guardrail_exit.py.
-COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py /opt/hermes/hermes_cli/kanban_guardrail_exit.py
+#
+# Quota storms (2026-09-03, #1225) add two edits to the same block. A worker
+# whose 429 retries are exhausted used to leave its card `running` with no
+# reason on the board and exit 75 for the reaper to classify; the storm recorded
+# three `crashed` and a hard block, and the delegating agent reported the
+# delegation's status as its answer. Two more guardrail-exit edits make the
+# worker block its own card first, `kind=transient` with the provider's 429
+# text as the reason: at the cli.py exit-code site (the return a 429 takes) and,
+# through the finalize_turn backstop, for a retry loop that ends with no
+# response at all. billing keeps the stock exit. transient counts in upstream's
+# unblock-loop breaker like every truly-blocked kind: a card blocked this way,
+# unblocked, and blocked this way again lands in triage, not blocked. The second half,
+# rate_limit_retry_delay, makes the retries land where they can succeed: the
+# loop honoured only a Retry-After header, and Google sends its ~54s window in
+# the body as google.rpc.RetryInfo.retryDelay, so the three retries fell 2-6s
+# apart. The retryDelay fallback shares the header path's 600s cap and leaves
+# the retry count alone. Both new files ride this block's COPYs and RUN because
+# the image is three layers under the ceiling check_image_layers.py enforces.
+# See the module docstrings in deploy/docker/patches/kanban_guardrail_exit.py
+# and deploy/docker/patches/rate_limit_retry_delay.py.
+COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
+     deploy/docker/patches/rate_limit_retry_delay.py \
+     /opt/hermes/hermes_cli/
 COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_kanban_guardrail_exit.py \
+     deploy/docker/patches/apply_rate_limit_retry_delay.py \
+     deploy/docker/patches/verify_rate_limit_retry_delay.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardrail_exit.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_rate_limit_retry_delay.py /opt/hermes && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/conversation_loop.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
+    grep -q "agent._kube_last_api_failure = (" /opt/hermes/agent/conversation_loop.py && \
+    grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
+    grep -q "_kube_block_rate_limited_chat(result)" /opt/hermes/cli.py && \
+    grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/conversation_loop.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a

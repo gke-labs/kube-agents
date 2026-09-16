@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # SCENARIO_* and the run flags are read by lib/common.sh, sourced below
 #
 # Rule A — Lack of Zone/Family Fallbacks.
 #

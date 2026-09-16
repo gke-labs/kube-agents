@@ -1,0 +1,95 @@
+{
+  "case": "agent-kanban-smoke",
+  "name": "Agent kanban smoke test",
+  "domain": "chat-and-routing",
+  "rung": 4,
+  "rung_name": "COLLAPSE",
+  "blocking": true,
+  "reason": "failed all 3 repetitions, and this case is admitted (it has screening evidence that it passes reliably): VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe']",
+  "admitted": true,
+  "expected_fail": false,
+  "notes": [],
+  "passes": 0,
+  "scored": 3,
+  "pass_rate": 0.0,
+  "judged_means": {
+    "OutcomeValidity": {
+      "mean": 0.7000000000000001,
+      "n": 3
+    },
+    "ToolInvocation": {
+      "mean": 0.5666666666666668,
+      "n": 3
+    },
+    "OutcomeScore": {
+      "mean": 0.5,
+      "n": 3
+    }
+  },
+  "reps": [
+    {
+      "index": 1,
+      "outcome": "fail",
+      "rung": null,
+      "reason": "VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe']",
+      "run_dir": "<FIXTURE_RUNS>/kanban_red_1",
+      "correctness": 0.5,
+      "coverage": 1.0,
+      "catastrophic": null,
+      "judged": {
+        "OutcomeValidity": 0.9,
+        "ToolInvocation": 0.6,
+        "OutcomeScore": 0.5
+      },
+      "latency": 133.12637670803815,
+      "total_tokens": 275153
+    },
+    {
+      "index": 2,
+      "outcome": "fail",
+      "rung": null,
+      "reason": "VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe']",
+      "run_dir": "<FIXTURE_RUNS>/kanban_red_2",
+      "correctness": 0.5,
+      "coverage": 1.0,
+      "catastrophic": null,
+      "judged": {
+        "OutcomeValidity": 1.0,
+        "ToolInvocation": 0.5,
+        "OutcomeScore": 0.5
+      },
+      "latency": 49.3587532970123,
+      "total_tokens": 135530
+    },
+    {
+      "index": 3,
+      "outcome": "fail",
+      "rung": null,
+      "reason": "VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe']",
+      "run_dir": "<FIXTURE_RUNS>/kanban_red_3",
+      "correctness": 0.5,
+      "coverage": 1.0,
+      "catastrophic": null,
+      "judged": {
+        "OutcomeValidity": 0.2,
+        "ToolInvocation": 0.6,
+        "OutcomeScore": 0.5
+      },
+      "latency": 46.11065511684865,
+      "total_tokens": 135064
+    }
+  ],
+  "admission_reason": "admitted by BOOTSTRAP_ADMITTED (transition bridge)",
+  "version_key": {
+    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "scoring_version": "v1",
+    "judge_model": "gemini-3.1-pro-preview",
+    "fleet": 1,
+    "verifiers": 1
+  },
+  "baseline_judged": null,
+  "baseline_runs": 0,
+  "baseline_passes": 0,
+  "deployer": "noop",
+  "label": "FAILED"
+}

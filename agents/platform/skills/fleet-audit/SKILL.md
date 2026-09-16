@@ -142,6 +142,8 @@ branch. It prints exactly one JSON line:
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"],
+  "context_repos": ["acme/terraform-live"],
+  "declared_intent_repos": ["acme/fleet", "acme/terraform-live"],
   "sop": "governance/compliance_audit_sop.md",
   "checks": ["privileged-container", "host-namespace", "…"],
   "checks_contract": "Run every check above against every cluster you can read. …"
@@ -166,6 +168,21 @@ workspace is empty rather than a checkout. Read it rather than guessing from wha
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
+
+`context_repos` names the repositories registered for **declared intent**: the `context_repos` key
+of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
+whose SOP has a declared-intent step (today `obtainability-audit`, §4a) searches them before it
+reports a posture as a finding. They are read and nothing else: the key is separate from
+`managed_repos`, the harness never merges the two, so the broker's push gate, the repository
+resolver and the sweep never see them. The list is empty when nothing is registered or the key
+could not be read, which `start` says on stderr; the GitOps clone is searched either way.
+
+`declared_intent_repos` is the set that step must account for: the GitOps repository plus every
+`context_repos` slug, one entry each. `start` writes the same set to a run record beside the
+findings document (`/opt/data/scratch/run_<audit-id>.json`), before it prints, and `finish` measures
+the document's `declared_intent_searched` against that record rather than against the ConfigMap as
+it stands at finish time. Every stream prints it; only a stream with a declared-intent step is held
+to it.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 
@@ -208,6 +225,10 @@ returns, so read `truncated` on both and **pass `--prefix`** on a large reposito
 each file into the workspace at its repo-relative path, which is exactly where a remediation editing
 that file has to end up; fetch it, edit it in place, and name the same path in the finding.
 
+All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this
+side to ask, and the declared-intent record (`declared_intent_searched`, below) names each repository
+as `owner/name@sha`; take the sha from the command whose answer you searched.
+
 All three take `--branch`, and a second round needs it. Without it they answer from the base, so a
 file the remediation branch has already changed — by an earlier run or by a reviewer — comes back as
 the base has it, and committing the edit onto that branch reverts the change. The revert
@@ -228,14 +249,18 @@ All three exit 2 in directory mode, where the clone already holds the file.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with nine fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
-`partial`, `coverage_gaps`, and `silent_ok`:
+JSON line with eleven fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+`partial`, `coverage_gaps`, `silent_ok`, `declared`, the number of postures a repository
+declaration kept off the ledger (it never decides silence), and `postures_withheld`, the ids of the
+posture findings `finish` held back because the document recorded no complete declared-intent
+search (empty everywhere but on a declaring stream that skipped the step; see
+[`declared_intent_searched`](#declared_intent_searched)):
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -254,9 +279,11 @@ broke.
 ### Partial coverage
 
 `partial` is `true` exactly when the run could not speak for the whole fleet: any entry in
-`scope.skipped`, any cluster carrying a `limitations` note, or any cluster whose `checks_run` is
-short of the checks that _apply_ to it. `coverage_gaps` says which, and why — so `partial` is `true`
-if and only if `coverage_gaps` is non-empty, and you can report from either.
+`scope.skipped`, any cluster carrying a `limitations` note, any cluster whose `checks_run` is
+short of the checks that _apply_ to it, or — on a stream with a declared-intent step — posture
+checks that ran without a complete search record ([`declared_intent_searched`](#declared_intent_searched)).
+`coverage_gaps` says which, and why — so `partial` is `true` if and only if `coverage_gaps` is
+non-empty, and you can report from either.
 
 A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
@@ -359,9 +386,34 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
         "note": "Apply a default-deny NetworkPolicy."
       }
     }
+  ],
+  "declared": [
+    {
+      "check": "no-hpa",
+      "cluster": "prod-us-east",
+      "namespace": "payments",
+      "object": "Deployment/api",
+      "title": "api is pinned at three replicas by Terraform",
+      "declaration": {
+        "repo": "acme/terraform-live",
+        "path": "clusters/prod-us-east/payments.tf",
+        "excerpt": "replicas = 3  # fixed: the upstream rate limit is per-instance"
+      }
+    }
+  ],
+  "declared_intent_searched": [
+    "acme/fleet@3f2a9c1d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b",
+    "acme/terraform-live@8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d"
   ]
 }
 ```
+
+(The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
+real compliance document would be rejected for carrying either. `declared[].check` is validated
+against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
+only `obtainability-audit` has one today, because only its SOP has a step that writes the list. A
+non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
+everywhere.)
 
 Field rules the validator enforces — a violation exits 2 naming the offending finding index and
 field, and publishes nothing:
@@ -437,6 +489,16 @@ field, and publishes nothing:
 - `remediation.kind` is `manifest`, `gcloud`, or `manual`. `path` is required for `manifest`
   (repo-relative, no `..`, no absolute paths, no glob metacharacters) and forbidden for the other
   two. For `gcloud`, put the exact command in `note` — it is rendered as a runnable block.
+- `declared` is **optional**, and is not a list of findings. Each entry is a posture a check would
+  have flagged that a linked repository declares on purpose — see
+  [`declared`](#declared) below. It carries `check`, `cluster`, `namespace`, `object` and `title`
+  under the same rules as a finding, plus a `declaration` object whose `repo` is an `owner/name`
+  slug, whose `path` follows the remediation-path rules, and whose `excerpt` is the non-empty lines
+  that pin the property. No `severity`, no `remediation`, no `id`. The document is rejected when an
+  entry's four identity fields match a finding's — a posture is reported or declared, never both —
+  when its `cluster` is not in `scope.clusters`, or when its `check` is not one of the stream's
+  declarable posture checks (a declared fault is a declared bug, and a stream with no
+  declared-intent step has none). A document without the key validates as before.
 - **A `path` is discovered, never invented.** Editing an object means writing over its existing
   declaration. Creating one means writing beside a sibling already applied to the same cluster and
   namespace — search the repository for `namespace: <namespace>`, then **open the hits and confirm
@@ -503,6 +565,74 @@ Three fields, all required, all load-bearing for the human who has to decide:
 - **`rationale`** — why _this_ fix and not the obvious alternative. **Name the alternative you
   considered and why you rejected it.** A rationale that restates the action is not a rationale.
 - **`risk`** — what breaks on apply, and the read-only check to run first.
+
+### `declared`
+
+A finding says the fleet is wrong; a declared posture says the fleet is what somebody meant. The
+list exists because the audits judge live state against generic practice, and a platform team that
+pinned a replica count in Terraform on purpose was getting the same `no-hpa` finding every morning
+until someone suppressed it by hand. The SOP's declared-intent step (`obtainability_audit_sop.md`
+§4a, the pilot) searches the GitOps clone's `provisioning/` and `knowledge/` directories and every
+repository in `context_repos` for a declaration that names the same object and pins the flagged
+property, and moves a match here instead of into `findings`.
+
+What the shape enforces:
+
+- **It is not a finding.** No id is derived, so a declared posture never enters the hidden delta
+  block: it is not announced as new when the declaration appears and not announced as resolved when
+  it goes, and nothing about it is ever promoted to a pull request. A finding that moves here
+  _does_ read as resolved in that run's delta — that is the intended outcome, and the ledger's
+  _Declared intent_ section says where it went.
+- **It is refutable.** Every entry names `repo:path` and quotes the lines that pin the property,
+  and the ledger renders both, so a reviewer who disagrees changes or removes the declaration and
+  the posture returns as a finding on the next run. A declaration the worker did not read is not
+  one it may cite.
+- **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
+  set in `AUDITS`, four for the pilot, and the validator rejects any other check with exit 2. A
+  drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
+  document that lists it under `declared` publishes nothing.
+
+### `declared_intent_searched`
+
+A top-level list of `owner/name@sha` strings: each repository the declared-intent step searched,
+at the commit it was read at. It is the record that the step ran, and it is what makes a skipped
+step visible. Nothing else in the document can: a run that skipped the search and published every
+posture as a finding, and a run that skipped it and left a candidate out, both validated as complete
+before this field existed.
+
+What `finish` does with it:
+
+- **Complete means every repository `start` named.** The list, sha stripped and case-folded, must
+  cover every slug in `start`'s `declared_intent_repos` — the GitOps repository and every
+  `context_repos` entry — measured against the run record `start` wrote, not the ConfigMap at finish
+  time. Extra repositories are allowed. The sha is checked for shape only (7 to 40 lowercase hex
+  characters), so the record is as forgeable as a padded `checks_run` and carries less; it makes a
+  skipped step visible, not impossible.
+- **It is owed whenever a declarable check ran.** Keyed on `checks_run`, not on the postures in
+  `findings`, for the reason above: a candidate left out without a search reads exactly like one a
+  declaration covered. A run on which none of the four checks ran anywhere owes nothing.
+- **Anything less is no search, and the postures are withheld.** No key, a list missing a
+  repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
+  declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
+  shares its slug with the `min == max` posture, and adds one `coverage_gaps` sentence naming each
+  withheld entry and the repositories not searched. The faults publish; `declared[]` entries publish.
+  `partial` stays `bool(coverage_gaps)`, so the ledger does not close, `resolved` is `0`, no stale
+  pull request is retired, and the withheld ids enter no delta block and no remediation pull
+  request. The ledger names the withheld postures under _Declared intent not searched_ below the
+  Scope table, the clean comment lists them, and the JSON line carries their ids as
+  `postures_withheld`.
+- **A complete record renders.** One line under Scope, `Declared-intent search: owner/name@sha, …`,
+  so a reader can see what was read.
+
+Where the sha comes from is the SOP's §4a: in content mode `list`, `grep` and `fetch` print it for
+the GitOps repository and `inspect_repository.py clone` and `open` print it for a context copy; in
+directory mode it is `git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that
+`clone` named for the context copy.
+
+The withhold binds the direct-ask path too: `remediate --finding <id>` applies it against the same
+record and refuses a withheld id by name, because a pull request for a posture the ledger says was
+held back would contradict the ledger. A `/remediate` comment naming a withheld posture is deferred,
+not refused — see the answers list under [Remediation pull requests](#remediation-pull-requests).
 
 ## Evidence rules
 
@@ -576,6 +706,16 @@ April close every morning forever. Post a fresh one.
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
 
+Below the findings, a ledger whose document carried a `declared` list renders a **Declared intent**
+table: one row per entry, with the check, the cluster, the object, `repo:path`, and the title and
+excerpt. Rows have no state and no id — nothing in that table is tracked between runs — and the
+table is capped at 50 rows and says how many it left out. On a clean run the ledger closes without
+being rewritten, so the all-clear comment lists the declared postures instead, with the same
+`repo:path` pointers — and that comment is the last ledger record: a later clean run with nothing
+but declarations opens no ledger and posts nothing, because the ledger tracks findings and a
+standing declaration is the same every morning. From then on the declaration in the repository is
+the record, and `finish` reports the count as `declared`.
+
 ## Remediation pull requests
 
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
@@ -605,6 +745,13 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
   finding that is not in the current document, or one naming a non-`manifest` finding.
+- **Deferred**, when the target is a posture this run withheld for want of a declared-intent search
+  ([`declared_intent_searched`](#declared_intent_searched)) — on the findings branch and on the clean
+  branch alike, since "no longer reproduces" would be false there. One reply says the request is on
+  hold and why, under its own `audit-deferred` marker, which nothing reads as an answer: the same
+  comment is acted on, and acknowledged, by the first run that records the search and still sees
+  the posture. The refused marker is never written for it, so the requester is not told their id was
+  a typo and does not have to ask again.
 - Refused **on syntax**, likewise once, because a command the parser will not honour is a person
   waiting for a fix that is never coming. `/remediate` is only read at the start of its own line outside
   block quotes, so one written mid-sentence or rendered inside a block quote / lazy continuation gets a reply
@@ -708,6 +855,10 @@ Resolution accounting is unaffected by truncation, because the two halves of the
 against different sets: **new** is judged against what the body rendered, and **resolved** against
 every finding in the document, rendered or not. A finding cut for space still reproduces and is
 never reported as fixed.
+
+The **Declared intent** table is measured with the fixed sections, before the findings claim what
+is left, so on a body near the limit it is the findings that yield — and it is row-capped, so what
+it can cost is bounded.
 
 The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
 `checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the

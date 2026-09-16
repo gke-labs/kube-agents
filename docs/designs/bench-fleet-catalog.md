@@ -42,11 +42,13 @@ and `seeded-c`, all zonal in `us-central1-a`. The clusters also carry
 `managed-by=kube-agents-seeded-fleet`, which is what keeps the orphan sweep (it matches
 `managed-by=kube-agents-bench`) away from them.
 
-The rule is about where a check points, not about every string in the file. Two cases
-assert a rendered cluster name in a phrase list — `upgrade-readiness-lagging-cluster`
-requires `seeded-b` and `consistency-drift-outlier` requires `seeded-c` — because the
-claim being graded is that the audit named the right cluster, and `bench/tasks/DRAFTS.md`
-records those two names as a contract with `bench/tf/fleet/`. That is a different thing
+The rule is about where a check points, not about every string in the file. A case may
+require a rendered cluster name in a phrase list (`seeded-b` in the upgrade cases,
+`seeded-c` in `consistency-drift-outlier`) when the claim being graded is that the audit
+named the right cluster; `bench/tasks/DRAFTS.md` records those names as a contract with
+`bench/tf/fleet/`, and the cases that rely on it say so in a comment beside the phrase
+(`grep -l 'required_phrases:.*"seeded-' bench/tasks/*/task.yaml` lists them). That is a
+different thing
 from addressing a fixture: the phrase survives the prefix being the default it has always
 been, and it breaks loudly and correctly if the prefix ever changes. What must never
 happen is a check _targeting_ a cluster by name, which is the harness's job and the thing
@@ -63,11 +65,11 @@ eventually resolves it.
 Every project in the Boskos pool carries a fleet and keeps its own state bucket. Which
 projects those are is not repeated here, because a count written into prose goes stale the
 next time a project is onboarded and nothing fails when it does. Two lists hold it and they
-are not the same list: the table in
-[CI pool project prerequisites](../site/src/content/docs/deploy/ci-pool-projects.md) is every
-project this codebase maps to a GitOps repository, while the leasable roster is
-`gke-internal/test-infra`. A project is mapped before it is registered, so the table runs
-ahead.
+are not the same list: `gitops_repo_for_project()` in `hack/ci-deploy.sh` (see
+[CI pool project prerequisites](../ci-pool-projects.md)) is every
+project this codebase maps to a GitOps repository, while the leasable roster is the Boskos
+configuration in Google's internal test-infra repository. A project is mapped before it is
+registered, so the mapping runs ahead.
 
 The live audit behind this document covered `kube-agents-evals` and `kube-agents-evals-2`.
 `kube-agents-evals-3` predates `scripts/provision_ci_pool_project.sh`; every project from
@@ -83,7 +85,7 @@ So the rule is that the fleet stack is applied to every project in the pool befo
 fleet-dependent case activates, and a project added to the pool later is not lease-eligible
 until its fleet is applied. Nothing in the harness checks it, so it belongs on the
 pool-project onboarding checklist in
-[CI pool project prerequisites](../site/src/content/docs/deploy/ci-pool-projects.md),
+[CI pool project prerequisites](../ci-pool-projects.md),
 whose own rule is that the project is registered last.
 
 ## The roles

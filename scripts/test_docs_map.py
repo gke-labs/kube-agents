@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the two guards the documentation map's mergeability rests on.
+"""Unit tests for the guards the documentation map's mergeability and audience rest on.
 
 Run: cd scripts && python3 -m unittest test_docs_map
 
@@ -12,7 +12,12 @@ back with no signal. A family-glob extraction that stops matching a row makes
 family's deletion guard is gone.
 """
 
+import contextlib
+import io
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import check_docs_map
 import generate_docs
@@ -53,6 +58,101 @@ class RealignedRowsTest(unittest.TestCase):
     def test_the_committed_map_is_compact(self):
         text = check_docs_map.MAP.read_text(encoding="utf-8")
         self.assertEqual(check_docs_map.realigned_rows(text), [])
+
+
+SITE_TABLE_HEAD = (
+    "### `docs/site/src/content/docs/` — the published site\n\n"
+    "| Path | Category | Purpose | Key topics | Audience / notes |\n| --- | --- | --- | --- | --- |\n"
+)
+
+
+class MaintainerAudienceRowsTest(unittest.TestCase):
+    """`maintainer_audience_rows` -- the audience check on the site table."""
+
+    def _site(self, *rows: str, after: str = "") -> str:
+        return SITE_TABLE_HEAD + "".join(f"{row}\n" for row in rows) + after
+
+    def test_users_row_is_clean(self):
+        text = self._site("| `install/x.md` | Site page | Installing. | Install | Users |")
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [])
+
+    def test_ci_engineers_row_is_flagged(self):
+        text = self._site("| `deploy/ci.md` | Site page | Wiring. | Prow | CI engineers |")
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [(5, "`deploy/ci.md`", "CI engineers")])
+
+    def test_maintainers_and_contributors_are_flagged_case_insensitively(self):
+        text = self._site(
+            "| `a.md` | Site page | A. | A | maintainers only |",
+            "| `b.md` | Site page | B. | B | New Contributors |",
+        )
+        self.assertEqual([w for _, _, w in check_docs_map.maintainer_audience_rows(text)], ["maintainers", "Contributors"])
+
+    def test_the_word_in_a_purpose_cell_is_not_a_finding(self):
+        """A page may point contributors off-site without being for them."""
+        text = self._site("| `contributing.md` | Site page | Points contributors at `CONTRIBUTING.md`. | CLA | Users |")
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [])
+
+    def test_the_cla_page_may_name_contributors(self):
+        text = self._site("| `contributing.md` | Site page | The CLA. | CLA | Prospective contributors |")
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [])
+
+    def test_rows_outside_the_site_table_are_not_checked(self):
+        text = self._site(after="### `terraform/`\n\n| Path | C | P | K | A |\n| --- | --- | --- | --- | --- |\n| `t/README.md` | README | T. | T | CI engineers |\n")
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [])
+
+    def test_a_level_two_heading_also_closes_the_site_table(self):
+        """The table is the last `###` of the inventory the day `examples/` moves; §5's rows are not site rows."""
+        text = self._site(after="## 5. Editing\n\n| Path | C | P | K | A |\n| --- | --- | --- | --- | --- |\n| `t/README.md` | README | T. | T | CI engineers |\n")
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [])
+
+    def test_the_committed_map_has_no_maintainer_site_rows(self):
+        text = check_docs_map.MAP.read_text(encoding="utf-8")
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [])
+
+
+class SiteTablePreconditionTest(unittest.TestCase):
+    """A map whose site heading was reworded is an error, never a clean report."""
+
+    def test_reworded_site_heading_is_an_error(self):
+        text = SITE_TABLE_HEAD.replace("### `docs/site/src/content/docs/`", "### The published site") + "| `x.md` | Site page | X. | X | CI engineers |\n"
+        self.assertEqual(check_docs_map.maintainer_audience_rows(text), [], "the rows are invisible, which is the point")
+        errors = check_docs_map.preconditions(text)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no published-site table", errors[0])
+
+    def test_the_committed_map_has_a_site_table(self):
+        self.assertEqual(check_docs_map.preconditions(check_docs_map.MAP.read_text(encoding="utf-8")), [])
+
+
+class MainRedPathTest(unittest.TestCase):
+    """`main()` on a failing map: the exit code and the line an author has to act on."""
+
+    def _run_main_on(self, text: str) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_map = Path(tmp) / "README.md"
+            fake_map.write_text(text, encoding="utf-8")
+            out = io.StringIO()
+            with mock.patch.object(check_docs_map, "MAP", fake_map), contextlib.redirect_stdout(out):
+                code = check_docs_map.main()
+        return code, out.getvalue()
+
+    def test_a_maintainer_site_row_fails_and_is_named(self):
+        """The committed map plus one bad row: coverage still holds, so only the audience check fires."""
+        lines = check_docs_map.MAP.read_text(encoding="utf-8").splitlines(keepends=True)
+        first_site_row = next(number for number, _ in check_docs_map.site_rows("".join(lines)))
+        cells = lines[first_site_row - 1].rstrip("\n").strip("|").split("|")
+        cells[-1] = " CI engineers "
+        lines.insert(first_site_row, "|" + "|".join(cells) + "|\n")
+        code, out = self._run_main_on("".join(lines))
+        self.assertEqual(code, 1)
+        self.assertIn(f"AUDIENCE line {first_site_row + 1}: {cells[0].strip()} -- 'CI engineers'", out)
+
+    def test_a_map_without_a_site_table_fails_before_any_check(self):
+        text = check_docs_map.MAP.read_text(encoding="utf-8").replace("### `docs/site/src/content/docs/`", "### The published site")
+        code, out = self._run_main_on(text)
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR:", out)
+        self.assertIn("no published-site table", out)
 
 
 class FamilyGlobsTest(unittest.TestCase):

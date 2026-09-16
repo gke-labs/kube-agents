@@ -3,7 +3,7 @@ name: gke-manifest-generation
 metadata:
   category: Containers
 description: >-
-  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning (use gke-cluster-creation).
+  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), cluster infrastructure provisioning (use gke-cluster-creation), or Google Cloud resources as Config Connector manifests (use gcp-config-connector).
 ---
 
 # GKE Manifest Generation Skill
@@ -26,7 +26,7 @@ following rules:
     active `SETTINGS.md`. Never omit the namespace.
 -   **Dedicated ServiceAccount**: Avoid using the namespace's `default`
     ServiceAccount. Always create and reference a dedicated `ServiceAccount`
-    (e.g., `devteam-agent-sa`) for each microservice.
+    (e.g., `checkout-sa`) for each microservice.
 
 ### 2. GKE Resource Tuning (Autopilot & Standard)
 

@@ -1,0 +1,10 @@
+## Evaluation verdict
+
+**GREEN**
+
+Admitted-case pass rate: 100.0% (no baseline at the current version key -- advisory)
+
+| Case | Domain | Verdict | Passes | Detail |
+| --- | --- | --- | --- | --- |
+| `agent-kanban-smoke` | chat-and-routing | UNSTABLE (rung 7) | 0/3 | passed 0 of 3 repetitions (not admitted, so it cannot collapse) |
+| `agent-kanban-smoke` | chat-and-routing | PASSED (rung 7) | 3/3 | passed all 3 repetitions |

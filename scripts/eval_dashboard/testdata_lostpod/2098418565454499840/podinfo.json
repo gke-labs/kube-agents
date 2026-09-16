@@ -1,0 +1,121 @@
+{
+ "pod": {
+  "metadata": {
+   "name": "04b326d5-ced8-4997-b889-36107331de0a",
+   "namespace": "test-pods",
+   "creationTimestamp": "2026-09-11T14:29:07Z"
+  },
+  "spec": {
+   "nodeName": "gke-kube-agents-prow-default-pool-eb220b2a-baaq"
+  },
+  "status": {
+   "phase": "Failed",
+   "startTime": "2026-09-11T14:29:07Z",
+   "containerStatuses": [
+    {
+     "name": "sidecar",
+     "state": {
+      "waiting": {
+       "reason": "PodInitializing"
+      }
+     },
+     "ready": false
+    },
+    {
+     "name": "test",
+     "state": {
+      "waiting": {
+       "reason": "PodInitializing"
+      }
+     },
+     "ready": false
+    }
+   ]
+  }
+ },
+ "events": [
+  {
+   "reason": "Scheduled",
+   "message": "Successfully assigned test-pods/04b326d5-ced8-4997-b889-36107331de0a to gke-kube-agents-prow-default-pool-eb220b2a-baaq",
+   "type": "Normal",
+   "firstTimestamp": "2026-09-11T14:29:07Z",
+   "lastTimestamp": "2026-09-11T14:29:07Z",
+   "count": 1,
+   "source": {
+    "component": "default-scheduler"
+   }
+  },
+  {
+   "reason": "Pulled",
+   "message": "Container image \"us-central1-docker.pkg.dev/gob-prow/prow-images/clonerefs:v20260812-b5681a827\" already present on machine and can be accessed by the pod",
+   "type": "Normal",
+   "firstTimestamp": "2026-09-11T14:29:08Z",
+   "lastTimestamp": "2026-09-11T14:29:08Z",
+   "count": 1,
+   "source": {
+    "component": "kubelet",
+    "host": "gke-kube-agents-prow-default-pool-eb220b2a-baaq"
+   }
+  },
+  {
+   "reason": "Created",
+   "message": "Container created",
+   "type": "Normal",
+   "firstTimestamp": "2026-09-11T14:29:08Z",
+   "lastTimestamp": "2026-09-11T14:29:08Z",
+   "count": 1,
+   "source": {
+    "component": "kubelet",
+    "host": "gke-kube-agents-prow-default-pool-eb220b2a-baaq"
+   }
+  },
+  {
+   "reason": "Started",
+   "message": "Container started",
+   "type": "Normal",
+   "firstTimestamp": "2026-09-11T14:29:08Z",
+   "lastTimestamp": "2026-09-11T14:29:08Z",
+   "count": 1,
+   "source": {
+    "component": "kubelet",
+    "host": "gke-kube-agents-prow-default-pool-eb220b2a-baaq"
+   }
+  },
+  {
+   "reason": "Pulled",
+   "message": "Container image \"us-central1-docker.pkg.dev/gob-prow/prow-images/initupload:v20260812-b5681a827\" already present on machine and can be accessed by the pod",
+   "type": "Normal",
+   "firstTimestamp": "2026-09-11T14:29:15Z",
+   "lastTimestamp": "2026-09-11T14:29:15Z",
+   "count": 1,
+   "source": {
+    "component": "kubelet",
+    "host": "gke-kube-agents-prow-default-pool-eb220b2a-baaq"
+   }
+  },
+  {
+   "reason": "Created",
+   "message": "Container created",
+   "type": "Normal",
+   "firstTimestamp": "2026-09-11T14:29:15Z",
+   "lastTimestamp": "2026-09-11T14:29:15Z",
+   "count": 1,
+   "source": {
+    "component": "kubelet",
+    "host": "gke-kube-agents-prow-default-pool-eb220b2a-baaq"
+   }
+  },
+  {
+   "reason": "Started",
+   "message": "Container started",
+   "type": "Normal",
+   "firstTimestamp": "2026-09-11T14:29:15Z",
+   "lastTimestamp": "2026-09-11T14:29:15Z",
+   "count": 1,
+   "source": {
+    "component": "kubelet",
+    "host": "gke-kube-agents-prow-default-pool-eb220b2a-baaq"
+   }
+  }
+ ]
+}

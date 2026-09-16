@@ -45,14 +45,6 @@ SCRATCH_DIR = "/opt/data/scratch"
 BODY_STDIN = "-"
 
 
-# The operator accepts a bare "owner/repo" shorthand as a valid gitRepo and
-# writes it through to SETTINGS.md verbatim, so it reaches us hostless. This
-# mirrors ownerRepoRegex in k8s-operator/api/v1alpha1/common_types.go, which is
-# the contract for what can land in the file — treating the shorthand as
-# malformed would alert on a supported configuration. It is also the form
-# `gh -R` takes natively.
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
 
 def _run_gh_once(args: list, stdin: str | None = None) -> subprocess.CompletedProcess:
     """Run one gh command, mapping a missing binary onto a return code.
@@ -467,7 +459,7 @@ def handle_poll(args):
         )
         return
 
-    repos = [r for r in repos if BARE_REPO_RE.match(r)]
+    repos = [r for r in repos if is_valid_repo_slug(r)]
     if not repos:
         print(json.dumps({"status": "NOT_CONFIGURED"}))
         return

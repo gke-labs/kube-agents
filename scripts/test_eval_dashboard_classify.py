@@ -32,7 +32,7 @@ CRASHLOOP_TRIO = [
     "cluster-agent-crashloop-evidence-chain",
     "cluster-agent-crashloop-misleading-symptom",
 ]
-# The roster in force on 2026-09-08 (hack/ci-eval-pr.sh at this checkout).
+# The roster in force on 2026-09-08 (hack/eval/blocking-roster.txt at this checkout).
 ADMITTED = frozenset(
     CRASHLOOP_TRIO
     + [
@@ -117,12 +117,12 @@ class RepAndOutcomeTest(unittest.TestCase):
         with_excerpt = dict(task("a", "fff"), excerpt="  payments-api is Pending  ")
         self.assertEqual(classify.excerpt_of(with_excerpt), "payments-api is Pending")
 
-    def test_the_roster_is_read_from_the_ci_script(self):
+    def test_the_roster_is_read_from_the_roster_file(self):
         roster = classify.admitted_cases()
         self.assertIsNotNone(roster)
         for name in CRASHLOOP_TRIO:
             self.assertIn(name, roster)
-        self.assertIsNone(classify.admitted_cases(pathlib.Path("/nonexistent/ci-eval-pr.sh")))
+        self.assertIsNone(classify.admitted_cases(pathlib.Path("/nonexistent/blocking-roster.txt")))
 
 
 class SharedRuleTest(unittest.TestCase):
@@ -249,6 +249,45 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertEqual(verdict["do"], classify.DO_SETUP)
         self.assertFalse(classify_run(target, [target])["matches_incident"])
 
+    def test_a_conflicted_merge_is_the_branch_s_own_and_says_rebase(self):
+        # #1608: the same zero-task FAILURE shape, but the run page must not
+        # send the author to /retest -- that re-runs the same merge.
+        target = dict(run(1, 1, T0, minutes=3, result="FAILURE"), merge_conflict=True)
+        self.assertTrue(classify.is_merge_conflict(target))
+        self.assertFalse(classify.is_setup_death(target))
+        verdict = classify_run(target, [target], health_at=SETUP)
+        self.assertEqual((verdict["verdict"], verdict["setup_death"], verdict["cases"]), ("red", False, []))
+        self.assertEqual(verdict["do"], classify.DO_MERGE_CONFLICT)
+        # A setup-death outage running at the same time is not this run's.
+        self.assertFalse(verdict["matches_incident"])
+        # False and absent both stay setup deaths.
+        for other in ({"merge_conflict": False}, {}):
+            self.assertTrue(classify.is_setup_death(dict(run(1, 1, T0, minutes=3, result="FAILURE"), **other)))
+
+    def test_a_lost_pod_is_run_level_and_never_a_setup_death(self):
+        # The build node went away (#1478): zero tasks, FAILURE, no build
+        # log, NodeNotReady -- at any duration, including under five minutes.
+        for minutes in (2, 128):
+            raw = {"build_id": "1", "pr": 1118, "result": "failure", "started": "2026-09-11T12:11:04+00:00", "finished": "2026-09-11T14:19:16+00:00", "duration_s": minutes * 60, "tasks": [], "has_build_log": False, "pod_phase": "Failed", "pod_node": "gke-kube-agents-prow-default-pool-eb220b2a-sgnk", "pod_last_event": "NodeNotReady"}
+            self.assertTrue(classify.is_lost_pod(raw))
+            self.assertFalse(classify.is_setup_death(raw))
+            verdict = classify.classify_run(raw, [raw], None, admitted=frozenset())
+            self.assertEqual(verdict["headline"], f"The build node running this job went away {minutes} minutes in.")
+            self.assertIn("lost gke-kube-agents-prow-default-pool-eb220b2a-sgnk mid-run", verdict["lede"])
+            self.assertEqual((verdict["verdict"], verdict["setup_death"], verdict["matches_incident"]), ("infra", False, False))
+            self.assertEqual(verdict["do"], classify.DO_LOST_POD)
+        lost = {"state": "DEGRADED", "condition": "lost_pods", "failing_cases": []}
+        verdict = classify.classify_run(raw, [raw], lost, admitted=frozenset())
+        self.assertTrue(verdict["matches_incident"])
+        self.assertIn("Other PRs lost their runs the same way right now.", verdict["lede"])
+        # Missing log alone is enough; an old document with neither field
+        # is unknown and falls through to the setup-death rule.
+        self.assertTrue(classify.is_lost_pod(dict(raw, pod_last_event=None, pod_node=None)))
+        self.assertFalse(classify.is_lost_pod(dict(raw, has_build_log=True, pod_last_event="Started")))
+        legacy = {k: v for k, v in raw.items() if k not in ("has_build_log", "pod_phase", "pod_node", "pod_last_event")}
+        self.assertFalse(classify.is_lost_pod(legacy))
+        self.assertTrue(classify.is_setup_death(dict(legacy, duration_s=120)))
+
     def test_a_zero_task_green_is_a_revalidated_push(self):
         # hack/ci-eval-pr.sh step 0: inert paths changed, the earlier green stands.
         verdict = classify_run(run(1, 913, T0, minutes=4, result="SUCCESS"), [])
@@ -303,6 +342,72 @@ class PassRateTest(unittest.TestCase):
         classify._RATE_CACHE[second_key] = classify._RATE_CACHE[first_key]
         self.assertEqual(classify.case_pass_rates(second, T0)["agent-kanban-smoke"], 0.0, "the hit must be verified against the list, not only its id")
         self.assertIs(classify._RATE_CACHE[second_key][0], second, "the memo holds the list so its id stays pinned")
+
+
+class NightlyTierTest(unittest.TestCase):
+    """The nightly periodic's runs (runs[].tier) are not other PRs: they
+    never make a case shared, never supply the passes only-this-PR needs,
+    and never enter the 30-day rate. What they add is nightly_failed_recent."""
+
+    @staticmethod
+    def nightly(run_doc):
+        return dict(run_doc, tier="nightly", pr=None)
+
+    def test_nightly_failures_are_not_other_prs_for_the_shared_rule(self):
+        target = run(1, 1275, T0, tasks=gate_tasks(["cluster-agent-crashloop-debug"]))
+        others = [run(100 + i, None, T0 - timedelta(minutes=60 * (i + 1)), tasks=gate_tasks(["cluster-agent-crashloop-debug"])) for i in range(2)]
+        # Two runs with pr None but no tier are still other-PR runs (the
+        # pre-tier reading of an unknown PR) and count as ONE phantom PR;
+        # tagged nightly they count as none. A third such run would have
+        # been the difference between "unexplained" and "shared".
+        c = case(classify_run(target, [target] + others), "cluster-agent-crashloop-debug")
+        self.assertEqual((c["cls"], c["also_failing_prs"]), (None, 1))
+        c = case(classify_run(target, [target] + [self.nightly(o) for o in others]), "cluster-agent-crashloop-debug")
+        self.assertEqual((c["cls"], c["also_failing_prs"]), (None, 0))
+        with_one_pr = others + [run(300, 1246, T0 - timedelta(minutes=30), tasks=gate_tasks(["cluster-agent-crashloop-debug"]))]
+        self.assertEqual(case(classify_run(target, [target] + with_one_pr), "cluster-agent-crashloop-debug")["cls"], "shared", "untagged: the phantom PR plus #1246 clear the two-PR floor")
+        self.assertIsNone(case(classify_run(target, [target] + [self.nightly(o) for o in others] + with_one_pr[-1:]), "cluster-agent-crashloop-debug")["cls"], "tagged: #1246 alone does not")
+        self.assertTrue(c["nightly_failed_recent"], "but the nightly's collapse is reported beside the verdict")
+
+    def test_nightly_passes_do_not_make_a_failure_only_this_prs(self):
+        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe"]))
+        passing = [run(200 + i, 500 + i, T0 - timedelta(minutes=60 * (i + 1)), tasks=gate_tasks()) for i in range(3)]
+        self.assertEqual(case(classify_run(target, [target] + passing), "security-overgrant-probe")["cls"], "only-this-pr")
+        c = case(classify_run(target, [target] + [self.nightly(p) for p in passing]), "security-overgrant-probe")
+        self.assertIsNone(c["cls"])
+        self.assertIs(c["nightly_failed_recent"], False, "the latest nightly passed it")
+
+    def test_the_30_day_rate_is_the_presubmits_alone(self):
+        good = [run(300 + i, 1, T0 - timedelta(days=i + 1), tasks=gate_tasks()) for i in range(3)]
+        nightly_bad = [self.nightly(run(400 + i, None, T0 - timedelta(days=i + 1), tasks=gate_tasks(["agent-kanban-smoke"]))) for i in range(3)]
+        target = run(1, 9, T0, tasks=gate_tasks(["agent-kanban-smoke"]))
+        c = case(classify.classify_run(target, good + nightly_bad + [target], admitted=ADMITTED, now=T0), "agent-kanban-smoke")
+        self.assertAlmostEqual(c["pass_rate_30d"], 9 / 12, msg="9 presubmit passes, this run's 3 fails; the nightly's 9 fails not counted")
+
+    def test_nightly_failed_recent_is_the_newest_night_within_two_days_or_none(self):
+        target = run(1, 9, T0, tasks=gate_tasks(["agent-kanban-smoke"]))
+        old_fail = self.nightly(run(500, None, T0 - timedelta(days=3), tasks=gate_tasks(["agent-kanban-smoke"])))
+        self.assertIsNone(case(classify_run(target, [target, old_fail]), "agent-kanban-smoke")["nightly_failed_recent"], "outside the window")
+        newer_pass = self.nightly(run(501, None, T0 - timedelta(hours=20), tasks=gate_tasks()))
+        older_fail = self.nightly(run(502, None, T0 - timedelta(hours=44), tasks=gate_tasks(["agent-kanban-smoke"])))
+        self.assertIs(case(classify_run(target, [target, older_fail, newer_pass]), "agent-kanban-smoke")["nightly_failed_recent"], False, "the newest night wins")
+        after = self.nightly(run(503, None, T0 + timedelta(hours=6), tasks=gate_tasks(["agent-kanban-smoke"])))
+        self.assertIs(case(classify_run(target, [target, newer_pass, after]), "agent-kanban-smoke")["nightly_failed_recent"], True, "a night after the run counts too")
+        ungraded = self.nightly(run(504, None, T0 - timedelta(hours=1), tasks=[task("agent-kanban-smoke", "iii")]))
+        self.assertIsNone(case(classify_run(target, [target, ungraded]), "agent-kanban-smoke")["nightly_failed_recent"], "infra grades nothing")
+        whole_night_red = self.nightly(run(505, None, T0 - timedelta(hours=2), tasks=gate_tasks(sorted(ADMITTED))))
+        self.assertIsNone(case(classify_run(target, [target, whole_night_red]), "agent-kanban-smoke")["nightly_failed_recent"], "a run-level-event night says nothing about one case")
+        self.assertIs(case(classify_run(target, [target, whole_night_red, older_fail]), "agent-kanban-smoke")["nightly_failed_recent"], True, "the newest night that counts is the one before it")
+        # A passing case on the target still gets the note; a case the
+        # nightly never ran gets None.
+        verdict = classify_run(target, [target, after])
+        self.assertIs(case(verdict, "reliability-pdb-probe")["nightly_failed_recent"], False)
+
+    def test_the_tier_split_is_stable_across_calls(self):
+        runs = [run(1, 1, T0, tasks=gate_tasks()), self.nightly(run(2, None, T0, tasks=gate_tasks()))]
+        gate, nightly = classify.split_tiers(runs)
+        self.assertEqual(([r["build_id"] for r in gate], [r["build_id"] for r in nightly]), (["1"], ["2"]))
+        self.assertIs(classify.split_tiers(runs)[0], gate, "the same list object, so the rate memo keyed on it hits")
 
 
 class RealWeekTest(unittest.TestCase):
@@ -394,6 +499,7 @@ class RealWeekTest(unittest.TestCase):
             self.assertIn(verdict["verdict"], ("red", "green", "infra"))
             for c in verdict["cases"]:
                 self.assertEqual(set(c) >= {"case", "outcome", "cls", "also_failing_prs", "pass_rate_30d", "reason", "excerpt", "do"}, True)
+                self.assertIsNone(c["nightly_failed_recent"], "no nightly in the fixture week")
                 self.assertIn(c["outcome"], ("failed", "partial", "passed", "infra"))
                 self.assertIn(c["cls"], ("shared", "only-this-pr", "storm", "setup", None))
 

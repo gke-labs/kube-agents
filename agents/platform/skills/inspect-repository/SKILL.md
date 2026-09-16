@@ -40,8 +40,9 @@ python3 ./skills/inspect-repository/scripts/inspect_repository.py clone --repo k
 ```
 
 Copies into `/opt/data/scratch/repos/<owner>__<name>` unless `--into` names
-somewhere else, and prints `written`, `bytes`, `skipped`, `stopped` and
-`complete`. Narrow with `--prefix api` when only part of it matters.
+somewhere else, and prints `written`, `bytes`, `skipped`, `stopped`,
+`complete` and, in content mode, `sha`, the commit the copy was taken from.
+Narrow with `--prefix api` when only part of it matters.
 
 **Search first, take what it names** when the repository is large — which is
 most of them:
@@ -55,6 +56,10 @@ python3 ./skills/inspect-repository/scripts/inspect_repository.py close --handle
 
 The handle survives between turns; the shell does not. Keep it, and **close it
 when you are done** — an open handle holds a clone on the broker's volume.
+`open` also prints `sha`, the commit the workspace was cloned at; a report
+that has to say which commit it read (the fleet-audit declared-intent record
+names each repository as `owner/name@sha`) takes it from there, since there
+is no `.git` on this side to ask.
 
 ## Rules
 
@@ -83,7 +88,7 @@ when you are done** — an open handle holds a clone on the broker's volume.
 | Subcommand | What it does                                                           |
 | ---------- | ---------------------------------------------------------------------- |
 | `clone`    | Copy a repository (or a `--prefix`) into a scratch directory and close |
-| `open`     | Open a broker-side workspace, print a handle                           |
+| `open`     | Open a broker-side workspace, print a handle and the `sha` it is at    |
 | `list`     | One page of the checkout's paths; page with `--after`                  |
 | `grep`     | Search tracked files; fixed-string unless `--regex`                    |
 | `fetch`    | Copy named paths into `--into`                                         |

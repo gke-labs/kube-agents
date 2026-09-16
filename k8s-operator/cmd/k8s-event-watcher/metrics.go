@@ -153,18 +153,19 @@ func newMetrics() *metrics {
 			Help: "Cluster Agent profiles that could not be turned into a watched cluster. Non-zero means a cluster is not being monitored.",
 		}, []string{"profile"}),
 		// 1 once the initial list has completed and events are flowing; 0
-		// before that and again once the informer stops. Deliberately not
-		// goroutine liveness: WaitForCacheSync has no timeout and the reflector
-		// retries forever, so an informer that cannot reach its cluster stays
-		// blocked and alive indefinitely. This gauge is the only thing that
-		// tells that apart from a working one.
+		// before that, while a 403 Forbidden holds the informer between
+		// attempts (watcher.go, handleWatchError), and again once the
+		// informer stops. Deliberately not goroutine liveness: WaitForCacheSync
+		// has no timeout and the reflector retries forever, so an informer that
+		// cannot reach its cluster stays blocked and alive indefinitely. This
+		// gauge is the only thing that tells that apart from a working one.
 		//
 		// 0 is therefore the normal state during startup, which inverts the
 		// obvious alert: it wants a "for" comfortably longer than a healthy
 		// initial list, not a short one.
 		clusterUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_cluster_up",
-			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server) or has stopped.",
+			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server), while the API server refuses its events list or watch with 403 Forbidden and the informer is held between attempts, or once it has stopped.",
 		}, []string{"cluster", "project", "location"}),
 	}
 	reg.MustRegister(

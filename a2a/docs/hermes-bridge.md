@@ -75,15 +75,27 @@ do.
 
 On the W6 install the bridge connects as the static `worker` user, whose grants already
 cover it: subscribe `a2a.tasks.>`, publish `a2a.tasks.*.*.events`, plus the JetStream
-tax (`$JS.API.>`, `$JS.ACK.TASKS.>` — ack scoped to the one stream this user consumes
-with explicit ack; unscoped `$JS.ACK.>` is a cross-principal +TERM — `$JS.FC.>`,
-`_INBOX.worker.>`) and `$KV.runtime-state.>`
-for the in-flight registry below. Playground posture - the shared static user is the
-playground, per the deployment spec. The production shape, recorded for when the
-callout arms: a dedicated `bridge` identity with subscribe `a2a.tasks.platform.*.in`,
-publish `a2a.tasks.platform.*.events`, its own inbox prefix, and the KV grant. Nothing
-wider - a bridge that can publish submissions is a bridge that can impersonate the
-gateway.
+tax and `$KV.runtime-state.>` for the in-flight registry below. The tax is not
+`$JS.API.>`: it is the `$JS.API` subjects the bridge emits on TASKS and
+`KV_runtime-state` — stream info, consumer create, pull, direct get, and the KV
+watcher's consumer delete — named one by one, with the CLI's topic-stream reads, in the
+operator's `a2aWorkerJetStreamGrants`; `$JS.ACK.TASKS.>`, ack scoped to the one stream this user
+consumes with explicit ack (unscoped `$JS.ACK.>` is a cross-principal +TERM); `$JS.FC.>`;
+and `_INBOX.worker.>`.
+
+**This is now the bridge's own debt rather than the deployment's posture.** The auth
+callout has armed and session pods authenticate as themselves, so the shared static user
+is no longer "the playground" — it is a residue, and this program is one of the reasons
+it survives. `cmd/hermes-bridge/main.go` sets `nats.UserInfo` from the environment and
+has no token path, so it cannot present a projected ServiceAccount token even though the
+callout would resolve one. Note what it would present it _as_: there is no `agent`
+principal in the rendered map and deliberately so, so moving the bridge means giving it
+an identity of its own rather than reaching for one already waiting.
+
+The target shape, unchanged: a dedicated `bridge` identity with subscribe
+`a2a.tasks.platform.*.in`, publish `a2a.tasks.platform.*.events`, its own inbox prefix,
+and the KV grant. Nothing wider - a bridge that can publish submissions is a bridge that
+can impersonate the gateway.
 
 ## Lifecycle, steering, cancel
 

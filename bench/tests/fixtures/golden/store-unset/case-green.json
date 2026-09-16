@@ -1,0 +1,95 @@
+{
+  "case": "agent-kanban-smoke",
+  "name": "Agent kanban smoke test",
+  "domain": "chat-and-routing",
+  "rung": 7,
+  "rung_name": "GREEN",
+  "blocking": false,
+  "reason": "passed all 3 repetitions",
+  "admitted": true,
+  "expected_fail": false,
+  "notes": [],
+  "passes": 3,
+  "scored": 3,
+  "pass_rate": 1.0,
+  "judged_means": {
+    "OutcomeValidity": {
+      "mean": 1.0,
+      "n": 3
+    },
+    "ToolInvocation": {
+      "mean": 0.5,
+      "n": 3
+    },
+    "OutcomeScore": {
+      "mean": 1.0,
+      "n": 3
+    }
+  },
+  "reps": [
+    {
+      "index": 1,
+      "outcome": "pass",
+      "rung": null,
+      "reason": "VerificationCorrectness=1.0",
+      "run_dir": "<FIXTURE_RUNS>/kanban_green_1",
+      "correctness": 1.0,
+      "coverage": 1.0,
+      "catastrophic": null,
+      "judged": {
+        "OutcomeValidity": 1.0,
+        "ToolInvocation": 0.5,
+        "OutcomeScore": 1.0
+      },
+      "latency": 46.67580479523167,
+      "total_tokens": 135281
+    },
+    {
+      "index": 2,
+      "outcome": "pass",
+      "rung": null,
+      "reason": "VerificationCorrectness=1.0",
+      "run_dir": "<FIXTURE_RUNS>/kanban_green_2",
+      "correctness": 1.0,
+      "coverage": 1.0,
+      "catastrophic": null,
+      "judged": {
+        "OutcomeValidity": 1.0,
+        "ToolInvocation": 0.5,
+        "OutcomeScore": 1.0
+      },
+      "latency": 47.00481715425849,
+      "total_tokens": 135195
+    },
+    {
+      "index": 3,
+      "outcome": "pass",
+      "rung": null,
+      "reason": "VerificationCorrectness=1.0",
+      "run_dir": "<FIXTURE_RUNS>/kanban_green_1",
+      "correctness": 1.0,
+      "coverage": 1.0,
+      "catastrophic": null,
+      "judged": {
+        "OutcomeValidity": 1.0,
+        "ToolInvocation": 0.5,
+        "OutcomeScore": 1.0
+      },
+      "latency": 46.67580479523167,
+      "total_tokens": 135281
+    }
+  ],
+  "admission_reason": "admitted by BOOTSTRAP_ADMITTED (transition bridge)",
+  "version_key": {
+    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "scoring_version": "v1",
+    "judge_model": "gemini-3.1-pro-preview",
+    "fleet": 1,
+    "verifiers": 1
+  },
+  "baseline_judged": null,
+  "baseline_runs": 0,
+  "baseline_passes": 0,
+  "deployer": "noop",
+  "label": "PASSED"
+}

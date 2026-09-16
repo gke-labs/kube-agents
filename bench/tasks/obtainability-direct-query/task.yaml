@@ -1,4 +1,4 @@
-# Registered in hack/ci-eval-pr.sh NIGHTLY_TASKS (nightly-tier active since
+# Registered in hack/eval/nightly-cases.txt (nightly-tier active since
 # 2026-09-02) — superseded in
 # presubmit by reliability-pdb-probe, which is active and asks the same
 # question of the same planted defect (checkout-gateway's missing PDB),

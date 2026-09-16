@@ -51,6 +51,9 @@ class GitResult:
 
 
 AUDIT = "compliance-audit"
+# The one stream whose SOP has a declared-intent step, so the one stream on
+# which a `declared` list validates. Every other stream rejects the list.
+DECLARING_AUDIT = "obtainability-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 
 # Which SOP owns each stream's check roster. Spelled out rather than derived
@@ -587,6 +590,11 @@ class BaseTestCase(unittest.TestCase):
         target.write_text("# remediation\n", encoding="utf-8")
         return target
 
+    def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT):
+        """Leave the run record `start` would have, under the scratch directory."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        return audit_report.write_run_record(audit, repo, list(context))
+
     def run_finish(self, doc, argv_extra=(), audit=AUDIT):
         findings_file = self.write_findings(doc)
         return self.run_main(
@@ -627,6 +635,12 @@ class HarnessTestCase(BaseTestCase):
         self.patch_attr("refresh_credentials", lambda repo=None: None)
         self.patch_attr("resolve_repo", lambda *a, **k: "acme/fleet")
         self.patch_attr("repo_root", lambda: self.workspace)
+        # `start` reads `context_repos` through gitops_workspace, which with no
+        # mounted ConfigMap falls through to kubectl. Pin it to "none
+        # registered"; the tests about the key set their own value.
+        context = patch.object(gitops_workspace, "get_context_github_repos", lambda: [])
+        context.start()
+        self.addCleanup(context.stop)
         # Most tests describe a pod that has audited before, so the clone
         # already exists and `ensure_workspace` takes the fetch path. Tests
         # about the first run call `self.unclone()` to remove it.
@@ -1760,6 +1774,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
                 "kanban-workspace-gc",
+                "kanban-board-health",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
             },
@@ -1959,6 +1974,24 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"audit_report.AUDITS[{audit_id!r}].title is "
                     f"{spec.title!r} but cron/jobs.json calls it "
                     f"{jobs[audit_id]['name']!r}",
+                )
+
+    def test_declarable_checks_are_posture_checks_on_the_roster(self):
+        """`declarable` is a subset of the roster: no derived slug, no duplicate.
+
+        The validator holds `declared[].check` to this set, so a slug listed
+        here but not on the roster would admit a declared posture no check can
+        produce, and a derived slug here would let a meta-finding be declared
+        away.
+        """
+        for audit_id, spec in audit_report.AUDITS.items():
+            with self.subTest(audit=audit_id):
+                self.assertEqual(len(spec.declarable), len(set(spec.declarable)))
+                self.assertLessEqual(set(spec.declarable), set(spec.checks))
+                self.assertFalse(set(spec.declarable) & set(spec.derived))
+                self.assertEqual(
+                    audit_report.audit_declarable_checks(audit_id),
+                    frozenset(spec.declarable),
                 )
 
     def test_check_rosters_match_the_sops(self):
@@ -2646,6 +2679,8 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
+                "postures_withheld": [],
             },
         )
 
@@ -2704,6 +2739,8 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
+                "postures_withheld": [],
             },
         )
 
@@ -2922,6 +2959,32 @@ class TestPublishedBodies(HarnessTestCase):
 
 
 class TestFinishClean(HarnessTestCase):
+    def test_a_clean_run_with_no_ledger_still_counts_what_was_declared(self):
+        # Nothing to open and nothing to close, so the JSON line and the log
+        # are the only trace that the run deferred to a declaration.
+        self.harness.replies = {"issue list": "[]"}
+        self.record_run()
+        doc = searched_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["declared"], 1)
+        # A standing declaration is the same every morning; it must not wake
+        # the channel.
+        self.assertTrue(payload["silent_ok"])
+        self.assertIn("1 declared posture(s)", self.err)
+        self.assertFalse(self.harness.gh_calls("issue", "create"))
+        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+
+    def test_the_findings_branch_reports_the_declared_count_too(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.record_run()
+        doc = searched_doc(findings=[make_finding(check="no-pdb")])
+        doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
+        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
+        self.assertEqual(self.stdout_json()["declared"], 2)
+
     def test_clean_run_closes_the_open_ledger_as_completed(self):
         previous_body = published_body(
             make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
@@ -2958,6 +3021,8 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
+                "postures_withheld": [],
             },
         )
 
@@ -2989,6 +3054,8 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": True,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
+                "postures_withheld": [],
             },
         )
 
@@ -3052,6 +3119,10 @@ class TestStart(HarnessTestCase):
             "findings_path_for",
             lambda audit_id: str(self.tmp_path / f"findings_{audit_id}.json"),
         )
+        self.patch_attr(
+            "run_record_path_for",
+            lambda audit_id: str(self.tmp_path / f"run_{audit_id}.json"),
+        )
 
     def test_emits_one_json_line(self):
         self.harness.replies = {"issue list": self.issue_list()}
@@ -3072,6 +3143,8 @@ class TestStart(HarnessTestCase):
                 "workspace": str(self.workspace),
                 "findings_path": str(self.tmp_path / "findings_compliance-audit.json"),
                 "pending_remediation_requests": [],
+                "context_repos": [],
+                "declared_intent_repos": ["acme/fleet"],
                 "sop": "governance/compliance_audit_sop.md",
                 "checks": list(audit_report.audit_checks(AUDIT)),
             },
@@ -3115,6 +3188,41 @@ class TestStart(HarnessTestCase):
                 self.assertEqual(
                     f"governance/{audit_report.audit_sop(audit_id)}", payload["sop"]
                 )
+
+    def test_start_hands_over_the_context_repositories(self):
+        """The declared-intent step searches what `start` names, and nothing else.
+
+        Printed here rather than looked up by the worker so the list it
+        searched is the list the harness read, and so no SOP step needs a
+        `kubectl get configmap` of its own.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        with patch.object(
+            gitops_workspace,
+            "get_context_github_repos",
+            lambda: ["acme/terraform-live", "acme/fleet"],
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        payload = json.loads(self.out)
+        self.assertEqual(payload["context_repos"], ["acme/terraform-live", "acme/fleet"])
+        # The set the document must account for: the GitOps repository first,
+        # and a context slug that is the GitOps repository folded into it, so
+        # a document naming `acme/fleet` once is not short by one.
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
+
+    def test_an_unreadable_context_key_degrades_to_none_and_says_so(self):
+        # A filter over an optional list must not stop the audit: the run
+        # searches the clone alone and every unmatched posture stays a finding.
+        self.harness.replies = {"issue list": "[]"}
+
+        def unreadable():
+            raise RuntimeError("kubectl failed: Forbidden")
+
+        with patch.object(gitops_workspace, "get_context_github_repos", unreadable):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(self.out)["context_repos"], [])
+        self.assertIn("could not read context_repos", self.err)
+        self.assertIn("Forbidden", self.err)
 
     def test_the_workspace_is_named_so_manifests_can_be_written_into_it(self):
         # The agent does not start in a working tree, so a `remediation.path`
@@ -3341,6 +3449,1059 @@ class TestDryRun(BaseTestCase):
         self.assertEqual(sorted(announced), sorted(rendered))
 
 
+def make_declared(
+    check="no-hpa",
+    cluster="prod-us-east",
+    namespace="payments",
+    obj="Deployment/api",
+    title="api is pinned at three replicas by Terraform",
+    repo="acme/terraform-live",
+    path="clusters/prod-us-east/payments.tf",
+    excerpt="min_replicas = 3\nmax_replicas = 3",
+):
+    """One `declared[]` entry: a finding's identity plus the declaration that justifies it."""
+    return {
+        "check": check,
+        "cluster": cluster,
+        "namespace": namespace,
+        "object": obj,
+        "title": title,
+        "declaration": {"repo": repo, "path": path, "excerpt": excerpt},
+    }
+
+
+def declaring_doc(findings=None, **kwargs):
+    """A document on the declaring stream, carrying one posture finding by default."""
+    if findings is None:
+        findings = [make_finding(check="no-pdb")]
+    return make_doc(findings=findings, audit=DECLARING_AUDIT, **kwargs)
+
+
+# A full sha, as the broker reports one; `git rev-parse --short` would give
+# seven characters and the validator takes either.
+SEARCH_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def searched(*slugs, sha=SEARCH_SHA):
+    """A `declared_intent_searched` list: each slug read at one sha."""
+    return [f"{slug}@{sha}" for slug in slugs]
+
+
+def searched_doc(findings=None, repos=("acme/fleet",), **kwargs):
+    """A declaring document that records a search of `repos`.
+
+    Every cluster `make_doc` builds ran the full roster, the four declarable
+    checks included, so on this stream a document owes the search record and
+    a test that is not about the record has to carry one — beside the run
+    record `record_run` writes — or it reads as a skipped step.
+    """
+    doc = declaring_doc(findings=findings, **kwargs)
+    doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched(*repos)
+    return doc
+
+
+class TestDeclaredIntent(BaseTestCase):
+    """The `declared` list: seen, declared on purpose, and therefore not a finding.
+
+    Two properties carry the whole design. A declared posture is *not a
+    finding* — no id, no severity, no slot in the delta block, so it is never
+    announced as new or resolved and never becomes a pull request. And it is
+    *refutable* — every row names `repo:path` and the lines that pin the
+    property, so a reviewer who disagrees edits the declaration rather than
+    arguing with the ledger.
+    """
+
+    def validate(self, doc):
+        return audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT)
+
+    def rejects(self, doc, *fragments):
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            self.validate(doc)
+        for fragment in fragments:
+            self.assertIn(fragment, str(caught.exception))
+        return caught.exception
+
+    # -- validation ---------------------------------------------------------
+
+    def test_a_document_without_the_key_validates_as_before(self):
+        doc = declaring_doc()
+        self.assertNotIn("declared", doc)
+        self.validate(doc)
+
+    def test_a_well_formed_entry_is_accepted_and_gets_no_id(self):
+        doc = declaring_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        validated = self.validate(doc)
+        self.assertNotIn("id", validated["declared"][0])
+        self.assertNotIn("severity", validated["declared"][0])
+
+    def test_the_key_must_be_a_list(self):
+        doc = declaring_doc()
+        doc["declared"] = {"check": "no-hpa"}
+        self.rejects(doc, "declared: must be a list")
+
+    def test_the_check_must_be_on_the_roster_and_the_roster_is_not_printed(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(check="pinned-replicas")]
+        exc = self.rejects(doc, "declared[0].check", "'pinned-replicas'")
+        for slug in audit_report.audit_checks(DECLARING_AUDIT):
+            self.assertNotIn(slug, str(exc))
+
+    def test_a_fault_check_is_rejected_and_the_declarable_set_is_not_printed(self):
+        # The red line "a declaration justifies posture, never a fault" is an
+        # exit 2, not a sentence: `blocking-pdb` is the SOP's own example of a
+        # declared bug, and `no-requests` is the fault a declaration most
+        # plausibly names by accident. Both are on the roster; neither moves.
+        for fault in ("blocking-pdb", "no-requests", "rigid-scheduling"):
+            with self.subTest(check=fault):
+                doc = declaring_doc()
+                doc["declared"] = [make_declared(check=fault)]
+                exc = self.rejects(
+                    doc, "declared[0].check", repr(fault), "fault, not a posture"
+                )
+                for slug in audit_report.audit_declarable_checks(DECLARING_AUDIT):
+                    self.assertNotIn(slug, str(exc))
+
+    def test_every_posture_check_may_be_declared(self):
+        for posture in audit_report.audit_declarable_checks(DECLARING_AUDIT):
+            with self.subTest(check=posture):
+                doc = declaring_doc(findings=[])
+                doc["declared"] = [make_declared(check=posture)]
+                self.validate(doc)
+
+    def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
+        # Eight streams have no §4a. A worker on one of them that writes a
+        # `declared` list has misread a step that does not exist for it, and a
+        # hostile document has found a stream with no rule to break; both are
+        # rejected whole rather than admitted because the check is on the
+        # roster. `[]` still validates everywhere: it says what an absent key
+        # says.
+        silent = [
+            audit_id
+            for audit_id, spec in audit_report.AUDITS.items()
+            if not spec.declarable
+        ]
+        self.assertIn(AUDIT, silent)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 1)
+        for audit_id in silent:
+            with self.subTest(audit=audit_id):
+                doc = make_doc(audit=audit_id, findings=[])
+                doc["declared"] = []
+                audit_report.validate_findings(copy.deepcopy(doc), audit_id)
+                doc["declared"] = [
+                    make_declared(check=audit_report.audit_checks(audit_id)[0])
+                ]
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(copy.deepcopy(doc), audit_id)
+                self.assertIn("declared[0]", str(caught.exception))
+                self.assertIn("no declared-intent step", str(caught.exception))
+
+    def test_an_entry_must_be_an_object(self):
+        doc = declaring_doc()
+        for bad in ("no-hpa", ["no-hpa"], None, 7):
+            with self.subTest(entry=bad):
+                doc["declared"] = [bad]
+                self.rejects(doc, "declared[0]: expected an object")
+
+    def test_the_cluster_must_be_one_this_run_read(self):
+        doc = declaring_doc(skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
+        doc["declared"] = [make_declared(cluster="dr-west")]
+        self.rejects(doc, "declared[0].cluster", "not in scope.clusters")
+        doc["declared"] = [make_declared(cluster="never-heard-of")]
+        self.rejects(doc, "declared[0].cluster", "not in scope.clusters")
+
+    def test_the_declaration_is_required_and_complete(self):
+        doc = declaring_doc()
+        entry = make_declared()
+        del entry["declaration"]
+        doc["declared"] = [entry]
+        self.rejects(doc, "declared[0].declaration", "'repo', 'path', 'excerpt'")
+        for field in audit_report.DECLARATION_FIELDS:
+            with self.subTest(missing=field):
+                entry = make_declared()
+                del entry["declaration"][field]
+                doc["declared"] = [entry]
+                self.rejects(doc, f"declared[0].declaration.{field}")
+
+    def test_the_repository_is_a_slug(self):
+        doc = declaring_doc()
+        for bad in ("https://github.com/acme/terraform-live", "acme", "", None, 7):
+            with self.subTest(repo=bad):
+                doc["declared"] = [make_declared(repo=bad)]
+                self.rejects(doc, "declared[0].declaration.repo", "owner/name")
+
+    def test_the_path_follows_the_remediation_path_rules(self):
+        doc = declaring_doc()
+        for bad in ("/etc/passwd", "../../secrets.tf", "clusters/*.tf", "a/.git/config"):
+            with self.subTest(path=bad):
+                doc["declared"] = [make_declared(path=bad)]
+                self.rejects(doc, "declared[0].declaration.path")
+        doc["declared"] = [make_declared(path="./clusters//prod/./main.tf")]
+        validated = self.validate(doc)
+        self.assertEqual(
+            validated["declared"][0]["declaration"]["path"], "clusters/prod/main.tf"
+        )
+
+    def test_the_excerpt_must_carry_the_lines_that_pin_the_property(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(excerpt="   ")]
+        self.rejects(doc, "declared[0].declaration.excerpt", "non-empty")
+
+    def test_a_title_is_required(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(title="")]
+        self.rejects(doc, "declared[0].title")
+
+    def test_identity_fields_must_name_something(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(obj="///")]
+        self.rejects(doc, "declared[0].object", "names nothing")
+
+    def test_a_posture_cannot_be_both_a_finding_and_declared(self):
+        finding = make_finding(check="no-pdb", obj="Deployment/api", namespace="payments")
+        doc = declaring_doc(findings=[finding])
+        doc["declared"] = [
+            make_declared(
+                check=finding["check"],
+                cluster=finding["cluster"],
+                namespace=finding["namespace"],
+                obj=finding["object"],
+            )
+        ]
+        self.rejects(
+            doc,
+            "declared[0]",
+            "same identity as findings[0]",
+            "listed as a finding and as declared",
+        )
+
+    def test_two_declared_entries_cannot_share_an_identity(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(), make_declared(title="said twice")]
+        self.rejects(doc, "declared[1]", "same identity as declared[0]")
+
+    def test_the_same_object_may_be_declared_under_two_checks(self):
+        # Identity is the finding's identity: check is part of it, so a
+        # workload whose replica count and missing budget are both declared
+        # is two entries, not a collision.
+        doc = declaring_doc()
+        doc["declared"] = [
+            make_declared(check="no-hpa"),
+            make_declared(check="no-pdb"),
+        ]
+        self.validate(doc)
+
+    # -- rendering ----------------------------------------------------------
+
+    def test_the_ledger_renders_a_declared_intent_section_after_the_findings(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared()]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        self.assertIn("## Declared intent", body)
+        self.assertLess(body.index("## Findings"), body.index("## Declared intent"))
+        # The pointer a reviewer follows, and the lines that pin the property.
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", body)
+        self.assertIn("`payments/Deployment/api`", body)
+        self.assertIn("api is pinned at three replicas by Terraform", body)
+        self.assertIn("min_replicas = 3 max_replicas = 3", body)
+
+    def test_no_section_renders_when_nothing_is_declared(self):
+        self.assertNotIn(
+            "## Declared intent", render_body(declaring_doc(), generated_at=NOW)
+        )
+        doc = declaring_doc()
+        doc["declared"] = []
+        self.assertNotIn("## Declared intent", render_body(doc, generated_at=NOW))
+
+    def test_declared_entries_never_enter_the_delta_block(self):
+        # The whole point of a separate list. In the delta block the entry
+        # would be announced as new today and as resolved the day the
+        # declaration is removed — the opposite of what happened.
+        doc = declaring_doc(findings=[make_finding(check="no-pdb", fid="real")])
+        doc["declared"] = [make_declared()]
+        validated = self.validate(doc)
+        rendered = audit_report.render_issue_body(validated, generated_at=NOW)
+        self.assertEqual(rendered.rendered_ids, [validated["findings"][0]["id"]])
+        self.assertEqual(
+            audit_report.parse_delta_block(rendered.body), rendered.rendered_ids
+        )
+
+    def test_a_declared_posture_renders_on_a_ledger_with_no_findings(self):
+        # Coverage gap plus zero findings opens a ledger; the declared section
+        # still says what was seen and where it is declared.
+        doc = declaring_doc(
+            findings=[], skipped=[{"cluster": "dr-west", "reason": "down"}]
+        )
+        doc["declared"] = [make_declared()]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        self.assertIn("No findings", body)
+        self.assertIn("## Declared intent", body)
+
+    def test_cells_are_escaped_and_clipped(self):
+        doc = declaring_doc()
+        doc["declared"] = [
+            make_declared(
+                title="pipe | and `tick` in the title",
+                excerpt="x" * (audit_report.MAX_CELL_CHARS + 50),
+            )
+        ]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        row = next(line for line in body.splitlines() if "acme/terraform-live" in line)
+        self.assertIn("pipe \\| and 'tick' in the title", row)
+        self.assertNotIn("x" * (audit_report.MAX_CELL_CHARS + 1), row)
+
+    def test_the_table_is_row_capped_and_says_so(self):
+        doc = declaring_doc()
+        doc["declared"] = [
+            make_declared(obj=f"Deployment/api-{n}")
+            for n in range(audit_report.MAX_DECLARED_ROWS + 5)
+        ]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        section = body.split("## Declared intent", 1)[1].split("\n## ", 1)[0]
+        rows = [line for line in section.splitlines() if "acme/terraform-live" in line]
+        self.assertEqual(len(rows), audit_report.MAX_DECLARED_ROWS)
+        self.assertIn("…and 5 more", section)
+        self.assertIn(f"{audit_report.MAX_DECLARED_ROWS + 5} posture(s)", section)
+
+    def test_the_section_is_charged_against_the_body_budget(self):
+        # Findings yield to the declared table, not the other way round: with
+        # the table present, fewer findings fit and the body stays legal.
+        findings = bulk_findings(400, check="no-pdb")
+        plain = audit_report.render_issue_body(
+            self.validate(declaring_doc(findings=findings)), generated_at=NOW
+        )
+        doc = declaring_doc(findings=findings)
+        doc["declared"] = [
+            make_declared(obj=f"Deployment/api-{n}")
+            for n in range(audit_report.MAX_DECLARED_ROWS)
+        ]
+        with_declared = audit_report.render_issue_body(
+            self.validate(doc), generated_at=NOW
+        )
+        self.assertLess(len(with_declared.body), audit_report.MAX_BODY_CHARS)
+        self.assertLessEqual(len(with_declared.body), audit_report.BODY_BUDGET + 2000)
+        self.assertIn("## Declared intent", with_declared.body)
+        self.assertGreater(len(with_declared.omitted), len(plain.omitted))
+
+    # -- the clean run --------------------------------------------------------
+
+    def test_the_clean_comment_says_what_was_declared(self):
+        doc = declaring_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, self.validate(doc), NOW
+        )
+        self.assertIn("is now clean", comment)
+        self.assertIn("1 posture(s)", comment)
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
+        self.assertIn("`payments/Deployment/api`", comment)
+
+    def test_the_clean_comment_is_row_capped_and_says_so(self):
+        doc = declaring_doc(findings=[])
+        doc["declared"] = [
+            make_declared(obj=f"Deployment/api-{n}")
+            for n in range(audit_report.MAX_DECLARED_ROWS + 5)
+        ]
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, self.validate(doc), NOW
+        )
+        rows = [line for line in comment.splitlines() if "acme/terraform-live" in line]
+        self.assertEqual(len(rows), audit_report.MAX_DECLARED_ROWS)
+        self.assertIn("…and 5 more", comment)
+        self.assertIn(f"{audit_report.MAX_DECLARED_ROWS + 5} posture(s)", comment)
+        self.assertNotIn("comment truncated", comment)
+
+    def test_the_clean_comment_is_unchanged_without_declarations(self):
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, declaring_doc(findings=[]), NOW
+        )
+        self.assertNotIn("posture(s)", comment)
+
+    def test_the_pointer_is_not_clipped_to_a_cell(self):
+        # `repo:path` is followed, not read: a 120-character clip renders a
+        # path that does not exist inside a code span that says it does.
+        repo = "acme/terraform-live-infrastructure-repository"
+        path = (
+            "clusters/prod-us-east-1/workloads/payments/checkout-gateway/"
+            "deployment-and-scaling-policy.tf"
+        )
+        self.assertGreater(len(f"{repo}:{path}"), audit_report.MAX_CELL_CHARS)
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(repo=repo, path=path)]
+        validated = self.validate(doc)
+        body = render_body(validated, generated_at=NOW)
+        self.assertIn(f"`{repo}:{path}`", body)
+        comment = audit_report.render_clean_comment(DECLARING_AUDIT, validated, NOW)
+        self.assertIn(f"`{repo}:{path}`", comment)
+
+    # -- the CLI --------------------------------------------------------------
+
+    def test_a_dry_run_prints_the_section_and_counts_it(self):
+        self.patch_attr("run_cmd", Recorder())
+        self.patch_attr("repo_root_best_effort", lambda: self.tmp_path)
+        self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
+        self.record_run()
+        doc = searched_doc()
+        doc["declared"] = [make_declared()]
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=("--dry-run",))
+        self.assertEqual(rc, 0)
+        self.assertIn("## Declared intent", self.out)
+        self.assertIn("DECLARED: 1 posture(s)", self.err)
+
+    def test_a_dry_run_rejects_a_posture_listed_twice(self):
+        self.patch_attr("run_cmd", Recorder())
+        finding = make_finding(check="no-pdb")
+        doc = declaring_doc(findings=[finding])
+        doc["declared"] = [
+            make_declared(
+                check=finding["check"], namespace=finding["namespace"], obj=finding["object"]
+            )
+        ]
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=("--dry-run",))
+        self.assertEqual(rc, 2)
+        self.assertIn("listed as a finding and as declared", self.err)
+        self.assertNotIn("## Findings", self.out)
+
+
+def posture_and_fault_findings():
+    """Three declarable-check findings and two faults, on one cluster.
+
+    The `hpa-cannot-scale` one is the dangling-target shape — a fault by the
+    SOP's reading — and is here because the validator cannot tell it from the
+    `min == max` posture, so it is withheld with them and the run has to say
+    so. The `blocking-pdb` critical carries a manifest so a test can show that
+    the fault's pull request still opens while the postures are held.
+    """
+    return [
+        make_finding(
+            fid="pdb",
+            check="no-pdb",
+            severity="major",
+            title="checkout-gateway runs 3 replicas with no PodDisruptionBudget",
+            namespace="payments",
+            obj="Deployment/checkout-gateway",
+            command="kubectl --context prod-us-east -n payments get pdb -o json",
+            remediation={"kind": "manual", "note": "Add a PDB."},
+        ),
+        make_finding(
+            fid="hpa",
+            check="no-hpa",
+            severity="minor",
+            title="api runs 3 replicas with no HorizontalPodAutoscaler",
+            namespace="payments",
+            obj="Deployment/api",
+            command="kubectl --context prod-us-east -n payments get hpa -o json",
+            remediation={"kind": "manual", "note": "Add an HPA."},
+        ),
+        make_finding(
+            fid="dangling",
+            check="hpa-cannot-scale",
+            severity="minor",
+            title="HPA web targets a Deployment that does not exist",
+            namespace="web",
+            obj="HorizontalPodAutoscaler/web",
+            command="kubectl --context prod-us-east -n web get hpa web -o json",
+            remediation={"kind": "manual", "note": "Point the HPA at a live target."},
+        ),
+        make_finding(
+            fid="blocking",
+            check="blocking-pdb",
+            severity="critical",
+            title="payments-db PDB blocks every drain",
+            namespace="payments",
+            obj="PodDisruptionBudget/payments-db",
+            command="kubectl --context prod-us-east -n payments get pdb payments-db -o json",
+            remediation={
+                "kind": "manifest",
+                "path": "clusters/prod-us-east/payments-db-pdb.yaml",
+                "note": "Rewrite the budget with maxUnavailable: 1.",
+            },
+        ),
+        make_finding(
+            fid="requests",
+            check="no-requests",
+            severity="major",
+            title="worker declares no CPU request",
+            namespace="batch",
+            obj="Deployment/worker",
+            command="kubectl --context prod-us-east -n batch get deploy worker -o json",
+            remediation={"kind": "manual", "note": "Set requests."},
+        ),
+    ]
+
+
+POSTURE_CHECKS = ("no-pdb", "no-hpa", "hpa-cannot-scale")
+FAULT_CHECKS = ("blocking-pdb", "no-requests")
+
+
+class TestDeclaredIntentSearch(HarnessTestCase):
+    """`declared_intent_searched`: the record that the §4a step ran, or the postures are withheld.
+
+    Nothing in the document used to show whether the declared-intent step ran,
+    so a model that skipped it published every posture as a finding, and one
+    that skipped it and found nothing published a clean fleet. Now the run
+    owes a record whenever a declarable check ran, `finish` measures it
+    against the repositories `start` named, and anything short of complete is
+    no search: the declarable checks' findings come out, the faults publish,
+    and the ledger names what was held back as a coverage gap.
+    """
+
+    CONTEXT = ("acme/terraform-live",)
+
+    def setUp(self):
+        super().setUp()
+        # The lease segment is the audit id, and this class runs the declaring
+        # stream, so its clone — where the manifest below has to be — is not
+        # the one the base class prepared.
+        self.workspace = self.gitops_root / DECLARING_AUDIT / "acme__fleet"
+        (self.workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(self.workspace)
+        self.patch_attr("repo_root", lambda: self.workspace)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.touch("clusters/prod-us-east/payments-db-pdb.yaml")
+
+    def doc(self, findings=None, repos=None, clusters=None):
+        doc = declaring_doc(
+            findings=posture_and_fault_findings() if findings is None else findings,
+            clusters=clusters,
+        )
+        if repos is not None:
+            doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched(*repos)
+        return doc
+
+    def finish(self, doc, *extra):
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=extra)
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json() if not extra else None
+
+    def ledger_body(self):
+        bodies = self.harness.bodies_for("issue", "create")
+        self.assertEqual(len(bodies), 1, bodies)
+        return bodies[0]
+
+    def declared_gaps(self, payload):
+        return [g for g in payload["coverage_gaps"] if g.startswith("declared intent:")]
+
+    def assert_withheld(self, payload, body):
+        """The shape every no-search outcome shares."""
+        self.assertTrue(payload["partial"])
+        gaps = self.declared_gaps(payload)
+        self.assertEqual(len(gaps), 1, payload["coverage_gaps"])
+        gap = gaps[0]
+        for check in POSTURE_CHECKS:
+            self.assertIn(check, gap)
+        self.assertIn("Deployment/checkout-gateway", gap)
+        self.assertIn("prod-us-east/payments/", gap)
+        # The dangling-target fault goes with the postures, and the sentence
+        # says so rather than implying only postures were held.
+        self.assertIn("dangling-target hpa-cannot-scale", gap)
+        withheld = set(payload["postures_withheld"])
+        self.assertEqual(
+            withheld,
+            {derived_id(check=f["check"], namespace=f["namespace"], obj=f["object"])
+             for f in posture_and_fault_findings() if f["check"] in POSTURE_CHECKS},
+        )
+        # The faults publish: the critical one still opens its pull request,
+        # and neither posture reaches the body as a finding, the delta block,
+        # or a pull request.
+        self.assertEqual(len(payload["prs_opened"]), 1)
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        for fid in withheld:
+            self.assertNotIn(fid, audit_report.parse_delta_block(body))
+            self.assertNotIn(fid, " ".join(" ".join(c) for c in self.harness.gh_calls("pr")))
+        for check in FAULT_CHECKS:
+            self.assertIn(f"`{check}`", body)
+        self.assertNotIn("### Major (", body.split("### Declared intent not searched")[0])
+        # And the ledger names them, as a gap, under Scope.
+        self.assertIn("### Declared intent not searched", body)
+        self.assertIn("**Coverage is partial.**", body)
+        self.assertIn("| `no-pdb` | `prod-us-east` | payments | `Deployment/checkout-gateway` |", body)
+        self.assertIn("| `hpa-cannot-scale` | `prod-us-east` | web | `HorizontalPodAutoscaler/web` |", body)
+        self.assertIn("shares its slug with the `min == max` posture", body)
+        self.assertIn("2 findings", body)
+
+    # -- withheld -------------------------------------------------------------
+
+    def test_no_record_in_the_document_withholds_the_postures_and_publishes_the_faults(self):
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(self.doc())
+        body = self.ledger_body()
+        self.assert_withheld(payload, body)
+        gap = self.declared_gaps(payload)[0]
+        self.assertIn("repositories not searched: acme/fleet, acme/terraform-live", gap)
+        self.assertIn("WITHHELD: 3 posture finding(s)", self.err)
+        self.assertEqual(payload["new"], 2)
+
+    def test_a_partial_list_is_no_search(self):
+        # The GitOps repository searched, the context repository not: the SOP
+        # already treats a search the run could not complete as no search, and
+        # the gap names the one it missed rather than both.
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(self.doc(repos=["acme/fleet"]))
+        self.assert_withheld(payload, self.ledger_body())
+        gap = self.declared_gaps(payload)[0]
+        self.assertIn("repositories not searched: acme/terraform-live", gap)
+        self.assertNotIn("acme/fleet,", gap)
+
+    def test_a_missing_run_record_is_no_search(self):
+        # `start` crashed before it wrote the record, or never ran: there is
+        # nothing to measure a complete-looking list against, and the run
+        # withholds rather than trusting the document about what it owed.
+        self.assertFalse(Path(audit_report.run_record_path_for(DECLARING_AUDIT)).exists())
+        payload = self.finish(self.doc(repos=["acme/fleet", "acme/terraform-live"]))
+        body = self.ledger_body()
+        self.assert_withheld(payload, body)
+        self.assertIn("no run record from `start`", self.declared_gaps(payload)[0])
+        self.assertIn("`start` left no run record", body)
+
+    def test_a_malformed_run_record_is_no_search(self):
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        Path(audit_report.run_record_path_for(DECLARING_AUDIT)).write_text(
+            "{not json", encoding="utf-8"
+        )
+        payload = self.finish(self.doc(repos=["acme/fleet"]))
+        self.assert_withheld(payload, self.ledger_body())
+
+    def test_the_run_record_is_measured_not_the_configmap(self):
+        # A repository registered after `start` ran is neither searched nor
+        # required: `finish` reads what this run was told, not what the
+        # ConfigMap says now.
+        self.record_run(context=())
+        with patch.object(
+            gitops_workspace, "get_context_github_repos", lambda: ["acme/terraform-live"]
+        ):
+            payload = self.finish(self.doc(repos=["acme/fleet"]))
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["postures_withheld"], [])
+
+    def test_matching_is_case_folded_and_sha_blind(self):
+        self.record_run(repo="Acme/Fleet", context=("acme/Terraform-Live",))
+        doc = self.doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = [
+            "acme/fleet@abcdef1",
+            "ACME/terraform-live@" + SEARCH_SHA,
+        ]
+        payload = self.finish(doc)
+        self.assertFalse(payload["partial"])
+
+    def test_extra_repositories_beyond_the_record_are_allowed(self):
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(
+            self.doc(repos=["acme/fleet", "acme/terraform-live", "acme/knowledge"])
+        )
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["postures_withheld"], [])
+
+    # -- applicability --------------------------------------------------------
+
+    def test_posture_checks_that_ran_owe_the_record_even_with_no_posture_finding(self):
+        """The laundering path: ran `no-pdb`, saw a candidate, left it out.
+
+        That document is byte-identical to one whose search found a
+        declaration, so the record is required whenever a declarable check
+        ran, not only when a posture was written. With nothing to withhold
+        the run still goes partial, and an open ledger does not close.
+        """
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(self.doc(findings=[]))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["postures_withheld"], [])
+        self.assertEqual(payload["resolved"], 0)
+        gap = self.declared_gaps(payload)[0]
+        self.assertIn("posture checks ran with no declared-intent search on record", gap)
+        self.assertIn("acme/terraform-live", gap)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        comment = self.harness.bodies_for("issue", "comment")[0]
+        self.assertIn("did not see the whole fleet", comment)
+        self.assertIn("declared intent:", comment)
+
+    def test_a_run_on_which_no_declarable_check_ran_owes_nothing(self):
+        # Pure: every cluster ran the faults only. Nothing is owed and
+        # nothing is filed on the document, whatever the record says.
+        clusters = [
+            {
+                "name": "prod-us-east",
+                "location": "us-east1",
+                "project": "acme-prod",
+                "checks_run": list(FAULT_CHECKS),
+            }
+        ]
+        doc = audit_report.validate_findings(
+            self.doc(findings=[], clusters=clusters), DECLARING_AUDIT
+        )
+        self.assertFalse(audit_report.declared_intent_applies(doc))
+        self.assertEqual(audit_report.withhold_unsearched_postures(doc, None), [])
+        self.assertNotIn(audit_report.POSTURES_WITHHELD_KEY, doc)
+        self.assertEqual(
+            [g for g in audit_report.coverage_gaps(doc) if g.startswith("declared intent")],
+            [],
+        )
+
+    def test_other_streams_owe_nothing(self):
+        doc = audit_report.validate_findings(make_doc(), AUDIT)
+        self.assertFalse(audit_report.declared_intent_applies(doc))
+        self.assertEqual(audit_report.withhold_unsearched_postures(doc, None), [])
+
+    # -- complete -------------------------------------------------------------
+
+    def test_a_complete_record_publishes_everything_and_renders_what_was_searched(self):
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(self.doc(repos=["acme/fleet", "acme/terraform-live"]))
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["coverage_gaps"], [])
+        self.assertEqual(payload["postures_withheld"], [])
+        self.assertEqual(payload["new"], 5)
+        self.assertNotIn("WITHHELD", self.err)
+        body = self.ledger_body()
+        self.assertIn(
+            f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`, "
+            f"`acme/terraform-live@{SEARCH_SHA}`.",
+            body,
+        )
+        self.assertNotIn("Declared intent not searched", body)
+        for check in POSTURE_CHECKS + FAULT_CHECKS:
+            self.assertIn(f"`{check}`", body)
+
+    def test_declared_entries_survive_a_withheld_run(self):
+        # A `declared[]` entry cites the file it read, so it is its own
+        # record; the withhold is about the postures with no such citation.
+        self.record_run(context=self.CONTEXT)
+        doc = self.doc()
+        doc["declared"] = [make_declared(obj="Deployment/web")]
+        payload = self.finish(doc)
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["declared"], 1)
+        body = self.ledger_body()
+        self.assertIn("## Declared intent", body)
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", body)
+
+    def test_the_withheld_ids_are_not_reported_as_resolved(self):
+        # Yesterday's ledger carried the posture; today the harness took it
+        # out. That is not a fix, and a partial run says `resolved: 0` anyway.
+        previous = published_body(
+            audit_report.validate_findings(
+                self.doc(repos=["acme/fleet", "acme/terraform-live"]), DECLARING_AUDIT
+            ),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous}),
+        }
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["resolved"], 0)
+        self.assertTrue(payload["partial"])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_a_clean_run_over_withheld_postures_names_them_in_the_comment(self):
+        # Every finding was a posture, so after the withhold the run is CLEAN
+        # over a gap: the open ledger is not closed, and the comment — the one
+        # artifact a clean run updates — lists what was held back.
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.record_run(context=self.CONTEXT)
+        postures = [f for f in posture_and_fault_findings() if f["check"] in POSTURE_CHECKS]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertTrue(payload["partial"])
+        self.assertEqual(len(payload["postures_withheld"]), 3)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        comment = self.harness.bodies_for("issue", "comment")[0]
+        self.assertIn("3 posture finding(s) are withheld rather than published", comment)
+        self.assertIn("- `no-pdb` on `Deployment/checkout-gateway` in `prod-us-east`", comment)
+
+    # -- the dry run ----------------------------------------------------------
+
+    def test_the_dry_run_withholds_the_same_way(self):
+        self.record_run(context=self.CONTEXT)
+        self.finish(self.doc(repos=["acme/fleet"]), "--dry-run")
+        self.assertIn("WITHHELD: 3 posture finding(s)", self.err)
+        gap_lines = [l for l in self.err.splitlines() if "COVERAGE GAP: declared intent:" in l]
+        self.assertEqual(len(gap_lines), 1, self.err)
+        self.assertIn("repositories not searched: acme/terraform-live", gap_lines[0])
+        self.assertIn("### Declared intent not searched", self.out)
+        self.assertIn("`Deployment/checkout-gateway`", self.out)
+        self.assertIn("`blocking-pdb`", self.out)
+        self.assertNotIn("### Minor (", self.out)
+        self.assertEqual(self.harness.gh_calls("issue"), [])
+
+    def test_the_dry_run_renders_a_complete_search(self):
+        self.record_run(context=self.CONTEXT)
+        self.finish(self.doc(repos=["acme/fleet", "acme/terraform-live"]), "--dry-run")
+        self.assertNotIn("COVERAGE GAP", self.err)
+        self.assertIn("Declared-intent search: `acme/fleet@", self.out)
+
+    # -- the validator --------------------------------------------------------
+
+    def rejects(self, doc, audit, *fragments):
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.validate_findings(copy.deepcopy(doc), audit)
+        for fragment in fragments:
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_the_key_must_be_a_list_of_repo_at_sha(self):
+        doc = self.doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = "acme/fleet@" + SEARCH_SHA
+        self.rejects(doc, DECLARING_AUDIT, "declared_intent_searched: must be a list")
+        for bad in (
+            "acme/fleet",
+            "acme/fleet@",
+            "acme/fleet@abc12",
+            "acme/fleet@" + "0" * 41,
+            "acme/fleet@ABCDEF1",
+            "acme/fleet@main",
+            "../fleet@abcdef1",
+            "https://github.com/acme/fleet@abcdef1",
+            {"repo": "acme/fleet", "sha": SEARCH_SHA},
+        ):
+            with self.subTest(entry=bad):
+                doc = self.doc()
+                doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = [bad]
+                self.rejects(doc, DECLARING_AUDIT, "declared_intent_searched[0]", "owner/name@sha")
+
+    def test_the_key_is_rejected_on_a_stream_with_no_declared_intent_step(self):
+        doc = make_doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/fleet")
+        self.rejects(doc, AUDIT, "declared_intent_searched[0]", "no declared-intent step")
+        # `[]` says the same thing as an absent key, everywhere.
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = []
+        audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+
+    def test_a_short_sha_is_accepted(self):
+        doc = self.doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = ["acme/fleet@abcdef1"]
+        audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT)
+
+    def test_a_malformed_entry_exits_2_at_finish(self):
+        self.record_run(context=self.CONTEXT)
+        doc = self.doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = ["acme/fleet"]
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT)
+        self.assertEqual(rc, 2)
+        self.assertIn("declared_intent_searched[0]", self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "create"), [])
+
+    # -- start ----------------------------------------------------------------
+
+    def test_start_writes_the_run_record_before_it_prints(self):
+        patcher = patch.object(audit_report.os, "makedirs", lambda *a, **k: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        real = audit_report.write_run_record
+        printed_before_write = []
+
+        def spy(audit_id, repo, context):
+            # A crash between the write and the print leaves a record; one
+            # between the print and a write would leave none, and the run
+            # would go on to withhold. Only the first order is acceptable.
+            printed_before_write.append(sys.stdout.getvalue())
+            return real(audit_id, repo, context)
+
+        self.patch_attr("write_run_record", spy)
+        with patch.object(
+            gitops_workspace,
+            "get_context_github_repos",
+            lambda: ["acme/terraform-live", "acme/fleet"],
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
+        self.assertEqual(printed_before_write, [""])
+        self.assertEqual(
+            audit_report.read_run_record(DECLARING_AUDIT),
+            {"repo": "acme/fleet", "context_repos": ["acme/terraform-live", "acme/fleet"]},
+        )
+        payload = json.loads(self.out)
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
+
+    def test_start_clears_yesterdays_record_before_anything_can_fail(self):
+        # Every step between the top of `start` and the write can raise. A
+        # `start` that died in between must not leave the previous run's
+        # repository list for today's `finish` to measure a document against.
+        patcher = patch.object(audit_report.os, "makedirs", lambda *a, **k: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.record_run(context=("acme/old-context",))
+
+        def boom(repo, audit_id):
+            raise RuntimeError("gh label create: 502")
+
+        self.patch_attr("ensure_labels", boom)
+        self.assertNotEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
+        self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT))
+
+    def test_a_record_for_another_repository_is_no_record(self):
+        # The multi-repository cron runs `start` and `finish` per repository in
+        # turn; a record left behind for repository A must not measure B's
+        # document. The harness resolves `acme/fleet`.
+        self.record_run(repo="acme/other", context=())
+        payload = self.finish(self.doc(repos=["acme/fleet", "acme/other"]))
+        self.assert_withheld(payload, self.ledger_body())
+        self.assertIn("no run record from `start`", self.declared_gaps(payload)[0])
+
+    # -- remediate ------------------------------------------------------------
+
+    def test_remediate_refuses_a_withheld_id_by_name(self):
+        """The direct-ask path applies the same withhold as `finish`.
+
+        The ledger says the posture was held back for want of a search; a pull
+        request for it opened through `remediate` would contradict that.
+        """
+        self.record_run(context=self.CONTEXT)
+        findings_file = self.write_findings(self.doc())
+        held = derived_id(
+            check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway"
+        )
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+             "--finding", held]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("withheld", self.err)
+        self.assertIn("declared_intent_searched", self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        # And `--dry-run`, which resolves no repository, holds the same line.
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+             "--finding", held, "--dry-run"]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("withheld", self.err)
+
+    def test_remediate_still_opens_a_fault_on_a_withheld_run(self):
+        self.record_run(context=self.CONTEXT)
+        findings_file = self.write_findings(self.doc())
+        fault = derived_id(
+            check="blocking-pdb", namespace="payments", obj="PodDisruptionBudget/payments-db"
+        )
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+             "--finding", fault]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(self.stdout_json()["prs_opened"]), 1)
+
+    # -- a standing /remediate on a withheld posture ---------------------------
+
+    def held_id(self):
+        return derived_id(
+            check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway"
+        )
+
+    def test_a_request_for_a_withheld_posture_is_deferred_not_refused(self):
+        """Neither "typo" nor a permanent marker: the request stands.
+
+        The withhold takes the posture out of `findings` before the ledger's
+        comments are parsed. Read as "not a finding in the current report" it
+        would be refused with a false reason and the refused marker, and never
+        revisited when the posture returns. It is deferred on its own marker
+        instead, which nothing reads as answered.
+        """
+        request = comment(f"/remediate {self.held_id()}")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request]}),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(self.doc())
+        self.assertTrue(payload["partial"])
+        posted = self.harness.bodies_for("issue", "comment")
+        deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferrals), 1, posted)
+        self.assertIn("on hold, not refused", deferrals[0])
+        self.assertIn("declared-intent search", deferrals[0])
+        self.assertNotIn("typo", deferrals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+        # The one pull request is the critical fault's auto-promotion; nothing
+        # opened for the deferred posture.
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertNotIn(
+            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+        )
+
+    def test_a_deferred_request_is_answered_once_per_hold(self):
+        request = comment(f"/remediate {self.held_id()}")
+        earlier = harness_comment(f"on hold\n{audit_report.deferred_marker('IC_1')}\n")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request, earlier]}),
+        }
+        self.record_run(context=self.CONTEXT)
+        self.finish(self.doc())
+        for body in self.harness.bodies_for("issue", "comment"):
+            self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
+
+    def test_a_deferred_request_is_honoured_by_the_run_that_records_the_search(self):
+        # Yesterday's deferral marker does not count as an answer: the same
+        # comment is acted on and acknowledged once the search is recorded.
+        request = comment(f"/remediate {self.held_id()}")
+        earlier = harness_comment(f"on hold\n{audit_report.deferred_marker('IC_1')}\n")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request, earlier]}),
+            "pr create": "https://github.com/acme/fleet/pull/9\n",
+        }
+        self.record_run(context=self.CONTEXT)
+        # The posture carries a manifest this time, so there is something to open.
+        findings = posture_and_fault_findings()
+        findings[0]["remediation"] = {
+            "kind": "manifest",
+            "path": "clusters/prod-us-east/checkout-gateway-pdb.yaml",
+            "note": "Add a PDB.",
+        }
+        self.touch("clusters/prod-us-east/checkout-gateway-pdb.yaml")
+        payload = self.finish(
+            self.doc(findings=findings, repos=["acme/fleet", "acme/terraform-live"])
+        )
+        self.assertFalse(payload["partial"])
+        # Two pull requests: the critical fault's auto-promotion, and the
+        # requested posture's.
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 2)
+        acked = [
+            b for b in self.harness.bodies_for("issue", "comment")
+            if audit_report.acked_marker("IC_1") in b
+        ]
+        self.assertEqual(len(acked), 1)
+
+    def test_a_clean_run_defers_a_request_for_a_withheld_posture(self):
+        # Every finding was a posture, so the run lands on the CLEAN branch
+        # with a gap. "No longer reproduces" would be false — the harness is
+        # holding it — so the request is deferred there too, and not acked.
+        request = comment(f"/remediate {self.held_id()}")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request]}),
+        }
+        self.record_run(context=self.CONTEXT)
+        postures = [f for f in posture_and_fault_findings() if f["check"] in POSTURE_CHECKS]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        posted = self.harness.bodies_for("issue", "comment")
+        self.assertTrue(any(audit_report.deferred_marker("IC_1") in b for b in posted), posted)
+        for body in posted:
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn("no longer reproduces", body)
+
+    def test_start_replaces_yesterdays_record(self):
+        patcher = patch.object(audit_report.os, "makedirs", lambda *a, **k: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.record_run(context=("acme/old-context",))
+        self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
+        self.assertEqual(
+            audit_report.read_run_record(DECLARING_AUDIT),
+            {"repo": "acme/fleet", "context_repos": []},
+        )
+
+
 class TestAiSecurityAuditStream(BaseTestCase):
     """The AI stream driven through validate, coverage and render together.
 
@@ -3509,12 +4670,13 @@ class TestAiSecurityAuditStream(BaseTestCase):
 # --------------------------------------------------------------------------- #
 
 
-def bulk_findings(count, severity="minor", prefix="f"):
+def bulk_findings(count, severity="minor", prefix="f", check="netpol-missing"):
     """`count` findings with distinct ids and SOP-shaped prose."""
     return [
         make_finding(
             fid=f"{prefix}-{i:04d}",
             severity=severity,
+            check=check,
             title=f"Finding {i}: workload deviates from the baseline",
             namespace=f"ns-{i:04d}",
             obj=f"Deployment/app-{i:04d}",
@@ -8749,7 +9911,11 @@ class ContentModeTestCase(BaseTestCase):
         )
         self.assertEqual(
             json.loads(self.out.strip()),
-            {"workspace": str(self.workspace), "files": ["README.md"]},
+            {
+                "workspace": str(self.workspace),
+                "files": ["README.md"],
+                "sha": self.origin_git(["rev-parse", "main"]).strip(),
+            },
         )
         self.assertEqual(
             (self.workspace / "README.md").read_text(encoding="utf-8"), "seed\n"
@@ -8825,6 +9991,42 @@ class ContentModeTestCase(BaseTestCase):
         # No content left the broker except the matching lines themselves: the
         # audit did not have to fetch the file to find out that it matched.
         self.assertNotIn("read", self.verbs)
+
+    def test_the_read_commands_print_the_sha_of_the_tree_they_read(self):
+        """The commit behind every `list`, `grep` and `fetch` answer.
+
+        A content-mode run has no `git` to ask, and the declared-intent record
+        it owes (`declared_intent_searched`) names each repository at the sha
+        it was read at — so the sha rides on the reads themselves, and it is
+        the broker's, not something the agent could have made up.
+        """
+        self.start()
+        head = self.origin_git(["rev-parse", "main"]).strip()
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(self.out.strip())["sha"], head)
+        self.assertEqual(
+            self.run_main(["grep", "--audit", AUDIT, "--pattern", "seed"]), 0
+        )
+        self.assertEqual(json.loads(self.out.strip())["sha"], head)
+        self.assertTrue(audit_report.SEARCHED_REPO_RE.match(f"acme/fleet@{head}"))
+
+    def test_a_branch_read_prints_the_branch_head(self):
+        # With `--branch` naming a branch the remote has, the tree read is the
+        # branch's, so the sha is the branch head rather than the base.
+        self.start()
+        path = "clusters/prod-us-east/payments-netpol.yaml"
+        self.write_manifest(path, "kind: NetworkPolicy\n")
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        branch = self.branch_for(make_doc())
+        branch_head = self.origin_git(["rev-parse", branch]).strip()
+        self.assertNotEqual(branch_head, self.origin_git(["rev-parse", "main"]).strip())
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT, "--branch", branch]), 0)
+        self.assertEqual(json.loads(self.out.strip())["sha"], branch_head)
 
     def test_grep_that_matches_nothing_is_not_an_error(self):
         self.start()

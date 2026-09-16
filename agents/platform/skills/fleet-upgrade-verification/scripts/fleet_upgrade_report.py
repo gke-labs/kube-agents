@@ -8,8 +8,24 @@ reads each control-plane and node-pool version, and compares them with a target:
 release-channel `defaultVersion` from `gcloud container get-server-config`. Prints a
 Markdown table on stdout and, with `--output`, writes the same data as JSON.
 
-Read-only: the three gcloud commands it runs are `container clusters list`,
-`container get-server-config`, and `config get-value project`.
+Each run also records its per-member result under a state directory, keyed by target,
+and reads the previous run's record for the same target: a "Rollout progress" section
+after the table says per member whether it `started`, `completed`, or is `unchanged`
+since that run, and flags an unchanged, behind member as `stalled` while a rollout is
+active (another member moved, or `--rollout-in-progress` was passed).
+
+With `--readiness`, each member is also graded on whether it can take the upgrade to its
+target: drain-blocking PodDisruptionBudgets (read with one `kubectl get` per member after
+`gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
+exclusion in effect whose scope covers the upgrade, the maintenance window's state at
+`--at`, and node-pool version skew against the target control plane. The rules live in
+`upgrade_readiness.py`; this file reads and renders.
+
+Read-only against GCP: the gcloud commands it runs are `container clusters list`,
+`container get-server-config`, `config get-value project` and, with `--readiness`,
+`container clusters get-credentials`. The only things it writes are its own state file,
+the per-target kubeconfig files `get-credentials` produces, and the optional `--output`
+JSON.
 """
 
 import argparse
@@ -18,6 +34,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
+
+import upgrade_readiness as readiness
 
 # Project resolution, in the order networking_audit.py and the fleet SOPs use it:
 # explicit --project flags, then the fleet's monitored-project list, then the
@@ -83,6 +103,123 @@ TABLE_COLUMNS = (
     "note",
 )
 
+# Where a run leaves its record for the next one. The script runs in the shell sandbox,
+# whose /opt/data is a PersistentVolumeClaim the operator retains when the sandbox
+# StatefulSet goes (shell_sandbox_manifests.go), and whose entrypoint replaces only the
+# /opt/defaults trees and the database stubs on start (deploy/sandbox/entrypoint.sh);
+# /opt/data/scratch is per-run scratch by convention, so the record goes in a directory
+# of the skill's own name that nothing else writes. One file per target, named after
+# it: the target string is validated by VERSION_RE, so it is filesystem-safe as is, and
+# a run without --target-version measures each member against its channel default and
+# keys its record under CHANNEL_DEFAULT_STATE_KEY. --state-dir overrides the directory.
+DEFAULT_STATE_DIR = "/opt/data/state/fleet-upgrade-verification"
+CHANNEL_DEFAULT_STATE_KEY = "channel-default"
+STATE_FILE_SUFFIX = ".json"
+# The record is written to a uniquely named sibling and renamed into place, so two
+# runs against one target at once (a chat turn and a delegated card) cannot truncate
+# each other's half-written file; the last rename wins whole.
+STATE_TMP_PREFIX = ".fleet-upgrade-record-"
+# Bumped when the record's shape changes; a file with another version is reported and
+# treated as no prior run rather than compared field by field.
+STATE_FORMAT_VERSION = 1
+# `project/location/cluster`, the same triple the table sorts on; unique across a
+# fleet because a project's cluster names are unique per location.
+MEMBER_KEY_SEPARATOR = "/"
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+# Per-member progress since the previous run for the same target. `completed`: the
+# member is current or ahead after a version change (a current member that moved to a
+# new channel default included), or its status became current or ahead. `started`:
+# the control plane or the lowest pool changed version without reaching the target, or
+# the member is in flight. `unchanged`:
+# the same versions and status as before. `new`: no prior record. `stalled` is an
+# unchanged member that is lagging or patch-behind while a rollout is active, which is
+# the signal a point-in-time table cannot give: a member that has not moved between two
+# polls while its peers did.
+PROGRESS_NEW = "new"
+PROGRESS_STARTED = "started"
+PROGRESS_COMPLETED = "completed"
+PROGRESS_UNCHANGED = "unchanged"
+PROGRESS_STALLED = "stalled"
+PROGRESS_ORDER = (PROGRESS_COMPLETED, PROGRESS_STARTED, PROGRESS_STALLED, PROGRESS_UNCHANGED, PROGRESS_NEW)
+# Statuses that mean the member has reached the target, and the ones a stall can be
+# called on. `unknown` is in neither: a row that could not be graded is not a stall,
+# and an `unknown` observation on either side of a comparison is not evidence of a
+# move either (a timed-out get-server-config must not read as a completed upgrade),
+# so the comparison falls back to the versions alone and the record keeps the last
+# graded status.
+DONE_STATUSES = (STATUS_CURRENT, STATUS_AHEAD)
+BEHIND_STATUSES = (STATUS_LAGGING, STATUS_PATCH_BEHIND)
+GRADED_STATUSES = DONE_STATUSES + BEHIND_STATUSES
+# Why a rollout counted as active, for the summary line and the JSON.
+ACTIVE_REASON_FLAG = "--rollout-in-progress"
+ACTIVE_REASON_MOVERS = "another member moved since the previous run"
+# Why a member in the previous record has no row this run.
+GONE_REASON_ABSENT = "not in this run's cluster list; dropped from the record"
+GONE_REASON_NOT_READ = "not read this run ({why}); carried forward"
+NOT_READ_FAILED = "clusters list failed for {project}"
+NOT_READ_OUT_OF_SCOPE = "{project} not in this run's projects"
+
+# Elapsed-time rendering for `stalled (unchanged for ...)`.
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+ELAPSED_UNDER_A_MINUTE = "<1m"
+PROGRESS_COLUMNS = (
+    "project",
+    "cluster",
+    "location",
+    "previous (control plane / lowest pool)",
+    "now (control plane / lowest pool)",
+    "status",
+    "progress",
+)
+VERSION_PAIR_SEPARATOR = " / "
+
+# Readiness (`--readiness`). The PDB check needs one kubectl read per member, which needs
+# credentials for that member: `get-credentials` writes a per-target kubeconfig, passed to
+# both commands as KUBECONFIG in the subprocess environment rather than through a flag,
+# because the gcloud and kubectl in the agent pod are credential-proxy shims that forward
+# that variable. The directory is `$HERMES_HOME/.kubeconfigs`, the platform AGENTS.md
+# convention, and the file name mirrors `_thread_kubeconfig_path` in
+# scripts/platform_mcp_server.py: one file per target, so concurrent reads of different
+# clusters never race on one current-context; the proxy refuses a path outside its
+# workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
+KUBECTL = "kubectl"
+KUBECTL_TIMEOUT_SECONDS = 60
+KUBECTL_RESOURCES = "pdb,deploy,statefulset"
+KUBECONFIG_ENV = "KUBECONFIG"
+HERMES_HOME_ENV = "HERMES_HOME"
+DEFAULT_HERMES_HOME = "/opt/data"
+KUBECONFIG_SUBDIR = ".kubeconfigs"
+KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
+# The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
+# lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
+# holding `/` or `..` from steering the path out of the directory.
+KUBECONFIG_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]")
+KUBECONFIG_SLUG_REPLACEMENT = "_"
+KUBECONFIG_SLUG_EMPTY = "unset"
+# `--dns-endpoint` is added when the cluster record says its DNS endpoint accepts external
+# traffic, the decision agents/platform/scripts/gke_endpoint.py makes from `clusters
+# describe`; the `clusters list` record already read here carries the same block. The
+# flag is not safe unconditionally: gcloud rejects it on a cluster without a DNS endpoint.
+DNS_ENDPOINT_FLAG = "--dns-endpoint"
+# Readiness table rendering.
+READINESS_COLUMNS = (
+    "project",
+    "cluster",
+    "location",
+    "readiness",
+    "drain-blocking PDBs",
+    "maintenance",
+    "node-pool skew",
+    "note",
+)
+READINESS_NONE_CELL = "none"
+READINESS_READ_FAILED_CELL = "read failed"
+READINESS_NOT_EVALUATED_CELL = "not evaluated"
+READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
+
 # Exit codes. A failed gcloud call is reported per project and per location and does
 # not abort the run; the exit code only says whether every requested read succeeded.
 EXIT_OK = 0
@@ -90,10 +227,10 @@ EXIT_PARTIAL = 1
 EXIT_USAGE = 2
 
 
-def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS) -> tuple[int, str, str]:
-    """Runs a command and returns (rc, stdout, stderr); never raises."""
+def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | None = None) -> tuple[int, str, str]:
+    """Runs a command and returns (rc, stdout, stderr); never raises. `env` None inherits."""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout, env=env)
         return res.returncode, res.stdout, res.stderr
     except subprocess.TimeoutExpired:
         return -1, "", f"timed out after {timeout} seconds"
@@ -297,8 +434,119 @@ def grade_member(cluster: dict, project: str, explicit_target: str | None, cache
     return member
 
 
-def build_report(projects: list[str], explicit_target: str | None) -> dict:
-    """Enumerates every project and grades every member; one failure never aborts the rest."""
+def default_kubeconfig_dir() -> str:
+    """`$HERMES_HOME/.kubeconfigs`, resolved at run time so the environment decides."""
+    return os.path.join(os.environ.get(HERMES_HOME_ENV, DEFAULT_HERMES_HOME), KUBECONFIG_SUBDIR)
+
+
+def _kubeconfig_slug(value) -> str:
+    return KUBECONFIG_SLUG_RE.sub(KUBECONFIG_SLUG_REPLACEMENT, str(value or "")) or KUBECONFIG_SLUG_EMPTY
+
+
+def kubeconfig_path(kubeconfig_dir: str, project: str, cluster: str, location: str) -> str:
+    """One kubeconfig per (project, cluster, location), named as platform_mcp_server names them."""
+    name = KUBECONFIG_FILE_FORMAT.format(project=_kubeconfig_slug(project), cluster=_kubeconfig_slug(cluster), location=_kubeconfig_slug(location))
+    return os.path.join(kubeconfig_dir, name)
+
+
+def dns_endpoint_args(cluster: dict) -> list[str]:
+    """`[--dns-endpoint]` when the record's DNS endpoint accepts external traffic, else nothing."""
+    dns = ((cluster.get("controlPlaneEndpointsConfig") or {}).get("dnsEndpointConfig") or {})
+    if dns.get("endpoint") and dns.get("allowExternalTraffic") is True:
+        return [DNS_ENDPOINT_FLAG]
+    return []
+
+
+def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
+    return [
+        GCLOUD, "container", "clusters", "get-credentials", cluster.get("name", ""),
+        f"--location={cluster.get('location', '')}", f"--project={project}",
+        *dns_endpoint_args(cluster),
+    ]
+
+
+def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tuple[list | None, str | None, str]:
+    """(items, error, kubeconfig): the PDBs and workloads of one member, read through kubectl.
+
+    `get-credentials` writes the member's kubeconfig, then one `kubectl get` reads every
+    PodDisruptionBudget, Deployment and StatefulSet. Either command failing is the error;
+    the member is then graded `unknown` on the PDB rule and the run exits 1.
+    """
+    path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
+    try:
+        os.makedirs(kubeconfig_dir, exist_ok=True)
+    except OSError as e:
+        return None, f"cannot create kubeconfig directory {kubeconfig_dir}: {e}", path
+    env = {**os.environ, KUBECONFIG_ENV: path}
+    cmd = get_credentials_cmd(cluster, project)
+    rc, _, stderr = run_cmd(cmd, GCLOUD_TIMEOUT_SECONDS, env)
+    if rc != 0:
+        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
+    cmd = [KUBECTL, "get", KUBECTL_RESOURCES, "-A", "-o", "json"]
+    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
+    if rc != 0:
+        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
+    try:
+        data = json.loads(stdout) if stdout.strip() else {}
+    except ValueError as e:
+        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}", path
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, f"{' '.join(cmd)} returned no items list", path
+    return items, None, path
+
+
+def assess_readiness(cluster: dict, member: dict, items: list | None, read_error: str | None, at: datetime, kubeconfig: str) -> dict:
+    """The member's `readiness` object: the three rules against the row's target."""
+    target = parse_version(member["target_version"]) if member["target_version"] else None
+    master = parse_version(member["control_plane_version"])
+    pools = [{"name": p["name"], "version": p["version"], "parsed": parse_version(p["version"])} for p in member["node_pools"]]
+    autopilot = bool((cluster.get("autopilot") or {}).get("enabled"))
+    pdbs = None if items is None else readiness.grade_pdbs(*readiness.split_items(items))
+    maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
+    skew = readiness.evaluate_skew(target, pools, autopilot)
+    status = readiness.readiness_status(pdbs, maintenance, skew, target is not None)
+
+    notes = []
+    if read_error:
+        notes.append("cluster read failed; PDBs not graded")
+    if target is None:
+        notes.append("no target; exclusion scope and skew not graded")
+    if pdbs:
+        if pdbs["scaled_to_zero"]:
+            notes.append(f"{pdbs['scaled_to_zero']} PDB(s) on scaled-to-zero workloads skipped")
+        if pdbs["orphan"]:
+            notes.append(f"{pdbs['orphan']} orphan PDB(s) matching no workload skipped")
+        if pdbs["unmatched"]:
+            notes.append(f"{pdbs['unmatched']} PDB(s) cover pods of no Deployment or StatefulSet; not graded")
+    if maintenance["undecided_exclusions"]:
+        notes.append(f"exclusion(s) not evaluated: {readiness.LIST_SEPARATOR.join(maintenance['undecided_exclusions'])}")
+    if maintenance["window"]["state"] == readiness.WINDOW_NOT_EVALUATED:
+        notes.append(maintenance["window"]["detail"])
+    if skew["at_ceiling"]:
+        notes.append(f"pool(s) at the skew ceiling: {readiness.LIST_SEPARATOR.join(skew['at_ceiling'])}")
+    if skew["applicable"] and skew["unknown"] and target is not None:
+        notes.append(f"pool version unparsable, skew unknown: {readiness.LIST_SEPARATOR.join(skew['unknown'])}")
+
+    return {
+        "status": status,
+        "evaluated_at": at.astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT),
+        "kubeconfig": kubeconfig,
+        "read_error": read_error,
+        "autopilot": autopilot,
+        "pdbs": pdbs,
+        "maintenance": maintenance,
+        "skew": skew,
+        "note": NOTE_SEPARATOR.join(notes),
+    }
+
+
+def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None) -> dict:
+    """Enumerates every project and grades every member; one failure never aborts the rest.
+
+    `readiness_options` (`at`, `kubeconfig_dir`) turns on the per-member readiness read and
+    grade; None leaves the report as the version table alone.
+    """
     cache = ServerConfigCache()
     members: list[dict] = []
     errors: list[dict] = []
@@ -309,17 +557,31 @@ def build_report(projects: list[str], explicit_target: str | None) -> dict:
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
             continue
         for cluster in clusters:
-            if isinstance(cluster, dict):
-                members.append(grade_member(cluster, project, explicit_target, cache))
+            if not isinstance(cluster, dict):
+                continue
+            member = grade_member(cluster, project, explicit_target, cache)
+            if readiness_options is not None:
+                items, read_error, path = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
+                if read_error is not None:
+                    errors.append({"project": project, "location": member["location"], "cluster": member["cluster"], "message": read_error})
+                member["readiness"] = assess_readiness(cluster, member, items, read_error, readiness_options["at"], path)
+            members.append(member)
     errors.extend(cache.errors)
     members.sort(key=lambda m: (m["project"], m["location"], m["cluster"]))
-    return {
+    report = {
         "target_version": explicit_target,
         "projects": list(projects),
         "members": members,
         "errors": errors,
         "summary": {status: sum(1 for m in members if m["status"] == status) for status in STATUS_ORDER},
     }
+    if readiness_options is not None:
+        report["readiness"] = {
+            "evaluated_at": readiness_options["at"].astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT),
+            "kubeconfig_dir": readiness_options["kubeconfig_dir"],
+            "summary": {status: sum(1 for m in members if m["readiness"]["status"] == status) for status in readiness.READINESS_ORDER},
+        }
+    return report
 
 
 def _cell(value) -> str:
@@ -365,9 +627,308 @@ def render_table(report: dict) -> str:
         + (f"; target {report['target_version']}" if report["target_version"] else "; target: each cluster's channel default")
     )
     for err in report["errors"]:
-        where = err["project"] + (f" ({err['location']})" if err.get("location") else "")
+        where = err["project"] + (f" ({err['location']})" if err.get("location") else "") + (f" cluster {err['cluster']}" if err.get("cluster") else "")
         lines.append(f"- read failed for {where}: {err['message']}")
     return "\n".join(lines)
+
+
+def _pdb_cell(r: dict) -> str:
+    if r["pdbs"] is None:
+        return READINESS_READ_FAILED_CELL
+    if not r["pdbs"]["blocking"]:
+        return READINESS_NONE_CELL
+    return NOTE_SEPARATOR.join(readiness.describe_finding(f) for f in r["pdbs"]["blocking"])
+
+
+def _maintenance_cell(r: dict) -> str:
+    parts = []
+    for e in r["maintenance"]["exclusions"]:
+        if e["in_effect"] or e["blocks"] is None:
+            parts.append(f"exclusion {e['name']} ({e['scope']}) {e['detail']}")
+    if not parts:
+        parts.append("no exclusion in effect")
+    window = r["maintenance"]["window"]
+    if window["kind"] == readiness.WINDOW_NONE:
+        parts.append("no maintenance window")
+    elif window["state"] == readiness.WINDOW_NOT_EVALUATED:
+        parts.append(f"window {window['recurrence']!r} {READINESS_NOT_EVALUATED_CELL}")
+    elif window["state"] == readiness.WINDOW_OPEN:
+        parts.append(f"window {window['detail']}: open, closes {window['closes_at']}")
+    else:
+        parts.append(f"window {window['detail']}: closed, next opening {window['next_opening'] or READINESS_NO_OPENING_CELL}")
+    return NOTE_SEPARATOR.join(parts)
+
+
+def _skew_cell(r: dict) -> str:
+    skew = r["skew"]
+    if not skew["applicable"]:
+        return f"{readiness.SKEW_NOT_APPLICABLE} ({skew['reason']})"
+    if skew["reason"]:
+        return f"{READINESS_NOT_EVALUATED_CELL} ({skew['reason']})"
+    parts = []
+    for p in skew["pools"]:
+        if p["verdict"] == readiness.SKEW_BLOCKS:
+            parts.append(f"{p['name']} {p['version']}: {p['detail']}")
+        elif p["verdict"] == readiness.SKEW_AT_CEILING:
+            parts.append(f"{p['name']} {p['version']}: {readiness.SKEW_AT_CEILING} ({p['minors_behind_target']} minors behind the target)")
+    if parts:
+        return NOTE_SEPARATOR.join(parts)
+    behind = [p["minors_behind_target"] for p in skew["pools"] if p["minors_behind_target"] is not None and p["minors_behind_target"] > 0]
+    return f"{readiness.SKEW_OK} (at most {max(behind)} minor(s) behind the target)" if behind else readiness.SKEW_OK
+
+
+def render_readiness(report: dict) -> str:
+    """The readiness table printed after the version table, with its own summary line."""
+    lines = [
+        "| " + " | ".join(READINESS_COLUMNS) + " |",
+        "| " + " | ".join(TABLE_SEPARATOR_CELL for _ in READINESS_COLUMNS) + " |",
+    ]
+    for m in report["members"]:
+        r = m["readiness"]
+        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
+        lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
+    summary = report["readiness"]["summary"]
+    lines.append("")
+    lines.append(
+        f"Readiness at {report['readiness']['evaluated_at']}: "
+        + ", ".join(f"{summary[s]} {s}" for s in readiness.READINESS_ORDER)
+        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB or skew any upgrade."
+    )
+    return "\n".join(lines)
+
+
+def utc_now() -> datetime:
+    """The clock every timestamp in the state file comes from; tests patch it."""
+    return datetime.now(timezone.utc)
+
+
+def format_timestamp(when: datetime) -> str:
+    return when.astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+def parse_timestamp(text) -> datetime | None:
+    """A TIMESTAMP_FORMAT string back to an aware datetime; None when it does not parse."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.strptime(text, TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def format_elapsed(seconds: int) -> str:
+    """`2h 15m`, `3d 1h`, `45m`; under a minute is ELAPSED_UNDER_A_MINUTE."""
+    seconds = max(0, int(seconds))
+    days, rest = divmod(seconds, SECONDS_PER_DAY)
+    hours, rest = divmod(rest, SECONDS_PER_HOUR)
+    minutes = rest // SECONDS_PER_MINUTE
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return ELAPSED_UNDER_A_MINUTE
+
+
+def member_key(member: dict) -> str:
+    return MEMBER_KEY_SEPARATOR.join((member["project"], member["location"], member["cluster"]))
+
+
+def state_path(state_dir: str, explicit_target: str | None) -> str:
+    """The record for this target: `<state_dir>/<target>.json`, or the channel-default file."""
+    return os.path.join(state_dir, (explicit_target or CHANNEL_DEFAULT_STATE_KEY) + STATE_FILE_SUFFIX)
+
+
+def load_state(path: str) -> tuple[dict | None, str | None]:
+    """(previous record, error). No file is (None, None); a bad file is (None, why)."""
+    if not os.path.exists(path):
+        return None, None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, f"previous record {path} unreadable, starting a new baseline: {e}"
+    if not isinstance(data, dict) or data.get("format_version") != STATE_FORMAT_VERSION or not isinstance(data.get("members"), dict):
+        return None, f"previous record {path} is not a format-{STATE_FORMAT_VERSION} record, starting a new baseline"
+    return data, None
+
+
+def save_state(path: str, state: dict) -> None:
+    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=STATE_TMP_PREFIX, suffix=STATE_FILE_SUFFIX, dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=JSON_INDENT)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _member_record(member: dict, unchanged_since: str, previous: dict | None) -> dict:
+    """The member's entry in the record; an ungraded run keeps the last graded status."""
+    lowest = member["lowest_node_pool"]
+    status = member["status"]
+    if status == STATUS_UNKNOWN and previous and previous.get("status") in GRADED_STATUSES:
+        status = previous["status"]
+    return {
+        "control_plane_version": member["control_plane_version"],
+        "lowest_node_pool_version": lowest["version"] if lowest else None,
+        "status": status,
+        "unchanged_since": unchanged_since,
+    }
+
+
+def _delta(member: dict, previous: dict | None) -> tuple[str, bool]:
+    """(progress before the stall rule, whether this observation agrees with the previous)."""
+    if previous is None:
+        return PROGRESS_NEW, False
+    lowest = member["lowest_node_pool"]
+    versions_now = (member["control_plane_version"], lowest["version"] if lowest else None)
+    versions_before = (previous.get("control_plane_version"), previous.get("lowest_node_pool_version"))
+    status_now, status_before = member["status"], previous.get("status")
+    moved = versions_now != versions_before
+    # `completed` needs evidence of a move: a version change, or a graded behind status
+    # before. A member that was already at the target and changed version is at the
+    # target again (the channel default moved and it followed), which is a completed
+    # upgrade, not a started one. An `unknown` baseline (a failed server-config read)
+    # proves nothing on its own.
+    if status_now in DONE_STATUSES and (moved or status_before in BEHIND_STATUSES):
+        return PROGRESS_COMPLETED, False
+    in_flight = [member["cluster_status"]] + [p.get("status", "") for p in member["node_pools"]]
+    if moved or any(s in IN_FLIGHT_STATUSES for s in in_flight):
+        return PROGRESS_STARTED, False
+    # Same versions. A graded status that moved without them (the channel default
+    # advanced under a member) starts a new observation series rather than inheriting
+    # the old one's clock, so a stall is never dated from before the target it is
+    # measured against existed. An `unknown` on either side is not a status change:
+    # the versions agree, and that is all the observation says.
+    both_graded = status_now in GRADED_STATUSES and status_before in GRADED_STATUSES
+    return PROGRESS_UNCHANGED, status_now == status_before or not both_graded
+
+
+def compute_progress(report: dict, previous: dict | None, now: datetime, rollout_flag: bool, path: str) -> dict:
+    """Annotates every member with its progress since `previous`; returns the record to save.
+
+    A member's `progress` is one of PROGRESS_ORDER; `unchanged_since` is the timestamp of
+    the first of the consecutive agreeing observations, carried forward across runs, and
+    `unchanged_for_seconds` the time since it. `report["rollout"]` gets the run-level view:
+    whether the rollout counted as active and why, the per-progress counts, and the members
+    of the previous record that have no row this run.
+    """
+    now_text = format_timestamp(now)
+    prior_members = previous["members"] if previous else {}
+    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None}
+    read_projects = set(report["projects"]) - failed_projects
+
+    record: dict[str, dict] = {}
+    agreeing: set[str] = set()
+    for member in report["members"]:
+        key = member_key(member)
+        before = prior_members.get(key)
+        progress, agrees = _delta(member, before if isinstance(before, dict) else None)
+        since = now_text
+        if agrees:
+            since = before.get("unchanged_since") or (previous or {}).get("recorded_at") or now_text
+            agreeing.add(key)
+        member["progress"] = progress
+        member["unchanged_since"] = since
+        since_at = parse_timestamp(since)
+        member["unchanged_for_seconds"] = int((now - since_at).total_seconds()) if since_at else None
+        record[key] = _member_record(member, since, before if isinstance(before, dict) else None)
+
+    movers = [m for m in report["members"] if m["progress"] in (PROGRESS_STARTED, PROGRESS_COMPLETED)]
+    active_reason = None
+    if rollout_flag:
+        active_reason = ACTIVE_REASON_FLAG
+    elif movers:
+        active_reason = ACTIVE_REASON_MOVERS
+    if active_reason:
+        for member in report["members"]:
+            if member["progress"] == PROGRESS_UNCHANGED and member["status"] in BEHIND_STATUSES and member_key(member) in agreeing:
+                member["progress"] = PROGRESS_STALLED
+
+    # Members of the previous record with no row this run: gone when their project was
+    # read cleanly (a deleted cluster leaves the record); carried forward when it was not
+    # read at all, so a failed or narrowed read never loses a record or dates a stall
+    # from it.
+    gone = []
+    for key, before in prior_members.items():
+        if key in record or not isinstance(before, dict):
+            continue
+        project = key.split(MEMBER_KEY_SEPARATOR, 1)[0]
+        if project in read_projects:
+            gone.append({"member": key, "reason": GONE_REASON_ABSENT, "carried_forward": False})
+            continue
+        why = NOT_READ_FAILED.format(project=project) if project in failed_projects else NOT_READ_OUT_OF_SCOPE.format(project=project)
+        gone.append({"member": key, "reason": GONE_REASON_NOT_READ.format(why=why), "carried_forward": True})
+        record[key] = before
+
+    report["rollout"] = {
+        "state_file": path,
+        "recorded_at": now_text,
+        "previous_run_at": previous.get("recorded_at") if previous else None,
+        "active": active_reason is not None,
+        "active_reason": active_reason,
+        "summary": {p: sum(1 for m in report["members"] if m["progress"] == p) for p in PROGRESS_ORDER},
+        "missing_members": gone,
+    }
+    return {
+        "format_version": STATE_FORMAT_VERSION,
+        "target": report["target_version"],
+        "recorded_at": now_text,
+        "members": dict(sorted(record.items())),
+    }
+
+
+def _versions_cell(control_plane, lowest_pool) -> str:
+    return _cell(control_plane) + VERSION_PAIR_SEPARATOR + _cell(lowest_pool)
+
+
+def render_progress(report: dict, previous: dict | None) -> str:
+    """The "Rollout progress" section printed after the table; one line on a first run."""
+    rollout = report["rollout"]
+    target = f"target {report['target_version']}" if report["target_version"] else "each cluster's channel default"
+    if previous is None:
+        return f"Rollout progress: no previous run for {target}; baseline recorded at {rollout['state_file']}. Rerun after the next wave to see per-member deltas."
+    lines = [
+        f"Rollout progress against {target}, compared with the run at {rollout['previous_run_at']} (record: {rollout['state_file']}):",
+        "",
+        "| " + " | ".join(PROGRESS_COLUMNS) + " |",
+        "| " + " | ".join(TABLE_SEPARATOR_CELL for _ in PROGRESS_COLUMNS) + " |",
+    ]
+    prior_members = previous["members"]
+    for m in report["members"]:
+        before = prior_members.get(member_key(m))
+        before = before if isinstance(before, dict) else {}
+        lowest = m["lowest_node_pool"]
+        progress = m["progress"]
+        if progress == PROGRESS_STALLED:
+            progress = f"{PROGRESS_STALLED} (unchanged for {format_elapsed(m['unchanged_for_seconds'] or 0)})"
+        row = (
+            m["project"],
+            m["cluster"],
+            m["location"],
+            _versions_cell(before.get("control_plane_version"), before.get("lowest_node_pool_version")) if before else EMPTY_CELL,
+            _versions_cell(m["control_plane_version"], lowest["version"] if lowest else None),
+            m["status"],
+            progress,
+        )
+        lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
+    summary = rollout["summary"]
+    active = f"rollout active ({rollout['active_reason']})" if rollout["active"] else "no member moved and --rollout-in-progress not passed, so nothing is flagged stalled"
+    lines.append("")
+    lines.append(f"{len(report['members'])} member(s): " + ", ".join(f"{summary[p]} {p}" for p in PROGRESS_ORDER) + f"; {active}.")
+    for gone in rollout["missing_members"]:
+        lines.append(f"- {gone['member']}: in the previous record, {gone['reason']}")
+    return "\n".join(lines)
+
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -375,10 +936,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
+    parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
+    parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
+    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs (one kubectl read per member), maintenance exclusions and window, node-pool skew.")
+    parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
+    parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")
+        return EXIT_USAGE
+
+    readiness_options = None
+    if args.readiness:
+        at = utc_now()
+        if args.at:
+            at = readiness.parse_rfc3339(args.at)
+            if at is None:
+                sys.stderr.write(f"--at {args.at!r} is not an RFC 3339 timestamp\n")
+                return EXIT_USAGE
+        readiness_options = {"at": at, "kubeconfig_dir": args.kubeconfig_dir or default_kubeconfig_dir()}
+    elif args.at or args.kubeconfig_dir:
+        sys.stderr.write("--at and --kubeconfig-dir need --readiness\n")
         return EXIT_USAGE
 
     projects = get_target_projects(args.project)
@@ -386,8 +965,25 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
         return EXIT_USAGE
 
-    report = build_report(projects, args.target_version)
+    report = build_report(projects, args.target_version, readiness_options)
+    path = state_path(args.state_dir, args.target_version)
+    previous, state_error = load_state(path)
+    state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
     print(render_table(report))
+    if readiness_options is not None:
+        print()
+        print(render_readiness(report))
+    print()
+    print(render_progress(report, previous))
+    if state_error:
+        sys.stderr.write(state_error + "\n")
+
+    write_failed = False
+    try:
+        save_state(path, state)
+    except OSError as e:
+        sys.stderr.write(f"failed to write the record {path}: {e}\n")
+        write_failed = True
 
     if args.output:
         try:
@@ -397,9 +993,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nWrote {len(report['members'])} member(s) to {args.output}")
         except OSError as e:
             sys.stderr.write(f"failed to write {args.output}: {e}\n")
-            return EXIT_PARTIAL
+            write_failed = True
 
-    return EXIT_PARTIAL if report["errors"] else EXIT_OK
+    return EXIT_PARTIAL if report["errors"] or write_failed else EXIT_OK
 
 
 if __name__ == "__main__":

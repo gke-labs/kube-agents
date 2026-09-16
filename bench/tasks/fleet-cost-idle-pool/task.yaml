@@ -1,5 +1,6 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# Registered in hack/eval/nightly-cases.txt (nightly tier) since 2026-09-15,
+# commented out of the presubmit's TASKS array before that (A3: the disk
+# half of its objective is date-gated; the nightly file carries the gate).
 #
 # Domain: cost (fleet-wide-cost-analysis SOP). Journey: the weekly waste
 # audit names the resource and the saving, not just an observation.

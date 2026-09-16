@@ -878,6 +878,152 @@ class TestResolveRepo(WorkspaceTestCase):
                 gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
             )
 
+
+# --------------------------------------------------------------------------- #
+# Context repositories — read for declared intent, never written
+# --------------------------------------------------------------------------- #
+
+
+class TestContextRepos(WorkspaceTestCase):
+    """`context_repos` is a second key in the same ConfigMap, and a different list.
+
+    The property every test here protects: a repository registered for
+    context is one the audit may *read*, and nothing that decides what the
+    agent may *write* — `get_managed_github_repos`, and through it the
+    broker's push gate and `resolve_repo` — ever sees it.
+    """
+
+    CONTEXT = '[{"type": "github", "url": "https://github.com/acme/terraform-live"}]'
+    MANAGED = '[{"type": "github", "url": "https://github.com/acme/fleet"}]'
+
+    def mount(self, **keys):
+        """A projected ConfigMap: one file per key under one directory."""
+        mount = self.tmp_path / "gitops-mount"
+        mount.mkdir(exist_ok=True)
+        for key, value in keys.items():
+            (mount / key).write_text(value, encoding="utf-8")
+        return mount / "managed_repos"
+
+    def test_the_key_is_read_from_the_file_beside_managed_repos(self):
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=self.CONTEXT)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ) as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_context_repo_entries(),
+                [{"type": "github", "url": "https://github.com/acme/terraform-live"}],
+            )
+            self.assertEqual(
+                gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+            )
+            mock_run.assert_not_called()
+
+    def test_a_mount_without_the_key_is_a_known_empty_list(self):
+        state_file = self.mount(managed_repos=self.MANAGED)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ) as mock_run:
+            self.assertEqual(gitops_workspace.get_context_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_context_github_repos(), [])
+            # Absent key on a present mount is "nothing registered", not
+            # "unreadable": no kubectl round trip, same as the managed key.
+            mock_run.assert_not_called()
+
+    def test_the_kubectl_fallback_reads_the_same_configmap_key(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout=json.dumps(
+                {"data": {"managed_repos": self.MANAGED, "context_repos": self.CONTEXT}}
+            ),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run", return_value=fake_cm
+        ) as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+            )
+            mock_run.assert_called_once()
+            self.assertEqual(mock_run.call_args.args[0][:3], ["kubectl", "get", "configmap"])
+
+    def test_a_configmap_with_no_context_key_answers_empty(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout=json.dumps({"data": {"managed_repos": self.MANAGED}}),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run", return_value=fake_cm
+        ):
+            self.assertEqual(gitops_workspace.get_context_repo_entries(), [])
+
+    def test_a_context_repository_never_enters_the_managed_list(self):
+        # The safety property. A context repo in the file and no managed repo
+        # at all: the managed answer stays empty, so the broker's push gate
+        # refuses it and the resolver does not pick it as the GitOps target.
+        state_file = self.mount(managed_repos="[]", context_repos=self.CONTEXT)
+        module = type(sys)("github_token_refresh")
+        module.get_current_git_repo = lambda cwd=None: None
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ), patch.dict(sys.modules, {"github_token_refresh": module}):
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["acme/terraform-live"])
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+            with self.assertRaises(RuntimeError):
+                gitops_workspace.resolve_repo()
+
+    def test_the_gitops_repo_may_also_be_a_context_repo(self):
+        # Registering the GitOps repo for context is allowed and changes
+        # nothing about what may be written: both lists carry it, on their
+        # own terms.
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=self.MANAGED)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["acme/fleet"])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/fleet"])
+
+    def test_malformed_context_json_is_an_empty_list_not_a_crash(self):
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos="{not a list}")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ) as mock_run:
+            self.assertEqual(gitops_workspace.get_context_repo_entries(), [])
+            mock_run.assert_not_called()
+
+    def test_the_context_file_sits_beside_whatever_path_names_the_managed_file(self):
+        # One environment variable locates both keys: the operator projects
+        # the whole ConfigMap as a directory, so the second key is a sibling.
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": "/mnt/state/managed_repos"}):
+            self.assertEqual(
+                gitops_workspace._state_key_path(gitops_workspace.CONTEXT_REPOS_KEY),
+                Path("/mnt/state/context_repos"),
+            )
+            self.assertEqual(
+                gitops_workspace._state_key_path(gitops_workspace.MANAGED_REPOS_KEY),
+                Path("/mnt/state/managed_repos"),
+            )
+
+    def test_a_skipped_context_entry_names_the_list_it_came_from(self):
+        """The skip warning says which ConfigMap key holds the entry, so an
+        administrator fixing it edits the right list."""
+        state_file = self.mount(
+            managed_repos=self.MANAGED,
+            context_repos='[{"type": "gitlab", "url": "https://gitlab.com/acme/live"}]',
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(gitops_workspace.get_context_github_repos(), [])
+        joined = "\n".join(logs.output)
+        self.assertIn("context_repos", joined)
+        self.assertIn("no provider for type 'gitlab'", joined)
+        self.assertNotIn("managed_repos repository", joined)
+
     def test_validate_repo_org_matching_primary_org(self):
         with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
             self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")
@@ -900,6 +1046,57 @@ class TestResolveRepo(WorkspaceTestCase):
                 gitops_workspace.get_managed_github_repos(),
                 ["acme/repo1"],
             )
+
+    def test_get_managed_github_repos_says_why_it_skipped_an_entry(self):
+        """A registered repository the agent will never touch has to be
+        distinguishable from one that was never registered."""
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"gitlab\\", \\"url\\": \\"https://gitlab.com/g/p\\"}, {\\"type\\": \\"github\\", \\"url\\": \\"not a url\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+        joined = "\n".join(logs.output)
+        self.assertIn("no provider for type 'gitlab'", joined)
+        self.assertIn("not a GitHub repository URL", joined)
+
+    def test_get_managed_github_repos_survives_an_unparseable_url(self):
+        """One malformed entry skips that entry, not the whole sweep."""
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://[::1/acme/repo\\"}, {\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/good\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            with self.assertLogs("gitops_workspace", level="WARNING"):
+                self.assertEqual(
+                    gitops_workspace.get_managed_github_repos(), ["acme/good"]
+                )
+
+    def test_extract_github_slug_accepts_only_the_canonical_host(self):
+        """The `hosts=` narrowing is the point: a registration is not a remote."""
+        self.assertEqual(
+            gitops_workspace.extract_github_slug("https://github.com/acme/repo"),
+            "acme/repo",
+        )
+        self.assertEqual(gitops_workspace.extract_github_slug("acme/repo"), "acme/repo")
+        for value in (
+            "https://ssh.github.com/acme/repo",
+            "https://ghe.example.com/acme/repo",
+            "https://gitlab.com/acme/repo",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(gitops_workspace.extract_github_slug(value))
+
+    def test_is_valid_repo_slug_refuses_what_it_would_have_to_rewrite(self):
+        self.assertTrue(gitops_workspace.is_valid_repo_slug("acme/repo"))
+        for value in ("acme/..", "acme/-x", "github.com/acme", " acme/repo ", "/acme/repo/"):
+            with self.subTest(value=value):
+                self.assertFalse(gitops_workspace.is_valid_repo_slug(value))
 
     def test_get_managed_github_repos_raises_on_kubectl_error(self):
         with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, ["kubectl"], stderr="Forbidden")):

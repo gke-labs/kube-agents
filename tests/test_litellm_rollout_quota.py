@@ -28,8 +28,9 @@ three that roll. Only two are the pair `AGENTS.md` keeps in step on purpose:
                                                  hit this at all — exempt by
                                                  construction, not by omission)
 
-Nothing else asserts this. `make chart-check` compares only the CRD and RBAC
-copies, and `test_gateway_rollout_budgets.py` reads the CI rollout gate rather
+Nothing else asserts this. `make chart-check` covers the CRD, RBAC,
+admission-policy and webhook manifests, not the integration Deployments, and
+`test_gateway_rollout_budgets.py` reads the CI rollout gate rather
 than the Deployment's strategy — so before this suite the fix could be reverted
 in any one of them with every gate still green.
 

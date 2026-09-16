@@ -7,7 +7,7 @@
 # evaluation pool (kube-agents-evals-project).
 #
 # Follows the sequence codified in
-# docs/site/src/content/docs/deploy/ci-pool-projects.md.
+# docs/ci-pool-projects.md.
 #
 # The project itself and its billing link are preconditions: this script
 # provisions *into* a project that already exists and already bills.

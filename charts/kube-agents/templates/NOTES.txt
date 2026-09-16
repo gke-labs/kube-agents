@@ -70,3 +70,14 @@ defaulting, and delete-protection do not. Install cert-manager and re-run with
 --set operator.webhooks.enabled=true to turn them on; the provisioning scripts /
 kustomize path enables them by default.
 {{- end }}
+{{- if and .Values.litellm.enabled .Values.litellm.networkPolicy (not (and .Values.platformAgent.enabled .Values.operator.enabled)) }}
+
+This release renders the static litellm-policy, because platformAgent.enabled or
+operator.enabled is false. Before an upgrade that sets both true, annotate the live
+policy so Helm keeps it for the operator to adopt instead of pruning it and leaving
+LiteLLM unselected until the operator has reconciled:
+
+  kubectl annotate netpol litellm-policy -n {{ .Release.Namespace }} helm.sh/resource-policy=keep
+
+Chart README, "Upgrade notes: static to dynamic NetworkPolicy".
+{{- end }}

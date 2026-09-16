@@ -863,8 +863,8 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
-	if fbContainer.Image != "fluent/fluent-bit:5.1.1" {
-		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.1, got %s", fbContainer.Image)
+	if fbContainer.Image != "fluent/fluent-bit:5.1.2" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.2, got %s", fbContainer.Image)
 	}
 	if fbContainer.SecurityContext == nil || fbContainer.SecurityContext.ReadOnlyRootFilesystem == nil || !*fbContainer.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on fluent-bit container")
@@ -1486,10 +1486,10 @@ func TestImageEnvOverrides(t *testing.T) {
 }
 
 func TestFluentBitImageEnvOverride(t *testing.T) {
-	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.1" {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.2" {
 		t.Fatalf("unexpected default fluent-bit image: %s", got)
 	}
-	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.1")
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.2")
 
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
@@ -1499,7 +1499,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
 			found = true
-			if c.Image != "registry.corp/mirror/fluent-bit:5.1.1" {
+			if c.Image != "registry.corp/mirror/fluent-bit:5.1.2" {
 				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
 			}
 		}
@@ -1518,7 +1518,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	const mirror = "registry.corp/mirror"
 	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
-	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.1")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.2")
 	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
 	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
 
@@ -5056,6 +5056,63 @@ func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
 	}
 	if found[0] == "not-the-operators-idea" {
 		t.Errorf("spec.deployment.env overrode the operator's cluster name, got %q", found[0])
+	}
+}
+
+// The watcher derives its Go soft memory limit from this variable, so it has to
+// be the container's own limits.memory read through the Downward API — not a
+// copy of the number, which would drift the first time the limit changed — and
+// as a plain byte count, which is what divisor 1 yields.
+func TestAgentAPIAuthSidecarReportsItsMemoryLimitToTheWatcher(t *testing.T) {
+	sidecar := buildAgentAPIAuthSidecar(newTestPlatformAgent(), "/opt/data")
+
+	var found []corev1.EnvVar
+	for _, e := range sidecar.Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	ref := found[0].ValueFrom
+	if ref == nil || ref.ResourceFieldRef == nil {
+		t.Fatalf("EVENT_WATCHER_MEMORY_LIMIT_BYTES must come from a resourceFieldRef, got %#v", found[0])
+	}
+	if ref.ResourceFieldRef.ContainerName != sidecar.Name {
+		t.Errorf("resourceFieldRef names container %q, want the sidecar's own %q", ref.ResourceFieldRef.ContainerName, sidecar.Name)
+	}
+	if ref.ResourceFieldRef.Resource != "limits.memory" {
+		t.Errorf("resourceFieldRef reads %q, want limits.memory", ref.ResourceFieldRef.Resource)
+	}
+	if ref.ResourceFieldRef.Divisor.Cmp(resource.MustParse("1")) != 0 {
+		t.Errorf("resourceFieldRef divisor is %s, want 1 so the value is a byte count", ref.ResourceFieldRef.Divisor.String())
+	}
+	if _, ok := sidecar.Resources.Limits[corev1.ResourceMemory]; !ok {
+		t.Error("the sidecar has no memory limit for the resourceFieldRef to read")
+	}
+}
+
+// Same hole as the two variables beside it: appended after the merge, so a
+// same-named spec.deployment.env entry would sit alongside it and server-side
+// apply would reject the Deployment.
+func TestDeploymentEnvCannotDuplicateTheEventWatcherMemoryLimit(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_MEMORY_LIMIT_BYTES", Value: "1"}},
+	}
+
+	var found []corev1.EnvVar
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	if found[0].ValueFrom == nil || found[0].Value == "1" {
+		t.Errorf("spec.deployment.env overrode the operator's memory limit reference, got %#v", found[0])
 	}
 }
 

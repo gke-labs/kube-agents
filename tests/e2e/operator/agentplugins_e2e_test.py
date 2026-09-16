@@ -1330,11 +1330,14 @@ def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
     """Run a probe in the agent container until its output contains `expect`.
 
     Rolling out is not the same as being ready to assert against. The platform-agent
-    container has no readiness probe — the pod's readiness comes from the credential-proxy
-    sidecar — so `kubectl rollout status` returns while the entrypoint may still be
-    syncing files, scaffolding the platform profile, or linking plugins. A single-shot
-    probe against that window passes or fails on timing, which in a suite this slow reads
-    as a flaky product rather than a flaky test.
+    container does carry probes — a StartupProbe and a ReadinessProbe, both `agentAPIProbe`
+    in `platformagent_manifests.go`, which curl the Hermes API on pod loopback — and on a
+    single-replica gateway a Ready pod has therefore finished the entrypoint's file sync,
+    profile scaffolding, and plugin linking, all of which run before `exec`. Under leader
+    election it has not: that probe exits 0 on connection-refused when
+    ENABLE_LEADER_ELECTION is true, so a standby reports Ready without serving. Polling
+    covers that configuration, and costs one exec where a single-replica gateway has
+    already settled.
 
     Every probe must print a token for both outcomes, so "not yet" and "the exec broke"
     stay distinguishable. The two tokens must not be substrings of one another: this
@@ -1376,9 +1379,10 @@ def restart_agent_pod() -> None:
     raise AssertionError(f"agent pod {old} was not replaced within 240s")
 
 
-def reconcile_and_wait() -> None:
+def reconcile_and_wait(gen_before: int | None = None) -> None:
     """Give the operator a reconcile, then wait for the agent Deployment to settle."""
-    gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+    if gen_before is None:
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
     # min_gen must be gen_before + 1: passing the current generation satisfies the
     # >= check immediately and the helper returns without waiting for anything.
     wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
@@ -1763,6 +1767,7 @@ def step17_verify_link_self_heals_over_a_stale_directory(plugin_image: str) -> N
 
     link = profile_plugin_link(TARGET_PROFILE, TARGETED_PLUGIN_CR_NAME)
     try:
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         apply_kubectl_manifest(f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentPlugin
 metadata:
@@ -1773,7 +1778,7 @@ spec:
   image: {plugin_image}
   targetProfile: {TARGET_PROFILE}
 """)
-        reconcile_and_wait()
+        reconcile_and_wait(gen_before)
 
         # Recreate the pre-upgrade shape: the link replaced by the empty directory the
         # kubelet used to leave on the PVC.
@@ -1795,8 +1800,52 @@ spec:
             f"the healed link must resolve to the mounted plugin: {reachable.stdout}{reachable.stderr}"
         )
         log("Verified startup replaced the stale directory with a working link.")
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE])
+        reconcile_and_wait(gen_before)
     finally:
-        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+        # The delete is unconditional. `check=False` already swallows NotFound, and a `get`
+        # that fails for any other reason -- an API blip, an expired credential, the wrong
+        # context -- must not be read as "already gone" and skip it: leaving the plugin
+        # mounted on the gateway for whichever suite runs next is the failure this block
+        # exists to prevent.
+        #
+        # What the probe decides is which wait follows it, so it runs before the delete and
+        # nothing between here and there is allowed to raise. On the success path the step
+        # has already withdrawn the CR and waited its rollout out, and the plain rollout
+        # wait is a settled-state re-check. On a failure path the CR is still here and the
+        # delete below is what starts the rollout -- and wait_deployment_rollout cannot see
+        # that one coming, because `kubectl rollout status` succeeds as soon as the observed
+        # generation matches the current one, which is still the pre-delete generation. It
+        # would return against the revision that still has the plugin in it. So capture the
+        # generation first and wait for the operator's bump, the way step 6 does.
+        gen_before_cleanup = None
+        try:
+            cr_still_present = run_kubectl(
+                ["get", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE],
+                check=False,
+                capture_output=True,
+            ).returncode == 0
+            if cr_still_present:
+                gen_before_cleanup = get_deployment_generation(GATEWAY_DEPLOYMENT)
+        except subprocess.CalledProcessError:
+            # Reading the cluster failed, which says nothing about what the cleanup owes.
+            # Fall through to the delete and settle with the generation-blind wait.
+            pass
+
+        deleted = run_kubectl(
+            ["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE],
+            check=False,
+            capture_output=True,
+        ).returncode == 0
+
+        # A delete that did not land starts no rollout, so waiting for a generation bump
+        # would spend DEFAULT_GENERATION_TIMEOUT_SEC on one that is never coming and then
+        # raise a TimeoutError over whatever the step actually failed on.
+        if gen_before_cleanup is not None and deleted:
+            reconcile_and_wait(gen_before_cleanup)
+        else:
+            wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 17 SUCCESS: stale plugin directory self-heals into the link on startup.")
 

@@ -360,7 +360,7 @@ func TestNonCompletedTerminalKeepsTheNarrationTail(t *testing.T) {
 // land every spawn in the failure path above.
 func TestSpawnSetsSeccompRuntimeDefault(t *testing.T) {
 	cs := k8sfake.NewSimpleClientset()
-	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", NATSCredsSecret: "creds",
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
 		TaskDeadline: 15 * time.Minute}
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1",

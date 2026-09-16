@@ -190,7 +190,7 @@ BOSKOS_STATE_FREE = "free"
 # like it had one mystery holder.
 BOSKOS_NO_OWNER = ""
 
-# The policy in docs/site/src/content/docs/deploy/ci-pool-projects.md. A breach
+# The policy in docs/ci-pool-projects.md. A breach
 # of either is the signal to onboard the next project -- if, and only if, the
 # pool was actually full at the time.
 DEFAULT_P50_THRESHOLD_MINUTES = 15
@@ -1523,7 +1523,7 @@ def cause(
         return CAUSE_CAPACITY, [
             "CAPACITY. Every project was leased while runs were waiting, so the",
             "queue is real demand. Onboard the next project, per the pool runbook:",
-            "docs/site/src/content/docs/deploy/ci-pool-projects.md",
+            "docs/ci-pool-projects.md",
         ] + _cap_at_pool_caveat(pool_state, concurrency)
 
     if concurrency is not None and pool_state.total > concurrency:

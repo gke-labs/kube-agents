@@ -2,14 +2,19 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 
 # Every 15 minutes, and on demand: refresh the live eval dashboard
 # (incremental collect -> render -> publish, the pipeline
-# hack/ci-dashboard-refresh.sh runs), read the data.json just published,
-# decide whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why
-# (scripts/eval_dashboard/health.py), tell #kube-agents-ci-health on Google
-# Chat only when that changes plus one digest a day
-# (scripts/eval_dashboard/post_health.py), and publish health.json next to
-# data.json. docs/ci-health.md explains the states, the rules and the advice
-# each one carries. The data and the verdict are fresh together, with no
-# dependency on a Prow periodic.
+# hack/ci-dashboard-refresh.sh runs), decide from the data.json just
+# collected whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why
+# (scripts/eval_dashboard/health.py), publish health.json next to data.json,
+# render the dashboard with that verdict and its history baked into the
+# Brief (render.py --health / --health-history, the same flags the refresh
+# script passes), and tell #kube-agents-ci-health on Google Chat only when
+# the state changes plus one digest a day (scripts/eval_dashboard/
+# post_health.py). docs/ci-health.md explains the states, the rules and the
+# advice each one carries. The data and the verdict are fresh together, with
+# no dependency on a Prow periodic. The order inside a tick is adjudicate ->
+# upload health.json -> append history -> render -> publish -> post ->
+# comment, so the Brief a reader opens from a message already shows the
+# verdict the message names.
 #
 # Two identities, each least-privilege for its half, which is why the
 # refresh script is not invoked as one unit here: it couples collect and
@@ -39,8 +44,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # against (#1251's review). The fork guard covers the other axis.
 #
 # Budget: this job runs the INCREMENTAL path only -- the bucket holds
-# data.json, and collect.py's watermark makes a tick cost the archive
-# listing plus the new builds (seconds to a few minutes). A cold sweep does
+# data.json, and collect.py's watermark makes a tick cost one listing of
+# Prow's per-job directory index plus the new builds (seconds to a few
+# minutes). A cold sweep does
 # not fit here and is not attempted: hack/ci-dashboard-refresh.sh prices it
 # at 30-45 minutes, past the 30-minute job, and retrying it every 15 minutes
 # would burn a red run per tick without ever publishing. So a tick that finds
@@ -59,8 +65,10 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # "kube-agents-ci-health" space) is not a secret and defaults here; a
 # repository variable overrides it. The off switch is a separate variable,
 # CI_HEALTH_MUTE=true: no token is minted, the poster finds nothing to post
-# with and exits 0 ("webhook not configured"), and the refresh, the verdict
-# and the health.json upload carry on. (An empty CI_HEALTH_CHAT_SPACE could
+# with and exits 0 ("webhook not configured") before it would file an
+# issue, the comment step is skipped, and the refresh, the verdict and the
+# health.json upload carry on -- so the one switch silences every write
+# onto Chat, issues and other people's pull requests. (An empty CI_HEALTH_CHAT_SPACE could
 # not be that switch: `vars.X || 'default'` yields the default for an empty
 # string too.) An incoming-webhook URL is the optional alternative, read
 # from Secret Manager (ci-health-chat-webhook in kube-agents-prow) when a
@@ -69,6 +77,20 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # health.json is uploaded before anything is posted: it is the --prev the
 # next tick reads, so a Chat fault must not cost the adjudicator its memory.
 # A post failure still fails the run, in the last step, so the red shows.
+# After the upload the same health.json is appended, with a `tick` time, to
+# health-history.jsonl beside it (download, append, upload: GCS has no
+# append); a failure there is a warning.
+#
+# Two things write to GitHub with this workflow's own token, which is why
+# the job asks for pull-requests: write and issues: write and nothing else
+# does: the poster files the tracking issue a new OUTAGE lacks (label
+# presubmit-gate; it adopts a human's if one names the same cases, and
+# never closes one) and, for a new lost_pods condition, the issue the
+# cluster owner is owed (same label; it adopts a human's naming the same
+# nodes); scripts/eval_dashboard/gate_comment.py leaves one comment per
+# pull request whose smoke run went red -- or lost its build node -- since
+# the last tick, edited in place on later runs. Both are best-effort: a
+# GitHub failure is a warning, retried next tick, never a failed run.
 
 on:
   schedule:
@@ -96,11 +118,17 @@ env:
   CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
   CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
-  # the smoke-test presubmit's archive, the bound collect.py applies to a
-  # prior it finds unusable (a corrupt download; a missing one stops the step
-  # before collect.py runs), and the freshness-badge threshold written into
-  # data.json (this job's 15m cadence with slack for ~2 missed ticks).
+  # the smoke-test presubmit's archive, the nightly periodic's log prefix
+  # (same bucket, so the reader's grant already covers it; until the
+  # periodic exists the prefix lists nothing, which collect.py notes and
+  # carries on -- it is not the refusal line below until a night is on
+  # record, after which a prefix that stops listing is), the bound collect.py
+  # applies to a prior it finds unusable (a corrupt download; a missing one
+  # stops the step before collect.py runs), and the freshness-badge
+  # threshold written into data.json (this job's 15m cadence with slack for
+  # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  NIGHTLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -118,9 +146,26 @@ jobs:
     if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The workflow-level grant plus the two writes the header explains: the
+    # gate comment on a pull request (a red run, or a lost build node) and
+    # the tracking issue (an OUTAGE, or a lost_pods condition).
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # render.py's "what changed right before" block reads the last
+          # three days of first-parent history and omits itself when
+          # `git rev-parse --is-shallow-repository` is not "false"; any
+          # positive depth is still shallow, so the full history it is.
+          fetch-depth: 0
+          # The job token holds issues/PR write; nothing here pushes, and
+          # render's git log is local, so the token does not stay on disk.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -176,6 +221,7 @@ jobs:
           fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
+            --nightly-prefix "$NIGHTLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
@@ -216,34 +262,86 @@ jobs:
       - name: Make the publisher credential active for gsutil
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
-      - name: Render and publish the dashboard
-        if: steps.collect.outcome == 'success'
-        run: |
-          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site
-          python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
-
-      - name: Fetch data.json and the last-posted state
+      - name: Fetch data.json (after a failed collect) and the last-posted state
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
         run: |
           mkdir -p work
-          # After a successful publish this is the document just written;
-          # after a failed collect it is whatever the bucket holds, which the
-          # adjudicator ages against the clock.
-          gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
+          # After a successful collect work/data.json is the document about
+          # to be published; after a failed one it is whatever the bucket
+          # holds, which the adjudicator ages against the clock.
+          if [ "$COLLECT_OUTCOME" != "success" ]; then
+            gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
+          fi
           # No state yet is the first tick, not an error.
           gsutil -q cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
           gsutil -q cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
 
       - name: Adjudicate
         run: |
+          # --posted-state is the poster's file, read for the tracking issue
+          # the bot filed so health.json can cite it.
           python3 scripts/eval_dashboard/health.py \
             --data work/data.json \
             --prev work/health-prev.json \
+            --posted-state work/health-state.json \
             --out work/health.json
           python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'
 
       - name: Upload health.json next to data.json
         run: |
           gsutil -q -h "Cache-Control: no-cache" cp work/health.json "$DASHBOARD_BUCKET/health.json"
+
+      - name: Append this tick to health-history.jsonl
+        continue-on-error: true
+        run: |
+          # Download-append-upload. Only a download that failed because the
+          # object does not exist (the first tick) starts the feed empty; any
+          # other failure -- a 5xx, a timeout, a permission denial -- stops
+          # here, before an upload could replace the whole feed with one
+          # line. (`gsutil stat` cannot tell the two apart: it exits 1 for
+          # both, which is why the error text is read instead.)
+          set +e
+          gsutil -q cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl 2>gsutil.err
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then
+              echo "no health-history.jsonl yet; starting the feed"
+              : > work/health-history.jsonl
+            else
+              echo "::warning::could not download health-history.jsonl (not a NotFound); not appending this tick:"
+              cat gsutil.err
+              rm -f gsutil.err
+              exit 1
+            fi
+          fi
+          rm -f gsutil.err
+          python3 scripts/eval_dashboard/health_history.py --health work/health.json --history work/health-history.jsonl
+          if ! gsutil -q -h "Cache-Control: no-cache" cp work/health-history.jsonl "$DASHBOARD_BUCKET/health-history.jsonl"; then
+            echo "::warning::health-history.jsonl was not updated this tick"
+            exit 1
+          fi
+
+      # Render with the verdict just taken and its history, the way
+      # hack/ci-dashboard-refresh.sh does (`--health`, `--health-history`,
+      # each passed only when the file exists). health.json is always there
+      # by now; the history file is missing only when the step above failed
+      # before downloading, and the Brief then shows the current state alone.
+      # Still gated on the collect: publishing re-renders data.json too, and
+      # a failed collect has nothing new that is safe to publish (header).
+      - name: Render and publish the dashboard
+        if: steps.collect.outcome == 'success'
+        run: |
+          render_args=()
+          [ -f work/health.json ] && render_args+=(--health work/health.json)
+          [ -f work/health-history.jsonl ] && render_args+=(--health-history work/health-history.jsonl)
+          [ -f work/health-history.jsonl ] || echo "::warning::no health-history.jsonl this tick; the Brief renders the current verdict only"
+          # --public-url (bare) emits <base href> for the published site,
+          # post_health.DASHBOARD_URL's directory, so the pages' links
+          # resolve there whatever URL the console login lands on.
+          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site "${render_args[@]}" --public-url
+          python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
 
       - name: Fetch the webhook URL (optional alternative to the Chat API)
         if: env.CI_HEALTH_MUTE != 'true'
@@ -281,11 +379,34 @@ jobs:
         continue-on-error: true
         env:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
+          # For the tracking issue a new OUTAGE or lost_pods condition files (header).
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # --digest-hour is a Toronto hour (the poster's default zone).
+          # --data is the data.json this tick collected (or, after a failed
+          # collect, the bucket's): the digest's nightly line reads last
+          # night's run from it.
           python3 scripts/eval_dashboard/post_health.py \
             --health work/health.json \
+            --data work/data.json \
             --state "$DASHBOARD_BUCKET/health-state.json" \
-            --digest-hour 8
+            --digest-hour 9
+
+      # One comment per pull request whose smoke run went red, or lost its
+      # build node, since the last tick (header). The script exits 0 on a
+      # GitHub failure; the continue-on-error covers everything else, so
+      # this never reds the run. The mute switch covers this write too
+      # (header).
+      - name: Comment on pull requests whose smoke run went red or lost its node
+        if: env.CI_HEALTH_MUTE != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/eval_dashboard/gate_comment.py \
+            --data work/data.json \
+            --health work/health.json \
+            --state "$DASHBOARD_BUCKET/gate-comment-state.json"
 
       - name: Fail the run if the collect or the post failed
         if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'

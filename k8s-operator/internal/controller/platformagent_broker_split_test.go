@@ -646,7 +646,7 @@ func TestARefusalStillReconcilesTheAgentsNetworkPolicies(t *testing.T) {
 					},
 				}
 			},
-			reason: "ForbiddenVolumeMount",
+			reason: reasonForbiddenVolumeMount,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

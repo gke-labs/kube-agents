@@ -22,9 +22,15 @@ creates and 409 against the live fleet. The stack applies **once per eval projec
 and each project keeps its own state: bucket `<project>-tf-state`, prefix
 `seeded-fleet`, always. Whether a given project's apply is complete is not recorded here,
 because a list of project names goes stale silently: `scripts/verify_ci_pool_project.py`
-runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles.
-A role on a cluster it could not reach usually reports as unchecked rather than absent; the
-warnings that override that default are in the site's `deploy/ci-pool-projects` §6.
+runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles,
+then runs `hack/fleet-fixture-state.py` and requires each of them to be in its **designed
+state** — the `state` assertions beside each role in `fixtures.json` (the crashloop has a
+recorded OOMKilled termination, `checkout-gateway` has two Ready replicas and no PDB in its
+namespace, `seeded-b`'s master is still one minor behind its channel with the exclusion
+window ahead of now). Presence alone passed on 2026-09-07 while every slot-a fixture sat
+Pending (#1278); the state pass is what would have failed that project. A role on a cluster
+it could not reach usually reports as unchecked rather than absent; the warnings that
+override that default are in `docs/ci-pool-projects.md` §6.
 Project N+1 follows the same convention. The fleet owner creates the bucket once per project; switching projects means
 re-initializing against that project's bucket and naming the project on the apply:
 
@@ -38,8 +44,19 @@ Local validation without credentials: `tofu init -backend=false && tofu validate
 Drift is corrected by re-applying this stack on a schedule — a scheduled GitHub
 workflow, because the repository's other recurring jobs already live there and the
 apply needs nothing Cloud Build has that Actions lacks. The workflow does not exist
-yet; creating it is the fleet owner's call. Until it does, a manual `tofu apply` after
-any suspected drift is the reconcile.
+yet; creating it is the fleet owner's call (#1550). Until it does, a manual `tofu apply`
+after any suspected drift is the reconcile. Detecting the drift is a separate job, and
+it is `hack/fleet-fixture-state.py`'s: today the pool verifier runs it against one
+project when asked; a scheduled scan of every pool project from the CI health bot, which
+reports a repeated drift the way it reports a lost build node, is the follow-up pull
+request on #1550. The presubmit does not run it and does not act on a drift: an eval
+run's verdict is about the pull request, and skipping or excusing cases on the fleet's
+account is deliberately not part of evals v1. The script's `--wait` exists for a
+fixture that has just been rescheduled (the crashloop needs its first restart before
+OOMKilled evidence exists, observed about 40 minutes behind the node repair on one
+project in the #1278 retest sweep); a role still drifted at the deadline gets a
+`<role>.drift` file beside its kubeconfig whose lines name the assertion and what was
+observed, so the operator knows whether it is a `tofu apply` or a node.
 
 The reconcile is load-bearing for `seeded-b` in particular, and it does two distinct
 things there. First, it **carries the control plane forward**: `min_master_version` is
@@ -110,13 +127,13 @@ The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 
 | Defect                                                                                                                                                                                                                          | Where                                | Fixture role         | Asserting scenario                                                                                                                                                                   |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`    | `obtainability-planted-pdb`, `cluster-agent-healthy-workload-no-finding`                                                                                                             |
+| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`    | `obtainability-planted-pdb`, `cluster-agent-healthy-workload-no-finding`, `cluster-agent-stalled-controller-healthy-silence`                                                         |
 | `debug-binding`, a cluster-scoped ClusterRoleBinding of cluster-admin to the `seeded-security` default SA (the compliance SOP reads ClusterRoleBindings only)                                                                   | `seeded-a`                           | `rbac-overgrant`     | `compliance-rbac-overgrant`, `security-overgrant-probe`, `security-overgrant-remediation-proposal`                                                                                   |
 | `payments-api`, deterministic OOM crashloop                                                                                                                                                                                     | `seeded-a` / ns `seeded-debug`       | `crashloop-workload` | `cluster-agent-crashloop-debug`, `cluster-agent-crashloop-fix-request`, `cluster-agent-crashloop-misleading-symptom`, `cluster-agent-crashloop-evidence-chain`, `rca-remediation-pr` |
 | `pinned-inference-pool`: one zone, autoscaler pinned at one node, HPA wants more replicas than the pool can place, leaving a standing Pending backlog (no figure: the count is a load calculation and moves between projects)   | `seeded-a` / ns `seeded-capacity`    | `hpa-saturated`      | `stockout-pinned-pool`, `cluster-agent-pending-replicas-capped-pool`                                                                                                                 |
 | `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                                                                                                                                                          | `seeded-a`                           | `idle-nodepool`      | `fleet-cost-idle-pool`                                                                                                                                                               |
 | `orphan-pd-1`, `orphan-pd-2`, unattached disks                                                                                                                                                                                  | project, `var.zone`                  | — (GCE-level)        | `fleet-cost-idle-pool`                                                                                                                                                               |
-| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `version-laggard`    | `upgrade-readiness-lagging-cluster`                                                                                                                                                  |
+| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `version-laggard`    | `upgrade-readiness-lagging-cluster`, `upgrades-lagging-master-probe`, `upgrades-fleet-version-table`, `upgrades-fleet-rollout-stall`, `upgrades-fleet-readiness-exclusion`           |
 | Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares); all three clusters carry `environment=seeded` so the drift cohort is exactly this fleet | `seeded-c`                           | `drift-outlier`      | `consistency-drift-outlier`                                                                                                                                                          |
 
 The `environment=seeded` resource label is the cohort confinement, the same class of
@@ -184,7 +201,13 @@ The chain, end to end:
    then reported a catastrophic `fail` against an agent that had touched nothing.
    Adding a fixture therefore means adding both its role and its probes; every subject
    a `task.yaml` asserts on must appear in that list, which
-   `bench/tests/test_fleet_verifier.py` enforces in both directions.
+   `bench/tests/test_fleet_verifier.py` enforces in both directions. It also means
+   adding the role's `state` assertions — the observable shape the cases depend on,
+   in the small path-and-operator language `fixtures.json`'s `state_syntax` describes
+   — which `hack/fleet-fixture-state.py` evaluates after the presence gate. For slots
+   b and c the subject is the cluster itself, read back through `clusters describe`
+   on the name the runner recorded in `.fleet-context`; the script discovers nothing
+   on its own.
 3. A check in a `task.yaml` uses the `fleet_resource_property` verifier and names
    `fixture_role: crashloop-workload`.
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the

@@ -189,7 +189,7 @@ export GSA_NAME="kubeagents-platform-gsa"
 # security-and-iam.md, "The Vertex AI gateway is a separate identity"). The
 # pair must exist in the leased PROJECT_ID before a vertex_ai deploy;
 # provision_ci_pool_project.sh creates it, verify_ci_pool_project.py checks
-# it, and the site's deploy/ci-pool-projects.md carries the hand repair.
+# it, and docs/ci-pool-projects.md carries the hand repair.
 export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
 export MEMORY_ENABLED="false"
 export USER_PROFILE_ENABLED="false"
@@ -216,7 +216,7 @@ export SLACK_ENABLED="false"
 # choosing it. Note this is a *correctness* argument, not the containment
 # boundary: what a run can actually write to is fixed by which repositories the
 # GitHub App is installed on, which no PR can change. See
-# docs/site/src/content/docs/deploy/ci-pool-projects.md.
+# docs/ci-pool-projects.md.
 #
 # One GitOps repo per leasable project, so two concurrent leases can never
 # share a ledger issue or race on a remediation branch. Onboarding a further
@@ -301,7 +301,7 @@ elif [ "${IS_PROW_RUN}" = "true" ]; then
   echo "       private GitOps repo; deploying without one would leave the fleet-audit and" >&2
   echo "       rca-remediation-pr scenarios failing at step 0 for a reason no log explains." >&2
   echo "       Add the project to gitops_repo_for_project() in hack/ci-deploy.sh and follow" >&2
-  echo "       docs/site/src/content/docs/deploy/ci-pool-projects.md before registering it" >&2
+  echo "       docs/ci-pool-projects.md before registering it" >&2
   echo "       in the pool." >&2
   exit 1
 else
@@ -558,7 +558,7 @@ echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 # its own gate with diagnostics.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying platform-agent rollout ==="
-for i in {1..60}; do
+for _ in {1..60}; do
   kubectl get deployment platform-agent-gateway -n "${NAMESPACE}" >/dev/null 2>&1 && break
   sleep 5
 done
@@ -575,7 +575,7 @@ fi
 # stuck on ImagePullBackOff is an install this job must fail rather than pass.
 # Gated separately for the same reason the Deployment is -- the operator
 # creates it from the CR, so `helm --wait` never saw it.
-for i in {1..60}; do
+for _ in {1..60}; do
   kubectl get statefulset platform-agent-shell -n "${NAMESPACE}" >/dev/null 2>&1 && break
   sleep 5
 done
@@ -619,7 +619,7 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
   PF_PID=$!
 
   echo "Waiting for platform-agent port-forward on port 8642 (attempt ${attempt}/${CONNECTIVITY_ATTEMPTS})..."
-  for i in {1..30}; do
+  for _ in {1..30}; do
     if nc -z localhost 8642 2>/dev/null; then
       break
     fi

@@ -61,7 +61,7 @@ The base [`networkpolicy-apiserver-egress.yaml`](https://github.com/gke-labs/kub
 > [!IMPORTANT]
 > **Workload Identity metadata egress**: On GKE Dataplane V1 (iptables), the node DNATs `169.254.169.254:80` to the node-local metadata daemon at `169.254.169.252:988` in `nat PREROUTING` before `NetworkPolicy` is evaluated. Dataplane V2 (eBPF) evaluates policy pre-NAT at the socket layer, where the `169.254.169.254/32` rule on port `80` satisfies it directly. Ports `8080` and `987` (ALTS DirectPath) are intentionally omitted under least privilege since agent components authenticate over standard REST ADC. That deviates from Google's guidance, which recommends allowing both and warns that workloads omitting them "might experience disruptions during auto-upgrades" — if a token fetch starts failing during a node auto-upgrade, check the drop's destination port before looking elsewhere.
 >
-> - **Operator Deployments**: The operator generates both rules (`169.254.169.254/32` on port `80` and `169.254.169.252/32` on port `988`), covering both dataplanes out of the box. The cluster DNS ClusterIP is discovered from the `kube-system/kube-dns` Service; the metadata daemon container port is discovered from the `kube-system/gke-metadata-server` DaemonSet (falling back to port `988` and IP `169.254.169.252` if undiscoverable). Either can be overridden via the `kubeagents.x-k8s.io/dns-cluster-ip` / `kubeagents.x-k8s.io/metadata-daemon-ip` annotations, the typed `spec.networkPolicy` block on the CR, or the `KUBERNETES_DNS_CLUSTER_IP` / `KUBERNETES_METADATA_DAEMON_IP` operator environment variables — in that precedence order, ahead of discovery. [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for the typed field, including `enabled: false`, which stops policy generation and deletes both policies the operator owns — the gateway `NetworkPolicy`, and the `FQDNNetworkPolicy` that `kubeagents.x-k8s.io/enable-fqdn-network-policy` turns on.
+> - **Operator Deployments**: The operator generates both rules (`169.254.169.254/32` on port `80` and `169.254.169.252/32` on port `988`), covering both dataplanes out of the box. The cluster DNS ClusterIP is discovered from the `kube-system/kube-dns` Service; the metadata daemon container port is discovered from the `kube-system/gke-metadata-server` DaemonSet (falling back to port `988` and IP `169.254.169.252` if undiscoverable). Either can be overridden via the `kubeagents.x-k8s.io/dns-cluster-ip` / `kubeagents.x-k8s.io/metadata-daemon-ip` annotations, the typed `spec.networkPolicy` block on the CR, or the `KUBERNETES_DNS_CLUSTER_IP` / `KUBERNETES_METADATA_DAEMON_IP` operator environment variables — in that precedence order, ahead of discovery. [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for the typed field, including `enabled: false`, which stops policy generation and deletes the policies the operator manages — the gateway `NetworkPolicy`, the `FQDNNetworkPolicy` that `kubeagents.x-k8s.io/enable-fqdn-network-policy` turns on, and the shared `litellm-policy` (if LiteLLM is present).
 > - **Static Kustomize Deployments**: [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) ships both rules directly, covering both Dataplane V1 and Dataplane V2 out of the box.
 
 Do **not** edit base manifests directly. If your cluster uses a different service CIDR, is a GKE Dataplane V2 cluster, is managing private-endpoint fleet clusters, or is a GKE Private Cluster with a specific Control Plane VIP range (e.g., `172.16.0.0/28`), override the CIDR cleanly in your deployment overlay using a Kustomize patch in your `kustomization.yaml`:
@@ -120,12 +120,12 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
 spec:
   selector:
-    app: platform-agent
+    app: platform-agent-gateway
   ports:
     - name: api
       protocol: TCP
       port: 8642
-      targetPort: 8642
+      targetPort: 8643
     - name: dashboard
       protocol: TCP
       port: 9119
@@ -133,11 +133,11 @@ spec:
   type: ClusterIP
 ```
 
-The `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
+The `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent. The `selector` matches what the operator labels its gateway pods, `<agent-name>-gateway`. It is the one object in this overlay that depends on the agent being named `platform-agent`: the NetworkPolicies beside it select `app.kubernetes.io/name`, which the operator stamps as a constant whatever the CR is called. Rename the agent and this Service needs the same edit; they do not.
 
 The exposed ports:
 
-- `8642` — Hermes API server. Chat integrations and the operator health probes hit this.
+- `8642` — the Platform Agent API. Chat integrations hit this. It targets `8643` on the pod, the credential proxy's authenticated listener: Hermes itself binds `8642` on loopback only and validates a different key, so a caller never reaches it directly. [Credential isolation](/kube-agents/reference/credential-isolation/#request-paths) is canonical for that topology. The operator's health probes do not use this port — they `exec` `curl` against `127.0.0.1:8642` inside the container.
 - `9119` — Hermes dashboard. Behind `harness.hermes.dashboardEnabled` in the CR. Nothing answers on the pod network; the listener is loopback-only — see [`PlatformAgent` CRD](/kube-agents/operator/platformagent-crd/#specharness) for how to reach it.
 
 ## Kustomize for operator integrations
@@ -161,8 +161,9 @@ a mirrored install can redirect it, and most need other substitutions besides.
 These copies are the **development path**: a stock install gets the same
 components rendered by the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents)
 (via the Terraform engine the installer drives), while `k8s-operator/config/`
-remains the source of truth for the CRDs and operator RBAC the chart copies
-(`make chart-check` enforces that). Deploy the dev copies via `make deploy-*`
+remains the source of truth for the CRDs, operator RBAC, admission policy and
+webhook configuration the chart copies or mirrors (`make chart-check` enforces
+that). Deploy the dev copies via `make deploy-*`
 from `k8s-operator/`:
 
 ```bash

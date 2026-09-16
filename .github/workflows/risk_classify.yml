@@ -3,7 +3,8 @@ name: Risk Classification
 # Classifies every pull request's risk tier (low / medium / high) from its
 # diff, against the rules in .github/risk-rules.yml -- a non-blocking signal
 # for reviewers (#818). The verdict lands as a `Risk Classification` check run
-# that always concludes `success`, and a `risk:*` label.
+# that always concludes `success`, and a `risk:*` label. The job's own
+# `classify` check run is the one Tide can trip over; see `concurrency` below.
 #
 # The trigger cannot be `pull_request`: every pull request here comes from a
 # fork, and on a fork `pull_request` hands the workflow a read-only
@@ -27,10 +28,22 @@ on:
 
 permissions: {}
 
-# One run per pull request, newest wins: a push supersedes the classification
-# of the commit it replaced.
+# One run per pull request head, newest wins: a second event for the same
+# head supersedes the run already classifying it.
+#
+# The head SHA is in the group, not just the number, because two events a
+# second apart can start their runs in the other order. On 2026-09-09 a body
+# edit landed two seconds before a push (#1364): the push's `synchronize` run
+# started first, the edit's run started a second later still carrying the old
+# head, and being newer it cancelled the push's run. The script classifies
+# whatever head the API reports, so the verdict was right either way -- but
+# the edit's run put its `classify` check run on the old head, which left the
+# cancelled one as the only `classify` on the new head, and Tide counts a
+# cancelled check run as failing whether or not the context is required, so
+# the pull request sat unmerged with lgtm and approved. Keyed by head, a run
+# can only supersede runs for its own head.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
   cancel-in-progress: true
 
 jobs:

@@ -381,7 +381,9 @@ write_fleet_kubeconfigs() {
   : >"${dir}/${_FLEET_MARKER}"
   # So a check that cannot resolve its role can name the project it was looking
   # in. "role X is unavailable" is a bug report nobody can act on; "role X is
-  # unavailable in kube-agents-evals-3" is one sentence from the answer.
+  # unavailable in kube-agents-evals-3" is one sentence from the answer. The
+  # per-slot `cluster.<slot>=` / `location.<slot>=` lines are appended below
+  # as each slot resolves.
   printf 'project=%s\n' "$project" >"${dir}/.fleet-context"
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
@@ -421,6 +423,12 @@ write_fleet_kubeconfigs() {
       echo "WARNING: ${cluster} kubeconfig keeps the runner's own credential; FLEET_READONLY_SA=${sa} could not be used" >&2
     fi
     chmod 600 "$slot_config"
+    # Which cluster each resolved slot IS, for hack/fleet-fixture-state.py:
+    # slots b and c carry control-plane defects that only `clusters describe`
+    # shows, and recording the name here keeps that script from discovering
+    # clusters on its own -- the catalog's rule is that this file is the one
+    # place a seeded cluster is resolved.
+    printf 'cluster.%s=%s\nlocation.%s=%s\n' "$slot" "$cluster" "$slot" "$location" >>"${dir}/.fleet-context"
   done <<<"$discovered"
 
   if [ "$labelled" -eq 0 ]; then

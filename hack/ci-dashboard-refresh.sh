@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Eval dashboard hourly refresh (the periodic job's entrypoint)
+# Eval dashboard periodic refresh (the periodic job's entrypoint)
 # ==============================================================================
 # collect -> render -> publish for the live eval dashboard, INCREMENTALLY:
 # download the currently published data.json, hand it to collect.py's
 # --merge-with so the GCS scan only reads builds newer than the newest one on
-# record, then re-render and republish. A cold sweep is ~3 serial gsutil calls
-# per archived build -- 30-45 minutes over two weeks of history -- so the
-# watermark is what makes an hourly cadence possible at all; only the first
+# record, then re-render and republish. A cold sweep is ~3 gsutil calls per
+# archived build -- tens of minutes over two weeks of history -- so the
+# watermark is what makes a 15-minute cadence possible at all; only the first
 # armed run (no data.json published yet) pays a sweep, and even that one is
 # bounded to EVAL_DASHBOARD_SINCE_DAYS (default 14).
 #
@@ -42,17 +42,23 @@
 #                              dormant. (Live: gs://kube-agents-dashboards/evals/)
 #   EVAL_DASHBOARD_PR_GLOB     Prow build-dir glob(s) for collect.py; default
 #                              below is the smoke-test presubmit's archive.
+#   EVAL_DASHBOARD_NIGHTLY_PREFIX  the nightly periodic's Prow log prefix,
+#                              collected beside the presubmit as tier
+#                              "nightly" (default below: the live job's).
+#                              Empty disables the nightly scan. Not used on
+#                              the EVAL_DASHBOARD_FROM_DIR path, which is
+#                              offline by definition.
 #   EVAL_DASHBOARD_SINCE_DAYS  sweep bound when no usable prior data exists
+#                              (default 14).
 #   EVAL_DASHBOARD_STALE_AFTER_S  freshness-badge threshold written into
 #                              data.json (default 2400 = 15m cadence x ~2.5)
-#                              (default 14).
 #   EVAL_DASHBOARD_TIMEOUT     whole-pipeline budget in seconds (default 900).
 #   EVAL_DASHBOARD_FROM_DIR    local build-dir source instead of the GCS glob
 #                              -- the offline path the unit tests use. It also
 #                              disarms EVAL_DASHBOARD_RC_GLOB, so a from-dir
 #                              run reaches no bucket at all.
 #   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir glob, feeding the
-#                              page's Releases section; default below is
+#                              Brief's release-candidate table; default below is
 #                              post-kube-agents-eval-rc's archive. Empty =
 #                              leave releases[] to the prior data.json.
 #   EVAL_DASHBOARD_RC_FROM_DIR local release-candidate source, the offline
@@ -117,7 +123,8 @@ trap cleanup EXIT
 trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
-# The release-candidate archive, which feeds the page's Releases section.
+EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/}"
+# The release-candidate archive, which feeds the Brief's release-candidate table.
 # post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
 # rather than pr-logs/. Set to the empty string to leave the section on its
 # placeholder; a sweep that finds nothing does the same thing.
@@ -133,7 +140,7 @@ EVAL_DASHBOARD_STALE_AFTER_S="${EVAL_DASHBOARD_STALE_AFTER_S:-2400}"
 # Downloaded here rather than left to collect.py's gs:// --merge-with support
 # so the artifact log shows exactly which prior document this run merged
 # into. A failed or partial download is removed and collect.py degrades to
-# the bounded fresh sweep -- slower, still correct, self-heals next hour.
+# the bounded fresh sweep -- slower, still correct, self-heals next tick.
 PRIOR="${WORK}/prior-data.json"
 PRIOR_SRC="${EVAL_DASHBOARD_TARGET%/}/data.json"
 case "${EVAL_DASHBOARD_TARGET}" in
@@ -179,10 +186,11 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..$9 are the child bash's own positionals, so
+# Single quotes on purpose: $1..${10} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
-# it as a first run and bounds the sweep itself.
+# it as a first run and bounds the sweep itself. The nightly prefix rides
+# only with the GCS source: the from-dir path is the offline one.
 rc=0
 # shellcheck disable=SC2016
 ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
@@ -191,15 +199,16 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     src_args=(--from-dir "$6")
   else
     src_args=(--pr-glob "$4")
+    [ -n "$8" ] && src_args+=(--nightly-prefix "$8")
   fi
-  # The RC source. $9 is the offline one and wins outright; the bucket glob
-  # in $8 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
+  # The RC source. ${10} is the offline one and wins outright; the bucket glob
+  # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
   # what it says it is -- a run that reaches no bucket at all. Neither set
   # leaves releases[] to whatever --merge-with carried forward.
-  if [ -n "$9" ]; then
-    src_args+=(--rc-from-dir "$9")
-  elif [ -n "$8" ] && [ -z "$6" ]; then
-    src_args+=(--rc-glob "$8")
+  if [ -n "${10}" ]; then
+    src_args+=(--rc-from-dir "${10}")
+  elif [ -n "$9" ] && [ -z "$6" ]; then
+    src_args+=(--rc-glob "$9")
   fi
   python3 "$1/collect.py" "${src_args[@]}" \
     --merge-with "$2/prior-data.json" \
@@ -214,12 +223,16 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   render_args=()
   [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
   [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+  # A bucket target is the published site: pass the target to derive <base href>
+  # so every relative link resolves there without hardcoding production
+  # when targeting a staging bucket. A local directory keeps relative links.
+  case "$3" in gs://*) render_args+=(--public-url "$3") ;; esac
   python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site" "${render_args[@]}"
   python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
 ' _ "${DASH_SRC}" "${WORK}" "${EVAL_DASHBOARD_TARGET}" "${EVAL_DASHBOARD_PR_GLOB}" \
   "${EVAL_DASHBOARD_SINCE_DAYS}" "${EVAL_DASHBOARD_FROM_DIR:-}" \
-  "${EVAL_DASHBOARD_STALE_AFTER_S}" "${EVAL_DASHBOARD_RC_GLOB}" \
-  "${EVAL_DASHBOARD_RC_FROM_DIR:-}" \
+  "${EVAL_DASHBOARD_STALE_AFTER_S}" "${EVAL_DASHBOARD_NIGHTLY_PREFIX}" \
+  "${EVAL_DASHBOARD_RC_GLOB}" "${EVAL_DASHBOARD_RC_FROM_DIR:-}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

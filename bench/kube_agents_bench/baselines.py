@@ -42,7 +42,7 @@ read only the newest line could never admit anything the routine job produced
 — the store would ship empty and stay empty. :meth:`BaselineStore.evidence_for`
 therefore pools the NEWEST lines at the current key until it holds ``min_runs``
 runs. One deliberate twenty-run screening campaign satisfies that in a single
-line; seven ordinary merges to ``main`` satisfy it in seven. Pooling stops at
+line; seven ordinary nightlies on ``main`` satisfy it in seven. Pooling stops at
 the bar rather than reading the whole file, which is what gives recency for
 free: a case that starts failing has its old passing lines pushed out of the
 window by the new failing ones, and de-admits itself without anyone editing
@@ -55,6 +55,17 @@ cannot self-admit their own case in the same diff that makes it pass; bumping
 any version de-admits everything until it is re-screened; and a key with no
 record is reported STALE rather than silently compared against a baseline
 measured on different software.
+
+WHO DECIDES IS A MODE, AND THE ROSTER IS THE DEFAULT. ``EVAL_ADMISSION_MODE``
+selects it (:func:`admission_mode`). In ``roster`` mode ``BOOTSTRAP_ADMITTED``
+decides admission outright and the record's verdict on the case -- would
+admit, would demote, collecting, stale -- is reported beside it, never acted
+on: nobody should be able to move a case into or out of the blocking set
+without the eval crew knowing, and a roster edit reviewed in a pull request
+is that knowledge (decided 2026-09-14, gke-labs/kube-agents#1493). In
+``record`` mode the list is a fallback, not an override: it admits a named
+case only while the store cannot judge it, and once a full window exists the
+record decides either way. See :meth:`BaselineStore.admission`.
 
 THE VERSION KEY, AND WHY IT IS MOSTLY NOT OURS. Three of its five components
 are produced by devops-bench and read off the run: ``setupId`` from
@@ -90,18 +101,30 @@ from typing import Any
 from .evidence_store import EvidenceSource, StoreUnreachable, is_gcs, open_backend
 
 __all__ = [
-    "StoreUnreachable",
-    "is_gcs",
-]
-
-__all__ = [
+    "ADMISSION_MODES",
+    "ADMISSION_MODE_ENV",
+    "ADMISSION_MODE_RECORD",
+    "ADMISSION_MODE_ROSTER",
+    "ADMITTED_BY_BOOTSTRAP",
+    "ADMITTED_BY_NEITHER",
+    "ADMITTED_BY_RECORD",
+    "RECORD_COLLECTING",
+    "RECORD_NONE",
+    "RECORD_STALE",
+    "RECORD_WOULD_ADMIT",
+    "RECORD_WOULD_DEMOTE",
+    "Admission",
     "AdmissionBar",
     "BaselineEvidence",
     "BaselineRecord",
     "BaselineStore",
+    "RecordVerdict",
+    "StoreUnreachable",
     "VersionKey",
     "Versions",
+    "admission_mode",
     "append_record",
+    "is_gcs",
     "load_versions",
     "utc_now",
 ]
@@ -113,6 +136,78 @@ DEFAULT_ADMISSION_RATE = 0.95
 #: nothing, and admitting it would let a single lucky run arm the collapse
 #: rule against every future pull request.
 DEFAULT_ADMISSION_MIN_RUNS = 20
+
+#: Who decided a case's admission. ``record``: the store held a full window
+#: at the current key and its rate decided, either way (``record`` mode
+#: only). ``bootstrap``: ``BOOTSTRAP_ADMITTED`` decided -- always, in
+#: ``roster`` mode; in ``record`` mode only while the store had no full
+#: window. ``neither``: not on the list and not admitted by the record.
+ADMITTED_BY_RECORD = "record"
+ADMITTED_BY_BOOTSTRAP = "bootstrap"
+ADMITTED_BY_NEITHER = "neither"
+
+#: What the store says about a case, independent of who decides. Reported
+#: per case in every mode so a roster edit can cite it. ``would-admit`` and
+#: ``would-demote`` are a full window at the current key, above and below
+#: the bar; the other three are the pre-admission states in the store's own
+#: words. ``none`` also covers a run with no version key, which nothing can
+#: be filed under.
+RECORD_WOULD_ADMIT = "would-admit"
+RECORD_WOULD_DEMOTE = "would-demote"
+RECORD_COLLECTING = "collecting"
+RECORD_STALE = "stale"
+RECORD_NONE = "none"
+
+#: Which authority admits a case. ``roster``: ``BOOTSTRAP_ADMITTED`` decides,
+#: the record informs. ``record``: the record decides once it holds a full
+#: window; the list is the fallback until then. Read by :func:`admission_mode`.
+ADMISSION_MODE_ENV = "EVAL_ADMISSION_MODE"
+ADMISSION_MODE_ROSTER = "roster"
+ADMISSION_MODE_RECORD = "record"
+ADMISSION_MODES = (ADMISSION_MODE_ROSTER, ADMISSION_MODE_RECORD)
+
+#: The reason a listed case has always been given. Byte-identical to what the
+#: list produced before the record existed, and pinned by the store-unset
+#: golden; the record's verdict is appended after it only when the store
+#: holds something for the case.
+BOOTSTRAP_REASON = "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+BOOTSTRAP_STATE_PREFIX = "; the record cannot judge it yet: "
+#: Appended when, in ``record`` mode, the record turns away a case the list
+#: still names.
+RECORD_OVERRIDES_SUFFIX = (
+    " -- the record overrides BOOTSTRAP_ADMITTED, which still names this case"
+)
+#: In ``roster`` mode, how a full window is reported beside the list's
+#: decision -- said, never acted on.
+RECORD_WOULD_ADMIT_PREFIX = "the record would admit it: "
+RECORD_WOULD_DEMOTE_PREFIX = "the record would demote it: "
+#: Appended in ``roster`` mode when the record would admit a case the list
+#: does not name, so the log says why a case at 21/21 is not blocking.
+ROSTER_DECIDES_SUFFIX = (
+    f" -- {ADMISSION_MODE_ENV}={ADMISSION_MODE_ROSTER}, so BOOTSTRAP_ADMITTED "
+    "decides and does not name this case"
+)
+
+
+def admission_mode(env: dict[str, str] | None = None) -> str:
+    """Which authority admits a case, from ``EVAL_ADMISSION_MODE``.
+
+    Unset or empty means ``roster``. Anything else that is not one of
+    :data:`ADMISSION_MODES` raises rather than defaulting: a typo that
+    silently fell back to ``roster`` would read as a working switch to
+    ``record`` and switch nothing, which is the same silent-disarm class a
+    misspelled ``BOOTSTRAP_ADMITTED`` entry belongs to.
+    """
+    src = env if env is not None else os.environ
+    raw = (src.get(ADMISSION_MODE_ENV) or "").strip().lower()
+    if not raw:
+        return ADMISSION_MODE_ROSTER
+    if raw not in ADMISSION_MODES:
+        raise ValueError(
+            f"{ADMISSION_MODE_ENV}={raw!r}: expected one of "
+            + ", ".join(ADMISSION_MODES)
+        )
+    return raw
 
 
 @dataclass(frozen=True)
@@ -129,6 +224,46 @@ class AdmissionBar:
             rate=float(src.get("EVAL_ADMISSION_RATE", DEFAULT_ADMISSION_RATE)),
             min_runs=int(src.get("EVAL_ADMISSION_MIN_RUNS", DEFAULT_ADMISSION_MIN_RUNS)),
         )
+
+
+@dataclass(frozen=True)
+class RecordVerdict:
+    """What the store says about a case, before anyone decides anything.
+
+    ``state`` is one of the five ``RECORD_*`` values; ``detail`` is the
+    store's own sentence for it, the same words in either mode. Computed
+    first and reported in every mode, so the record informs a roster edit
+    whether or not it is allowed to decide.
+    """
+
+    state: str
+    detail: str
+    evidence: BaselineEvidence | None = None
+
+    @property
+    def full_window(self) -> bool:
+        return self.state in (RECORD_WOULD_ADMIT, RECORD_WOULD_DEMOTE)
+
+
+@dataclass(frozen=True)
+class Admission:
+    """Whether a case may reach rungs 4 and 6, the one-line why, and who said so.
+
+    ``source`` is one of :data:`ADMITTED_BY_RECORD`,
+    :data:`ADMITTED_BY_BOOTSTRAP` or :data:`ADMITTED_BY_NEITHER`. It is
+    reported per case so a verdict says which authority admitted a case, and
+    a case the record turned away despite its name being on the bootstrap
+    list is visibly the record's decision rather than a missing name.
+
+    ``record`` is the store's own verdict on the case (one of the
+    ``RECORD_*`` states), whoever decided: in ``roster`` mode it is the one
+    thing the verdict says about the evidence, and a roster edit cites it.
+    """
+
+    admitted: bool
+    reason: str
+    source: str
+    record: str = RECORD_NONE
 
 
 @dataclass(frozen=True)
@@ -520,49 +655,162 @@ class BaselineStore:
         *,
         bar: AdmissionBar,
         bootstrap: frozenset[str] = frozenset(),
+        mode: str = ADMISSION_MODE_RECORD,
     ) -> tuple[bool, str]:
         """Whether the case may reach rung 4, and the one-line why.
 
-        ``bootstrap`` is the transition bridge. The store ships empty, so
-        without it every case would stop blocking on the day this lands and
-        the presubmit would grade nothing for as long as screening takes.
-        Named cases keep their old blocking behaviour meanwhile. It is
-        deliberately an environment list in the shell rather than a field in
-        the store: a bridge that is inconvenient to extend is a bridge people
-        take down.
+        :meth:`admission` with the source dropped, for callers that only need
+        the boolean and the sentence.
         """
-        if case_id in bootstrap:
-            return True, "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+        decision = self.admission(
+            case_id, key, bar=bar, bootstrap=bootstrap, mode=mode
+        )
+        return decision.admitted, decision.reason
+
+    def _pre_admission_state(
+        self, case_id: str, key: VersionKey | None, evidence: BaselineEvidence | None, bar: AdmissionBar
+    ) -> str:
+        """The four states short of admission, in the store's own words.
+
+        Distinct on purpose: only the last is a problem with the case, and a
+        build log has to tell "we have not measured this yet" from "we
+        measured it and it is not reliable enough", which are the same boolean
+        and completely different problems.
+        """
         if key is None:
-            return False, "the run carries no version key, so no baseline matches it"
-        evidence = self.evidence_for(case_id, key, min_runs=bar.min_runs)
+            return "the run carries no version key, so no baseline matches it"
         if evidence is None:
             known = len(self._records.get(case_id, []))
             if known:
-                return False, (
+                return (
                     f"stale: {known} baseline record(s) exist for this case but "
                     f"none at the current key ({key.setup_id}, judge "
                     f"{key.judge_model}, fleet {key.fleet}, verifiers "
                     f"{key.verifiers}) -- re-screen before this case can collapse"
                 )
-            return False, "no screening evidence for this case yet"
+            return "no screening evidence for this case yet"
         span = f"{evidence.lines} recorded run(s)"
-        if evidence.admits(bar):
-            return True, (
-                f"admitted on {evidence.passes}/{evidence.runs} screening runs "
-                f"across {span} (bar {bar.rate:.0%} over {bar.min_runs})"
-            )
         if evidence.runs < bar.min_runs:
-            # Not a failure -- this is the store filling up. Said in its own
-            # words so a build log distinguishes "we have not measured this
-            # yet" from "we measured it and it is not reliable enough", which
-            # are the same boolean and completely different problems.
-            return False, (
+            return (
                 f"collecting: {evidence.passes}/{evidence.runs} runs recorded at "
                 f"this key across {span}, {bar.min_runs - evidence.runs} more "
                 f"needed before this case can collapse"
             )
-        return False, (
+        return (
             f"screened at {evidence.passes}/{evidence.runs} across {span}, below "
             f"the bar of {bar.rate:.0%} over {bar.min_runs} runs"
         )
+
+    def record_verdict(
+        self, case_id: str, key: VersionKey | None, *, bar: AdmissionBar
+    ) -> RecordVerdict:
+        """What the store says about the case, in one of five states.
+
+        Pure evidence, no list and no mode: the same answer feeds the
+        decision in ``record`` mode and the report beside it in ``roster``
+        mode, which is what makes "would admit" in one mode mean exactly
+        "admitted" in the other.
+        """
+        evidence = (
+            self.evidence_for(case_id, key, min_runs=bar.min_runs)
+            if key is not None
+            else None
+        )
+        if evidence is not None and evidence.runs >= bar.min_runs:
+            if evidence.admits(bar):
+                return RecordVerdict(
+                    RECORD_WOULD_ADMIT,
+                    f"{evidence.passes}/{evidence.runs} screening runs across "
+                    f"{evidence.lines} recorded run(s) (bar {bar.rate:.0%} over "
+                    f"{bar.min_runs})",
+                    evidence,
+                )
+            return RecordVerdict(
+                RECORD_WOULD_DEMOTE,
+                self._pre_admission_state(case_id, key, evidence, bar),
+                evidence,
+            )
+        detail = self._pre_admission_state(case_id, key, evidence, bar)
+        if evidence is not None:
+            return RecordVerdict(RECORD_COLLECTING, detail, evidence)
+        if key is not None and self._records.get(case_id):
+            return RecordVerdict(RECORD_STALE, detail)
+        return RecordVerdict(RECORD_NONE, detail)
+
+    def admission(
+        self,
+        case_id: str,
+        key: VersionKey | None,
+        *,
+        bar: AdmissionBar,
+        bootstrap: frozenset[str] = frozenset(),
+        mode: str = ADMISSION_MODE_RECORD,
+    ) -> Admission:
+        """Who admits the case -- the record, the bootstrap list, or nobody.
+
+        ``mode`` is one of :data:`ADMISSION_MODES`. The CLI reads it from
+        ``EVAL_ADMISSION_MODE`` and defaults to ``roster``; here the default
+        is ``record`` because this method's job is the record's verdict and
+        the list is the policy layer the caller chooses to put in front of
+        it. Whichever mode, :meth:`record_verdict` is computed first and
+        rides on the result as :attr:`Admission.record`.
+
+        ROSTER MODE: ``bootstrap`` decides, outright. A named case is
+        admitted and an unnamed one is not, whatever the store holds; the
+        record's verdict is appended to the reason -- "would admit", "would
+        demote", or how far the store is from a full window -- so the log
+        and the verdict say what the evidence would do, and a roster edit
+        can cite it. The list is deliberately an environment list in the
+        shell rather than a field in the store: a change to what blocks is a
+        reviewed diff, which is the point of the mode.
+
+        RECORD MODE: the record governs once it holds a full window. When
+        the store has at least ``bar.min_runs`` runs for this case at the
+        current key, that pooled rate decides, and it decides either way: a
+        case at 12/20 is turned away even if ``bootstrap`` names it.
+        ``bootstrap`` is then the fallback for a case the record cannot yet
+        judge: no evidence at all, evidence only at a superseded key, or
+        fewer than ``bar.min_runs`` runs at this one. While a named case
+        rides that bridge the store's own state is appended to the reason --
+        except when the store holds nothing for it, where the sentence is
+        the one the list has always produced.
+        """
+        if mode not in ADMISSION_MODES:
+            raise ValueError(
+                f"admission mode {mode!r}: expected one of " + ", ".join(ADMISSION_MODES)
+            )
+        verdict = self.record_verdict(case_id, key, bar=bar)
+        listed = case_id in bootstrap
+
+        if mode == ADMISSION_MODE_ROSTER:
+            if listed:
+                reason = BOOTSTRAP_REASON
+                if verdict.state == RECORD_WOULD_ADMIT:
+                    reason += "; " + RECORD_WOULD_ADMIT_PREFIX + verdict.detail
+                elif verdict.state == RECORD_WOULD_DEMOTE:
+                    reason += "; " + RECORD_WOULD_DEMOTE_PREFIX + verdict.detail
+                elif self._records.get(case_id):
+                    reason += BOOTSTRAP_STATE_PREFIX + verdict.detail
+                return Admission(True, reason, ADMITTED_BY_BOOTSTRAP, verdict.state)
+            reason = verdict.detail
+            if verdict.state == RECORD_WOULD_ADMIT:
+                reason = RECORD_WOULD_ADMIT_PREFIX + reason + ROSTER_DECIDES_SUFFIX
+            return Admission(False, reason, ADMITTED_BY_NEITHER, verdict.state)
+
+        if verdict.state == RECORD_WOULD_ADMIT:
+            return Admission(
+                True, "admitted on " + verdict.detail, ADMITTED_BY_RECORD, verdict.state
+            )
+        if verdict.state == RECORD_WOULD_DEMOTE:
+            reason = verdict.detail
+            if listed:
+                reason += RECORD_OVERRIDES_SUFFIX
+            return Admission(False, reason, ADMITTED_BY_RECORD, verdict.state)
+
+        if listed:
+            reason = BOOTSTRAP_REASON
+            if self._records.get(case_id):
+                reason += BOOTSTRAP_STATE_PREFIX + verdict.detail
+            return Admission(True, reason, ADMITTED_BY_BOOTSTRAP, verdict.state)
+
+        return Admission(False, verdict.detail, ADMITTED_BY_NEITHER, verdict.state)

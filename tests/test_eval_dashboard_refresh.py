@@ -30,6 +30,7 @@ SKIP = "eval-dashboard refresh skipped:"
 _SCRUB = (
     "EVAL_DASHBOARD_TARGET",
     "EVAL_DASHBOARD_PR_GLOB",
+    "EVAL_DASHBOARD_NIGHTLY_PREFIX",
     "EVAL_DASHBOARD_SINCE_DAYS",
     "EVAL_DASHBOARD_TIMEOUT",
     "EVAL_DASHBOARD_FROM_DIR",
@@ -59,6 +60,22 @@ def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
     stub = directory / name
     stub.write_text("#!/usr/bin/env bash\n" + body)
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def recording_python(directory: pathlib.Path, log: pathlib.Path) -> None:
+    """A python3 on PATH that appends collect.py's argv to `log` and then
+    runs the real interpreter, so a test can assert what the script hands
+    the collector without faking the pipeline."""
+    real = shutil.which("python3")
+    write_stub(
+        directory,
+        "python3",
+        f'case "$1" in *collect.py) printf "%s\\n" "$@" >> "{log}" ;; esac\nexec "{real}" "$@"\n',
+    )
+
+
+def collect_argv(log: pathlib.Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
 
 
 class RefreshScriptTest(unittest.TestCase):
@@ -116,12 +133,17 @@ class RefreshScriptTest(unittest.TestCase):
     # ── The pipeline itself, against the real fixtures ─────────────────────
 
     def test_first_run_publishes_the_fixture_dashboard(self):
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
         proc = run_script(
             env={
                 "EVAL_DASHBOARD_TARGET": str(self.target),
                 "EVAL_DASHBOARD_FROM_DIR": str(TESTDATA),
                 "JOB_TYPE": "periodic",
-            }
+            },
+            path_prepend=str(stubs),
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("first run against this directory", proc.stdout)
@@ -130,6 +152,44 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(data["schema_version"], 1)
         self.assertEqual(len(data["runs"]), 3)
         self.assertIn("<html", (self.target / "index.html").read_text().lower())
+        # The offline path hands collect.py the directory and no bucket
+        # source of either tier.
+        argv = collect_argv(argv_log)
+        self.assertIn("--from-dir", argv)
+        self.assertNotIn("--pr-glob", argv)
+        self.assertNotIn("--nightly-prefix", argv)
+        self.assertNotIn("<base href", (self.target / "index.html").read_text())
+
+    def test_bucket_target_emits_derived_base_href(self):
+        """gs:// target derives <base href> from the bucket URL rather than
+        hardcoding production, so staging bucket targets point to staging."""
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        published_capture = self.tmp / "captured_site"
+        published_capture.mkdir()
+        fake_gsutil = f"""
+        for arg in "$@"; do
+            if [[ -f "$arg" ]]; then
+                cp "$arg" "{published_capture}/"
+            fi
+        done
+        exit 0
+        """
+        write_stub(stubs, "gsutil", fake_gsutil)
+        proc = run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": "gs://staging-bucket/evals/",
+                "EVAL_DASHBOARD_FROM_DIR": str(TESTDATA),
+                "JOB_TYPE": "periodic",
+            },
+            path_prepend=str(stubs),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rendered_html = (published_capture / "index.html").read_text()
+        self.assertIn(
+            '<base href="https://storage.cloud.google.com/staging-bucket/evals/">',
+            rendered_html,
+        )
 
     def test_a_from_dir_run_never_reaches_the_rc_bucket(self):
         """EVAL_DASHBOARD_RC_GLOB defaults to a real bucket path, so the
@@ -162,11 +222,11 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn("1 releases", proc.stdout + proc.stderr)
         data = json.loads((self.target / "data.json").read_text())
         self.assertEqual([r["rc_tag"] for r in data["releases"]], ["staging_2609092307_5b5ad10"])
-        # The Releases table is on the two-band page, which the Brief links
-        # to as "Legacy view" -- not on index.html, which renders from
-        # brief.json and carries no release records at all.
-        self.assertIn("staging_2609092307_5b5ad10", (self.target / "legacy.html").read_text())
-        self.assertNotIn("staging_2609092307_5b5ad10", (self.target / "index.html").read_text())
+        # The Brief's release table renders from brief.json, which the
+        # pipeline bakes into index.html and publishes beside it.
+        self.assertIn("staging_2609092307_5b5ad10", (self.target / "brief.json").read_text())
+        self.assertIn("staging_2609092307_5b5ad10", (self.target / "index.html").read_text())
+        self.assertFalse((self.target / "legacy.html").exists(), "the legacy page is retired")
 
     def test_second_run_merges_with_the_published_prior(self):
         env = {
@@ -220,6 +280,8 @@ class RefreshScriptTest(unittest.TestCase):
         stubs = self.tmp / "stubs"
         stubs.mkdir()
         write_stub(stubs, "gsutil", "exit 1\n")
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
         artifacts = self.tmp / "artifacts"
         artifacts.mkdir()
         proc = run_script(
@@ -236,6 +298,25 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn(
             "gsutil ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
         )
+        # The bucket path hands collect.py both sources, the nightly one with
+        # its default prefix; an empty EVAL_DASHBOARD_NIGHTLY_PREFIX drops it.
+        argv = collect_argv(argv_log)
+        self.assertIn("--pr-glob", argv)
+        self.assertIn("--nightly-prefix", argv)
+        self.assertEqual(
+            argv[argv.index("--nightly-prefix") + 1],
+            "gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/",
+        )
+        argv_log.unlink()
+        run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/",
+                "JOB_TYPE": "periodic",
+                "EVAL_DASHBOARD_NIGHTLY_PREFIX": "",
+            },
+            path_prepend=str(stubs),
+        )
+        self.assertNotIn("--nightly-prefix", collect_argv(argv_log))
 
     @unittest.skipUnless(shutil.which("timeout"), "needs coreutils timeout")
     def test_a_hung_pipeline_times_out_red(self):

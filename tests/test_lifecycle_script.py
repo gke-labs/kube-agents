@@ -31,13 +31,23 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_cluster_name="null",
                    tfvar_enable_minter="false",
                    gcloud_key_version="",
-                   gcloud_kms_fail=False):
+                   gcloud_kms_fail=False,
+                   gcloud_kms_error="ERROR: permission denied",
+                   gcloud_kms_notice="",
+                   tfvar_enable_google_chat="true",
+                   tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
+                   tfvar_chat_topic_name='"platform-agent-chat-events"'):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
             gcloud = bin_dir / "gcloud"
-            kms_behavior = "echo 'ERROR: permission denied' >&2; exit 1" if gcloud_kms_fail else f"echo '{gcloud_key_version}'; exit 0"
+            if gcloud_kms_fail:
+                kms_behavior = f"echo '{gcloud_kms_error}' >&2; exit 1"
+            else:
+                # gcloud_kms_notice models a warning written to stderr on a zero exit.
+                notice = f"echo '{gcloud_kms_notice}' >&2; " if gcloud_kms_notice else ""
+                kms_behavior = f"{notice}echo '{gcloud_key_version}'; exit 0"
             gcloud.write_text(f"""#!/usr/bin/env bash
 set -e
 if [[ "$*" == *"kms keys versions list"* ]]; then
@@ -98,6 +108,15 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"location"* ]]; then
         echo '"us-central1-c"'
+        exit 0
+    elif [[ "$expr" == *"enable_google_chat"* ]]; then
+        echo '{tfvar_enable_google_chat}'
+        exit 0
+    elif [[ "$expr" == *"chat_subscription_name"* ]]; then
+        echo '{tfvar_chat_sub_name}'
+        exit 0
+    elif [[ "$expr" == *"chat_topic_name"* ]]; then
+        echo '{tfvar_chat_topic_name}'
         exit 0
     fi
     echo 'null'
@@ -434,6 +453,46 @@ resource "google_service_account" "agent" {
         self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
 
+    def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
+        proc = self._run_guard("guard_pubsub_subscription", tfvar_enable_google_chat="false")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_subscription_not_in_state(self):
+        proc = self._run_guard("guard_pubsub_subscription", state_list="")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_passes_when_matches_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_differs_from_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_chat_sub_name='"custom-chat-events-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("chat_subscription_name resolved to 'custom-chat-events-sub', but this state manages Pub/Sub subscription 'platform-agent-chat-events-sub'", proc.stderr)
+        self.assertIn('CHAT_SUB_NAME="platform-agent-chat-events-sub"', proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_topic_differs_from_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n    topic = "projects/test-proj/topics/platform-agent-chat-events"\n}',
+            tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
+            tfvar_chat_topic_name='"renamed-chat-topic"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("chat_topic_name resolved to 'renamed-chat-topic', but this state's Pub/Sub subscription is attached to topic 'platform-agent-chat-events'", proc.stderr)
+        self.assertIn('CHAT_TOPIC_NAME="platform-agent-chat-events"', proc.stderr)
+
     def test_guard_minter_key_no_op_when_minter_disabled(self):
         """When enable_github_minter is false, guard_minter_key passes cleanly."""
         proc = self._run_guard(
@@ -474,6 +533,59 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, f"unexpected failure: {proc.stderr}")
         self.assertIn("could not verify Cloud KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' for GitHub minter", proc.stderr)
         self.assertIn("Proceeding with apply", proc.stderr)
+
+    def test_guard_minter_key_refuses_when_key_does_not_exist_yet(self):
+        """A NOT_FOUND keyring or key is the first-apply wedge itself, so the guard refuses rather than proceeding.
+
+        Terraform creates the keyring and key import-only, so before the first apply
+        neither exists and `gcloud kms keys versions list` exits non-zero with
+        NOT_FOUND. Treating that like an unreachable API would let the apply build
+        the cluster and then hang forever on the minter's readiness probe.
+        """
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_kms_fail=True,
+            gcloud_kms_error="ERROR: (gcloud.kms.keys.versions.list) NOT_FOUND: KeyRing projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring not found.",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' does not exist yet.", proc.stderr)
+        self.assertIn("Applying now would deploy the minter and wedge waiting on its readiness probe.", proc.stderr)
+        self.assertNotIn("Proceeding with apply", proc.stderr)
+
+    def test_guard_minter_key_refuses_when_cloud_kms_is_not_enabled_yet(self):
+        """A disabled Cloud KMS API is the same first-apply state as an absent key.
+
+        main.tf enables cloudkms.googleapis.com as part of the very apply this
+        guard runs ahead of, so on a genuinely fresh project the probe comes back
+        SERVICE_DISABLED rather than NOT_FOUND. Reading only NOT_FOUND let the
+        first apply -- the wedge the guard exists for -- fall into warn-and-proceed.
+        """
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_kms_fail=True,
+            gcloud_kms_error="ERROR: (gcloud.kms.keys.versions.list) FAILED_PRECONDITION: Cloud Key Management Service (KMS) API has not been used in project 123 before or it is disabled.",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("does not exist yet.", proc.stderr)
+        self.assertNotIn("Proceeding with apply", proc.stderr)
+
+    def test_guard_minter_key_ignores_a_gcloud_notice_on_stderr(self):
+        """A warning gcloud writes to stderr on a zero exit must not be read back as a key version.
+
+        The version list and stderr are captured separately for this reason: merged,
+        `head -1` takes the notice, the guard sees a non-empty "version" and passes
+        against a key that has none -- the exact wedge it exists to prevent.
+        """
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_kms_notice="WARNING: Your active project does not match the quota project.",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("has no ENABLED version.", proc.stderr)
 
 
 if __name__ == "__main__":

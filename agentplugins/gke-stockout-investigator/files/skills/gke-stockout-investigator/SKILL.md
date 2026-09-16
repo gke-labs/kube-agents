@@ -254,33 +254,43 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 
 **MANDATORY Summary Requirements**:
 
-- 🛑 **NON-NEGOTIABLE RULE**: The `--body` string for `submit_suggestion.py` MUST contain the literal text `- **Checks Performed**:` followed by a `\`\`\`bash`code block containing the exact`kubectl describe pod ...`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...`commands you executed during analysis. Failing to include this`\`\`\`bash`block in the`--body` argument will cause the PR to be rejected by automated SRE audit rules.
-- Do NOT omit the `Checks Performed` section or code block from the `--body` argument.
+- 🛑 **NON-NEGOTIABLE RULE**: The description MUST contain the literal text `- **Checks Performed**:` followed by a `bash` code block containing the exact `kubectl describe pod ...`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include that block will cause the PR to be rejected by automated SRE audit rules.
+- Do NOT omit the `Checks Performed` section or its code block.
 - Do NOT include any `gh` commands (such as `gh pr list` or `gh pr create`) in the summary or PR description.
+
+Write the description to a file and pass the path, never `--body`. The `Checks Performed` block those rules mandate is nothing but backticks and `--format="json(...)"` strings, and inside the double quotes of a `--body` argument bash expands both — the diagnostic commands you are being told to record would run in the leased clone instead of appearing in the pull request.
 
 Run the `submit_suggestion.py` helper script with the `submit` subcommand to push the branch and open a SRE review Pull Request EXACTLY as follows, substituting `<workspace>` and `<lease>` with the values Step 3 printed:
 
+````bash
+BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)
+cat > "$BODY" <<'EOF'
+### 🚨 Stockout Diagnostic Report
+
+- **Trigger**: Received stockout alert for workload `<workload_name>` in cluster `<cluster_name>` (`<region_zone>`).
+- **Diagnosis**: <detailed summary of what caused the stockout and which rule was violated>.
+- **Checks Performed**:
+
 ```bash
+# Diagnostic commands executed during analysis:
+kubectl describe pod <pod_name> -n <namespace>
+gcloud compute regions describe us-central1 --format="json(quotas.filter(metric=NVIDIA_L4_GPUS))"
+gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selection-machine-types="g2-standard-4,g2-standard-12" --target-distribution-shape=ANY --size=1 --region=us-central1 --format="json"
+gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-type=g2-standard-4 --types=PREEMPTION,PRICE --region=us-central1 --format="json"
+```
+
+- **Remediation**: <description of the changes made to ComputeClass/workload manifests>.
+EOF
+
 ./skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --workspace "<workspace>" \
   --lease "<lease>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
   --title "fix(capacity): remediate GKE stockout for <workload_name>" \
-  --body "### 🚨 Stockout Diagnostic Report
+  --body-file "$BODY"
+````
 
-- **Trigger**: Received stockout alert for workload \`<workload_name>\` in cluster \`<cluster_name>\` (\`<region_zone>\`).
-- **Diagnosis**: <detailed summary of what caused the stockout and which rule was violated>.
-- **Checks Performed**:
-\`\`\`bash
-# Diagnostic commands executed during analysis:
-kubectl describe pod <pod_name> -n <namespace>
-gcloud compute regions describe us-central1 --format=\"json(quotas.filter(metric=NVIDIA_L4_GPUS))\"
-gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selection-machine-types=\"g2-standard-4,g2-standard-12\" --target-distribution-shape=ANY --size=1 --region=us-central1 --format=\"json\"
-gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-type=g2-standard-4 --types=PREEMPTION,PRICE --region=us-central1 --format=\"json\"
-\`\`\`
-- **Remediation**: <description of the changes made to ComputeClass/workload manifests>.
-"
-```
+The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc expands the same constructs the argument would have.
 
 `--workspace` and `--lease` are not optional bookkeeping. `prepare` and `submit` are separate processes: omit `--workspace` and `submit` falls back to the current directory, which holds no lease; omit `--lease` and it has no lease to check the tree against. Either way it stops with a `PermissionError` instead of opening the PR. The script returns the live GitHub PR URL on stdout.
 

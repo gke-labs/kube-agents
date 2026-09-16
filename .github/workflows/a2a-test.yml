@@ -4,6 +4,17 @@ name: A2A Module Tests
 # runs against an embedded JetStream server (a test-only dependency), so this
 # job needs no cluster and no credentials.
 #
+# The auth callout suite additionally wants a real Kubernetes API server, which
+# `setup-envtest` provides as a pair of local binaries - still no cluster, no
+# kubelet and no credentials. It is what makes the audience binding testable at
+# all: a token minted and validated by a real API server is the only way that
+# assertion is about Kubernetes rather than about a stub this repository also
+# wrote. Those tests SKIP when KUBEBUILDER_ASSETS is unset, so without this step
+# they would run nowhere and the job would still report green. The nats CLI the
+# step below installs is the same shape of dependency with the same failure
+# mode. Both are checked before the tests run, because these are the only two
+# things this job arms that a test quietly does without.
+#
 # The trigger arrangement is k8s-operator-test.yml's, for the reasons its
 # header comment gives: on a pull request the job always starts and the
 # `Detect changes` step decides whether to test, so the check can be required
@@ -18,6 +29,9 @@ on:
     paths:
       - "a2a/**"
       - ".github/workflows/a2a-test.yml"
+      # This job runs `make -C k8s-operator envtest-path`, so it depends on
+      # that Makefile as surely as on its own sources.
+      - "k8s-operator/Makefile"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -50,6 +64,7 @@ jobs:
             a2a:
               - "a2a/**"
               - ".github/workflows/a2a-test.yml"
+              - "k8s-operator/Makefile"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'
@@ -59,9 +74,45 @@ jobs:
           cache: true
           cache-dependency-path: "a2a/go.sum"
 
+      # The provision Job hands the nats CLI a ServiceAccount token in the
+      # password field, and whether that works is a fact about the CLI rather
+      # than about our client library - so the test that covers the one product
+      # client authenticating through the callout needs the real binary. A Go
+      # install, no container.
+      - name: Install the nats CLI
+        if: steps.filter.outputs.a2a == 'true'
+        run: go install github.com/nats-io/natscli/nats@v0.4.0
+
       - name: Run Tests
         if: steps.filter.outputs.a2a == 'true'
+        # envtest-path installs the binaries if absent and prints the path, so
+        # the Kubernetes version stays declared once, in k8s-operator/Makefile.
         run: |
+          ASSETS="$(make -C k8s-operator -s envtest-path)"
+          # Guarded, because the failure this prevents is silent. Every test
+          # that needs a real API server skips when KUBEBUILDER_ASSETS is unset
+          # or wrong, and the job still reports green - so an empty or
+          # multi-line value here would quietly un-arm the envtest-backed
+          # tests the step above exists to arm.
+          if [ ! -x "$ASSETS/kube-apiserver" ]; then
+            echo "::error::envtest-path gave '$ASSETS', which holds no kube-apiserver. The envtest-backed tests would skip and this job would pass regardless."
+            exit 1
+          fi
+          # The same guard for the other tool this job installs, and the same
+          # reason. natscli_test.go resolves the binary from $NATS_CLI or, if
+          # that is unset, from PATH, and SKIPS when it finds neither - so an
+          # install that landed anywhere other than the directory the tests
+          # look in un-arms its three tests and the job still reports green.
+          # Resolved the way `go install` resolves it, GOBIN first, and handed
+          # to the tests by name below: the guard and the tests then agree on
+          # one file rather than on a PATH they each work out separately.
+          GO_BIN_DIR="$(go env GOBIN)"
+          [ -n "$GO_BIN_DIR" ] || GO_BIN_DIR="$(go env GOPATH)/bin"
+          NATS_CLI="$GO_BIN_DIR/nats"
+          if [ ! -x "$NATS_CLI" ]; then
+            echo "::error::the nats CLI install did not produce an executable at '$NATS_CLI'. The three CLI-backed tests would skip and this job would pass regardless."
+            exit 1
+          fi
           cd a2a
           go vet ./...
-          go test -race ./...
+          KUBEBUILDER_ASSETS="$ASSETS" NATS_CLI="$NATS_CLI" PATH="$GO_BIN_DIR:$PATH" go test -race ./...

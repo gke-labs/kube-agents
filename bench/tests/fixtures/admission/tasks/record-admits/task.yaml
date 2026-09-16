@@ -1,0 +1,11 @@
+# Replay fixture for bench/tests/test_admission_sources.py -- not a real case.
+# The store holds a full window at the current key and the rate clears the bar.
+# Graded against the captured agent-kanban-smoke run records, so its version
+# key is theirs; the store beside it decides admission.
+id: record-admits
+name: "admission replay: record-admits"
+prompt: replay fixture
+expected_output: replay fixture
+infrastructure:
+  deployer: noop
+domain: chat-and-routing

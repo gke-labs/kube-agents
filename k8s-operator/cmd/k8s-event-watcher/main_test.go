@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -868,4 +869,85 @@ func clusterNames(clusters []targetCluster) []string {
 		out = append(out, c.Name)
 	}
 	return out
+}
+
+// The soft memory limit is half of what the operator reports as the container's
+// limit, and only when nothing else has already set one.
+func TestDeriveMemoryLimit(t *testing.T) {
+	tests := []struct {
+		name           string
+		goMemLimit     string
+		containerLimit string
+		wantApply      bool
+		wantBytes      int64
+		wantReason     string
+	}{
+		{name: "container limit set", containerLimit: "2147483648", wantApply: true, wantBytes: 1073741824},
+		{name: "explicit GOMEMLIMIT wins", goMemLimit: "512MiB", containerLimit: "2147483648", wantReason: "GOMEMLIMIT=512MiB is set and takes precedence"},
+		{name: "nothing set", wantReason: "EVENT_WATCHER_MEMORY_LIMIT_BYTES is not set"},
+		{name: "garbage", containerLimit: "2Gi", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="2Gi" is not a positive byte count`},
+		{name: "zero", containerLimit: "0", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="0" is not a positive byte count`},
+		{name: "negative", containerLimit: "-5", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="-5" is not a positive byte count`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBytes, gotApply, gotReason := deriveMemoryLimit(tt.goMemLimit, tt.containerLimit)
+			if gotApply != tt.wantApply {
+				t.Fatalf("apply = %v, want %v (reason %q)", gotApply, tt.wantApply, gotReason)
+			}
+			if gotBytes != tt.wantBytes {
+				t.Errorf("bytes = %d, want %d", gotBytes, tt.wantBytes)
+			}
+			if !strings.Contains(gotReason, tt.wantReason) {
+				t.Errorf("reason = %q, want it to contain %q", gotReason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// applyMemoryLimit turns the derived value into the runtime's soft limit —
+// the same setting GOMEMLIMIT controls — and leaves it alone otherwise.
+func TestApplyMemoryLimit_SetsTheRuntimeSoftLimit(t *testing.T) {
+	// SetMemoryLimit(-1) reads the current limit without changing it.
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+
+	t.Setenv("GOMEMLIMIT", "")
+	t.Setenv("EVENT_WATCHER_MEMORY_LIMIT_BYTES", "2147483648")
+	applyMemoryLimit()
+	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
+		t.Errorf("runtime soft limit = %d, want 1073741824", got)
+	}
+
+	// An explicit GOMEMLIMIT is respected: the limit set above must not move.
+	debug.SetMemoryLimit(prev)
+	t.Setenv("GOMEMLIMIT", "256MiB")
+	applyMemoryLimit()
+	if got := debug.SetMemoryLimit(-1); got != prev {
+		t.Errorf("runtime soft limit = %d with GOMEMLIMIT set, want it untouched at %d", got, prev)
+	}
+}
+
+// The process applies the limit, not just the helper: realMain has to reach
+// applyMemoryLimit before anything that can fail. A kubeconfig that does not
+// parse stops the run right after it, and the runtime's limit shows whether
+// the call happened.
+func TestRealMain_AppliesTheMemoryLimitBeforeStarting(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+	t.Setenv("GOMEMLIMIT", "")
+	t.Setenv("EVENT_WATCHER_MEMORY_LIMIT_BYTES", "2147483648")
+
+	badKubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(badKubeconfig, []byte("not: [a kubeconfig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := realMain([]string{"--dry-run", "--kubeconfig", badKubeconfig, "--cluster-name", "x"})
+	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
+		t.Fatalf("want realMain to stop on the unparseable kubeconfig, got err=%v", err)
+	}
+	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
+		t.Errorf("runtime soft limit after realMain = %d, want 1073741824", got)
+	}
 }

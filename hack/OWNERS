@@ -1,0 +1,14 @@
+# The presubmit eval rosters are owned here: hack/eval/presubmit-cases.txt is
+# what every pull request runs and hack/eval/blocking-roster.txt is what can
+# red one, so adding or removing a case in either needs an eval-crew approver
+# and a root approver does not count (no_parent_owners). Everything else under
+# hack/ -- hack/eval/nightly-cases.txt, ci-eval-pr.sh itself, the deploy
+# scripts -- matches no filter and falls through to the root OWNERS, so a new
+# case lands in the nightly with the normal approvers (#1546, decided
+# 2026-09-15). docs/eval-gate-roster.md states the rule.
+filters:
+  'eval/(presubmit-cases|blocking-roster)\.txt$':
+    approvers:
+    - eval-crew
+options:
+  no_parent_owners: true

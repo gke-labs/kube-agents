@@ -39,8 +39,8 @@ _SECTION_END_RE = re.compile(r"^# ─── (?!2b\.)", re.MULTILINE)
 
 # Repeated here on purpose rather than parsed out of the script: a test that
 # derives the expected mapping from the mapping under test asserts nothing.
-# These pairs are also the table in
-# docs/site/src/content/docs/deploy/ci-pool-projects.md.
+# docs/ci-pool-projects.md is the onboarding runbook that
+# points here; it carries no copy of the pairs.
 _EXPECTED_MAPPING = {
     "kube-agents-evals": "gke-agentic/kube-agents-evals-infra",
     "kube-agents-evals-2": "gke-agentic/kube-agents-evals-2-infra",

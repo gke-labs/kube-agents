@@ -22,6 +22,16 @@
 
 set -euo pipefail
 
+# The eval rosters, three files beside this script under hack/eval/ (#1546):
+# what every pull request runs, what can red one on a graded failure, and
+# what the nightly adds. Section 6 reads the first and third into TASKS and
+# NIGHTLY_TASKS; the BOOTSTRAP_ADMITTED export reads the second. Files rather
+# than arrays here so OWNERS can put the eval-crew rule on the presubmit
+# pair alone. Relative to this script's directory.
+readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
+readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
+readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
+
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
 # run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
@@ -472,8 +482,8 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # MAIN-BRANCH RUNS ONLY, the baseline store's trust boundary: a presubmit
 # runs branch-authored code, so publishing from one would let any pull
 # request rewrite the dashboard everyone reads -- both through the bucket
-# credential and through collect.py, which reads TASKS and the domain
-# metadata out of THIS checkout. The gate is the baseline recorder's
+# credential and through collect.py, which reads the hack/eval/ rosters and
+# the domain metadata out of THIS checkout. The gate is the baseline recorder's
 # (JOB_TYPE postsubmit/periodic, no PULL_NUMBER), re-derived here because the
 # trap can fire from a set -e death long before that code runs. The gate
 # alone is conventional -- a branch can edit this file -- which is why
@@ -551,9 +561,10 @@ publish_eval_dashboard() {
   #
   # The budget must be LARGER than the 300s collect.py grants each individual
   # gsutil call, or the one hung call the collector is willing to wait out
-  # kills the whole pipeline instead -- and the sweep is serial over every
-  # archived build (1 + 3N gsutil processes), so it needs real headroom on
-  # top. 900s covers both and only ever taxes the nightly's tail (the gate
+  # kills the whole pipeline instead -- and the sweep is 1 + 3N gsutil
+  # processes over every archived build (READ_WORKERS at a time), so it
+  # needs real headroom on top. 900s covers both and only ever taxes the
+  # nightly's tail (the gate
   # above keeps presubmits out entirely); EVAL_DASHBOARD_TIMEOUT overrides it
   # from the job config without a code change. Bounding the sweep itself
   # (--since/--limit) is collect.py's follow-up, not this hook's.
@@ -577,7 +588,29 @@ import json, sys
 if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     sys.exit(\"collected zero runs: source unreadable or empty; refusing to publish an empty dashboard over a good one\")
 " "$2/data.json"
-    python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site"
+    # The adjudicator verdict and its history, when the target has them, so the
+    # rendered Brief bakes the current state instead of waiting for the first
+    # page poll (and on storage.cloud.google.com that XHR redirects and fails).
+    # Missing is the normal case until the adjudicator has run.
+    case "$3" in
+      gs://*)
+        gsutil cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
+        gsutil cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
+        ;;
+      *)
+        [ -f "${3%/}/health.json" ] && cp "${3%/}/health.json" "$2/health.json" || true
+        [ -f "${3%/}/health-history.jsonl" ] && cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" || true
+        ;;
+    esac
+    render_args=()
+    [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
+    [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+    # Same --public-url rule as hack/ci-dashboard-refresh.sh: a bucket target
+    # is the published site, so pass the target to derive <base href> without
+    # hardcoding production when targeting a staging bucket. A local directory
+    # target keeps links relative.
+    case "$3" in gs://*) render_args+=(--public-url "$3") ;; esac
+    python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site" ${render_args[@]+"${render_args[@]}"}
     python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
   ' _ "${dash_src}" "${dash_tmp}" "${EVAL_DASHBOARD_TARGET}" >"${dash_tmp}/publish.log" 2>&1 || dash_rc=$?
   if [ "${dash_rc}" -eq 0 ]; then
@@ -667,7 +700,7 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # and never silently reading platform-agent-host instead.
 #
 # It ran on every presubmit for weeks while every task that consumes it was
-# still commented out of TASKS below, and that was the point: the warnings it
+# still parked outside the matrix, and that was the point: the warnings it
 # prints per project ("carries no clusters labelled environment=seeded") are
 # how a pool project still needing bench/tf/fleet applied was found BEFORE
 # these tasks started gating PRs rather than after. Eleven of the active
@@ -1111,7 +1144,8 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
-export PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+export PLATFORM_AGENT_TOKEN
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
 # The judge is pinned INDEPENDENTLY of the agent, and the invariant is:
@@ -1149,362 +1183,114 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# Paths are relative to BENCH_DIR, which is where devops-bench runs. Tasks added
-# under bench/tasks/ are NOT picked up automatically -- list them here.
+# The matrix is data, not code: three files under hack/eval/, read here at
+# startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
+# runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
+# (NIGHTLY_TASKS), and blocking-roster.txt, read further down, is what can red
+# a pull request on a graded failure (BOOTSTRAP_ADMITTED). The split exists
+# so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
+# under the eval-crew alias and lets the nightly file and this script fall
+# through to the root approvers. Each file's header says what belongs in it;
+# docs/designs/bench-case-format.md "Registration" is the rule.
+#
+# Paths in the files are relative to BENCH_DIR, which is where devops-bench
+# runs. Tasks added under bench/tasks/ are NOT picked up automatically -- a
+# case runs because a file names it, and scripts/validate_bench_cases.py
+# fails a case named in neither. A missing file, a line that is not a
+# ./tasks/<id>/task.yaml path, a path with no case directory behind it, or a
+# nightly entry that is also a presubmit one (it would run twice a night) all
+# stop the job here, before it spends a cluster, rather than running a wrong
+# matrix and reporting green around it.
 BENCH_DIR="${SCRIPT_DIR}/../bench"
-# agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
-# (~100-300s), not a cluster.
-TASKS=(
-  # SEVEN DOMAINS THROUGH PROBES, THE AUDIT MACHINERY THROUGH ONE CANARY.
-  # The 2026-08-26 smoke run (build 2092638061140643840, kube-agents-evals-3)
-  # measured what six full audits cost: obtainability-planted-pdb PASSED in
-  # 962s and compliance-rbac-overgrant in 606s, the three that failed did so
-  # on agent-endpoint HTTP 502s (transport, not scenario bugs), and the job's
-  # 85-minute deadline expired before rca-remediation-pr ever ran. Six
-  # domains at 600-1300s each do not fit one presubmit, so each audit domain
-  # is covered by a PROBE -- a targeted question about that domain's planted
-  # defect, graded on the reply, the shape cluster-agent-crashloop-debug
-  # proved at 142s -- and exactly ONE full audit stays active as the
-  # machinery canary: compliance-rbac-overgrant, the measured-clean one,
-  # which exercises SOP dispatch, delegation, the token minter and the
-  # ledger write end to end under the fleet-audits domain. Budget: canary
-  # 606s + the probes and prompt variations at ~150-350s each + crashloop
-  # 142s + the incumbents, against the deadline the 2026-08-26 run blew with
-  # full audits. This sentence used to enumerate the matrix and fell behind
-  # it twice; the count and the arithmetic live in one place now, above
-  # EVAL_REPETITIONS, and that is the copy to keep current.
-  #
-  # This list is the gate's REPORTING order. Execution order is the
-  # fan-out's cost-hinted queue below (longest units first), so a Prow
-  # deadline kills whatever is still in flight rather than truncating this
-  # list's tail.
-  "./tasks/reliability-pdb-probe/task.yaml"
-  "./tasks/capacity-pinned-pool-probe/task.yaml"
-  "./tasks/security-overgrant-probe/task.yaml"
-  "./tasks/upgrades-lagging-master-probe/task.yaml"
-  "./tasks/consistency-authorized-networks-probe/task.yaml"
-  "./tasks/cost-idle-pool-probe/task.yaml"
-  # The security prompt variation, in the same relation to
-  # security-overgrant-probe that obtainability-remediation-proposal below
-  # holds to reliability-pdb-probe: the probe asks whether debug-binding is
-  # appropriately scoped, this one asks for the fix and checks the reply for
-  # a manifest's load-bearing nouns (apiVersion, roleRef, subjects --
-  # substrings, not schema validation), still with no cluster write.
-  # Measured 533s for three repetitions on build 2094466401401049088
-  # (2026-08-31, GREEN) -- 178s each, so unit_cost_hint's 200s default fits
-  # it and it needs no entry of its own. That was the last serial run before
-  # #1057's fan-out; position here is reporting order only. It carries one
-  # safeguard where the reliability variation below carries two; its
-  # task.yaml documents why the second cannot be grounded on a namespaceless
-  # role.
-  "./tasks/security-overgrant-remediation-proposal/task.yaml"
-  # Three activations that take the reliability domain to five enabled
-  # tasks (#1049), each grading a behavior nothing active grades: PDB
-  # SEMANTICS (what a wrong budget does — minAvailable: 2 on two replicas
-  # blocks drains), fleet-wide DISCOVERY (the prompt does not name the
-  # workload), and SILENCE on a namespace with no PDB-relevant defect (the
-  # false-alarm case). The semantics and silence objectives grade an
-  # output-contract token their prompts demand -- see the task headers for
-  # the two measured runs that forced that design. All three are
-  # probe-shaped, read-only against the same no-pdb-workload fixture, and
-  # measured across #1049's three draft smoke runs (the third, build
-  # 2094442155576659968 on 2026-08-31, ran the contracted prompts GREEN),
-  # so unit_cost_hint's 200s default fits them and position here is
-  # reporting order only. silence's header carries its #984 history; a red
-  # on any of the three takes its entry back out before the activating
-  # change leaves draft.
-  "./tasks/obtainability-pdb-semantics/task.yaml"
-  "./tasks/obtainability-fleet-exposure-sweep/task.yaml"
-  "./tasks/obtainability-healthy-namespace-silence/task.yaml"
-  # The reliability prompt variation that grades what the probe does not
-  # ask for: reliability-pdb-probe asks whether checkout-gateway survives a
-  # drain; this one asks for a remediation manifest and checks the reply
-  # for its load-bearing nouns (PodDisruptionBudget, a selector,
-  # minAvailable/maxUnavailable -- substrings, not schema validation),
-  # still with no cluster write. Measured on #984's three presubmit runs:
-  # 126s/130s/124s, OutcomeValidity 1.0 each time, on three different
-  # leased projects. Its three sibling variations are registered commented
-  # out below.
-  "./tasks/obtainability-remediation-proposal/task.yaml"
-  # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
-  # validation run: cost and signal were unmeasured (the 2026-08-26 run hit
-  # the job deadline before reaching it), so this entry's first smoke IS the
-  # measurement. Launch priority lives in unit_cost_hint below, not in this
-  # list's position.
-  # The one active task that WRITES: it files a remediation PR against the
-  # leased project's throwaway GitOps repo via submit-suggestion.
-  "./tasks/rca-remediation-pr/task.yaml"
-  # The audit-machinery canary: measured 606s clean on 2026-08-26, every
-  # exact check green -- the only task that has proven the A1/A4 path
-  # (minted token, cloned *-infra workspace, published ledger issue) in a
-  # real presubmit.
-  "./tasks/compliance-rbac-overgrant/task.yaml"
-  # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
-  # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
-  # exercises the whole of step 2b end to end: label discovery, slot-to-role
-  # resolution, the .confirmed probe, and fleet_resource_property binding the
-  # role to a kubeconfig. It is the cheapest task in this array (142s on the
-  # 2026-08-25 run) and it proves the chain the probes above stand on.
-  "./tasks/cluster-agent-crashloop-debug/task.yaml"
-  # Three more cluster-debugging cases in the same family, added by #982:
-  # measured 190s, 142s and 220s on build 2092719124550520832, all
-  # `deployer: noop`. Position here is reporting order only; execution
-  # order is unit_cost_hint's queue.
-  #
-  # A fourth is commented out beneath them, and why is worth reading before
-  # uncommenting it. All four are read-only: no pull request, no ledger, so
-  # neither A1 nor A4 ever applied to them, and A5's residual is the
-  # privilege gap every fleet case carries. They read the crashloop-workload
-  # and no-pdb-workload fixtures on seeded cluster A.
-  #
-  # They are uncommented while still `validated: false`, the state
-  # cluster-agent-crashloop-debug activated in and for the same reason: only
-  # a scored presubmit run closes that field, so leaving them commented out
-  # is what makes it uncloseable. What that field does NOT still stand for
-  # here is the verification half. All nine fleet safeguards across the four
-  # were driven through the real FleetResourcePropertyVerifier against live
-  # Kubernetes objects matching the fixtures: nine pass on the fixtures as
-  # planted, nine fail -- each naming the actual value -- against the
-  # mutation a misbehaving agent would make, and nine pass again on revert.
-  # Two scored runs bore that out: every safeguard across all four held
-  # (VerificationCatastrophic and VerificationCoverage both 1.0), and every
-  # failure was an objective rather than a safeguard.
-  "./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml"
-  "./tasks/cluster-agent-crashloop-evidence-chain/task.yaml"
-  "./tasks/cluster-agent-healthy-workload-no-finding/task.yaml"
-  # DEACTIVATED after its first scored run, and not because the case is
-  # wrong. On 2026-08-26 the agent read the cluster, changed nothing (all
-  # three safeguards green) and misdiagnosed: it blamed a missing label on
-  # idle-batch-pool -- the cost fixture, tainted seeded-role=idle-batch and
-  # deliberately empty -- instead of CPU exhaustion on pinned-inference-pool.
-  # The fixture is not at fault: main.tf gives the pinned pool both the
-  # `seeded-role: pinned-inference` node label and the matching taint, and
-  # defects-a.tf gives inference-server the matching nodeSelector and
-  # toleration, which is why one replica is Ready and the surplus is not.
-  # So the case works and the agent does not do this scenario yet, which
-  # makes activating it a permanently red presubmit for every pull request
-  # in the repository -- what the refusal variant's comment near the end of
-  # this array calls a case that can only fail.
-  # Uncomment when the agent can diagnose a capped pool, not before.
-  # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
-  # gpu-stress-test-diagnosis: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
-  "./tasks/agent-kanban-smoke/task.yaml"
-  # knowledge-grounding-sources-probe: moved to NIGHTLY_TASKS 2026-09-09 after one
-  # presubmit cycle (#945) -- knowledge grounding is not a core kube-agents journey.
-  # Last, because it is the only entry that pays twice. Its stack plants an
-  # OOM-killed workload on the host cluster and blocks until the event
-  # watcher's leading-edge debounce clears and the incident opens (~1 minute,
-  # bounded at 12), and then the agent turn itself waits on the AutoOps card,
-  # which ran a median of ~7 minutes across 83 completed k8s-evt-* cards on
-  # the live install. Everything above it has scored by the time that starts.
-  #
-  # It provisions no cluster despite being deployer: tofu -- see the header of
-  # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
-  # is the host cluster and not the per-run one that gets the incident.
-  # autoops-warning-event-triage: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
-  # Five registered scenarios stay commented out, and eight more run in the
-  # nightly tier only -- NIGHTLY_TASKS below; the task-registration lint
-  # reads both arrays. A commented entry here counts as registered, so a
-  # line is a promise the scenario exists, not that it runs; the
-  # domain-coverage lint counts only an UNCOMMENTED entry in THIS array, so
-  # activating a scenario in presubmit also deletes its domain from the
-  # allowlist in docs/designs/domains.yaml, while a NIGHTLY_TASKS entry
-  # deliberately counts as presubmit coverage of nothing. bench/tasks/
-  # DRAFTS.md carries the blockers, the measurements and the per-scenario
-  # status column.
-  #
-  # Five moved DOWN here on 2026-08-26, each with its one-line reason:
-  #   -- obtainability-planted-pdb, stockout-pinned-pool,
-  #      upgrade-readiness-lagging-cluster, consistency-drift-outlier:
-  #      full-audit shape recast to the nightly tier (600-1300s each, measured
-  #      or transport-failed on 2026-08-26); each domain is now covered by a
-  #      probe above. They moved again on 2026-09-02, to NIGHTLY_TASKS below,
-  #      when the nightly tier stopped being a plan: they run every night and
-  #      stay out of the presubmit.
-  #   -- rca-remediation-pr was parked here too until 2026-08-27; it is now
-  #      active above, this pull request's smoke run being the clean measured
-  #      run it was waiting for.
-  #
-  # Two reliability prompt variations landed with #984 (their siblings
-  # obtainability-remediation-proposal and, since #1049,
-  # obtainability-healthy-namespace-silence are active above), each with its
-  # one-line reason:
-  #   -- obtainability-direct-query: superseded in presubmit by
-  #      reliability-pdb-probe (same planted defect, same question); 1.0 on
-  #      #984's live validation. Nightly-tiered since 2026-09-02 -- see
-  #      NIGHTLY_TASKS below.
-  #   -- obtainability-refusal-direct-mutation: the agent fails it today --
-  #      objective 0.0 on #984's live validation (attempted the apply;
-  #      safeguards held). Activate after a clean run -- including into the
-  #      nightly, whose appends feed the baseline store.
-  # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
-  #
-  # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
-  # Both were one Prow-side change away with their repository halves already
-  # on main. GoogleCloudPlatform/oss-test-infra#2661 merged
-  # 2026-08-25T14:36:08Z and supplied both: it exports
-  # EVAL_GITHUB_APP_ID=4675512, which is the condition hack/ci-deploy.sh
-  # requires (with the GitOps repo gitops_repo_for_project() resolves from the
-  # leased PROJECT_ID) before it renders githubMinter.enabled=true and passes
-  # platformAgent.integration.github.gitRepo -- so `Git Repo:` in the rendered
-  # SETTINGS.md now names the leased project's throwaway
-  # gke-agentic/kube-agents-evals*-infra repo instead of the literal None, and
-  # audit_report.py start has a workspace to clone and a minter to clone it
-  # with (A1). And it mounts secret kube-agents-bench-github-token as
-  # BENCH_GITHUB_TOKEN into this job, which is the credential
-  # ledger_issue_contains reads the published ledger issue with (A4).
-  # The 2026-08-26 run minted, cloned and published through that path twice
-  # (compliance's ledger, and the upgrade audit's worker filing issue #3 in
-  # gke-agentic/kube-agents-evals-3-infra while the harness was deaf to it),
-  # so A1/A4 are exercised as well as closed.
-  #
-  # A5 is CLEARED, and that is what every fleet entry above rests on. Step 2b
-  # writes one kubeconfig per seeded-fleet fixture ROLE, and the fleet
-  # safeguards use `fleet_resource_property` with a `fixture_role:` instead of
-  # reading the ambient kubeconfig (which is platform-agent-host and carries
-  # no seeded namespace). The fleet is applied in EVERY project the Boskos
-  # pool can lease, each planted defect verified present: step 2b reports
-  # "7 role(s) written ... 0 whose fixtures were not present" against all
-  # three, re-measured 2026-08-25. One residual, which is hardening rather
-  # than a gate: with FLEET_READONLY_SA unset, or with the token-creator grant
-  # not applied in the leased project, the role kubeconfigs carry the runner's
-  # own identity, which can write to the shared fleet (roles/container.admin
-  # via the GKE IAM webhook, nothing to narrow in-cluster). The checks read
-  # correctly either way; the safeguards above are in fact what would DETECT
-  # such a write. bench/tf/fleet/README.md, "A read-only credential for
-  # evaluations", says which projects still need the apply.
-  #
-  # Still blocked, one reason each:
-  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own do-not-flag
-  #       rules, not by anything this repository can fix. Its objective
-  #       requires BOTH idle-batch-pool and an orphan-pd- disk in finding_ids,
-  #       and check 3.4's disk filter is the literal creationTimestamp<-P30D.
-  #       Boskos leases at random, so the gate is the NEWEST fleet in the
-  #       pool: kube-agents-evals-3 was planted 2026-08-24, three days after
-  #       the other two, which makes it 2026-08-31 for the pool and
-  #       2026-09-23 for the disks. A replant in any pool project moves them,
-  #       and so does REGISTERING one: kube-agents-evals-4/-5/-6 are
-  #       provisioned (scripts/provision_ci_pool_project.sh, 2026-08-25/26)
-  #       but have no Boskos entry yet -- adding one moves the gate to
-  #       2026-09-02 and 2026-09-25.
-  #       It no longer costs domain coverage: cost-idle-pool-probe above asks
-  #       the INSTANTANEOUS question (no age gate), so the cost domain is
-  #       covered while this SOP-faithful audit waits for its calendar.
-  #   A2  chat-routing-fleet-question. AGENT_SERVICE_NAME above is one global
-  #       target, so every entry here reaches the platform agent; this
-  #       scenario needs the chat front door and would fail its delegation
-  #       objective on a correct system until the harness can target an agent
-  #       per task. It costs no domain coverage: the two kanban probes already
-  #       cover chat-and-routing.
-  # "./tasks/chat-routing-fleet-question/task.yaml"
-  # "./tasks/fleet-cost-idle-pool/task.yaml"
-  #
-  # The fleet version table (#1343, the fleet-upgrade-verification skill's
-  # Phase-1 case), held commented out by the maintainer's call on #1343 until
-  # #1254 is closed. #1254 is the open issue on upgrades-lagging-master-probe
-  # above: a delegated run's acknowledgement graded as the final answer on
-  # unrelated pull requests, the #1010 family docs/eval-gate-roster.md holds
-  # two other cases out on. That probe is admitted and rides it out on the
-  # all-three-repetitions rule; this case would enter unadmitted and could
-  # not red the job on quality, but it reads the same final answer with the
-  # same fixture, so it cannot be watched to pass and fail until then. It
-  # needs no change to activate.
-  # "./tasks/upgrades-fleet-version-table/task.yaml"
-  #
-  # Refusal variant of cluster debugging, and not one of the nine above. Its
-  # compliant answer is a pull request on the eval GitOps repo, so it was A1's
-  # until A1 closed; A5's residual is the same privilege gap every fleet case
-  # carries. It is graded as a platform-agent case rather than a cluster-agent
-  # one because AGENT_SERVICE_NAME above is a single global target -- that is
-  # A2, and it shapes what the case asserts rather than blocking it. What it
-  # waits on now is having been watched to both pass and fail
-  # (`validated: false` in the file). Uncommenting a case nobody has run is
-  # how a case that can only fail reds every pull request here.
-  # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
-)
+PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
+NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
+BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
+
+# One roster file's entries, one per line: `#` to end of line is a comment,
+# blank lines are skipped, surrounding whitespace is trimmed. Called inside a
+# command substitution, so a missing file fails the assignment and set -e
+# stops the job with the message. No mapfile: the bash the unit tests lift
+# this into on a developer machine is 3.2.
+roster_entries() {
+  local file="$1"
+  if [ ! -f "${file}" ]; then
+    echo "ERROR: roster file ${file} is missing. The eval matrix is read from hack/eval/ (#1546); a checkout without it cannot run." >&2
+    return 1
+  fi
+  sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "${file}" | grep -v '^$' || true
+}
+
+# Every entry of one case file is a ./tasks/<id>/task.yaml path with a case
+# directory behind it. $1 is the file, for the message; the rest are entries.
+check_case_entries() {
+  local file="$1"
+  shift
+  local entry
+  for entry in "$@"; do
+    case "${entry}" in
+      ./tasks/*/task.yaml) ;;
+      *)
+        echo "ERROR: ${file}: '${entry}' is not a ./tasks/<id>/task.yaml path." >&2
+        exit 1
+        ;;
+    esac
+    if [ ! -f "${BENCH_DIR}/${entry}" ]; then
+      echo "ERROR: ${file}: '${entry}' names no case under bench/tasks/. Register a case that exists, or delete the line." >&2
+      exit 1
+    fi
+  done
+}
+
+# The presubmit matrix. The file's order is the gate's REPORTING order;
+# execution order is the fan-out's cost-hinted queue below (longest units
+# first), so a Prow deadline kills whatever is still in flight rather than
+# truncating the list's tail.
+PRESUBMIT_ENTRIES="$(roster_entries "${PRESUBMIT_CASES_FILE}")"
+TASKS=()
+while IFS= read -r ENTRY; do
+  if [ -n "${ENTRY}" ]; then TASKS+=("${ENTRY}"); fi
+done <<< "${PRESUBMIT_ENTRIES}"
+if [ "${#TASKS[@]}" -eq 0 ]; then
+  echo "ERROR: ${PRESUBMIT_CASES_FILE} names no case; the presubmit would run nothing and report green." >&2
+  exit 1
+fi
+check_case_entries "${PRESUBMIT_CASES_FILE}" "${TASKS[@]}"
+# The presubmit's case ids, one per line, for the blocking roster's subset
+# check below -- taken before the tier switch can append the nightly.
+PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${ENTRY}")"; done)"
 
 # ─── The nightly tier (#1021, the catch-all; #1023/#1024 consume it) ─────────
-# The nightly periodic runs the FULL catalog: every active TASKS entry above,
-# identically -- same repetitions, same gate, same reporting order -- PLUS the
-# entries here. What earns a case this array is measured cost, presubmit
-# redundancy, or grading something outside the core journeys the presubmit
-# gate is for -- never doubt about the case: a case whose header above says it is
-# broken, unvalidated, or fails on a correct agent stays commented out in
-# TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
-# chat-routing-fleet-question, fleet-cost-idle-pool,
-# upgrades-fleet-version-table), because the nightly is
-# what appends to the baseline evidence store (EVAL_BASELINE_STORE below) and
-# a case that can only fail would append nothing but evidence keeping itself
-# unadmitted while spending ~10 minutes of matrix a night doing it.
-#
-# Selection is EVAL_TIER below, exported by the Prow periodic and nothing
-# else. The registration lint (scripts/validate_bench_cases.py) reads this
-# array as well as TASKS; the domain-coverage lint deliberately does not, so
-# an entry here satisfies presubmit domain coverage exactly as much as a
-# commented one -- not at all.
-#
-# Budget, priced the way EVAL_REPETITIONS' comment prices the presubmit: the
-# twenty-five-task nightly matrix of 2026-09-03 was the pre-#1218 twenty-task
-# presubmit (measured ~317min SERIAL) plus the five recast cases -- four
-# audit-shaped (600-1300s a repetition, hinted at 900s in unit_cost_hint
-# below) and one probe-shaped, ~190min serial at three repetitions. #1218
-# then moved the two tofu incumbents (~106min serial of that ~317min) out of
-# TASKS and into this array, which reshuffles the presubmit/nightly split
-# (eighteen + seven) without changing the nightly total. #945 then added
-# knowledge-grounding-sources-probe, moved here 2026-09-09: its two
-# presubmit runs measured 615/715/166s and 1602/597/420s, ~25-45min serial
-# at three repetitions, so eighteen + eight, twenty-six in all, ~532-552min
-# serial. IF the periodic mirrors the presubmit's shape -- 360m deadline,
-# EVAL_REPETITIONS at its default 3; the periodic is in flight in
-# oss-test-infra, not merged, so this is the assumption and not yet a fact --
-# ~532-552min serial fits only through the fan-out: parallelism 4 has to
-# realise 1.5x or better, which the first scheduled run measures, and at more
-# repetitions the required factor scales with them. A deadline kill is
-# survivable by design --
-# the cost-hinted queue means it truncates in-flight units, the EXIT trap
-# still records what completed -- but it is a truncated night, so if the
-# first runs blow the deadline the lever is the periodic's timeout, not this
-# list's tail.
-NIGHTLY_TASKS=(
-  # The four full audits recast out of presubmit on 2026-08-26, spec-ready,
-  # each domain covered in presubmit by its probe in TASKS:
-  #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
-  #      (build 2092638061140643840); too slow for a presubmit seat.
-  #   -- stockout-pinned-pool: same full-audit shape and cost band; its
-  #      2026-08-26 failures were agent-endpoint 502s, not scenario bugs.
-  #   -- upgrade-readiness-lagging-cluster: same shape, same 2026-08-26
-  #      transport failures; the worker filed its ledger issue even so.
-  #   -- consistency-drift-outlier: same shape; its domain's probe measured
-  #      233s a repetition, which is why the probe kept the presubmit seat.
-  "./tasks/obtainability-planted-pdb/task.yaml"
-  "./tasks/stockout-pinned-pool/task.yaml"
-  "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
-  "./tasks/consistency-drift-outlier/task.yaml"
-  # Superseded in presubmit by reliability-pdb-probe (same planted defect,
-  # same question), not by any doubt: 1.0 on #984's live validation.
-  "./tasks/obtainability-direct-query/task.yaml"
-  # The two tofu-provisioned incumbents, moved out of presubmit 2026-09-03
-  # (#1218): they serialize on the infra lock (~20 and ~15 min a repetition)
-  # and were nearly half the presubmit wall clock (#1202 trim addendum).
-  # gpu-stress-test-diagnosis gates here via the nightly rather than in
-  # BOOTSTRAP_ADMITTED; autoops-warning-event-triage accrues its #1101
-  # admission record here.
-  "./tasks/gpu-stress-test-diagnosis/task.yaml"
-  "./tasks/autoops-warning-event-triage/task.yaml"
-  # Knowledge-grounding probe (#945): a pure GKE documentation question
-  # graded on the persona's grounding contract -- the answer names the
-  # compute-class nodeSelector key and ends in the mandated `## Sources`
-  # section. deployer: noop, no fixture, no cluster read. It ran one
-  # presubmit cycle in TASKS (2/3 on build 2097362391401500672, then 3/3 on
-  # 2097414338968031232 after its citation check was widened) and moved here
-  # on 2026-09-09: knowledge grounding is a cross-cutting persona behavior,
-  # not one of the core journeys the presubmit gate exists for, so it earns
-  # its record in the full catalog instead. Priced at 600s in unit_cost_hint.
-  "./tasks/knowledge-grounding-sources-probe/task.yaml"
-)
+# The nightly periodic runs the FULL catalog: every presubmit case above,
+# identically -- same repetitions, same gate, same reporting order -- PLUS
+# the entries of nightly-cases.txt. That file is the default home of a new
+# case (decided 2026-09-15 on #1546/#1564): it lands there, builds its record
+# in the evidence store (EVAL_BASELINE_STORE below), and earns a presubmit
+# seat on that record; measured cost, presubmit redundancy or grading
+# something outside the core journeys keep a case there for good. The file's
+# header carries the budget arithmetic against the periodic's 480m deadline
+# at EVAL_TASK_PARALLELISM=6 (#1491), and that is the copy to keep current.
+NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
+NIGHTLY_TASKS=()
+while IFS= read -r ENTRY; do
+  if [ -n "${ENTRY}" ]; then NIGHTLY_TASKS+=("${ENTRY}"); fi
+done <<< "${NIGHTLY_ENTRIES}"
+if [ "${#NIGHTLY_TASKS[@]}" -eq 0 ]; then
+  # A tier that appends nothing is a job that costs a Boskos lease to rerun
+  # the presubmit at midnight; if every nightly case graduates or is retired,
+  # delete the tier rather than leaving it vacuous.
+  echo "ERROR: ${NIGHTLY_CASES_FILE} names no case; the nightly tier would be the presubmit under another name." >&2
+  exit 1
+fi
+check_case_entries "${NIGHTLY_CASES_FILE}" "${NIGHTLY_TASKS[@]}"
+for ENTRY in "${NIGHTLY_TASKS[@]}"; do
+  if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"; then
+    echo "ERROR: ${NIGHTLY_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE}; a nightly would run it twice, six repetitions graded as two cases of one name." >&2
+    exit 1
+  fi
+done
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
-# existing job runs -- is exactly the TASKS array, so this change is dormant
+# existing job runs -- is exactly the presubmit file, so the tier is dormant
 # everywhere until a job exports the other value: the same
 # dormant-until-the-job-config-arms-it shape as EVAL_DASHBOARD_TARGET above.
 # "nightly" appends NIGHTLY_TASKS, so the nightly is a superset of the
@@ -1574,8 +1360,8 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #
 # Keep this count current when you activate: it was written at FOURTEEN, was
 # already one short the day #925 wrote it (the matrix stood at fifteen), and
-# #1045 took it to sixteen without touching it. Recount the uncommented entries
-# in TASKS rather than incrementing what is here.
+# #1045 took it to sixteen without touching it. Recount the entries in
+# hack/eval/presubmit-cases.txt rather than incrementing what is here.
 #
 # The budget has been raised three times to get here, all merged: oss-test-infra
 # #2667 took it 85m -> 150m off an estimate, #2669 took it 150m -> 240m off a
@@ -1646,6 +1432,15 @@ fi
 # variable metric, not a smaller number here.
 export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 
+# Whether the suite aggregate -- admitted-case pass rate against main's, over
+# at least EVAL_AGGREGATE_MIN_SCORED repetitions -- may red the job. Unset,
+# the default, it is computed and written into the verdict but cannot block:
+# the 0.05 margin has never been measured against how much an unchanged pull
+# request moves the aggregate on main, and arming a flat margin before the
+# store can say is arming a guess. Set it to 1 in the Prow job config, not
+# here, once the store holds enough nights to size it.
+export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
+
 # Reads infrastructure.stack out of a task file. The loop uses it to decide
 # whether the task's stack opts into seeded-cluster reuse.
 #
@@ -1663,9 +1458,45 @@ print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
 
-# The transition bridge: cases named here keep the old blocking behaviour
-# while bench/baselines/ ships empty -- they arm rung 4, leave rung 6 quiet,
-# and screening replaces them. Comma- or whitespace-separated task ids;
+# Who admits a case: the roster below, or the evidence store. Decided
+# 2026-09-14 on #1493: the roster stays hand-edited and the record informs.
+#
+#   roster  (default) BOOTSTRAP_ADMITTED decides, outright. The store's own
+#                     verdict on each case -- would-admit, would-demote,
+#                     collecting, stale, none -- rides in the per-case
+#                     hand-off (record_verdict) and, once a store is
+#                     configured, in the verdict's "Record says" column,
+#                     so a roster edit cites it. Nothing the nightly appends
+#                     changes which cases block.
+#   record            The store decides once it holds a full window for a
+#                     case at the current key (EVAL_ADMISSION_MIN_RUNS
+#                     runs), either way; the list is the fallback until
+#                     then. Kept for a later decision, not a schedule.
+#
+# Nobody should be able to move a case into or out of the blocking set
+# without the eval crew knowing, and a roster edit reviewed in a pull
+# request is that knowledge. Switching to `record` is a Prow-config change
+# and a team decision, never a default here; docs/eval-gate-roster.md says
+# what the record has to show first. Any other value stops the job here,
+# before a task runs: `records` grading as `roster` would look like a
+# working switch and switch nothing, and bench-gate refuses it too.
+export EVAL_ADMISSION_MODE="${EVAL_ADMISSION_MODE:-roster}"
+case "${EVAL_ADMISSION_MODE}" in
+  roster | record) ;;
+  *)
+    echo "ERROR: EVAL_ADMISSION_MODE must be 'roster' or 'record', got '${EVAL_ADMISSION_MODE}'." >&2
+    exit 1
+    ;;
+esac
+
+# The blocking roster: cases named in hack/eval/blocking-roster.txt arm rung
+# 4 -- three failed repetitions red the job -- and, while the store holds
+# nothing for them at the current key, leave rung 6 quiet. Under
+# EVAL_ADMISSION_MODE=roster that list is the whole answer to "which case can
+# red a pull request on a graded failure"; the store's record beside it says
+# whether the evidence agrees. The file is the default; an environment
+# override still wins, for a laptop run, and is not checked against the
+# presubmit the way the file is. Comma- or whitespace-separated task ids;
 # bench-gate's _bootstrap_admitted() accepts either.
 #
 # The prose about this roster -- the admission bar, who is held out and on
@@ -1673,12 +1504,36 @@ print(m.group(1).strip('\'\"') if m else '')
 # docs/eval-gate-roster.md, deliberately: docs/ edits are inert to the eval
 # (the Prow path filter and step 0 above both skip them), so a review
 # finding against that prose no longer costs a 2-hour run (#1179). Edit the
-# list here, the prose there.
+# list in the file, the prose there. hack/OWNERS puts the file under the
+# eval-crew alias (#1546).
 #
 # Demoting a flaky case is a one-line same-day edit: delete its name from
-# this list, referencing the issue that names its re-admission condition.
+# the file, referencing the issue that names its re-admission condition
+# and citing what the record says about it.
+#
+# A name that is not a presubmit case stops the job here: a misspelled entry
+# would otherwise arm nothing and look like a working roster, and a nightly
+# case cannot block a pull request it does not run on. A file that names
+# nothing stops it too: under EVAL_ADMISSION_MODE=roster an empty roster
+# disarms rung 4 for every pull request while the job reports green, so an
+# intentionally empty roster is an explicit BOOTSTRAP_ADMITTED="" in the
+# job's environment, never a file with only comments left in it.
+BLOCKING_ROSTER_ENTRIES="$(roster_entries "${BLOCKING_ROSTER_FILE}")"
+if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
+  echo "ERROR: ${BLOCKING_ROSTER_FILE} names no case; an empty blocking roster would disarm rung 4 for every pull request. Set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  exit 1
+fi
+BLOCKING_ROSTER_DEFAULT=""
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
+    echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
+    exit 1
+  fi
+  BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
+done <<< "${BLOCKING_ROSTER_ENTRIES}"
 
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
@@ -1700,18 +1555,15 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-
 # the baseline it is judged against" structural rather than conventional; see
 # docs/designs/eval-scorer.md#what-the-jobs-service-account-needs.
 #
-# It defaults to unset because the bucket does not exist yet. Pointing at a
-# bucket that is not there is not fatal -- an unreachable store degrades to
-# advisory with a banner -- but it is a banner on every run, so both exports
-# wait for the bucket. Until then the store fills only by hand from the
-# --lines-out artefact below. No job holds the writing export yet: two
-# oss-test-infra pull requests propose the nightly that would, and they need
-# to converge to ONE writer before either arms -- #2665
-# (periodic-kube-agents-eval-baseline, which exports this variable but not
-# EVAL_TIER, so as drafted it records the presubmit matrix only) and the
-# companion of this change (ci-kube-agents-eval-nightly, EVAL_TIER=nightly
-# with this export commented out until the bucket exists). Whichever job
-# survives, arming stays a Prow-config change, never a default here.
+# It defaults to unset because arming is a Prow-config decision, never a
+# default here: a laptop run must not read, let alone write, the production
+# store. Both Prow jobs export it since oss-test-infra#2698 (2026-09-14) --
+# the nightly periodic (ci-kube-agents-eval-nightly, EVAL_TIER=nightly) as
+# eval-baseline-recorder with objectViewer and objectCreator on
+# gs://kube-agents-evals-bench, the presubmit as prowjob-default-sa with
+# objectViewer only. Pointing at a bucket that is unreachable is not fatal --
+# the store degrades to advisory with a banner -- but it is a banner on every
+# run, which is how a revoked grant would announce itself.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and
@@ -1741,16 +1593,24 @@ fi
 # A wrong hint costs packing efficiency, never correctness.
 unit_cost_hint() {
   case "$1" in
-    # Inert while both cases sit outside TASKS (#1218): the only call site
-    # iterates TASK_NAMES. Kept for their NIGHTLY_TASKS re-entry (#1175).
+    # The two tofu incumbents, nightly-only since #1218: ~20 and ~15 min a
+    # repetition on the infra lock.
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
-    # The nightly-only full audits (NIGHTLY_TASKS): 600-1300s a repetition on
-    # 2026-08-26, planted-pdb's 962s the one clean measurement. Priced with
-    # the 900 band so a nightly run launches them first.
+    # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
+    # planted-pdb's 962s the one clean measurement. Priced with the 900 band
+    # so a nightly run launches them first. fleet-cost-idle-pool joined the
+    # nightly 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
+    fleet-cost-idle-pool) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    # Nightly-only. Measured 980-1929s across build 2099539376672346112's
+    # three repetitions (267-559s in August); median of the September run.
+    pdb-remediation-pr) echo 1250 ;;
     consistency-authorized-networks-probe) echo 300 ;;
+    # Median of its 1155 presubmit repetitions 2026-09-04 to 09-15 (p10 248s,
+    # p90 1318s); the 200s default under-packed it by 2.7x (#1023).
+    capacity-pinned-pool-probe) echo 540 ;;
     # Nightly-only since 2026-09-09. Median of its first three measured
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
@@ -1974,8 +1834,9 @@ profile_begin "record + final gate"
 # provisioning for three samples of each case, and provisioning -- not the eval
 # -- is what the job spends its time on. One nightly run amortises that setup
 # over every repetition, so it buys a sample far cheaper and can refill the
-# whole 20-run admission window in a night or two after a version-key bump
-# instead of over a week of merges. Neither job type is a pull request, which
+# whole 20-run admission window in seven nights at the default three
+# repetitions after a version-key bump, fewer once the count is raised on
+# measured wall clock. Neither job type is a pull request, which
 # is the property that actually matters here; PULL_NUMBER below is what
 # enforces it. See docs/designs/eval-scorer.md#the-job-that-writes-it.
 #
@@ -2002,9 +1863,17 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
 fi
 if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
+  # The commit each line is stamped with. A postsubmit carries it as
+  # PULL_BASE_SHA; a periodic carries neither that nor PULL_PULL_SHA (Prow's
+  # EnvForSpec returns before setting them for JOB_TYPE=periodic), so
+  # `bench-gate record`'s own default would leave the nightly's evidence
+  # unattributed. extra_refs has checked out main's head, so HEAD is the
+  # commit the run measured.
+  EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)}"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
   (cd "${BENCH_DIR}" && uv run bench-gate record \
     "${CASE_RESULTS[@]}" \
+    ${EVAL_RECORD_COMMIT:+--commit "${EVAL_RECORD_COMMIT}"} \
     --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 elif [ -n "${RC_COMMIT_SHA:-}" ]; then
@@ -2016,8 +1885,9 @@ fi
 # The suite roll-up: blocking cases, the admitted-case aggregate, and the
 # all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is not passed:
 # the rate is computed from the store, per admitted case at its own version
-# key. While the store holds nothing the aggregate stays advisory and the
-# markdown says so, rather than implying a comparison that did not happen.
+# key. While the store holds nothing, and until EVAL_AGGREGATE_ARMED is set
+# to 1, the aggregate stays advisory and the markdown says so, rather than implying
+# a comparison that did not happen or a rule that was armed.
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \

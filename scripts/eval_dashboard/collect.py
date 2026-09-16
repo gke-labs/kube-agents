@@ -10,12 +10,39 @@ data.json the dashboard renders.
 
 data.json is a CONTRACT: the renderer and the publisher are built against the
 exact shape documented in SCHEMA.md. Changes must be additive optional fields
-only, with schema_version bumped on anything else. The three additive fields
-this collector emits beyond the v1 core: `tasks[].reps` (per-repetition
-grading detail, present only when the log carries `rep N:` grading lines),
+only, with schema_version bumped on anything else. The additive fields this
+collector emits beyond the v1 core: `tasks[].reps` (per-repetition grading
+detail, present only when the log carries `rep N:` grading lines),
 `runs[].pr_merged` (whether the run's PR had merged at collection time,
-resolved best-effort through `gh`) and `releases[]` (release-candidate eval
-runs, below).
+resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which job
+produced the run: the presubmit gate, or the nightly periodic below),
+`runs[].has_build_log` plus the `runs[].pod_*` trio (how the build ended,
+from Prow's podinfo.json -- read only for a build that looks like a lost
+pod, below), `runs[].merge_conflict` (below) and `releases[]`
+(release-candidate eval runs, below).
+
+Two tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
+gate matrix on every pull request; the nightly periodic
+(ci-kube-agents-eval-nightly, EVAL_TIER=nightly in the same script) runs the
+full catalogue against main once a day, with no pull request. Both archive
+the same artifact layout, so both parse through build_run; the tier travels
+on the run so every consumer can keep the nightly out of the gate's verdicts
+(tiers.py). Prow's build ids are one global, start-ordered sequence, so the
+newest presubmit id sits far above every nightly id and a shared watermark
+would skip every night: each source keeps its own.
+
+A build whose node went NotReady mid-run (2026-09-11: twelve runs on five
+nodes, #1478) leaves finished.json (`failure`), podinfo.json and no
+build-log.txt at all; it lands here as a zero-task FAILURE of any duration
+and is indistinguishable from a clone failure without the pod's last event.
+So when a build has no build log, or concluded FAILURE with no tasks,
+podinfo.json is read as well -- one extra object per such build, none for a
+build that ran -- and the pod's phase, node and last event are recorded.
+
+A pull request that will not merge into main leaves the same zero-task
+FAILURE (2026-09-15: #1569, #1572, #1575, reported as an infrastructure
+degradation; #1608). clone-records.json is read for those builds too, and
+`merge_conflict` says which of the two it was.
 
 Release candidates are collected separately and land in `releases[]`, never
 in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
@@ -25,8 +52,41 @@ is read, never written"), and folding an RC into runs[] would feed it to
 build_cases and move the pass rates the candidate is being measured against.
 
 Sources:
+  --nightly-prefix  Prow's log prefix for the nightly periodic,
+              gs://<bucket>/logs/<job>/: for a periodic that prefix IS the
+              directory index -- one directory per build plus a
+              `latest-build.txt` this collector ignores -- so one `gsutil
+              ls` of it names every build. Given without a value it is the
+              live nightly's prefix (DEFAULT_NIGHTLY_PREFIX); omitted, no
+              nightly scan happens. A prefix that does not list while no
+              night is on record (the job has not run yet) is a note and no
+              nightly runs this scan, not the refusal line below: the
+              nightly is evidence beside the gate, and a missing night must
+              not stop the gate's dashboard from publishing. Once a night is
+              on record, a prefix that stops listing IS the refusal line: a
+              stall, not an absent job.
+  --nightly-job  the job name recorded on nightly runs (`runs[].job`);
+              defaults to the prefix's last path segment.
+  --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
+              directory/<job>/: one small `<build_id>.txt` object per build
+              holding the gs:// path of that build's directory (plus a
+              `latest-build.txt` this collector ignores). One `gsutil ls`
+              of the prefix names every build the job ever ran in seconds,
+              however many PRs the archive spans, so this is how an
+              incremental scan discovers what is new: list the index once,
+              keep the ids above the watermark, read those pointers, then
+              read the builds. Defaults to the index derived from each
+              --pr-glob's bucket and job; an empty string disables it. It
+              changes how a --pr-glob scan discovers builds, not whether
+              one happens: --pr-glob is still what asks for a GCS scan, and
+              --merge-with alone still recomputes without touching the
+              bucket.
   --pr-glob   gsutil glob(s) of Prow build directories (read-only; requires
-              gsutil on PATH). Repeatable.
+              gsutil on PATH). Repeatable. One `gsutil ls` of a whole-archive
+              glob walks every PR directory and grows with the archive (past
+              the per-call timeout at ~1700 builds), so the glob itself is
+              listed only for a cold sweep -- no watermark; with a watermark
+              the index above is listed instead.
   --from-dir  a local directory whose immediate subdirectories each hold a
               build's build-log.txt / started.json / finished.json -- the
               offline path the unit tests use.
@@ -38,20 +98,20 @@ Sources:
               the prior file's releases are carried forward and only the
               build ids it does not cover are read.
 
-Incremental mode (what the hourly refresh job runs):
+Incremental mode (what the 15-minute refresh job runs):
   --merge-with  a previously written data.json (local path or gs:// URL).
               Its runs are carried over verbatim, the GCS scan skips every
               build at or below the newest build id already on record, and
               cases/coverage are recomputed from the merged run list. The
-              cold sweep is ~3 serial gsutil calls per archived build --
-              tens of minutes over two weeks of history -- so an hourly
-              job MUST ride this watermark. Prow build ids are monotonic in
-              START order, not finish order, so a build still in flight
-              when a later, shorter build gets recorded would sit below the
-              watermark forever; the prior file's pending_builds list is
-              how those get back in: every listed-but-unrecorded build
-              rides it and is re-read on the next scan regardless of the
-              watermark, until it finishes or PENDING_RETRY_DAYS passes.
+              cold sweep is ~3 gsutil calls per archived build (READ_WORKERS
+              at a time) -- tens of minutes over two weeks of history -- so
+              a periodic job MUST ride this watermark. Prow build ids are
+              monotonic in START order, not finish order, so a build still
+              in flight when a later, shorter build gets recorded would sit
+              below the watermark forever; the prior file's pending_builds
+              list is how those get back in: every listed-but-unrecorded
+              build rides it and is re-read on the next scan regardless of
+              the watermark, until it finishes or PENDING_RETRY_DAYS passes.
               A missing, unreadable or implausible prior file is a warning
               that degrades to a fresh sweep bounded by --since-days
               (default 14 in that case), never a crash: the first armed
@@ -59,6 +119,11 @@ Incremental mode (what the hourly refresh job runs):
   --since-days  skip GCS builds whose started.json is older than N days.
               Costs one probe read per candidate build and saves the other
               two; the watermark filter above is free and runs first.
+
+A failed or timed-out listing -- index or glob -- is a `warning: gsutil ls
+... failed` line and an otherwise well-formed document with nothing new;
+the refresh workflow greps for that line and refuses to publish, so a
+stalled archive is never republished under a fresh generated_at.
 
 Builds with no finished.json are still running (or never finished uploading)
 and are skipped. Everything else is parsed best-effort: a truncated log
@@ -76,9 +141,72 @@ import re
 import statistics
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+try:
+    from . import tiers
+except ImportError:  # run as a script: python3 scripts/eval_dashboard/collect.py
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import tiers
+try:
+    import eval_rosters
+except ImportError:  # run as a script: scripts/ is not on sys.path yet
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import eval_rosters
+
 SCHEMA_VERSION = 1
+
+# The nightly periodic (oss-test-infra: ci-kube-agents-eval-nightly, the
+# EVAL_TIER=nightly companion of the presubmit) and where Prow archives it.
+# A periodic's log prefix holds one directory per build and a
+# latest-build.txt, so listing it is the directory index; there is no
+# pointer object to follow.
+DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
+PROW_LOGS_ROOT = "gs://kube-agents-prow/logs"
+DEFAULT_NIGHTLY_PREFIX = f"{PROW_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
+# What a build's job is called, read from the build directory's URL: the
+# segment before the build id, for a presubmit
+# (.../pull/<org_repo>/<pr>/<job>/<build>/) and a periodic
+# (.../logs/<job>/<build>/) alike. A --from-dir build has no URL and no job.
+_JOB_IN_PATH = re.compile(r"/(?P<job>[^/]+)/\d+/?$")
+# What a commit id looks like, and how much of one runs[].head_sha keeps.
+_SHA_SHAPE = re.compile(r"^[0-9a-f]{7,40}$")
+HEAD_SHA_CHARS = 7
+
+# The shape of a Prow presubmit build-directory glob,
+# gs://<bucket>/pr-logs/pull/<org_repo>/<pr or *>/<job>/*, from which the
+# job's directory index is derived: <root>/directory/<job>/. Prow keeps that
+# index as one `<build_id>.txt` object per build holding the gs:// path of
+# the build's directory. Listing it is one flat prefix (~3 s at 1700 builds)
+# where the glob is a walk of every PR directory (past GSUTIL_TIMEOUT_S at
+# the same size).
+_PR_GLOB_SHAPE = re.compile(
+    r"^(?P<root>gs://[^/]+/pr-logs)/pull/[^/]+/[^/]+/(?P<job>[^/*]+)/\*$"
+)
+INDEX_DIRECTORY_SEGMENT = "directory"
+
+# The suffix of a per-build pointer in the index. `latest-build.txt` shares
+# it and is skipped because its stem is not a build id.
+INDEX_POINTER_SUFFIX = ".txt"
+
+# What a pointer must start with to be followed, and how much of one that
+# does not is quoted in the warning.
+GS_SCHEME = "gs://"
+POINTER_EXCERPT_CHARS = 80
+
+# Ceiling on one gsutil call. A listing or read past it is reported as timed
+# out and the sweep carries on without it; the refresh workflow's budget must
+# stay larger than this.
+GSUTIL_TIMEOUT_S = 300
+
+# Concurrent gsutil reads while resolving index pointers and reading builds.
+# One build is ~3 sequential reads of a second or two each, so eight workers
+# bring a 150-build catch-up from ~10 minutes to well under two, within the
+# refresh workflow's collect budget, without hammering the bucket. Output
+# order does not depend on completion order: results come back in build-id
+# order.
+READ_WORKERS = 8
 
 # Cap on the free-text reason kept from a per-repetition grading line. Fail
 # reasons quote whole grader checklists and run past 1000 chars; the dashboard
@@ -91,6 +219,37 @@ REP_REASON_MAX_CHARS = 300
 # primary signal; the marker is the fallback for lines that carry the literal
 # under another token.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# Prow's podinfo.json: `{"pod": <v1.Pod>, "events": [<v1.Event>]}`, uploaded
+# by crier when the pod is done. Read only for a build with no build-log.txt
+# or a zero-task FAILURE (module docstring); the three keys below are what
+# the health adjudicator needs to tell a lost pod from a clone failure.
+PODINFO_FILE = "podinfo.json"
+BUILD_LOG_FILE = "build-log.txt"
+# Prow's clone-records.json: `[{refs, commands[], failed}]`. Read for the
+# zero-task FAILURE builds, to separate a pull request that would not merge
+# into its base from a setup crash.
+CLONE_RECORDS_FILE = "clone-records.json"
+# The clonerefs command that merges the pull request into the base ref.
+# Spaced: an unspaced needle also matches a path ending in "git".
+CLONE_MERGE_COMMAND = " git merge "
+# git prints it once per conflicted path. Required, because a merge can also
+# fail on a full disk or a broken workspace -- a build-cluster outage, which
+# must stay a setup death rather than being charged to the author.
+CLONE_CONFLICT_MARKER = "CONFLICT"
+# Prow's uploader container. A pod the kubelet stopped reporting on is
+# frozen with its sidecar `running`, and nothing ever uploaded a log; every
+# other sidecar state means a log exists somewhere -- `terminated` uploaded
+# it on the way out, `waiting` means the clone stage failed and initupload
+# wrote it -- so a missing log is then a failed read, not a lost pod.
+SIDECAR_CONTAINER = "sidecar"
+CONTAINER_RUNNING = "running"
+# The build log is the largest object read; a transient gsutil failure on it
+# alone would otherwise look exactly like a pod that never uploaded one.
+LOG_READ_ATTEMPTS = 2
+# Prow's job verdict for a failed build, as finished.json spells it (also
+# seen lowercase in the wild; compared case-insensitively).
+FINISHED_FAILURE = "FAILURE"
 
 # runs[].pr_merged is resolved against this repository. The collector only
 # reads this repo's Prow archive (the --pr-glob defaults in the CI scripts),
@@ -116,7 +275,7 @@ DEGRADED_SINCE_DAYS = 14.0
 
 # How long a listed-but-unfinished build stays on pending_builds before the
 # scan stops re-reading it. Prow's job deadline caps a real run at a few
-# hours, and 2 days of hourly retries also rides out a transiently unreadable
+# hours, and 2 days of retries also rides out a transiently unreadable
 # finished.json; a build still unfinished after that is a pod that died
 # without uploading, and dropping it is what keeps the retry list -- and the
 # reads it costs every sweep -- bounded.
@@ -130,7 +289,6 @@ RC_RELEASES_MAX = 20
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
-EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 DOMAINS_YAML = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 
 # One line per evaluated case, printed by hack/ci-eval-pr.sh. Observed shapes:
@@ -224,6 +382,13 @@ _RESULT_BY_VERDICT = {
 # trajectory), or a token this collector has never seen -- grades as fail.
 _REP_RESULT_BY_VERDICT = {"pass": "pass", "infra": "infra"}
 
+# The final verdict line's word, as runs[].eval_verdict records it (the
+# release record's GREEN/RED vocabulary). The run gets None when the log has
+# no such line: the job ended before its verdict -- Prow's deadline (SIGTERM;
+# hack/ci-eval-pr.sh's EXIT trap prints no banner), a death before the
+# cases, or step 0's revalidation, which is a SUCCESS.
+_EVAL_VERDICT_BY_WORD = {"Succeeded": "GREEN", "Failed": "RED"}
+
 
 # --------------------------------------------------------------------------
 # Build-log parsing
@@ -310,13 +475,101 @@ def _iso(ts) -> str | None:
         return None
 
 
-def build_run(build_id: str, read, pr_hint: int | None = None) -> dict | None:
+def _event_time(event: dict) -> str:
+    """The sortable timestamp of one v1.Event: lastTimestamp, else eventTime,
+    else the object's creation; "" when none, which sorts first."""
+    for key in ("lastTimestamp", "eventTime"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    meta = event.get("metadata")
+    created = meta.get("creationTimestamp") if isinstance(meta, dict) else None
+    return created if isinstance(created, str) else ""
+
+
+def parse_podinfo(text: str | None) -> dict | None:
+    """{pod_phase, pod_node, pod_last_event, sidecar_state} from podinfo.json
+    text, or None when there is no parseable document. Each value is None
+    when the pod record lacks it. The last event is the newest by timestamp
+    (list order breaks ties, so an unstamped list reads in upload order).
+    `sidecar_state` is the state key of Prow's uploader container (running,
+    waiting, terminated) -- read by build_run, not written."""
+    if text is None:
+        return None
+    try:
+        info = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(info, dict):
+        return None
+    pod = info.get("pod") if isinstance(info.get("pod"), dict) else {}
+    status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+    spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
+    events = [e for e in (info.get("events") or []) if isinstance(e, dict)] if isinstance(info.get("events"), list) else []
+    # Scheduled, Pulled, Created and Started all land in one second; among
+    # equal timestamps upload order decides, so the max is taken over the
+    # reversed list and the later-uploaded event wins the tie.
+    last = max(reversed(events), key=_event_time) if events else None
+    reason = last.get("reason") if last else None
+    sidecar_state = None
+    for container in status.get("containerStatuses") or []:
+        if isinstance(container, dict) and container.get("name") == SIDECAR_CONTAINER:
+            state = container.get("state") if isinstance(container.get("state"), dict) else {}
+            sidecar_state = next(iter(state), None)
+    return {
+        "pod_phase": status.get("phase") if isinstance(status.get("phase"), str) else None,
+        "pod_node": spec.get("nodeName") if isinstance(spec.get("nodeName"), str) else None,
+        "pod_last_event": reason if isinstance(reason, str) else None,
+        "sidecar_state": sidecar_state if isinstance(sidecar_state, str) else None,
+    }
+
+
+def parse_clone_records(text: str | None) -> bool | None:
+    """Whether the clone failed on the merge, from clone-records.json text.
+
+    True only for a record that carries pull requests, failed, and whose
+    merge command reported a conflict. A base-ref clone that fails, a merge
+    record that failed earlier on a fetch, and a merge that failed without a
+    conflict are all False: those are the pool's problem, not the author's.
+    None when there is no parseable document."""
+    if text is None:
+        return None
+    try:
+        records = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(records, list):
+        return None
+    conflict = False
+    for record in records:
+        if not isinstance(record, dict) or not record.get("failed"):
+            continue
+        refs = record.get("refs") if isinstance(record.get("refs"), dict) else {}
+        if not refs.get("pulls"):
+            continue
+        for command in record.get("commands") or []:
+            if not isinstance(command, dict) or not command.get("error"):
+                continue
+            if CLONE_MERGE_COMMAND in str(command.get("command") or "") and CLONE_CONFLICT_MARKER in str(command.get("output") or ""):
+                conflict = True
+    return conflict
+
+
+def build_run(
+    build_id: str,
+    read,
+    pr_hint: int | None = None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    job: str | None = None,
+) -> dict | None:
     """Assemble one `runs[]` entry.
 
     `read(name)` returns the text of a file in the build directory, or None.
     Returns None when the build has no parseable finished.json -- the run is
     still in flight or never finished uploading, so there is nothing final to
-    record.
+    record. `tier` and `job` are the source's, not the build's: the same
+    artifact layout parses for both tiers, and a nightly build has no pull
+    request whatever its metadata says.
     """
     finished_text = read("finished.json")
     if finished_text is None:
@@ -339,17 +592,71 @@ def build_run(build_id: str, read, pr_hint: int | None = None) -> dict | None:
         except ValueError:
             started = {}
 
-    parsed = parse_build_log(read("build-log.txt") or "")
+    log_text = None
+    for _attempt in range(LOG_READ_ATTEMPTS):
+        log_text = read(BUILD_LOG_FILE)
+        if log_text is not None:
+            break
+    parsed = parse_build_log(log_text or "")
+    result = finished.get("result")
+
+    # How the build ended (module docstring). A build that ran has a log and
+    # costs no extra read; the two shapes a lost pod leaves -- no log at all,
+    # or a zero-task FAILURE -- pay one read of podinfo.json. `has_build_log`
+    # is written as False only when the pod record corroborates it: the
+    # sidecar is still `running` (SIDECAR_CONTAINER), so nothing was ever
+    # uploaded. Any other sidecar state means a log exists and a miss on it
+    # is a failed read; a bucket that served neither file is unreachable.
+    # Both leave the field out (unknown) rather than guessed.
+    ended: dict = {}
+    zero_task_failure = not parsed["tasks"] and str(result or "").upper() == FINISHED_FAILURE
+    if log_text is None or zero_task_failure:
+        pod = parse_podinfo(read(PODINFO_FILE))
+        if pod is not None:
+            sidecar_state = pod.pop("sidecar_state")
+            if log_text is not None:
+                ended = {"has_build_log": True, **pod}
+            elif sidecar_state == CONTAINER_RUNNING:
+                ended = {"has_build_log": False, **pod}
+            else:
+                print(
+                    f"warning: build {build_id}: build-log.txt could not be read but the pod's sidecar is"
+                    f" {sidecar_state or 'unrecorded'}, so one was uploaded; how it ended is unknown",
+                    file=sys.stderr,
+                )
+                ended = dict(pod)
+        elif log_text is not None:
+            ended = {"has_build_log": True}
+        else:
+            print(f"warning: build {build_id}: no build-log.txt and no readable podinfo.json; how it ended is unknown", file=sys.stderr)
+        # Second read, for the zero-task FAILURE subset: that is also the
+        # shape a conflicted merge leaves. A pod that uploaded no log
+        # uploaded no clone record either, so skip it rather than spend a
+        # round trip per lost pod on a build-cluster event.
+        if zero_task_failure and ended.get("has_build_log") is not False:
+            conflict = parse_clone_records(read(CLONE_RECORDS_FILE))
+            if conflict is not None:
+                ended["merge_conflict"] = conflict
+    else:
+        ended = {"has_build_log": True}
 
     pr = pr_hint
     pull = started.get("pull")
     if isinstance(pull, (int, str)) and str(pull).isdigit():
         pr = int(pull)
+    if tier == tiers.TIER_NIGHTLY:
+        # A periodic runs main; the number a hint or a stray `pull` key
+        # might carry is nobody's pull request.
+        pr = None
 
+    # finished.json's `revision` is the tested commit on a presubmit; on a
+    # periodic Prow writes the branch name ("main") there and the commit in
+    # started.json's `repo-commit`, so take whichever one looks like a sha.
     head_sha = None
-    revision = finished.get("revision")
-    if isinstance(revision, str) and revision:
-        head_sha = revision[:7]
+    for candidate in (finished.get("revision"), started.get("repo-commit")):
+        if isinstance(candidate, str) and _SHA_SHAPE.match(candidate):
+            head_sha = candidate[:HEAD_SHA_CHARS]
+            break
 
     started_ts = started.get("timestamp")
     finished_ts = finished.get("timestamp")
@@ -362,14 +669,18 @@ def build_run(build_id: str, read, pr_hint: int | None = None) -> dict | None:
 
     return {
         "build_id": str(build_id),
+        "tier": tier,
+        "job": job,
         "pr": pr,
         "head_sha": head_sha,
         "project": parsed["project"],
         "started": _iso(started_ts),
         "finished": _iso(finished_ts),
-        "result": finished.get("result"),
+        "result": result,
+        "eval_verdict": _EVAL_VERDICT_BY_WORD.get(parsed["eval_verdict"]),
         "duration_s": duration_s,
         "tasks": parsed["tasks"],
+        **ended,
     }
 
 
@@ -492,28 +803,35 @@ def task_domain(name: str, repo_root: pathlib.Path = REPO_ROOT) -> str:
         text = path.read_text()
     except OSError:
         return "unknown"
-    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.M)
+    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.MULTILINE)
     return m.group(1) if m else "unknown"
 
 
-def active_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
-    """Case names the presubmit actually runs: uncommented TASKS entries.
+def _case_file_names(path: pathlib.Path) -> set[str]:
+    """The case ids one roster file under hack/eval/ names."""
+    return set(eval_rosters.case_names(path.read_text()))
 
-    Same narrow textual parse as scripts/test_domain_coverage.py -- the
-    script provisions clusters, so executing it to ask is not an option.
+
+def active_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
+    """Case names the presubmit actually runs: hack/eval/presubmit-cases.txt.
+
+    The same parse scripts/eval_rosters.py gives scripts/test_domain_coverage.py
+    and the registration lint, so the dashboard and the lints cannot disagree
+    about what runs.
     """
-    text = (repo_root / "hack" / "ci-eval-pr.sh").read_text()
-    m = re.search(r"^TASKS=\(\n(.*?)^\)$", text, re.M | re.S)
-    if not m:
-        raise ValueError("TASKS=( ... ) array not found in hack/ci-eval-pr.sh")
-    active = set()
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if line.startswith('"') and line.endswith('"'):
-            entry = re.fullmatch(r"\./tasks/([^/]+)/task\.yaml", line.strip('"'))
-            if entry:
-                active.add(entry.group(1))
-    return active
+    return _case_file_names(repo_root / "hack" / "eval" / "presubmit-cases.txt")
+
+
+def nightly_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
+    """Case names the nightly runs: the presubmit file plus hack/eval/nightly-cases.txt.
+
+    EVAL_TIER=nightly appends the nightly file to the presubmit one in
+    hack/ci-eval-pr.sh, so the nightly matrix is the presubmit's superset by
+    construction.
+    """
+    return active_task_names(repo_root) | _case_file_names(
+        repo_root / "hack" / "eval" / "nightly-cases.txt"
+    )
 
 
 def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
@@ -524,7 +842,7 @@ def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
     and the unit tests here assert this parse agrees with it.
     """
     text = (repo_root / "docs" / "designs" / "domains.yaml").read_text()
-    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.M)
+    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.MULTILINE)
     uncovered = []
     in_allowlist = False
     for line in text.splitlines():
@@ -553,39 +871,59 @@ def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _case_history(runs: list[dict]) -> dict[str, list[tuple[dict, dict]]]:
+    history: dict[str, list[tuple[dict, dict]]] = {}
+    for run in runs:
+        for task in run["tasks"]:
+            history.setdefault(task["name"], []).append((run, task))
+    return history
+
+
+def _graded_pass_rate(results: list[str]) -> float | None:
+    """pass / (pass + fail); None when nothing on record was graded."""
+    graded = [r for r in results if r != "infra"]
+    passes = sum(1 for r in graded if r == "pass")
+    return round(passes / len(graded), 4) if graded else None
+
+
 def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[dict]:
     """Derive per-case history from chronologically ordered runs.
 
     INFRA results never count against a case: they are excluded from the
     pass_rate denominator and from the duration stats, though they do appear
     in runs_on_record and last3 (they are still history).
+
+    The per-case fields are the PRESUBMIT's record, as they were before the
+    nightly existed; the nightly's record sits beside them under `nightly`,
+    never pooled into them, so a hold-out's admission evidence and the
+    gate's own history stay two numbers. A case only the nightly has run is
+    still on record, with an empty presubmit side.
     """
     active = active_task_names(repo_root)
-    history: dict[str, list[tuple[dict, dict]]] = {}
-    for run in runs:
-        for task in run["tasks"]:
-            history.setdefault(task["name"], []).append((run, task))
+    nightly_active = nightly_task_names(repo_root)
+    history = _case_history(tiers.presubmit_runs(runs))
+    nightly_history = _case_history(tiers.nightly_runs(runs))
 
     cases = []
-    for name in sorted(history):
-        entries = history[name]
+    for name in sorted(set(history) | set(nightly_history)):
+        entries = history.get(name, [])
         results = [task["result"] for _, task in entries]
-        graded = [r for r in results if r != "infra"]
-        passes = sum(1 for r in graded if r == "pass")
         durations = [
             task["duration_s"]
             for _, task in entries
             if task["result"] != "infra" and task["duration_s"] is not None
         ]
+        nightly_results = [task["result"] for _, task in nightly_history.get(name, [])]
         cases.append(
             {
                 "name": name,
                 "domain": task_domain(name, repo_root),
                 "active": name in active,
+                "nightly_active": name in nightly_active,
                 "runs_on_record": len(entries),
                 # null when every run on record was an infra failure: there
                 # is nothing graded to rate.
-                "pass_rate": round(passes / len(graded), 4) if graded else None,
+                "pass_rate": _graded_pass_rate(results),
                 "last3": results[-3:],
                 "durations": {
                     "min": min(durations) if durations else None,
@@ -597,6 +935,11 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
                     for run, task in entries
                     if task["outcome_validity"] is not None
                 ],
+                "nightly": {
+                    "runs_on_record": len(nightly_results),
+                    "pass_rate": _graded_pass_rate(nightly_results),
+                    "last3": nightly_results[-3:],
+                },
             }
         )
     return cases
@@ -703,7 +1046,11 @@ def annotate_pr_merged(runs: list[dict], gh: str, now: datetime | None = None) -
 def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
     try:
         proc = subprocess.run(
-            [gsutil, *args], capture_output=True, text=True, timeout=300, check=False
+            [gsutil, *args],
+            capture_output=True,
+            text=True,
+            timeout=GSUTIL_TIMEOUT_S,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"warning: {gsutil} {' '.join(args)}: {exc}", file=sys.stderr)
@@ -715,6 +1062,10 @@ def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
 
 _PR_IN_PATH = re.compile(r"/pull/[^/]+/(\d+)/")
 
+# What one build read came back as; _read_builds turns UNFINISHED into a
+# pending_builds entry and FILTERED (older than --since-days) into nothing.
+_RECORDED, _UNFINISHED, _FILTERED = "recorded", "unfinished", "filtered"
+
 
 def _started_at(started_text: str | None) -> datetime | None:
     """The build's start time from started.json text, or None when unknowable."""
@@ -725,6 +1076,26 @@ def _started_at(started_text: str | None) -> datetime | None:
         return datetime.fromtimestamp(int(started["timestamp"]), tz=timezone.utc)
     except (ValueError, TypeError, KeyError, OSError, OverflowError):
         return None
+
+
+def _admitted(build_id: str, after_build: int | None, retry_builds: frozenset[str]) -> bool:
+    """The incremental watermark: whether a listed build is worth reading.
+
+    Prow build ids are monotonic in START order, so a build at or below the
+    newest RECORDED id may still be in flight (started earlier, outlived the
+    build the watermark came from) -- skipping on the id alone would drop it
+    from the dashboard permanently once the watermark climbs past it.
+    retry_builds carries exactly those ids (the prior file's pending_builds)
+    back through the filter; everything else at or below the watermark is
+    already on record and costs zero reads.
+    """
+    return after_build is None or int(build_id) > after_build or build_id in retry_builds
+
+
+def _job_from_base(base: str) -> str | None:
+    """The job name in a build directory's URL, or None when it has none."""
+    m = _JOB_IN_PATH.search(base)
+    return m.group("job") if m else None
 
 
 def _build_dirs(listing: str) -> list[tuple[str, str]]:
@@ -754,16 +1125,204 @@ def _gcs_reader(base: str, gsutil: str):
     """A build_run/build_release reader over one GCS build directory.
 
     Caches per file: build_run asks for finished.json, started.json and
-    build-log.txt, and build_release re-asks for the log.
+    build-log.txt (plus podinfo.json and clone-records.json for a build that
+    ended with no tasks), and build_release re-asks for the log. A failed read is not cached, so
+    build_run's retry of the log is a real second attempt.
     """
-    cache: dict[str, str | None] = {}
+    cache: dict[str, str] = {}
 
     def reader(name: str) -> str | None:
         if name not in cache:
-            cache[name] = _gsutil(["cat", base + name], gsutil)
+            text = _gsutil(["cat", base + name], gsutil)
+            if text is None:
+                return None
+            cache[name] = text
         return cache[name]
 
     return reader
+
+
+def _read_build(
+    build_id: str,
+    base: str,
+    gsutil: str,
+    since_cutoff: datetime | None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    job: str | None = None,
+) -> tuple[str, dict | None, str]:
+    """One build's reads: (build_id, run or None, _RECORDED/_UNFINISHED/_FILTERED).
+
+    `base` is the build directory's gs:// URL with its trailing slash. Runs
+    on a worker thread, so it touches nothing shared: every outcome travels
+    back in the return value. `job` overrides the name read from the URL.
+    """
+    m = _PR_IN_PATH.search(base)
+    pr_hint = int(m.group(1)) if m else None
+    job = job or _job_from_base(base)
+    reader = _gcs_reader(base, gsutil)
+    if since_cutoff is not None:
+        # One probe read decides whether to pay the other two. An
+        # unparseable started.json keeps the build: build_run makes the
+        # final call, and a build with no readable metadata is skipped
+        # there anyway.
+        started_at = _started_at(reader("started.json"))
+        if started_at is not None and started_at < since_cutoff:
+            return build_id, None, _FILTERED
+    try:
+        run = build_run(build_id, reader, pr_hint, tier=tier, job=job)
+    except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
+        print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
+        return build_id, None, _UNFINISHED
+    if run is None:
+        print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
+        return build_id, None, _UNFINISHED
+    return build_id, run, _RECORDED
+
+
+def _read_builds(
+    candidates: list[tuple[str, str]],
+    gsutil: str,
+    since_cutoff: datetime | None,
+    unfinished: set[str] | None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    job: str | None = None,
+) -> list[dict]:
+    """Read `(build_id, base_url)` candidates READ_WORKERS at a time.
+
+    The result is in ascending build-id order whatever order the reads
+    finish in: candidates are sorted first and the pool's map keeps input
+    order, so two collects over the same archive write the same runs[].
+    """
+    candidates = sorted(candidates, key=lambda c: int(c[0]))
+    runs = []
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+        results = pool.map(
+            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff, tier=tier, job=job),
+            candidates,
+        )
+        for build_id, run, status in results:
+            if status == _RECORDED:
+                runs.append(run)
+            elif status == _UNFINISHED and unfinished is not None:
+                unfinished.add(build_id)
+    return runs
+
+
+def _index_build_ids(listing: str) -> list[str]:
+    """The build ids named by a `gsutil ls` of the directory index.
+
+    Every `<digits>.txt` object is a build; `latest-build.txt` and anything
+    else under the prefix is not.
+    """
+    ids = []
+    for line in listing.splitlines():
+        name = line.strip().rsplit("/", 1)[-1]
+        if not name.endswith(INDEX_POINTER_SUFFIX):
+            continue
+        build_id = name[: -len(INDEX_POINTER_SUFFIX)]
+        if build_id.isdigit():
+            ids.append(build_id)
+    return ids
+
+
+def _resolve_pointer(
+    prefix: str, build_id: str, gsutil: str
+) -> tuple[str, str | None, bool]:
+    """(build_id, build directory URL with trailing slash, retry) from one pointer.
+
+    The pointer is a one-line object holding the build directory's gs://
+    path; the build id comes from the pointer's NAME, so the index decides
+    which build this is and the pointer only says where it lives (a PR
+    directory the collector never has to guess). The URL is None when the
+    pointer cannot be read (retry: the build goes on pending_builds) or does
+    not hold a gs:// path (no retry: re-reading it would not change it).
+    """
+    pointer = f"{prefix}{build_id}{INDEX_POINTER_SUFFIX}"
+    text = _gsutil(["cat", pointer], gsutil)
+    if text is None:
+        # The object was in the listing a moment ago, so this is a read
+        # failure, not a missing build. Said in the shape the refresh
+        # workflow refuses to publish on; the build lands on pending_builds
+        # and is re-read next scan.
+        print(
+            f"warning: gsutil cat failed for {pointer}; build {build_id}"
+            " deferred to the next scan",
+            file=sys.stderr,
+        )
+        return build_id, None, True
+    path = text.strip()
+    if not path.startswith(GS_SCHEME):
+        print(
+            f"warning: build {build_id}: index pointer {pointer} does not hold a"
+            f" {GS_SCHEME} path ({path[:POINTER_EXCERPT_CHARS]!r}); skipping",
+            file=sys.stderr,
+        )
+        return build_id, None, False
+    return build_id, path.rstrip("/") + "/", False
+
+
+def discovery_index(glob: str, index_prefix: str | None) -> str | None:
+    """The index prefix an incremental scan of `glob` lists, or None.
+
+    An explicit --index-prefix wins; the default (None) derives the job's
+    index from the glob's bucket and job name; an empty string disables the
+    index, and so does a glob whose shape names no job -- both list the
+    glob itself, as a cold sweep does.
+    """
+    if index_prefix == "":
+        return None
+    if index_prefix is not None:
+        return index_prefix.rstrip("/") + "/"
+    m = _PR_GLOB_SHAPE.match(glob)
+    if m is None:
+        print(
+            f"note: no directory index derivable from {glob}; listing the glob itself",
+            file=sys.stderr,
+        )
+        return None
+    return f"{m.group('root')}/{INDEX_DIRECTORY_SEGMENT}/{m.group('job')}/"
+
+
+def runs_from_index(
+    index_prefix: str,
+    gsutil: str = "gsutil",
+    after_build: int | None = None,
+    since_cutoff: datetime | None = None,
+    retry_builds: frozenset[str] = frozenset(),
+    unfinished: set[str] | None = None,
+) -> list[dict]:
+    """Discover builds through Prow's per-job directory index, then read them.
+
+    One `gsutil ls` of the index prefix, the watermark filter on the ids it
+    names, one pointer read per admitted build (concurrent), then the same
+    per-build reads as the glob path. A failed listing is a warning and an
+    empty result -- the refresh workflow greps for that warning and refuses
+    to publish, so a stall never republishes old runs as fresh.
+    """
+    prefix = index_prefix.rstrip("/") + "/"
+    listing = _gsutil(["ls", prefix], gsutil)
+    if listing is None:
+        print(f"warning: gsutil ls failed for {prefix}; nothing new this scan", file=sys.stderr)
+        return []
+    wanted = sorted(
+        (b for b in _index_build_ids(listing) if _admitted(b, after_build, retry_builds)),
+        key=int,
+    )
+    print(
+        f"note: directory index {prefix}: {len(wanted)} build(s) to read"
+        f" (watermark {after_build}, {len(retry_builds)} pending)",
+        file=sys.stderr,
+    )
+    candidates: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+        for build_id, base, retry in pool.map(
+            lambda b: _resolve_pointer(prefix, b, gsutil), wanted
+        ):
+            if base is not None:
+                candidates.append((build_id, base))
+            elif retry and unfinished is not None:
+                unfinished.add(build_id)
+    return _read_builds(candidates, gsutil, since_cutoff, unfinished)
 
 
 def runs_from_gcs(
@@ -774,54 +1333,86 @@ def runs_from_gcs(
     retry_builds: frozenset[str] = frozenset(),
     unfinished: set[str] | None = None,
 ) -> list[dict]:
+    """Discover builds by listing the build-directory glob(s), then read them.
+
+    The whole-archive listing grows with the archive and times out past
+    ~1700 builds, so this is the cold-sweep path; an incremental scan goes
+    through runs_from_index.
+    """
     runs = []
     for glob in pr_globs:
         listing = _gsutil(["ls", glob], gsutil)
         if listing is None:
             print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
             continue
-        for build_id, line in _build_dirs(listing):
-            # The incremental watermark. Prow build ids are monotonic in
-            # START order, so a build at or below the newest RECORDED id may
-            # still be in flight (started earlier, outlived the build the
-            # watermark came from) -- skipping on the id alone would drop it
-            # from the dashboard permanently once the watermark climbs past
-            # it. retry_builds carries exactly those ids (the prior file's
-            # pending_builds) back through the filter; everything else at or
-            # below the watermark is already on record and costs zero reads.
-            if (
-                after_build is not None
-                and int(build_id) <= after_build
-                and build_id not in retry_builds
-            ):
-                continue
-            m = _PR_IN_PATH.search(line)
-            pr_hint = int(m.group(1)) if m else None
-
-            reader = _gcs_reader(line, gsutil)
-
-            if since_cutoff is not None:
-                # One probe read decides whether to pay the other two. An
-                # unparseable started.json keeps the build: build_run makes
-                # the final call, and a build with no readable metadata is
-                # skipped there anyway.
-                started_at = _started_at(reader("started.json"))
-                if started_at is not None and started_at < since_cutoff:
-                    continue
-            try:
-                run = build_run(build_id, reader, pr_hint)
-            except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
-                print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
-                if unfinished is not None:
-                    unfinished.add(build_id)
-                continue
-            if run is None:
-                print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
-                if unfinished is not None:
-                    unfinished.add(build_id)
-                continue
-            runs.append(run)
+        candidates = _build_dirs_in_listing(listing, after_build, retry_builds)
+        runs.extend(_read_builds(candidates, gsutil, since_cutoff, unfinished))
     return runs
+
+
+def _build_dirs_in_listing(
+    listing: str, after_build: int | None, retry_builds: frozenset[str]
+) -> list[tuple[str, str]]:
+    """The admitted `(build_id, directory URL)` pairs in a `gsutil ls` listing."""
+    return [
+        (build_id, line)
+        for build_id, line in _build_dirs(listing)
+        if _admitted(build_id, after_build, retry_builds)
+    ]
+
+
+def runs_from_periodic(
+    prefix: str,
+    gsutil: str = "gsutil",
+    after_build: int | None = None,
+    since_cutoff: datetime | None = None,
+    retry_builds: frozenset[str] = frozenset(),
+    unfinished: set[str] | None = None,
+    job: str | None = None,
+) -> list[dict]:
+    """The nightly periodic's builds: list its log prefix, then read them.
+
+    For a periodic the prefix is the directory index -- one `<build_id>/`
+    per build beside `latest-build.txt` -- so the one listing names every
+    build and the watermark filter runs on it directly; there is no pointer
+    to resolve. Every run comes back tagged tier `nightly`, `pr` null and
+    `job` = `job` (default: the prefix's last segment). A prefix that does
+    not list is read two ways. With no nightly on record yet (no watermark)
+    the job may simply not have run, and the nightly must never be what
+    stops the gate's dashboard publishing, so that is a note and no runs,
+    deliberately NOT the `warning: gsutil ls ... failed` line the refresh
+    workflow refuses on. Once a night IS on record, a prefix that listed
+    yesterday and does not today is the bucket or the grant failing, and
+    republishing would freeze the nightly record under a fresh generated_at
+    with nothing said -- so that one is the warning line. A listing that
+    hangs past GSUTIL_TIMEOUT_S is the warning line either way.
+    """
+    prefix = prefix.rstrip("/") + "/"
+    job = job or prefix.rstrip("/").rsplit("/", 1)[-1]
+    listing = _gsutil(["ls", prefix], gsutil)
+    if listing is None:
+        if after_build is not None:
+            print(
+                f"warning: gsutil ls failed for {prefix}; the nightly record is not"
+                " refreshed this scan",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"note: nightly prefix {prefix} did not list (no builds yet, or"
+                " unreadable); no nightly runs this scan",
+                file=sys.stderr,
+            )
+        return []
+    candidates = _build_dirs_in_listing(listing, after_build, retry_builds)
+    print(
+        f"note: nightly prefix {prefix}: {len(candidates)} build(s) to read"
+        f" (watermark {after_build}, {len(retry_builds)} pending)",
+        file=sys.stderr,
+    )
+    return _read_builds(
+        candidates, gsutil, since_cutoff, unfinished, tier=tiers.TIER_NIGHTLY, job=job
+    )
 
 
 def _dir_reader(base: pathlib.Path):
@@ -1096,6 +1687,9 @@ def collect(
     since_days: float | None = None,
     now: datetime | None = None,
     stale_after_s: int | None = None,
+    index_prefix: str | None = None,
+    nightly_prefix: str | None = None,
+    nightly_job: str | None = None,
     rc_globs: list[str] | None = None,
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
@@ -1104,16 +1698,31 @@ def collect(
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
     # default so a normal collect resolves best-effort. `now` anchors the
     # pr_merged resolution window and the pending-build/--since-days clocks
-    # (tests pin it; the CLI leaves it None).
+    # (tests pin it; the CLI leaves it None). index_prefix is the
+    # --index-prefix tri-state: None derives each glob's job index, "" turns
+    # the index off, anything else is listed as given. nightly_prefix is
+    # what asks for the nightly periodic to be scanned at all (None: it is
+    # not), the way --pr-glob asks for the presubmit; nightly_job labels
+    # the runs it yields.
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
+    # The retry ids the nightly's listing named (or the prior tagged): their
+    # pending_builds entry carries the tier, so a consumer whose columns are
+    # the presubmit's (the Grid) can keep a night in flight off them.
+    nightly_pending: set[str] = set()
+    # One watermark per source. Prow's build ids are one global sequence
+    # ordered by start, so the newest presubmit id (dozens of builds a day)
+    # is normally above every nightly id (one a day); the newest id on
+    # record says what one source has seen, not the other.
     after_build = None
+    nightly_after = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gsutil)
         if prior_data is not None:
             prior = prior_data["runs"]
-            after_build = newest_build_id(prior)
+            after_build = newest_build_id(tiers.presubmit_runs(prior))
+            nightly_after = newest_build_id(tiers.nightly_runs(prior))
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -1124,10 +1733,15 @@ def collect(
                     )
                 else:
                     retry[build_id] = first_seen
+            nightly_pending.update(
+                entry["build_id"]
+                for entry in (prior_data.get("pending_builds") if isinstance(prior_data.get("pending_builds"), list) else [])
+                if isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_nightly(entry)
+            )
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
-        # sweep is ~3 serial gsutil calls per archived build. Bound the
-        # recovery unless the caller already did.
+        # sweep is ~3 gsutil calls per archived build. Bound the recovery
+        # unless the caller already did.
         if after_build is None and since_days is None:
             since_days = DEGRADED_SINCE_DAYS
             print(
@@ -1144,10 +1758,26 @@ def collect(
     unfinished: set[str] = set()
     if from_dir is not None:
         fresh.extend(runs_from_dir(from_dir))
-    if pr_globs:
+    # GCS discovery. --pr-glob is still what asks for a GCS scan at all
+    # (--merge-with alone recomputes without touching the bucket); the index
+    # decides HOW that scan finds builds once there is a watermark to resume
+    # above: one flat listing of the glob's job index, then only the new
+    # builds. Without a watermark -- a cold sweep -- or with the index
+    # disabled or underivable, the glob is listed as before. A job's index
+    # is listed once however many globs name it, and a build is never read
+    # through both paths.
+    indexes: list[str] = []
+    glob_only: list[str] = []
+    for glob in pr_globs or []:
+        prefix = discovery_index(glob, index_prefix) if after_build is not None else None
+        if prefix is None:
+            glob_only.append(glob)
+        elif prefix not in indexes:
+            indexes.append(prefix)
+    for prefix in indexes:
         fresh.extend(
-            runs_from_gcs(
-                pr_globs,
+            runs_from_index(
+                prefix,
                 gsutil,
                 after_build=after_build,
                 since_cutoff=since_cutoff,
@@ -1155,11 +1785,47 @@ def collect(
                 unfinished=unfinished,
             )
         )
+    if glob_only:
+        fresh.extend(
+            runs_from_gcs(
+                glob_only,
+                gsutil,
+                after_build=after_build,
+                since_cutoff=since_cutoff,
+                retry_builds=frozenset(retry),
+                unfinished=unfinished,
+            )
+        )
+    # The nightly periodic, above its own watermark. The shared retry list
+    # is safe to hand over whole: a pending id is only re-read where its
+    # source's listing names it, and no id is in both listings.
+    nightly_fresh: list[dict] = []
+    if nightly_prefix:
+        listed_before = set(unfinished)
+        nightly_fresh = runs_from_periodic(
+            nightly_prefix,
+            gsutil,
+            after_build=nightly_after,
+            since_cutoff=since_cutoff,
+            retry_builds=frozenset(retry),
+            unfinished=unfinished,
+            job=nightly_job,
+        )
+        nightly_pending |= unfinished - listed_before
+        fresh.extend(nightly_fresh)
     if merge_with is not None:
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
-            f" collected (GCS scan resumed above build {after_build},"
-            f" retrying {len(retry)} pending)",
+            f" collected (GCS scan resumed above build {after_build}"
+            f" via {'the directory index' if indexes else 'the build-dir glob'},"
+            f" retrying {len(retry)} pending"
+            + (
+                f"; nightly scan resumed above build {nightly_after},"
+                f" {len(nightly_fresh)} new"
+                if nightly_prefix
+                else ""
+            )
+            + ")",
             file=sys.stderr,
         )
     runs = merge_runs(prior, fresh)
@@ -1188,7 +1854,11 @@ def collect(
     }
     if pending:
         data["pending_builds"] = [
-            {"build_id": build_id, "first_seen": pending[build_id]}
+            {
+                "build_id": build_id,
+                "first_seen": pending[build_id],
+                **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {}),
+            }
             for build_id in sorted(pending, key=int)
         ]
     if stale_after_s is not None:
@@ -1236,7 +1906,39 @@ def main(argv: list[str] | None = None) -> int:
         metavar="GS_GLOB",
         help="gsutil glob of Prow build dirs, e.g. gs://kube-agents-prow/"
         "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*"
-        " (repeatable)",
+        " (repeatable). Discovers builds only for a cold sweep (no watermark"
+        " from --merge-with); with a watermark, --index-prefix is listed"
+        " instead",
+    )
+    parser.add_argument(
+        "--index-prefix",
+        default=None,
+        metavar="GS_PREFIX",
+        help="Prow's per-job directory index (one <build_id>.txt pointer per"
+        " build), listed once to find the builds above the watermark instead"
+        " of walking every PR directory. Default: derived from each --pr-glob"
+        " as gs://<bucket>/pr-logs/directory/<job>/. Pass an empty string to"
+        " disable it and list the glob even with a watermark",
+    )
+    parser.add_argument(
+        "--nightly-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the nightly periodic from this Prow log prefix"
+        " (gs://<bucket>/logs/<job>/, one directory per build; for a periodic"
+        " the prefix is its own directory index). Given without a value:"
+        f" {DEFAULT_NIGHTLY_PREFIX}. Omitted: no nightly scan. Its runs carry"
+        " tier=nightly, pr=null, and their own incremental watermark",
+    )
+    parser.add_argument(
+        "--nightly-job",
+        default=None,
+        metavar="NAME",
+        help="the job name recorded on nightly runs (runs[].job); default: the"
+        f" last path segment of --nightly-prefix (i.e. {DEFAULT_NIGHTLY_JOB}"
+        " for the default prefix)",
     )
     parser.add_argument(
         "--from-dir",
@@ -1316,12 +2018,13 @@ def main(argv: list[str] | None = None) -> int:
         not args.pr_glob
         and args.from_dir is None
         and args.merge_with is None
+        and args.nightly_prefix is None
         and not args.rc_glob
         and args.rc_from_dir is None
     ):
         parser.error(
-            "nothing to collect: pass --pr-glob, --from-dir, --rc-glob,"
-            " --rc-from-dir and/or --merge-with"
+            "nothing to collect: pass --pr-glob, --nightly-prefix, --from-dir,"
+            " --rc-glob, --rc-from-dir and/or --merge-with"
         )
     if args.rc_limit < 1:
         parser.error("--rc-limit must be at least 1")
@@ -1335,13 +2038,18 @@ def main(argv: list[str] | None = None) -> int:
         merge_with=args.merge_with,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
+        index_prefix=args.index_prefix,
+        nightly_prefix=args.nightly_prefix,
+        nightly_job=args.nightly_job,
         rc_globs=args.rc_glob,
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
+    nightly = len(tiers.nightly_runs(data["runs"]))
     print(
-        f"wrote {args.out}: {len(data['runs'])} runs, {len(data['cases'])} cases,"
+        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly} presubmit,"
+        f" {nightly} nightly), {len(data['cases'])} cases,"
         f" {len(data.get('releases') or [])} releases,"
         f" {data['coverage']['domains_covered']}/{data['coverage']['domains_total']}"
         " domains covered",

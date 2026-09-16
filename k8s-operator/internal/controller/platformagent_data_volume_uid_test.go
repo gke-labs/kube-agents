@@ -87,6 +87,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	gatewayDeployment := buildDeployment(agent, "c", "f", "s", "p", nil, opts)
 	credentialProxy := buildCredentialProxyDeployment(agent, "p")
 	a2aGateway := buildA2AGatewayDeployment(agent)
+	a2aCallout := buildA2ACalloutDeployment(agent)
 	gatewayStatefulSet := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
 	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
 	nats := buildA2ANATSStatefulSet(agent, "c")
@@ -96,6 +97,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildDeployment", gatewayDeployment.Name, gatewayDeployment.Spec.Template.Spec},
 		{"buildCredentialProxyDeployment", credentialProxy.Name, credentialProxy.Spec.Template.Spec},
 		{"buildA2AGatewayDeployment", a2aGateway.Name, a2aGateway.Spec.Template.Spec},
+		{"buildA2ACalloutDeployment", a2aCallout.Name, a2aCallout.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
 	}
 	for builder, statefulSet := range map[string]*appsv1.StatefulSet{
@@ -326,56 +328,11 @@ var podBearingKinds = map[string]bool{
 // anywhere else in k8s-operator/ today, and one built outside it would need
 // this assertion widened along with the walk.
 func TestTheWalkCallsEveryPodBearingBuilder(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("reading the package directory: %v", err)
-	}
-
-	fset := token.NewFileSet()
-	builders := map[string]string{}
-	var walk *ast.FuncDecl
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parsing %s: %v", name, err)
-		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Recv != nil {
-				continue
-			}
-			if strings.HasSuffix(name, "_test.go") {
-				if fn.Name.Name == dataVolumeWalkFunc {
-					walk = fn
-				}
-				continue
-			}
-			if kind := podBearingResultKind(fn); kind != "" {
-				builders[fn.Name.Name] = kind
-			}
-		}
-	}
-
-	if walk == nil {
-		t.Fatalf("%s not found in this package; the assertion below has nothing to check", dataVolumeWalkFunc)
-	}
+	builders := buildersReturning(t, podBearingKinds)
 	if len(builders) == 0 {
 		t.Fatal("no pod-bearing builder found in this package, so this assertion passed vacuously")
 	}
-
-	called := map[string]bool{}
-	ast.Inspect(walk, func(node ast.Node) bool {
-		if call, ok := node.(*ast.CallExpr); ok {
-			if ident, ok := call.Fun.(*ast.Ident); ok {
-				called[ident.Name] = true
-			}
-		}
-		return true
-	})
+	called := identifiersMentionedIn(t, dataVolumeWalkFunc)
 
 	names := make([]string, 0, len(builders))
 	for builder := range builders {
@@ -390,10 +347,10 @@ func TestTheWalkCallsEveryPodBearingBuilder(t *testing.T) {
 	}
 }
 
-// podBearingResultKind names the workload kind a function returns, or "" for a
-// function that returns none. Every result is considered, so a builder that
-// returns an error alongside its object still counts.
-func podBearingResultKind(fn *ast.FuncDecl) string {
+// builderResultKind names which of kinds a function returns a pointer to, or ""
+// for a function that returns none. Every result is considered, so a builder
+// that returns an error alongside its object still counts.
+func builderResultKind(fn *ast.FuncDecl, kinds map[string]bool) string {
 	if fn.Type.Results == nil {
 		return ""
 	}
@@ -406,9 +363,94 @@ func podBearingResultKind(fn *ast.FuncDecl) string {
 		if !ok {
 			continue
 		}
-		if podBearingKinds[selector.Sel.Name] {
+		if kinds[selector.Sel.Name] {
 			return selector.Sel.Name
 		}
 	}
 	return ""
+}
+
+// buildersReturning reads this package's non-test source and maps every
+// top-level function returning a pointer to one of kinds to the kind it
+// returns. It is how a test asserts over the builders that exist rather than
+// over the builders somebody remembered to list: a builder added later shows up
+// here without anyone editing the test.
+//
+// This directory only. A builder outside it would need the caller widened.
+func buildersReturning(t *testing.T, kinds map[string]bool) map[string]string {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	builders := map[string]string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil {
+				continue
+			}
+			if kind := builderResultKind(fn, kinds); kind != "" {
+				builders[fn.Name.Name] = kind
+			}
+		}
+	}
+	return builders
+}
+
+// identifiersMentionedIn returns every bare identifier appearing in a call
+// position inside the named test-file function. Paired with buildersReturning
+// it answers "does this test reach that builder?" without the test having to
+// name the builders it reaches twice.
+func identifiersMentionedIn(t *testing.T, funcName string) map[string]bool {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	var target *ast.FuncDecl
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if ok && fn.Recv == nil && fn.Name.Name == funcName {
+				target = fn
+			}
+		}
+	}
+	if target == nil {
+		t.Fatalf("%s not found in this package's tests; the assertion has nothing to check", funcName)
+	}
+
+	called := map[string]bool{}
+	ast.Inspect(target, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok {
+				called[ident.Name] = true
+			}
+		}
+		return true
+	})
+	return called
 }

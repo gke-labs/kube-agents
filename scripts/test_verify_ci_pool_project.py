@@ -389,12 +389,25 @@ class SeededFleetFixturesTest(unittest.TestCase):
     def _roles(self) -> int:
         return len(json.loads(checker._FLEET_CATALOG.read_text(encoding="utf-8"))["roles"])
 
+    def _state(self, converged: int, drifted: int = 0, unchecked: int = 0) -> str:
+        """The line hack/fleet-fixture-state.py prints; the third call when the
+        presence pass published at least one role (#1544)."""
+        return (
+            f"Seeded-fleet fixture state: {converged} role(s) in their designed state, "
+            f"{drifted} drifted, {unchecked} not checked (project kube-agents-evals-5)"
+        )
+
     def test_every_role_written_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles()))]
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", self._state(self._roles())),
+            ]
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertTrue(result.passed, result.details)
         self.assertEqual([], result.warnings)
+        self.assertIn("in their designed state", result.message)
 
     def test_project_is_passed_to_the_script(self):
         # FLEET_PROJECT_ID is the only thing pointing the script at the project
@@ -402,11 +415,139 @@ class SeededFleetFixturesTest(unittest.TestCase):
         # ambient environment and verifies whichever project the operator's
         # shell happens to name.
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles()))]
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", self._state(self._roles())),
+            ]
             checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         env = run.call_args_list[1].kwargs["env"]
         self.assertEqual("kube-agents-evals-5", env["FLEET_PROJECT_ID"])
         self.assertTrue(env["BENCH_FLEET_KUBECONFIG_DIR"].startswith("/"))
+        # The state pass reads the directory the presence pass wrote, inside
+        # the same temporary directory, and is told how long it may wait.
+        state_cmd = run.call_args_list[2].args[0]
+        self.assertEqual(str(checker._FLEET_STATE), state_cmd[1])
+        self.assertEqual(env["BENCH_FLEET_KUBECONFIG_DIR"], state_cmd[state_cmd.index("--dir") + 1])
+        self.assertEqual("kube-agents-evals-5", state_cmd[state_cmd.index("--project") + 1])
+        self.assertEqual(str(checker.FLEET_STATE_WAIT_SECONDS), state_cmd[state_cmd.index("--wait") + 1])
+        self.assertGreater(run.call_args_list[2].kwargs["timeout"], checker.FLEET_STATE_WAIT_SECONDS)
+
+    def test_a_drifted_fixture_fails_and_names_the_role(self):
+        # Presence passed -- payments-api's Deployment exists -- and the pod
+        # has never restarted, so no OOMKilled evidence exists: the 2026-09-07
+        # shape (#1278), which every presence probe waved through.
+        stderr = "\n".join([
+            "WARNING: fixture role 'crashloop-workload' is present but not in its designed "
+            "state in kube-agents-evals-5; the cases that depend on it cannot be graded against it: "
+            "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0",
+            self._state(self._roles() - 1, drifted=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", stderr),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed)
+        self.assertIn("not in their designed state", result.message)
+        self.assertTrue(any("crashloop-workload" in d for d in result.details), result.details)
+        self.assertTrue(any("observed 0" in d for d in result.details), result.details)
+
+    def test_a_fixture_whose_state_could_not_be_read_is_unverified(self):
+        stderr = "\n".join([
+            "WARNING: fixture role 'no-pdb-workload' could not be checked in kube-agents-evals-5; "
+            "nothing is known about its state: deployment/checkout-gateway: kubectl get deployment "
+            "failed (1): Unable to connect to the server",
+            self._state(self._roles() - 1, unchecked=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", stderr),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(1, len(result.warnings), result.warnings)
+        self.assertIn("no-pdb-workload", result.warnings[0])
+        self.assertIn("state not checked", result.message)
+
+    def test_the_state_pass_is_skipped_when_presence_already_failed(self):
+        # One finding about the fleet, not two: a fixture that was never
+        # planted has no state to read, and the fail must not depend on a
+        # third call the test never supplies.
+        stderr = "\n".join([
+            "WARNING: deployment/payments-api absent from a.kubeconfig in "
+            "kube-agents-evals-5, so fixture role 'crashloop-workload' was never planted.",
+            self._summary(self._roles() - 1, unplanted=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed)
+        self.assertEqual(2, run.call_count)
+
+    def test_the_state_pass_is_skipped_when_no_role_was_published(self):
+        stderr = "\n".join([
+            f"WARNING: no credentials for seeded cluster seeded-{slot} in kube-agents-evals-5: "
+            f'code=403, message=Required "container.clusters.get" permission(s).'
+            for slot in ("a", "b", "c")
+        ] + [self._summary(0, unresolved=self._roles())])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(2, run.call_count)
+
+    def test_a_state_pass_with_no_summary_is_unverified(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", "something else entirely"),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed)
+        self.assertTrue(any("fleet-fixture-state.py" in w for w in result.warnings), result.warnings)
+
+    def test_a_state_pass_that_timed_out_is_unverified(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (124, "", "timed out after 900s: hack/fleet-fixture-state.py"),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(any("timed out" in w for w in result.warnings), result.warnings)
+
+    def test_a_state_pass_that_refused_the_catalog_fails(self):
+        # Exit 1 without a summary is the script's repository-bug exit: a
+        # malformed `state` entry. That is not weather and must not be excused.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (1, "", "ERROR: fleet fixture catalog fixtures.json: role 'x' state[0] names unknown op 'roughly'"),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed)
+
+    def test_the_state_summary_regex_matches_the_line_the_script_prints(self):
+        # Same standard as the presence line below: render the script's own
+        # format string rather than a hand-written copy of it.
+        import ast
+
+        text = checker._FLEET_STATE.read_text(encoding="utf-8")
+        start = text.index("SUMMARY_FORMAT = (")
+        end = text.index("\n)", start)
+        literal = ast.literal_eval("(" + text[start + len("SUMMARY_FORMAT = ("):end] + ")")
+        rendered = literal.format(converged=7, drifted=0, unchecked=0, project="p")
+        match = checker._FLEET_STATE_SUMMARY.search(rendered)
+        self.assertIsNotNone(match, rendered)
+        self.assertEqual("7", match.group("converged"))
 
     def test_unplanted_fixture_fails_and_names_the_role(self):
         # The clusters are up and labelled; the objects were never created.
@@ -470,9 +611,15 @@ class SeededFleetFixturesTest(unittest.TestCase):
             self._summary(self._roles() - 1, unresolved=1),
         ])
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", stderr),
+                (0, "", self._state(self._roles() - 1)),
+            ]
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertTrue(result.passed, result.details)
+        # The excuse for the unreached cluster survives a clean state pass.
+        self.assertTrue(result.warnings)
 
     def test_unlabelled_fleet_still_fails_though_every_role_is_unresolved(self):
         # The absent/misconfigured fleet, which arrives in the same "unresolved"
@@ -2556,9 +2703,9 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
 
     def test_matches_the_repair_block_on_the_prerequisites_page(self):
         page = (
-            checker._ROOT / "docs" / "site" / "src" / "content" / "docs" / "deploy" / "ci-pool-projects.md"
+            checker._ROOT / "docs" / "ci-pool-projects.md"
         ).read_text()
-        documented = self._loop_roles(page, "deploy/ci-pool-projects.md")
+        documented = self._loop_roles(page, "docs/ci-pool-projects.md")
         self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
 
 

@@ -97,6 +97,13 @@ the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issu
 `bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
 spelled out.
 
+`expected_fail` is the eval-driven-development marker, for a case whose fix is not yours: the
+case lands red so the gap is on record, and `bench-gate` reads it inverted — failing is the
+declared outcome, and passing every repetition reds the job until the marker is flipped. It
+defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
+boolean: `"false"` is a string, and truthy, and the validator rejects it.
+`.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
 
@@ -159,12 +166,14 @@ matched objects, with `op` one of eq/ne/gt/gte/lt/lte/exists/absent/contains/mat
 `pod_healthy` (pods matching a selector reach Ready), and `scaling_complete` (a
 deployment's ready replicas land in a range).
 
-Three read what the run produced, from this repository
+Four read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer), `tool_called` (calls in the
-trajectory), and `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published).
+trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
+published), and `worker_commands` (regular expressions over the terminal commands
+the delegated workers ran, read from each card's worker log before the harness
+purges it).
 
 Two limits are worth knowing before choosing one. `tool_called` sees the delegating
 turn's calls only — a delegated worker's calls never reach the trajectory — so it can
@@ -173,17 +182,20 @@ safeguard built on it is blind to the calls it fears; use `resource_property` fo
 And `report_contains` defaults to `scope: final`, the answer the user receives. `full`
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears
-in quoted material.
+in quoted material. `worker_commands` is the complement of the `tool_called` limit: it is
+the one check that sees the route a worker took, but only its terminal commands, never
+its MCP tool calls, and only for cards the run delegated — a router that answered without
+delegating leaves it nothing to read, which is `status: "error"`, not a pass.
 
-All six fail closed. A check that cannot observe its subject returns `status: "error"`,
+All seven fail closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
 1.0, which the gate fails. Silence is not a pass.
 
 ## What actually reds a build
 
-`hack/ci-eval-pr.sh` runs one devops-bench invocation per entry in its task matrix — the
-`TASKS` array, plus `NIGHTLY_TASKS` when the job exports `EVAL_TIER=nightly` — and
-grades the resulting record. For a case that carries a `verification_spec`, three keys
+`hack/ci-eval-pr.sh` runs one devops-bench invocation per entry in its task matrix —
+`hack/eval/presubmit-cases.txt`, plus `hack/eval/nightly-cases.txt` when the job exports
+`EVAL_TIER=nightly` — and grades the resulting record. For a case that carries a `verification_spec`, three keys
 decide the merge:
 
 | Key                        | Gate                           | Meaning                                    |
@@ -222,7 +234,7 @@ anything, and the conservative reading is an unmet objective.
 
 `domain:` is a slug from `docs/designs/domains.yaml`, and it is how coverage is counted.
 `scripts/test_domain_coverage.py` treats a domain as covered when some case claims its
-slug, carries a non-empty spec, and is an active — uncommented — entry in `TASKS`.
+slug, carries a non-empty spec, and is an entry in `hack/eval/presubmit-cases.txt`.
 Everything else is on the allowlist, and the shrinking allowlist is the programme's
 progress metric.
 
@@ -242,7 +254,7 @@ checked" and "nobody remembered".
 
 `hack/ci-eval-pr.sh` falls back to `OutcomeValidity >= 0.7` for a case with no
 `verification_spec`. That fallback is transitional, and the script says so in the comment
-above the branch that implements it: once every entry in `TASKS` carries a spec, it is
+above the branch that implements it: once every presubmit entry carries a spec, it is
 dead code to delete.
 
 Declare the spec as a block, not inline. The script decides whether a case has one by
@@ -260,7 +272,7 @@ took.
 The minimum a case owes is one objective that names something the case itself planted,
 and one safeguard for the thing the case must not do. Both can be written before the
 fixture exists — the `bench/tasks/DRAFTS.md` corpus did exactly that, specs first,
-registered commented-out, activated later. Writing the spec is what surfaces "this case
+parked, activated later. Writing the spec is what surfaces "this case
 cannot fail" while it is still cheap to fix.
 
 Where the exact check genuinely does not exist yet, the escape is the same shape as the
@@ -269,24 +281,39 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 ## Registration
 
-`hack/ci-eval-pr.sh` runs the tasks in its `TASKS` array — plus, when the job exports
-`EVAL_TIER=nightly`, its `NIGHTLY_TASKS` array — and only those. Cases under
-`bench/tasks/` are not discovered. A case registered nowhere never runs, and the suite
-reports green around it — which is how `agent-kanban-smoke`, a case whose whole purpose
-is to smoke the deployed pipeline, sat unregistered while the presubmit ran one case for
-months.
+`hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
+job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and only those.
+Cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
+purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
+case for months.
 
-A commented-out `TASKS` entry counts as registered. That is the intended state for a
-case whose fixture or blocker is not ready: it is written down, it is greppable, and
-activation is uncommenting one line. The alternative — leaving it out entirely — is
-indistinguishable from forgetting. A `NIGHTLY_TASKS` entry counts too, and means more:
-the case runs every night, kept out of the presubmit for cost, because a cheaper probe
-holds its presubmit seat, or because what it grades is not one of the core journeys the
-presubmit gate is for — never out of doubt about the case, which is what the
-commented-out state is for. The core journeys are the `journey:` rows of
-`docs/designs/domains.yaml`; a case that claims no domain there is outside them by
-construction. This paragraph is the one statement of the rule; `bench/CUSTOM-TASKS.md`
-and `docs/designs/testing-strategy.md` restate it and defer here.
+A new case lands in the nightly file (decided 2026-09-15,
+[#1546](https://github.com/gke-labs/kube-agents/issues/1546),
+[#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
+the night it merges, its record accrues in the evidence store, and a presubmit seat is a
+later pull request that moves its line to the presubmit file and cites that record —
+never the pull request that makes it pass. Cases that stay in the nightly for good are
+the ones kept out of the presubmit for cost, because a cheaper probe holds their presubmit
+seat, or because what they grade is not one of the core journeys the presubmit gate is
+for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`, and a case
+that claims no domain there is outside them by construction. A case the agent cannot pass
+yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
+is what the record is for.
+
+The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
+the parking state for a case whose fixture or blocker was not ready, and it was
+indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
+comment, and the validator rejects a case path inside one. The one case that does not go
+in a roster file is one whose fixture does not exist at all: it is a `FIXTURE_NOT_READY`
+entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture, and it
+moves to the nightly file in the pull request that lands the fixture.
+
+Who approves follows the split: an edit to the presubmit file or to
+`hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly
+file and a new case directory need only the normal approvers. This section is the one
+statement of the rule; `bench/CUSTOM-TASKS.md`, `bench/CONTRIBUTING.md` and
+`docs/designs/testing-strategy.md` restate it and defer here.
 
 ## The validator
 
@@ -296,7 +323,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define, a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, and a case that is registered nowhere. It
+as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
+boolean, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
@@ -321,7 +349,7 @@ green. A list of substrings is a second copy of the rule set; keep the assertion
 set.
 
 `make bench-case-check` itself is invoked by no workflow, and that is the intended shape.
-The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` (`Makefile:129`) and
+The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` in the `Makefile` and
 `.github/workflows/python-tests.yml`, so a separate job running the target would re-derive
 findings CI already has, on a second checkout, for nothing. The target is the pre-push
 copy of the gate rather than the gate; a rule that has to be enforced goes in the

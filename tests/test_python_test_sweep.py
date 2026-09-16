@@ -25,10 +25,16 @@ non-zero exit.
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+from _run_make import run_make  # noqa: E402
+
+REPO_ROOT = _HERE.parent
 
 #: A real directory with no test_*.py in it. Discovery there finds nothing and
 #: succeeds, which is the "green" half of each case below at near-zero cost.
@@ -78,20 +84,7 @@ sweep-probe:
 
 
 def _run_make(args):
-    env = dict(os.environ)
-    # This test may itself be running inside the sweep, and an inherited
-    # jobserver or MAKELEVEL would make the nested make behave unlike the one a
-    # developer runs by hand.
-    env.pop("MAKEFLAGS", None)
-    env.pop("MAKELEVEL", None)
-    return subprocess.run(
-        ["make", *args],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=SWEEP_TIMEOUT_SECONDS,
-    )
+    return run_make(args, timeout=SWEEP_TIMEOUT_SECONDS)
 
 
 def sweep(dirs, jobs):

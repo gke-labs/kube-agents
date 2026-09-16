@@ -2,7 +2,7 @@
 """Pre-flight verification for onboarding a GCP project into the CI evaluation pool.
 
 Validates that a project has completed every prerequisite in
-docs/site/src/content/docs/deploy/ci-pool-projects.md before it is registered in
+docs/ci-pool-projects.md before it is registered in
 the Boskos resource pool in gke-internal/test-infra.
 
 Registering a project that has not finished onboarding does not fail only that
@@ -49,6 +49,22 @@ _FLEET_SUMMARY = re.compile(
 # clusters in another project. The 120s ceiling the single gcloud calls use is
 # not enough, and a timeout here reads as a missing fleet.
 FLEET_TIMEOUT_SECONDS = 600
+
+# The second half of the fleet check (#1544): hack/fleet-fixture-state.py reads
+# each published role's `state` assertions out of the catalog and says which
+# fixtures are there but not in the shape the cases depend on. It prints one
+# summary line of its own, parsed the same way as the presence line above.
+_FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
+_FLEET_STATE_SUMMARY = re.compile(
+    r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
+    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked"
+)
+# How long the state pass may wait for a fixture to converge before calling it
+# drifted. An operator usually runs this minutes after `tofu apply`, when the
+# crashloop fixture has been scheduled but not yet restarted, and OOMKilled
+# evidence exists only after its first restart; five minutes covers that on a
+# healthy node without turning an onboarding check into a vigil.
+FLEET_STATE_WAIT_SECONDS = 300
 
 # No gcloud or gh call here should take anywhere near this long. The ceiling
 # exists so a hung call fails the run instead of hanging a CI job forever.
@@ -1426,7 +1442,132 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
         rc, _, err = run_cmd(
             ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
         )
+        presence = _fleet_presence_result(name, project_id, expected, rc, err)
+        match = _FLEET_SUMMARY.search(err)
+        written = int(match.group("written")) if match else 0
+        # A presence verdict that already fails, or one that published no role
+        # at all, is the whole answer: there is nothing whose state could be
+        # read, and a second finding about the same fleet would only blur the
+        # first. Otherwise the state pass runs INSIDE the temporary directory,
+        # because it reads the kubeconfigs the presence pass just wrote.
+        if not presence.passed or not written:
+            return presence
+        rc, _, err = run_cmd(
+            [
+                "python3",
+                str(_FLEET_STATE),
+                "--dir",
+                target,
+                "--project",
+                project_id,
+                "--wait",
+                str(FLEET_STATE_WAIT_SECONDS),
+            ],
+            timeout=FLEET_STATE_WAIT_SECONDS + FLEET_TIMEOUT_SECONDS,
+            env=env,
+        )
+    return _fleet_state_result(name, project_id, expected, presence, rc, err)
 
+
+def _fleet_state_result(
+    name: str, project_id: str, expected: int, presence: CheckResult, rc: int, err: str
+) -> CheckResult:
+    """Fold hack/fleet-fixture-state.py's verdict into the presence result.
+
+    Drift is a finding about the project -- the fixture is there and is not
+    what the cases were written against -- and fails the check with the
+    script's own lines saying which assertion and what it observed. A role the
+    script could not read is unverified, like an unreachable cluster in the
+    presence pass. A script that exited without reporting is unverified if it
+    was refused or timed out and a failure otherwise, because the only other
+    way it exits non-zero is a malformed catalog, which is a repository bug.
+    """
+    match = _FLEET_STATE_SUMMARY.search(err)
+    notes = [line.strip() for line in err.splitlines() if line.startswith(("WARNING:", "ERROR:"))]
+    if not match:
+        last = (err.strip().splitlines() or ["no output"])[-1]
+        if rc != 0:
+            reason = _unread_reason(err)
+            if reason:
+                return CheckResult(
+                    name,
+                    True,
+                    presence.message,
+                    warnings=[
+                        *presence.warnings,
+                        (
+                            f"hack/fleet-fixture-state.py exited {rc} without reading the fixtures, "
+                            f"so nothing is known about their state in {project_id}: {reason}"
+                        ),
+                    ],
+                )
+            return CheckResult(
+                name,
+                False,
+                f"hack/fleet-fixture-state.py exited {rc} without reporting",
+                details=[last],
+            )
+        return CheckResult(
+            name,
+            True,
+            presence.message,
+            warnings=[
+                *presence.warnings,
+                (
+                    "hack/fleet-fixture-state.py printed no summary line, so nothing is known "
+                    f"about the fixtures' state in {project_id}. Last line of its output: {last}"
+                ),
+            ],
+        )
+
+    converged = int(match.group("converged"))
+    drifted = int(match.group("drifted"))
+    unchecked = int(match.group("unchecked"))
+    counts = (
+        f"{converged} role(s) in their designed state, {drifted} drifted, "
+        f"{unchecked} whose state could not be read"
+    )
+    if drifted:
+        return CheckResult(
+            name,
+            False,
+            "Seeded fleet fixtures present but not in their designed state",
+            details=[counts, *notes],
+        )
+    if unchecked:
+        return CheckResult(
+            name,
+            True,
+            f"{unchecked} of {expected} fixture role(s) present, state not checked",
+            warnings=[
+                *presence.warnings,
+                "\n      ".join(
+                    [
+                        (
+                            f"{counts}. Nothing was found out of shape: the reads failed, so "
+                            f"confirm the seeded fleet in {project_id} before registering it."
+                        ),
+                        *notes,
+                    ]
+                ),
+            ],
+        )
+    if presence.warnings:
+        return presence
+    return CheckResult(
+        name, True, f"All {expected} fixture roles planted, reachable and in their designed state"
+    )
+
+
+def _fleet_presence_result(
+    name: str, project_id: str, expected: int, rc: int, err: str
+) -> CheckResult:
+    """The presence half: what hack/fleet-kubeconfigs.sh's summary line says.
+
+    Passes only when every role was written, or when the roles it could not
+    write sit on clusters the script said it could not reach (unverified, with
+    a warning). Every other shape is a finding about the project.
+    """
     match = _FLEET_SUMMARY.search(err)
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
@@ -1888,7 +2029,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             return CheckResult(name, False, "Ledger issues not readable", details=[
                 f"App {LEDGER_APP_ID} cannot see {repo_slug} at all (404). Its installation is "
                 "repository_selection: selected, so add this repository to it -- see section 5.4 "
-                "of deploy/ci-pool-projects.md. (The same 404 covers a repository that does not "
+                "of docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
                 "exist; the check above settles which.)"
             ])
         return CheckResult(name, True, "Not checked", warnings=[

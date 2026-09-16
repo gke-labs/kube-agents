@@ -119,6 +119,46 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    def test_get_previous_ga_tag(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            for tag in ("0.3.0", "0.4.0", "0.5.0", "0.10.0", "rc_0.3.0_validated", "v1.0.0"):
+                git("tag", "-a", tag, "-m", f"Tag {tag}")
+
+            cases = [
+                ("0.5.0", "0.4.0"),
+                ("0.4.0", "0.3.0"),
+                ("0.3.0", ""),
+                # Numeric, not lexical: 0.10.0 outranks 0.5.0.
+                ("1.0.0", "0.10.0"),
+                ("0.6.0", "0.5.0"),
+            ]
+            for version, expected in cases:
+                with self.subTest(version=version):
+                    proc = self._run_common_func(f'get_previous_ga_tag "{version}"', cwd=repo_dir)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.strip(), expected)
+
+            proc = self._run_common_func("get_previous_ga_tag", cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("version is required for get_previous_ga_tag", proc.stderr)
+
+            proc = self._run_common_func('get_previous_ga_tag "v0.5.0"', cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("not a valid pure numeric SemVer", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_get_previous_ga_tag_is_empty_in_a_repo_without_ga_tags(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "-a", "rc_0.3.0_validated", "-m", "RC tag")
+            proc = self._run_common_func('get_previous_ga_tag "0.3.0"', cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "")
+        finally:
+            temp_dir.cleanup()
+
     def test_get_latest_validated_rc_tag(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:

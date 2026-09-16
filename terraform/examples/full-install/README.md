@@ -25,8 +25,9 @@ install without the interview.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
   module): a service account (`kubeagents-platform-gsa` by default; a second
   install in the same project sets `agent_service_account_id` — see
-  [Remote state](#remote-state)), its read-only project roles, and the Workload Identity
-  binding to the `kubeagents-platform-agent` KSA (see
+  [Remote state](#remote-state)), its read-only project roles, and the Workload
+  Identity binding to the agent KSA (`agent_ksa_name`,
+  `kubeagents-platform-agent` by default; see
   [IAM roles](#iam-roles-permission_set-and-project_roles) below).
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
@@ -163,12 +164,28 @@ so do the CMEK key ring and key names (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`,
 `guard_kms_identity`): on a cluster this state created, a renamed key would be
 destroyed and recreated, which schedules the live key's versions for destruction.
 A key is rotated in Cloud KMS, not by renaming it here.
-And a distinct name un-collides creation, not identity: the Workload
-Identity principal names a namespace and KSA project-wide, no cluster, so
-both installs bind the same principal and each agent can mint the other's
-GSA tokens. The `agent_service_account_id` description in `variables.tf`
-carries the limits to read before relying on this. Versioning is the
-recovery story:
+And a distinct GSA name un-collides creation, not identity: the Workload
+Identity principal names a namespace and KSA project-wide, no cluster, so two
+installs that share the namespace and the default KSA name bind the same
+principal and each agent can mint the other's GSA tokens however differently
+the GSAs are named. The second install names its own `agent_ksa_name` too. One
+variable feeds both the module's binding and the chart's `serviceAccountName`,
+so the pod and the binding move together, and it must end in `-agent`: the
+`kube-agents-agent-binding-scope` admission policy the chart ships selects the
+bindings it governs by that suffix on the bound ServiceAccount, so a name
+outside it would leave this install's agent bindings unselected by that policy
+and by any validation it gains. The validation in `variables.tf` refuses the
+plan instead, and the variable's description says what the policy does and does
+not deny today. `agent_ksa_name` has no `install.env` key of its own yet, so
+through the front doors it is a `TF_VAR_agent_ksa_name=...` line in that file:
+every front door sources it with `set -a`, and the generator never writes
+`agent_ksa_name` into `terraform.tfvars`, so the passthrough is what Terraform
+reads. The caution above applies to it with one gap — a lost line resolves the
+KSA back to the default and re-shares the identity silently, and there is no
+`guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
+GSA's destroy-and-recreate. The `agent_service_account_id` description in
+`variables.tf` carries the limits to read before relying on any of this.
+Versioning is the recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
 generations; `gcloud storage restore` is for soft-deleted objects, which is a
@@ -334,6 +351,18 @@ neither means what it looks like:
   longer manages them, so `lifecycle.sh apply` forgets them from state
   (`forget_unmanaged_cluster_kms`) rather than let the apply schedule the key's
   versions for destruction under the live cluster.
+
+### Applying over a Pub/Sub topic that already exists
+
+`lifecycle.sh apply` adopts a pre-existing Google Chat Pub/Sub topic and
+subscription rather than failing with `Error 409: Resource already exists`, the
+way it already adopts KMS key rings (`adopt_pubsub`, beside `adopt_kms`).
+Configuring the Chat app in the Cloud console creates the topic before the
+installer runs, so this is reachable on a first install, not only on a
+re-apply. Every Pub/Sub IAM binding in the
+[`chat-pubsub`](../../modules/chat-pubsub/main.tf) module is keyed on its
+parent's `.id`, never its `.name`, so a replaced topic takes its bindings into
+the plan with it instead of leaving a green apply over an empty policy.
 
 ### The `image_tag` rule
 
@@ -533,7 +562,10 @@ uninstall its standalone release before setting these variables (`helm uninstall
   select Cloud Pub/Sub and enter the created topic (the `chat_topic_name`
   output, as `projects/<project>/topics/<topic>`), set visibility, and verify
   a **Service account email** appears under Connection settings after saving
-  (if it stays blank, Chat silently delivers no events). Then DM the bot; on
+  (if it stays blank, Chat silently delivers no events). That address is the
+  Workspace Add-ons service agent,
+  `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
+  the agent's own GSA. Then DM the bot; on
   first contact, optionally approve the pairing code via
   `hermes pairing approve google_chat <CODE>` in the gateway pod.
 - **Slack:** in the Slack app console enable Socket Mode and grant the bot

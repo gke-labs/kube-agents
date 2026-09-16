@@ -37,6 +37,10 @@ _CONFIG_ENV_VAR = "KUBE_AGENTS_REDACTION_CONFIG"
 _SALT_ENV_VAR = "SESSION_KV_SALT"
 _CONFIGMAP_KEYS = ("redaction.yaml", "redactor.py", "litellm_redaction_callback.py")
 _MOUNT_DIR = "/app"
+# The ConfigMap volume. The container also mounts an emptyDir scratch
+# directory that carries no subPath, so mounts are read by volume, not by
+# position (tests/test_workload_security_context.py owns that volume).
+_CONFIG_VOLUME = "config-volume"
 _HELM_BASE_ARGS = [
     "helm",
     "template",
@@ -81,6 +85,15 @@ def _stub_litellm() -> None:
     sys.modules.setdefault("litellm", package)
     sys.modules.setdefault("litellm.integrations", integrations)
     sys.modules.setdefault("litellm.integrations.custom_logger", custom_logger)
+
+
+def _configmap_mounts(container: dict) -> dict:
+    """subPath -> mountPath for the container's mounts of the ConfigMap volume."""
+    return {
+        m["subPath"]: m["mountPath"]
+        for m in container["volumeMounts"]
+        if m["name"] == _CONFIG_VOLUME
+    }
 
 
 def _load_callback_module(config: dict):
@@ -272,7 +285,7 @@ class TestChartRender(unittest.TestCase):
         self.assertEqual(sorted(configmap["data"]), ["config.yaml"])
         self.assertNotIn(_CALLBACK_INSTANCE, configmap["data"]["config.yaml"])
         container = deployment["spec"]["template"]["spec"]["containers"][0]
-        self.assertEqual([m["subPath"] for m in container["volumeMounts"]], ["config.yaml"])
+        self.assertEqual(list(_configmap_mounts(container)), ["config.yaml"])
         env_names = [e["name"] for e in container["env"]]
         self.assertNotIn(_CONFIG_ENV_VAR, env_names)
         self.assertNotIn(_SALT_ENV_VAR, env_names)
@@ -291,7 +304,7 @@ class TestChartRender(unittest.TestCase):
         self.assertEqual(settings["callbacks"], ["prometheus", _CALLBACK_INSTANCE])
 
         container = deployment["spec"]["template"]["spec"]["containers"][0]
-        mounts = {m["subPath"]: m["mountPath"] for m in container["volumeMounts"]}
+        mounts = _configmap_mounts(container)
         for key in ("config.yaml",) + _CONFIGMAP_KEYS:
             self.assertEqual(mounts.get(key), f"{_MOUNT_DIR}/{key}")
         env = {e["name"]: e for e in container["env"]}

@@ -36,14 +36,13 @@ CONFIG = {
         "defaults": ["repository-owners"],
         "groups": {
             "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder"],
-            "waw-leads": ["fatoshoti", "mateuszklinowski", "mplakhtiy"],
+            "eval-crew": ["jayantid", "lapis2002"],
         },
     },
     "files": {
         "**": ["repository-owners"],
-        "k8s-operator/**": ["waw-leads"],
-        ".github/workflows/k8s-operator-test.yml": ["waw-leads"],
-        ".github/workflows/staging-deploy.yml": ["waw-leads"],
+        "hack/eval/presubmit-cases.txt": ["eval-crew"],
+        "hack/eval/blocking-roster.txt": ["eval-crew"],
     },
     "options": {
         "ignore_draft": True,
@@ -55,7 +54,8 @@ CONFIG = {
 }
 
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
-WAW = CONFIG["reviewers"]["groups"]["waw-leads"]
+EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
+LIVE_CONFIG = _HERE.parent / rr.DEFAULT_CONFIG_PATH
 
 
 def pull_request(**overrides):
@@ -129,8 +129,8 @@ class GlobTest(unittest.TestCase):
         self.assert_matches("**", "docs/site/src/content/docs/contributing.md")
 
     def test_double_star_does_not_match_a_dot_segment(self):
-        # The dotfile rule, and the reason `.github/workflows/...` needs its own
-        # literal entries in the config: `**` does not reach them.
+        # The dotfile rule: `**` does not reach `.github/workflows/...`, so a
+        # dotfile path is routed only by a literal entry or by the defaults.
         self.assert_no_match("**", ".github/workflows/validate.yml")
         self.assert_no_match("**", ".gitignore")
         self.assert_no_match("k8s-operator/**", "k8s-operator/.golangci.yml")
@@ -167,6 +167,15 @@ class ConfigValidationTest(unittest.TestCase):
     def test_the_live_config_is_accepted(self):
         rr.validate_config(CONFIG)
 
+    def test_the_fixture_is_the_live_config(self):
+        # The docstring above promises the fixture mirrors the file, order
+        # included. Nothing else would notice the two drifting apart. Dict
+        # equality is order-blind, so the glob order is compared on its own:
+        # it is the input `last_files_match_only` decides on.
+        live = rr.load_config(LIVE_CONFIG)
+        self.assertEqual(live, CONFIG)
+        self.assertEqual(list(live["files"]), list(CONFIG["files"]))
+
     def test_per_author_is_refused(self):
         config = {"reviewers": {"per_author": {"alice": ["bob"]}}}
         with self.assertRaises(ValueError) as caught:
@@ -193,23 +202,64 @@ class SelectionTest(unittest.TestCase):
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md"], "author")
         self.assertEqual(matched, OWNERS)
 
-    def test_last_matching_glob_wins(self):
-        # Both `**` and `k8s-operator/**` match, and the later entry replaces
-        # the earlier one rather than adding to it.
-        matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "k8s-operator/main.go"], "author")
-        self.assertEqual(matched, WAW)
-
     def test_a_literal_dot_entry_still_matches(self):
-        matched = rr.reviewers_by_changed_files(
-            CONFIG, [".github/workflows/k8s-operator-test.yml"], "author"
-        )
-        self.assertEqual(matched, WAW)
+        # The live config names no dotfile path today, but the port has to
+        # honour a literal entry when one exists: `**` cannot stand in for it.
+        config = dict(CONFIG, files={**CONFIG["files"], ".github/workflows/validate.yml": ["eval-crew"]})
+        matched = rr.reviewers_by_changed_files(config, [".github/workflows/validate.yml"], "author")
+        self.assertEqual(matched, EVAL_CREW)
 
     def test_dotfile_only_change_matches_no_glob_and_uses_defaults(self):
         # `**` cannot reach `.github/workflows/validate.yml`, so nothing matches
         # and the defaults carry it.
         self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [".github/workflows/validate.yml"], "author"), [])
         self.assertEqual(self.select([".github/workflows/validate.yml"])[0] in OWNERS, True)
+
+    def test_a_presubmit_roster_change_goes_to_eval_crew(self):
+        # Only eval-crew can /approve hack/eval/presubmit-cases.txt and
+        # blocking-roster.txt (hack/OWNERS, no_parent_owners), so a random root
+        # owner would review a pull request they cannot clear, and nothing
+        # would tell eval-crew it exists.
+        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), EVAL_CREW)
+                self.assertIn(self.select([path])[0], EVAL_CREW)
+
+    def test_the_nightly_file_a_case_and_the_script_stay_with_root(self):
+        # Decision A (#1546, 2026-09-15): the nightly file, a new case directory
+        # and ci-eval-pr.sh itself fall through to the root OWNERS, so they
+        # route to the default reviewers like any other change.
+        for path in ("hack/eval/nightly-cases.txt", "bench/tasks/new-case/task.yaml", "hack/ci-eval-pr.sh", "hack/ci-deploy.sh"):
+            with self.subTest(path=path):
+                self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), OWNERS)
+
+    def test_a_mixed_change_still_goes_to_eval_crew(self):
+        # Last match wins, and eval-crew is listed last: the reviewer who can
+        # clear the roster half is asked. Not every member is a root owner, so
+        # the README half may still wait on a root approver's /approve; the
+        # alternative, a random root owner who cannot clear the roster at all,
+        # is the gap this entry closes.
+        matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "hack/eval/presubmit-cases.txt"], "author")
+        self.assertEqual(matched, EVAL_CREW)
+
+    def test_eval_crews_own_roster_change_goes_to_the_other_member(self):
+        # The author is never requested, so a member's own roster change goes
+        # to the rest of the group; the author's approved is already on it (#1075).
+        author = EVAL_CREW[0]
+        matched = rr.reviewers_by_changed_files(CONFIG, ["hack/eval/blocking-roster.txt"], author)
+        self.assertEqual(matched, [name for name in EVAL_CREW if name != author])
+        self.assertEqual(self.select(["hack/eval/blocking-roster.txt"], author=author), matched)
+
+    def test_a_roster_change_by_the_whole_group_falls_back_to_the_defaults(self):
+        # Only the author is excluded, so this needs a one-member group: the
+        # shape the config had before lapis2002 joined, and the shape it has
+        # again if the alias ever shrinks. The defaults carry it to a root
+        # owner, whose review sets lgtm.
+        config = dict(CONFIG, reviewers=dict(CONFIG["reviewers"], groups=dict(CONFIG["reviewers"]["groups"], **{"eval-crew": ["jayantid"]})))
+        self.assertEqual(rr.reviewers_by_changed_files(config, ["hack/eval/presubmit-cases.txt"], "jayantid"), [])
+        picked = rr.select_reviewers(config, ["hack/eval/presubmit-cases.txt"], "jayantid", rng=random.Random(0))
+        self.assertEqual(len(picked), 1)
+        self.assertIn(picked[0], [name for name in OWNERS if name != "jayantid"])
 
     def test_the_author_is_never_requested(self):
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md"], "bradhoekstra")
@@ -228,8 +278,8 @@ class SelectionTest(unittest.TestCase):
 
     def test_fewer_candidates_than_requested_is_not_an_error(self):
         config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=5))
-        picked = rr.select_reviewers(config, ["k8s-operator/main.go"], "author", rng=random.Random(0))
-        self.assertCountEqual(picked, WAW)
+        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0))
+        self.assertCountEqual(picked, OWNERS)
 
     def test_teams_are_split_from_users(self):
         users, teams = rr.split_teams(["bradhoekstra", "team:sre"])

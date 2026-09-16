@@ -32,6 +32,7 @@ _CALL_SITES = (
     "check_go_directive deploy/docker/Dockerfile GOLANG_VERSION",
     "check_go_directive k8s-operator/Dockerfile GOLANG_VERSION",
     "check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod",
+    "check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod",
 )
 
 # What the check requires of the builder stage besides the ARG default, and

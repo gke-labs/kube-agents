@@ -367,7 +367,7 @@ STALE_PROMPTS=""
 while IFS= read -r HIT; do
   [ -n "$HIT" ] || continue
   QUOTED=$(printf '%s\n' "$HIT" | grep -oE 'Read the SOP at .*so a read that stops early' || true)
-  # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
+  # shellcheck disable=SC2086 # CRON_JOBS is a deliberate word-split list.
   if [ -z "$QUOTED" ] || ! grep -qF "$QUOTED" $CRON_JOBS; then
     STALE_PROMPTS="${STALE_PROMPTS}${HIT}
 "

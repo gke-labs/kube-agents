@@ -17,7 +17,7 @@ concern; the `gh` snippets are reference examples, not requirements.
 
 Read this alongside the root [`AGENTS.md`](../../AGENTS.md) (PR hygiene, the
 `kube-agents-bot` review contract, local validation) and
-[`docs/contributing.md`](../../docs/contributing.md) (the CLA). This document
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md) (the CLA). This document
 does not restate them - it only adds the agent-to-agent loop. Root `AGENTS.md`
 is written for an agent working **with** a human user - its "work the findings
 with the user" and "ask the user before acting" clauses assume one is in the
@@ -101,7 +101,7 @@ silently stall:
 
 1. Apply the `needs-human` label.
 2. Comment, `@mention`ing the relevant maintainer: read `OWNERS` for the
-   approver, and expand a group alias (e.g. `waw-leads`) through
+   approver, and expand a group alias (e.g. `eval-crew`) through
    `OWNERS_ALIASES` to the accounts a mention actually reaches. State what
    blocks you, what would unblock you, and who can unblock it.
 

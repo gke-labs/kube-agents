@@ -32,8 +32,9 @@ type Mode string
 const (
 	// ModeToday is the current architecture — what a normal install runs.
 	ModeToday Mode = "today"
-	// ModeNext additionally renders the NATS and A2A gateway components,
-	// which are otherwise dark.
+	// ModeNext additionally renders the A2A stack, which is otherwise
+	// dark: NATS, the auth callout that authenticates every client to it,
+	// the gateway, and the provisioning Job.
 	ModeNext Mode = "next"
 )
 

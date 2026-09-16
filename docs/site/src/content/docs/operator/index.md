@@ -18,7 +18,6 @@ k8s-operator/
 ├── config/                 # Kustomize base for the operator + integrations
 ├── internal/               # controller reconciler + admission webhook logic
 ├── examples/               # sample PlatformAgent CR
-├── testing/staging_workloads/  # multi-cluster staging PoC
 ├── Dockerfile              # controller manager image
 └── Makefile                # generate, build, test, deploy
 ```
@@ -41,7 +40,7 @@ The controller reconciles a `PlatformAgent` into:
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and GitHub (GitOps repo, with the GitHub Token Minter endpoint injected as an env var).
-- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the A2A gateway) — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
+- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the auth callout, the A2A gateway) — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
@@ -97,9 +96,8 @@ on any other port is unreachable until someone adds a VPC firewall rule for it �
 hand. Serving on 10250 lands inside the rule GKE already made. It does not collide with the kubelet,
 which binds 10250 on the node IP in a different network namespace.
 
-The port is set in three places that must agree, and `TestWebhookPortsMatchDefault` fails the build
-if they drift: the `--webhook-port` flag default (`DefaultPort` in
-`internal/webhook/platformagent_webhook.go`), the manager `containerPort`, and the Service
+The port is set in three places that must agree, and a test under `make test` fails if they drift: the
+`--webhook-port` flag default in the webhook package, the manager `containerPort`, and the Service
 `targetPort`. The Service `port` stays `443` regardless — that is what the `*WebhookConfiguration`
 `clientConfig` resolves to, not what crosses the network.
 
@@ -134,8 +132,8 @@ All three have to move together, so the override is a Kustomize patch rather tha
       value: 8443
 ```
 
-Changing the compiled-in default instead of patching means editing `DefaultPort` as well —
-`TestWebhookPortsMatchDefault` reads both manifests and fails the build if either still names the old
+Changing the compiled-in default instead of patching means changing the flag default in the webhook
+package as well — the test reads both manifests and fails if either still names the old
 port. `--webhook-port` rejects anything outside 1–65535 at startup rather than letting
 controller-runtime fall back to its own 9443 default.
 
@@ -144,7 +142,7 @@ controller-runtime fall back to its own 9443 default.
 Re-apply the manifests; do not bump the image alone. `targetPort` lives in the Service, so a
 `kubectl set image` — or any pipeline that rolls the tag without re-applying `config/webhook/` —
 leaves the Service pointing at 9443 while the new pod listens on 10250, which is the wedge described
-below on what looked like a routine version bump. `make deploy IMG=$IMG` applies both.
+below. `make deploy IMG=$IMG` applies both.
 
 Applying both together still leaves a short window: the Service starts sending traffic to 10250 the
 moment it is applied, and the old pod does not answer there. Any `PlatformAgent` write in the gap
@@ -170,8 +168,8 @@ That leaves the cluster with the same validation coverage a chart install has. R
 The webhook port above is one instance of a general skew: `make deploy` ships the ClusterRole with
 the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
 is upgraded on its next pod reschedule while the applied ClusterRole stays put, and the first verb
-the newer controller needs that the older role lacks fails every reconcile with `forbidden`
-(issue #1009). Two things say so.
+the newer controller needs that the older role lacks fails every reconcile with `forbidden`.
+Two things say so.
 
 `make deploy` refuses an `IMG` whose tag is `latest`, `main`, `master`, `HEAD`, `dev`, or missing,
 unless `ALLOW_MUTABLE_IMG=1` is set for a cluster that will be thrown away before its next
@@ -193,5 +191,5 @@ minutes.
 
 - [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — reference for `PlatformAgent` custom resource.
 - [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) — reference for `AgentPlugin` custom resource.
-- [Development](/kube-agents/operator/development/) — build, test, and run the operator locally.
+- [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) — build, test, and run the operator locally.
 - [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md) — the installer helper scripts (`install.env` loader, tfvars generator), at the repository root rather than under `k8s-operator/`.

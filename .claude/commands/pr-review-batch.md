@@ -107,9 +107,10 @@ appear, re-run the same query with `--jq '…| last | .body'` and read it before
 front of me — one more call, on the rare PR that needs it. An unanchored High is a live finding on
 the pull request, and it must not vanish between the review and the evidence I am shown.
 
-Note the width too. The footer reads `_This was a strict pass: only what I am certain of…_` or
-`_This was a wider pass: as well as what I am certain of…_`. A strict-pass clean covers less ground
-than a wide-pass clean, and I may want the difference.
+Note the width too. The footer reads `_This was a strict pass: what I am certain of, plus any
+high-severity finding just under that bar…_` or `_This was a wider pass: as well as what I am
+certain of…_`. A strict-pass clean covers less ground than a wide-pass clean, and I may want the
+difference.
 
 **Current.** Either the review's commit is the head, or everything after it is a merge **from the
 base branch**. Merging the base branch in is not new work to review — this is the API-only twin of

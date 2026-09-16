@@ -1,0 +1,49 @@
+{
+ "pod": {
+  "metadata": {
+   "name": "d2959c4b-33d5-4f25-89ad-8f2337d2c8fc",
+   "namespace": "test-pods",
+   "creationTimestamp": "2026-09-11T12:10:56Z"
+  },
+  "spec": {
+   "nodeName": "gke-kube-agents-prow-default-pool-eb220b2a-sgnk"
+  },
+  "status": {
+   "phase": "Failed",
+   "startTime": "2026-09-11T12:10:56Z",
+   "containerStatuses": [
+    {
+     "name": "sidecar",
+     "state": {
+      "running": {
+       "startedAt": "2026-09-11T12:11:06Z"
+      }
+     },
+     "ready": true
+    },
+    {
+     "name": "test",
+     "state": {
+      "running": {
+       "startedAt": "2026-09-11T12:11:06Z"
+      }
+     },
+     "ready": true
+    }
+   ]
+  }
+ },
+ "events": [
+  {
+   "reason": "NodeNotReady",
+   "message": "Node is not ready",
+   "type": "Warning",
+   "firstTimestamp": "2026-09-11T14:17:18Z",
+   "lastTimestamp": "2026-09-11T14:17:18Z",
+   "count": 1,
+   "source": {
+    "component": "node-controller"
+   }
+  }
+ ]
+}

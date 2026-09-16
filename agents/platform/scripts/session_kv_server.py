@@ -1102,6 +1102,17 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     the delegation to that persona is what makes the citation unresolvable for
     the agent being asked to obey it.
 
+    The **Done when** line is the card's acceptance criterion, stated apart from
+    the template on purpose. `_build_agent_query` rule 4 keeps triage cards out
+    of goal mode; this line is the fallback if one is graded anyway. Hermes's
+    `judge_goal` grades the worker's `summary` (falling back to `result`)
+    against title + body, so the line asks for the three facts in `summary`
+    too: a body that says what done means, answered by a summary that states
+    it, can be satisfied where a body that only says what the report looks like
+    cannot (#656). It is deliberately not a ``##`` heading, for the
+    three-section rule above, and it sits outside the ``## What to do`` → 🔗
+    span that the bench delivery contract slices.
+
     The report ends by inviting the reader to reply ``apply``, and something
     honours it. The agent that acts on such a reply reads the report back from
     the ``incidents`` table through the ``incident_context`` plugin, and the row
@@ -1171,6 +1182,11 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where the "
         f"alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` delivers "
         f"one line to the person waiting for the diagnosis.\n\n"
+        f"**Done when:** the root cause is named with the evidence that proves it; at least one GitOps remediation option is proposed, "
+        f"or the report says explicitly that no manifest change is warranted and why; and the whole report is recorded with `kanban_complete`. "
+        f"Nothing else is a condition of finishing. The shape below is how to present that work, not a fourth requirement: "
+        f"once you have those three things, complete the card — never `kanban_block` over formatting. "
+        f"State those three things in `summary`'s one line as well: a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list.\n\n"
@@ -1226,6 +1242,16 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
     Nothing about where the answer goes travels through this text. The card the
     front door files inherits the alert's chat route from the session it is
     filed in, so a paraphrase can cost the report's shape but not its address.
+
+    The fourth rule exists because on 2026-08-12 the front door set
+    `goal_mode=true` on its own (card t_0a43cf9c, #656). Nothing asked for it;
+    the tool's default is false. A goal-mode card is graded by Hermes's
+    `judge_goal` against its title and body before `kanban_complete` is allowed
+    through, and this body is a shape rather than a criterion, so the worker's
+    only exit once the judge rejected its report was a sticky `needs_input`
+    block with `result = NULL`. The rule is stated here, where the router reads
+    its instructions, rather than in the persona, because the persona is what
+    the router had when it improvised.
     """
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
@@ -1240,8 +1266,9 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
         f"- `assignee`: the `cluster-*` agent scoped to **{cluster_name}** — take its exact name from your "
         f"`[SPECIALIST AGENTS AVAILABLE NOW]` block, and call `list_agents` once to refresh if none is listed for that cluster.\n"
         f"- `title`: `Triage {namespace}/{object_kind}/{object_name} ({event_reason}) on {cluster_name}`\n"
-        f"- `body`: everything between the two markers below, **copied verbatim**.\n\n"
-        f"Three rules, and they are why this text spells the call out:\n\n"
+        f"- `body`: everything between the two markers below, **copied verbatim**.\n"
+        f"- `goal_mode`: leave it unset (it defaults to false). Rule 4 says why.\n\n"
+        f"Four rules, and they are why this text spells the call out:\n\n"
         f"1. **Copy the body exactly.** Do not summarise it, shorten it, reformat it, or restate it in your own words. "
         f"It carries the report format and the delivery instruction the diagnosis depends on, and on 2026-08-17 a "
         f"paraphrase dropped both.\n"
@@ -1250,7 +1277,11 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
         f"`list_agents` refresh.\n"
         f"3. **Do nothing else.** Do not diagnose the event, do not post anything to chat, and do not file a second card to "
         f"have someone else deliver the answer. Completing the card is the delivery: this one is subscribed to the thread "
-        f"the alert was posted in, and the report reaches the user from there.\n\n"
+        f"the alert was posted in, and the report reaches the user from there.\n"
+        f"4. **Leave `goal_mode` off.** A goal-mode card is graded by an auxiliary judge against its title and body before "
+        f"`kanban_complete` is allowed through, and this body is a presentation template, not a checklist a judge can tick: "
+        f"a worker whose finished report the judge rejects cannot complete the card and has only `kanban_block` left, which "
+        f"parks the report unread for good (#656).\n\n"
         f"--- BEGIN TASK BODY (copy verbatim) ---\n"
         f"{_triage_task_body(payload)}\n"
         f"--- END TASK BODY ---"

@@ -3,13 +3,22 @@
 // sidecar in the platform-agent pod. Design: a2a/docs/hermes-bridge.md.
 //
 // PLAYGROUND POSTURE: this deployment exists to prove the A2A fabric shape.
-// Static bus credentials, a shared bus user, and no queue-staleness guard
-// are the playground, not the product - the auth callout, per-identity
-// users, and the stage-3 dispatcher replace them.
+// A shared bus user and no queue-staleness guard are the playground, not the
+// product; the stage-3 dispatcher replaces the second.
+//
+// The first is now this program's own debt. The auth callout is armed, but
+// main() below sets nats.UserInfo from the environment and has no path that
+// reads a projected ServiceAccount token, so the bridge cannot authenticate
+// through the callout; it is the last workload of its kind still holding a
+// shared password. Note there is nothing waiting for it either: the rendered
+// map has no `agent` principal and deliberately so, so moving the bridge means
+// giving it an identity of its own rather than reaching for one already there.
+// a2a/docs/hermes-bridge.md owns the move.
 package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -22,20 +31,71 @@ import (
 	hermesbridge "github.com/gke-labs/kube-agents/a2a/hermes-bridge"
 )
 
+const (
+	// exitFailure is the exit for anything that went wrong after the
+	// environment was read: bridge init, the run itself.
+	exitFailure = 1
+	// exitUsage is the exit for a missing NATS_URL, the one thing the bridge
+	// cannot default; it is the code the sidecar has always used for it.
+	exitUsage = 2
+
+	// The default* values below are the environment's spelling of the
+	// zero-value defaults hermesbridge.Config applies in defaults()
+	// (a2a/hermes-bridge/bridge.go); the two must agree, because a variable
+	// left unset and one set to its default have to configure the same
+	// bridge. defaultConcurrency and defaultTaskDeadlineSeconds are the
+	// platform profile's concurrency and activeDeadlineSeconds in
+	// docs/designs/spec-subagent-profiles.md, which is where the numbers
+	// come from.
+	defaultProfile             = "platform"
+	defaultConcurrency         = 2
+	defaultTaskDeadlineSeconds = 7200
+	defaultKillGraceSeconds    = 10
+	defaultKVBucket            = "runtime-state"
+)
+
+// errUsage is what realMain returns when NATS_URL is missing, so run can
+// keep the usage exit code distinct from every other failure.
+var errUsage = errors.New("NATS_URL is required")
+
 func main() {
+	os.Exit(run())
+}
+
+// run owns the process logger, the signal context and the exit code.
+// Everything that can fail is in realMain, which returns the error instead
+// of exiting so a test can drive it to each failure.
+func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	if err := realMain(ctx, log); err != nil {
+		if errors.Is(err, errUsage) {
+			return exitUsage
+		}
+		return exitFailure
+	}
+	return 0
+}
+
+// realMain is the bridge from environment to shutdown. Every failure is
+// logged where it is found and then returned; a missing NATS_URL returns
+// errUsage before anything is dialed.
+func realMain(ctx context.Context, log *slog.Logger) error {
 	url := os.Getenv("NATS_URL")
 	if url == "" {
 		log.Error("NATS_URL is required")
-		os.Exit(2)
+		return errUsage
 	}
 	cfg := hermesbridge.Config{
 		NATSURL:      url,
-		Profile:      envOr("BRIDGE_PROFILE", "platform"),
-		Concurrency:  envInt(log, "BRIDGE_CONCURRENCY", 2),
-		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", 7200)) * time.Second,
-		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", 10)) * time.Second,
-		KVBucket:     envOr("BRIDGE_KV_BUCKET", "runtime-state"),
+		Profile:      envOr("BRIDGE_PROFILE", defaultProfile),
+		Concurrency:  envInt(log, "BRIDGE_CONCURRENCY", defaultConcurrency),
+		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
+		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
+		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
 		Logger:       log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
@@ -49,19 +109,17 @@ func main() {
 		cfg.NATSOptions = append(cfg.NATSOptions, nats.CustomInboxPrefix("_INBOX."+user))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-
 	b, err := hermesbridge.New(ctx, cfg)
 	if err != nil {
 		log.Error("bridge init failed", "err", err)
-		os.Exit(1)
+		return err
 	}
 	if err := b.Run(ctx); err != nil {
 		log.Error("bridge exited", "err", err)
-		os.Exit(1)
+		return err
 	}
 	log.Info("bridge shut down cleanly")
+	return nil
 }
 
 func envOr(key, def string) string {

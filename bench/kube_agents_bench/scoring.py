@@ -1024,6 +1024,7 @@ def grade_suite(
     baseline_rate: float | None = None,
     margin: float = 0.05,
     min_scored: int = DEFAULT_AGGREGATE_MIN_SCORED,
+    armed: bool = False,
 ) -> SuiteVerdict:
     """Combine per-case verdicts into the job's exit status.
 
@@ -1036,6 +1037,14 @@ def grade_suite(
     ``min_scored`` scored repetitions the rate is computed and reported but
     cannot block -- see :data:`DEFAULT_AGGREGATE_MIN_SCORED` for why a flat
     margin at n=3 is a coin flip rather than a gate.
+
+    And it blocks only when ``armed``. Unarmed -- the default, and what the
+    CLI passes until ``EVAL_AGGREGATE_ARMED`` says otherwise -- a rate below
+    the margin over a full sample is still computed and still reported, as a
+    note the markdown renders, rather than as a reason that reds the job.
+    The flat margin has never been measured against how much an unchanged
+    pull request's aggregate moves on main; arming it is a decision to take
+    once the store holds enough nights to say.
     """
     reasons: list[str] = []
     notes: list[str] = []
@@ -1066,11 +1075,22 @@ def grade_suite(
                 + (" -- BELOW the margin, and not blocking." if below else ".")
             )
         elif below:
-            reasons.append(
+            finding = (
                 f"suite pass rate {pass_rate:.3f} is below main's "
                 f"{baseline_rate:.3f} by more than the {margin:.3f} margin "
                 f"(over {scored} scored repetitions)"
             )
+            if armed:
+                reasons.append(finding)
+            else:
+                # Enough samples to compare, and the comparison came out
+                # badly -- said in full, so a rule nobody has armed is still
+                # a rule somebody can see firing.
+                notes.append(
+                    f"aggregate advisory: {finding} -- BELOW the margin, and "
+                    "not blocking because the aggregate rule is not armed "
+                    "(EVAL_AGGREGATE_ARMED)."
+                )
 
     if not cases:
         reasons.append("no case results were produced at all")

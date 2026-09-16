@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import warnings
 from collections.abc import Generator
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -452,6 +453,20 @@ _PROXY_PYTHON = "/opt/hermes/.venv/bin/python3"
 _PROXY_API_PORT = 8643
 _HERMES_API_PORT = 8642
 
+# The local end of the relay, and the name this suite reads it under. bench
+# (bench/kube_agents_bench/harness.py) reads AGENT_LOCAL_PORT for the same idea
+# with the opposite default: a fixed 8642, because it dials a URL it builds from
+# the number, where this suite yields the bound URL to its tests and wants an
+# ephemeral port. Sharing one name for two defaults is #971's finding 7 -- the
+# mitigation was a warning in .env.example telling the reader not to set it to
+# 0; two names need no warning. The legacy name is not read, only reported.
+#
+# The report is for one release, so a .env or a shell mid-flight is told rather
+# than ignored. Deleted together after that: _LEGACY_LOCAL_PORT_ENV, the branch
+# in _local_port, and the paragraph naming it in .env.example.
+_LOCAL_PORT_ENV = "E2E_AGENT_LOCAL_PORT"
+_LEGACY_LOCAL_PORT_ENV = "AGENT_LOCAL_PORT"
+
 # Read-only, and the endpoint the operator's own readiness probe asks for
 # (agentAPIProbe in platformagent_manifests.go), so a pass here means what a
 # pass there means.
@@ -470,6 +485,31 @@ def _numeric_env(name: str, default: str, cast: Any) -> Any:
         return cast(raw)
     except ValueError:
         raise ValueError(f"{name} must be numeric, got {raw!r}") from None
+
+
+def _local_port() -> int:
+    """The local end of the relay, plus a word about the name that no longer feeds it.
+
+    0 takes an ephemeral port. A fixed one turns a leftover listener from an
+    earlier run into "address already in use", which reads like a broken agent.
+
+    A still-set AGENT_LOCAL_PORT is reported rather than honoured: honouring it
+    is the collision this suite was renamed out of, and ignoring it in silence
+    would move a configuration that used to work into doing nothing visible.
+
+    The report is a warning rather than a print because a print would be the
+    silence it is meant to prevent: pytest captures a fixture's stderr and shows
+    it only for a failing test, and this run passes. A warning reaches the
+    summary of a green run, and stderr when the helper is called outside pytest.
+    """
+    if os.environ.get(_LEGACY_LOCAL_PORT_ENV) and not os.environ.get(_LOCAL_PORT_ENV):
+        warnings.warn(
+            f"{_LEGACY_LOCAL_PORT_ENV} is set but this suite no longer reads it -- "
+            f"the name is bench's alone, where it means a fixed port. Taking an "
+            f"ephemeral one; set {_LOCAL_PORT_ENV} to pin the local end instead.",
+            stacklevel=2,
+        )
+    return _numeric_env(_LOCAL_PORT_ENV, "0", int)
 
 
 def _probe_agent_api(port: int, api_key: str, timeout: float) -> Tuple[Optional[int], str]:
@@ -712,9 +752,7 @@ def port_forward_agent(
             "API_SERVER_KEY, and neither PLATFORM_AGENT_TOKEN nor API_SERVER_KEY is set."
         )
 
-    # 0 takes an ephemeral port. A fixed one turns a leftover listener from an
-    # earlier run into "address already in use", which reads like a broken agent.
-    local_port = _numeric_env("AGENT_LOCAL_PORT", "0", int)
+    local_port = _local_port()
     budget = _numeric_env("AGENT_TUNNEL_TIMEOUT", "30", float)
 
     # kubectl's stderr, which is where a failed exec explains itself. A file

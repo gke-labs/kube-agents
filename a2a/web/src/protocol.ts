@@ -205,7 +205,7 @@ export function parseEnvelope(data: Uint8Array | string): Envelope {
 
 /** Where on the bus an envelope arrived. Task subjects carry the authorization seam. */
 export type SubjectInfo =
-  | { plane: "tasks"; addressee: string; taskId: string; dir: "in" | "events" }
+  | { plane: "tasks"; addressee: string; taskId: string; dir: "in" | "events" | "supervisor" }
   | { plane: "agents"; profile: string }
   | { plane: "topics"; scope: "agent" | "shared"; owner?: string; topic: string }
   | { plane: "other" };
@@ -213,7 +213,18 @@ export type SubjectInfo =
 export function parseSubject(subject: string): SubjectInfo {
   const t = subject.split(".");
   if (t[0] !== "a2a") return { plane: "other" };
-  if (t[1] === "tasks" && t.length === 5 && (t[4] === "in" || t[4] === "events")) {
+  // All three classes, `supervisor` included. Nothing reads `dir`; what the
+  // rail gets out of this branch is `addressee`, and a class missing from the
+  // list falls through to `other`, where the addressee becomes "" -- so the
+  // `to`-vs-subject check (assertion 4) silently stops running on that class
+  // and a task first seen on it is filed against no addressee. The envelope
+  // is still folded either way, keyed on `taskId`, which is what makes the
+  // omission quiet.
+  if (
+    t[1] === "tasks" &&
+    t.length === 5 &&
+    (t[4] === "in" || t[4] === "events" || t[4] === "supervisor")
+  ) {
     return { plane: "tasks", addressee: t[2], taskId: t[3], dir: t[4] };
   }
   if (t[1] === "agents" && t.length === 3) {

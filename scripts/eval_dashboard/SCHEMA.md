@@ -13,12 +13,15 @@ only — anything that renames, removes or re-types a field bumps
   "runs": [
     {
       "build_id": "2093054394793725952",
+      "tier": "presubmit",
+      "job": "pull-kube-agents-smoke-test",
       "pr": 998,
       "head_sha": "a28f0b3",
       "project": "kube-agents-evals-2",
       "started": "<iso8601>",
       "finished": "<iso8601>",
       "result": "SUCCESS|FAILURE|ABORTED",
+      "eval_verdict": "GREEN|RED|null",
       "duration_s": 5793,
       "tasks": [
         {
@@ -35,11 +38,13 @@ only — anything that renames, removes or re-types a field bumps
       "name": "...",
       "domain": "reliability",
       "active": true,
+      "nightly_active": true,
       "runs_on_record": 4,
       "pass_rate": 1.0,
       "last3": ["pass", "pass", "pass"],
       "durations": { "min": 145, "med": 165, "max": 182 },
-      "ov_history": [{ "build_id": "...", "value": 1.0 }]
+      "ov_history": [{ "build_id": "...", "value": 1.0 }],
+      "nightly": { "runs_on_record": 1, "pass_rate": 1.0, "last3": ["pass"] }
     }
   ],
   "coverage": {
@@ -56,19 +61,52 @@ only — anything that renames, removes or re-types a field bumps
 
 Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
+One job feeds it today, the presubmit gate (`pull-kube-agents-smoke-test`,
+one build per pull-request push). The collector also reads a second, the
+nightly periodic (`ci-kube-agents-eval-nightly`, `EVAL_TIER=nightly` in the
+same `hack/ci-eval-pr.sh`, against `main`, no pull request), which archives
+the same layout and is collected from the moment it starts running.
 
 - `build_id` — the Prow build directory name, as a **string** (the ids
   overflow 53-bit JSON-consumer integers).
+- `tier` — **optional, additive**: `"presubmit"` or `"nightly"`, from the
+  source the build was discovered through, never from the build's own
+  metadata. **Absent means `presubmit`** — every run written before the
+  field existed was one — and consumers read it through `tiers.py`'s
+  `run_tier` / `presubmit_runs` / `nightly_runs`. A value outside the two
+  is neither tier and counts nowhere: a run tagged some new way is never
+  the gate's by default. Every gate verdict — the
+  health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
+  mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
+  red comment's "runs from other PRs" count (`gate_comment.py`), the
+  Brief's runs list, the Grid's columns, the Cases page's strips and
+  presubmit rates — reads presubmit runs only. A nightly run appears where
+  the nightly is meant to: `cases[].nightly`, the Cases page's nightly rate
+  columns and a case's last failure when the presubmit has none on record,
+  and `classify.py`'s per-case `nightly_failed_recent` note.
+- `job` — **optional, additive**: the Prow job name, read from the build
+  directory's URL (the segment before the build id) or overridden by
+  `--nightly-job`. `null` for a `--from-dir` build, which has no URL.
 - `pr` — `started.json`'s `pull`, falling back to the number in the GCS
-  path. `null` when neither is available.
-- `head_sha` — first 7 chars of `finished.json`'s `revision`; `null` when
-  absent.
+  path. `null` when neither is available, and **always `null` on a
+  `nightly` run**: a periodic runs `main`, whatever its metadata carries.
+- `head_sha` — first 7 chars of the first sha-shaped value among
+  `finished.json`'s `revision` and `started.json`'s `repo-commit` (a
+  periodic's `finished.json` says `revision: main` and keeps the commit in
+  `started.json`); `null` when neither is one.
 - `project` — from the `Successfully leased project: <name>` log line;
   `null` when the log never got that far.
 - `started` / `finished` — `started.json` / `finished.json` timestamps as
   ISO 8601 UTC; `null` when unparseable.
 - `result` — `finished.json`'s `result` verbatim: `SUCCESS`, `FAILURE` or
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
+- `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
+  the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
+  `RED`. `null` when the log has no such line — the job ended before its
+  verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
+  `ABORTED`; build 2092688354838581248 below is one), a death before the
+  cases, or step 0's revalidation (a `SUCCESS`). A record written before
+  the field existed has no key: unknown, which is not `null`.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
@@ -131,22 +169,70 @@ A build with no `finished.json` is still running and is skipped entirely.
   a missing binary or a timed-out call stops further calls for the rest of
   the pass.
 
+- `has_build_log`, `pod_phase`, `pod_node`, `pod_last_event` — **optional,
+  additive**: how the build ended. A pod whose node went NotReady mid-run
+  (twelve runs on 2026-09-11, #1478) leaves `finished.json`, `podinfo.json`
+  and **no** `build-log.txt`, and lands here as a zero-task `FAILURE` of any
+  duration — the same shape as a clone failure, which does have a log. So
+  for a build with no build log, or one that concluded `FAILURE` with no
+  tasks, the collector reads Prow's `podinfo.json` (the pod record and its
+  events) as well — one extra object per such build, none for a build that
+  ran — and records `pod_phase` (`status.phase`),
+  `pod_node` (`spec.nodeName`) and `pod_last_event` (the `reason` of the
+  newest event by `lastTimestamp`/`eventTime`/creation, upload order
+  breaking ties), each `null` when the record lacks it. `has_build_log` is
+  `true` for a build with a log. Without one the collector reads the log a
+  second time, then lets the pod record decide: `false` when
+  `podinfo.json` answered and its `sidecar` container is still `running`
+  (the kubelet stopped reporting, so Prow's uploader never ran and there is
+  no log anywhere); any other sidecar state means a log was uploaded —
+  `terminated` on the way out, `waiting` when the clone stage failed and
+  initupload wrote it — so the miss is a failed read, `has_build_log` is
+  left **absent** and only the `pod_*` trio is written; a bucket that
+  served neither file leaves all four absent. A
+  zero-task `FAILURE` with a log but no readable `podinfo.json` carries
+  `has_build_log: true` alone. Absent means unknown; consumers treat a run
+  without the fields as neither a lost pod nor anything else. Runs carried
+  over by `--merge-with` keep whatever they have (older documents have
+  none).
+
+- `merge_conflict` — **optional, additive**: `true` when the zero-task
+  `FAILURE` was a pull request that would not merge into its base rather than
+  a setup crash (#1608). One read of `clone-records.json`, for the zero-task
+  `FAILURE` subset of the builds `podinfo.json` is read for, and skipped when
+  that read already said no log was uploaded: `true` when a record carrying
+  `pulls` has `failed: true` and a `git merge` command that both errored and
+  printed `CONFLICT`. A merge that failed any other way is `false` — a full
+  disk fails the merge too, and that is the pool's problem. Absent means
+  unknown and reads as a setup crash, as it did before the field existed.
+
 A truncated log yields a **partial run** (fewer tasks, fallback duration),
 never an error. A task line whose name matches nothing under `bench/tasks/`
 on the current checkout still parses; only its domain lookup degrades (see
 below).
 
-### `cases[]` — one entry per task name seen in any run, sorted by name
+### `cases[]` — one entry per task name seen in any run of either tier, sorted by name
+
+The per-case fields are the **presubmit's** record, exactly as they were
+before the nightly existed; the nightly's record sits beside them under
+`nightly`, never pooled in. A case only the nightly has run is on record
+with `runs_on_record: 0`, `pass_rate: null`, `last3: []` on the presubmit
+side.
 
 - `domain` — the top-level `domain:` field of
   `bench/tasks/<name>/task.yaml` **on the checkout the collector runs
   from**; `"unknown"` for a historical task with no yaml (renamed or
   deleted). Never a crash.
-- `active` — `true` iff the name is an **uncommented** entry in
-  `hack/ci-eval-pr.sh`'s `TASKS` array (same textual parse as
+- `active` — `true` iff the name is an entry in
+  `hack/eval/presubmit-cases.txt` (the same parse, `scripts/eval_rosters.py`, as
   `scripts/test_domain_coverage.py`). Historical-only cases are kept with
   `active: false`.
-- `runs_on_record` — total task appearances across all runs, `infra`
+- `nightly_active` — **optional, additive**: `true` iff the name is an
+  entry in `hack/eval/presubmit-cases.txt` **or** `hack/eval/nightly-cases.txt`
+  — the nightly matrix is the presubmit's superset (`EVAL_TIER=nightly`
+  appends the second file). `active` implies `nightly_active`; the Cases page's "nightly
+  only" status is `nightly_active and not active`.
+- `runs_on_record` — total task appearances across presubmit runs, `infra`
   included (it is history).
 - `pass_rate` — `passes / (passes + fails)`. **`infra` results are excluded
   from the denominator** — an infrastructure failure never counts against a
@@ -157,6 +243,13 @@ below).
   runs; all three `null` when there are none. Median is rounded to an int.
 - `ov_history` — `{build_id, value}` per run that recorded an
   OutcomeValidity, oldest first.
+- `nightly` — **optional, additive**: `{runs_on_record, pass_rate, last3}`
+  over the nightly runs alone, each derived by the rule of its presubmit
+  namesake above (task-level, `infra` in `runs_on_record` and `last3`,
+  out of the `pass_rate` denominator; `pass_rate` `null` when nothing was
+  graded). Present on every case, zeros and `null` when the nightly has
+  not run it. The renderer's per-tier 7- and 30-day rates are computed
+  from `runs[]` at rep level, not from this block.
 - **Known gap:** multi-repetition verdict lines carry no task-level
   duration or OutcomeValidity, so `durations` and `ov_history` accrue only
   from single-repetition-era runs and freeze once those age out of the
@@ -170,13 +263,16 @@ Additive, optional, and safe to omit — consumers must default them.
 
 - `stale_after_s` — seconds after `generated_at` beyond which the rendered
   page labels itself `STALE`. Emitted only when the collector is invoked
-  with `--stale-after-s` (the hourly refresh job passes its cadence plus
+  with `--stale-after-s` (the 15-minute refresh job passes its cadence plus
   slack); the renderer defaults to `7200` when it is absent.
 - `pending_builds` — builds the GCS scan listed but could not record: no
-  readable `finished.json` yet (still running, or the upload failed), so
+  readable `finished.json` yet (still running, or the upload failed), or an
+  index pointer that could not be read this scan, so
   they are not in `runs[]` and do not raise the watermark. Entries are
-  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, lowest id first;
-  `first_seen` is when the collector first listed the build. The next
+  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
+  when the nightly periodic's listing named the build (absent: the
+  presubmit's, as for `runs[].tier`; the tag is kept across scans), lowest
+  id first; `first_seen` is when the collector first listed the build. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
   `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
@@ -246,15 +342,30 @@ collector's derivation rules for both live under `runs[]` above; this is
 what the renderer does with them.
 
 - `runs[].pr_merged` — `true` | `false` | `null`: whether the run's PR has
-  merged. The renderer's "agent" band charts only runs where it is `true`
-  (the final such run per PR); absent or `null` keeps a run out of that
-  cohort without any other effect.
+  merged. No page reads it today — the merged-PR cohort it fed left with
+  the two-band page — and it stays in the contract as the collector writes
+  it; a consumer that reads it must treat absent and `null` alike (unknown).
 - `runs[].tasks[].reps` — the task's individual repetitions, in order:
   `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
   `reason` is free-form log text (renderers must escape it). `infra` reps
   are excluded from every pass-fraction denominator, exactly like `infra`
   task results. When `reps` is absent the task's single `result` stands in
   for one rep.
+- `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
+  it; a night that is not a `SUCCESS` and carries `null` was ended before
+  its verdict and is reported as truncated. Absent means unknown.
+- `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
+  `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
+  pod**: `classify.py` gives it its own run-level headline (`infra`, never
+  the branch's), `health.py` counts it under the `lost_pods` condition and
+  never as a setup death, and `gate_comment.py` leaves the one-line "run
+  lost" comment on its pull request. Absent fields make none of that
+  happen.
+- `runs[].merge_conflict` — `true` makes the same zero-task `FAILURE` the
+  branch's own: `classify.py` verdicts it `red` with a rebase as the `do`,
+  and `health.py` excludes it from `setup_deaths` and `infra_reds`.
+  `gate_comment.py` does not read it; no comment is left either way.
+  Absent reads as a setup crash.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -265,10 +376,55 @@ what the renderer does with them.
 
 ## Sources
 
-- `--pr-glob <gs glob>` (repeatable) — Prow build dirs, discovered with
-  `gsutil ls`, read with `gsutil cat`. **Read-only.**
+- `--pr-glob <gs glob>` (repeatable) — Prow build dirs, read with
+  `gsutil cat`. **Read-only.** How they are discovered depends on whether
+  there is a watermark (below): a cold sweep lists the glob itself with
+  `gsutil ls`, a walk of every PR directory that grows with the archive and
+  passes the collector's per-call timeout (`GSUTIL_TIMEOUT_S`) at ~1700
+  builds; an incremental scan lists the job's directory index instead.
+- `--index-prefix <gs prefix>` — Prow's per-job directory index,
+  `gs://<bucket>/pr-logs/directory/<job>/`: one `<build_id>.txt` object per
+  build holding the `gs://` path of that build's directory (its
+  `latest-build.txt` is ignored). One `gsutil ls` of the prefix names every
+  build in seconds; the ids above the watermark (plus `pending_builds`) are
+  the only pointers read, and only those builds are then read,
+  `READ_WORKERS` at a time. Defaults to the index derived from each
+  `--pr-glob`'s bucket and job; an empty string disables it and the glob is
+  listed even with a watermark. It changes how a `--pr-glob` scan finds
+  builds, not whether one happens: `--merge-with` alone still recomputes
+  without touching the bucket. A listing that fails or times out is a
+  `warning: gsutil ls ... failed` line and nothing new; a pointer that
+  cannot be read is a `warning: gsutil cat ... failed` line and that one
+  build deferred to `pending_builds`. The refresh workflow greps for either
+  line and does not publish, so a stall is never republished under a fresh
+  `generated_at`.
+- `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
+  prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
+  the directory index: one `<build_id>/` directory per build beside a
+  `latest-build.txt` (ignored), no pointer objects, so one `gsutil ls`
+  names every build and the watermark filter runs on it directly. Every
+  build read through it is `tier: "nightly"`, `pr: null`, `job` the
+  prefix's last segment (or `--nightly-job`). Given without a value it is
+  `gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/`; omitted, no
+  nightly scan happens (`--merge-with` alone still recomputes without
+  touching the bucket). A prefix that does not list is read by whether a
+  night is already on record. With none (no nightly watermark) the
+  periodic may simply not have run yet, so that is a
+  `note: nightly prefix ... did not list` line and no nightly runs this
+  scan, **not** the refusal line below: the nightly is evidence beside the
+  gate, and a missing night must not stop the gate's dashboard from
+  publishing. With a night on record it is a
+  `warning: gsutil ls failed for ...` line — the refusal line — because a
+  prefix that listed yesterday and not today is the bucket or the grant
+  failing, and republishing would freeze the nightly record under a fresh
+  `generated_at` with nothing said. A listing that hangs past
+  `GSUTIL_TIMEOUT_S` is the refusal line either way, as any hung `gsutil`
+  call is.
+- `--nightly-job <name>` — the `job` recorded on nightly runs; default
+  derived from the prefix.
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
-  three files; the offline/testing path.
+  files; the offline/testing path. Its runs are the presubmit with
+  `job: null`.
 - `--rc-glob <gs glob>` (repeatable) / `--rc-from-dir <dir>` — the same two
   shapes for `post-kube-agents-eval-rc`, collected into `releases[]` rather
   than `runs[]`. `--rc-limit <n>` (default 20) bounds how many builds per
@@ -281,8 +437,14 @@ what the renderer does with them.
   is re-resolved on carried runs by the same rules as on fresh ones — a
   `false`/`null` inside the 14-day window is re-asked, `true` is
   terminal), and skip every GCS build whose id is ≤ the newest
-  **numeric** `build_id` on record — except the
-  ids on the prior's `pending_builds`, which are re-read regardless. Prow
+  **numeric** `build_id` on record **for that source** — the presubmit
+  scan resumes above the newest presubmit run, the nightly scan above the
+  newest nightly run; Prow's ids are one global sequence, so the newest
+  presubmit id is normally far above every nightly id and a shared
+  watermark would skip every night — except the
+  ids on the prior's `pending_builds`, which are re-read regardless (the
+  list is shared: an id is only ever re-read where its own source's
+  listing names it). Prow
   build ids increase monotonically **by start time**, not by finish time,
   so the watermark alone would permanently skip a build that was still in
   flight when a later, shorter build got recorded; `pending_builds` (see
@@ -292,8 +454,8 @@ what the renderer does with them.
   current checkout. A missing, unreadable, truncated, non-v1 or
   implausible prior file is a **warning that degrades to a fresh sweep
   bounded to `--since-days 14`** — never a crash (the first armed run has
-  no prior file at all). This is what lets an hourly periodic republish in
-  minutes instead of re-reading ~3 objects per archived build.
+  no prior file at all). This is what lets a 15-minute periodic republish
+  in minutes instead of re-reading ~3 objects per archived build.
 - `--since-days <n>` — skip GCS builds whose `started.json` timestamp is
   older than `n` days. Costs one probe read per candidate build and saves
   the other two; builds with an unreadable `started.json` are kept (the
@@ -305,66 +467,192 @@ what the renderer does with them.
 
 ## The rendered pages
 
-`render.py` writes three pages beside `data.json`. Every time shown on the
-first two is America/Toronto ("ET"), formatted in the browser with
+`render.py` writes five pages beside `data.json`. Every time shown is
+America/Toronto ("ET"), formatted in the browser with
 `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
-| Page          | What it is                                                                                                                                                                                                                                                         |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                               |
-| `run.html`    | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
-| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto, evidence table).                                                                                                                                                                                              |
+| Page           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
+| `run.html`     | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
+| `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
+| `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
+| `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it.                                          |
 
-The Brief and the PR view render in the browser from `brief.json` (below)
-and refetch it and `health.json` every 60 seconds. `classify.py` is the one
-place the "is this red mine?" rule lives; the pages read its answer through
-`brief.json`, and anything else that answers the question imports it.
+The pages render in the browser from `brief.json` (below),
+which `render.py` inlines into each page as
+`<script type="application/json" id="inline-brief">` (the verdict it read,
+the same document as `brief.health`, again as `inline-health`), so a page
+needs no request beyond itself;
+the poll of the published `brief.json` and `health.json` every 60 seconds
+is a best-effort refresh on top. That matters on `storage.cloud.google.com`, which answers an XHR
+with a login redirect: the pages still render whole there. The header
+badge says `updated <time> · Nm ago`, plus `· regenerated every 15 min`
+while no poll has succeeded (the workflow republishes every page on that
+cron, so that is how old the inlined copy can be); `STALE` is prepended
+only when the data's `generated_at` is older than its `stale_after_s`.
+`render.py --public-url [BASE]` emits `<base href>` so every relative link
+resolves to the published site wherever the browser landed after the
+login redirect; the bare flag means `post_health.DASHBOARD_URL`'s
+directory, and without the flag links stay relative for a local render.
+`classify.py` is the one place the "is this red mine?" rule lives; the
+pages read its answer through `brief.json`, and anything else that answers
+the question imports it.
 
 ### URL contract
 
-`index.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>#gate|#agent`
+`index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
+`run.html#build=<prow build id>`
+`grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
+`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
+`nightly.html[#build=<prow build id>]`
+
+Every parameter travels in the URL fragment as `key=value` pairs joined
+by `&`. `storage.cloud.google.com` answers an unauthenticated request with
+a login redirect that comes back without the query string, so a scope
+carried there arrived empty and the reader landed on the unscoped Brief; a
+browser never sends the fragment to the server and carries it through a
+redirect, so a scope carried there survives. The older form,
+`index.html?cases=a,b&since=…&until=…#gate|#agent`, `run.html?build=<id>`
+and the same query form on the Grid and the Cases page, is still read, so
+a link already posted to Chat, a pull request or an issue opens the same
+page wherever its query survives (a session the host does not redirect, a
+local render); a key present in both places is read from the query.
+`linkState()` in `template/pages.js` is the one parser;
+`post_health.dashboard_link` / `run_link` (Python: the Chat messages, the
+gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
+/ `caseHref` / `nightHref` (the pages' own links; `incidentHref` and
+`numbersHref` wrap the first) are the writers. A writer omits an empty parameter.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
   when `until` is given). `since` is matched to an incident in
-  `health-history.jsonl`; without history the parameters describe it.
-- `#agent` shows the last 24 hours in numbers; `#gate` lands on the
-  "why we think" block. No parameters: the current state from `health.json`.
+  `health-history.jsonl`; without history the parameters describe it. On
+  the Grid the same three make the incident the window and pin its cases
+  first; the Brief's "See it in the grid" link carries them.
+- `view=agent` shows the last 24 hours in numbers; `view=gate` lands on
+  the "why we think" block (the page scrolls to the section after it
+  renders). No parameters: the current state from `health.json`.
 - Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
   (`maxLinkCases`) that do are read, and a link the pages write carries at
   most those 50. A value that fails its grammar is dropped and everything
-  reaches the DOM escaped.
+  reaches the DOM escaped. On the Cases page a `#<case id>` fragment
+  highlights that row; the PR view and the Grid link there.
 - `since` and `until` are read with a `Z`, a space separator, or a UTC
   offset written `+02:00` or `+0200`, and converted; the pages themselves
-  write `Z`.
-- `run.html?build=<digits>`; an id not in `brief.json` shows a
+  write `Z`, and nothing a writer emits is percent-encoded (the case-id
+  grammar and the `Z` form need none).
+- `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
+- `nightly.html#build=<digits>` opens that night instead of the newest;
+  an id not among the `nightly.nights[]` on record says so and links
+  last night's.
+- `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
+  chips as parameters; a value outside the vocabulary is the default.
 
 ### `brief.json` (written by `render.py`)
 
-`{schema_version, generated_at, stale_after_s, run_days, admitted[],
-health, history, merges, cases{}, runs[]}`. `runs[]` is the last
-`run_days` of `data.json`, oldest first, each carrying its identity and
-timing plus `classify.classify_run(...)`: `verdict` (`red` = looks like
-the PR, `green`, `infra` = the gate's), `headline`, `lede`,
-`matches_incident`, `setup_death`, `storm_reps`, `do`, `cases[]`
-(`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt,
-do, admitted, reps}`) and `health_at` (the verdict in force when it
-finished, from history; `null` without history). `health` is the current
-verdict, `history` the ticks and the incidents derived from them, `merges`
-the recent first-parent commits of the checkout (`null` when the checkout
-is shallow or has no git, and the page omits "what changed right before").
+`{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
+strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
+pending[], releases[], nightly{}}`. `runs[]` is the **presubmit's** last `run_days` of
+`data.json`, oldest first — a nightly run is nobody's pull request and is
+not listed — each carrying its identity and timing plus
+`classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
+`infra` = the gate's), `headline`, `lede`, `matches_incident`,
+`setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
+also_failing_prs, pass_rate_30d, reason, excerpt, do, admitted, reps,
+nightly_failed_recent}`) and `health_at` (the verdict in force when it
+finished, from history; `null` without history). `also_failing_prs` and
+`pass_rate_30d` count presubmit runs only; `nightly_failed_recent` is
+`true` / `false` when the newest nightly run within two days of this one
+graded the case and failed / did not fail it on every repetition, `null`
+when none did — evidence about `main`, shown beside the case, never a tag.
+
+`cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
+demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
+`blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
+(active, off the roster), `demoted` (held out, with `demoted_on` read from the hold-out
+entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`),
+`nightly_only`, or `retired` (in neither matrix on this checkout); an
+unreadable roster reads every active case as `blocking`, over-reporting
+rather than hiding. `rates` is `{presubmit: [[pass, fail], [pass, fail]],
+nightly: [...]}` over graded reps for each of `rate_windows_days` (7 and
+30), run-level events excluded, `null` when nothing was graded. `strip[]`
+is the case's last `strip_runs` presubmit appearances, oldest first,
+`{build, pr, at, state, event}` with `state` in `pass|partial|fail|infra`
+and `event` true for a run-level event. `last_failure` is the newest `fail`
+or `partial` appearance — the presubmit's, else the nightly's — as `{tier,
+build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
+(`cls` and `also_failing_prs` from the Brief's classification of that run
+when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
+
+`pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
+running" columns — the presubmit's entries only (a night in flight,
+`tier: nightly`, gets no column) and only the ones first seen inside the last
+`PENDING_MAX_AGE_MS` (8 hours, past the presubmit's ceiling): an older one
+is a build that never finished, not one still running. `releases[]` is `data.json`'s `releases[]` newest first,
+at most `RELEASES_MAX_ROWS`, each reduced to `{build, rc_tag, commit, tier,
+verdict, result, started, duration_s, artifacts_url, pass_rate,
+baseline_rate, margin, cases{passed, graded, infra}}` — `artifacts_url`
+only when it is `https://`, else `null`; `cases` `null` when no task
+parsed. `catches` is `events.yaml`'s `catches` block or `null`. `health` is
+the current verdict, `history` the ticks and the incidents derived from
+them, `merges` the recent first-parent commits of the checkout (`null`
+when the checkout is shallow or has no git; the Brief then omits "what
+changed right before" and the Grid its merge markers).
+
+`nightly` is `{job, nights[], running[]}` from `nightly.py`: `job` the
+periodic's name as the newest nightly run carries it (the default when none
+is on record),
+`nights[]` the last `NIGHTS_ON_RECORD` (14) nightly runs **newest first**,
+each `{build, job, head_sha, project, started, finished, duration_s, result,
+log_url, truncated, complete, counts{expected, recorded, passed, partial,
+failed, infra, missing}, missing[], newly_failing[], fixed[],
+previous_build, cases[]}`. `cases[]` is every task row the night measured,
+sorted by domain then name, as `{case, domain, state, reps{pass, fail,
+infra}, reason, transcript_url}` with `state` in `pass|partial|fail|infra`
+by the strip's rule over the task's reps (no `reps` key: the task's result
+is one rep) and `reason` the first failing rep's grader text (`null` on a
+pass). `expected` counts the cases `nightly_active` on this checkout;
+`missing[]` names the expected cases the night did not record.
+`truncated` is a night Prow ended before its verdict: `result == "ABORTED"`
+(an interrupt), or any other non-`SUCCESS` result with `eval_verdict`
+`null` — the periodic's deadline arrives as SIGTERM and Prow records
+`FAILURE`, so `ABORTED` alone would miss it; a record without the field
+is unknown, not truncated. `complete` is neither truncated nor missing
+anything. `newly_failing`
+is every `fail` tonight that was not `fail` on `previous_build`, the night
+before it on record (the one past the window included), `fixed` every
+`fail` then that is `pass` now; both `[]` on the first night, when
+`previous_build` is `null`. `log_url` and `transcript_url` point at
+Spyglass under `logs/<job>/<build>`, a periodic's path. The nights are
+never in `runs[]`. `running[]` is the nightly's entries of `pending_builds`
+first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
+and Prow's time to write `finished.json`) of `generated_at`, oldest first,
+each `{build, first_seen, log_url}` — a night in flight, which the Brief's
+block, the report page and the digest say instead of "no night".
 
 ### `health.json` and `health-history.jsonl` (optional inputs)
 
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
-and shows no gate banner. Only a `GREEN` verdict reads as healthy.
+and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
+`lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
+it}`) and `event` (`true` when the loss counts as a build-cluster event);
+the pages give it the same 2-hour lead on the Brief's window as a storm and
+a run-page banner of its own, and otherwise show the generic degraded
+headline. `issue` (`{number, url}`) may carry `condition`, the one it was
+filed for. `slow` is `null` or, on a `GREEN` tick, the slow-gate note
+(`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
+baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
+gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
+`baseline_days` for the one sentence the Brief's healthy headline adds while
+it is set.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
@@ -399,6 +687,19 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 | 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
 | 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
 
+`testdata_lostpod/` holds two **real** builds of 2026-09-11 (#1478), the two
+zero-task shapes the health adjudicator has to tell apart. `started.json` /
+`finished.json` are verbatim; `podinfo.json` is trimmed to the pod's
+metadata, node, phase, container states and events (the values are real);
+PR 1446's build log keeps the clone header and the failing tail, and its
+`clone-records.json` keeps every field the parser reads, with only the long
+`git` transcripts in `output` cut short:
+
+| build               | why it is here                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                                            |
+| 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log and `clone-records.json` present, last event `Started`, phase `Failed` |
+
 `testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
 release-candidate job, which is a postsubmit, so its `started.json` carries no
 `pull` key and its log carries no PR number:
@@ -423,16 +724,30 @@ opens the parse on the first one, so the decoy stays in the fixture.
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by
 suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of
 them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
-`pr`, `started`, `finished`, `result`, `duration_s`, and per task `name`,
-`result`, `reps[].result` and the first 96 characters of `reps[].reason`);
+`pr`, `started`, `finished`, `result`, `duration_s`, `tier` when the run
+carries one, and per task `name`, `result`, `reps[].result` and the first
+96 characters of `reps[].reason`);
 its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
 the one departure from the `result` vocabulary above seen in the wild, so
 consumers compare it case-insensitively. `testdata_health/roster-history.json` is the
-`BOOTSTRAP_ADMITTED` roster per era over the same week, taken from the
-commits that changed it. Together they are the replay fixture
+blocking roster per era over the same week, taken from the commits that
+changed it (the `BOOTSTRAP_ADMITTED` line of `hack/ci-eval-pr.sh` then;
+`hack/eval/blocking-roster.txt` since 2026-09-15 — `health.Roster.from_file`
+reads the file and `health.Roster.from_script_text` the old line, so an era
+from before the move is taken from the script at that commit). Together they are the replay fixture
 `scripts/test_eval_dashboard_health.py` asserts the week's incident
-timeline against.
+timeline against. `testdata_health/lost-pods-2026-09-11.json.gz` is the same
+cut of the published `data.json` for 2026-09-11 (#1478) — the day five build
+nodes went NotReady — with its twenty zero-task reds re-read by
+`collect.build_run` so they carry `has_build_log` and the `pod_*` trio
+(`trim` keeps those fields when the source has them); the same test file
+asserts it reads as `lost_pods` and not as setup deaths.
+`testdata_health/slow-gate-2026-09-14.json.gz` is the same cut for
+[2026-09-07 18:00Z, 2026-09-14 18:20Z) — the seven days the slow-gate rule's
+baseline needs, ending on the afternoon every run was green and three hours
+long (#1586); the test asserts the `slow` note from 18:00Z that day and none
+over the 09-12/13 weekend.
 
 `testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;

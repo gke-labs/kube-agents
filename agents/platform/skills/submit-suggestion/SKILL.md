@@ -162,6 +162,31 @@ The same helper with `submit` handles the GitHub App token exchange, git
 credential configuration, the push, and Pull Request creation. Pass back what
 Step 1 printed for the mode you are in.
 
+Write the description to a file first, in either mode, and pass the path. Inside
+double quotes bash expands backticks and `$(...)`, and a pull request body is
+full of backticks — through `--body` a benign one silently deletes its own text
+and a hostile one runs where a credentialed `git` and `gh` are on `PATH`:
+
+```bash
+BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)
+cat > "$BODY" <<'EOF'
+This Pull Request was generated automatically by the **Platform Agent** control plane.
+
+### 🚀 Functional Impact:
+<detailed_markdown_bulleted_impact_description>
+
+Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!
+EOF
+```
+
+The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc
+expands the same constructs the argument would have. `mktemp` matters because
+`/opt/data/scratch` is shared with every other card running right now, and a
+fixed name there is two cards writing one file — one card's description on the
+other's pull request. Keep the file inside `/opt/data/scratch`, the only
+directory `--body-file` reads from, and outside `$SCRATCH` — everything under
+`--from` is committed.
+
 **Content mode** — the `handle`, the scratch directory, and the `baseSha`:
 
 ```bash
@@ -171,7 +196,7 @@ Step 1 printed for the mode you are in.
   --base-sha "<baseSha>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
-  --body "<pr_body>"
+  --body-file "$BODY"
 ```
 
 Add `--delete <path>` (repeatable) to remove a file the repository has.
@@ -188,18 +213,7 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py sub
   --lease "<lease>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
-  --body "<pr_body>"
-```
-
-For `--body`, use a description of this shape:
-
-```
-This Pull Request was generated automatically by the **Platform Agent** control plane.
-
-### 🚀 Functional Impact:
-<detailed_markdown_bulleted_impact_description>
-
-Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!
+  --body-file "$BODY"
 ```
 
 `--lease` is not optional bookkeeping. `prepare` and `submit` are separate
@@ -213,7 +227,9 @@ present.
 
 The script returns the clean, live GitHub PR URL. If a Pull Request for this
 branch is already open, it updates that one's title and body in place and
-returns its URL — resubmitting is not an error.
+returns its URL — resubmitting is not an error. `--keep-description` (Step 5) is
+the one exception: it leaves the open Pull Request's title and body as their
+author wrote them.
 
 ### Step 4: Confirm Suggestion
 
@@ -242,6 +258,16 @@ When you are asked to **address review comments / reviewer feedback** on an exis
    being asked to change, and rewriting it from memory loses the rest of the
    file. Directory mode is unchanged: edit in the `workspace`, stage only the
    specific files (**never `git add .` / `-A`**), and commit.
+
+   Pass `--title` and `--body-file` again so the description matches the commits
+   now on the branch — or `--keep-description` and no body, when the change you
+   were asked for does not alter what the pull request is for. That flag keeps
+   the title along with the body, and it needs the pull request to still be
+   open: a merged or closed one is not a description to keep, and the script
+   refuses before it pushes anything rather than opening a fresh pull request
+   with no description at all. Keep `--title` in content mode even then — there
+   it is the message of the commit this script makes, not just the pull
+   request's headline.
 
 4. **Reply on the PR** summarizing what changed (`gh pr comment <PR_NUMBER> --repo <owner/repo> --body "..."`), then relay a clean confirmation (PR URL + what you changed) back through your kanban result.
 

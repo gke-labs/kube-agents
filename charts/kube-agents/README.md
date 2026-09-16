@@ -75,6 +75,15 @@ helm install kube-agents oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents \
 `platformAgent.harness.{clusterName,location,projectId}` are required and have
 no defaults — rendering fails until they are set.
 
+The chart ships a `values.schema.json`, so an unknown or mistyped key — a
+`clustername` for `clusterName`, a `replicaCount` of `two` — fails `helm lint`,
+`helm template`, `helm install` and `helm upgrade` with the offending path before
+anything renders; the Terraform `helm_release` validates the same way. Blocks the
+templates hand on without reading, such as `platformAgent.annotations` and the
+`resources` maps, are not checked below their key; the schema's `description`
+lists every one. An all-digit image tag is admitted as an integer, so
+`--set operator.image.tag=20260913` renders without `--set-string`.
+
 These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
 chart enables by default. On a cluster that has no such RuntimeClass the
 operator reports `RuntimeClassNotFound` and never writes the agent Deployment;
@@ -241,6 +250,54 @@ which carries no redaction. The site's
 owns what is redacted, what is not (responses, on-disk transcripts, chat
 egress) and why a pseudonymised identifier is one the agent cannot act on.
 
+#### Vertex AI (`litellm.modelProvider=vertex_ai`)
+
+Vertex AI has no API key. The gateway calls
+`projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
+as a Google Service Account reached through Workload Identity. `projectId`
+defaults to `platformAgent.harness.projectId`; `location` defaults to `global`
+rather than the harness location, since a model is only callable from a
+location that serves it. Set a region for a data-residency requirement or a
+Model Garden partner model: [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden). That GSA, its
+`roles/aiplatform.user` grant, and its binding to the gateway's KSA are not
+chart resources — see
+[Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/).
+
+The chart does create the gateway KSA whenever `modelProvider=vertex_ai`, since no
+operator reconciles this one. Pass the Workload Identity annotation so it
+resolves to that GSA:
+
+```bash
+--set litellm.modelProvider=vertex_ai \
+--set litellm.modelDefaultName=<publisher-model-id> \
+--set litellm.vertex.serviceAccountAnnotations."iam\.gke\.io/gcp-service-account"=<LITELLM_GSA>@<PROJECT>.iam.gserviceaccount.com
+```
+
+`terraform/examples/full-install` wires all of this up when
+`model_provider = "vertex_ai"` — the second `kube-agents-iam` module
+instantiation creates the identity and roles, and the chart values above carry
+the annotated KSA.
+
+#### Upgrade notes: static to dynamic NetworkPolicy
+
+**Upgrading from a chart version that shipped the static `litellm-policy`:** on the first `helm upgrade` after dynamic management takes effect, Helm prunes the static `litellm-policy` (unless the live object already carries `helm.sh/resource-policy: keep`, in which case Helm retains it and the operator adopts it). The operator recreates it once the new operator pod rolls out, acquires leader election, and reconciles. During this operator rollout window LiteLLM is selected by no NetworkPolicy and its egress is unrestricted (fail-open). Measured on a GKE Autopilot cluster with the operator Deployment created from scratch in the same upgrade, the gap between Helm's delete and the operator's recreate was 19 seconds. To eliminate this window on an existing cluster, annotate the live policy before upgrading: `kubectl annotate netpol litellm-policy helm.sh/resource-policy=keep -n <namespace>`. Helm will retain the policy across the upgrade, and the operator will seamlessly adopt it via Server-Side Apply. The annotation outlives the transition: a policy that carries it also survives `helm uninstall`, and a reinstall under a different release name then fails on its ownership metadata, so delete the policy or drop the annotation before that. Alternatively, pre-roll the new operator image (e.g. updating the `<release>-controller-manager` deployment image) to narrow the window to controller watch latency (~1s), or set `litellm.networkPolicy=false` and manage `litellm-policy` out-of-band during the transition. To opt out of operator management permanently, set the annotation `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` on the `PlatformAgent` (and manage `litellm-policy` out-of-band to prevent fail-open egress).
+
+**The same window opens on a fresh default install.** Helm renders no `litellm-policy` there, so the LiteLLM Deployment starts serving, with the provider API key in its environment, before the operator pod has rolled out, won leader election, and reconciled. How long depends on which image pulls first: measured on a GKE Autopilot cluster, the policy existed 10 seconds before the first LiteLLM container started on a cold cluster, and 23 seconds after it on a reinstall whose nodes already held the LiteLLM image. Nothing exists yet for `kubectl annotate` to keep. If that window matters for the install, apply a NetworkPolicy of your own that selects `app: litellm` before the release, under a name other than `litellm-policy` so the operator does not have to adopt it, and delete it once `litellm-policy` exists. (Flipping `operator.enabled` or `platformAgent.enabled` from `false` to `true` on a live release is the upgrade case above: the static policy is live, so annotate it first.)
+
+#### Handing `litellm-policy` back to Helm
+
+Once the operator has created or adopted `litellm-policy`, a `helm upgrade` back to the static copy — `operator.enabled=false` or `platformAgent.enabled=false` — fails. The object is in the cluster, absent from the current release manifest, and labelled `app.kubernetes.io/managed-by: platformagent-controller`, so Helm refuses to import it (`NetworkPolicy "litellm-policy" … exists and cannot be imported into the current release: invalid ownership metadata`) and the release stays at its previous revision. Hand it over first, with the operator stopped so its watch does not re-stamp the label between the relabel and the upgrade:
+
+```bash
+kubectl scale deployment <release>-controller-manager -n <namespace> --replicas=0
+kubectl label netpol litellm-policy -n <namespace> app.kubernetes.io/managed-by=Helm --overwrite
+kubectl annotate netpol litellm-policy -n <namespace> \
+  meta.helm.sh/release-name=<release> meta.helm.sh/release-namespace=<namespace> --overwrite
+helm upgrade <release> … --set operator.enabled=false
+```
+
+Helm adopts the object and rewrites its spec to the static copy in the same upgrade, so LiteLLM is never unselected. If the upgrade keeps the operator (`platformAgent.enabled=false` alone), scale it back up afterwards: the CR that upgrade deletes carries a finalizer only the operator clears, and with no `PlatformAgent` the operator leaves the policy alone. That route also deletes the CR while the operator's validating webhook has no backend, which `operator.webhooks.failurePolicy=Fail` rejects; under that policy take the `operator.enabled=false` route, or set the policy to `Ignore` for the upgrade. Go back with `helm upgrade` and the earlier values rather than `helm rollback`: rollback skips Helm's adoption step, so the relabel does nothing for it.
+
 ### Hindsight memory store
 
 `hindsight.*` renders the agents' long-term memory store — the Hindsight API
@@ -275,48 +332,35 @@ Deployment passes its readiness probe.
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
-Empty means "do not decide here": the LiteLLM exporter and NetworkPolicy keep
-the GKE Managed OpenTelemetry collector, and the `telemetry` block is omitted
-from the PlatformAgent CR so the operator discovers an in-cluster collector at
-reconcile time. Setting it moves the agent and the policy's egress namespace
-together, and pins the agent so a release can't be internally split. It also
-moves the LiteLLM exporter, but that variable only exists when `litellm.otel=true`
-— off by default, and not turned on by naming a collector.
+Empty means "do not decide here": on default installs (`platformAgent.enabled=true` and
+`operator.enabled=true`), the operator dynamically discovers an in-cluster collector at
+reconcile time for the agent's NetworkPolicy, while LiteLLM's exporter and NetworkPolicy
+default to the GKE Managed OpenTelemetry collector (`gke-managed-otel`). When either is
+false, the LiteLLM exporter and static NetworkPolicy keep the GKE Managed OpenTelemetry collector.
+Setting it moves the agent and the policy's egress namespace together, and pins
+the agent so a release can't be internally split. It also moves the LiteLLM exporter,
+but that variable only exists when `litellm.otel=true` — off by default, and not
+turned on by naming a collector.
 
 The egress namespace is read off the endpoint host when it names an in-cluster
-Service. An external endpoint has none to read: with `litellm.otel=true` that
-fails the render, so set `telemetry.collectorNamespace` (or
-`litellm.networkPolicy=false`); with the callback off the rule keeps
-`gke-managed-otel`, since nothing exports through it. Full precedence
+Service. An external endpoint or bare hostname has no namespace to read, and
+both renders then do the same thing: with `litellm.otel=true` they emit no OTLP
+egress rule (unless `telemetry.collectorNamespace` names one), so the exporter
+leaves over the policy's port-443 rule, which excepts private ranges. The
+endpoint therefore has to be a public host on port 443; an external endpoint on
+any other port fails the render, because the exporter would be blocked (unless
+nothing selects LiteLLM: `litellm.networkPolicy=false`, or on the default
+install the CR's `networkPolicy.enabled=false` or the opt-out annotation), and
+a 443 endpoint whose DNS name resolves to private address space (an internal
+load balancer behind a hostname, say) is blocked without a render error; given
+as a private IP literal it fails the render instead. With the callback off
+the static copy keeps `gke-managed-otel` and the operator emits no rule.
+`telemetry.collectorNamespace` is for an in-cluster collector whose host does
+not name its namespace: it tells both renders the collector is in-cluster
+whatever the host looks like, and they open 4317/4318 to that namespace instead
+of applying the port-443 check. The site's telemetry page is canonical for this
+rule as well as for the full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
-
-#### Vertex AI (`litellm.modelProvider=vertex_ai`)
-
-Vertex AI has no API key. The gateway calls
-`projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
-as a Google Service Account reached through Workload Identity. `projectId`
-defaults to `platformAgent.harness.projectId`; `location` defaults to `global`
-rather than the harness location, since a model is only callable from a
-location that serves it. Set a region for a data-residency requirement or a
-Model Garden partner model: [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden). That GSA, its
-`roles/aiplatform.user` grant, and its binding to the gateway's KSA are not
-chart resources — see
-[Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/).
-
-The chart does create the gateway KSA whenever `modelProvider=vertex_ai`, since no
-operator reconciles this one. Pass the Workload Identity annotation so it
-resolves to that GSA:
-
-```bash
---set litellm.modelProvider=vertex_ai \
---set litellm.modelDefaultName=<publisher-model-id> \
---set litellm.vertex.serviceAccountAnnotations."iam\.gke\.io/gcp-service-account"=<LITELLM_GSA>@<PROJECT>.iam.gserviceaccount.com
-```
-
-`terraform/examples/full-install` wires all of this up when
-`model_provider = "vertex_ai"` — the second `kube-agents-iam` module
-instantiation creates the identity and roles, and the chart values above carry
-the annotated KSA.
 
 ### Turning telemetry off
 
@@ -401,6 +445,26 @@ by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
+
+#### PlatformAgent annotations
+
+`platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and
+it is the chart's route to the `kubeagents.x-k8s.io/*` annotations the operator
+reads, such as `prevent-deletion`, `enable-litellm-network-policy`, and
+`otlp-collector-namespace` (see the
+[PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)).
+Two of those the chart also stamps from values: `litellm.networkPolicy=false`
+stamps `enable-litellm-network-policy: "false"`, and a non-empty
+`telemetry.collectorNamespace` stamps `otlp-collector-namespace`. When the
+chart stamps a key, the value wins because it drives the rest of the release
+too, and an entry in `platformAgent.annotations` that disagrees with it fails
+the render instead of being overwritten. When the chart does not stamp the key
+— `litellm.networkPolicy` left `true`, `telemetry.collectorNamespace` left
+empty — the entry passes through, which is how the permanent opt-out above is
+set from values. The one check the render still applies is that, with
+`litellm.otel=true`, an `otlp-collector-namespace` entry names a namespace (a
+lowercase RFC 1123 label): the operator would otherwise ignore it or open OTLP
+egress to a namespace that cannot exist, so the render fails instead.
 
 `platformAgent.deployment.image.pullPolicy` defaults to `Always`. Under
 `IfNotPresent` a node that has already cached the tag never
@@ -610,6 +674,9 @@ helm uninstall kube-agents -n kubeagents-system
   two published releases.
 - The CRD, RBAC and admission-policy manifests under this chart are generated
   copies of `k8s-operator/config/` — edit the source and run `make chart-sync`
-  (CI enforces this via `make chart-check`).
+  (CI enforces this via `make chart-check`). `make chart-check` also renders
+  `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
+  its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
+  (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.

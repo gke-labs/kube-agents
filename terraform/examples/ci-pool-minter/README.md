@@ -14,7 +14,7 @@ Use [`terraform/examples/full-install`](../full-install/README.md) instead for a
 
 Each pool project gets its **own** private GitOps repository, and the minty rule the chart renders scopes tokens to exactly that one repository, keyed on that project's agent GSA. Two leases therefore cannot reach each other's repository, cannot share a ledger issue, and cannot race on a remediation branch. The resources are per-project (a KMS key ring is not shareable across projects), so the composition is applied once per project with its own state.
 
-The project-to-repository mapping has exactly one home: `gitops_repo_for_project()` in `hack/ci-deploy.sh`, documented in [CI pool project prerequisites](../../../docs/site/src/content/docs/deploy/ci-pool-projects.md). Read the `gitops_repo` for the project being onboarded out of there. Onboarding a project is one line in that function plus one row on that page, so a copy of the table here would go stale on the first onboarding.
+The project-to-repository mapping has exactly one home: `gitops_repo_for_project()` in `hack/ci-deploy.sh`, with [CI pool project prerequisites](../../../docs/ci-pool-projects.md) as the onboarding runbook. Read the `gitops_repo` for the project being onboarded out of there. Onboarding a project is one line in that function and one entry in `_EXPECTED_MAPPING` in `tests/test_ci_gitops_repo.py`, so a copy of the mapping here would go stale on the first onboarding.
 
 ## Usage
 
@@ -28,7 +28,7 @@ cd terraform/examples/ci-pool-minter
 # a) Workspaces — one local state file per project under terraform.tfstate.d/,
 #    no extra files to write. Fine when the checkout is long-lived.
 terraform init
-terraform workspace new kube-agents-evals    # later runs: workspace select
+terraform workspace new "${PROJECT_ID}"      # later runs: workspace select
 
 # b) Remote state, the same pattern terraform/examples/full-install uses: a
 #    gitignored backend_override.tf (*_override.tf is in .gitignore) with a
@@ -37,7 +37,7 @@ cat > backend_override.tf <<'EOF'
 terraform {
   backend "gcs" {
     bucket = "<your-tfstate-bucket>"
-    prefix = "ci-pool-minter/kube-agents-evals"
+    prefix = "ci-pool-minter/<project>"
   }
 }
 EOF
@@ -55,7 +55,7 @@ terraform output manual_steps
 
 `terraform plan` before every apply is the check that matters. Onboarding a project that has not been onboarded yet is a create-only plan; **any `destroy` line means the wrong state is loaded** — stop and fix the workspace or the backend prefix rather than confirming.
 
-**Applied for `kube-agents-evals` through `kube-agents-evals-10` as of 2026-08-27**, each in its own workspace, each with the App PEM imported — `gcloud kms keys versions list --location us-central1 --keyring github-token-minter-keyring --key github-token-minter-key --project <project>` shows one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each. Applied is not the same as leasable: which projects a presubmit can draw is the Boskos roster in `gke-internal/test-infra`, which a project joins after this apply rather than before. The next project onboarded is the create-only case above, in a workspace of its own, and step 2 below has no key to import into until that apply lands.
+A project `gitops_repo_for_project()` maps is expected to have this applied, in its own workspace, with the App PEM imported — `gcloud kms keys versions list --location us-central1 --keyring github-token-minter-keyring --key github-token-minter-key --project <project>` shows one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version — and `scripts/verify_ci_pool_project.py` is the check for any one project rather than this paragraph. Applied is not the same as leasable: which projects a presubmit can draw is the Boskos roster, which a project joins after this apply rather than before. The next project onboarded is the create-only case above, in a workspace of its own, and step 2 below has no key to import into until that apply lands.
 
 `location` and `namespace` default to the values `hack/ci-env.sh` uses (`us-central1`, `kubeagents-system`) and should only be overridden if that file changes: the chart derives the KMS key path from `platformAgent.harness.location`, which `hack/ci-deploy.sh` sets from `REGION`.
 
@@ -65,21 +65,24 @@ terraform output manual_steps
 
 Two steps are human-only, and the minter does not work until both are done. `terraform output manual_steps` prints them with this project's values substituted.
 
-**1. Install the GitHub App on the project's GitOps repository.** A GitHub App installation is not a GCP resource, and creating one needs org-admin rights on `gke-agentic`. Grant `contents: write`, `pull_requests: write` and `issues: write` on that repository only.
+**1. Install the GitHub App on the project's GitOps repository.** A GitHub App installation is not a GCP resource, and creating one needs org-admin rights on the organisation that hosts the pool's repositories. Grant `contents: write`, `pull_requests: write` and `issues: write` on that repository only.
 
-**This is already done for every project onboarded so far.** The pool is served by one App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on each project's `gke-agentic/<project>-infra` repository and nothing else. The query below is the list, rather than a copy of it kept here to go stale:
+**This is already done for every project onboarded so far.** The pool is served by one App — its numeric ID is `APP_ID` in `scripts/provision_ci_pool_project.sh` — installed on each project's GitOps repository and nothing else. The query below is the list, rather than a copy of it kept here to go stale:
 
 ```bash
-gh api /orgs/gke-agentic/installations \
-  --jq '.installations[] | select(.app_id==4675512) |
-        {app_slug, repository_selection, permissions}'
+# The organisation half of a gitops_repo_for_project() entry; one organisation hosts every pool repository.
+GITOPS_ORG="$(sed -nE 's#^[[:space:]]+kube-agents-evals[-0-9]*\) echo "([^/]+)/.*#\1#p' ../../../hack/ci-deploy.sh | head -1)"
+APP_ID="$(sed -n 's/^APP_ID="\(.*\)"$/\1/p' ../../../scripts/provision_ci_pool_project.sh)"
+gh api "/orgs/${GITOPS_ORG}/installations" \
+  --jq ".installations[] | select(.app_id==${APP_ID}) |
+        {app_slug, repository_selection, permissions}"
 ```
 
 `repository_selection` must read `selected`. If it ever reads `all`, a presubmit can mint for every repository in the organisation and the boundary below is gone.
 
 This installation — not the minty rule, and not `hack/ci-deploy.sh` — is what actually bounds where an eval run can write. A presubmit builds and deploys the pull request's own chart, operator, and agent, so a pull request can in principle rewrite the rule ConfigMap or the resolution table; it cannot make the App mint a token for a repository the App is not installed on. Keep the installation list to the pool's GitOps repositories, and treat adding a repository to it as the security review.
 
-A dedicated App rather than an existing one, deliberately. `gke-agentic` already hosts an all-repositories minter App used by the staging deployment, and pointing the pool at it would have meant three things: the staging App's signing key copied into every pool project's KMS, unreviewed presubmit code joining merged code as a caller of the same identity, and any rotation forced by an eval incident taking staging and autopush down with it. The pool's own App costs one creation and removes all three.
+A dedicated App rather than an existing one, deliberately. The organisation already hosts an all-repositories minter App used by the staging deployment, and pointing the pool at it would have meant three things: the staging App's signing key copied into every pool project's KMS, unreviewed presubmit code joining merged code as a caller of the same identity, and any rotation forced by an eval incident taking staging and autopush down with it. The pool's own App costs one creation and removes all three.
 
 **2. Import the App's private key into the signing key.** The PEM must never enter Terraform state, so the key is created import-only and empty. The Minty CLI does the cryptographic wrapping:
 
@@ -102,6 +105,6 @@ gcloud kms keys versions list --key=github-token-minter-key \
 
 ## Turning the minter on in CI
 
-`hack/ci-deploy.sh` renders `githubMinter.enabled=false` until `EVAL_GITHUB_APP_ID` is set in the job environment, and that variable is the switch meaning "the two manual steps above are done for this project". Its value is **`4675512`** and is the same for every pool project — one App serves the pool. What differs per project is the KMS key its PEM was imported into. The minter Deployment is part of the release `helm --wait` gates on, so enabling it before the key import fails every presubmit rather than degrading quietly.
+`hack/ci-deploy.sh` renders `githubMinter.enabled=false` until `EVAL_GITHUB_APP_ID` is set in the job environment, and that variable is the switch meaning "the two manual steps above are done for this project". Its value is the App's ID (`APP_ID` in `scripts/provision_ci_pool_project.sh`) and is the same for every pool project — one App serves the pool. What differs per project is the KMS key its PEM was imported into. The minter Deployment is part of the release `helm --wait` gates on, so enabling it before the key import fails every presubmit rather than degrading quietly.
 
 The chart needs nothing else per project. `githubMinter.gsaName` and `githubMinter.allowedServiceAccount` both derive from `platformAgent.harness.projectId`, which `hack/ci-deploy.sh` sets to the leased project, so the rule comes out keyed on that project's `kubeagents-platform-gsa` automatically.

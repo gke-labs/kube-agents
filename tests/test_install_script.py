@@ -7,10 +7,15 @@ NetworkPolicy enablement sequence install.sh runs against adopted clusters.
 
 import os
 import pathlib
+import pty
 import re
+import shutil
+import signal
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 
 from tests.testing.common import (
@@ -118,86 +123,291 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"DIR={_REPO_ROOT}", proc.stdout)
 
+    @staticmethod
+    def _git(*args, cwd):
+        return subprocess.run(
+            ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def _existing_clone_fixture(self, checked_out_tag, full_clone=False):
+        """Build the curl | bash situation: a clone of an earlier release under HOME.
+
+        A bare "upstream" repository holds tags 0.2.0 and 0.3.0, each a
+        revision that tracks install.sh (the marker refresh_existing_clone
+        requires). HOME/kube-agents is cloned from it while only 0.2.0 exists,
+        so a clone at 0.2.0 has never seen 0.3.0, the way a clone from an
+        earlier install has never seen the next release; 0.3.0 is then pushed
+        to the bare repository.
+
+        By default the clone has the shape the fresh-clone arm of
+        acquire_source_repo leaves: blobless, no checkout, one --depth=1 tag
+        fetch, detached at the tag. `full_clone=True` is a developer's plain
+        `git clone` instead, with complete history and the branch `main`.
+        Either way the clone is left detached at `checked_out_tag`. Returns
+        (home_dir, clone_dir, upstream_url, {tag: commit}).
+        """
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp_dir.cleanup)
+        base = pathlib.Path(temp_dir.name)
+        work_dir = base / "work"
+        bare_dir = base / "upstream.git"
+        home_dir = base / "home"
+        clone_dir = home_dir / "kube-agents"
+        home_dir.mkdir()
+        git = self._git
+
+        work_dir.mkdir()
+        git("init", "-b", "main", cwd=work_dir)
+        git("config", "user.name", "Test", cwd=work_dir)
+        git("config", "user.email", "test@example.com", cwd=work_dir)
+        git("config", "commit.gpgsign", "false", cwd=work_dir)
+        (work_dir / "install.sh").write_text("release 0.2.0\n")
+        git("add", "install.sh", cwd=work_dir)
+        git("commit", "-m", "release 0.2.0", cwd=work_dir)
+        git("tag", "0.2.0", cwd=work_dir)
+        git("clone", "--bare", "--quiet", str(work_dir), str(bare_dir), cwd=base)
+        upstream_url = bare_dir.as_uri()
+        if full_clone:
+            git("clone", "--quiet", upstream_url, str(clone_dir), cwd=base)
+        else:
+            git("clone", "--quiet", "--filter=blob:none", "--no-checkout", upstream_url, str(clone_dir), cwd=base)
+
+        (work_dir / "install.sh").write_text("release 0.3.0\n")
+        (work_dir / "CHANGELOG.md").write_text("0.3.0\n")
+        git("add", "install.sh", "CHANGELOG.md", cwd=work_dir)
+        git("commit", "-m", "release 0.3.0", cwd=work_dir)
+        git("tag", "0.3.0", cwd=work_dir)
+        git("push", "--quiet", upstream_url, "main", "--tags", cwd=work_dir)
+        commits = {tag: git("rev-parse", f"{tag}^{{commit}}", cwd=work_dir) for tag in ("0.2.0", "0.3.0")}
+
+        if full_clone:
+            if checked_out_tag == "0.3.0":
+                git("fetch", "--quiet", upstream_url, "+refs/tags/0.3.0:refs/tags/0.3.0", cwd=clone_dir)
+            git("checkout", "--quiet", "--detach", checked_out_tag, cwd=clone_dir)
+        else:
+            refspec = f"+refs/tags/{checked_out_tag}:refs/tags/{checked_out_tag}"
+            git("fetch", "--quiet", "--depth=1", upstream_url, refspec, cwd=clone_dir)
+            git("checkout", "--quiet", "--detach", "FETCH_HEAD", cwd=clone_dir)
+            self.assertEqual(git("rev-parse", "--is-shallow-repository", cwd=clone_dir), "true")
+        return home_dir, clone_dir, upstream_url, commits
+
+    def _acquire_from_outside(self, home_dir, upstream_url, requested_ref):
+        """Run acquire_source_repo with install.sh copied outside any checkout.
+
+        Neither the script's directory nor the working directory holds
+        scripts/installer/, so acquire_source_repo takes the clone arm and
+        looks under HOME. KUBE_AGENTS_REPO_URL is overridden after sourcing,
+        because install.sh assigns it unconditionally.
+        """
+        outside_dir = home_dir.parent / "outside"
+        outside_dir.mkdir(exist_ok=True)
+        isolated_install_sh = outside_dir / "install.sh"
+        isolated_install_sh.write_text(_INSTALL_SH.read_text())
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
+KUBE_AGENTS_REPO_URL="{upstream_url}"
+out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_dir"
+"""
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            cwd=str(outside_dir),
+        )
+
+    @staticmethod
+    def _head_of(clone_dir):
+        return subprocess.run(
+            ["git", "-C", str(clone_dir), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
     def test_acquire_source_repo_refuses_to_mutate_dirty_existing_repo(self):
-        """Verifies acquire_source_repo uses existing HOME/kube-agents and verify_local_source_ref rejects dirty checkout."""
-        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        try:
-            home_dir = pathlib.Path(temp_dir.name) / "home"
-            repo_dir = home_dir / "kube-agents"
-            repo_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
-            (repo_dir / "file.txt").write_text("initial\n")
-            subprocess.run(["git", "add", "file.txt"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "tag", "0.2.0"], cwd=str(repo_dir), check=True)
+        """A dirty clone already at the ref is left alone and verify_local_source_ref rejects it."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        (clone_dir / "install.sh").write_text("dirty changes\n")
 
-            # Make working tree dirty
-            (repo_dir / "file.txt").write_text("dirty changes\n")
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.2.0")
 
-            outside_dir = pathlib.Path(temp_dir.name) / "outside"
-            outside_dir.mkdir()
-            isolated_install_sh = outside_dir / "install.sh"
-            isolated_install_sh.write_text(_INSTALL_SH.read_text())
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Using existing repository", proc.stdout)
+        self.assertIn("without modifying local changes", proc.stdout)
+        self.assertIn("dirty checkout", proc.stdout)
+        self.assertIn("--allow-unverified-source", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.2.0"])
+        self.assertEqual((clone_dir / "install.sh").read_text(), "dirty changes\n")
 
-            cmd = 'out_dir=""; acquire_source_repo out_dir "0.2.0"'
-            setup = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
-{cmd}
-"""
-            proc = subprocess.run(
-                ["bash", "-c", setup],
-                capture_output=True,
-                text=True,
-                env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
-                cwd=str(outside_dir),
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("Using existing repository", proc.stdout)
-            self.assertIn("without modifying local changes", proc.stdout)
-            self.assertIn("dirty checkout", proc.stdout)
-        finally:
-            temp_dir.cleanup()
+    def test_acquire_source_repo_uses_clean_existing_repo_already_at_the_ref(self):
+        """A clean clone already at the requested ref is used as-is, with no fetch."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.3.0")
 
-    def test_acquire_source_repo_uses_clean_existing_repo_without_modifying_changes(self):
-        """Verifies acquire_source_repo uses clean existing HOME/kube-agents without mutating branch/checkout."""
-        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        try:
-            home_dir = pathlib.Path(temp_dir.name) / "home"
-            repo_dir = home_dir / "kube-agents"
-            repo_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
-            (repo_dir / "file.txt").write_text("initial\n")
-            subprocess.run(["git", "add", "file.txt"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "tag", "0.2.0"], cwd=str(repo_dir), check=True)
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
 
-            outside_dir = pathlib.Path(temp_dir.name) / "outside"
-            outside_dir.mkdir()
-            isolated_install_sh = outside_dir / "install.sh"
-            isolated_install_sh.write_text(_INSTALL_SH.read_text())
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn("Using existing repository", proc.stdout)
+        self.assertIn("already at '0.3.0'", proc.stdout)
+        self.assertNotIn("fetching", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        self.assertIn(f"RESOLVED={clone_dir}", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
 
-            cmd = 'out_dir=""; acquire_source_repo out_dir "0.2.0"; echo "RESOLVED=$out_dir"'
-            setup = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
-{cmd}
-"""
-            proc = subprocess.run(
-                ["bash", "-c", setup],
-                capture_output=True,
-                text=True,
-                env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
-                cwd=str(outside_dir),
-            )
-            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
-            self.assertIn("Using existing repository", proc.stdout)
-            self.assertIn("without modifying local changes", proc.stdout)
-            self.assertIn(f"RESOLVED={repo_dir}", proc.stdout)
-        finally:
-            temp_dir.cleanup()
+    def test_acquire_source_repo_moves_clean_existing_repo_to_the_requested_ref(self):
+        """A clean clone at an earlier release is fetched and detached at the requested tag."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn("Using existing repository", proc.stdout)
+        self.assertIn("fetching '0.3.0'", proc.stdout)
+        self.assertIn(f"Moved {clone_dir} from {commits['0.2.0']} to '0.3.0'", proc.stdout)
+        self.assertIn(f"Verified install sources and image ref resolve to commit {commits['0.3.0']}", proc.stdout)
+        self.assertIn(f"RESOLVED={clone_dir}", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
+        self.assertEqual((clone_dir / "install.sh").read_text(), "release 0.3.0\n")
+        self.assertEqual((clone_dir / "CHANGELOG.md").read_text(), "0.3.0\n")
+
+    def test_acquire_source_repo_moves_clean_existing_repo_to_a_commit_sha(self):
+        """A 40-hex ref goes through the object-name arm of fetch_source_ref and moves the clone.
+
+        A complete clone, because a blobless one resolves an unknown commit by
+        fetching it lazily through its promisor remote before fetch_source_ref
+        is reached.
+        """
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0", full_clone=True)
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, commits["0.3.0"])
+
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn(f"fetching '{commits['0.3.0']}'", proc.stdout)
+        self.assertIn(f"Moved {clone_dir} from {commits['0.2.0']} to '{commits['0.3.0']}'", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
+
+    def test_acquire_source_repo_moves_a_full_clone_on_a_branch_without_making_it_shallow(self):
+        """A developer's complete clone on a branch is moved to the detached tag with its history intact."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0", full_clone=True)
+        self._git("checkout", "--quiet", "main", cwd=clone_dir)
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn(f"from branch 'main' ({commits['0.2.0']}) to '0.3.0' (detached HEAD)", proc.stdout)
+        self.assertIn("untracked files such as install.env are kept", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
+        self.assertEqual(self._git("rev-parse", "main", cwd=clone_dir), commits["0.2.0"])
+        self.assertEqual(self._git("rev-parse", "--is-shallow-repository", cwd=clone_dir), "false")
+        self.assertEqual(self._git("rev-list", "--count", "HEAD", cwd=clone_dir), "2")
+
+    def test_acquire_source_repo_checks_out_a_ref_the_clone_already_has_without_fetching(self):
+        """A clone that already holds the tag is moved to it without reaching the network."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        self._git("fetch", "--quiet", "--depth=1", upstream_url, "+refs/tags/0.3.0:refs/tags/0.3.0", cwd=clone_dir)
+        unreachable_url = (home_dir.parent / "no-such-upstream.git").as_uri()
+
+        proc = self._acquire_from_outside(home_dir, unreachable_url, "0.3.0")
+
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn(f"already has '0.3.0' ({commits['0.3.0']}); checking it out", proc.stdout)
+        self.assertNotIn("fetching", proc.stdout)
+        self.assertIn(f"Moved {clone_dir} from {commits['0.2.0']} to '0.3.0'", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
+
+    def test_acquire_source_repo_leaves_a_plain_directory_inside_a_git_managed_home_alone(self):
+        """A non-Git HOME/kube-agents inside a HOME that is itself a repository is not the clone."""
+        home_dir, clone_dir, upstream_url, _ = self._existing_clone_fixture("0.2.0")
+        shutil.rmtree(clone_dir)
+        clone_dir.mkdir()
+        (clone_dir / "README.md").write_text("unpacked release archive\n")
+        self._git("init", "-q", "-b", "main", cwd=home_dir)
+        self._git("config", "user.name", "Test", cwd=home_dir)
+        self._git("config", "user.email", "test@example.com", cwd=home_dir)
+        self._git("config", "commit.gpgsign", "false", cwd=home_dir)
+        (home_dir / ".bashrc").write_text("export EDITOR=vi\n")
+        self._git("add", ".bashrc", cwd=home_dir)
+        self._git("commit", "-q", "-m", "dotfiles", cwd=home_dir)
+        home_head = self._head_of(home_dir)
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"Using existing repository at {clone_dir} as-is: it is not the root of a Git worktree", proc.stdout)
+        self.assertNotIn("fetching", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        self.assertEqual(self._head_of(home_dir), home_head)
+        self.assertEqual((home_dir / ".bashrc").read_text(), "export EDITOR=vi\n")
+        self.assertEqual((clone_dir / "README.md").read_text(), "unpacked release archive\n")
+        self.assertEqual(self._git("status", "--porcelain", "--untracked-files=no", cwd=home_dir), "")
+
+    def test_acquire_source_repo_leaves_an_unrelated_repository_alone(self):
+        """A clean repository that only shares the directory name is not fetched into or moved."""
+        home_dir, clone_dir, upstream_url, _ = self._existing_clone_fixture("0.2.0")
+        shutil.rmtree(clone_dir)
+        clone_dir.mkdir()
+        self._git("init", "-q", "-b", "main", cwd=clone_dir)
+        self._git("config", "user.name", "Test", cwd=clone_dir)
+        self._git("config", "user.email", "test@example.com", cwd=clone_dir)
+        self._git("config", "commit.gpgsign", "false", cwd=clone_dir)
+        (clone_dir / "notes.txt").write_text("my project\n")
+        self._git("add", "notes.txt", cwd=clone_dir)
+        self._git("commit", "-q", "-m", "notes", cwd=clone_dir)
+        own_head = self._head_of(clone_dir)
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("its HEAD is not a kube-agents revision (no install.sh), so it was not moved", proc.stdout)
+        self.assertNotIn("fetching", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), own_head)
+        self.assertEqual((clone_dir / "notes.txt").read_text(), "my project\n")
+        self.assertIn("'0.3.0' is not present in the current checkout", proc.stdout)
+
+    def test_acquire_source_repo_falls_through_when_an_untracked_file_blocks_the_checkout(self):
+        """An untracked file the new tree tracks makes the checkout fail; the clone and the file stay."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        (clone_dir / "CHANGELOG.md").write_text("my own notes\n")
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("fetching '0.3.0'", proc.stdout)
+        self.assertIn(f"Could not check out '0.3.0' in {clone_dir}; the checkout stays at {commits['0.2.0']}", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        self.assertIn("Source/image version mismatch", proc.stdout)
+        self.assertIn("--allow-unverified-source", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.2.0"])
+        self.assertEqual((clone_dir / "CHANGELOG.md").read_text(), "my own notes\n")
+
+    def test_acquire_source_repo_leaves_a_dirty_existing_repo_at_an_older_ref_alone(self):
+        """A dirty clone at an earlier release is neither fetched nor moved, and the run stops."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        (clone_dir / "install.sh").write_text("dirty changes\n")
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("the checkout is dirty, so '0.3.0' was not fetched", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        # verify_local_source_ref checks for the ref before it checks for a clean
+        # tree, so the refusal names the missing ref; the opt-out hint is the same.
+        self.assertIn("'0.3.0' is not present in the current checkout", proc.stdout)
+        self.assertIn("--allow-unverified-source", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.2.0"])
+        self.assertEqual((clone_dir / "install.sh").read_text(), "dirty changes\n")
+
+    def test_acquire_source_repo_falls_through_when_the_ref_cannot_be_fetched(self):
+        """A ref the upstream lacks leaves the clone where it was and the existing error names it."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "9.9.9")
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("fetching '9.9.9'", proc.stdout)
+        self.assertIn(f"Could not fetch '9.9.9' into {clone_dir}; the checkout stays at {commits['0.2.0']}", proc.stdout)
+        self.assertIn("'9.9.9' is not present in the current checkout", proc.stdout)
+        self.assertIn("--allow-unverified-source", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.2.0"])
 
     def test_verify_local_source_ref_dry_run_warning_does_not_claim_cluster_mutation(self):
         """Under --dry-run, an unverified mismatched checkout warns about dry-run continuing without claiming cluster mutation."""
@@ -810,6 +1020,114 @@ run_menu_system "."
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
         self.assertIn("VERIFIED_IMAGE_TAG=0.4.0", proc.stdout)
+
+    def test_run_menu_system_derives_chat_sub_name_on_save_and_apply(self):
+        """Verifies run_menu_system derives CHAT_SUB_NAME from custom topic when saving."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+tf_state_chat_subscription_name() { return 0; }
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=custom-topic-sub", env_content)
+
+    def test_run_menu_system_recovers_chat_sub_name_from_state_on_save_and_apply(self):
+        """Verifies run_menu_system recovers existing subscription from state when saving."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+gcloud() {
+  if [ "$1" = "storage" ] && [ "$2" = "cat" ]; then
+    cat <<'EOF'
+{
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "google_pubsub_subscription",
+      "name": "chat_events",
+      "instances": [
+        {
+          "attributes": {
+            "name": "managed-state-sub"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+    return 0
+  fi
+  command gcloud "$@"
+}
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=managed-state-sub", env_content)
+
+    def test_run_menu_system_rederives_when_recorded_sub_equals_default_and_state_empty(self):
+        """Verifies run_menu_system re-derives custom-topic subscription if recorded sub is default and state is empty."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+tf_state_chat_subscription_name() { return 0; }
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+CHAT_SUB_NAME="platform-agent-chat-events-sub"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=custom-topic-sub", env_content)
 
     def test_verify_local_source_ref_accepts_baked_release_in_non_git_dir(self):
         """Verifies verify_local_source_ref succeeds for unpacked release archive without Git repository."""
@@ -1533,6 +1851,8 @@ class EnsureExistingClusterWorkloadIdentityTest(unittest.TestCase):
                 f"  *autopilot.enabled*) printf '{autopilot}\\n' ;;\n"
                 f"  *workloadIdentityConfig.workloadPool*) printf '{workload_pool}\\n' ;;\n"
                 f"  *node-pools*list*) printf '{node_pools}\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-1\\n' ;;\n"
+                "  *'operations describe'*) printf 'DONE|||\\n' ;;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -1600,6 +1920,382 @@ class EnsureExistingClusterWorkloadIdentityTest(unittest.TestCase):
         self.assertEqual(len(node_updates), 1)
         self.assertIn("--workload-metadata=GKE_METADATA", node_updates[0])
         self.assertIn("pool-1", node_updates[0])
+        self.assertIn("--async", node_updates[0])
+
+
+class NodePoolMetadataMigrationPollingTest(unittest.TestCase):
+    """Tests dynamic timeout scaling and GKE operation polling during node pool migration (#1286)."""
+
+    def test_dynamic_timeout_scales_with_node_count(self):
+        body = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'for n in 0 1 5 6 9 12; do\n'
+            '  echo "$n=$(calculate_node_pool_update_timeout $n)"\n'
+            'done\n'
+        )
+        proc = subprocess.run(
+            ["bash", "-c", body],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        expected = "0=1800\n1=1800\n5=1800\n6=1800\n9=2700\n12=3600\n"
+        self.assertEqual(proc.stdout, expected)
+
+    def test_get_node_pool_node_count_prefers_igm_target_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            igm_urls = (
+                "https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instanceGroupManagers/igm-a;"
+                "https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-b/instanceGroupManagers/igm-b;"
+                "https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-c/instanceGroupManagers/igm-c"
+            )
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *'node-pools describe'*) printf '1|3|{igm_urls}\\n' ;;\n"
+                "  *'instance-groups managed describe'*) printf '3\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-9\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "9")
+
+    def test_get_node_pool_node_count_falls_back_to_initial_count_when_igm_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '3|3|\\n' ;;\n"
+                "  *'instance-groups managed describe'*) exit 1 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-9\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "9")
+
+    def test_get_node_pool_node_count_respects_zero_node_live_igm_target_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*)\n"
+                "    printf '5|2|https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instanceGroupManagers/igm-a\\n'\n"
+                "    ;;\n"
+                "  *'instance-groups managed describe'*)\n"
+                "    printf '0\\n'\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-zero\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "0")
+
+    def test_get_node_pool_node_count_falls_back_on_partial_igm_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*)\n"
+                "    printf '4|2|https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instanceGroupManagers/igm-a;https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b/instanceGroupManagers/igm-b\\n'\n"
+                "    ;;\n"
+                "  *'instance-groups managed describe'*'igm-a'*)\n"
+                "    printf '4\\n'\n"
+                "    ;;\n"
+                "  *'instance-groups managed describe'*'igm-b'*)\n"
+                "    exit 1\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-partial\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "8")
+
+    def test_migration_polls_operation_until_done_and_extends_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            state_file = pathlib.Path(tmp) / "poll_count"
+            state_file.write_text("0")
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '9|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'projects/p/zones/r/operations/op-1286\\n' ;;\n"
+                "  *'operations describe'*)\n"
+                f"    c=$(cat '{state_file}')\n"
+                "    c=$((c + 1))\n"
+                f"    printf '%s' \"$c\" > '{state_file}'\n"
+                "    if [ \"$c\" -lt 4 ]; then\n"
+                "      printf 'RUNNING|updating node %d of 9||\\n' \"$c\"\n"
+                "    else\n"
+                "      printf 'DONE|||\\n'\n"
+                "    fi\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_MIN_TIMEOUT_SECS=2\n"
+                "export NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS=0\n"
+                "export NODE_POOL_UPDATE_EXTENSION_SECS=2\n"
+                "export NODE_POOL_UPDATE_MAX_TIMEOUT_SECS=10\n"
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=1\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-large\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Polling operation 'op-1286' for node pool 'pool-large'", proc.stdout)
+            self.assertIn("updating node 1 of 9", proc.stdout)
+            self.assertIn("Operation 'op-1286' is still RUNNING after 2s; extending wait timeout to 4s", proc.stdout)
+            self.assertIn("Node pool 'pool-large' metadata migration completed (operation 'op-1286')", proc.stdout)
+
+    def test_migration_fails_when_operation_finishes_with_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-err-99\\n' ;;\n"
+                "  *'operations describe'*) printf 'DONE|||Quota exceeded | in region\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=0\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-err\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("finished with error: Quota exceeded | in region", proc.stdout + proc.stderr)
+
+    def test_migration_recovers_from_transient_describe_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            state_file = pathlib.Path(tmp) / "poll_count"
+            state_file.write_text("0")
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-transient\\n' ;;\n"
+                "  *'operations describe'*)\n"
+                f"    c=$(cat '{state_file}')\n"
+                "    c=$((c + 1))\n"
+                f"    printf '%s' \"$c\" > '{state_file}'\n"
+                "    if [ \"$c\" -le 2 ]; then\n"
+                "      exit 1\n"
+                "    else\n"
+                "      printf 'DONE|||\\n'\n"
+                "    fi\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=0\n"
+                "export NODE_POOL_UPDATE_POLL_MAX_RETRIES=3\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-t\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Transient error querying operation 'op-transient' (attempt 1/3)", proc.stdout)
+            self.assertIn("Transient error querying operation 'op-transient' (attempt 2/3)", proc.stdout)
+            self.assertIn("Node pool 'pool-t' metadata migration completed (operation 'op-transient')", proc.stdout)
+
+    def test_migration_times_out_when_exceeding_max_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-stuck\\n' ;;\n"
+                "  *'operations describe'*) printf 'RUNNING|still running||\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_MIN_TIMEOUT_SECS=1\n"
+                "export NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS=0\n"
+                "export NODE_POOL_UPDATE_EXTENSION_SECS=1\n"
+                "export NODE_POOL_UPDATE_MAX_TIMEOUT_SECS=2\n"
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=1\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-stuck\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Timed out after 2s waiting for GKE operation 'op-stuck'", proc.stdout + proc.stderr)
+
+    def test_migration_fails_immediately_when_update_initiation_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) exit 1 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-fail-init\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Failed to initiate metadata migration on node pool 'pool-fail-init'", proc.stdout + proc.stderr)
+
+    def test_migration_verifies_live_mode_when_op_id_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*'workloadMetadataConfig.mode'*)\n"
+                "    printf 'GCE_METADATA\\n'\n"
+                "    ;;\n"
+                "  *'node-pools describe'*)\n"
+                "    printf '2|1|\\n'\n"
+                "    ;;\n"
+                "  *'node-pools update'*)\n"
+                "    printf '\\n'\n"
+                "    ;;\n"
+                "  *'operations list'*)\n"
+                "    printf '\\n'\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-no-op\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("did not produce an operation ID and mode remains 'GCE_METADATA'", proc.stdout + proc.stderr)
+
+
+
 
 
 class EnsureExistingClusterGatedOnCreateClusterTest(unittest.TestCase):
@@ -1725,6 +2421,53 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
         self.assertIn("Could not query NetworkPolicy configuration", proc.stderr + proc.stdout)
         self.assertNotIn("enforces no NetworkPolicy", proc.stderr + proc.stdout)
+
+
+class GenerateOnlyCrossesTheExistingClusterConsentGatesTest(unittest.TestCase):
+    """--generate-only is held to the same existing-cluster refusals as a real run.
+
+    The mode's whole output is terraform.tfvars for an operator to apply, and
+    tfvars for a cluster enforcing no NetworkPolicy cannot apply -- the
+    gke-cluster module's postcondition rejects them. Reporting
+    GENERATE_ONLY_SUCCESS over inputs already known to fail is worse than
+    refusing, especially since the refusal names the opt-in flag the apply needs
+    anyway. Exempting the mode also splits it from the interactive `g`, which
+    install-kube-agents/SKILL.md calls the same choice.
+
+    These read the source rather than running it: the gate is main()'s control
+    flow, which the KUBE_AGENTS_SOURCE_ONLY harness cannot drive. The behaviour
+    of the two functions themselves is covered by the two classes above.
+    """
+
+    _POOLS_CALL = 'check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"'
+    _NETPOL_CALL = 'check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"'
+    _PROMPT = "Proceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)"
+    _MODE_BRANCH = "Generate-only: configuration files written"
+
+    def test_neither_preflight_is_conditioned_on_the_mode(self):
+        # self.fail rather than assertNotRegex: the latter prints the whole of
+        # install.sh as the subject on failure, burying the one line at issue.
+        gated = re.search(
+            r'if \[ "\$PARAM_GENERATE_ONLY" != "true" \][^\n]*\n(?:[^\n]*\n)*?'
+            r"\s*check_existing_cluster_(?:node_pools|network_policy)_preflight",
+            _INSTALL_SH.read_text(),
+        )
+        if gated:
+            self.fail(
+                "the existing-cluster consent gates sit inside a --generate-only "
+                f"exemption, which #1336 added them to prevent: {gated.group(0)!r}"
+            )
+
+    def test_both_preflights_run_above_the_confirmation_prompt(self):
+        """Above the prompt is what makes the flag and the `g` answer the same choice."""
+        text = _INSTALL_SH.read_text()
+        pools = text.index(self._POOLS_CALL)
+        netpol = text.index(self._NETPOL_CALL)
+        prompt = text.index(self._PROMPT)
+        mode_branch = text.index(self._MODE_BRANCH)
+        self.assertLess(pools, prompt, "the node-pool gate must precede the (Y/n/g) prompt")
+        self.assertLess(netpol, prompt, "the NetworkPolicy gate must precede the (Y/n/g) prompt")
+        self.assertLess(prompt, mode_branch, "the prompt must precede the generate-only handoff")
 
 
 class SummarizeExistingClusterMutationsTest(unittest.TestCase):
@@ -2479,7 +3222,7 @@ class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):
         )
 
     def test_each_google_chat_prompt_defaults_to_its_own_current_value(self):
-        for var in ("allowed_users", "chat_topic_name", "google_chat_home_channel"):
+        for var in ("allowed_users", "chat_topic_name", "chat_sub_name", "google_chat_home_channel"):
             with self.subTest(var=var):
                 self.assertRegex(
                     self._SOURCE,
@@ -3174,12 +3917,11 @@ exit 0
 """)
         terraform.chmod(0o755)
 
+        # No local definition of validate_tf_config: install.sh defines it at file
+        # scope, so _run_func sources the real one. Redeclaring it here would assert
+        # that this file's copy short-circuits, which is true of any string and
+        # stays green when install.sh's own chaining is removed.
         script = f"""
-# shellcheck disable=SC2317,SC2329
-validate_tf_config() {{
-  terraform init -backend=false -input=false &&
-    terraform validate
-}}
 tf_log="{self._tmp_path}/tf.log"
 rc=0
 run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config || rc=$?
@@ -3190,10 +3932,309 @@ echo "RC=$rc"
         self.assertIn("RC=2", proc.stdout)
         self.assertFalse(counter.exists(), "terraform validate must not be invoked if terraform init fails")
 
-    def test_rollout_warning_does_not_mention_hardcoded_timeout(self):
+    def test_rollout_warning_reports_measured_elapsed_not_the_timeout_constant(self):
+        """The warning carries how long the wait actually ran, never the budget.
+
+        Naming ROLLOUT_TIMEOUT_SECS asserted 300s even when the rollout failed in
+        three; ROLLOUT_ELAPSED_SECS is measured by wait_for_rollout, so a fast
+        ProgressDeadlineExceeded reads differently from an exhausted budget.
+        """
         source = _INSTALL_SH.read_text()
-        self.assertIn('print_warning "$deployment did not report ready."', source)
+        self.assertIn('print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."', source)
+        self.assertIn("ROLLOUT_ELAPSED_SECS=$((SECONDS - started))", source)
         self.assertNotIn('print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."', source)
+
+
+class ChatSubscriptionDerivationTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._empty_install_env = pathlib.Path(tmp.name) / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _run_install_func(self, func_call, env=None):
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source_provisioning_helpers . >/dev/null
+{func_call}
+"""
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        overrides.update(env or {})
+        full_env = get_isolated_test_env(overrides=overrides)
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_default_topic_derives_default_subscription(self):
+        proc = self._run_install_func('echo "SUB=$(derive_chat_sub_name)"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=platform-agent-chat-events-sub", proc.stdout)
+
+    def test_custom_topic_derives_matching_subscription(self):
+        proc = self._run_install_func('echo "SUB=$(derive_chat_sub_name "my-custom-topic")"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_custom_topic_with_empty_sub_derives(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_custom_topic_with_explicit_default_sub_is_preserved(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "platform-agent-chat-events-sub")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=platform-agent-chat-events-sub", proc.stdout)
+
+    def test_explicit_custom_subscription_wins(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "explicit-sub-name")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=explicit-sub-name", proc.stdout)
+
+    def test_custom_topic_ignores_ambient_chat_sub_name_when_not_passed(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic")"',
+            env={"CHAT_SUB_NAME": "stale-env-sub"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_parse_args_supports_chat_sub_name_flag(self):
+        proc = self._run_install_func(
+            'parse_args --chat-sub-name=custom-sub; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=custom-sub", proc.stdout)
+
+    def test_resolve_shared_defaults_leaves_chat_sub_name_empty_when_unset(self):
+        proc = self._run_install_func(
+            'PARAM_CHAT_TOPIC_NAME="custom-events"; resolve_shared_defaults; echo "SUB=${PARAM_CHAT_SUB_NAME:-EMPTY}"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=EMPTY", proc.stdout)
+
+    def test_resolve_shared_defaults_preserves_explicit_chat_sub_name(self):
+        proc = self._run_install_func(
+            'PARAM_CHAT_TOPIC_NAME="custom-events"; PARAM_CHAT_SUB_NAME="my-sub"; resolve_shared_defaults; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_rederives_when_flag_unset(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="" PARAM_CHAT_SUB_NAME="" google_chat_home_channel=""
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=operator-custom-topic-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_preserves_explicit_flag(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="pinned-sub" PARAM_CHAT_SUB_NAME="pinned-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=pinned-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_rederives_when_param_is_recorded_default(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="platform-agent-chat-events-sub" PARAM_CHAT_SUB_NAME="platform-agent-chat-events-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=operator-custom-topic-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_recovers_state_subscription(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+tf_state_chat_subscription_name() {{
+  echo "legacy-managed-sub"
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="" PARAM_CHAT_SUB_NAME="" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=legacy-managed-sub", proc.stdout)
+
+
+@unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")
+class SpinnerTerminalBranchTest(unittest.TestCase):
+    """run_with_spinner on a real terminal, the branch no piped test reaches.
+
+    Every other test in this file runs under a subprocess pipe, so `[ ! -t 1 ]`
+    diverts it to the fallback and the spinner loop, the cursor calls, the
+    background job and the interrupt traps never execute at all. On a terminal
+    -- where an operator actually meets them -- they all do, so these drive one.
+    """
+
+    _READY_TIMEOUT_SECS = 30
+    _POLL_INTERVAL_SECS = 0.1
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp_path = pathlib.Path(tmp.name)
+
+    def _spawn_on_pty(self, script):
+        """Run script under bash with a controlling terminal. Returns its pid."""
+        env = get_isolated_test_env(
+            overrides={"KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json")}
+        )
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(str(_REPO_ROOT))
+                os.execvpe("bash", ["bash", "-c", script], env)
+            finally:  # pragma: no cover - only on execvpe failure
+                os._exit(127)
+        # The spinner redraws continuously, so the pty buffer fills and the child
+        # blocks on write unless someone is reading. Drain it for the run's life.
+        drain = threading.Thread(target=self._drain, args=(fd,), daemon=True)
+        drain.start()
+        self.addCleanup(self._cleanup_pty, pid, fd)
+        return pid
+
+    @staticmethod
+    def _drain(fd):
+        while True:
+            try:
+                if not os.read(fd, 4096):
+                    return
+            except OSError:
+                return
+
+    @staticmethod
+    def _cleanup_pty(pid, fd):
+        for killer in (lambda: os.killpg(os.getpgid(pid), signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
+            try:
+                killer()
+            except OSError:
+                pass
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def _await_file(self, path, what):
+        deadline = time.monotonic() + self._READY_TIMEOUT_SECS
+        while time.monotonic() < deadline:
+            if path.exists() and path.read_text().strip():
+                return path.read_text().strip()
+            time.sleep(self._POLL_INTERVAL_SECS)
+        self.fail(f"timed out after {self._READY_TIMEOUT_SECS}s waiting for {what} at {path}")
+
+    def test_the_spinner_loop_keeps_errexit_out_of_its_interruptible_commands(self):
+        """The loop's forked children must not be able to fire the ERR trap.
+
+        SIGINT from a terminal goes to the whole foreground group, so the loop's
+        own `sleep` and the `tail | tr | cut` pipeline die of it and report 130.
+        Unguarded under `set -Ee` that fires the global ERR trap at install.sh:96,
+        and on_error exits before bash dispatches the pending INT trap -- so the
+        interrupt handler never runs, the worker is orphaned, the cursor stays
+        hidden, and a cancellation is written to the report as "FAILED".
+
+        Asserted on the source. The behaviour needs a signal delivered inside a
+        specific instruction window, which is measurable but not reliably
+        reproducible in a unit test; see this PR's Live validation for the
+        out-of-tree probe that measured it.
+        """
+        source = _INSTALL_SH.read_text()
+        self.assertIn('sleep "$SPINNER_INTERVAL_SECS" || true', source)
+        self.assertIn(
+            '''status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\\r' | cut -c1-"$status_width")" || status_line=""''',
+            source,
+        )
+
+    def test_the_interrupt_traps_arm_before_the_job_they_reap_exists(self):
+        """Arming after the `&` leaves the worker running with SIGINT at default here.
+
+        In that window the shell dies on Ctrl-C while the worker -- which
+        inherited SIG_IGN for SIGINT as a `&` child -- survives it with nothing
+        left to reap it. The order is the fix, so the order is what is pinned.
+        """
+        source = _INSTALL_SH.read_text()
+        arm = source.index("trap 'on_spinner_interrupt 130' INT")
+        start = source.index('"$@" >"$log_file" 2>&1 &')
+        assign = source.index("task_pid=$!")
+        self.assertLess(arm, start, "the INT trap must be armed before the job is backgrounded")
+        self.assertLess(start, assign)
+        self.assertIn('if [ "$task_pid" -ne 0 ]; then', source)
+
+    def test_terminal_branch_returns_the_wrapped_command_status(self):
+        """The spinner branch must propagate the exit code, not the spinner's own."""
+        log_file = self._tmp_path / "rc.log"
+        rc_file = self._tmp_path / "rc.out"
+        script = f"""
+source "{_INSTALLER_COMMON}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+fail_with_42() {{ echo "the wrapped output"; return 42; }}
+rc=0
+run_with_spinner "working" "{log_file}" fail_with_42 || rc=$?
+echo "$rc" > "{rc_file}"
+"""
+        self._spawn_on_pty(script)
+        self.assertEqual("42", self._await_file(rc_file, "the wrapped command's exit status"))
+        self.assertIn("the wrapped output", log_file.read_text())
 
 
 if __name__ == "__main__":

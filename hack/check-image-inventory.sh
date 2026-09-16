@@ -45,6 +45,17 @@ readonly LABEL_MIRRORED="a mirrored install"
 readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
 readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
 
+# The `image:` field of a rendered manifest, quoted or bare, reference in group
+# 1; a reference has no whitespace, so the class stops there and trailing
+# blanks stay out of it. Extended syntax like the two awk patterns above,
+# applied with `sed -E`: the basic-syntax spelling of an optional quote is
+# `"\?`, a GNU extension that BSD sed reads as a pattern matching nothing, so
+# on macOS every `image:` field dropped out of image_refs and nothing reported
+# it (#1449). POSIX basic syntax has `"\{0,1\}`, which works everywhere and
+# reads as a repetition count rather than an optional quote; `-E` is what the
+# sed programs in checks 4 and 5 use.
+readonly IMAGE_FIELD_RE='^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$'
+
 status=0
 
 fail() {
@@ -132,8 +143,14 @@ check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
+# The two a2a images. Both parameterize their bases now: the auth callout on
+# this branch, the gateway on main in #1334.
+check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
+check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
 # major.minor: a builder behind the directive fails the image build (the
@@ -183,7 +200,9 @@ check_go_directive() {
 
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
+check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
@@ -205,14 +224,30 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
   done || status=1
 
 # ---------------------------------------------------------------------------
-# 2. The fluent-bit pin compiled into the operator. It is the only image the
-#    operator falls back to without an env var, so a drift here mirrors the
-#    wrong tag with nothing to catch it at render time.
+# 2. The pins compiled into the operator. Each is an image the operator falls
+#    back to when its env var is unset, so a drift here mirrors the wrong tag
+#    with nothing to catch it at render time. fluent-bit reaches every agent
+#    pod. nats and nats-box reach only a `spec.mode: next` install, which no
+#    chart render in check 3 turns on, so this is the only check that sees
+#    them (#1557). The constants keep Docker Hub's short spelling because that
+#    is the string the operator renders into the pod template; the comparison
+#    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
+#    The first-party next defaults (gateway, worker, callout) fit the same
+#    description and are deliberately not here: they are not inventory
+#    entries, so there is nothing to hold them to until the stack graduates.
 # ---------------------------------------------------------------------------
-want_fluent="$(normalise "$(repo_of fluent-bit)"):$(pin_of fluent-bit)"
-got_fluent="$(sed -n 's/.*fallbackFluentBitImage = "\(.*\)".*/\1/p' k8s-operator/internal/controller/manifest_helpers.go)"
-[ "$(normalise "$got_fluent")" = "$want_fluent" ] ||
-  fail "k8s-operator/internal/controller/manifest_helpers.go: fallbackFluentBitImage is '$got_fluent', but $INVENTORY has '$want_fluent'."
+check_operator_pin() {
+  local name=$1 gofile=$2 constant=$3
+  local want got
+  want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
+  got="$(sed -n "s/^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$gofile" | head -n1)"
+  [ "$(normalise "$got")" = "$want" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
+}
+
+check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage
+check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
+check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
 
 # ---------------------------------------------------------------------------
 # 3. The chart. Rendering it is the only way to see what it actually pulls:
@@ -242,9 +277,12 @@ render_chart() {
   }
 }
 
-# The `image:` fields of a rendered manifest stream on stdin.
+# The `image:` fields of a rendered manifest stream on stdin. The job that
+# runs this, validate.yml, runs it on GNU sed, which accepts the escapes BSD
+# sed does not; tests/test_check_image_inventory_sed_portability.py lints
+# every sed program in this file for them, so a Linux run notices.
 image_field_refs() {
-  sed -n 's/^[[:space:]]*image:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p'
+  sed -E -n "s/${IMAGE_FIELD_RE}/\1/p"
 }
 
 # The image references the *_IMAGE env vars carry, from the same stream. The
@@ -422,12 +460,18 @@ mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR")" || exit 1
 default_images="$(image_refs <<<"$default_render")"
 mirrored_images="$(image_refs <<<"$mirrored_render")"
 
-[ -n "$default_images" ] || {
-  echo "ERROR: the chart rendered no image references at all — the extraction patterns in image_refs no longer match the manifests, so checks 3a, 3b and 3c are inspecting nothing." >&2
+# One guard per extractor rather than one over their union. Either half of
+# image_refs keeps the union non-empty while the other matches nothing, so a
+# guard on the union passes with half the images unchecked — the state macOS
+# sat in until #1449: BSD sed matched nothing for image_field_refs, the env
+# vars kept the list non-empty, and checks 3a, 3b and 3c inspected the three
+# env-var references and none of the `image:` fields.
+[ -n "$(image_field_refs <<<"$default_render")" ] || {
+  echo "ERROR: the chart rendered no 'image:' field that image_field_refs recognises, so checks 3a, 3b and 3c see only the *_IMAGE env vars. Either the chart stopped emitting them, IMAGE_FIELD_RE no longer matches the shape it emits, or this sed does not accept the pattern." >&2
   exit 1
 }
 [ -n "$(image_env_refs <<<"$default_render")" ] || {
-  echo "ERROR: the chart rendered no *_IMAGE env var that image_env_refs recognises, so the images the operator stamps onto agent pods are unchecked — and the 'image:' fields keep the list above non-empty, which is why the guard above does not catch it. Either the chart stopped emitting them or IMAGE_ENV_NAME_RE no longer matches the shape it emits." >&2
+  echo "ERROR: the chart rendered no *_IMAGE env var that image_env_refs recognises, so the images the operator stamps onto agent pods are unchecked. Either the chart stopped emitting them or IMAGE_ENV_NAME_RE no longer matches the shape it emits." >&2
   exit 1
 }
 

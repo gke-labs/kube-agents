@@ -30,6 +30,7 @@ agents/cluster/*.md
 agents/cluster/skills/*/SKILL.md
   agents/cluster/skills/gke-observability/SKILL.md
   agents/cluster/skills/gke-reliability/SKILL.md
+  agents/cluster/skills/gke-stall-detection/SKILL.md
   agents/cluster/skills/gke-storage/SKILL.md
   agents/cluster/skills/gke-workload-scaling/SKILL.md
   agents/cluster/skills/gke-workload-security/SKILL.md
@@ -55,11 +56,16 @@ agents/platform/governance/*.md
   agents/platform/governance/standardization_validator_sop.md
   agents/platform/governance/stockout_prevention_sop.md
 
+agents/platform/scripts/testdata/providers/*/README.md
+  agents/platform/scripts/testdata/providers/github/README.md
+
 agents/platform/skills/*/SKILL.md
+  agents/platform/skills/capacity-obtainability/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
   agents/platform/skills/fleet-audit/SKILL.md
   agents/platform/skills/fleet-upgrade-verification/SKILL.md
   agents/platform/skills/gce-compute-fleet-audit/SKILL.md
+  agents/platform/skills/gcp-config-connector/SKILL.md
   agents/platform/skills/gcp-networking-fabric-audit/SKILL.md
   agents/platform/skills/github-issue-resolver/SKILL.md
   agents/platform/skills/gke-ai-troubleshooting-handle-disruption-gpu-tpu/SKILL.md
@@ -96,9 +102,14 @@ agents/platform/skills/*/SKILL.md
   agents/platform/skills/manage-cluster/SKILL.md
   agents/platform/skills/pr-conversation/SKILL.md
   agents/platform/skills/submit-suggestion/SKILL.md
+  agents/platform/skills/version-control/SKILL.md
   agents/platform/skills/workload-rebalancing/SKILL.md
 
 agents/platform/skills/*/references/*.md
+  agents/platform/skills/gcp-config-connector/references/acquisition.md
+  agents/platform/skills/gcp-config-connector/references/compute-firewall.md
+  agents/platform/skills/gcp-config-connector/references/container.md
+  agents/platform/skills/gcp-config-connector/references/sql.md
   agents/platform/skills/gke-ai-troubleshooting-jobset-interruption/references/failure_signatures.md
   agents/platform/skills/gke-ai-troubleshooting-tpu-vbar-oom/references/failure_signatures.md
   agents/platform/skills/gke-basics/references/cli-reference.md

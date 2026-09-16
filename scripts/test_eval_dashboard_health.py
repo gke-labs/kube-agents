@@ -34,6 +34,23 @@ from eval_dashboard import health
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
 ROSTER_HISTORY = TESTDATA / "roster-history.json"
+# 2026-09-11, the build-cluster node loss (#1478), and BOOTSTRAP_ADMITTED as
+# hack/ci-eval-pr.sh had it that day.
+LOST_FIXTURE = TESTDATA / "lost-pods-2026-09-11.json.gz"
+# The week ending 2026-09-14 18:20Z: every run green, every run long (#1586).
+SLOW_FIXTURE = TESTDATA / "slow-gate-2026-09-14.json.gz"
+ROSTER_0911 = [
+    "reliability-pdb-probe",
+    "security-overgrant-probe",
+    "upgrades-lagging-master-probe",
+    "consistency-authorized-networks-probe",
+    "cost-idle-pool-probe",
+    "obtainability-remediation-proposal",
+    "cluster-agent-crashloop-debug",
+    "cluster-agent-crashloop-misleading-symptom",
+    "cluster-agent-crashloop-evidence-chain",
+    "agent-kanban-smoke",
+]
 CASE_NOTES = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "case-notes.yaml"
 
 UTC = timezone.utc
@@ -101,6 +118,11 @@ def data(*runs):
 
 def green_tasks():
     return [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HOLD_OUT, "fff")]
+
+
+def full_tasks():
+    """Eighteen passing cases: a full run in rule 7's sense (SLOW_MIN_TASKS)."""
+    return [task(f"case-{k}", "ppp") for k in range(18)]
 
 
 def broken_tasks(cases):
@@ -219,16 +241,25 @@ class SharedBreak(unittest.TestCase):
         self.assertEqual(roster.at(T0 - timedelta(days=3)), frozenset())
         self.assertEqual(roster.current, frozenset())
 
-    def test_the_roster_is_read_from_the_ci_script_default_line(self):
+    def test_the_roster_is_read_from_the_roster_file_or_the_old_script(self):
         with tempfile.TemporaryDirectory() as tmp:
-            script = pathlib.Path(tmp) / "ci-eval-pr.sh"
-            script.write_text('#!/bin/bash\nexport BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe,b-probe}"\n')
-            self.assertEqual(health.Roster.from_script(script).current, frozenset({"a-probe", "b-probe"}))
-            script.write_text("#!/bin/bash\n")
+            roster_file = pathlib.Path(tmp) / "blocking-roster.txt"
+            roster_file.write_text("# the roster\na-probe\nb-probe  # admitted 09-01\n\n")
+            self.assertEqual(health.Roster.from_file(roster_file).current, frozenset({"a-probe", "b-probe"}))
+            # The shape the script carried before 2026-09-15, for an era
+            # taken from `git show <old-commit>:hack/ci-eval-pr.sh`, has its
+            # own reader; the file reader treats that line as prose.
+            old_script = '#!/bin/bash\nexport BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe,b-probe}"\n'
+            self.assertEqual(health.Roster.from_script_text(old_script).current, frozenset({"a-probe", "b-probe"}))
+            roster_file.write_text("# a laptop run may export " + old_script.splitlines()[1] + "\nc-probe\n")
+            self.assertEqual(health.Roster.from_file(roster_file).current, frozenset({"c-probe"}))
             with self.assertRaises(SystemExit):
-                health.Roster.from_script(script)
+                health.Roster.from_script_text("c-probe\n")
+            roster_file.write_text("# nothing admitted\n")
+            with self.assertRaises(SystemExit):
+                health.Roster.from_file(roster_file)
         # And the real one parses to a non-empty roster of case names.
-        live = health.Roster.from_script()
+        live = health.Roster.from_file()
         self.assertTrue(live.current)
         self.assertTrue(all("/" not in name and " " not in name for name in live.current))
 
@@ -320,6 +351,27 @@ class SetupDeaths(unittest.TestCase):
             "Retest once the setup failures stop; check the leased pool projects (stuck Helm release, image pulls) before spending another run.",
         )
 
+    def test_a_conflicted_merge_is_not_a_setup_death(self):
+        # 2026-09-15 (#1608): #1569, #1572 and #1575 died in six to twelve
+        # seconds because they would not merge into main, and were reported
+        # as an infrastructure degradation.
+        conflicted = self.deaths([1569, 1572, 1575])
+        for entry in conflicted["runs"]:
+            entry["merge_conflict"] = True
+        self.assertFalse(any(health.Run(entry).setup_death for entry in conflicted["runs"]))
+        result = adjudicate(conflicted, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["metrics"]["setup_deaths"], 0)
+        self.assertEqual(result["metrics"]["infra_reds"], 0, "the author's rebase is not the pool's fault")
+
+    def test_a_clone_that_failed_any_other_way_still_is_one(self):
+        for flag in (False, None):
+            doc = self.deaths([1, 2, 3])
+            for entry in doc["runs"]:
+                if flag is not None:
+                    entry["merge_conflict"] = flag
+            self.assertEqual(assess(doc, T0)["condition"], "setup_deaths", f"merge_conflict={flag}")
+
     def test_greens_that_predate_the_deaths_do_not_recover_it(self):
         doc = self.deaths([1, 2, 3])
         doc["runs"] += [run(200 + i, 20 + i, T0 - timedelta(hours=3) + timedelta(minutes=10 * i), tasks=broken_tasks(set())) for i in range(3)]
@@ -334,6 +386,131 @@ class SetupDeaths(unittest.TestCase):
     def test_a_lowercase_prow_verdict_still_counts(self):
         # Prow wrote `failure` on six zero-task runs on 2026-09-05.
         self.assertEqual(assess(self.deaths([1, 1, 2], result="failure"), T0)["state"], "DEGRADED")
+
+
+# --------------------------------------------------------------------------- #
+# Rule 3b: lost pods
+# --------------------------------------------------------------------------- #
+
+
+def lost(build_id, pr, finished, minutes=120, node="node-a", **fields):
+    """A run whose build node went away, as the collector records it: a
+    zero-task FAILURE with no build log and a NodeNotReady pod event."""
+    raw = run(build_id, pr, finished, minutes=minutes, result="FAILURE")
+    raw.update({"has_build_log": False, "pod_phase": "Failed", "pod_node": node, "pod_last_event": "NodeNotReady"})
+    raw.update(fields)
+    return raw
+
+
+class LostPods(unittest.TestCase):
+    def lost_doc(self, count, spread_minutes=5, prs=None, nodes=("node-a", "node-b")):
+        prs = prs or list(range(1, count + 1))
+        return data(*(lost(100 + i, prs[i], T0 - timedelta(minutes=spread_minutes * i), node=nodes[i % len(nodes)]) for i in range(count)))
+
+    def test_the_predicate_reads_the_pod_record_not_the_clock(self):
+        long_run, short_run = health.Run(lost(1, 1, T0, minutes=128)), health.Run(lost(2, 2, T0, minutes=2))
+        self.assertEqual((long_run.lost_pod, long_run.setup_death), (True, False))
+        self.assertEqual((short_run.lost_pod, short_run.setup_death), (True, False), "under five minutes is still a lost pod, never a setup death")
+        self.assertTrue(health.Run(lost(3, 3, T0, pod_phase=None, pod_node=None, pod_last_event=None)).lost_pod, "a missing log alone is enough")
+        self.assertTrue(health.Run(lost(4, 4, T0, has_build_log=True)).lost_pod, "NodeNotReady alone is enough")
+        self.assertTrue(health.Run(lost(5, 5, T0, result="failure")).lost_pod, "Prow's lowercase verdict")
+        clone_failed = health.Run(lost(6, 6, T0, minutes=0, has_build_log=True, pod_last_event="Started"))
+        self.assertEqual((clone_failed.lost_pod, clone_failed.setup_death), (False, True))
+        legacy = run(7, 7, T0, minutes=2, result="FAILURE")
+        self.assertEqual((health.Run(legacy).lost_pod, health.Run(legacy).setup_death), (False, True), "a document without the fields is unknown")
+        self.assertEqual((health.Run(dict(legacy, duration_s=3600)).lost_pod, health.Run(dict(legacy, duration_s=3600)).setup_death), (False, False))
+        self.assertFalse(health.Run(lost(8, 8, T0, result="ABORTED")).lost_pod)
+        self.assertFalse(health.Run(lost(9, 9, T0, tasks=green_tasks())).lost_pod, "a run with tasks is a full run")
+
+    def test_three_within_thirty_minutes_degrade_and_fewer_or_sparser_do_not(self):
+        result = assess(self.lost_doc(3, spread_minutes=10), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "lost_pods"))
+        self.assertEqual(result["cause"], "lost pods: 3 runs on 3 PRs died with their build node 23:40–00:00 UTC")
+        self.assertEqual(result["evidence"][0], "lost pods: 3 runs on 3 PRs died with their build node 23:40–00:00 UTC (nodes node-a ×2, node-b; #1, #2, #3)")
+        self.assertEqual(assess(self.lost_doc(2), T0)["state"], "GREEN")
+        self.assertEqual(assess(self.lost_doc(3, spread_minutes=15), T0)["state"], "DEGRADED", "0, 15 and 30 minutes ago fit one span")
+        self.assertEqual(assess(self.lost_doc(3, spread_minutes=20), T0)["state"], "GREEN", "0, 20 and 40 minutes ago do not")
+
+    def test_no_distinct_pr_floor_the_pod_record_already_blames_the_node(self):
+        self.assertEqual(assess(self.lost_doc(3, prs=[7, 7, 7]), T0)["condition"], "lost_pods")
+
+    def test_eight_is_a_build_cluster_event(self):
+        # Eight losses four minutes apart: 28 minutes, one span.
+        incident = assess(self.lost_doc(8, spread_minutes=4), T0)["incident"]
+        self.assertTrue(incident["event"])
+        self.assertEqual(incident["nodes"], {"node-a": 4, "node-b": 4})
+        self.assertEqual((incident["runs"], incident["prs"]), (8, list(range(1, 9))))
+        self.assertEqual((incident["window_start"], incident["window_end"]), (health.iso(T0 - timedelta(minutes=28)), health.iso(T0)))
+        self.assertFalse(assess(self.lost_doc(7, spread_minutes=4), T0)["incident"]["event"])
+        # Eight losses five minutes apart span 35 minutes: the densest
+        # 30-minute span holds seven, and seven is not an event.
+        self.assertEqual(assess(self.lost_doc(8), T0)["incident"]["runs"], 7)
+
+    def test_older_losses_in_the_window_are_evidence_not_the_event(self):
+        doc = self.lost_doc(3)
+        doc["runs"].append(lost(200, 20, T0 - timedelta(minutes=90)))
+        result = assess(doc, T0)
+        self.assertEqual(result["incident"]["runs"], 3)
+        self.assertTrue(result["evidence"][0].endswith("; 1 more earlier in the last 2h"), result["evidence"])
+
+    def test_lost_pods_outrank_a_storm_and_are_counted_in_exactly_one_class(self):
+        doc = self.lost_doc(3)
+        for i in range(3):
+            stormy = [task(f"s{k}", "eee") for k in range(2)] + broken_tasks(set())
+            doc["runs"].append(run(300 + i, 30 + i, T0 - timedelta(minutes=2 * i), result="SUCCESS", tasks=stormy))
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["condition"], "lost_pods")
+        self.assertTrue(any(line.startswith("quota storm:") for line in result["evidence"]), "the storm stays as context")
+        self.assertEqual((result["metrics"]["lost_pods"], result["metrics"]["setup_deaths"]), (3, 0))
+        self.assertEqual(result["metrics"]["infra_reds"], 3)
+
+    def test_advice_names_the_nodes_on_the_readers_clock(self):
+        # The first loss was 20 minutes before T0 (2026-09-08 00:00Z): 7:40 PM EDT on the 7th.
+        self.assertEqual(
+            adjudicate(self.lost_doc(3, spread_minutes=10), T0)["advice"],
+            "The Prow build cluster lost node(s) node-a ×2, node-b at 7:40 PM ET; 3 runs died mid-run."
+            " Nothing about your change; /retest when the new jobs are progressing. Cluster owner: check the node events and autorepair.",
+        )
+        self.assertEqual(health.reader_clock(None), "?")
+
+    def test_recovery_needs_greens_after_the_last_loss(self):
+        doc = self.lost_doc(3)
+        doc["runs"] += [run(200 + i, 20 + i, T0 - timedelta(hours=3) + timedelta(minutes=10 * i), tasks=broken_tasks(set())) for i in range(3)]
+        prev = adjudicate(doc, T0)
+        self.assertEqual((prev["state"], prev["condition"]), ("DEGRADED", "lost_pods"))
+        later = T0 + timedelta(hours=2, minutes=1)
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["condition"], held["recovering"]), ("DEGRADED", "lost_pods", True))
+        doc["runs"] += [run(300 + i, 30 + i, later - timedelta(minutes=30 - 5 * i), tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
+
+    def test_the_posters_issue_is_cited_only_for_the_condition_it_was_filed_for(self):
+        doc = self.lost_doc(3)
+        outage_issue = {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "shared_break"}
+        self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": outage_issue})["issue"])
+        owner_issue = dict(outage_issue, number=1301, condition="lost_pods")
+        cited = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": owner_issue})
+        self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner_issue, ["#1301"]))
+        # An issue from before the key was only ever an outage's: cited for
+        # a shared break, never for lost pods.
+        untagged = {"number": 1302, "url": "x"}
+        self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": untagged})["issue"])
+        outage_doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))
+        self.assertEqual(health.adjudicate(outage_doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": untagged})["issue"], untagged)
+
+    def test_trim_carries_how_the_build_ended(self):
+        doc = data(lost(1, 1, T0), run(2, 2, T0, tasks=[task("x", "ppp")]))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")["runs"]
+        self.assertEqual({k: v for k, v in trimmed[0].items() if k in health.ENDED_FIELDS}, {"has_build_log": False, "pod_phase": "Failed", "pod_node": "node-a", "pod_last_event": "NodeNotReady"})
+        self.assertFalse(set(health.ENDED_FIELDS) & set(trimmed[1]))
+
+    def test_trim_carries_merge_conflict_so_a_fixture_replays_the_same_verdict(self):
+        # #1608: a field trim drops is a field the replay cannot see, and the
+        # conflicted merge silently returns as a setup death in the fixture.
+        doc = data(*(dict(run(i, i, T0, minutes=0.2, result="FAILURE"), merge_conflict=True) for i in (1569, 1572, 1575)))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")
+        self.assertTrue(all(entry["merge_conflict"] is True for entry in trimmed["runs"]))
+        self.assertEqual(assess(trimmed, T0)["condition"], None)
 
 
 # --------------------------------------------------------------------------- #
@@ -452,6 +629,65 @@ class Hysteresis(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
+class NightlyTier(unittest.TestCase):
+    """A nightly run (SCHEMA.md: runs[].tier) is never the gate's evidence:
+    not for a rule, not for the recovery bar, not in the digest's numbers."""
+
+    def nightly(self, run_doc):
+        return dict(run_doc, tier="nightly", pr=None)
+
+    def test_a_shared_break_made_of_nightly_runs_is_not_an_outage(self):
+        broken = broken_tasks({"cluster-agent-crashloop-debug"})
+        runs = [run(100 + i, i, T0 - timedelta(minutes=60 * (3 - i)), tasks=broken) for i in range(3)]
+        self.assertEqual(assess(data(*runs), T0)["state"], "OUTAGE", "as presubmit runs, the same three fire")
+        doc = data(*(self.nightly(r) for r in runs))
+        result = assess(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["evidence"], [])
+
+    def test_nightly_storm_reps_and_setup_deaths_do_not_count(self):
+        stormy = [task(f"case-{k}", "eee") for k in range(2)] + [task(n, "ppp") for n in sorted(ADMITTED)]
+        storm_runs = [self.nightly(run(100 + i, None, T0 - timedelta(minutes=20 * i), result="SUCCESS", tasks=stormy)) for i in range(3)]
+        self.assertEqual(assess(data(*storm_runs), T0)["state"], "GREEN")
+        deaths = [self.nightly(run(200 + i, None, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE")) for i in range(3)]
+        self.assertEqual(assess(data(*deaths), T0)["state"], "GREEN")
+
+    def test_nightly_runs_change_nothing_about_a_presubmit_verdict(self):
+        presubmit = [run(100 + i, i, T0 - timedelta(hours=i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(1, 5)]
+        baseline = adjudicate(data(*presubmit), T0)
+        self.assertEqual(baseline["state"], "OUTAGE")
+        nightly_green = self.nightly(run(900, None, T0 - timedelta(minutes=5), tasks=broken_tasks(set())))
+        nightly_red = self.nightly(run(901, None, T0 - timedelta(minutes=3), tasks=broken_tasks({"reliability-pdb-probe"})))
+        with_nightly = adjudicate(data(*presubmit, nightly_green, nightly_red), T0)
+        for key in ("state", "condition", "cause", "failing_cases", "evidence", "incident"):
+            self.assertEqual(with_nightly[key], baseline[key], key)
+        self.assertEqual(with_nightly["metrics"], baseline["metrics"], "the digest's 24h numbers are the presubmit's")
+
+    def test_nightly_greens_do_not_recover_an_incident(self):
+        presubmit = [run(100 + i, i, T0 - timedelta(hours=5) + timedelta(minutes=30 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)]
+        doc = data(*presubmit)
+        prev = adjudicate(doc, T0)
+        later = T0 + timedelta(hours=7)
+        doc["runs"] += [self.nightly(run(300 + i, None, later - timedelta(minutes=10 * i), tasks=broken_tasks(set()))) for i in range(3)]
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["recovering"]), ("OUTAGE", True))
+
+    def test_a_run_without_a_tier_is_the_presubmit(self):
+        doc = data(run(1, 1, T0 - timedelta(hours=1), tasks=broken_tasks(set())))
+        self.assertEqual(adjudicate(doc, T0)["metrics"]["full_runs"], 1)
+        doc["runs"][0]["tier"] = "nightly"
+        self.assertEqual(adjudicate(doc, T0)["metrics"]["full_runs"], 0)
+        doc["runs"][0]["tier"] = "rc"
+        self.assertEqual(adjudicate(doc, T0)["metrics"]["full_runs"], 0, "an unknown tier is never the gate's by default")
+
+    def test_trim_keeps_the_tier_so_a_fixture_replays_the_same_filter(self):
+        doc = data(run(1, 1, T0, tasks=[task("x", "ppp")]), self.nightly(run(2, None, T0, tasks=[task("x", "fff")])))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")
+        self.assertNotIn("tier", trimmed["runs"][0])
+        self.assertEqual(trimmed["runs"][1]["tier"], "nightly")
+        self.assertEqual(len(health.load_runs(trimmed)), 1)
+
+
 class Metrics(unittest.TestCase):
     def test_green_report_metrics(self):
         doc = data(
@@ -481,6 +717,108 @@ class Metrics(unittest.TestCase):
         self.assertEqual(adjudicate(doc, T0)["metrics"]["infra_rep_rate"], round(5 / 9, 3))
 
 
+# --------------------------------------------------------------------------- #
+# Rule 7: slow gate
+# --------------------------------------------------------------------------- #
+
+
+class SlowGate(unittest.TestCase):
+    def week(self, recent, typical=150, baseline=30, recent_end=T0, tasks=None):
+        """`baseline` full runs of `typical` minutes, four hours apart, the
+        newest finishing seven hours before T0; then the `recent` runs
+        (minutes each), ten minutes apart, the last finishing at
+        `recent_end`."""
+        runs = [run(100 + i, i, T0 - timedelta(hours=7 + 4 * i), minutes=typical, tasks=full_tasks()) for i in range(baseline)]
+        runs += [
+            run(200 + i, 50 + i, recent_end - timedelta(minutes=10 * (len(recent) - 1 - i)), minutes=m, tasks=tasks or full_tasks())
+            for i, m in enumerate(recent)
+        ]
+        return data(*runs)
+
+    def test_five_runs_whose_median_is_1_2x_the_weeks_typical_are_slow(self):
+        result = adjudicate(self.week([180, 200, 170, 185, 190]), T0)
+        self.assertEqual(result["state"], "GREEN", "a slow gate is a note, not a state")
+        self.assertEqual(
+            result["slow"],
+            {
+                "since": health.iso(T0),
+                "runs": 5,
+                "min_s": 170 * 60,
+                "median_s": 185 * 60,
+                "max_s": 200 * 60,
+                "baseline_days": 7,
+                "baseline_runs": 30,
+                "baseline_p50_s": 150 * 60,
+                "baseline_p90_s": 150 * 60,
+                "infra_reps": 0,
+            },
+        )
+        self.assertIn("slow gate: last 5 full runs 170–200 min (median 185) against a 7-day typical of 150 min (p90 150); no reps lost", result["evidence"])
+
+    def test_the_median_decides_so_one_straggler_does_not(self):
+        self.assertIsNone(adjudicate(self.week([150, 150, 150, 150, 400]), T0)["slow"])
+        self.assertIsNone(adjudicate(self.week([179] * 5), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([180] * 5), T0)["slow"])
+
+    def test_needs_twenty_full_runs_in_the_baseline_and_five_after_them(self):
+        self.assertIsNone(adjudicate(self.week([200] * 5, baseline=19), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, baseline=20), T0)["slow"])
+        self.assertIsNone(adjudicate(self.week([200] * 4, baseline=0), T0)["slow"])
+
+    def test_only_recent_concluded_full_runs_count(self):
+        # The same five slow runs, the newest finished six hours ago: nobody
+        # is waiting on them.
+        self.assertIsNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=6)), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=5)), T0)["slow"])
+        # Ten cases is a run Prow cut short, not a full run, and an aborted
+        # run concluded nothing: the newest five full runs are then the
+        # baseline's own, at the typical length.
+        short = [task(f"case-{k}", "ppp") for k in range(10)]
+        self.assertIsNone(adjudicate(self.week([200] * 5, tasks=short), T0)["slow"])
+        doc = self.week([200] * 5)
+        for aborted in doc["runs"][-5:]:
+            aborted["result"] = "ABORTED"
+        self.assertIsNone(adjudicate(doc, T0)["slow"])
+
+    def test_an_episode_holds_until_the_median_is_under_1_1x_and_keeps_its_start(self):
+        first = adjudicate(self.week([180] * 5), T0)
+        self.assertIsNotNone(first["slow"])
+        later = T0 + timedelta(hours=1)
+        # 1.15x would not start an episode; it does not end one either.
+        self.assertIsNone(adjudicate(self.week([173] * 5, recent_end=later), later)["slow"])
+        held = adjudicate(self.week([173] * 5, recent_end=later), later, first)
+        self.assertEqual((held["slow"]["since"], held["slow"]["median_s"]), (first["slow"]["since"], 173 * 60))
+        self.assertIsNone(adjudicate(self.week([164] * 5, recent_end=later), later, held)["slow"])
+        # A previous health.json from before the field starts fresh.
+        legacy = {"state": "GREEN", "condition": None, "cause": "", "failing_cases": [], "since": health.iso(T0), "recovering": False}
+        self.assertEqual(adjudicate(self.week([180] * 5), T0, legacy)["slow"]["since"], health.iso(T0))
+
+    def test_a_slow_gate_inside_an_incident_is_not_a_note(self):
+        # Three setup deaths on two pull requests in the last half hour make
+        # the state DEGRADED (rule 3); the same five slow runs are then the
+        # incident's symptom, not a note, and an episode in progress does not
+        # hold across the incident: GREEN afterwards starts one afresh.
+        earlier = T0 - timedelta(hours=1)
+        before = adjudicate(self.week([200] * 5, recent_end=earlier), earlier)
+        self.assertIsNotNone(before["slow"])
+        doc = self.week([200] * 5)
+        doc["runs"] += [run(300 + i, pr, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE") for i, pr in enumerate([1, 1, 2])]
+        degraded = adjudicate(doc, T0, before)
+        self.assertEqual((degraded["state"], degraded["condition"]), ("DEGRADED", "setup_deaths"))
+        self.assertIsNone(degraded["slow"])
+        self.assertFalse(any(line.startswith("slow gate") for line in degraded["evidence"]), degraded["evidence"])
+        later = T0 + timedelta(hours=3)
+        again = adjudicate(self.week([200] * 5, recent_end=later), later, degraded)
+        self.assertEqual((again["state"], again["slow"]["since"]), ("GREEN", health.iso(later)))
+
+    def test_repetitions_lost_in_the_slow_runs_are_counted(self):
+        doc = self.week([200] * 5)
+        doc["runs"][-1]["tasks"][-1] = task("case-17", "eee")
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["slow"]["infra_reps"], 3)
+        self.assertTrue(result["evidence"][-1].endswith("; 3 reps lost to infra"), result["evidence"])
+
+
 class Advice(unittest.TestCase):
     def test_outage_advice_cites_the_tracking_issue_from_case_notes(self):
         notes = {"compliance-rbac-overgrant": {"issues": ["#998", "#1171"]}}
@@ -488,6 +826,21 @@ class Advice(unittest.TestCase):
         self.assertEqual(text, "Don't retest yet; the failing cases share a cause. Tracking: #998, #1171")
         text = health.advice_for("OUTAGE", "shared_break", ["unknown-case"], None, notes)
         self.assertTrue(text.endswith("Tracking: no issue filed yet — file one with the presubmit-gate label"))
+
+    def test_the_posters_tracking_issue_rides_in_health_json_until_green(self):
+        doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))
+        posted = {"state": "OUTAGE", "issue": {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300"}}
+        first = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted=posted)
+        self.assertEqual(first["issue"], posted["issue"])
+        self.assertEqual(first["tracking_issues"], ["#1300"])
+        self.assertEqual(first["advice"], "Don't retest yet; the failing cases share a cause. Tracking: #1300")
+        # Carried from the previous health.json when the poster's state has none.
+        second = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE"})
+        self.assertEqual(second["issue"], posted["issue"])
+        # Gone on GREEN, and never a non-issue.
+        self.assertIsNone(health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED), posted=posted)["issue"])
+        self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": None})["issue"])
+        self.assertEqual(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED))["tracking_issues"], [])
 
     def test_the_repo_case_notes_load(self):
         notes = health.load_case_notes(CASE_NOTES)
@@ -608,6 +961,148 @@ class Replay(unittest.TestCase):
         # window's moving bounds do not count. Bound the week's entries so
         # the poster's silence is real, not a coincidence of the fixture.
         self.assertLess(len(self.timeline), 60, [e["at"] for e in self.timeline])
+
+
+class LostPodsReplay(unittest.TestCase):
+    """2026-09-11 (#1478): the published data.json's runs of that day, with
+    the twenty zero-task reds re-read by the collector so they carry
+    has_build_log and the pod record. Twelve of them are lost pods -- five
+    nodes went NotReady 14:03-14:17Z under runs on twelve pull requests --
+    and eight are clone failures (setup deaths), five of them in the morning.
+    health.py of the day counted three of the twelve as setup deaths and
+    advised checking the pool projects."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = health.load_json(LOST_FIXTURE)
+        cls.roster = health.Roster.fixed(ROSTER_0911)
+        cls.every = list(health.replay(cls.data, timedelta(minutes=30), cls.roster, start=day("09-11")))
+        cls.timeline = health.timeline(cls.every)
+
+    def tick(self, when):
+        return next(h for now, h in self.every if now == when)
+
+    def test_the_fixture_is_what_trim_produces(self):
+        trimmed = self.data["trimmed"]
+        again = health.trim(self.data, health.parse_iso(trimmed["from"]), health.parse_iso(trimmed["to"]), trimmed["source"])
+        self.assertEqual(again["runs"], self.data["runs"])
+        runs = [health.Run(r) for r in self.data["runs"]]
+        self.assertEqual(sum(1 for r in runs if r.lost_pod), 12)
+        self.assertEqual(sum(1 for r in runs if r.setup_death), 8)
+
+    def test_the_morning_clone_failures_are_still_setup_deaths(self):
+        # 10:50-11:16Z: four clone failures on three pull requests (#1195
+        # twice, #1456, #1468), none of them a lost pod.
+        entry = at(self.timeline, day("09-11", 11, 30))
+        self.assertEqual((entry["state"], entry["condition"]), ("DEGRADED", "setup_deaths"), entry)
+        self.assertNotIn("lost_pods", {e["condition"] for e in between(self.timeline, day("09-11"), day("09-11", 14, 0))})
+
+    def test_the_build_cluster_event_is_lost_pods_on_five_nodes(self):
+        entry = at(self.timeline, day("09-11", 14, 30))
+        self.assertEqual((entry["state"], entry["condition"]), ("DEGRADED", "lost_pods"), entry)
+        self.assertEqual(entry["cause"], "lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC")
+        tick = self.tick(day("09-11", 15, 0))
+        self.assertEqual(
+            tick["incident"],
+            {
+                "prs": [926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1456, 1460, 1471],
+                "runs": 12,
+                "window_start": "2026-09-11T14:05:52+00:00",
+                "window_end": "2026-09-11T14:19:16+00:00",
+                "nodes": {
+                    "gke-kube-agents-prow-default-pool-eb220b2a-6uhg": 1,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-93sl": 2,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-er33": 3,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-pe72": 3,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3,
+                },
+                "event": True,
+            },
+        )
+        self.assertTrue(
+            tick["advice"].startswith(
+                "The Prow build cluster lost node(s) gke-kube-agents-prow-default-pool-eb220b2a-6uhg, gke-kube-agents-prow-default-pool-eb220b2a-93sl ×2,"
+                " gke-kube-agents-prow-default-pool-eb220b2a-er33 ×3, gke-kube-agents-prow-default-pool-eb220b2a-pe72 ×3, gke-kube-agents-prow-default-pool-eb220b2a-sgnk ×3"
+                " at 10:05 AM ET; 12 runs died mid-run."
+            ),
+            tick["advice"],
+        )
+
+    def test_setup_deaths_no_longer_claim_the_lost_pods(self):
+        # At 15:00Z the setup-death window holds three clone failures (#1471
+        # 13:14Z, #1446 14:29Z, #1319 14:49Z); #1351's 297-second lost pod,
+        # which the old rule counted, is not among them.
+        tick = self.tick(day("09-11", 15, 0))
+        setup = [line for line in tick["evidence"] if line.startswith("setup/clone failures:")]
+        self.assertEqual(setup, ["setup/clone failures: 3 runs under 5 min with no tasks in the last 2h (#1319, #1446, #1471)"])
+        self.assertEqual((tick["metrics"]["lost_pods"], tick["metrics"]["setup_deaths"]), (12, 8))
+
+
+class SlowGateReplay(unittest.TestCase):
+    """2026-09-14 (#1586): the published data.json's runs of the week ending
+    18:20Z that day -- the seven days rule 7's baseline needs. Every run of
+    the afternoon was green and three hours long (Vertex latency; the 429s
+    were all retried), so rules 1-3b see nothing. The note appears at 18:00Z,
+    about one run's length after the slowdown began, and never over the quiet
+    09-12/13 weekend before it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = health.load_json(SLOW_FIXTURE)
+        # The roster enters rules 1 and 4 only; rule 7 reads the wall clock.
+        cls.every = list(health.replay(cls.data, timedelta(minutes=30), health.Roster.fixed(ROSTER_0911), start=day("09-07", 18, 0)))
+
+    def tick(self, when):
+        return next(h for now, h in self.every if now == when)
+
+    def test_the_fixture_is_what_trim_produces(self):
+        trimmed = self.data["trimmed"]
+        again = health.trim(self.data, health.parse_iso(trimmed["from"]), health.parse_iso(trimmed["to"]), trimmed["source"])
+        self.assertEqual(again["runs"], self.data["runs"])
+
+    def test_the_quiet_weekend_is_not_slow(self):
+        self.assertEqual([now for now, h in self.every if day("09-12") <= now < day("09-14", 18, 0) and h["slow"]], [])
+
+    def test_09_14_reads_slow_from_18_00z_with_the_days_numbers(self):
+        tick = self.tick(day("09-14", 18, 0))
+        self.assertEqual(tick["state"], "GREEN")
+        self.assertEqual(
+            tick["slow"],
+            {
+                "since": "2026-09-14T18:00:00+00:00",
+                "runs": 5,
+                "min_s": 9161,
+                "median_s": 10984,
+                "max_s": 12836,
+                "baseline_days": 7,
+                "baseline_runs": 264,
+                "baseline_p50_s": 9085,
+                "baseline_p90_s": 11919,
+                "infra_reps": 2,
+            },
+        )
+        self.assertIn("slow gate: last 5 full runs 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to infra", tick["evidence"])
+        self.assertEqual(self.tick(day("09-14", 18, 30))["slow"]["since"], "2026-09-14T18:00:00+00:00", "the episode keeps its start")
+
+    def test_the_replay_timeline_shows_the_note_beside_the_state(self):
+        # `--replay` is how a threshold is re-checked on the next incident,
+        # so the note's edges are entries and the text form names them.
+        entries = health.timeline(self.every)
+        edge = next(e for e in entries if e["slow"] and health.parse_iso(e["at"]) >= day("09-14"))
+        self.assertEqual((edge["at"], edge["state"], edge["slow"]), ("2026-09-14T18:00:00+00:00", "GREEN", {"since": "2026-09-14T18:00:00+00:00", "median_s": 10984, "baseline_p50_s": 9085}))
+        self.assertIn("2026-09-14T18:00:00+00:00  GREEN      (slow since 2026-09-14T18:00:00+00:00: median 183 min against 151)", health.format_timeline([edge]))
+        self.assertTrue(all(e["slow"] is None for e in entries if day("09-12") <= health.parse_iso(e["at"]) < day("09-14", 18, 0)))
+
+    def test_three_runs_above_the_seven_day_p90_would_not_have_fired(self):
+        # The rule the issue proposed, checked at the tick the note appears:
+        # the newest three full runs took 207, 152 and 167 minutes against a
+        # p90 of 198, because 09-08 to 09-11 had been slow days too.
+        now = day("09-14", 18, 0)
+        full = [r for r in health.load_runs(self.data) if r.finished <= now and r.result in ("SUCCESS", "FAILURE") and len(r.tasks) >= health.SLOW_MIN_TASKS]
+        p90 = health.percentile([r.wall_clock.total_seconds() for r in full[:-3] if r.finished > now - health.SLOW_BASELINE], 90)
+        self.assertEqual([int(r.wall_clock.total_seconds() // 60) for r in full[-3:]], [207, 152, 167])
+        self.assertEqual(int(p90 // 60), 198)
+        self.assertFalse(all(r.wall_clock.total_seconds() > p90 for r in full[-3:]))
 
 
 class CommandLine(unittest.TestCase):

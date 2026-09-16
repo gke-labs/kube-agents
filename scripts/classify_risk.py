@@ -386,6 +386,10 @@ def post_check_run(api, head_sha, result):
     SHA; a fresh POST each time would stack runs, leaving the stale verdict
     ("declares low") standing beside the corrected one with nothing marking
     which is current. So the existing run is PATCHed when there is one --
+    the list-then-write is not atomic, so two runs classifying one head at
+    the same moment (the workflow groups concurrency per head, so an `edited`
+    run for a superseded head and the `synchronize` run for the current one
+    can overlap) may both POST; later runs then PATCH the newest of the pair --
     filtered to the github-actions app AND this script's external_id. The app
     slug alone is not enough: the workflow job's own check run is created by
     the same app on the same SHA, and on a re-classification it is the newest

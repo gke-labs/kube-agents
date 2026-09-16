@@ -119,9 +119,9 @@ is happening inside _some_ lease but never whose.
 
 ## 4. Consequences for the two skills
 
-**fleet-audit** threads `lease=<audit-id>` through `start`, `remediate`, and `finish`. Six streams
-that used to share one tree now hold six, so `finish`'s forced checkout and the untracked manifests
-`start` left behind are no longer racing anyone.
+**fleet-audit** threads `lease=<audit-id>` through `start`, `remediate`, and `finish`. Each of the nine
+audit streams holds a tree of its own, so `finish`'s forced checkout and the untracked manifests
+`start` left behind race nobody.
 
 **submit-suggestion** grows two subcommands. `prepare --branch <name>` leases a clone, resets it,
 cuts the branch off the repository's default branch — `origin/HEAD`, overridable with

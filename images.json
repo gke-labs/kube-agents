@@ -65,7 +65,7 @@
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
-      "tag": "v1.98.0",
+      "tag": "v1.100.0",
       "override": "LITELLM_IMAGE",
       "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
       "description": "The model gateway the agent's baked default endpoint points at."
@@ -74,16 +74,34 @@
       "name": "fluent-bit",
       "origin": "third-party",
       "repository": "docker.io/fluent/fluent-bit",
-      "tag": "5.1.1",
+      "tag": "5.1.2",
       "override": "FLUENT_BIT_IMAGE",
       "pulledBy": "The logging sidecar the operator injects into every agent pod.",
       "description": "Ships agent container logs off the pod."
     },
     {
+      "name": "nats",
+      "origin": "third-party",
+      "repository": "docker.io/library/nats",
+      "tag": "2.10-alpine",
+      "override": "A2A_NATS_IMAGE",
+      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing on a default install.",
+      "description": "The JetStream bus behind the A2A next stack. The pin is the operator's compiled default; the env var is the only override, since the chart does not set it."
+    },
+    {
+      "name": "nats-box",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/nats-box",
+      "tag": "0.14.5",
+      "override": "A2A_PROVISION_IMAGE",
+      "pulledBy": "The provision Job the operator runs against that NATS under spec.mode: next, and nothing on a default install.",
+      "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats."
+    },
+    {
       "name": "k8s",
       "origin": "third-party",
       "repository": "docker.io/alpine/k8s",
-      "tag": "1.36.2",
+      "tag": "1.36.4",
       "pulledBy": "The chart's pre-delete cleanup hook Job.",
       "description": "alpine/k8s — kubectl plus a shell, for the hook that deletes the PlatformAgent CR before Helm removes the operator. The name is the trailing path segment because the chart renders this one: kube-agents.imageRepository rewrites onto <prefix>/<trailing name>, which has to be the destination mirror_images.sh writes (<prefix>/<name>)."
     },
@@ -181,8 +199,17 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile and a2a/Dockerfile.gateway builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway and a2a/Dockerfile.worker builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
+    },
+    {
+      "name": "node",
+      "origin": "build-time",
+      "repository": "docker.io/library/node",
+      "tag": "22-slim",
+      "buildArg": "NODE_IMAGE",
+      "pulledBy": "a2a/Dockerfile.worker runtime stage.",
+      "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary."
     },
     {
       "name": "python",
@@ -199,7 +226,7 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile and a2a/Dockerfile.gateway runtime stages.",
+      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout and a2a/Dockerfile.gateway runtime stages.",
       "description": "Runtime base for the operator image."
     },
     {

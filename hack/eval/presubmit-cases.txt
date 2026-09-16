@@ -1,0 +1,154 @@
+# The presubmit eval matrix: what every pull request runs.
+#
+# One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
+# a comment, blank lines are skipped. hack/ci-eval-pr.sh reads this file at
+# startup into its TASKS array and refuses to start on a line that names no
+# case directory; scripts/validate_bench_cases.py reads it too, so a case
+# under bench/tasks/ that is in neither this file nor nightly-cases.txt
+# fails the registration lint. Cases are NOT discovered; this list is the
+# registration.
+#
+# WHO APPROVES. Adding or removing a line here changes what every pull
+# request runs, so hack/OWNERS puts this file and blocking-roster.txt under
+# the eval-crew alias with no_parent_owners: a root approver alone cannot
+# merge an edit. nightly-cases.txt, a new case directory and the script
+# itself need only the normal approvers (#1546, decided 2026-09-15).
+#
+# WHERE A NEW CASE GOES. nightly-cases.txt, by default. A case earns a seat
+# here on its nightly record, and never in the pull request that makes it
+# pass; a seat here for a case nobody has watched pass and fail is how a case
+# that can only fail reds every pull request in the repository.
+# docs/designs/bench-case-format.md "Registration" is the rule. The
+# commented-out parking state the TASKS array used to carry is retired: a
+# `#` line in this file is a comment, never a registration, and the
+# validator rejects a commented-out case path. A case whose fixture does not
+# exist at all waits in the validator's FIXTURE_NOT_READY allowlist with the
+# issue that plants it.
+#
+# ORDER. This list is the gate's REPORTING order. Execution order is the
+# fan-out's cost-hinted queue in the script (unit_cost_hint, longest units
+# first), so a Prow deadline kills whatever is still in flight rather than
+# truncating this list's tail. A case known to be slow gets a unit_cost_hint
+# entry in the script, not a position here.
+#
+# BUDGET. Seven domains through probes, the audit machinery through one
+# canary. The 2026-08-26 smoke run (build 2092638061140643840,
+# kube-agents-evals-3) measured what six full audits cost:
+# obtainability-planted-pdb PASSED in 962s and compliance-rbac-overgrant in
+# 606s, the three that failed did so on agent-endpoint HTTP 502s (transport,
+# not scenario bugs), and the job's 85-minute deadline expired before
+# rca-remediation-pr ever ran. Six domains at 600-1300s each do not fit one
+# presubmit, so each audit domain is covered by a PROBE -- a targeted
+# question about that domain's planted defect, graded on the reply, the
+# shape cluster-agent-crashloop-debug proved at 142s -- and exactly ONE full
+# audit stays active as the machinery canary: compliance-rbac-overgrant, the
+# measured-clean one, which exercises SOP dispatch, delegation, the token
+# minter and the ledger write end to end under the fleet-audits domain. The
+# comment above EVAL_REPETITIONS in the script carries the measured history
+# of that budget (its last serial figure is the twenty-task job at ~317min);
+# recount the entries here rather than trusting any count in prose.
+
+# ── The domain probes ────────────────────────────────────────────────────────
+./tasks/reliability-pdb-probe/task.yaml
+./tasks/capacity-pinned-pool-probe/task.yaml
+./tasks/security-overgrant-probe/task.yaml
+./tasks/upgrades-lagging-master-probe/task.yaml
+./tasks/consistency-authorized-networks-probe/task.yaml
+./tasks/cost-idle-pool-probe/task.yaml
+
+# The security prompt variation, in the same relation to
+# security-overgrant-probe that obtainability-remediation-proposal below
+# holds to reliability-pdb-probe: the probe asks whether debug-binding is
+# appropriately scoped, this one asks for the fix and checks the reply for a
+# manifest's load-bearing nouns (apiVersion, roleRef, subjects -- substrings,
+# not schema validation), still with no cluster write. Measured 533s for
+# three repetitions on build 2094466401401049088 (2026-08-31, GREEN) -- 178s
+# each, so unit_cost_hint's 200s default fits it. It carries one safeguard
+# where the reliability variation below carries two; its task.yaml documents
+# why the second cannot be grounded on a namespaceless role.
+./tasks/security-overgrant-remediation-proposal/task.yaml
+
+# Three activations that took the reliability domain to five enabled cases
+# (#1049), each grading a behavior nothing else grades: PDB SEMANTICS (what
+# a wrong budget does -- minAvailable: 2 on two replicas blocks drains),
+# fleet-wide DISCOVERY (the prompt does not name the workload), and SILENCE
+# on a namespace with no PDB-relevant defect (the false-alarm case). The
+# semantics and silence objectives grade an output-contract token their
+# prompts demand -- see the task headers for the two measured runs that
+# forced that design. All three are probe-shaped, read-only against the same
+# no-pdb-workload fixture, and measured across #1049's three draft smoke runs
+# (the third, build 2094442155576659968 on 2026-08-31, ran the contracted
+# prompts GREEN), so the 200s default fits them. silence's header carries its
+# #984 history.
+./tasks/obtainability-pdb-semantics/task.yaml
+./tasks/obtainability-fleet-exposure-sweep/task.yaml
+./tasks/obtainability-healthy-namespace-silence/task.yaml
+
+# The reliability prompt variation that grades what the probe does not ask
+# for: reliability-pdb-probe asks whether checkout-gateway survives a drain;
+# this one asks for a remediation manifest and checks the reply for its
+# load-bearing nouns (PodDisruptionBudget, a selector,
+# minAvailable/maxUnavailable -- substrings, not schema validation), still
+# with no cluster write. Measured on #984's three presubmit runs:
+# 126s/130s/124s, OutcomeValidity 1.0 each time, on three different leased
+# projects. Its siblings obtainability-direct-query and
+# obtainability-refusal-direct-mutation run in the nightly.
+./tasks/obtainability-remediation-proposal/task.yaml
+
+# rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
+# validation run: cost and signal were unmeasured (the 2026-08-26 run hit the
+# job deadline before reaching it), so that entry's first smoke WAS the
+# measurement. The one active case that WRITES: it files a remediation PR
+# against the leased project's throwaway GitOps repo via submit-suggestion.
+# Priced at 700s in unit_cost_hint.
+./tasks/rca-remediation-pr/task.yaml
+
+# The audit-machinery canary: measured 606s clean on 2026-08-26, every exact
+# check green -- the only case that has proven the A1/A4 path (minted token,
+# cloned *-infra workspace, published ledger issue) in a real presubmit.
+# Priced at 700s in unit_cost_hint.
+./tasks/compliance-rbac-overgrant/task.yaml
+
+# Activated by #939, the first Phase 2 domain scenario to run. It was blocked
+# on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
+# exercises the whole of the script's step 2b end to end: label discovery,
+# slot-to-role resolution, the .confirmed probe, and fleet_resource_property
+# binding the role to a kubeconfig. It is the cheapest case in this list
+# (142s on the 2026-08-25 run) and it proves the chain the probes above stand
+# on.
+./tasks/cluster-agent-crashloop-debug/task.yaml
+
+# Three more cluster-debugging cases in the same family, added by #982:
+# measured 190s, 142s and 220s on build 2092719124550520832, all
+# `deployer: noop`, read-only against the crashloop-workload and
+# no-pdb-workload fixtures on seeded cluster A. They were activated while
+# still `validated: false`, the state cluster-agent-crashloop-debug activated
+# in and for the same reason: only a scored presubmit run closes that field.
+# The verification half was validated first: all nine fleet safeguards
+# across the four were driven through the real FleetResourcePropertyVerifier
+# against live Kubernetes objects matching the fixtures -- nine pass as
+# planted, nine fail against the mutation a misbehaving agent would make,
+# nine pass again on revert -- and two scored runs bore that out
+# (VerificationCatastrophic and VerificationCoverage both 1.0 throughout).
+# The fourth of the family, cluster-agent-pending-replicas-capped-pool, runs
+# in the nightly; nightly-cases.txt says why.
+./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml
+./tasks/cluster-agent-crashloop-evidence-chain/task.yaml
+./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
+
+# agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
+# (~100-300s), not a cluster. Re-admitted to the blocking roster after the
+# 2026-08-27 redesign (a real SRE question graded on kanban_create plus
+# cluster names).
+./tasks/agent-kanban-smoke/task.yaml
+
+# Moved out to nightly-cases.txt, for the record:
+#   gpu-stress-test-diagnosis and autoops-warning-event-triage, 2026-09-03
+#   (tofu wall clock, #1218/#1202); knowledge-grounding-sources-probe,
+#   2026-09-09 after one presubmit cycle (#945: knowledge grounding is not a
+#   core kube-agents journey); the four full audits recast on 2026-08-26
+#   (obtainability-planted-pdb, stockout-pinned-pool,
+#   upgrade-readiness-lagging-cluster, consistency-drift-outlier), each
+#   domain covered by its probe above; obtainability-direct-query,
+#   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
+#   cases this file's predecessor held commented out.

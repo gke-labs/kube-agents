@@ -149,17 +149,32 @@ SOURCES: dict[str, Source] = {
         ("DefaultPlatformAgentVersion",),
     ),
     "operator_clusterrole": Source(
-        # The second anchor was "resourceNames", proving the bind-to-view
-        # restriction. #387 removed the bind rule outright — the operator no
-        # longer binds agents to the built-in view role at all, a narrowing —
-        # so the restriction has nothing to anchor to and A4 asserts bind's
-        # absence instead.
+        # "resourceNames" is back as an anchor, and it is the load-bearing one.
+        # #387 removed the operator's only bind rule (bind-to-view), and for a
+        # while A4 asserted bind's absence, so there was nothing for it to
+        # anchor to. The auth callout reintroduces bind, over exactly one name
+        # (system:auth-delegator), and A4 is once again a statement about how
+        # that bind is bounded rather than about its absence. Deleting the
+        # scoping is the mutation this anchor exists to make loud.
         "k8s-operator/config/rbac/role.yaml",
-        ("clusterrolebindings",),
+        ("clusterrolebindings", "resourceNames"),
+    ),
+    # The other Role a kustomize install ships. role.yaml is the operator's
+    # ClusterRole and was for a long time the only RBAC A4 read; this one is
+    # listed beside it in config/rbac/kustomization.yaml and grants the
+    # leader-election recorder its event verbs. An escalation verb added here
+    # installs exactly as readily as one added there.
+    "operator_leader_election_role": Source(
+        "k8s-operator/config/rbac/leader_election_role.yaml",
+        ("kind: Role", "leader-election-role"),
     ),
     "chart_operator_rbac": Source(
         "charts/kube-agents/templates/operator-rbac.yaml",
-        ("END GENERATED RULES",),
+        # The end marker bounds the generated block. The leader-election Role
+        # is anchored too because it is the chart's RBAC object OUTSIDE that
+        # block -- the one `make chart-sync` does not manage and a
+        # block-scoped parse never reached.
+        ("END GENERATED RULES", "operator-leader-election-role"),
     ),
     "admission_policy": Source(
         "k8s-operator/config/admission/agent-rbac-policy.yaml",
@@ -207,6 +222,25 @@ SOURCES: dict[str, Source] = {
         "platformagent-ha.yaml",
         ("kind: Deployment", "kubeagents:leader:", "- pods"),
     ),
+    # C1's cross-module pair. The session fence is rendered by the operator
+    # (Go module k8s-operator) and its selector has to match the labels the
+    # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
+    # can compare them, and a NetworkPolicy that selects nothing is
+    # indistinguishable from one that is working.
+    "a2a_session_fence": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
+    ),
+    # labelPartOf lives here rather than beside the fence, so resolving the
+    # operator's side of the pair needs both files.
+    "operator_labels": Source(
+        "k8s-operator/internal/controller/manifest_helpers.go",
+        ("labelPartOf",),
+    ),
+    "a2a_spawner": Source(
+        "a2a/gateway/spawn.go",
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+    ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
     # the chat plugin's module, and tests/test_litellm_redaction.py keeps the
@@ -225,6 +259,37 @@ SOURCES: dict[str, Source] = {
             "gserviceaccount",
             "def redact_text(",
         ),
+    ),
+    # The operator half of C1's identity check. The spawner names a session
+    # ServiceAccount; this file is where that account is built and where every
+    # RBAC binding the A2A stack renders lives, so it is what decides whether
+    # the name the spawner uses authorises anything.
+    "a2a_callout_rbac": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
+    ),
+    # A3's task-plane writer sets. The bus principals are data in one Go file
+    # (the rendered map and the static nats.conf users come from the same
+    # list), except the session's, which the callout derives from the
+    # attested pod name at mint time and which is therefore in no map at all.
+    # Two files, two modules, and the writer-set invariant is about the union.
+    "a2a_identities": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("func gatewayIdentity", "func workerIdentity", "a2a.tasks.*.*.supervisor"),
+    ),
+    "a2a_session_grants": Source(
+        "a2a/authcallout/session.go",
+        ("func sessionGrants", "lib.TaskEventsSubject(pod,"),
+    ),
+    # What the server actually loads, as opposed to what the Go builders say.
+    # The writer-set tests read both and assert they agree: the Go map is what
+    # a developer edits, this is what NATS enforces, and a reader of only the
+    # first has been wrong before -- a builder that assembled its list in a
+    # local variable instead of a struct literal parsed as *no grants at all*,
+    # which made A3's own known violation report as closed.
+    "a2a_rendered_nats_conf": Source(
+        "a2a/authcallout/testdata/rendered-nats.conf",
+        ("user: worker", "auth_users:", "a2a.tasks.*.*.supervisor"),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
@@ -304,6 +369,39 @@ def yaml_documents(name: str) -> tuple[dict, ...]:
             f"{SOURCES[name].path} carries an inline Helm expression; the "
             f"conformance suite cannot read it as a rendered object set"
         )
+    return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
+
+
+#: What an inline Helm expression becomes in helm_documents(). Not a name any
+#: RBAC verb, group or resource has a reason to contain, so a caller can assert
+#: it did not land in a field the caller is reading.
+HELM_PLACEHOLDER = "helm-expression"
+
+_HELM_EXPRESSION = re.compile(r"\{\{-?.*?-?\}\}")
+
+
+@functools.lru_cache(maxsize=None)
+def helm_documents(name: str) -> tuple[dict, ...]:
+    """Every YAML document in a chart template, with expressions neutralized.
+
+    yaml_documents() refuses a source carrying an inline `{{ }}`, on the
+    grounds that an expression inside a value changes what the object says and
+    dropping it silently would let a chart assert something the cluster never
+    sees. That is right for a template whose values are the assertion. It is
+    wrong for one where the fields under test are plain and only the names
+    around them are templated -- an RBAC rule's verbs next to a
+    `{{ .Release.Name }}` in metadata -- because refusing there means not
+    reading the object at all, which is how the chart's leader-election Role
+    came to be parsed by nothing.
+
+    So the expression becomes HELM_PLACEHOLDER instead of an exception, and
+    the obligation the refusal used to discharge moves to the caller: check
+    that the placeholder is not sitting in a field you are about to trust.
+    """
+    body = "\n".join(
+        line for line in text(name).splitlines() if not _HELM_DIRECTIVE.match(line)
+    )
+    body = _HELM_EXPRESSION.sub(HELM_PLACEHOLDER, body)
     return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
 
 

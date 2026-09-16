@@ -13,7 +13,6 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _PLUGIN_DIR = _REPO_ROOT / "agentplugins" / "gke-stockout-investigator"
 _SCENARIOS_DIR = _PLUGIN_DIR / "scenarios"
-_INSTALL_SCRIPT = _PLUGIN_DIR / "install.sh"
 _CLEAN_KANBAN_SCRIPT = _SCENARIOS_DIR / "lib" / "clean_stale_kanban_tasks.py"
 
 # AgentPlugin object name, Helm release, and Hermes plugin module — one identifier, fixed
@@ -25,6 +24,13 @@ _PLUGIN_SKILL_NAME = "gke-stockout-investigator"
 # the live CR: the fixture has to name the same agent install.sh will, and install.sh
 # takes it from AGENT_REF or this default without consulting the cluster.
 _DEFAULT_AGENT_REF = "platform-agent"
+_CRD_NAME = "agentplugins.kubeagents.x-k8s.io"
+
+# Suites in tests/e2e/e2e_config.yaml that run this test file. When E2E_SUITE matches
+# any of these, the stockout plugin is required to be provisioned, and its absence fails
+# the run (pytest.fail) rather than skipping it.
+# Enforced by test_suites_running_stockout_match_expected_suites_tuple in tests/test_stockout_fixture_helpers.py.
+_EXPECTED_E2E_SUITES = ("rc", "nightly", "stockout-full", "investigations")
 
 # Everything this fixture does has to finish inside the E2E job's `timeout-minutes`
 # (.github/workflows/e2e-run.yml, whose default is what the RC pipeline gets), which also
@@ -39,12 +45,6 @@ _DEFAULT_AGENT_REF = "platform-agent"
 # minutes. Sum of the individual caps exceeds it deliberately — each is the honest
 # ceiling for its own step, and the budget is what binds when several go long at once.
 _FIXTURE_BUDGET_SECONDS = 600
-# Only reachable when the AgentPlugin is absent, which on the RC means the environment was
-# never provisioned rather than that the plugin drifted. Bounded because install.sh builds
-# and pushes an image on that path: before this, a hung gcloud or docker burned the whole
-# job timeout with no output. The fixture budget above binds first, and that is the
-# intended ceiling — a plugin missing outright is a finding, not something to wait out.
-_INSTALL_TIMEOUT_SECONDS = 600
 # How long the gateway's generation has to hold still before its spec counts as settled.
 #
 # Step 2 provisions the environment immediately before this suite runs, and a `helm
@@ -65,22 +65,29 @@ _GENERATION_STABLE_SECONDS = 20
 # roll on a warm node rather than a boot from nothing.
 _ROLLOUT_TIMEOUT_SECONDS = 300
 _PLUGIN_READY_TIMEOUT_SECONDS = 300
+# How long an AgentPlugin must continuously report Degraded before treating it as a
+# permanent failure rather than a transient condition.
+#
+# The operator updates plugin.Status.ObservedGeneration = plugin.Generation on every pass
+# before evaluating readiness (platformagent_controller.go:3004), and maps live container
+# states such as ErrImagePull, ImagePullBackOff, or staging crashes directly into
+# Degraded (platformagent_controller.go:3076-3119). During gateway rollouts or under
+# registry throttling (e.g. HTTP 429), kubelet retries pulling the image on an exponential
+# backoff (10s -> 20s -> 40s...). A 120s window allows several backoff cycles while still
+# failing fast on permanently broken specs or missing images well short of the 300s ceiling.
+_DEGRADED_PERSISTENCE_SECONDS = 120
 # Polled rather than read once, because rollout-complete does not always mean the entrypoint
 # has finished linking plugins.
 #
 # On the RC's single-replica gateway it does. platform-agent carries
-# ReadinessProbe: agentAPIProbe(15, 3) (platformagent_manifests.go:2927, added by #674), and
+# ReadinessProbe: agentAPIProbe(15, 3) (platformagent_manifests.go:3701, added by #674), and
 # deploy/shared/profile_plugins.py runs at entrypoint step 2.65 before `exec "$@"`, so a pod
 # that answers the probe has already linked them.
 #
-# Under leader election it does not. replicas > 1 sets ENABLE_LEADER_ELECTION (:1848-1853),
-# and agentAPIProbe then exits 0 on connection-refused (:2773) so a standby can report Ready
+# Under leader election it does not. replicas > 1 sets ENABLE_LEADER_ELECTION (:2178), and
+# agentAPIProbe then exits 0 on connection-refused (:3545) so a standby can report Ready
 # without serving — which means Ready no longer implies the entrypoint reached `exec`. The
 # window is for that configuration.
-#
-# Older comments here and at tests/e2e/operator/agentplugins_e2e_test.py:1212-1226 say the
-# platform-agent container has no readiness probe at all. That was true before #674 and is
-# not now; the sibling still needs correcting.
 _SKILL_MOUNT_TIMEOUT_SECONDS = 120
 
 # What _kubectl reports for a call that never answered. 124 is what `timeout(1)` uses, and
@@ -145,6 +152,17 @@ def _kubectl(
             stdout=_as_text(exc.stdout),
             stderr=f"kubectl did not answer within {timeout}s: kubectl {rendered}",
         )
+
+
+def _is_resource_not_found(res: subprocess.CompletedProcess) -> bool:
+    """Reports whether kubectl failed specifically because the resource does not exist.
+
+    Distinguishes genuine resource absence (NotFound / not found) from transport,
+    connection, authentication, or context errors (e.g. connection refused, dial tcp,
+    unauthorized, or no context set).
+    """
+    err = (res.stderr + " " + res.stdout).lower()
+    return "notfound" in err or "not found" in err
 
 
 def _remaining(deadline: float, cap: int) -> Tuple[int, str]:
@@ -287,10 +305,16 @@ def _wait_for_plugin_ready(namespace: str, budget_deadline: float) -> Dict[str, 
     platformagent_controller.go:485 and the workload at :514 inside one reconcile, so
     waiting here first means the rollout wait that follows is looking at a workload the
     operator has already written, not one it is about to.
+
+    Requires a Degraded observation to persist for _DEGRADED_PERSISTENCE_SECONDS before
+    treating it as a terminal failure. The operator stamps observedGeneration = generation
+    on every pass before evaluating readiness, and maps transient container states like
+    ErrImagePull (which kubelet retries) straight into Degraded.
     """
     window, bound = _remaining(budget_deadline, _PLUGIN_READY_TIMEOUT_SECONDS)
     deadline = time.time() + window
     detail = "the AgentPlugin was never read"
+    degraded_first_seen: Optional[float] = None
     while True:
         res = _kubectl("get", "agentplugins", _PLUGIN_NAME, "-n", namespace, "-o", "json")
         if res.returncode == 0:
@@ -304,13 +328,34 @@ def _wait_for_plugin_ready(namespace: str, budget_deadline: float) -> Dict[str, 
                 status = obj.get("status", {})
                 phase = status.get("phase")
                 observed = status.get("observedGeneration")
-                if phase == "Ready" and observed == generation:
-                    return obj
                 detail = (
                     f"phase={phase!r}, observedGeneration={observed}, generation={generation}"
                 )
+                if phase == "Ready" and observed == generation:
+                    return obj
+                if phase == "Degraded" and observed == generation:
+                    now = time.time()
+                    if degraded_first_seen is None:
+                        degraded_first_seen = now
+                    elif now - degraded_first_seen >= _DEGRADED_PERSISTENCE_SECONDS:
+                        conditions = status.get("conditions", [])
+                        reason = ""
+                        message = ""
+                        for cond in conditions:
+                            if cond.get("status") == "False" or cond.get("reason"):
+                                reason = cond.get("reason", "")
+                                message = cond.get("message", "")
+                                break
+                        pytest.fail(
+                            f"AgentPlugin '{_PLUGIN_NAME}' in '{namespace}' installation failed: "
+                            f"phase has remained 'Degraded' for {int(now - degraded_first_seen)}s "
+                            f"(reason: {reason or 'Unknown'}): {message or detail}"
+                        )
+                else:
+                    degraded_first_seen = None
         else:
             detail = res.stderr.strip() or f"kubectl exited {res.returncode}"
+            degraded_first_seen = None
         if time.time() >= deadline:
             break
         time.sleep(5)
@@ -699,32 +744,13 @@ def ensure_stockout_plugin_installed(
     gcp_region: str,
     agent_namespace: str,
 ) -> None:
-    """Waits for the deployed stockout plugin to settle, then refuses to run on a broken one.
+    """Waits for the deployed stockout plugin to settle, or skips if not installed.
 
-    Installs the plugin only when the AgentPlugin CR is absent, which is what this fixture
-    has always done. What it adds is the waiting: step 2 of the RC pipeline provisions the
-    environment immediately before this module runs, so the gateway may still be rolling
-    when the first scenario starts, and the plugin's skill is linked by the entrypoint of
-    whichever pod wins. Probing before that settles reads the outgoing pod.
-
-    That is not a hypothetical. Run 32866087154 reported `SKILL.md not found under the
-    platform profile's plugins directory` and every selected scenario then burned its full
-    360s watch to report "Platform Agent never started investigation"; run 32953137904, on
-    the same cluster, found the skill present. The difference between them is which pod the
-    preflight caught, and this fixture is what removes that from the result.
-
-    Three waits, in this order: the AgentPlugin's status catches up to its spec, the gateway
-    finishes rolling, and the plugin's SKILL.md is readable inside the pod that survived.
-    Any of them failing ends the module naming what was wrong, in place of ten minutes of
-    watch timeouts that name nothing.
-
-    Deliberately not a reinstall. Running `install.sh` every session would repair an
-    AgentPlugin whose rendered spec has drifted from this candidate's, but it repairs
-    nothing in the common case — an unchanged plugin source tree renders a byte-identical
-    CR — while adding unconditional writes to the RC's critical path, including four
-    `add-iam-policy-binding` calls that read-modify-write the *project* IAM policy. An IAM
-    race unrelated to the candidate would then block the release. Drift is worth detecting;
-    the checks below do that and say so, rather than papering over it with a write.
+    Skips the suite if the AgentPlugin CRD or the stockout plugin CR is absent from the
+    cluster, avoiding out-of-band cluster mutations or IAM writes. When the plugin is
+    installed, refuses to run on a broken one, distinguishing between operator
+    reconciliation failures, imageVolume mounting/staging failures, entrypoint linker
+    failures, and missing skill files.
 
     `SKIP_STOCKOUT=1` skips the whole thing, tests included.
     """
@@ -734,9 +760,52 @@ def ensure_stockout_plugin_installed(
     if not gcp_project_id or not gke_cluster_name:
         pytest.fail("GCP_PROJECT_ID and GKE_CLUSTER_NAME are required for stockout E2E tests.")
 
+    expected = (
+        os.environ.get("ENABLE_STOCKOUT_INVESTIGATOR", "").lower() == "true"
+        or os.environ.get("E2E_SUITE") in _EXPECTED_E2E_SUITES
+    )
+
+    # 1. The CRD is the prerequisite for plugins. If absent, plugins are not installed on the cluster.
+    check_crd = _kubectl("get", "crd", _CRD_NAME, fail_on_timeout=True)
+    if check_crd.returncode != 0:
+        if not _is_resource_not_found(check_crd):
+            pytest.fail(
+                f"Failed to reach cluster when checking for CRD '{_CRD_NAME}': "
+                f"{check_crd.stderr.strip() or f'kubectl exited {check_crd.returncode}'}"
+            )
+        if expected:
+            pytest.fail(
+                f"AgentPlugin CRD '{_CRD_NAME}' was expected on this environment, but is missing from cluster."
+            )
+        pytest.skip(
+            f"AgentPlugin CRD '{_CRD_NAME}' not found on cluster; "
+            "stockout investigator is not installed."
+        )
+
+    # 2. Check if the stockout AgentPlugin is installed.
+    check_plugin = _kubectl(
+        "get", "agentplugins", _PLUGIN_NAME, "-n", agent_namespace, fail_on_timeout=True
+    )
+    if check_plugin.returncode != 0:
+        if not _is_resource_not_found(check_plugin):
+            pytest.fail(
+                f"Failed to reach cluster when checking for AgentPlugin '{_PLUGIN_NAME}' in '{agent_namespace}': "
+                f"{check_plugin.stderr.strip() or f'kubectl exited {check_plugin.returncode}'}"
+            )
+        if expected:
+            pytest.fail(
+                f"Stockout investigator was expected on this environment (ENABLE_STOCKOUT_INVESTIGATOR=true), "
+                f"but AgentPlugin '{_PLUGIN_NAME}' is not installed in namespace '{agent_namespace}'."
+            )
+        pytest.skip(
+            f"Stockout investigator plugin '{_PLUGIN_NAME}' is not installed in namespace "
+            f"'{agent_namespace}'. Enable it via Helm (plugins.stockoutInvestigator.enabled=true) "
+            "or Terraform (enable_stockout_investigator=true) to run this suite."
+        )
+
     budget_deadline = time.time() + _FIXTURE_BUDGET_SECONDS
 
-    # 1. Ensure the Pub/Sub topic exists.
+    # 3. Ensure the Pub/Sub topic exists (only reached when plugin is installed).
     topic = os.environ.get("STOCKOUT_TOPIC", "gke-stockout-alerts-topic")
     check_topic = subprocess.run(
         ["gcloud", "pubsub", "topics", "describe", topic, f"--project={gcp_project_id}"],
@@ -748,69 +817,7 @@ def ensure_stockout_plugin_installed(
             capture_output=True,
         )
 
-    # 2. The CRD is the one prerequisite install.sh does not own: the kube-agents Helm
-    # chart installs it, and helm would otherwise fail on an unknown kind.
-    check_crd = _kubectl("get", "crd", "agentplugins.kubeagents.x-k8s.io", fail_on_timeout=True)
-    if check_crd.returncode != 0:
-        pytest.fail(
-            "AgentPlugin CRD 'agentplugins.kubeagents.x-k8s.io' not found on cluster; "
-            "it is managed and installed by the kube-agents Helm chart."
-        )
-
-    # AGENT_REF and KUBECTL_CONTEXT are pinned rather than inherited, so the agent and
-    # cluster this fixture inspects cannot be different ones from those install.sh would
-    # write to. install.sh falls back to `kubectl config current-context`, which is
-    # whatever the last `get-credentials` in this process left behind.
     agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
-    kube_context = os.environ.get("KUBECTL_CONTEXT") or ""
-    if not kube_context:
-        ctx_res = _kubectl("config", "current-context", fail_on_timeout=True)
-        kube_context = ctx_res.stdout.strip() if ctx_res.returncode == 0 else ""
-        if not kube_context:
-            pytest.fail(
-                "No kubectl context is set and KUBECTL_CONTEXT is unset, so there is no cluster "
-                "to verify the stockout plugin against."
-            )
-
-    # 3. Install only when the plugin is genuinely absent.
-    check_plugin = _kubectl(
-        "get", "agentplugins", _PLUGIN_NAME, "-n", agent_namespace, fail_on_timeout=True
-    )
-    if check_plugin.returncode != 0:
-        if not _INSTALL_SCRIPT.is_file():
-            pytest.fail(f"Stockout investigator install script missing at '{_INSTALL_SCRIPT}'.")
-        install_env = {
-            **os.environ,
-            "GCP_PROJECT_ID": gcp_project_id,
-            "TARGET_CLUSTER_NAME": gke_cluster_name,
-            "TARGET_CLUSTER_LOCATION": gcp_region,
-            "HERMES_NAMESPACE": agent_namespace,
-            "AGENT_REF": agent_ref,
-            "KUBECTL_CONTEXT": kube_context,
-        }
-        install_timeout, install_bound = _remaining(budget_deadline, _INSTALL_TIMEOUT_SECONDS)
-        try:
-            proc = subprocess.run(
-                [str(_INSTALL_SCRIPT)],
-                capture_output=True,
-                text=True,
-                env=install_env,
-                timeout=install_timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            pytest.fail(
-                f"Stockout investigator install.sh did not finish within {install_timeout}s "
-                f"({install_bound}):\n"
-                f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
-            )
-        if proc.returncode != 0:
-            pytest.fail(
-                f"Stockout investigator install.sh failed with exit code {proc.returncode}:\n"
-                f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
-            )
-        # Printed on success too. It names the image tag and says whether the build was
-        # skipped, which is the only record of what the tests below ran against.
-        print(proc.stdout)
 
     # 4. Plugin status first, rollout second. See _wait_for_plugin_ready for why the other
     # order lets a slow reconcile pass a check against the outgoing pod.
@@ -852,16 +859,6 @@ def test_stockout_ingress_alert_smoke(
         pytest.fail(f"Stockout verify script missing at '{verify_script}'.")
     if not gcp_project_id or not gke_cluster_name:
         pytest.fail("GCP_PROJECT_ID and GKE_CLUSTER_NAME are required for stockout smoke test.")
-
-    # Check if the stockout plugin is active in the cluster
-    res_plugin = subprocess.run(
-        ["kubectl", "get", "agentplugins", "gkestockoutinvestigator", "-n", agent_namespace],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if res_plugin.returncode != 0:
-        pytest.fail("gkestockoutinvestigator AgentPlugin is not active in cluster; ingress smoke test failed.")
 
     agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
     ready_pod = _wait_for_agent_available(agent_ref, agent_namespace)
@@ -933,13 +930,24 @@ def test_stockout_scenario(
             pytest.skip(f"Scenario {scenario_slug} not included in STOCKOUT_SCENARIOS='{selected_scenarios}'")
 
     if "gpu" in scenario_slug.lower():
-        # Check if the cluster has any GPU accelerators or nodepools
-        res_gpu = subprocess.run(
-            ["kubectl", "get", "nodes", "-o", "jsonpath={.items[*].status.allocatable}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+        # Check if the cluster has any GPU accelerators or nodepools.
+        #
+        # Through _kubectl, and with the exit code read, because empty stdout is not
+        # evidence of absence: a non-zero exit produces one too, so testing the output
+        # alone reported "this cluster has no GPU nodes" whenever the API server refused
+        # the call, and skipped the GPU scenarios on it. A timeout was never that case --
+        # the raw call passed timeout=5 with no handler, so it raised TimeoutExpired and
+        # errored the test. It now goes through the wrapper's default budget with
+        # fail_on_timeout, which reports the same thing in the suite's own words.
+        res_gpu = _kubectl(
+            "get", "nodes", "-o", "jsonpath={.items[*].status.allocatable}",
+            fail_on_timeout=True,
         )
+        if res_gpu.returncode != 0:
+            pytest.fail(
+                f"Failed to reach cluster when checking for GPU nodes on '{gke_cluster_name}': "
+                f"{res_gpu.stderr.strip() or f'kubectl exited {res_gpu.returncode}'}"
+            )
         if "nvidia.com/gpu" not in res_gpu.stdout:
             pytest.skip(f"Cluster '{gke_cluster_name}' has no GPU nodes (nvidia.com/gpu); skipping GPU scenario '{scenario_slug}'.")
 
