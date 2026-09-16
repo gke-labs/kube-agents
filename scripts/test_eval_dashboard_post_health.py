@@ -986,10 +986,6 @@ class BucketState(unittest.TestCase):
         self.assertEqual(calls[1][-1], "gs://bucket/evals/health-state.json")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # --------------------------------------------------------------------------- #
 # Fixture drift (#1550): the hourly seeded-fleet scan's condition
 # --------------------------------------------------------------------------- #
@@ -1117,3 +1113,7 @@ class FixtureDrift(RunHarness):
         self.tick(health("GREEN"), T14)
         self.assertEqual(self.opener.texts, [])
         self.assertFalse(self.recorded()["fixture_unknown"])
+
+
+if __name__ == "__main__":
+    unittest.main()

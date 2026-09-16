@@ -1154,10 +1154,6 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(health.load_json(out)["runs"], trimmed["runs"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # --------------------------------------------------------------------------- #
 # Rule 3c: fixture drift (the hourly seeded-fleet scan)
 # --------------------------------------------------------------------------- #
@@ -1330,3 +1326,7 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner, ["#1400"]))
         other = dict(owner, condition="lost_pods")
         self.assertIsNone(self.judge(firing, posted={"issue": other})["issue"])
+
+
+if __name__ == "__main__":
+    unittest.main()
