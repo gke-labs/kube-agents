@@ -630,9 +630,14 @@ echo "Agent Deployment generation ${GEN_BEFORE} -> ${GEN_AFTER}; managed .env no
 kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true
 echo
 
+# The A2A gateway is deliberately NOT gated. Its builder says it is expected to
+# crash-loop until a chat backend exists (buildA2AGatewayDeployment: the
+# discord-bot Secret is an optional reference; a2a/gateway/config.go refuses
+# to start with neither DISCORD_TOKEN nor A2A_GCHAT_RELAY_URL), and a leased
+# eval project has neither. The bench drives the agent over /v1/responses, so
+# its state is reported below as a finding rather than a gate.
 for workload in \
   "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats" \
-  "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" \
   "deployment/platform-agent-gateway" \
   "statefulset/platform-agent-shell"; do
   for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
@@ -654,6 +659,10 @@ done
 # overlay landing (or not) in the agent pod.
 kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
 kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" || true
+echo "--- A2A gateway (not gated; see the comment above the rollout loop) ---"
+kubectl get deployment "${PLATFORM_AGENT_CR_NAME}-a2a-gateway" -n "${NAMESPACE}" || true
+kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" --all-containers --tail=30 2>/dev/null || true
+echo "--- agent entrypoint lines about the mode and the A2A overlay ---"
 kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway --all-containers --tail=400 2>/dev/null | grep -i "a2a\|overlay\|mode" | head -40 || true
 echo "✓ mode: next rollout finished in $((SECONDS - STEP_START))s"
 
