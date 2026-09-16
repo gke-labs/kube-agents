@@ -380,31 +380,44 @@ def first_reason(task: dict) -> str:
     return clean_reason(rep.get("reason")) if rep else ""
 
 
-def reason_rep_n(task: dict) -> int | None:
-    """The 1-based number of the repetition ``first_reason`` and ``excerpt_of``
-    show, so a page links that repetition's transcript and not rep 1's.
-    None when no rep carries a reason or the rep has no number (a synthetic
-    rep from a single result); the pages then link rep 1 as they always did."""
+def _has_excerpt(rep: dict) -> bool:
+    return isinstance(rep.get("excerpt"), str) and bool(rep["excerpt"].strip())
+
+
+def shown_rep(task: dict) -> dict | None:
+    """The one repetition a case row is about: the rep whose reason
+    ``first_reason`` shows, else -- when no rep carries a reason -- the
+    first with an excerpt. Its reason, its words and its transcript link
+    then all belong to the same run of the agent."""
     rep = reason_rep(task)
+    if rep:
+        return rep
+    for candidate in task_reps(task):
+        if _has_excerpt(candidate):
+            return candidate
+    return None
+
+
+def shown_rep_n(task: dict) -> int | None:
+    """The 1-based number of :func:`shown_rep`, so a page links that
+    repetition's transcript and not rep 1's. None when there is no shown
+    rep or it has no number (a synthetic rep from a single result); the
+    pages then link rep 1 as they always did."""
+    rep = shown_rep(task)
     n = rep.get("n") if rep else None
     return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
 
 
 def excerpt_of(task: dict) -> str | None:
     """A report excerpt, when the collector recorded one (additive, optional):
-    ``tasks[].excerpt``, else the ``excerpt`` of the repetition whose reason
-    ``first_reason`` shows, so the quote and the check beside it come from
-    the same run of the agent: a rep that said nothing quotes nothing, and
-    another rep's words never stand in. When no rep carries a reason there
-    is nothing to pair with, and the first rep's excerpt stands (the gate
-    comment's fallback for a rep with no reason). Never invented."""
+    ``tasks[].excerpt``, else the ``excerpt`` of :func:`shown_rep`, so the
+    quote and the check beside it come from the same run of the agent: a rep
+    that said nothing quotes nothing, and another rep's words never stand
+    in. Never invented."""
     if isinstance(task.get("excerpt"), str) and task["excerpt"].strip():
         return task["excerpt"].strip()
-    rep = reason_rep(task)
-    for candidate in [rep] if rep else task_reps(task):
-        if isinstance(candidate.get("excerpt"), str) and candidate["excerpt"].strip():
-            return candidate["excerpt"].strip()
-    return None
+    rep = shown_rep(task)
+    return rep["excerpt"].strip() if rep and _has_excerpt(rep) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -604,7 +617,7 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         "pass_rate_30d": rates.get(name),
         "reason": first_reason(task) if outcome in (OUTCOME_FAILED, OUTCOME_PARTIAL, OUTCOME_INFRA) else "",
         "excerpt": excerpt_of(task),
-        "rep_n": reason_rep_n(task),
+        "rep_n": shown_rep_n(task),
         "do": do,
         # Additive detail the pages show; the keys above are the contract.
         "admitted": is_admitted,
