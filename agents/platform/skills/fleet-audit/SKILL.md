@@ -154,6 +154,9 @@ branch. It prints exactly one JSON line:
   ],
   "context_repos": ["acme/terraform-live"],
   "declared_intent_repos": ["acme/fleet", "acme/terraform-live"],
+  "declared_intent_searched": [],
+  "declared_intent_sources": [],
+  "declarations_path": "/opt/data/scratch/declarations_compliance-audit.json",
   "sop": "governance/compliance_audit_sop.md",
   "checks": ["privileged-container", "host-namespace", "…"],
   "checks_contract": "Run every check above against every cluster you can read. …"
@@ -208,6 +211,19 @@ findings document (`/opt/data/scratch/run_<audit-id>.json`), before it prints, a
 the document's `declared_intent_searched` against that record rather than against the ConfigMap as
 it stands at finish time. Every stream prints it; only a stream with a declared-intent step is held
 to it.
+
+`declared_intent_searched`, `declared_intent_sources` and `declarations_path` are the harness's own
+half of that step, already done by the time `start` prints. On a stream with a declared-intent step,
+`start` reads every repository in `declared_intent_repos` it can — each `context_repos` entry
+through `inspect_repository.py clone` at the entry's `ref` when it has one, the GitOps repository
+from the clone it just reset or through the same script in content mode — for `declares:`
+frontmatter in OKF notes, within the paths each repository's `.kube-agents/intent.yaml` names
+(`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree
+was read). It files what it found at `declarations_path` and lists each repository it read
+completely as `owner/name@sha`. `finish` unions that list into the document's and moves every
+finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
+from `declared_intent_searched` is one the harness could not read; stderr says why, and the SOP
+says what the worker does about it. On every other stream the three are empty.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 
@@ -629,9 +645,15 @@ A finding says the fleet is wrong; a declared posture says the fleet is what som
 list exists because the audits judge live state against generic practice, and a platform team that
 pinned a replica count in Terraform on purpose was getting the same `no-hpa` finding every morning
 until someone suppressed it by hand. The SOP's declared-intent step (`obtainability_audit_sop.md`
-§4a, the pilot) searches the GitOps clone's `provisioning/` and `knowledge/` directories and every
-repository in `context_repos` for a declaration that names the same object and pins the flagged
-property, and moves a match here instead of into `findings`.
+§4a, the pilot) has two halves. The harness reads every repository in `declared_intent_repos` for
+OKF notes whose frontmatter carries a `declares:` list — items of `{check, namespace, object}` plus
+an optional `cluster`, `object` as `Kind/name` — within the paths each repository's
+`.kube-agents/intent.yaml` names, and `finish` moves every finding one covers here itself: an exact
+lookup on `(check, cluster, namespace, object)`, then on the fleet-wide `(check, namespace, object)`,
+the finding's `cluster` and `title` kept and the note's `repo`, `path` and title as the declaration.
+The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
+machine-readable form yet; a match there is moved here by the worker with the lines that pin the
+property as `excerpt`.
 
 What the shape enforces:
 
@@ -665,6 +687,12 @@ What `finish` does with it:
   time. Extra repositories are allowed. The sha is checked for shape only (7 to 40 lowercase hex
   characters), so the record is as forgeable as a padded `checks_run` and carries less; it makes a
   skipped step visible, not impossible.
+- **The harness's own search counts first.** `start` records each repository it read completely
+  in the run record, and `finish` unions that list into the document's before it measures, so a
+  repository the harness read needs no entry from the worker and a document with no key at all
+  is complete when the harness read every repository. What the worker owes is the rest: the
+  repositories `start` listed under `declared_intent_repos` and not under
+  `declared_intent_searched`.
 - **It is owed whenever a declarable check ran.** Keyed on `checks_run`, not on the postures in
   `findings`, for the reason above: a candidate left out without a search reads exactly like one a
   declaration covered. A run on which none of the four checks ran anywhere owes nothing.
@@ -681,15 +709,18 @@ What `finish` does with it:
 - **A complete record renders.** One line under Scope, `Declared-intent search: owner/name@sha, …`,
   so a reader can see what was read.
 
-Where the sha comes from is the SOP's §4a: in content mode `list`, `grep` and `fetch` print it for
-the GitOps repository and `inspect_repository.py clone` and `open` print it for a context copy; in
-directory mode it is `git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that
-`clone` named for the context copy.
+Where the sha comes from is the SOP's §4a, and it is the same for the harness and the worker: in
+content mode `list`, `grep` and `fetch` print it for the GitOps repository and
+`inspect_repository.py clone` and `open` print it for a context copy; in directory mode it is
+`git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that `clone` named for
+the context copy.
 
 The withhold binds the direct-ask path too: `remediate --finding <id>` applies it against the same
 record and refuses a withheld id by name, because a pull request for a posture the ledger says was
-held back would contradict the ledger. A `/remediate` comment naming a withheld posture is deferred,
-not refused — see the answers list under [Remediation pull requests](#remediation-pull-requests).
+held back would contradict the ledger. It applies the harness's declarations the same way, and
+refuses an id a declaration covers for the same reason. A `/remediate` comment naming a withheld
+posture is deferred, not refused — see the answers list under
+[Remediation pull requests](#remediation-pull-requests).
 
 ## Evidence rules
 

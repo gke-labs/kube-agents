@@ -410,6 +410,12 @@ record — every finding whose check is declarable is withheld and the run goes 
 reads: `list`, `grep` and `fetch` print the broker's tree sha, and in content mode
 `inspect_repository.py clone` and `open` print it for a context copy (#1477).
 
+`start` also performs the search itself: it reads each repository in that set for `declares:`
+frontmatter within the paths its `.kube-agents/intent.yaml` names, files the result in
+`declarations_<audit-id>.json`, records each repository it read completely under `searched` in the
+run record, and `finish` unions that list into the document and moves each covered finding to
+`declared` before the withhold (#1576, #1577).
+
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
 `git config --get remote.origin.url` to answer. The harness therefore clones lazily on the way in,

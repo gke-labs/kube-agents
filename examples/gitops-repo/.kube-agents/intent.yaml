@@ -1,0 +1,5 @@
+# Where the obtainability audit looks for declared-intent notes (README, "Declared intent").
+# One key, `paths`: repository-relative prefixes; only Markdown under them is read for a
+# `declares:` frontmatter list. Without this file the audit reads the whole repository.
+paths:
+  - knowledge/

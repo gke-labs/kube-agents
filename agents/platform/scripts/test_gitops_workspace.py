@@ -1041,6 +1041,95 @@ class TestContextRepos(WorkspaceTestCase):
         self.assertIn("no provider for type 'gitlab'", joined)
         self.assertNotIn("managed_repos repository", joined)
 
+    def test_a_ref_on_a_context_entry_is_kept_and_handed_over_beside_the_slug(self):
+        context = (
+            '[{"type": "github", "url": "https://github.com/acme/terraform-live", '
+            '"ref": "release-2026"}, '
+            '{"type": "github", "url": "https://github.com/acme/notes"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [
+                    {"repo": "acme/terraform-live", "ref": "release-2026"},
+                    {"repo": "acme/notes", "ref": None},
+                ],
+            )
+            # The slug list every other caller reads is unchanged by the pin.
+            self.assertEqual(
+                gitops_workspace.get_context_github_repos(),
+                ["acme/terraform-live", "acme/notes"],
+            )
+
+    def test_a_ref_that_is_not_a_branch_name_is_dropped_with_a_warning(self):
+        # A leading dash is an option to `git`; the rest are shapes a ref
+        # cannot take. The repository is still read, at HEAD.
+        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "a/.b", "with space", "a@{1}"):
+            with self.subTest(ref=bad):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": bad}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None}],
+                        )
+                    # The raw entry carries no `ref` key at all once dropped.
+                    self.assertEqual(
+                        gitops_workspace.get_context_repo_entries(),
+                        [{"type": "github", "url": "https://github.com/acme/terraform-live"}],
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Dropping ref", joined)
+                self.assertIn("reading HEAD", joined)
+
+    def test_a_non_github_entry_is_skipped_from_the_entries_too(self):
+        context = (
+            '[{"type": "gitlab", "url": "https://gitlab.com/acme/live", "ref": "main"}, '
+            '{"type": "github", "url": "https://github.com/acme/notes", "ref": "docs"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(
+                    gitops_workspace.get_context_github_repo_entries(),
+                    [{"repo": "acme/notes", "ref": "docs"}],
+                )
+        self.assertIn("no provider for type 'gitlab'", "\n".join(logs.output))
+
+    def test_a_ref_on_a_managed_entry_is_not_a_thing(self):
+        # Only the context list carries a branch pin: the managed list is what
+        # the push gate and the resolver read, and a pin there would claim
+        # something nothing downstream honours.
+        managed = '[{"type": "github", "url": "https://github.com/acme/fleet", "ref": "release"}]'
+        state_file = self.mount(managed_repos=managed, context_repos=self.CONTEXT)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_managed_repo_entries(),
+                [{"type": "github", "url": "https://github.com/acme/fleet"}],
+            )
+
+    def test_the_first_entry_for_a_slug_wins_ref_included(self):
+        context = (
+            '[{"type": "github", "url": "https://github.com/acme/live", "ref": "a"}, '
+            '{"type": "github", "url": "https://github.com/acme/live", "ref": "b"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "acme/live", "ref": "a"}],
+            )
+
     def test_validate_repo_org_matching_primary_org(self):
         with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
             self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")

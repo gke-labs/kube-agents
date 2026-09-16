@@ -53,8 +53,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -598,6 +600,58 @@ SEARCHED_REPO_RE = re.compile(
 # and the gap sentence says so.
 DUAL_SHAPE_CHECK = "hpa-cannot-scale"
 
+# Harness-side declaration discovery (the obtainability SOP's §4a). `start`
+# reads every repository the step must search, collects the declarations it
+# finds into one file beside the findings document, and records each
+# repository it read completely; `finish` joins the declarations against the
+# findings and folds the record into the document, so neither the match nor
+# the search record depends on the model performing the step.
+#
+# A declaration is an item under the `declares:` key of an OKF note's YAML
+# frontmatter — Markdown whose first line opens a `---` block carrying the
+# `type` the knowledge contract requires — with `check`, `namespace`,
+# `object` (`Kind/name`) and an optional `cluster`. The frontmatter is the
+# whole format: no body text is scanned, so a note that merely mentions a
+# workload declares nothing.
+DECLARATIONS_KEY = "declarations"
+DECLARED_INTENT_SOURCES_KEY = "declared_intent_sources"
+RUN_RECORD_SEARCHED_KEY = "searched"
+RUN_RECORD_SOURCES_KEY = "sources"
+FRONTMATTER_DELIMITER = "---"
+FRONTMATTER_END_DELIMITERS = ("---", "...")
+OKF_TYPE_KEY = "type"
+OKF_TITLE_KEY = "title"
+DECLARES_KEY = "declares"
+DECLARATION_ITEM_FIELDS = ("check", "namespace", "object")
+DECLARATION_CLUSTER_FIELD = "cluster"
+NOTE_SUFFIX = ".md"
+HEADING_RE = re.compile(r"^#{1,6}[ \t]+(?P<text>\S.*?)[ \t#]*$", re.M)
+# The per-repository search bound: one key, `paths`, a list of repo-relative
+# prefixes held to the remediation-path rules (a trailing `/` allowed, because
+# they are prefixes). Absent or invalid reads as the whole tree, said on
+# stderr, because a bound that fails closed would let a typo hide every
+# declaration in the repository.
+INTENT_FILE = ".kube-agents/intent.yaml"
+INTENT_PATHS_KEY = "paths"
+# Never descended, in either mode: a `.git` is repository state, and a symlink
+# is a path out of the copy the bound was checked against.
+SKIPPED_TREE_DIRS = frozenset({".git"})
+# The copies come from the sibling skill's script, which works in both broker
+# modes and prints `sha` and `complete`; resolved from this file so the staged
+# and the source layouts both find it. Shallow, because the read is of one
+# tree at one commit. The temporary destination lives under the scratch
+# directory — the one place the sidecar and this container share — and each
+# context copy in directory mode lands under a lease of its own, distinct from
+# the audit's GitOps clone so `reset=True` there never scrubs this tree.
+CLONE_SCRIPT = (
+    Path(__file__).resolve().parents[2] / "inspect-repository" / "scripts" / "inspect_repository.py"
+)
+CLONE_DEPTH = 1
+CLONE_TMP_PREFIX = "declared-intent-"
+CLONE_LEASE_SUFFIX = "-declared-intent"
+CLONE_MODE_CONTENT = "content"
+CLONE_MODE_DIRECTORY = "directory"
+
 # `gh pr list` takes a limit, not a cursor. A full page means the oldest
 # remediation branches fell off the end, and a branch that reads as "no pull
 # request exists" is one the harness will force-push over. Detect it and stop.
@@ -1120,6 +1174,11 @@ def findings_path_for(audit_id: str) -> str:
 def run_record_path_for(audit_id: str) -> str:
     """Where `start` records which repositories this run was told to search."""
     return f"{SCRATCH_DIR}/run_{audit_id}.json"
+
+
+def declarations_path_for(audit_id: str) -> str:
+    """Where `start` files the declarations it found for `finish` to join."""
+    return f"{SCRATCH_DIR}/declarations_{audit_id}.json"
 
 
 def base_branch() -> str:
@@ -2385,6 +2444,302 @@ def _declared_intent_gap(data: dict) -> str | None:
             "min == max posture and is held back with the postures"
         )
     return f"declared intent: {what} — {where}{tail}"
+
+
+def _split_note(text: str) -> tuple[str, str] | None:
+    """`(frontmatter, body)` of a note that opens with `---`, or None when it does not.
+
+    None for a file that does not open with the delimiter, or opens one and
+    never closes it: neither is an OKF note, and neither declares anything.
+    """
+    lines = normalise_newlines(text).split("\n")
+    if not lines or lines[0].strip() != FRONTMATTER_DELIMITER:
+        return None
+    for index in range(1, len(lines)):
+        if lines[index].strip() in FRONTMATTER_END_DELIMITERS:
+            return "\n".join(lines[1:index]), "\n".join(lines[index + 1 :])
+    return None
+
+
+def split_frontmatter(text: str) -> str | None:
+    """The YAML between a leading `---` line and the next `---`/`...` line, or None."""
+    split = _split_note(text)
+    return split[0] if split is not None else None
+
+
+def _note_excerpt(front: dict, text: str, path: str) -> str:
+    """What the ledger's Declaration cell shows: the note's title, else its first heading, else its path."""
+    title = front.get(OKF_TITLE_KEY)
+    if isinstance(title, str) and title.strip():
+        return clip_text(title, MAX_TITLE_CHARS)
+    split = _split_note(text)
+    body = split[1] if split is not None else text
+    heading = HEADING_RE.search(strip_fenced_blocks(body))
+    if heading:
+        return clip_text(heading.group("text"), MAX_TITLE_CHARS)
+    return clip_text(path, MAX_TITLE_CHARS)
+
+
+def parse_declarations(
+    text: str, *, repo: str, path: str, declarable: frozenset[str]
+) -> list[dict]:
+    """The declarations one note carries, each as the entry `finish` joins on.
+
+    A note counts when it is an OKF document — frontmatter carrying `type` —
+    whose `declares` is a list. Each item needs `check` (a declarable slug),
+    `namespace` (a string, empty for a cluster-scoped object) and `object` as
+    `Kind/name`; `cluster` is optional and, when present, a non-empty string.
+    An item that fails any of that is skipped with a warning naming the file
+    and the item, and the rest of the note still counts: one typo silences one
+    declaration, not the file.
+
+    Frontmatter that PyYAML cannot parse yields nothing for the file, with a
+    warning; a file with no frontmatter, no `type` or no `declares` yields
+    nothing and says nothing, because most notes are not declarations.
+    """
+    import yaml
+
+    where = f"{repo}:{path}"
+    front_text = split_frontmatter(text)
+    if front_text is None:
+        return []
+    try:
+        front = yaml.safe_load(front_text)
+    except yaml.YAMLError as exc:
+        log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
+        return []
+    if not isinstance(front, dict) or OKF_TYPE_KEY not in front:
+        return []
+    declares = front.get(DECLARES_KEY)
+    if declares is None:
+        return []
+    if not isinstance(declares, list):
+        log(f"WARNING: {where}: `{DECLARES_KEY}` must be a list of items; none read.")
+        return []
+    excerpt = _note_excerpt(front, text, path)
+    out: list[dict] = []
+    for index, item in enumerate(declares):
+        item_where = f"{where} {DECLARES_KEY}[{index}]"
+        if not isinstance(item, dict):
+            log(f"WARNING: {item_where}: expected an object; skipped.")
+            continue
+        missing = [
+            field
+            for field in DECLARATION_ITEM_FIELDS
+            if not isinstance(item.get(field), str)
+        ]
+        if missing:
+            log(f"WARNING: {item_where}: missing or non-string {', '.join(missing)}; skipped.")
+            continue
+        check = item["check"].strip()
+        if check not in declarable:
+            log(
+                f"WARNING: {item_where}: {check!r} is not a check a declaration may "
+                "justify; skipped."
+            )
+            continue
+        obj = item["object"].strip()
+        kind, _, name = obj.partition("/")
+        if not kind or not name or "/" in name:
+            log(f"WARNING: {item_where}: object must be Kind/name, got {obj!r}; skipped.")
+            continue
+        entry = {
+            "check": check,
+            "namespace": item["namespace"].strip(),
+            "object": obj,
+            "repo": repo,
+            "path": path,
+            "excerpt": excerpt,
+        }
+        if DECLARATION_CLUSTER_FIELD in item:
+            cluster = item[DECLARATION_CLUSTER_FIELD]
+            if not isinstance(cluster, str) or not cluster.strip():
+                log(
+                    f"WARNING: {item_where}: {DECLARATION_CLUSTER_FIELD} must be a "
+                    "non-empty string when present, or omitted for a fleet-wide "
+                    "declaration; skipped."
+                )
+                continue
+            entry[DECLARATION_CLUSTER_FIELD] = cluster.strip()
+        out.append(entry)
+    return out
+
+
+def read_intent_paths(tree: Path, repo: str) -> list[str]:
+    """The repo-relative prefixes `.kube-agents/intent.yaml` bounds the search to.
+
+    An empty list means the whole tree, and stderr says why: the file is
+    absent, is not YAML, has no `paths` list, or names a path the
+    remediation-path rules refuse. Any one bad path discards the whole bound
+    rather than the one path, because a bound that silently narrowed itself
+    would read as the owner's choice.
+    """
+    import yaml
+
+    intent = tree / INTENT_FILE
+    where = f"{repo}:{INTENT_FILE}"
+    if not intent.is_file():
+        log(f"{where}: absent; searching the whole tree.")
+        return []
+    try:
+        data = yaml.safe_load(intent.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        log(f"WARNING: {where}: unreadable ({exc}); searching the whole tree.")
+        return []
+    paths = data.get(INTENT_PATHS_KEY) if isinstance(data, dict) else None
+    if not isinstance(paths, list) or not paths:
+        log(
+            f"WARNING: {where}: `{INTENT_PATHS_KEY}` must be a non-empty list of "
+            "repo-relative prefixes; searching the whole tree."
+        )
+        return []
+    out: list[str] = []
+    for index, raw in enumerate(paths):
+        try:
+            if not isinstance(raw, str):
+                raise ValidationError(f"{INTENT_PATHS_KEY}[{index}]: expected a string")
+            out.append(_require_repo_relative(raw.rstrip("/"), f"{INTENT_PATHS_KEY}[{index}]"))
+        except ValidationError as exc:
+            log(f"WARNING: {where}: {exc}; searching the whole tree.")
+            return []
+    return out
+
+
+def _under_prefixes(path: str, prefixes: list[str]) -> bool:
+    return not prefixes or any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
+def note_paths(tree: Path, prefixes: list[str]) -> list[str]:
+    """Every `.md` under `tree` within `prefixes`, repo-relative, sorted.
+
+    `.git` is never entered and a symlink — file or directory — is never
+    followed: the bound was checked against paths inside the copy, and a link
+    is a path out of it.
+    """
+    out: list[str] = []
+    for current, dirs, files in os.walk(tree, followlinks=False):
+        here = Path(current)
+        dirs[:] = sorted(
+            d for d in dirs if d not in SKIPPED_TREE_DIRS and not (here / d).is_symlink()
+        )
+        for name in sorted(files):
+            if not name.endswith(NOTE_SUFFIX) or (here / name).is_symlink():
+                continue
+            rel = (here / name).relative_to(tree).as_posix()
+            if _under_prefixes(rel, prefixes):
+                out.append(rel)
+    return out
+
+
+def search_tree(tree: Path, *, repo: str, declarable: frozenset[str]) -> tuple[list[dict], list[str]]:
+    """Read one repository copy: `(declarations, prefixes applied)`."""
+    prefixes = read_intent_paths(tree, repo)
+    found: list[dict] = []
+    for rel in note_paths(tree, prefixes):
+        try:
+            text = (tree / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            log(f"WARNING: {repo}:{rel}: unreadable ({exc}); skipped.")
+            continue
+        found.extend(parse_declarations(text, repo=repo, path=rel, declarable=declarable))
+    return found, prefixes
+
+
+def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
+    key = (
+        str(entry.get("check", "")),
+        str(entry.get("namespace") or ""),
+        str(entry.get("object", "")),
+    )
+    if with_cluster:
+        return (str(entry.get(DECLARATION_CLUSTER_FIELD, "")),) + key
+    return key
+
+
+def fold_searched_record(data: dict, record: dict | None) -> None:
+    """Union the run record's `searched` into the document's search record.
+
+    The harness's entries join the model's rather than replace them: a model
+    that searched a repository the harness could not still gets credit for
+    it, and a harness entry never depends on the model having written any.
+    """
+    harness = list((record or {}).get(RUN_RECORD_SEARCHED_KEY) or [])
+    if not harness:
+        return
+    current = [
+        entry for entry in data.get(DECLARED_INTENT_SEARCHED_KEY) or [] if isinstance(entry, str)
+    ]
+    have = {entry.partition("@")[0].strip().lower() for entry in current}
+    for entry in harness:
+        slug = str(entry).partition("@")[0].strip().lower()
+        if slug and slug not in have:
+            have.add(slug)
+            current.append(str(entry))
+    data[DECLARED_INTENT_SEARCHED_KEY] = current
+
+
+def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
+    """Move each finding a declaration covers into `declared[]`; return the moved.
+
+    The lookup is exact, on the fields the owner wrote: first
+    `(cluster, check, namespace, object)` against entries that name a cluster,
+    then `(check, namespace, object)` against fleet-wide ones. The first entry
+    wins in repository-then-path order, which is the order `start` wrote them
+    in. Only a declarable check is looked up at all, so a fault stays a
+    finding whatever a note says about it. An identity the model already
+    declared is left to the model's entry.
+
+    The moved entry is what the validator would have accepted from the model:
+    the finding's identity and title, and the declaration's `repo`, `path`
+    and `excerpt`. Run after `validate_findings`, on a document whose findings
+    already carry their derived ids, so the caller can name what moved.
+    """
+    if not declarations:
+        return []
+    declarable = audit_declarable_checks(str(data.get("audit") or ""))
+    scoped: dict[tuple, dict] = {}
+    fleet_wide: dict[tuple, dict] = {}
+    for entry in declarations:
+        has_cluster = bool(entry.get(DECLARATION_CLUSTER_FIELD))
+        target = scoped if has_cluster else fleet_wide
+        target.setdefault(_declaration_key(entry, with_cluster=has_cluster), entry)
+    declared = list(data.get("declared") or [])
+    already = {derive_finding_id(entry) for entry in declared}
+    kept: list[dict] = []
+    moved: list[dict] = []
+    for finding in data.get("findings") or []:
+        check = str(finding.get("check", ""))
+        match = None
+        if check in declarable:
+            match = scoped.get(_declaration_key(finding, with_cluster=True)) or fleet_wide.get(
+                _declaration_key(finding, with_cluster=False)
+            )
+        if match is None or derive_finding_id(finding) in already:
+            kept.append(finding)
+            continue
+        declared.append(
+            {
+                "check": check,
+                "cluster": str(finding.get("cluster", "")),
+                "namespace": str(finding.get("namespace") or ""),
+                "object": str(finding.get("object", "")),
+                "title": str(finding.get("title", "")),
+                "declaration": {
+                    field: str(match.get(field, "")) for field in DECLARATION_FIELDS
+                },
+            }
+        )
+        moved.append(finding)
+        log(
+            f"DECLARED: {finding.get('id', '')} — {check} on "
+            f"{finding.get('cluster', '')}/{finding.get('namespace') or '(cluster)'}/"
+            f"{finding.get('object', '')} is declared at {match.get('repo', '')}:"
+            f"{match.get('path', '')}; listed under Declared intent, not as a finding."
+        )
+    if moved:
+        data["findings"] = kept
+        data["declared"] = declared
+    return moved
 
 
 class ContainmentError(ValidationError):
@@ -6337,19 +6692,71 @@ def ack_remediate_requests(
         )
 
 
-def write_run_record(audit_id: str, repo: str, context: list[str]) -> str:
+def write_run_record(
+    audit_id: str,
+    repo: str,
+    context: list[str],
+    *,
+    searched: list[str] | None = None,
+    sources: list[dict] | None = None,
+) -> str:
     """Record which repositories this run's declared-intent step must search.
 
     Written by `start`, read by `finish`: the comparison is against what this
     run was told, not against the ConfigMap as it stands at `finish`, so a
     repository registered mid-run neither fails the run nor gets searched.
+
+    `searched` is the harness's own half of the answer — each repository
+    `start` read completely, as `owner/name@sha` — and `sources` says where
+    in each it looked. `finish` folds the first into the document; the second
+    is the record of the bound that was applied.
     """
     path = run_record_path_for(audit_id)
     Path(path).write_text(
-        json.dumps({"audit": audit_id, "repo": repo, "context_repos": list(context)}),
+        json.dumps(
+            {
+                "audit": audit_id,
+                "repo": repo,
+                "context_repos": list(context),
+                RUN_RECORD_SEARCHED_KEY: list(searched or []),
+                RUN_RECORD_SOURCES_KEY: list(sources or []),
+            }
+        ),
         encoding="utf-8",
     )
     return path
+
+
+def write_declarations(audit_id: str, repo: str, declarations: list[dict]) -> str:
+    """File what `start` found for `finish` to join, stamped with the run it belongs to."""
+    path = declarations_path_for(audit_id)
+    Path(path).write_text(
+        json.dumps({"audit": audit_id, "repo": repo, DECLARATIONS_KEY: list(declarations)}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
+    """The declarations `start` filed for this stream, or none.
+
+    The same reading as `read_run_record`: missing, unreadable, another
+    stream's or — when the caller knows which repository it is finishing —
+    another repository's file is no file, and no file joins nothing. A
+    document that reaches `finish` with no declarations file keeps every
+    posture it wrote, and the withhold decides what publishes.
+    """
+    try:
+        data = json.loads(Path(declarations_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or data.get("audit") != audit_id:
+        return []
+    recorded = data.get("repo")
+    if repo and (not isinstance(recorded, str) or recorded.strip().lower() != repo.strip().lower()):
+        return []
+    entries = data.get(DECLARATIONS_KEY)
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
 
 
 def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
@@ -6376,7 +6783,39 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
         return None
     if repo and recorded.strip().lower() != repo.strip().lower():
         return None
-    return {"repo": recorded, "context_repos": [str(slug) for slug in context]}
+    searched = data.get(RUN_RECORD_SEARCHED_KEY)
+    sources = data.get(RUN_RECORD_SOURCES_KEY)
+    return {
+        "repo": recorded,
+        "context_repos": [str(slug) for slug in context],
+        # Absent on a record an older `start` wrote, which is a run that
+        # searched nothing on the harness's behalf.
+        RUN_RECORD_SEARCHED_KEY: (
+            [str(entry) for entry in searched] if isinstance(searched, list) else []
+        ),
+        RUN_RECORD_SOURCES_KEY: (
+            [entry for entry in sources if isinstance(entry, dict)]
+            if isinstance(sources, list)
+            else []
+        ),
+    }
+
+
+def join_harness_declarations(
+    data: dict, record: dict | None, audit_id: str, repo: str | None
+) -> list[str]:
+    """Fold `start`'s search into the document and apply its declarations.
+
+    What `finish` — real and dry — and `remediate` share, in the one order
+    that is right: the record's `searched` joins the document's
+    `declared_intent_searched`, then every finding a filed declaration covers
+    moves to `declared[]`, each move logged. Returns the ids that moved so a
+    caller can refuse one by name. Run on a validated document, after
+    `load_findings`, so the ids are the derived ones.
+    """
+    fold_searched_record(data, record)
+    moved = apply_declarations(data, read_declarations(audit_id, repo=repo))
+    return [str(finding.get("id", "")) for finding in moved]
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -6540,8 +6979,8 @@ def _workspace_runner(
     return run_cmd(cmd, cwd=cwd, check=check)
 
 
-def context_repos() -> list[str]:
-    """The `context_repos` slugs, or an empty list when the key cannot be read.
+def context_repo_entries() -> list[dict]:
+    """The `context_repos` entries as `{repo, ref}`, or none when the key cannot be read.
 
     Unreadable is not fatal at `start`: the declared-intent step is a
     pre-report filter over an optional list, and a run that cannot read it
@@ -6552,7 +6991,10 @@ def context_repos() -> list[str]:
     import gitops_workspace
 
     try:
-        return list(gitops_workspace.get_context_github_repos())
+        return [
+            {"repo": str(entry["repo"]), "ref": entry.get("ref") or None}
+            for entry in gitops_workspace.get_context_github_repo_entries()
+        ]
     except Exception as exc:
         log(
             "WARNING: could not read context_repos from the gitops-state "
@@ -6562,14 +7004,166 @@ def context_repos() -> list[str]:
         return []
 
 
+def _searched_entry(slug: str, sha: object) -> str | None:
+    """`owner/name@sha` when `sha` has the shape the validator takes, else None."""
+    entry = f"{slug}@{str(sha or '').strip()}"
+    return entry if SEARCHED_REPO_RE.match(entry) else None
+
+
+def _head_sha(tree: Path) -> str:
+    """`git rev-parse HEAD` in a directory-mode checkout; empty when git cannot say."""
+    result = git(["rev-parse", "HEAD"], check=False, cwd=tree)
+    return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+class _Copy(NamedTuple):
+    """One repository copy: the tree to read, its commit, and the scratch to remove."""
+
+    tree: Path
+    sha: str
+    into: Path
+
+
+def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> _Copy | None:
+    """Copy `slug` through `inspect_repository.py clone` into `into`, or None.
+
+    None, with a warning, whenever the copy is not one the harness may call
+    searched: the script exited non-zero, printed something other than its
+    JSON line, reported `complete: false` (a bound stopped it or it skipped a
+    file), or gave no sha the validator would accept. In directory mode the
+    script ignores `--into` and names the leased checkout it made instead, so
+    the tree to read and the scratch to remove are two different paths.
+    """
+    cmd = [
+        sys.executable,
+        str(CLONE_SCRIPT),
+        "clone",
+        "--repo",
+        slug,
+        "--depth",
+        str(CLONE_DEPTH),
+        "--into",
+        str(into),
+        "--lease",
+        f"{audit_id}{CLONE_LEASE_SUFFIX}",
+    ]
+    if ref:
+        cmd += ["--ref", ref]
+    result = run_cmd(cmd, check=False)
+    if result.returncode != 0:
+        log(f"WARNING: {slug}: clone exited {result.returncode}; not searched.")
+        return None
+    lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
+    try:
+        reply = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict):
+        log(f"WARNING: {slug}: clone printed no JSON line; not searched.")
+        return None
+    if reply.get("complete") is not True:
+        log(
+            f"WARNING: {slug}: copy incomplete (stopped: {reply.get('stopped')!r}, "
+            f"skipped: {len(reply.get('skipped') or [])}); not searched."
+        )
+        return None
+    if reply.get("mode") == CLONE_MODE_DIRECTORY:
+        tree = Path(str(reply.get("workspace") or ""))
+        sha = _head_sha(tree) if reply.get("workspace") else ""
+    else:
+        tree = Path(str(reply.get("into") or into))
+        sha = str(reply.get("sha") or "")
+    if not tree.is_dir():
+        log(f"WARNING: {slug}: clone named {tree}, which is not a directory; not searched.")
+        return None
+    if _searched_entry(slug, sha) is None:
+        log(f"WARNING: {slug}: no commit sha for the copy; not searched.")
+        return None
+    return _Copy(tree, sha, into)
+
+
+def discover_declarations(
+    audit_id: str, repo: str, root: Path, context: list[dict]
+) -> tuple[list[dict], list[str], list[dict]]:
+    """Search every repository the step owes and return what the run record needs.
+
+    `(declarations, searched, sources)`: the entries `finish` joins, each
+    repository read completely as `owner/name@sha`, and per searched
+    repository the `{repo, ref, paths}` the read was bounded by. The GitOps
+    repository is read in the tree `start` just reset when that tree is a
+    checkout, and through `inspect_repository.py clone` like a context
+    repository when the workspace is a content-mode scratch directory.
+
+    Nothing here raises: a repository whose copy or read fails is left out of
+    `searched` with a warning, and the withhold in `finish` does the rest. A
+    stream with no declared-intent step searches nothing.
+    """
+    declarable = audit_declarable_checks(audit_id)
+    if not declarable:
+        return [], [], []
+    try:
+        import yaml  # noqa: F401 — availability check; the readers import it again
+    except ImportError as exc:
+        log(
+            f"WARNING: PyYAML is not importable ({exc}); the declared-intent "
+            "search cannot read frontmatter, so no repository is searched."
+        )
+        return [], [], []
+    refs = {entry["repo"].lower(): entry.get("ref") for entry in context}
+    declarations: list[dict] = []
+    searched: list[str] = []
+    sources: list[dict] = []
+    for slug in declared_intent_repos(repo, [entry["repo"] for entry in context]):
+        is_gitops = slug.lower() == repo.strip().lower()
+        # The GitOps repository is read from the audit's own tree; a `ref` on
+        # a context entry naming it is not honoured, because the run reads the
+        # branch it will publish against.
+        ref = None if is_gitops else refs.get(slug.lower())
+        into: Path | None = None
+        try:
+            if is_gitops and not content_mode():
+                tree, sha = root, _head_sha(root)
+                if _searched_entry(slug, sha) is None:
+                    log(f"WARNING: {slug}: no commit sha for the checkout; not searched.")
+                    continue
+            else:
+                into = Path(tempfile.mkdtemp(prefix=CLONE_TMP_PREFIX, dir=SCRATCH_DIR))
+                copied = _clone_for_search(slug, ref, audit_id, into)
+                if copied is None:
+                    continue
+                tree, sha = copied.tree, copied.sha
+            found, prefixes = search_tree(tree, repo=slug, declarable=declarable)
+        except Exception as exc:  # noqa: BLE001 — one repository must not end the run
+            log(f"WARNING: {slug}: declared-intent search failed ({exc}); not searched.")
+            continue
+        finally:
+            # Removed on every path, including the directory-mode one where it
+            # stayed empty; the leased checkout that mode reads is left where
+            # the SOP has the model leave it.
+            if into is not None:
+                shutil.rmtree(into, ignore_errors=True)
+        declarations.extend(found)
+        searched.append(_searched_entry(slug, sha))
+        sources.append({"repo": slug, "ref": ref, "paths": prefixes})
+        log(
+            f"Declared intent: searched {slug}@{sha[:MIN_SHA_CHARS]} "
+            f"({'whole tree' if not prefixes else ', '.join(prefixes)}): "
+            f"{len(found)} declaration(s)."
+        )
+    return declarations, searched, sources
+
+
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
-    # `finish` to measure today's document against.
+    # `finish` to measure today's document against. Yesterday's declarations
+    # go with it: a note a reviewer removed since must not go on silencing the
+    # posture it covered.
     Path(run_record_path_for(audit_id)).unlink(missing_ok=True)
+    Path(declarations_path_for(audit_id)).unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
     repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
@@ -6614,8 +7208,19 @@ def handle_start(args: argparse.Namespace) -> None:
     # the worker was handed; with the unlink at the top, a `start` that did
     # not get this far leaves no record at all, and `finish` withholds rather
     # than measuring the document against yesterday's list.
-    context = context_repos()
-    write_run_record(audit_id, repo, context)
+    context_entries = context_repo_entries()
+    context = [entry["repo"] for entry in context_entries]
+    # The harness's half of the declared-intent step, before the record is
+    # written so the record carries what it read: every repository the step
+    # owes, each searched for `declares:` frontmatter within the bound its
+    # `.kube-agents/intent.yaml` names, and each one read completely recorded
+    # as `owner/name@sha`. Nothing in it raises; a repository it could not
+    # read is left out and `finish` withholds that repository's postures.
+    declarations, searched, sources = discover_declarations(
+        audit_id, repo, root, context_entries
+    )
+    declarations_path = write_declarations(audit_id, repo, declarations)
+    write_run_record(audit_id, repo, context, searched=searched, sources=sources)
 
     print(
         json.dumps(
@@ -6665,6 +7270,18 @@ def handle_start(args: argparse.Namespace) -> None:
                 # derive it, and so the list it searched is the list the
                 # harness recorded.
                 DECLARED_INTENT_REPOS_KEY: declared_intent_repos(repo, context),
+                # The harness's own search: the repositories it read
+                # completely, as `finish` will credit them; where in each it
+                # looked (`paths` is the bound applied, `[]` for the whole
+                # tree, `ref` the branch or null); and the file holding what
+                # it found, which `finish` joins against the document. A slug
+                # in `declared_intent_repos` and not here is one the harness
+                # could not read — stderr says why — and the postures it
+                # covers are withheld unless the document records that search
+                # itself.
+                DECLARED_INTENT_SEARCHED_KEY: searched,
+                DECLARED_INTENT_SOURCES_KEY: sources,
+                "declarations_path": declarations_path,
                 # The roster, handed over rather than left to be discovered.
                 #
                 # It is in the SOP, and the SOP is required reading, but "the
@@ -7115,12 +7732,18 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # back for want of a declared-intent search, and a pull request for one of
     # them would contradict it.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
-    withheld_ids = set(
-        finding_ids(
-            withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
-        )
-    )
+    record = read_run_record(audit_id, repo=repo_hint)
+    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint))
+    withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
+    covered = [fid for fid in args.finding if fid in declared_ids]
+    if covered:
+        raise ValidationError(
+            f"--finding: {', '.join(covered)} declared — a repository declaration "
+            "covers this posture, so finish lists it under Declared intent rather "
+            "than as a finding, and a pull request for it would contradict the "
+            "ledger. Remove the declaration and run start and finish again, then ask"
+        )
     held = [fid for fid in args.finding if fid in withheld_ids]
     if held:
         raise ValidationError(
@@ -7306,7 +7929,13 @@ def handle_finish(args: argparse.Namespace) -> None:
     # holds the record to it; a dry run resolves nothing and compares only
     # when `--repo` was given.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
-    withheld = withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
+    record = read_run_record(audit_id, repo=repo_hint)
+    # The harness's search first, then the withhold against the record. The
+    # order matters: a posture a declaration covers moves to `declared[]`,
+    # where it cites the file it was read from, and only what is left is
+    # measured against the search record.
+    join_harness_declarations(data, record, audit_id, repo_hint)
+    withheld = withhold_unsearched_postures(data, record)
     if withheld:
         log(
             f"WITHHELD: {len(withheld)} posture finding(s) with no complete "

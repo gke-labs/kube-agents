@@ -153,6 +153,17 @@ LOGGER = logging.getLogger(__name__)
 #: there.
 GITHUB_REPO_TYPE = "github"
 
+#: The optional `ref` on a `context_repos` entry: the branch the declared-intent
+#: search reads instead of the remote's HEAD. Held to the shape of a git branch
+#: name and, above all, never allowed to begin with `-`, because the value is
+#: handed to `inspect_repository.py clone --ref` and from there to `git`, where
+#: a leading dash is an option. An entry whose `ref` fails the shape keeps its
+#: URL and drops the ref, with a warning; the repository is still read, at HEAD.
+CONTEXT_REF_KEY = "ref"
+_REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}\Z")
+_REF_FORBIDDEN_SUBSTRINGS = ("..", "/.", "//", "@{")
+_REF_FORBIDDEN_SUFFIXES = ("/", ".", ".lock")
+
 Runner = Callable[..., object]
 # One `git symbolic-ref` per clone per process, keyed by workspace path. The
 # answer cannot change while a process runs, and the call is not free: `git`
@@ -766,7 +777,11 @@ def _parse_repos_json(repos_str: str, key: str = MANAGED_REPOS_KEY) -> list[dict
                         url = str(item.get("url", "")).strip()
                         repo_type = str(item.get("type", "")).strip()
                         if url and repo_type:
-                            entries.append({"type": repo_type, "url": url})
+                            entry = {"type": repo_type, "url": url}
+                            ref = _context_ref(item, url, key)
+                            if ref:
+                                entry[CONTEXT_REF_KEY] = ref
+                            entries.append(entry)
         except json.JSONDecodeError as err:
             LOGGER.warning("Failed to decode %s JSON: %s", key, err)
             return []
@@ -774,6 +789,37 @@ def _parse_repos_json(repos_str: str, key: str = MANAGED_REPOS_KEY) -> list[dict
         LOGGER.warning("%s JSON does not start with '[': %r", key, repos_str)
         return []
     return entries
+
+
+def is_valid_ref(ref: object) -> bool:
+    """True for a value shaped like a git branch name that cannot read as a flag."""
+    if not isinstance(ref, str) or not _REF_SHAPE_RE.match(ref):
+        return False
+    if any(part in ref for part in _REF_FORBIDDEN_SUBSTRINGS):
+        return False
+    return not ref.endswith(_REF_FORBIDDEN_SUFFIXES)
+
+
+def _context_ref(item: dict, url: str, key: str) -> str | None:
+    """The entry's `ref`, or None — with a warning when one was given and dropped.
+
+    Only a `context_repos` entry may carry one: the managed list is what the
+    push gate and the resolver read, and a branch pin there would be a claim
+    about where fixes land that nothing downstream honours.
+    """
+    raw = item.get(CONTEXT_REF_KEY)
+    if raw is None or key != CONTEXT_REPOS_KEY:
+        return None
+    ref = str(raw).strip()
+    if is_valid_ref(ref):
+        return ref
+    LOGGER.warning(
+        "Dropping ref %r on %s repository %r: not a git branch name; reading HEAD.",
+        raw,
+        key,
+        url,
+    )
+    return None
 
 
 def _state_key_path(key: str) -> Path:
@@ -873,8 +919,8 @@ def get_context_repo_entries() -> list[dict[str, str]]:
     return _read_state_key(CONTEXT_REPOS_KEY)
 
 
-def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
-    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates.
+def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
+    """The GitHub entries in `entries` as `{repo, ref}`, in order, one per slug.
 
     An entry naming a forge this agent cannot drive is logged rather than
     dropped in silence. It is still skipped — there is one provider — but this
@@ -883,8 +929,13 @@ def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
     never touch indistinguishable from one that was never registered. `key`
     names the list in the warning, because both ConfigMap keys come through
     here and an administrator fixing the entry needs to know which one.
+
+    `ref` is the entry's branch pin or None. The first entry for a slug wins,
+    ref included: two entries for one repository on two branches is one
+    repository read once, at the branch the first names.
     """
-    res: list[str] = []
+    res: list[dict] = []
+    seen: set[str] = set()
     for entry in entries:
         url = entry.get("url", "")
         if entry.get("type") != GITHUB_REPO_TYPE:
@@ -901,9 +952,15 @@ def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
                 "Skipping %s repository %r: not a GitHub repository URL.", key, url
             )
             continue
-        if slug not in res:
-            res.append(slug)
+        if slug not in seen:
+            seen.add(slug)
+            res.append({"repo": slug, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)})
     return res
+
+
+def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
+    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates."""
+    return [entry["repo"] for entry in _github_entries(entries, key)]
 
 
 def get_managed_github_repos() -> list[str]:
@@ -920,6 +977,17 @@ def get_context_github_repos() -> list[str]:
     `resolve_repo` or `get_managed_github_repos`.
     """
     return _github_slugs(get_context_repo_entries(), CONTEXT_REPOS_KEY)
+
+
+def get_context_github_repo_entries() -> list[dict]:
+    """The `context_repos` GitHub entries as `[{repo, ref}]`, in ConfigMap order.
+
+    The same list as `get_context_github_repos` with each slug's branch pin
+    beside it (None when the entry has none), for the one caller that passes
+    the pin on to a clone. Same skip rule, same warning, same one-way
+    relationship to the managed list.
+    """
+    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY)
 
 
 def resolve_repo(workspace: str | Path | None = None) -> str:

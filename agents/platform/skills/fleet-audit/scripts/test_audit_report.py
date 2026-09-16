@@ -661,6 +661,11 @@ class HarnessTestCase(BaseTestCase):
         context = patch.object(gitops_workspace, "get_context_github_repos", lambda: [])
         context.start()
         self.addCleanup(context.stop)
+        entries = patch.object(
+            gitops_workspace, "get_context_github_repo_entries", lambda: []
+        )
+        entries.start()
+        self.addCleanup(entries.stop)
         # Most tests describe a pod that has audited before, so the clone
         # already exists and `ensure_workspace` takes the fetch path. Tests
         # about the first run call `self.unclone()` to remove it.
@@ -3625,6 +3630,10 @@ class TestStart(HarnessTestCase):
             "run_record_path_for",
             lambda audit_id: str(self.tmp_path / f"run_{audit_id}.json"),
         )
+        self.patch_attr(
+            "declarations_path_for",
+            lambda audit_id: str(self.tmp_path / f"declarations_{audit_id}.json"),
+        )
 
     def test_emits_one_json_line(self):
         self.harness.replies = {"issue list": self.issue_list()}
@@ -3648,6 +3657,14 @@ class TestStart(HarnessTestCase):
                 "carried": [],
                 "context_repos": [],
                 "declared_intent_repos": ["acme/fleet"],
+                # A stream with no declared-intent step searches nothing on
+                # the harness's behalf, and says so with empty lists rather
+                # than by leaving the keys out.
+                "declared_intent_searched": [],
+                "declared_intent_sources": [],
+                "declarations_path": str(
+                    self.tmp_path / "declarations_compliance-audit.json"
+                ),
                 "sop": "governance/compliance_audit_sop.md",
                 "checks": list(audit_report.audit_checks(AUDIT)),
             },
@@ -3742,8 +3759,8 @@ class TestStart(HarnessTestCase):
         self.harness.replies = {"issue list": "[]"}
         with patch.object(
             gitops_workspace,
-            "get_context_github_repos",
-            lambda: ["acme/terraform-live", "acme/fleet"],
+            "get_context_github_repo_entries",
+            lambda: context_entries("acme/terraform-live", "acme/fleet"),
         ):
             self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         payload = json.loads(self.out)
@@ -3761,7 +3778,7 @@ class TestStart(HarnessTestCase):
         def unreadable():
             raise RuntimeError("kubectl failed: Forbidden")
 
-        with patch.object(gitops_workspace, "get_context_github_repos", unreadable):
+        with patch.object(gitops_workspace, "get_context_github_repo_entries", unreadable):
             self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(self.out)["context_repos"], [])
         self.assertIn("could not read context_repos", self.err)
@@ -4028,6 +4045,11 @@ SEARCH_SHA = "0123456789abcdef0123456789abcdef01234567"
 def searched(*slugs, sha=SEARCH_SHA):
     """A `declared_intent_searched` list: each slug read at one sha."""
     return [f"{slug}@{sha}" for slug in slugs]
+
+
+def context_entries(*slugs, ref=None):
+    """What `get_context_github_repo_entries` returns for `slugs`, each at `ref`."""
+    return [{"repo": slug, "ref": ref} for slug in slugs]
 
 
 def searched_doc(findings=None, repos=("acme/fleet",), **kwargs):
@@ -4840,24 +4862,32 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         real = audit_report.write_run_record
         printed_before_write = []
 
-        def spy(audit_id, repo, context):
+        def spy(audit_id, repo, context, **kwargs):
             # A crash between the write and the print leaves a record; one
             # between the print and a write would leave none, and the run
             # would go on to withhold. Only the first order is acceptable.
             printed_before_write.append(sys.stdout.getvalue())
-            return real(audit_id, repo, context)
+            return real(audit_id, repo, context, **kwargs)
 
         self.patch_attr("write_run_record", spy)
         with patch.object(
             gitops_workspace,
-            "get_context_github_repos",
-            lambda: ["acme/terraform-live", "acme/fleet"],
+            "get_context_github_repo_entries",
+            lambda: context_entries("acme/terraform-live", "acme/fleet"),
         ):
             self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(printed_before_write, [""])
+        # The recorder answers `git rev-parse HEAD` and the context clone with
+        # nothing, so the harness's own search read neither repository and
+        # the record says so: `TestDeclaredIntentDiscovery` is where it reads.
         self.assertEqual(
             audit_report.read_run_record(DECLARING_AUDIT),
-            {"repo": "acme/fleet", "context_repos": ["acme/terraform-live", "acme/fleet"]},
+            {
+                "repo": "acme/fleet",
+                "context_repos": ["acme/terraform-live", "acme/fleet"],
+                "searched": [],
+                "sources": [],
+            },
         )
         payload = json.loads(self.out)
         self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
@@ -5041,8 +5071,680 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(
             audit_report.read_run_record(DECLARING_AUDIT),
-            {"repo": "acme/fleet", "context_repos": []},
+            {"repo": "acme/fleet", "context_repos": [], "searched": [], "sources": []},
         )
+
+
+# --------------------------------------------------------------------------- #
+# Harness-side declaration discovery and matching (the obtainability SOP's §4a)
+# --------------------------------------------------------------------------- #
+
+
+def note(declares=None, *, type_="observation", title="checkout-gateway runs unbudgeted", body="", raw=None):
+    """One OKF note: frontmatter carrying `type` and, when given, `declares`."""
+    if raw is not None:
+        return raw
+    front = []
+    if type_ is not None:
+        front.append(f"type: {type_}")
+    if title is not None:
+        front.append(f"title: {title}")
+    if declares is not None:
+        front.append("declares:")
+        for item in declares:
+            if not isinstance(item, dict):
+                front.append(f"  - {json.dumps(item)}")
+                continue
+            first = True
+            for key, value in item.items():
+                prefix = "  - " if first else "    "
+                first = False
+                front.append(f"{prefix}{key}: {json.dumps(value)}")
+    return "---\n" + "\n".join(front) + "\n---\n" + body
+
+
+def declaration(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway", cluster=None):
+    """One `declares:` item."""
+    item = {"check": check, "namespace": namespace, "object": obj}
+    if cluster is not None:
+        item["cluster"] = cluster
+    return item
+
+
+DECLARABLE = audit_report.audit_declarable_checks(DECLARING_AUDIT)
+
+
+def parse(text, path="knowledge/checkout.md", repo="acme/fleet"):
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        entries = audit_report.parse_declarations(
+            text, repo=repo, path=path, declarable=DECLARABLE
+        )
+    return entries, err.getvalue()
+
+
+class TestDeclarationParsing(unittest.TestCase):
+    """`declares:` frontmatter is the whole declaration format; the body is never scanned."""
+
+    def test_each_item_is_one_entry_with_the_note_as_its_pointer(self):
+        entries, err = parse(
+            note([declaration(), declaration(check="no-hpa", obj="Deployment/api", cluster="prod-us-east")])
+        )
+        self.assertEqual(err, "")
+        self.assertEqual(
+            entries,
+            [
+                {
+                    "check": "no-pdb",
+                    "namespace": "payments",
+                    "object": "Deployment/checkout-gateway",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                },
+                {
+                    "check": "no-hpa",
+                    "namespace": "payments",
+                    "object": "Deployment/api",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                    "cluster": "prod-us-east",
+                },
+            ],
+        )
+        # A fleet-wide item carries no `cluster` key at all, not a null one.
+        self.assertNotIn("cluster", entries[0])
+
+    def test_a_cluster_scoped_object_declares_an_empty_namespace(self):
+        entries, _ = parse(note([declaration(namespace="", obj="Node/pool-a")]))
+        self.assertEqual(entries[0]["namespace"], "")
+
+    def test_notes_that_are_not_declarations_yield_nothing_quietly(self):
+        for text in (
+            "# No frontmatter\n\nDeployment/checkout-gateway no-pdb\n",
+            note([declaration()], type_=None),
+            note(None),
+            "---\ntype: runbook\n",
+        ):
+            with self.subTest(text=text[:30]):
+                entries, err = parse(text)
+                self.assertEqual(entries, [])
+                self.assertEqual(err, "")
+
+    def test_body_text_naming_the_object_and_the_slug_is_not_a_declaration(self):
+        entries, _ = parse(note(None, body="payments/Deployment/checkout-gateway is `no-pdb` on purpose.\n"))
+        self.assertEqual(entries, [])
+
+    def test_a_bad_item_is_skipped_by_name_and_the_rest_of_the_note_counts(self):
+        cases = {
+            "a fault slug": declaration(check="blocking-pdb"),
+            "an unknown slug": declaration(check="no-such-check"),
+            "a missing field": {"check": "no-pdb", "object": "Deployment/x"},
+            "a non-string field": {"check": "no-pdb", "namespace": 3, "object": "Deployment/x"},
+            "an object that is not Kind/name": declaration(obj="checkout-gateway"),
+            "an object with a path in it": declaration(obj="apps/Deployment/x"),
+            "an empty cluster": declaration(cluster=""),
+            "a non-object item": "no-pdb",
+        }
+        for label, bad in cases.items():
+            with self.subTest(label):
+                entries, err = parse(note([bad, declaration(check="no-hpa", obj="Deployment/api")]))
+                self.assertEqual([e["check"] for e in entries], ["no-hpa"])
+                self.assertIn("WARNING: acme/fleet:knowledge/checkout.md declares[0]", err)
+                self.assertIn("skipped", err)
+
+    def test_declares_that_is_not_a_list_reads_nothing_with_a_warning(self):
+        entries, err = parse("---\ntype: observation\ndeclares: no-pdb\n---\n")
+        self.assertEqual(entries, [])
+        self.assertIn("`declares` must be a list", err)
+
+    def test_unparseable_frontmatter_reads_nothing_with_a_warning(self):
+        entries, err = parse("---\ntype: [unclosed\ndeclares:\n  - check: no-pdb\n---\n")
+        self.assertEqual(entries, [])
+        self.assertIn("not valid YAML", err)
+        self.assertIn("acme/fleet:knowledge/checkout.md", err)
+
+    def test_an_unclosed_frontmatter_block_is_not_frontmatter(self):
+        self.assertIsNone(audit_report.split_frontmatter("---\ntype: x\n"))
+        self.assertEqual(audit_report.split_frontmatter("---\ntype: x\n...\n"), "type: x")
+
+    def test_the_excerpt_falls_back_to_the_first_heading_then_the_path(self):
+        heading, _ = parse(note([declaration()], title=None, body="\n# Checkout runs without a budget\n"))
+        self.assertEqual(heading[0]["excerpt"], "Checkout runs without a budget")
+        # A heading inside a fence is code, not a heading.
+        fenced, _ = parse(note([declaration()], title=None, body="```\n# not a heading\n```\n"))
+        self.assertEqual(fenced[0]["excerpt"], "knowledge/checkout.md")
+
+    def test_the_excerpt_is_redacted_and_clipped(self):
+        token = "ghp_" + "a" * 36
+        entries, _ = parse(note([declaration()], title=f"pinned with token {token}"))
+        self.assertNotIn(token, entries[0]["excerpt"])
+        long, _ = parse(note([declaration()], title="x" * 1000))
+        self.assertLess(len(long[0]["excerpt"]), 1000)
+        self.assertTrue(long[0]["excerpt"].endswith("…(truncated)"))
+
+
+class TestIntentPaths(unittest.TestCase):
+    """`.kube-agents/intent.yaml` bounds the search; anything wrong with it means the whole tree."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tree = Path(tmp.name)
+
+    def write(self, relative, text):
+        target = self.tree / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def read(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            paths = audit_report.read_intent_paths(self.tree, "acme/fleet")
+        return paths, err.getvalue()
+
+    def test_a_valid_list_bounds_the_walk(self):
+        self.write(".kube-agents/intent.yaml", "paths:\n  - knowledge/\n  - docs/intent.md\n")
+        self.write("knowledge/a.md", "")
+        self.write("knowledge/deep/b.md", "")
+        self.write("knowledge.md", "")
+        self.write("docs/intent.md", "")
+        self.write("docs/other.md", "")
+        self.write("clusters/prod/c.md", "")
+        paths, err = self.read()
+        # The trailing slash is accepted and dropped; the prefix is a prefix.
+        self.assertEqual(paths, ["knowledge", "docs/intent.md"])
+        self.assertEqual(err, "")
+        self.assertEqual(
+            audit_report.note_paths(self.tree, paths),
+            ["docs/intent.md", "knowledge/a.md", "knowledge/deep/b.md"],
+        )
+
+    def test_an_absent_file_is_the_whole_tree(self):
+        paths, err = self.read()
+        self.assertEqual(paths, [])
+        self.assertIn("acme/fleet:.kube-agents/intent.yaml: absent", err)
+
+    def test_anything_wrong_with_the_file_is_the_whole_tree_with_a_warning(self):
+        cases = {
+            "invalid YAML": "paths: [unclosed\n",
+            "not a mapping": "- knowledge/\n",
+            "no paths key": "prefixes:\n  - knowledge/\n",
+            "a scalar": "paths: knowledge/\n",
+            "an empty list": "paths: []\n",
+            "a non-string entry": "paths:\n  - 3\n",
+            "an escaping path": "paths:\n  - knowledge/../secrets\n",
+            "an absolute path": "paths:\n  - /etc\n",
+            "a .git path": "paths:\n  - sub/.git\n",
+            "a glob": "paths:\n  - knowledge/*\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.write(".kube-agents/intent.yaml", text)
+                paths, err = self.read()
+                self.assertEqual(paths, [])
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
+                self.assertIn("searching the whole tree", err)
+
+    def test_the_walk_skips_git_and_symlinks(self):
+        self.write("knowledge/a.md", "")
+        self.write(".git/HOOKS.md", "")
+        self.write("sub/.git/x.md", "")
+        outside = self.write("outside/o.md", "")
+        (self.tree / "knowledge" / "link.md").symlink_to(outside)
+        (self.tree / "linked").symlink_to(self.tree / "outside", target_is_directory=True)
+        self.assertEqual(
+            audit_report.note_paths(self.tree, []), ["knowledge/a.md", "outside/o.md"]
+        )
+
+
+class DiscoveryTestCase(HarnessTestCase):
+    """The declaring stream's `start`, with a workspace the harness can read."""
+
+    def setUp(self):
+        super().setUp()
+        self.workspace = self.gitops_root / DECLARING_AUDIT / "acme__fleet"
+        (self.workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(self.workspace)
+        self.patch_attr("repo_root", lambda: self.workspace)
+        self.scratch = Path(audit_report.SCRATCH_DIR)
+        self.harness.replies = {"issue list": "[]"}
+
+    def write(self, root, relative, text):
+        target = Path(root) / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def context(self, *slugs, ref=None):
+        patcher = patch.object(
+            gitops_workspace,
+            "get_context_github_repo_entries",
+            lambda: context_entries(*slugs, ref=ref),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def copy_reply(self, into, sha=SEARCH_SHA, complete=True, mode="content", **extra):
+        reply = {"mode": mode, "repo": "acme/terraform-live", "complete": complete, **extra}
+        if mode == "content":
+            reply.update({"into": str(into), "sha": sha, "skipped": [], "stopped": None})
+        else:
+            reply["workspace"] = str(into)
+        return json.dumps(reply) + "\n"
+
+    def start(self):
+        rc = self.run_main(["start", "--audit", DECLARING_AUDIT])
+        self.assertEqual(rc, 0, self.err)
+        return json.loads(self.out)
+
+    def clone_calls(self):
+        return [c for c in self.harness.calls if "clone" in c and str(audit_report.CLONE_SCRIPT) in c]
+
+    def filed(self):
+        return audit_report.read_declarations(DECLARING_AUDIT)
+
+    def temp_dirs(self):
+        return sorted(p.name for p in self.scratch.glob(f"{audit_report.CLONE_TMP_PREFIX}*"))
+
+
+class TestDeclaredIntentDiscovery(DiscoveryTestCase):
+    """`start` reads every repository the step owes and records what it read."""
+
+    def test_directory_mode_walks_the_reset_workspace_and_takes_the_sha_from_git(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}]
+        )
+        self.assertEqual(payload["declarations_path"], str(self.scratch / f"declarations_{DECLARING_AUDIT}.json"))
+        self.assertEqual(
+            self.filed(),
+            [
+                {
+                    "check": "no-pdb",
+                    "namespace": "payments",
+                    "object": "Deployment/checkout-gateway",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                }
+            ],
+        )
+        record = audit_report.read_run_record(DECLARING_AUDIT)
+        self.assertEqual(record["searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(record["sources"], payload["declared_intent_sources"])
+        rev = [c for c in self.harness.calls if c[:3] == ["git", "rev-parse", "HEAD"]]
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(self.harness.cwds[self.harness.calls.index(rev[0])], str(self.workspace))
+        # Nothing was cloned: the tree was already there.
+        self.assertEqual(self.clone_calls(), [])
+        self.assertIn("searched acme/fleet@0123456 (whole tree): 1 declaration(s)", self.err)
+
+    def test_the_intent_file_bounds_the_walk_and_is_reported(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - knowledge/\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        payload = self.start()
+        self.assertEqual(
+            payload["declared_intent_sources"],
+            [{"repo": "acme/fleet", "ref": None, "paths": ["knowledge"]}],
+        )
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_no_sha_for_the_checkout_leaves_it_unsearched(self):
+        # The recorder answers `git rev-parse HEAD` with nothing.
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(payload["declared_intent_sources"], [])
+        self.assertEqual(self.filed(), [])
+        self.assertIn("WARNING: acme/fleet: no commit sha for the checkout; not searched", self.err)
+
+    def test_content_mode_clones_the_gitops_repository_through_the_sibling_script(self):
+        self.patch_attr("detect_content_mode", lambda: True)
+        copy = self.tmp_path / "copy"
+        self.write(copy, "knowledge/checkout.md", note([declaration()]))
+        self.harness.replies["--repo acme/fleet"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertEqual(payload["mode"], "content")
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(self.filed()[0]["path"], "knowledge/checkout.md")
+        calls = self.clone_calls()
+        self.assertEqual(len(calls), 1)
+        cmd = calls[0]
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertEqual(cmd[2:6], ["clone", "--repo", "acme/fleet", "--depth"])
+        self.assertEqual(cmd[6], "1")
+        self.assertIn("--into", cmd)
+        self.assertIn("--lease", cmd)
+        self.assertEqual(cmd[cmd.index("--lease") + 1], f"{DECLARING_AUDIT}-declared-intent")
+        self.assertNotIn("--ref", cmd)
+        self.assertEqual([c for c in self.harness.calls if c[:2] == ["git", "rev-parse"]], [])
+        # The temporary destination is gone once the read is done.
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_context_repository_is_cloned_with_its_ref_and_read(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live", ref="release-2026")
+        copy = self.tmp_path / "copy"
+        sha = "89abcdef" * 5
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.write(copy, "README.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy, sha=sha)
+        payload = self.start()
+        self.assertEqual(
+            payload["declared_intent_searched"],
+            [f"acme/fleet@{SEARCH_SHA}", f"acme/terraform-live@{sha}"],
+        )
+        self.assertEqual(
+            payload["declared_intent_sources"][1],
+            {"repo": "acme/terraform-live", "ref": "release-2026", "paths": ["intent"]},
+        )
+        cmd = self.clone_calls()[0]
+        self.assertEqual(cmd[cmd.index("--ref") + 1], "release-2026")
+        self.assertEqual(
+            [(e["repo"], e["path"]) for e in self.filed()],
+            [("acme/terraform-live", "intent/api.md")],
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_directory_mode_copy_is_the_leased_workspace_the_clone_names(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        leased = self.tmp_path / "leased" / "acme__terraform-live"
+        self.write(leased, "intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            leased, mode="directory", depthIgnored=True
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        rev = [i for i, c in enumerate(self.harness.calls) if c[:3] == ["git", "rev-parse", "HEAD"]]
+        self.assertEqual([self.harness.cwds[i] for i in rev], [str(self.workspace), str(leased)])
+        # The leased checkout is left in place; only the scratch destination goes.
+        self.assertTrue(leased.is_dir())
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_copy_the_harness_cannot_call_searched_is_left_out_with_a_warning(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "intent.md", note([declaration()]))
+        cases = {
+            "complete false": (self.copy_reply(copy, complete=False, stopped="maxBytes"), "copy incomplete"),
+            "no json": ("cloning...\n", "clone printed no JSON line"),
+            "no sha": (self.copy_reply(copy, sha=""), "no commit sha for the copy"),
+            "no such tree": (self.copy_reply(self.tmp_path / "missing"), "clone named"),
+        }
+        for label, (reply, expected) in cases.items():
+            with self.subTest(label):
+                self.harness.replies["--repo acme/terraform-live"] = reply
+                self.out = ""
+                payload = self.start()
+                self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+                self.assertIn(f"WARNING: acme/terraform-live: {expected}", self.err)
+                self.assertEqual(self.filed(), [])
+                self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_clone_that_exits_non_zero_is_not_searched_and_does_not_end_the_run(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.harness.failures = {"--repo acme/terraform-live": 1}
+        self.context("acme/terraform-live")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("WARNING: acme/terraform-live: clone exited 1; not searched", self.err)
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_yesterdays_declarations_are_cleared_before_anything_can_fail(self):
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(DECLARING_AUDIT, "acme/fleet", [{"check": "no-pdb"}])
+
+        def boom(repo, audit_id):
+            raise RuntimeError("gh label create: 502")
+
+        self.patch_attr("ensure_labels", boom)
+        self.assertNotEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
+        self.assertEqual(self.filed(), [])
+        self.assertFalse(Path(audit_report.declarations_path_for(DECLARING_AUDIT)).exists())
+
+    def test_without_pyyaml_nothing_is_searched_and_the_run_says_so(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        with patch.dict(sys.modules, {"yaml": None}):
+            payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(self.clone_calls(), [])
+        self.assertIn("PyYAML is not importable", self.err)
+
+    def test_a_stream_with_no_declared_intent_step_clones_nothing(self):
+        self.context("acme/terraform-live")
+        self.workspace = self.gitops_root / AUDIT / "acme__fleet"
+        rc = self.run_main(["start", "--audit", AUDIT])
+        self.assertEqual(rc, 0, self.err)
+        payload = json.loads(self.out)
+        self.assertEqual(payload["context_repos"], ["acme/terraform-live"])
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(self.clone_calls(), [])
+
+
+class TestHarnessDeclarationJoin(HarnessTestCase):
+    """`finish` and `remediate` apply what `start` filed, before the withhold."""
+
+    CONTEXT = ("acme/terraform-live",)
+    OTHER_SHA = "89abcdef" * 5
+
+    def setUp(self):
+        super().setUp()
+        self.workspace = self.gitops_root / DECLARING_AUDIT / "acme__fleet"
+        (self.workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(self.workspace)
+        self.patch_attr("repo_root", lambda: self.workspace)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.touch("clusters/prod-us-east/payments-db-pdb.yaml")
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
+    def record(self, searched=("acme/fleet", "acme/terraform-live"), context=CONTEXT, sources=()):
+        shas = {"acme/fleet": SEARCH_SHA, "acme/terraform-live": self.OTHER_SHA}
+        audit_report.write_run_record(
+            DECLARING_AUDIT,
+            "acme/fleet",
+            list(context),
+            searched=[f"{slug}@{shas[slug]}" for slug in searched],
+            sources=list(sources),
+        )
+
+    def file(self, *entries, repo="acme/fleet"):
+        audit_report.write_declarations(DECLARING_AUDIT, repo, list(entries))
+
+    @staticmethod
+    def entry(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway", cluster=None,
+              repo="acme/fleet", path="knowledge/checkout.md", excerpt="checkout runs unbudgeted"):
+        entry = {"check": check, "namespace": namespace, "object": obj,
+                 "repo": repo, "path": path, "excerpt": excerpt}
+        if cluster is not None:
+            entry["cluster"] = cluster
+        return entry
+
+    def doc(self, findings=None):
+        return declaring_doc(findings=posture_and_fault_findings() if findings is None else findings)
+
+    def finish(self, doc, *extra):
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=extra)
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json() if not extra else None
+
+    def ledger_body(self):
+        bodies = self.harness.bodies_for("issue", "create")
+        self.assertEqual(len(bodies), 1, bodies)
+        return bodies[0]
+
+    PDB_ID = staticmethod(lambda: derived_id(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway"))
+
+    def test_a_matching_finding_moves_to_declared_with_the_findings_cluster_and_title(self):
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc())
+        self.assertFalse(payload["partial"], payload["coverage_gaps"])
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["postures_withheld"], [])
+        # Five findings in, one declared: four publish.
+        self.assertEqual(payload["new"], 4)
+        body = self.ledger_body()
+        self.assertIn("## Declared intent", body)
+        self.assertIn(
+            "| `no-pdb` | `prod-us-east` | `payments/Deployment/checkout-gateway` "
+            "| `acme/fleet:knowledge/checkout.md` | checkout-gateway runs 3 replicas with no "
+            "PodDisruptionBudget: `checkout runs unbudgeted` |",
+            body,
+        )
+        self.assertNotIn(self.PDB_ID(), audit_report.parse_delta_block(body))
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        self.assertIn("acme/fleet:knowledge/checkout.md", self.err)
+        # And the harness's search record renders as the model's would have.
+        self.assertIn(f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`", body)
+
+    def test_a_cluster_scoped_entry_matches_only_its_cluster(self):
+        self.record()
+        self.file(self.entry(cluster="stage-eu"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertEqual(payload["new"], 5)
+        self.harness.calls.clear()
+        self.harness.bodies.clear()
+        self.file(self.entry(cluster="prod-us-east"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+
+    def test_a_scoped_entry_wins_over_a_fleet_wide_one_for_its_cluster(self):
+        self.record()
+        self.file(self.entry(path="knowledge/fleet.md"), self.entry(cluster="prod-us-east", path="knowledge/prod.md"))
+        self.finish(self.doc())
+        self.assertIn("`acme/fleet:knowledge/prod.md`", self.ledger_body())
+
+    def test_a_non_matching_entry_leaves_the_finding_alone(self):
+        self.record()
+        self.file(
+            self.entry(namespace="other"),
+            self.entry(obj="Deployment/checkout"),
+            self.entry(check="no-hpa"),
+        )
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertNotIn("## Declared intent", self.ledger_body())
+
+    def test_a_fault_is_never_moved_whatever_the_file_says(self):
+        # `parse_declarations` would not have written this entry; a file that
+        # carries one anyway still cannot silence a fault.
+        self.record()
+        self.file(self.entry(check="blocking-pdb", obj="PodDisruptionBudget/payments-db"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertIn("`blocking-pdb`", self.ledger_body())
+
+    def test_a_model_written_entry_survives_beside_a_harness_one(self):
+        self.record()
+        self.file(self.entry())
+        doc = self.doc()
+        doc["declared"] = [make_declared(obj="Deployment/web")]
+        payload = self.finish(doc)
+        self.assertEqual(payload["declared"], 2)
+        body = self.ledger_body()
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", body)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", body)
+
+    def test_a_complete_harness_record_lifts_the_withhold_without_a_model_record(self):
+        self.record()
+        payload = self.finish(self.doc())
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["postures_withheld"], [])
+        self.assertIn(
+            f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`, `acme/terraform-live@{self.OTHER_SHA}`",
+            self.ledger_body(),
+        )
+
+    def test_a_partial_harness_record_withholds_and_names_the_unread_repository(self):
+        self.record(searched=("acme/fleet",))
+        self.file(self.entry())
+        payload = self.finish(self.doc())
+        self.assertTrue(payload["partial"])
+        gap = [g for g in payload["coverage_gaps"] if g.startswith("declared intent:")][0]
+        self.assertIn("repositories not searched: acme/terraform-live", gap)
+        self.assertNotIn("acme/fleet,", gap)
+        # The declared posture is its own record and is not among the withheld.
+        self.assertEqual(payload["declared"], 1)
+        self.assertNotIn(self.PDB_ID(), payload["postures_withheld"])
+        self.assertEqual(len(payload["postures_withheld"]), 2)
+
+    def test_the_model_record_and_the_harness_record_are_unioned(self):
+        self.record(searched=("acme/fleet",))
+        doc = self.doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/terraform-live")
+        payload = self.finish(doc)
+        self.assertFalse(payload["partial"])
+
+    def test_a_file_for_another_repository_joins_nothing(self):
+        self.record()
+        self.file(self.entry(), repo="acme/other")
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+
+    def test_the_dry_run_applies_the_same_join(self):
+        self.record()
+        self.file(self.entry())
+        self.finish(self.doc(), "--dry-run")
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        self.assertIn("DECLARED: 1 posture(s)", self.err)
+        self.assertIn("## Declared intent", self.out)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", self.out)
+        self.assertEqual(self.harness.gh_calls("issue"), [])
+
+    def test_remediate_refuses_a_declared_id_by_name(self):
+        self.record()
+        self.file(self.entry())
+        findings_file = self.write_findings(self.doc())
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                rc = self.run_main(
+                    ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+                     "--finding", self.PDB_ID(), *extra]
+                )
+                self.assertEqual(rc, 2, self.err)
+                self.assertIn("declared", self.err)
+                self.assertIn("Declared intent", self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+
+    def test_remediate_still_opens_a_fault_beside_a_declared_posture(self):
+        self.record()
+        self.file(self.entry())
+        findings_file = self.write_findings(self.doc())
+        fault = derived_id(check="blocking-pdb", namespace="payments", obj="PodDisruptionBudget/payments-db")
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file, "--finding", fault]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(self.stdout_json()["prs_opened"]), 1)
+
+    def test_a_run_with_nothing_but_declared_postures_is_clean(self):
+        self.record()
+        self.file(self.entry(), self.entry(check="no-hpa", obj="Deployment/api"))
+        postures = [f for f in posture_and_fault_findings() if f["check"] in ("no-pdb", "no-hpa")]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["declared"], 2)
+        self.assertIn("2 declared posture(s) were not reported as findings", self.err)
+
 
 
 class TestAiSecurityAuditStream(BaseTestCase):
