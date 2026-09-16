@@ -411,10 +411,14 @@ reads: `list`, `grep` and `fetch` print the broker's tree sha, and in content mo
 `inspect_repository.py clone` and `open` print it for a context copy (#1477).
 
 `start` also performs the search itself: it reads each repository in that set for `declares:`
-frontmatter within the paths its `.kube-agents/intent.yaml` names, files the result in
-`declarations_<audit-id>.json`, records each repository it read completely under `searched` in the
-run record, and `finish` unions that list into the document and moves each covered finding to
-`declared` before the withhold (#1576, #1577).
+frontmatter within the paths its `.kube-agents/intent.yaml` names — in content mode copying the
+intent directory first and then only those paths, so the copy's caps count notes rather than
+manifests — files the result in `declarations_<audit-id>.json`, records each repository it read
+completely (every note under the searched paths arrived and was read) under `searched` in the run
+record, and `finish` unions that list into the document and moves each covered finding to
+`declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
+severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
+stays a finding.
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for

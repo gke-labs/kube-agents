@@ -219,9 +219,13 @@ through `inspect_repository.py clone` at the entry's `ref` when it has one, the 
 from the clone it just reset or through the same script in content mode — for `declares:`
 frontmatter in OKF notes, within the paths each repository's `.kube-agents/intent.yaml` names
 (`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree
-was read). It files what it found at `declarations_path` and lists each repository it read
-completely as `owner/name@sha`. `finish` unions that list into the document's and moves every
-finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
+was read). In content mode the copy is bounded the same way: `.kube-agents/` first, then only the
+named paths, so the sibling script's file and byte caps count notes rather than manifests; a
+repository with no usable intent file is copied whole under those caps. `start` files what it found
+at `declarations_path` and lists each repository it read completely — every note under the
+searched paths arrived and was read; one the broker withheld or the harness could not decode costs
+the repository its entry — as `owner/name@sha`. `finish` unions that list into the document's and
+moves every finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
 from `declared_intent_searched` is one the harness could not read; stderr says why, and the SOP
 says what the worker does about it. On every other stream the two lists are empty and the file at
 `declarations_path` holds none.
@@ -652,6 +656,9 @@ an optional `cluster`, `object` as `Kind/name` — within the paths each reposit
 `.kube-agents/intent.yaml` names, and `finish` moves every finding one covers here itself: an exact
 lookup on `(check, cluster, namespace, object)`, then on the fleet-wide `(check, namespace, object)`,
 the finding's `cluster` and `title` kept and the note's `repo`, `path` and title as the declaration.
+For `hpa-cannot-scale`, the one slug that names both a posture and a fault, the join moves only the
+`min == max` shape, read off the severity the SOP fixes for it (`major`); a declaration matching the
+`minor` dangling-target fault is reported on stderr and not applied.
 The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
 machine-readable form yet; a match there is moved here by the worker with the lines that pin the
 property as `excerpt`.

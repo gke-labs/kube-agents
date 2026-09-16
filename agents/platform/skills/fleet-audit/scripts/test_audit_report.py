@@ -5259,7 +5259,7 @@ class TestIntentPaths(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(
             audit_report.note_paths(self.tree, paths),
-            ["docs/intent.md", "knowledge/a.md", "knowledge/deep/b.md"],
+            (["docs/intent.md", "knowledge/a.md", "knowledge/deep/b.md"], []),
         )
 
     def test_an_absent_file_is_the_whole_tree(self):
@@ -5296,7 +5296,27 @@ class TestIntentPaths(unittest.TestCase):
         (self.tree / "knowledge" / "link.md").symlink_to(outside)
         (self.tree / "linked").symlink_to(self.tree / "outside", target_is_directory=True)
         self.assertEqual(
-            audit_report.note_paths(self.tree, []), ["knowledge/a.md", "outside/o.md"]
+            audit_report.note_paths(self.tree, []), (["knowledge/a.md", "outside/o.md"], [])
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "root can list any directory")
+    def test_a_directory_the_walk_cannot_enter_is_reported_when_the_bound_reaches_it(self):
+        self.write("knowledge/a.md", "")
+        self.write("knowledge/deep/b.md", "")
+        self.write("manifests/sub/c.md", "")
+        for locked in ("knowledge/deep", "manifests/sub"):
+            (self.tree / locked).chmod(0)
+            self.addCleanup((self.tree / locked).chmod, 0o755)
+        # Under the bound: the notes in it were never seen.
+        self.assertEqual(
+            audit_report.note_paths(self.tree, ["knowledge"]), (["knowledge/a.md"], ["knowledge/deep"])
+        )
+        # Outside it: nothing the search reads could be there.
+        self.assertEqual(audit_report.note_paths(self.tree, ["knowledge/a.md"]), (["knowledge/a.md"], []))
+        # No bound: every directory is in reach.
+        self.assertEqual(
+            audit_report.note_paths(self.tree, []),
+            (["knowledge/a.md"], ["knowledge/deep", "manifests/sub"]),
         )
 
 
@@ -5416,15 +5436,22 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
         self.assertEqual(self.filed()[0]["path"], "knowledge/checkout.md")
         calls = self.clone_calls()
-        self.assertEqual(len(calls), 1)
-        cmd = calls[0]
-        self.assertEqual(cmd[0], sys.executable)
-        self.assertEqual(cmd[2:6], ["clone", "--repo", "acme/fleet", "--depth"])
-        self.assertEqual(cmd[6], "1")
-        self.assertIn("--into", cmd)
-        self.assertIn("--lease", cmd)
-        self.assertEqual(cmd[cmd.index("--lease") + 1], f"{DECLARING_AUDIT}-declared-intent")
-        self.assertNotIn("--ref", cmd)
+        # Two copies into one tree: `.kube-agents/` for the bound, then — with
+        # no intent file in it — the whole tree.
+        self.assertEqual(len(calls), 2)
+        for cmd in calls:
+            self.assertEqual(cmd[0], sys.executable)
+            self.assertEqual(cmd[2:6], ["clone", "--repo", "acme/fleet", "--depth"])
+            self.assertEqual(cmd[6], "1")
+            self.assertIn("--into", cmd)
+            self.assertIn("--lease", cmd)
+            self.assertEqual(cmd[cmd.index("--lease") + 1], f"{DECLARING_AUDIT}-declared-intent")
+            self.assertNotIn("--ref", cmd)
+        self.assertEqual(calls[0][calls[0].index("--prefix") + 1], ".kube-agents")
+        self.assertNotIn("--force", calls[0])
+        self.assertNotIn("--prefix", calls[1])
+        self.assertIn("--force", calls[1])
+        self.assertEqual(calls[0][calls[0].index("--into") + 1], calls[1][calls[1].index("--into") + 1])
         self.assertEqual([c for c in self.harness.calls if c[:2] == ["git", "rev-parse"]], [])
         # The temporary destination is gone once the read is done.
         self.assertEqual(self.temp_dirs(), [])
@@ -5447,13 +5474,91 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
             payload["declared_intent_sources"][1],
             {"repo": "acme/terraform-live", "ref": "release-2026", "paths": ["intent"]},
         )
-        cmd = self.clone_calls()[0]
-        self.assertEqual(cmd[cmd.index("--ref") + 1], "release-2026")
+        calls = self.clone_calls()
+        self.assertEqual([c[c.index("--ref") + 1] for c in calls], ["release-2026"] * 2)
+        # The bound is read from the first copy and the second fetches only it.
+        self.assertEqual([c[c.index("--prefix") + 1] for c in calls], [".kube-agents", "intent"])
         self.assertEqual(
             [(e["repo"], e["path"]) for e in self.filed()],
             [("acme/terraform-live", "intent/api.md")],
         )
         self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_content_mode_copy_fetches_each_named_path_and_nothing_else(self):
+        # The sibling script's default caps count every file in the repository,
+        # so a whole-tree copy of a GitOps repository that vendors charts would
+        # be stopped by files the search never opens. Only the intent
+        # directory and the paths it names are copied.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths:\n  - intent/\n  - docs/intent.md\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.write(copy, "docs/intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["intent", "docs/intent.md"])
+        calls = self.clone_calls()
+        self.assertEqual(
+            [c[c.index("--prefix") + 1] for c in calls], [".kube-agents", "intent", "docs/intent.md"]
+        )
+        self.assertEqual([("--force" in c) for c in calls], [False, True, True])
+        self.assertEqual(len({c[c.index("--into") + 1] for c in calls}), 1)
+        self.assertEqual(
+            [e["path"] for e in self.filed()], ["docs/intent.md", "intent/api.md"]
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_repository_that_moved_between_copies_is_not_searched(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        moved = "89abcdef" * 5
+        # The recorder answers with the first key that matches, so the
+        # specific one goes first.
+        self.harness.replies = {
+            "--prefix .kube-agents": self.copy_reply(copy),
+            "--repo acme/terraform-live": self.copy_reply(copy, sha=moved),
+            **self.harness.replies,
+        }
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn(
+            "WARNING: acme/terraform-live: the copy of intent is at 89abcde, not 0123456: "
+            "the repository moved between copies; not searched",
+            self.err,
+        )
+        self.assertEqual(self.filed(), [])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_note_the_harness_cannot_read_costs_the_repository_its_entry(self):
+        # The local twin of a note the broker withheld: a cp1252 byte in a note
+        # under the searched paths, and the repository must not be recorded
+        # as read around it.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths: [knowledge/]\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        legacy = self.workspace / "knowledge" / "legacy.md"
+        legacy.write_bytes(note([declaration(check="no-hpa", obj="Deployment/api")]).encode("utf-8") + b"caf\xe9\n")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(payload["declared_intent_sources"], [])
+        self.assertEqual(self.filed(), [])
+        self.assertIn("WARNING: acme/fleet:knowledge/legacy.md: unreadable", self.err)
+        self.assertIn(
+            "WARNING: acme/fleet: 1 path(s) under the searched paths could not be read "
+            "(knowledge/legacy.md); not searched",
+            self.err,
+        )
+        # Outside the bound, the same file costs nothing.
+        legacy.rename(self.workspace / "docs.md")
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
 
     def test_a_directory_mode_copy_is_the_leased_workspace_the_clone_names(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
@@ -5716,6 +5821,33 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         payload = self.finish(self.doc())
         self.assertEqual(payload["declared"], 0)
         self.assertIn("`blocking-pdb`", self.ledger_body())
+
+    def test_a_standing_hpa_declaration_does_not_move_the_dangling_target_fault(self):
+        # `hpa-cannot-scale` is a posture at `major` (`min == max`) and a fault
+        # at `minor` (a dangling target). The fixture's is the fault; a
+        # declaration filed for the HPA must leave it a finding, and say so.
+        self.record()
+        self.file(self.entry(check="hpa-cannot-scale", namespace="web", obj="HorizontalPodAutoscaler/web"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        dangling = derived_id(check="hpa-cannot-scale", namespace="web", obj="HorizontalPodAutoscaler/web")
+        self.assertIn(
+            f"DECLARATION NOT APPLIED: {dangling} — hpa-cannot-scale at severity 'minor' is the "
+            "dangling-target fault (SOP §3.6(b)), which no declaration excuses",
+            self.err,
+        )
+        self.assertIn("acme/fleet:knowledge/checkout.md stands and the finding publishes", self.err)
+        self.assertIn(f"[`{dangling}`]", self.ledger_body())
+        # The same declaration moves the posture shape.
+        self.harness.calls.clear()
+        self.harness.bodies.clear()
+        findings = self.doc()["findings"]
+        for finding in findings:
+            if finding["check"] == "hpa-cannot-scale":
+                finding["severity"] = "major"
+        payload = self.finish(self.doc(findings=findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertIn(f"DECLARED: {dangling}", self.err)
 
     def test_a_model_written_entry_survives_beside_a_harness_one(self):
         self.record()

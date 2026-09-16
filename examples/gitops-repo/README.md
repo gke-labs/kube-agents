@@ -38,7 +38,9 @@ gitops-repo/
   `cluster` when the choice is one cluster's rather than fleet-wide; the audit reads the
   frontmatter, never the prose, and lists a match under _Declared intent_ with the file's path
   instead of reporting it. `.kube-agents/intent.yaml` names the paths the audit reads for such
-  notes (`knowledge/` here); without it the whole repository is read. A Terraform repository that
+  notes (`knowledge/` here); without it the whole repository is read, and in content mode copied
+  whole under the audit's file and byte caps, so naming paths is what keeps a large repository
+  searchable. A Terraform repository that
   is not this one is registered under the `context_repos` key of the agent's `gitops-state`
   ConfigMap, optionally pinned to a branch with `ref`, and is read the same way, never written to.
 - **Version pins:** kube-agents artifacts referenced from this repo are pinned to immutable SemVer

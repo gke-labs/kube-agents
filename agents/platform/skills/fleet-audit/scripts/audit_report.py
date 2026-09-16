@@ -599,6 +599,13 @@ SEARCHED_REPO_RE = re.compile(
 # validator cannot tell the two apart. The fault is withheld with the postures,
 # and the gap sentence says so.
 DUAL_SHAPE_CHECK = "hpa-cannot-scale"
+# The severity the obtainability SOP's §3.6 fixes for the `min == max` posture
+# (`major`; the dangling-target fault is `minor`). The severity is the one
+# validated field that carries the shape, so the harness-side join moves an
+# `hpa-cannot-scale` finding only at this severity and leaves every other one a
+# finding whatever a note declares. The withhold keeps taking both shapes: it
+# errs toward holding a finding back, the join would err toward silencing one.
+DUAL_SHAPE_POSTURE_SEVERITY = "major"
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
 # reads every repository the step must search, collects the declarations it
@@ -634,6 +641,9 @@ HEADING_RE = re.compile(r"^#{1,6}[ \t]+(?P<text>\S.*?)[ \t#]*$", re.M)
 # declaration in the repository.
 INTENT_FILE = ".kube-agents/intent.yaml"
 INTENT_PATHS_KEY = "paths"
+# The directory a content-mode copy fetches first, so the bound is known before
+# anything else is copied.
+INTENT_DIR = str(PurePosixPath(INTENT_FILE).parent)
 # Never descended, in either mode: a `.git` is repository state, and a symlink
 # is a path out of the copy the bound was checked against.
 SKIPPED_TREE_DIRS = frozenset({".git"})
@@ -2610,15 +2620,40 @@ def _under_prefixes(path: str, prefixes: list[str]) -> bool:
     return not prefixes or any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
-def note_paths(tree: Path, prefixes: list[str]) -> list[str]:
-    """Every `.md` under `tree` within `prefixes`, repo-relative, sorted.
+def _bounds_searched_notes(rel: str, prefixes: list[str]) -> bool:
+    """Whether a directory the walk could not enter may hold a searched note.
 
-    `.git` is never entered and a symlink — file or directory — is never
-    followed: the bound was checked against paths inside the copy, and a link
-    is a path out of it.
+    True for the tree root, for a directory at or under a prefix, and for an
+    ancestor of one; a directory the bound excludes cannot have held one.
+    """
+    if rel in ("", ".") or _under_prefixes(rel, prefixes):
+        return True
+    return any(prefix.startswith(rel + "/") for prefix in prefixes)
+
+
+def note_paths(tree: Path, prefixes: list[str]) -> tuple[list[str], list[str]]:
+    """`(notes, unlisted)`: every `.md` under `tree` within `prefixes`, and the directories the walk could not enter.
+
+    Both repo-relative and sorted. `.git` is never entered and a symlink —
+    file or directory — is never followed: the bound was checked against
+    paths inside the copy, and a link is a path out of it. A directory
+    `os.walk` could not list is reported when it lies where a searched note
+    could be, because the notes under it were never seen and the repository
+    must not be called read.
     """
     out: list[str] = []
-    for current, dirs, files in os.walk(tree, followlinks=False):
+    unlisted: list[str] = []
+
+    def could_not_enter(exc: OSError) -> None:
+        failed = Path(str(exc.filename or tree))
+        try:
+            rel = failed.relative_to(tree).as_posix()
+        except ValueError:
+            rel = failed.as_posix()
+        if _bounds_searched_notes(rel, prefixes):
+            unlisted.append(rel)
+
+    for current, dirs, files in os.walk(tree, onerror=could_not_enter, followlinks=False):
         here = Path(current)
         dirs[:] = sorted(
             d for d in dirs if d not in SKIPPED_TREE_DIRS and not (here / d).is_symlink()
@@ -2629,21 +2664,40 @@ def note_paths(tree: Path, prefixes: list[str]) -> list[str]:
             rel = (here / name).relative_to(tree).as_posix()
             if _under_prefixes(rel, prefixes):
                 out.append(rel)
-    return out
+    return out, sorted(unlisted)
 
 
-def search_tree(tree: Path, *, repo: str, declarable: frozenset[str]) -> tuple[list[dict], list[str]]:
-    """Read one repository copy: `(declarations, prefixes applied)`."""
-    prefixes = read_intent_paths(tree, repo)
+def search_tree(
+    tree: Path,
+    *,
+    repo: str,
+    declarable: frozenset[str],
+    prefixes: list[str] | None = None,
+) -> tuple[list[dict], list[str], list[str]]:
+    """Read one repository copy: `(declarations, prefixes applied, paths not read)`.
+
+    `prefixes` is the bound when the caller already read the intent file (a
+    content-mode copy fetched it first); None reads it from the tree. The
+    third element names every note under the bound the harness could not read
+    — not UTF-8, unreadable, or in a directory it could not list. It is the
+    local twin of a note the broker withheld, and the caller treats it the
+    same way: a repository with one is not searched, because a declaration in
+    that note would go unhonoured while the record said the repository was
+    read.
+    """
+    if prefixes is None:
+        prefixes = read_intent_paths(tree, repo)
+    notes, unread = note_paths(tree, prefixes)
     found: list[dict] = []
-    for rel in note_paths(tree, prefixes):
+    for rel in notes:
         try:
             text = (tree / rel).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            log(f"WARNING: {repo}:{rel}: unreadable ({exc}); skipped.")
+            log(f"WARNING: {repo}:{rel}: unreadable ({exc}).")
+            unread.append(rel)
             continue
         found.extend(parse_declarations(text, repo=repo, path=rel, declarable=declarable))
-    return found, prefixes
+    return found, prefixes, unread
 
 
 def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
@@ -2687,8 +2741,11 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     then `(check, namespace, object)` against fleet-wide ones. The first entry
     wins in repository-then-path order, which is the order `start` wrote them
     in. Only a declarable check is looked up at all, so a fault stays a
-    finding whatever a note says about it. An identity the model already
-    declared is left to the model's entry.
+    finding whatever a note says about it — and for `hpa-cannot-scale`, the
+    one slug that names both, only the `min == max` shape moves, read off the
+    severity §3.6 fixes for it (`DUAL_SHAPE_POSTURE_SEVERITY`); a match on the
+    dangling-target fault is said on stderr and not applied. An identity the
+    model already declared is left to the model's entry.
 
     The moved entry is what the validator would have accepted from the model:
     the finding's identity and title, and the declaration's `repo`, `path`
@@ -2715,6 +2772,21 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
             match = scoped.get(_declaration_key(finding, with_cluster=True)) or fleet_wide.get(
                 _declaration_key(finding, with_cluster=False)
             )
+        if (
+            match is not None
+            and check == DUAL_SHAPE_CHECK
+            and str(finding.get("severity", "")) != DUAL_SHAPE_POSTURE_SEVERITY
+        ):
+            # The slug names a posture at `major` and a fault at `minor`, and
+            # a declaration justifies only the posture.
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} at severity "
+                f"{finding.get('severity', '')!r} is the dangling-target fault (SOP §3.6(b)), "
+                f"which no declaration excuses; the min == max posture is severity "
+                f"{DUAL_SHAPE_POSTURE_SEVERITY!r}. {match.get('repo', '')}:{match.get('path', '')} "
+                "stands and the finding publishes."
+            )
+            match = None
         if match is None or derive_finding_id(finding) in already:
             kept.append(finding)
             continue
@@ -7031,20 +7103,22 @@ class _Copy(NamedTuple):
     sha: str
     into: Path
     skipped: tuple[str, ...] = ()
+    # The bound a content-mode copy was fetched under, already read from the
+    # intent file; None when the tree is whole and the reader reads it itself.
+    prefixes: list[str] | None = None
 
 
-def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> _Copy | None:
-    """Copy `slug` through `inspect_repository.py clone` into `into`, or None.
+def _clone_step(
+    slug: str, ref: str | None, audit_id: str, into: Path, *, prefix: str | None, force: bool
+) -> dict | None:
+    """One `inspect_repository.py clone`, as its JSON reply, or None with a warning.
 
-    None, with a warning, whenever the copy is not one the harness may call
-    searched: the script exited non-zero, printed something other than its
-    JSON line, was stopped by a bound (`stopped` set: the listing was cut and
-    what lies past the cut is unknown), or gave no sha the validator would
-    accept. A copy the broker merely skipped files from is returned with the
-    skipped paths, because whether any of them was a note under the searched
-    paths is the caller's question. In directory mode the script ignores
-    `--into` and names the leased checkout it made instead, so the tree to
-    read and the scratch to remove are two different paths.
+    None whenever the copy is not one the harness may call searched: the
+    script exited non-zero, printed something other than its JSON line, or
+    was stopped by a bound (`stopped` set: the listing was cut and what lies
+    past the cut is unknown). The reply's `skipped` is normalised to the
+    paths the broker did not send; whether any of them mattered is the
+    caller's question.
     """
     cmd = [
         sys.executable,
@@ -7061,6 +7135,10 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
     ]
     if ref:
         cmd += ["--ref", ref]
+    if prefix:
+        cmd += ["--prefix", prefix]
+    if force:
+        cmd.append("--force")
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         log(f"WARNING: {slug}: clone exited {result.returncode}; not searched.")
@@ -7086,19 +7164,71 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
     if reply.get("complete") is not True and not skipped:
         log(f"WARNING: {slug}: copy reported incomplete without saying what is missing; not searched.")
         return None
-    if reply.get("mode") == CLONE_MODE_DIRECTORY:
-        tree = Path(str(reply.get("workspace") or ""))
-        sha = _head_sha(tree) if reply.get("workspace") else ""
+    reply["skipped"] = skipped
+    return reply
+
+
+def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> _Copy | None:
+    """Copy what the search reads of `slug` into `into`, or None with a warning.
+
+    In content mode the copy is bounded to what the search will read, because
+    the script's default caps count every file in the repository and a GitOps
+    repository that vendors charts or renders manifests would be stopped by
+    files the search never opens: `.kube-agents/` is fetched first, for the
+    intent file, then each path it names (`--prefix`, into the same tree), and
+    only a repository with no usable intent file is copied whole, under those
+    caps. Every step is a clone of its own, so each must report the commit the
+    first did; a branch that moved between them would give a tree from two
+    commits and a sha for neither, and the repository is not searched. In
+    directory mode the script ignores `--prefix` and `--into`, makes one full
+    leased checkout and names it, so the first step is the whole copy and the
+    tree to read and the scratch to remove are two different paths.
+
+    None whenever the copy is not one the harness may call searched, with the
+    reason on stderr. A copy the broker merely skipped files from is returned
+    with the skipped paths, because whether any of them was a note under the
+    searched paths is the caller's question.
+    """
+    first = _clone_step(slug, ref, audit_id, into, prefix=INTENT_DIR, force=False)
+    if first is None:
+        return None
+    if first.get("mode") == CLONE_MODE_DIRECTORY:
+        tree = Path(str(first.get("workspace") or ""))
+        sha = _head_sha(tree) if first.get("workspace") else ""
     else:
-        tree = Path(str(reply.get("into") or into))
-        sha = str(reply.get("sha") or "")
+        tree = Path(str(first.get("into") or into))
+        sha = str(first.get("sha") or "")
     if not tree.is_dir():
         log(f"WARNING: {slug}: clone named {tree}, which is not a directory; not searched.")
         return None
     if _searched_entry(slug, sha) is None:
         log(f"WARNING: {slug}: no commit sha for the copy; not searched.")
         return None
-    return _Copy(tree, sha, into, skipped)
+    if first.get("mode") == CLONE_MODE_DIRECTORY:
+        return _Copy(tree, sha, into)
+    skipped: dict[str, None] = dict.fromkeys(first["skipped"])
+    if INTENT_FILE in skipped:
+        log(
+            f"WARNING: {slug}: the broker did not send {INTENT_FILE}, so the "
+            "search bound is unknown and the whole tree is searched."
+        )
+        prefixes: list[str] = []
+    else:
+        prefixes = read_intent_paths(tree, slug)
+    for prefix in prefixes or [None]:
+        step = _clone_step(slug, ref, audit_id, into, prefix=prefix, force=True)
+        if step is None:
+            return None
+        step_sha = str(step.get("sha") or "")
+        if step_sha != sha:
+            log(
+                f"WARNING: {slug}: the copy of {prefix or 'the whole tree'} is at "
+                f"{step_sha[:MIN_SHA_CHARS] or 'no sha'}, not {sha[:MIN_SHA_CHARS]}: the "
+                "repository moved between copies; not searched."
+            )
+            return None
+        skipped.update(dict.fromkeys(step["skipped"]))
+    return _Copy(tree, sha, into, tuple(skipped), prefixes)
 
 
 def discover_declarations(
@@ -7140,6 +7270,7 @@ def discover_declarations(
         ref = None if is_gitops else refs.get(slug.lower())
         into: Path | None = None
         skipped: tuple[str, ...] = ()
+        bound: list[str] | None = None
         try:
             if is_gitops and not content_mode():
                 tree, sha = root, _head_sha(root)
@@ -7151,16 +7282,23 @@ def discover_declarations(
                 copied = _clone_for_search(slug, ref, audit_id, into)
                 if copied is None:
                     continue
-                tree, sha, skipped = copied.tree, copied.sha, copied.skipped
-            if INTENT_FILE in skipped:
+                tree, sha, skipped, bound = copied.tree, copied.sha, copied.skipped, copied.prefixes
+            found, prefixes, unread = search_tree(
+                tree, repo=slug, declarable=declarable, prefixes=bound
+            )
+            # What the read could not reach, judged against the bound that
+            # was applied. A note under the searched paths the harness could
+            # not read locally, or a directory there it could not list, is a
+            # declaration it may have missed; the repository is not searched.
+            if unread:
                 log(
-                    f"WARNING: {slug}: the broker did not send {INTENT_FILE}, so the "
-                    "search bound is unknown and the whole tree is searched."
+                    f"WARNING: {slug}: {len(unread)} path(s) under the searched paths "
+                    f"could not be read ({', '.join(unread[:MAX_HINT_IDS])}); not searched."
                 )
-            found, prefixes = search_tree(tree, repo=slug, declarable=declarable)
-            # The copy's gaps, judged against the bound that was applied: a
-            # skipped file that is not a note under the searched paths could
-            # not have carried a declaration, and a skipped note could have.
+                continue
+            # The copy's gaps, the same way: a skipped file that is not a note
+            # under the searched paths could not have carried a declaration,
+            # and a skipped note could have.
             missed = [
                 path
                 for path in skipped
