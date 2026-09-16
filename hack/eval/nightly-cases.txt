@@ -45,13 +45,14 @@
 # eight are deployer: noop and probe-shaped (~200s a repetition, ~10min each
 # at three) and fleet-cost-idle-pool is a full cost audit priced with the
 # 900s audit band (~45min). 2026-09-16 added incident-triage-oom-event-probe
-# (#1023, ~45min at its measured 737s/599s/1357s). Thirty-nine cases,
-# ~775-795min serial. The
+# (#1023, ~45min at its measured 737s/599s/1357s). 2026-09-21 added the two
+# expected-fail cost probes at the tail (deployer: noop, probe-shaped, ~10min
+# each at three). Forty-one cases, ~795-815min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
 # whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~675-690min, over the deadline; 480m holds only if the nightly,
+# would be ~690-710min, over the deadline; 480m holds only if the nightly,
 # alone on the model quota at that hour and two lanes wider, realises ~1.65x
 # or better, which is priced, not measured. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
@@ -211,3 +212,10 @@
 # than a cluster-agent one because AGENT_SERVICE_NAME is a single global
 # target (A2), which shapes what the case asserts rather than blocking it.
 ./tasks/cluster-agent-crashloop-fix-request/task.yaml
+
+# Expected-fail gap cases: bottom-up GCP project monthly spend and breakdown
+# probes. Registered with `expected_fail: true` until gke-cost-analysis supports
+# live inventory + list-price estimation without requiring a BigQuery export.
+./tasks/cost-project-spend-probe/task.yaml
+./tasks/cost-project-spend-breakdown-probe/task.yaml
+

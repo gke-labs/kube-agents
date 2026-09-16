@@ -89,6 +89,12 @@ NIGHTLY_AT_SPLIT = [
 ADDED_AFTER_THE_SPLIT = [
     "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625
 ]
+# Registered after MOVED_TO_NIGHTLY in file order: the expected-fail cost
+# probes, appended at the file's tail by the pull request that authored them.
+ADDED_AT_THE_TAIL = [
+    "cost-project-spend-probe",
+    "cost-project-spend-breakdown-probe",
+]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",
     "obtainability-refusal-direct-mutation",
@@ -100,7 +106,6 @@ MOVED_TO_NIGHTLY = [
     "upgrades-api-deprecation-clean-repo",
     "cluster-agent-crashloop-fix-request",
 ]
-
 OLD_SCRIPT_LINE = 'export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe,b-probe,c-probe}"\n'
 
 
@@ -155,7 +160,7 @@ class SplitLostNothingTest(unittest.TestCase):
         self.assertEqual(eval_rosters.blocking_roster(), ROSTER_AT_SPLIT)
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases(self):
-        self.assertEqual(eval_rosters.nightly_cases(), NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY)
+        self.assertEqual(eval_rosters.nightly_cases(), NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AT_THE_TAIL)
 
     def test_the_script_no_longer_carries_the_arrays(self):
         # A literal array creeping back in would be a second source of truth
