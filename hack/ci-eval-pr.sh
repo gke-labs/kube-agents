@@ -85,7 +85,25 @@ set -euo pipefail
 # docs/ branch, `bench/OWNERS` must not match the OWNERS one, and a .md file
 # below the root (agents/**/*.md is prompt content shipped in the image)
 # must still run the eval.
-readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
+# tests/ and .agents/ are on the list because neither can reach a run. The
+# agent image copies only deploy/, agents/, k8s-operator/ and a2a/ (every
+# COPY in deploy/docker/Dockerfile), so nothing under either directory is in
+# the image the eval deploys; .agents/ is repository-level review skills and
+# rules that AGENTS.md states are not shipped, and tests/ is the repository's
+# own suite, which no eval path reads. Measured over the 200 most recent
+# first-parent merges to main, adding them takes the share of merges this
+# gate can revalidate from 6.0% to 14.0% -- 12 to 28 runs, about 32 more
+# hours of eval matrix not spent.
+#
+# Deliberately still absent, each for a checked reason rather than caution:
+# scripts/ (hack/ci-deploy.sh sources scripts/release/common.sh and this
+# script reads scripts/eval_dashboard, so it is on the eval path), a2a/ and
+# k8s-operator/ (their binaries are copied into agent-base, so they ship in
+# the agent), bench/ (it is the harness doing the grading), and terraform/
+# (no eval path reads it and it would add another 2.5%, but it provisions
+# the pool projects a run leases, so it wants the eval crew's call rather
+# than this comment's).
+readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples|tests|\.agents)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
 # Where the job history lives and how a human opens a build from the log.
 readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
 readonly REVALIDATION_JOB_NAME="pull-kube-agents-smoke-test"

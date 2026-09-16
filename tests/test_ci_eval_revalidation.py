@@ -132,6 +132,11 @@ class RevalidationTest(unittest.TestCase):
         # to the destination path alone.
         self._git("mv", "code.py", "docs/moved.md")
         self.c7 = self._commit("c7", {})
+        # c8 touches only the two directories that cannot reach a run: the
+        # repository's own suite and the repository-level agent rules.
+        self.c8 = self._commit(
+            "c8", {"tests/test_thing.py": "v1", ".agents/rules/core_engineering.md": "v1"}
+        )
 
     def _git(self, *args):
         subprocess.run(
@@ -361,6 +366,16 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         for survivor in ("docs-evil.go", "sub/notes.md", "bench/OWNERS"):
             self.assertIn(survivor, proc.stdout)
+
+    def test_repository_tests_and_agent_rules_are_inert(self):
+        """Neither directory reaches a run, so a delta confined to them
+        revalidates. The agent image copies only deploy/, agents/,
+        k8s-operator/ and a2a/, and no eval path reads either of these."""
+        ls = self._plant_history([("200", True, self.c7, self.c7)])
+        proc = self._run(cur_head=self.c8, cur_base=self.c7, ls_file=ls)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        for inert in ("tests/test_thing.py", ".agents/rules/core_engineering.md"):
+            self.assertIn(inert, proc.stdout)
 
     def test_a_rename_to_an_inert_path_is_a_full_run(self):
         """`git mv code.py docs/moved.md` deletes non-inert content. With
