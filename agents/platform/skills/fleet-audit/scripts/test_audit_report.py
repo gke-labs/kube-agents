@@ -5563,6 +5563,26 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertIn("`linked` names nothing", self.err)
         self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "knowledge/checkout.md"])
 
+    def test_a_prefix_behind_a_symlinked_directory_means_the_whole_tree(self):
+        # `Path.is_symlink` sees only the last component: `linked/sub` exists
+        # through the link, so the bound stood while the walk, which never
+        # enters a link, read nothing under it, and the repository was
+        # credited with a complete search of zero notes.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - linked/sub\n")
+        self.write(self.workspace, "real/sub/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        (self.workspace / "linked").symlink_to(self.workspace / "real", target_is_directory=True)
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}])
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "real/sub/checkout.md"])
+        self.assertIn(
+            "WARNING: acme/fleet:.kube-agents/intent.yaml: `linked/sub` names nothing in the "
+            "repository at this commit; searching the whole tree.",
+            self.err,
+        )
+
     def test_a_note_saved_with_a_byte_order_mark_still_declares(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         target = self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))

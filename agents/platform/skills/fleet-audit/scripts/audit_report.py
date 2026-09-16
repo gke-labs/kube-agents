@@ -2680,15 +2680,18 @@ def _unmatched_prefixes(tree: Path, prefixes: list[str], skipped: tuple[str, ...
     """The prefixes in `prefixes` with nothing behind them in the copy at `tree`.
 
     A prefix is matched when it names a file or directory in the copy — not
-    through a symlink, which the walk never follows — or when the broker
-    reported skipping a file under it, which is a file the repository has
-    even though the copy does not. Git tracks no empty directory, so a
-    prefix that matches nothing names nothing at this commit.
+    through a symlink at any component of it, which the walk never follows —
+    or when the broker reported skipping a file under it, which is a file
+    the repository has even though the copy does not. Git tracks no empty
+    directory, so a prefix that matches nothing names nothing at this commit.
     """
     out: list[str] = []
     for prefix in prefixes:
-        target = tree / prefix
-        if target.is_symlink() or not target.exists():
+        # `Path.is_symlink` inspects the last component only; a prefix behind
+        # a linked directory exists through the link and the walk, which
+        # never enters one, would read nothing under it while the bound
+        # stood, and the repository would be credited with a search.
+        if _symlinked_component(tree, prefix) is not None or not (tree / prefix).exists():
             if not any(_under_prefixes(path, [prefix]) for path in skipped):
                 out.append(prefix)
     return out
