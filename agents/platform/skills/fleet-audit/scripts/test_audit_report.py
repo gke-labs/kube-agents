@@ -5205,6 +5205,33 @@ class TestDeclarationParsing(unittest.TestCase):
         self.assertIn("not valid YAML", err)
         self.assertIn("acme/fleet:knowledge/checkout.md", err)
 
+    def test_an_impossible_date_in_the_frontmatter_costs_the_note_only(self):
+        # PyYAML resolves an unquoted date as a timestamp and builds it with
+        # `datetime`, which raises a plain ValueError rather than a YAMLError;
+        # uncaught, it would leave `parse_declarations` and cost the whole
+        # repository its `searched` entry. `timestamp:` is the OKF convention.
+        for label, line in {
+            "a day past the month": "timestamp: 2026-02-30T00:00:00Z",
+            "a thirteenth month": "updated: 2026-13-01",
+            "a twenty-fifth hour": "timestamp: 2026-07-23T25:00:00Z",
+        }.items():
+            with self.subTest(label):
+                entries, err = parse(
+                    f"---\ntype: observation\n{line}\ndeclares:\n"
+                    "  - check: no-pdb\n    namespace: payments\n"
+                    "    object: Deployment/checkout-gateway\n---\n"
+                )
+                self.assertEqual(entries, [])
+                self.assertIn("WARNING: acme/fleet:knowledge/checkout.md: frontmatter is not valid YAML", err)
+        # A real timestamp parses as any note does.
+        entries, err = parse(
+            "---\ntype: observation\ntimestamp: 2026-07-23T23:00:00Z\ndeclares:\n"
+            "  - check: no-pdb\n    namespace: payments\n"
+            "    object: Deployment/checkout-gateway\n---\n"
+        )
+        self.assertEqual(err, "")
+        self.assertEqual([e["check"] for e in entries], ["no-pdb"])
+
     def test_an_unclosed_frontmatter_block_is_not_frontmatter(self):
         self.assertIsNone(audit_report.split_frontmatter("---\ntype: x\n"))
         self.assertEqual(audit_report.split_frontmatter("---\ntype: x\n...\n"), "type: x")
@@ -5298,6 +5325,9 @@ class TestIntentPaths(unittest.TestCase):
             "an absolute path": "paths:\n  - /etc\n",
             "a .git path": "paths:\n  - sub/.git\n",
             "a glob": "paths:\n  - knowledge/*\n",
+            # An unquoted date `datetime` refuses: PyYAML raises ValueError,
+            # not YAMLError, and it must still be the whole tree, not a crash.
+            "an impossible date": "updated: 2026-02-30\npaths:\n  - knowledge/\n",
         }
         for label, text in cases.items():
             with self.subTest(label):
@@ -5590,6 +5620,24 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         payload = self.start()
         self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
         self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_note_with_an_impossible_date_costs_its_declaration_not_the_repository(self):
+        # One typo in one note's `timestamp:` silences that note; the
+        # repository is still read completely and its other notes filed.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths: [knowledge/]\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(
+            self.workspace,
+            "knowledge/api.md",
+            "---\ntype: observation\ntimestamp: 2026-02-30T00:00:00Z\ndeclares:\n"
+            "  - check: no-hpa\n    namespace: payments\n    object: Deployment/api\n---\n",
+        )
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+        self.assertIn("WARNING: acme/fleet:knowledge/api.md: frontmatter is not valid YAML", self.err)
+        self.assertNotIn("declared-intent search failed", self.err)
 
     def test_a_directory_mode_copy_is_the_leased_workspace_the_clone_names(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"

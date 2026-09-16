@@ -2523,7 +2523,11 @@ def parse_declarations(
         return []
     try:
         front = yaml.safe_load(front_text)
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, ValueError) as exc:
+        # `ValueError` is PyYAML's own: an unquoted `2026-02-30` or `T25:00`
+        # is resolved as a timestamp and built with `datetime`, which raises
+        # it outside the `YAMLError` tree. Left uncaught it would cost the
+        # repository its entry, not the note its declaration.
         log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
         return []
     if not isinstance(front, dict) or OKF_TYPE_KEY not in front:
@@ -2601,7 +2605,9 @@ def read_intent_paths(tree: Path, repo: str) -> list[str]:
         return []
     try:
         data = yaml.safe_load(intent.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError) as exc:
+        # `ValueError`: an unquoted date PyYAML resolves and `datetime` refuses,
+        # as in `parse_declarations`.
         log(f"WARNING: {where}: unreadable ({exc}); searching the whole tree.")
         return []
     paths = data.get(INTENT_PATHS_KEY) if isinstance(data, dict) else None
