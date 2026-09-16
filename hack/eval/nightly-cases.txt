@@ -51,8 +51,8 @@
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
 # whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~635-650min, over the deadline; 480m holds only if the nightly,
-# alone on the model quota at that hour and two lanes wider, realises ~1.55x
+# would be ~675-690min, over the deadline; 480m holds only if the nightly,
+# alone on the model quota at that hour and two lanes wider, realises ~1.65x
 # or better, which is priced, not measured. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
