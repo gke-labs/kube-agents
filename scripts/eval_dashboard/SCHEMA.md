@@ -596,9 +596,12 @@ not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
 `setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
-also_failing_prs, pass_rate_30d, reason, excerpt, do, admitted, reps,
+also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
 nightly_failed_recent}`) and `health_at` (the verdict in force when it
-finished, from history; `null` without history). `also_failing_prs` and
+finished, from history; `null` without history). `rep_n` is the 1-based
+repetition whose `reason` and `excerpt` are shown (`null` when no rep
+carries a reason); the pages link that repetition's transcript, rep 1's
+when it is `null`. `also_failing_prs` and
 `pass_rate_30d` count presubmit runs only; `nightly_failed_recent` is
 `true` / `false` when the newest nightly run within two days of this one
 graded the case and failed / did not fail it on every repetition, `null`
@@ -618,7 +621,7 @@ is the case's last `strip_runs` presubmit appearances, oldest first,
 `{build, pr, at, state, event}` with `state` in `pass|partial|fail|infra`
 and `event` true for a run-level event. `last_failure` is the newest `fail`
 or `partial` appearance — the presubmit's, else the nightly's — as `{tier,
-build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
+build, pr, at, state, reps, reason, excerpt, rep_n, cls, also_failing_prs, event}`
 (`cls` and `also_failing_prs` from the Brief's classification of that run
 when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
 

@@ -558,6 +558,22 @@ class BrowserTest(unittest.TestCase):
         run_page = dom_text(out / "run.html", query="build=2097282860221206528")
         self.assertIn(f'<div class="quote">“{words}”</div>', run_page)
 
+    def test_the_quote_links_the_transcript_of_the_repetition_it_came_from(self):
+        """A case whose rep 1 was lost to infra shows rep 2's reason and
+        quote; the transcript link beside them must be rep 2's, not rep 1's."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        self.assertGreaterEqual(len(task["reps"]), 2)
+        task["reps"][0] = {"n": 1, "result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE: agent transport"}
+        task["reps"][1] = dict(task["reps"][1], n=2, result="fail", excerpt="Rep two's own words.")
+        out = render_to(pathlib.Path(self.tmp.name) / "rep2", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("“Rep two's own words.”", page)
+        self.assertIn(f"artifacts/eval_{CRASHLOOP_TRIO[0]}_rep2.log", page)
+        self.assertIn("transcript (rep 2)", page)
+        self.assertNotIn(f"artifacts/eval_{CRASHLOOP_TRIO[0]}_rep1.log", page)
+
     def test_storm_brief(self):
         app = self.render_state(health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[],
                                            since="2026-09-08T12:00:00+00:00",

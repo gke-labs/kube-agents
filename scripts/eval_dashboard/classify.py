@@ -12,7 +12,7 @@ interface::
         "build": str, "pr": int|None, "headline": str, "lede": str,
         "verdict": "red" | "green" | "infra",
         "cases": [{"case", "outcome", "cls", "also_failing_prs",
-                   "pass_rate_30d", "reason", "excerpt", "do",
+                   "pass_rate_30d", "reason", "excerpt", "rep_n", "do",
                    "admitted", "reps"}],
         "matches_incident": bool,
         # run-level detail: "setup_death", "storm_reps", "cls", "do"
@@ -380,6 +380,16 @@ def first_reason(task: dict) -> str:
     return clean_reason(rep.get("reason")) if rep else ""
 
 
+def reason_rep_n(task: dict) -> int | None:
+    """The 1-based number of the repetition ``first_reason`` and ``excerpt_of``
+    show, so a page links that repetition's transcript and not rep 1's.
+    None when no rep carries a reason or the rep has no number (a synthetic
+    rep from a single result); the pages then link rep 1 as they always did."""
+    rep = reason_rep(task)
+    n = rep.get("n") if rep else None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+
 def excerpt_of(task: dict) -> str | None:
     """A report excerpt, when the collector recorded one (additive, optional):
     ``tasks[].excerpt``, else the ``excerpt`` of the repetition whose reason
@@ -594,6 +604,7 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         "pass_rate_30d": rates.get(name),
         "reason": first_reason(task) if outcome in (OUTCOME_FAILED, OUTCOME_PARTIAL, OUTCOME_INFRA) else "",
         "excerpt": excerpt_of(task),
+        "rep_n": reason_rep_n(task),
         "do": do,
         # Additive detail the pages show; the keys above are the contract.
         "admitted": is_admitted,

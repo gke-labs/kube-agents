@@ -834,6 +834,7 @@ def last_failure(name: str, gate: list[tuple[dict, dict]], nightly: list[tuple[d
                 "reps": {"pass": passed, "fail": failed, "infra": infra},
                 "reason": classify.first_reason(task),
                 "excerpt": classify.excerpt_of(task),
+                "rep_n": classify.reason_rep_n(task),
                 "cls": tagged.get("cls"),
                 "also_failing_prs": tagged.get("also_failing_prs", 0),
                 "event": is_run_event(run),

@@ -133,6 +133,10 @@ class RepAndOutcomeTest(unittest.TestCase):
         s["reps"][1]["excerpt"] = "the real report"
         self.assertEqual(classify.first_reason(s), classify.clean_reason(GRADED_FAIL))
         self.assertEqual(classify.excerpt_of(s), "the real report")
+        # The pages link the transcript of that same repetition.
+        self.assertEqual(classify.reason_rep_n(t), 1)
+        self.assertEqual(classify.reason_rep_n(s), 2)
+        self.assertIsNone(classify.reason_rep_n({"name": "d", "result": "fail"}), "a synthetic rep has no number")
         # No rep carries a reason: nothing to pair with, so the first rep's
         # words stand (the gate comment's fallback for a reason-less rep).
         p = {"name": "c", "result": "fail", "reps": [
@@ -141,6 +145,7 @@ class RepAndOutcomeTest(unittest.TestCase):
         ]}
         self.assertEqual(classify.first_reason(p), "")
         self.assertEqual(classify.excerpt_of(p), "the only words on record")
+        self.assertIsNone(classify.reason_rep_n(p))
 
     def test_the_roster_is_read_from_the_roster_file(self):
         roster = classify.admitted_cases()
