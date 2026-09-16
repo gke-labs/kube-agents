@@ -41,6 +41,7 @@ def run_trap(exit_code: int) -> subprocess.CompletedProcess:
         [
             "set -euo pipefail",
             "collect_bench_results() { echo 'called collect_bench_results'; }",
+            "collect_litellm_log() { echo 'called collect_litellm_log'; }",
             "profile_report() { echo \"called profile_report $1\"; }",
             "dump_prow_artifacts_on_failure() { echo \"called dumper with $?\"; }",
             trap_body(),
@@ -68,6 +69,11 @@ class ExitTrapTest(unittest.TestCase):
         result = run_trap(0)
         self.assertIn("called collect_bench_results", result.stdout)
         self.assertIn("called dumper with 0", result.stdout)
+
+    def test_the_litellm_log_is_collected_on_a_green_exit_too(self):
+        """Tuning EVAL_TASK_PARALLELISM needs the upstream 429 rate on runs
+        that PASS; failure-only collection can only ever show the other half."""
+        self.assertIn("called collect_litellm_log", run_trap(0).stdout)
 
     def test_collection_precedes_the_profile_and_the_dump(self):
         out = run_trap(7).stdout
