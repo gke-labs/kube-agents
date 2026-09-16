@@ -2152,9 +2152,9 @@ class IamGrantsTest(unittest.TestCase):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
 
     def _fleet_reader_policy(self, members=None):
-        """seeded-fleet-reader's own policy, with both runners able to borrow it."""
+        """seeded-fleet-reader's own policy, with every listed borrower on it."""
         if members is None:
-            members = [member for _, _, member in checker.RUNNERS]
+            members = [member for _, member in checker.FLEET_READER_TOKEN_CREATORS]
         return json.dumps(
             {"bindings": [{"role": "roles/iam.serviceAccountTokenCreator", "members": members}]}
         )
@@ -2609,16 +2609,19 @@ class IamGrantsTest(unittest.TestCase):
         )
 
     def test_fleet_reader_missing_the_nightly_token_creator_names_it(self):
-        # Every pool project on 2026-09-16: the presubmit's account (and the CI
-        # health bot's) on the binding, the nightly's not, since its entry in
-        # bench/tf/fleet's default postdates every apply.
+        # Every pool project on 2026-09-16: every other borrower on the binding,
+        # the nightly's not, since its entry in bench/tf/fleet's default
+        # postdates every apply. "Every other" rather than the presubmit's
+        # alone so that a borrower added to FLEET_READER_TOKEN_CREATORS later
+        # (the CI health bot, #1612) does not turn this into a two-finding case.
+        others = [m for _, m in checker.FLEET_READER_TOKEN_CREATORS if m != checker.NIGHTLY_RUNNER_MEMBER]
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
-                _ok(self._fleet_reader_policy(members=[checker.PROW_RUNNER_MEMBER])),
+                _ok(self._fleet_reader_policy(members=others)),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2780,10 +2783,10 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
-    """RUNNERS must equal bench/tf/fleet's token-creator default.
+    """FLEET_READER_TOKEN_CREATORS must equal bench/tf/fleet's token-creator default.
 
     The verifier asserts these members hold the grant and Terraform grants it to
-    others, and neither reads the other. Rename a runner in one place and the
+    others, and neither reads the other. Rename a borrower in one place and the
     verifier fails every correctly-applied project -- or, worse round, passes a
     project whose grant went to an account that no longer runs anything.
     """
@@ -2797,7 +2800,9 @@ class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
         default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
         self.assertIsNotNone(default, "fleet_reader_token_creators has no default")
         members = re.findall(r'"([^"]+)"', default.group(1))
-        self.assertEqual(sorted(members), sorted(member for _, _, member in checker.RUNNERS))
+        self.assertEqual(
+            sorted(members), sorted(member for _, member in checker.FLEET_READER_TOKEN_CREATORS)
+        )
 
 
 class ExitStatusTest(unittest.TestCase):

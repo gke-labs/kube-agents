@@ -209,12 +209,19 @@ NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.
 # as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
 # project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
 # missing grant is reported under its label. Kept equal to the grant loop in
-# scripts/provision_ci_pool_project.sh and to bench/tf/fleet's
-# `fleet_reader_token_creators` default by scripts/test_verify_ci_pool_project.py.
+# scripts/provision_ci_pool_project.sh by scripts/test_verify_ci_pool_project.py.
 RUNNERS = (
     ("The Prow runner", "a presubmit", PROW_RUNNER_MEMBER),
     ("The nightly runner", "the nightly periodic", NIGHTLY_RUNNER_MEMBER),
 )
+
+# Every (label, member) that may mint a token as the fleet reader: the two
+# runners today. Its own tuple rather than a read of RUNNERS because the two
+# sets are about to diverge -- the CI health bot's hourly fixture scan (#1612)
+# borrows the reader without leasing a project, so it joins this list and not
+# RUNNERS. Kept equal to bench/tf/fleet's `fleet_reader_token_creators`
+# default by scripts/test_verify_ci_pool_project.py.
+FLEET_READER_TOKEN_CREATORS = tuple((label, member) for label, _, member in RUNNERS)
 
 # The set kube-agents-evals holds, matched literally rather than by permission.
 # Not minimal -- container.admin subsumes container.developer, viewer subsumes
@@ -1026,7 +1033,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             for b in policy.get("bindings", []):
                 if b.get("role") == "roles/iam.serviceAccountTokenCreator":
                     token_creators.update(b.get("members", []))
-            for label, _, member in RUNNERS:
+            for label, member in FLEET_READER_TOKEN_CREATORS:
                 if member not in token_creators:
                     passed = False
                     details.append(

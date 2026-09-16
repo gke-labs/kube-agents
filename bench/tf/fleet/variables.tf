@@ -31,7 +31,7 @@ variable "cluster_prefix" {
 }
 
 variable "fleet_reader_token_creators" {
-  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. These are the identities that run hack/ci-eval-pr.sh in a leased pool project -- the presubmit's Prow runner and the nightly periodic's recorder: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as whichever is running, so without its entry here that runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). Defaults to both -- the same two accounts in every pool project, kept equal to RUNNERS in scripts/verify_ci_pool_project.py by its tests. Override it when applying this stack outside the CI pool."
+  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. These are the identities that run hack/ci-eval-pr.sh in a leased pool project -- the presubmit's Prow runner and the nightly periodic's recorder: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as whichever is running, so without its entry here that runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). Defaults to both -- the same two accounts in every pool project, kept equal to FLEET_READER_TOKEN_CREATORS in scripts/verify_ci_pool_project.py by its tests. Override it when applying this stack outside the CI pool."
   type        = list(string)
 
   # Defaulted here rather than passed with -var, because the resource is keyed
