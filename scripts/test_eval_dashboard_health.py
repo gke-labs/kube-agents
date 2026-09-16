@@ -55,6 +55,9 @@ CASE_NOTES = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "case-
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 8, 0, 0, tzinfo=UTC)
+# What json.loads returns for the `Infinity` and `NaN` literals it accepts.
+INF = float("inf")
+NAN = float("nan")
 
 CRASHLOOP_TRIO = [
     "cluster-agent-crashloop-debug",
@@ -1028,6 +1031,26 @@ class PoolNote(unittest.TestCase):
                 {
                     "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
                     "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": "22"}]},
+                },
+            ),
+            # json.loads accepts Infinity and NaN, and int() raises on both.
+            # These rows are dated to T0 so the digest figure is really read:
+            # a row two days back leaves before _as_seconds on POOL_DIGEST_DAYS.
+            *(
+                (
+                    f"a day's minutes {name}",
+                    {
+                        "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
+                        "trend": {"days": [{"day": "2026-09-08", "breached": True, "p50_minutes": value}]},
+                    },
+                )
+                for name, value in (("infinite", INF), ("NaN", NAN), ("a bool", True))
+            ),
+            (
+                "a threshold infinite",
+                {
+                    "thresholds": {"p50_minutes": INF, "p95_minutes": 45},
+                    "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": 22.0}]},
                 },
             ),
         ):

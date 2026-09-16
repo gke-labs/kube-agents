@@ -263,7 +263,7 @@ jobs:
       # Rule 8's input (#1607): the hourly pool-pressure periodic's newest
       # artifact, read here because it lives in the Prow archive and only this
       # half of the job holds the reader credential. Optional throughout --
-      # no pointer means no note and no digest wait, which is what "not wired
+      # no reading means no note and no digest wait, which is what "not wired
       # up" should look like; health.py judges a present one's age.
       - name: Fetch the pool-pressure artifact
         continue-on-error: true
@@ -271,14 +271,19 @@ jobs:
           mkdir -p work
           build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt") || exit 0
           [ -n "$build" ] || exit 0
+          # The pointer moves at job start, so for the ~8 minutes the periodic
+          # runs it names a build with no artifact. finished.json lands with
+          # the artifact: absent means "still running", and a tick that skips
+          # beats one that calls the job stopped.
+          gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json" || exit 0
           # The periodic opens the file with a shell redirect before it runs,
           # so a crash publishes a 0-byte object that copies fine. Parsing is
           # the only check that catches it, and it costs nothing on the object
           # health.py is about to parse anyway.
           if ! gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
             || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' work/pool-pressure.json 2>/dev/null; then
-            # The pointer moved to a build that published nothing usable, so the
-            # periodic is running and failing. Ageing `window_end` cannot catch
+            # The build finished and published nothing usable, so the periodic
+            # is running and failing. Ageing `window_end` cannot catch
             # that -- an artifact never written never gets old -- and staying
             # quiet would read as "not wired up". A document with no reading in
             # it is what health.py turns into "the numbers stopped". An object

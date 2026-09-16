@@ -181,10 +181,10 @@ it, and reading them is not something a tick does.
 
 Every number above is measured from a run's start, so nothing here sees a run
 that sat in the queue first. The `ci-kube-agents-pool-pressure` periodic
-(#1069) measures that hourly and grades it against the runbook's thresholds;
-this job reads its `pool-pressure.json` and never re-derives the verdict, so
-the two cannot disagree (#1607). A missing artifact is not an alert — that is
-"not wired up", not "the pool is fine".
+measures that hourly and grades it against the runbook's thresholds; this job
+reads its `pool-pressure.json` and never re-derives the verdict, so the two
+cannot disagree. A missing artifact is not an alert — that is "not wired up",
+not "the pool is fine".
 
 Like the slow note it rides beside the state and never becomes one: the runs
 still pass, they just start late, and DEGRADED would tell people to retest,

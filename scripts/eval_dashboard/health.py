@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import pathlib
 import re
 import sys
@@ -887,8 +888,14 @@ def slow_evidence(slow: dict) -> str:
 
 
 def _as_seconds(minutes) -> int | None:
-    """pool-pressure.json reports minutes; health.json stores seconds."""
-    return int(minutes * SECONDS_PER_MINUTE) if isinstance(minutes, (int, float)) else None
+    """pool-pressure.json reports minutes; health.json stores seconds.
+
+    `json.loads` accepts `Infinity` and `NaN` and `int()` raises on both, so
+    only a finite real number is a figure. Bools are a data error rather than
+    1 and 0, as render.is_number already has it.
+    """
+    numeric = isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and math.isfinite(minutes)
+    return int(minutes * SECONDS_PER_MINUTE) if numeric else None
 
 
 def _section(artifact: dict, key: str) -> dict:

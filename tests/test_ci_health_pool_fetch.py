@@ -1,13 +1,13 @@
 """The pool-pressure fetch step in .github/workflows/ci-health.yml (#1607).
 
-Three outcomes, and the step is the only thing that distinguishes them: no
+Four outcomes, and the step is the only thing that distinguishes them: no
 pointer means the periodic was never wired up and the bot says nothing; a
-pointer to a build that published nothing means the periodic is running and
-failing, and the bot has to say so; both present means the artifact. The
-middle one is the dead-man's switch -- an artifact never written never gets
-old, so ageing `window_end` cannot catch it -- and it is one `if !` branch
-that no other test reaches. The step's own bash is lifted and run here rather
-than copied, against a stub gsutil.
+build still running means this tick takes no reading; a finished build that
+published nothing means the periodic is running and failing, and the bot has
+to say so; anything else is the artifact. The third is the dead-man's switch
+-- an artifact never written never gets old, so ageing `window_end` cannot
+catch it -- and it is one `if !` branch that no other test reaches. The step's
+own bash is lifted and run here rather than copied, against a stub gsutil.
 """
 
 import json
@@ -39,10 +39,11 @@ def step_script() -> str:
 
 
 class PoolFetchStepTest(unittest.TestCase):
-    def run_step(self, pointer=BUILD, artifact=READING, raw=None):
+    def run_step(self, pointer=BUILD, artifact=READING, raw=None, finished=True):
         """The step against a stub gsutil. `pointer` None means latest-build.txt
-        is unreadable, `artifact` None means the copy fails, and `raw` is bytes
-        copied verbatim -- what a crashed periodic leaves behind."""
+        is unreadable, `artifact` None means the copy fails, `raw` is bytes
+        copied verbatim -- what a crashed periodic leaves behind -- and
+        `finished` False is a build still running."""
         tmp = pathlib.Path(tempfile.mkdtemp())
         bin_dir = tmp / "bin"
         bin_dir.mkdir()
@@ -58,6 +59,7 @@ class PoolFetchStepTest(unittest.TestCase):
             "shift  # -q\n"
             'case "$1" in\n'
             f"  cat) {cat} ;;\n"
+            f"  stat) exit {0 if finished else 1} ;;\n"
             f"  cp) shift; {copy} ;;\n"
             "  *) exit 2 ;;\n"
             "esac\n"
@@ -82,6 +84,15 @@ class PoolFetchStepTest(unittest.TestCase):
         """"Not wired up" is silence: no note, no digest wait, no message."""
         self.assertIsNone(self.run_step(pointer=None))
         self.assertIsNone(self.run_step(pointer=""))
+
+    def test_a_build_still_running_writes_nothing(self):
+        """The pointer moves at job start, so a tick landing inside the ~8
+        minutes the periodic takes sees a build with no artifact yet. Reading
+        that as a stopped job is a false alert roughly once an hour."""
+        self.assertIsNone(
+            self.run_step(finished=False),
+            "a periodic still running must not read as one that stopped",
+        )
 
     def test_a_pointer_to_a_build_that_published_nothing_writes_a_reading_less_document(self):
         """The dead-man's switch. health.py reads a document with no
