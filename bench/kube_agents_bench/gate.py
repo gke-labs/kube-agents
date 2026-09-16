@@ -113,11 +113,12 @@ RECORD_CELL_UNKNOWN = "--"
 # caps at the same figure, so the two never disagree about the cut.
 REPORT_EXCERPT_MAX_CHARS = 300
 
-# What must not reach the log line: C0 controls and DEL (a captured kubectl
-# colour code, a NUL), and lone surrogates, which a JSON `\ud8xx` escape in
-# results.json turns into a str that print() cannot encode -- and an
-# exception there would end `bench-gate case` before its hand-off is written.
-_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
+# What must not reach the log line: C0 and C1 controls and DEL (a captured
+# kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
+# which a JSON `\ud8xx` escape in results.json turns into a str that print()
+# cannot encode -- and an exception there would end `bench-gate case` before
+# its hand-off is written.
+_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 def _env_float(name: str, default: float) -> float:

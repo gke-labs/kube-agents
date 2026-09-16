@@ -286,6 +286,7 @@ def test_the_report_line_is_one_flat_line_with_no_angle_brackets_and_a_cap(
         # colour code, a NUL, a BEL) become spaces: print() must not raise.
         ("a\ud83db", "a b"),
         ("\x1b[31mred\x1b[0m\x00 done\x07", "[31mred [0m done"),
+        ("c1\x85controls\x9bhere", "c1 controls here"),
         ("café — naïve 🔀", "café — naïve 🔀"),
     ],
 )
