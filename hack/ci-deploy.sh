@@ -40,6 +40,20 @@ readonly HELM_RELEASE_SECRET_SELECTOR="owner=helm,name=${HELM_RELEASE_NAME}"
 # so a Helm formatting change cannot silently blind the guard.
 readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 
+# Mode-switch probe. THIS PULL REQUEST IS A MEASUREMENT AND NEVER MERGES: it
+# flips the presubmit install to `spec.mode: next` after the today-mode install
+# has proven itself, so the eval matrix reports which cases and which pieces of
+# the next stack fail. The chart deliberately does not render spec.mode
+# (docs/designs/spec-mode-switch.md), so the flip is a merge patch on the CR the
+# chart created. The names are what the operator renders for a CR of this name
+# (platformagent_a2a_manifests.go: <cr>-a2a-nats, <cr>-a2a-gateway; the
+# managed .env rides the <cr>-config ConfigMap).
+readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+readonly MODE_NEXT_PATCH='{"spec":{"mode":"next"}}'
+readonly MODE_NEXT_GENERATION_ATTEMPTS=60
+readonly MODE_NEXT_POLL_SECONDS=5
+readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
+
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
 # run and thrown away with the lease: nothing outside this cluster ever sees it,
 # and the next run's install gets a pair of its own.
@@ -587,6 +601,61 @@ if ! kubectl rollout status statefulset/platform-agent-shell -n "${NAMESPACE}" -
   exit 1
 fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
+
+# ─── 6b. Mode switch: next (measurement pull request, never merges) ──────────
+# Everything above proved the today-mode install. From here the same gates run
+# again for what `mode: next` adds (the NATS StatefulSet and the A2A gateway)
+# and for the agent Deployment, which the operator rolls when it pins the mode
+# into the managed .env and the config hash moves. The Deployment's generation
+# is recorded first: `rollout status` right after the patch would answer for
+# the today ReplicaSet, before the operator has reconciled anything.
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next ==="
+GEN_BEFORE="$(kubectl get deployment platform-agent-gateway -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
+kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"
+
+GEN_AFTER="${GEN_BEFORE}"
+for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+  GEN_AFTER="$(kubectl get deployment platform-agent-gateway -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
+  [ "${GEN_AFTER}" != "${GEN_BEFORE}" ] && break
+  sleep "${MODE_NEXT_POLL_SECONDS}"
+done
+if [ "${GEN_AFTER}" = "${GEN_BEFORE}" ]; then
+  echo "ERROR: the agent Deployment never rolled after the mode patch (generation ${GEN_BEFORE} throughout)"
+  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
+  kubectl logs -n "${NAMESPACE}" deployment/kubeagents-controller-manager --tail=100 || true
+  exit 1
+fi
+echo "Agent Deployment generation ${GEN_BEFORE} -> ${GEN_AFTER}; managed .env now reads:"
+kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true
+echo
+
+for workload in \
+  "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats" \
+  "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" \
+  "deployment/platform-agent-gateway" \
+  "statefulset/platform-agent-shell"; do
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    kubectl get "${workload}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if ! kubectl rollout status "${workload}" -n "${NAMESPACE}" --timeout="${MODE_NEXT_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: ${workload} rollout failed under mode: next"
+    kubectl describe "${workload}" -n "${NAMESPACE}" || true
+    kubectl get pods,jobs,networkpolicies -n "${NAMESPACE}" || true
+    kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp | tail -40 || true
+    kubectl logs -n "${NAMESPACE}" deployment/kubeagents-controller-manager --tail=100 || true
+    exit 1
+  fi
+done
+
+# What the run has to show for itself, for the artifact log: the CR status,
+# the stack the mode rendered, and the entrypoint's account of the A2A skill
+# overlay landing (or not) in the agent pod.
+kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
+kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" || true
+kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway --all-containers --tail=400 2>/dev/null | grep -i "a2a\|overlay\|mode" | head -40 || true
+echo "✓ mode: next rollout finished in $((SECONDS - STEP_START))s"
 
 # ─── 7. Agent API Connectivity Verification ──────────────────────────────────
 STEP_START=$SECONDS
