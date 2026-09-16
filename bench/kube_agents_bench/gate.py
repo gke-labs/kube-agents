@@ -107,6 +107,18 @@ RECORD_COLUMN = "Record says"
 #: A hand-off that predates `record_verdict`.
 RECORD_CELL_UNKNOWN = "--"
 
+# How much of the agent's final report the build log quotes per failing
+# repetition. The dashboard's Brief shows it as "what the agent saw" beside
+# the grader's reason; the collector (scripts/eval_dashboard/collect.py)
+# caps at the same figure, so the two never disagree about the cut.
+REPORT_EXCERPT_MAX_CHARS = 300
+
+# What must not reach the log line: C0 controls and DEL (a captured kubectl
+# colour code, a NUL), and lone surrogates, which a JSON `\ud8xx` escape in
+# results.json turns into a str that print() cannot encode -- and an
+# exception there would end `bench-gate case` before its hand-off is written.
+_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
@@ -237,19 +249,6 @@ def _label(case: dict[str, Any]) -> str:
     if scored and int(case.get("passes") or 0) == scored:
         return "PASSED"
     return "UNSTABLE"
-
-
-# How much of the agent's final report the build log quotes per failing
-# repetition. The dashboard's Brief shows it as "what the agent saw" beside
-# the grader's reason; the collector (scripts/eval_dashboard/collect.py)
-# caps at the same figure, so the two never disagree about the cut.
-REPORT_EXCERPT_MAX_CHARS = 300
-
-# What must not reach the log line: C0 controls and DEL (a captured kubectl
-# colour code, a NUL), and lone surrogates, which a JSON `\ud8xx` escape in
-# results.json turns into a str that print() cannot encode -- and an
-# exception there would end `bench-gate case` before its hand-off is written.
-_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
 
 
 def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
