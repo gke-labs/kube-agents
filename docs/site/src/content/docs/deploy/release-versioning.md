@@ -9,6 +9,10 @@ sidebar:
 
 The release pipeline guarantees that installer scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`) and container runtime images are bit-for-bit synchronized from the exact same commit and, absent an emergency bypass, validated on a live GKE cluster before any release tag is published.
 
+Moving an install back to the previous GA release is its own page,
+[Rolling back a release](/kube-agents/deploy/rollback/): the two `upgrade.sh` commands run from the
+older release's checkout, and what they leave as it is.
+
 ## Tag and artifact taxonomy
 
 Every commit and build progresses through five distinct lifecycle tiers:
