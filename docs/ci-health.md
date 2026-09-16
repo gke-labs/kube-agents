@@ -386,7 +386,9 @@ workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
 configured" and exits 0 before it would file a tracking issue, the comment
 step on pull requests is skipped, and the refresh, the verdict and the
-`health.json` upload carry on. An incoming-webhook URL in Secret Manager
+`health.json` upload carry on. It exits before writing `health-state.json`
+too, so nothing carries between ticks while muted — the pool note's start
+date on the dashboard included. An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.

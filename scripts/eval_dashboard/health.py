@@ -1049,10 +1049,11 @@ def pool_evidence(pool: dict) -> str:
         )
     if pool["verdict"] == POOL_UNMEASURED:
         return "pool pressure: the hourly check ran but could not read how long recent runs waited"
-    return (
-        f"backed-up pool: {pool_measurement(pool)};"
-        f" {pool['free']} of {pool['total']} projects free"
-    )
+    # UNKNOWN *is* the pool read failing, so the counts are absent on exactly
+    # the breach that most wants explaining. Say the wait and stop.
+    counted = pool["free"] is not None and pool["total"] is not None
+    projects = f"; {pool['free']} of {pool['total']} projects free" if counted else ""
+    return f"backed-up pool: {pool_measurement(pool)}{projects}"
 
 
 def pool_measurement(pool: dict) -> str:

@@ -655,6 +655,16 @@ class Digest(RunHarness):
         )
         self.assertIn("typical wait n/a", self.opener.texts[1])
 
+    def test_digest_says_the_wait_is_unknown_without_reaching_for_a_number(self):
+        # UNMEASURED is the window sweep failing, not the periodic dying, so it
+        # is neither the stale line nor a breach with figures in it.
+        self.tick(pooled(verdict="UNMEASURED"), T0.replace(hour=7))
+        self.tick(pooled(verdict="UNMEASURED"), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
+            "⚪ Queue wait unknown — the hourly pool check couldn't read how long recent runs waited.",
+        )
+
     def test_digest_carries_the_slow_line_while_it_lasts(self):
         self.tick(slow(), T0.replace(hour=7))  # the note itself
         self.tick(slow(), self.at(DIGEST_UTC, 5))
@@ -855,6 +865,16 @@ class PoolNote(RunHarness):
         self.assertEqual(len(self.opener.requests), 2, "said once, like the note itself")
         self.tick(pooled(since="2026-09-04T14:30:00+00:00"), self.at(15))
         self.assertEqual(len(self.opener.requests), 3)
+
+    def test_a_clear_on_a_day_with_no_runs_drops_the_wait_rather_than_printing_one(self):
+        # queue_wait_p50_s is null on a day nothing concluded. "typical wait ?"
+        # reads as a broken number; the news is that the episode is over.
+        self.tick(pooled(), self.at(10))
+        self.tick(cleared(wait_s=None), self.at(10, 15))
+        self.assertEqual(
+            self.opener.texts[1],
+            "✅ *Smoke gate: queue clear* — runs are starting on time again.",
+        )
 
     def test_the_episode_start_follows_the_reading_not_the_send(self):
         # health.py reads this back so one episode stays one episode. It is a

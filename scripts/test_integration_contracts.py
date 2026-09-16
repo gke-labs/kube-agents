@@ -545,7 +545,12 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
         note = health.pool_note(doc, POOL_PRESSURE_AS_OF, None)
         self.assertIsNone(note["free"])
         self.assertEqual(0, note["over_threshold"], "no live queue is a real reading of zero")
-        self.assertNotIn("0 of", post_health.render_pool({"pool": note}))
+        # The count only reaches a message under CAUSE_CONTROL_PLANE; the other
+        # three never print it, so the fixture's own cause proves nothing.
+        note["cause"] = post_health.CAUSE_CONTROL_PLANE
+        rendered = post_health.render_pool({"pool": note})
+        self.assertIn("? of", rendered)
+        self.assertNotIn("0 of", rendered)
 
 
 if __name__ == "__main__":

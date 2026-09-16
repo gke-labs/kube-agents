@@ -680,7 +680,7 @@ window sits back inside its own limit after one bad day. `day` is `null` when
 only the live queue breached; `over_threshold` counts those runs. A `STALE`
 verdict carries no numbers: the periodic stopped publishing, and the last
 reading is not evidence about now. Unlike `slow` it is set in every state, and
-the pages read `verdict`, `since`, `measured_at`, `day`, `p50_s`,
+the pages read `verdict`, `since`, `measured_at`, `day`, `p50_s`, `p95_s`,
 `over_threshold`, `threshold_p50_s` and `threshold_p95_s` for one sentence on
 the Brief's healthy headline and on the last-24-hours view.
 `metrics.queue_wait_p50_s` is the same job's median wait over the last day, or

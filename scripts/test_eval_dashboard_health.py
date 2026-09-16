@@ -976,6 +976,20 @@ class PoolNote(unittest.TestCase):
             result["evidence"],
         )
 
+    def test_a_breach_that_could_not_count_the_pool_says_the_wait_and_stops(self):
+        # pool_pressure.cause() returns UNKNOWN exactly when the occupancy read
+        # failed, and writes free/total as null in the same breath -- so this is
+        # every UNKNOWN breach, not a corner of one.
+        unread = {"read": False, "error": "boskos: connection refused",
+                  "busy": None, "free": None, "total": None, "in_transition": None, "stranded": None}
+        result = pooled(verdict="BREACH", cause="UNKNOWN", pool=unread)
+        line = next(one for one in result["evidence"] if one.startswith("backed-up pool"))
+        self.assertNotIn("None", line)
+        self.assertEqual(
+            "backed-up pool: 2026-09-06 median 24 min against 15 min, p95 157 min against 45",
+            line,
+        )
+
     def test_a_breach_on_both_counts_reports_both(self):
         note = pooled(verdict="BREACH", cause="CAPACITY", over_threshold=1)["pool"]
         self.assertEqual(

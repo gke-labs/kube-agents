@@ -541,7 +541,8 @@ def render_stale(health: dict) -> str:
 
 def figure(value) -> str:
     """A count from the pool note, which sets a field it could not read to None.
-    Zero is a real reading -- `or "?"` would print "? of 30 projects free"."""
+    Zero is a real reading -- `or "?"` would hide a cap of 0, the one worth
+    saying out loud. (A `free` of 0 is not: cause() calls that CAPACITY.)"""
     return "?" if value is None else str(value)
 
 
@@ -679,9 +680,12 @@ def render_pool(health: dict) -> str:
 
 def render_pool_clear(health: dict) -> str:
     """The episode's end. No limits and no cause -- the episode is over, and
-    the digest's `typical wait` is where the numbers live from here."""
+    the digest's `typical wait` is where the numbers live from here. A day with
+    no concluded runs has no median; the clause goes rather than print the "?"
+    wait_text owes a fixed-width field."""
     wait = (health.get("metrics") or {}).get("queue_wait_p50_s")
-    return f"✅ *Smoke gate: queue clear* — runs are starting on time again, typical wait {wait_text(wait)}."
+    typical = f", typical wait {wait_text(wait)}" if wait is not None else ""
+    return f"✅ *Smoke gate: queue clear* — runs are starting on time again{typical}."
 
 
 def short_cause(prev: dict) -> str:

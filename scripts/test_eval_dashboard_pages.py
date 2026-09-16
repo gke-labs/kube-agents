@@ -687,6 +687,13 @@ class BrowserTest(unittest.TestCase):
         blind = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolblind", self.data,
                                    health=health_doc("GREEN", pool={"verdict": "STALE"})) / "index.html")
         self.assertIn("No pool numbers: the hourly pool check has stopped reporting.", blind)
+        # UNMEASURED is the periodic running and failing to sweep the window,
+        # which is a different sentence from the periodic going away.
+        unmeasured = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolunmeasured", self.data,
+                                        health=health_doc("GREEN", pool=note | {"verdict": "UNMEASURED"})) / "index.html")
+        self.assertIn("The queue wait is unknown: the hourly pool check ran but could not read"
+                      " how long recent runs waited.", unmeasured)
+        self.assertNotIn("median wait", unmeasured)
         control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notpool", self.data, health=health_doc("GREEN")) / "index.html")
         self.assertNotIn("Runs are waiting to start", control)
 
