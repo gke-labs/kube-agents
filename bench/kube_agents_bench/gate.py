@@ -43,6 +43,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -244,17 +245,24 @@ def _label(case: dict[str, Any]) -> str:
 # caps at the same figure, so the two never disagree about the cut.
 REPORT_EXCERPT_MAX_CHARS = 300
 
+# What must not reach the log line: C0 controls and DEL (a captured kubectl
+# colour code, a NUL), and lone surrogates, which a JSON `\ud8xx` escape in
+# results.json turns into a str that print() cannot encode -- and an
+# exception there would end `bench-gate case` before its hand-off is written.
+_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
+
 
 def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
     """The agent's final report as one build-log line, or "" when it said nothing.
 
-    Whitespace is collapsed to single spaces, so a newline in the report
-    cannot break the line; ``<`` is dropped, so a report can neither forge
-    the log's ``<<< finished`` marker nor open a tag in anything that renders
+    Control characters and lone surrogates become spaces and whitespace is
+    collapsed to single spaces, so the line is one printable line whatever
+    the report held; ``<`` is dropped, so a report can neither forge the
+    log's ``<<< finished`` marker nor open a tag in anything that renders
     the log as HTML; anything past ``limit`` is cut, with an ellipsis in the
     last position to say so.
     """
-    flat = " ".join(str(text or "").replace("<", "").split())
+    flat = " ".join(_UNPRINTABLE.sub(" ", str(text or "")).replace("<", "").split())
     if len(flat) > limit:
         return flat[: limit - 1].rstrip() + "…"
     return flat

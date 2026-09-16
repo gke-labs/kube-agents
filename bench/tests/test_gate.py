@@ -282,6 +282,11 @@ def test_the_report_line_is_one_flat_line_with_no_angle_brackets_and_a_cap(
         ("x" * 300, "x" * 300),
         ("x" * 301, "x" * 299 + "…"),
         ("word " * 100, ("word " * 100).strip()[:299].rstrip() + "…"),
+        # A lone surrogate (a JSON `\ud83d` escape) and C0 controls (an ANSI
+        # colour code, a NUL, a BEL) become spaces: print() must not raise.
+        ("a\ud83db", "a b"),
+        ("\x1b[31mred\x1b[0m\x00 done\x07", "[31mred [0m done"),
+        ("café — naïve 🔀", "café — naïve 🔀"),
     ],
 )
 def test_report_excerpt_collapses_strips_and_truncates(raw, expected):
@@ -289,6 +294,24 @@ def test_report_excerpt_collapses_strips_and_truncates(raw, expected):
     assert got == expected
     assert len(got) <= REPORT_EXCERPT_MAX_CHARS
     assert "\n" not in got and "<" not in got
+    got.encode("utf-8")  # strict: what a UTF-8 stdout does
+
+
+def test_a_report_with_a_lone_surrogate_still_grades_and_writes_the_hand_off(
+    kanban_task, make_run, tmp_path, capsys
+):
+    """results.json can carry `\ud83d` as a JSON escape; json.loads keeps it
+    as a lone surrogate, and printing that raises under a UTF-8 stdout. The
+    gate must still print its lines and write the case JSON."""
+    def broken(rec):
+        rec["output"] = "half an emoji \ud83d then the report"
+
+    out = tmp_path / "case.json"
+    assert run_case(kanban_task, [make_run("kanban_red_1", broken)], out) == 0
+    printed = capsys.readouterr().out
+    assert REPORT_PREFIX + "half an emoji then the report" in printed
+    printed.encode("utf-8")
+    assert out.is_file() and payload(out)["reps"][0]["outcome"] == "fail"
 
 
 def test_missing_is_accepted_as_a_repetition_placeholder(kanban_task, tmp_path):
