@@ -51,7 +51,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -321,8 +320,24 @@ JUNIT_TRUNCATED_MESSAGE = (
 )
 JUNIT_ENCODING = "utf-8"
 JUNIT_INDENT = "  "
+JUNIT_DECLARATION = "<?xml version='1.0' encoding='{encoding}'?>"
+JUNIT_TAG_FAILURE = "failure"
+JUNIT_TAG_SKIPPED = "skipped"
+# The file is written by hand rather than through the standard library's
+# `xml` package: the repository's semgrep audit rejects that import wholesale
+# because its parsers accept external entities, and nothing here parses. The
+# layout and escaping follow ElementTree's, so a reader gets the same bytes.
+# `&` is replaced first so a later entity is not escaped again; an attribute
+# value also escapes the quote and the whitespace a parser would otherwise fold.
+XML_TEXT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+XML_ATTRIBUTE_ESCAPES = XML_TEXT_ESCAPES + (
+    ('"', "&quot;"),
+    ("\r", "&#13;"),
+    ("\n", "&#10;"),
+    ("\t", "&#09;"),
+)
 # Skip messages and the failure body carry raw stderr from kubectl and gcloud.
-# ElementTree escapes markup but writes any other control byte through, and one
+# Escaping covers markup but passes any other control byte through, and one
 # escape sequence makes the whole file unparseable -- every row gone on exactly
 # the run that had a source failure to report. Everything outside XML 1.0's
 # Char production is dropped before it reaches an attribute or text node.
@@ -1601,26 +1616,63 @@ def cause(
     ] + _cap_at_pool_caveat(pool_state, concurrency)
 
 
-def _junit_case(suite: ET.Element, name: str) -> ET.Element:
-    return ET.SubElement(suite, "testcase", name=name, classname=JUNIT_SUITE_NAME)
-
-
-def _junit_value(case: ET.Element, value) -> None:
-    properties = ET.SubElement(case, "properties")
-    ET.SubElement(
-        properties, "property", name=JUNIT_METRIC_PROPERTY, value=str(value)
-    )
+def _xml_escape(text: str, escapes: Sequence[Tuple[str, str]]) -> str:
+    for char, entity in escapes:
+        text = text.replace(char, entity)
+    return text
 
 
 def _xml_text(text: Optional[str]) -> str:
     return XML_INVALID_CHARS.sub("", text or "")
 
 
-def _junit_skip(case: ET.Element, message: Optional[str]) -> None:
+def _xml_open(tag: str, attributes: Dict[str, str]) -> str:
+    """`<tag a="b"` without its closing bracket; attributes in the order given."""
+    return f"<{tag}" + "".join(
+        f' {name}="{_xml_escape(value, XML_ATTRIBUTE_ESCAPES)}"'
+        for name, value in attributes.items()
+    )
+
+
+def _xml_element(tag: str, attributes: Dict[str, str], text: str = "") -> str:
+    """One childless element on one line, self-closing when it has no text."""
+    if not text:
+        return _xml_open(tag, attributes) + " />"
+    return f"{_xml_open(tag, attributes)}>{_xml_escape(text, XML_TEXT_ESCAPES)}</{tag}>"
+
+
+def _junit_case(name: str, inner: Sequence[str]) -> List[str]:
+    """A <testcase> as lines: self-closing when empty, else wrapping `inner`,
+    which is indented one level further."""
+    attributes = {"name": name, "classname": JUNIT_SUITE_NAME}
+    if not inner:
+        return [_xml_element("testcase", attributes)]
+    return (
+        [_xml_open("testcase", attributes) + ">"]
+        + [JUNIT_INDENT + line for line in inner]
+        + ["</testcase>"]
+    )
+
+
+def _junit_value(value) -> List[str]:
+    metric = {"name": JUNIT_METRIC_PROPERTY, "value": str(value)}
+    return [
+        "<properties>",
+        JUNIT_INDENT + _xml_element("property", metric),
+        "</properties>",
+    ]
+
+
+def _junit_skip(message: Optional[str]) -> List[str]:
     # The reason goes in both places because JUnit readers differ on which
     # they show: the attribute is the schema's, the text is what several print.
     reason = _xml_text(message) or SEGMENT_UNMEASURED
-    ET.SubElement(case, "skipped", message=reason).text = reason
+    return [_xml_element(JUNIT_TAG_SKIPPED, {"message": reason}, reason)]
+
+
+def _junit_failure(message: str, text: str) -> List[str]:
+    attributes = {"message": _xml_text(message)}
+    return [_xml_element(JUNIT_TAG_FAILURE, attributes, _xml_text(text))]
 
 
 def junit_report(summary: dict) -> str:
@@ -1633,15 +1685,20 @@ def junit_report(summary: dict) -> str:
     queue = summary["queue"]
     pool = summary["pool"]
 
-    suite = ET.Element("testsuite", name=JUNIT_SUITE_NAME)
+    # Each row is (name, tag of its one child or None, that child's lines).
+    rows: List[Tuple[str, Optional[str], List[str]]] = []
 
-    verdict = _junit_case(suite, JUNIT_ROW_VERDICT)
+    def add(name: str, tag: Optional[str] = None, inner: Sequence[str] = ()) -> None:
+        rows.append((name, tag, list(inner)))
+
     if summary["exit_code"] != EXIT_OK:
         message = summary["verdict"]
         if summary["cause"]:
             message += f" ({summary['cause']})"
-        failure = ET.SubElement(verdict, "failure", message=_xml_text(message))
-        failure.text = _xml_text("\n".join(summary["cause_text"]) or trend["error"])
+        body = "\n".join(summary["cause_text"]) or trend["error"]
+        add(JUNIT_ROW_VERDICT, JUNIT_TAG_FAILURE, _junit_failure(message, body))
+    else:
+        add(JUNIT_ROW_VERDICT)
 
     # Skipped unless the percentile covers the window the row names; the
     # constants above say why an empty or a cut-short window is not graphed.
@@ -1655,32 +1712,37 @@ def junit_report(summary: dict) -> str:
     else:
         setup_measured, setup_skip = True, None
     for name, key in ((JUNIT_ROW_P50, "p50_minutes"), (JUNIT_ROW_P95, "p95_minutes")):
-        case = _junit_case(suite, name)
         if setup_measured:
-            _junit_value(case, trend[key])
+            add(name, "properties", _junit_value(trend[key]))
         else:
-            _junit_skip(case, setup_skip)
+            add(name, JUNIT_TAG_SKIPPED, _junit_skip(setup_skip))
 
     # An empty queue is a measured zero: Deck was read and nothing was waiting.
-    live = _junit_case(suite, JUNIT_ROW_QUEUE)
     if queue["read"]:
-        _junit_value(
-            live, max((run["minutes"] for run in queue["waiting_runs"]), default=0.0)
-        )
+        longest = max((run["minutes"] for run in queue["waiting_runs"]), default=0.0)
+        add(JUNIT_ROW_QUEUE, "properties", _junit_value(longest))
     else:
-        _junit_skip(live, queue["error"])
+        add(JUNIT_ROW_QUEUE, JUNIT_TAG_SKIPPED, _junit_skip(queue["error"]))
 
-    free = _junit_case(suite, JUNIT_ROW_FREE)
     if pool["read"]:
-        _junit_value(free, pool["free"])
+        add(JUNIT_ROW_FREE, "properties", _junit_value(pool["free"]))
     else:
-        _junit_skip(free, pool["error"])
+        add(JUNIT_ROW_FREE, JUNIT_TAG_SKIPPED, _junit_skip(pool["error"]))
 
-    suite.set("tests", str(len(suite)))
-    suite.set("failures", str(len(suite.findall("testcase/failure"))))
-    suite.set("skipped", str(len(suite.findall("testcase/skipped"))))
-    ET.indent(suite, space=JUNIT_INDENT)
-    return ET.tostring(suite, encoding="unicode", xml_declaration=True) + "\n"
+    suite = {
+        "name": JUNIT_SUITE_NAME,
+        "tests": str(len(rows)),
+        "failures": str(sum(tag == JUNIT_TAG_FAILURE for _, tag, _ in rows)),
+        "skipped": str(sum(tag == JUNIT_TAG_SKIPPED for _, tag, _ in rows)),
+    }
+    lines = [
+        JUNIT_DECLARATION.format(encoding=JUNIT_ENCODING),
+        _xml_open("testsuite", suite) + ">",
+    ]
+    for name, _, inner in rows:
+        lines.extend(JUNIT_INDENT + line for line in _junit_case(name, inner))
+    lines.append("</testsuite>")
+    return "\n".join(lines) + "\n"
 
 
 def write_junit(path: str, summary: dict) -> None:

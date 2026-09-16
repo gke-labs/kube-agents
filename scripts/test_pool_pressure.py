@@ -960,7 +960,7 @@ class JunitOutput(unittest.TestCase):
         self.assertIsNotNone(rows[pp.JUNIT_ROW_VERDICT].find("failure"))
 
     def test_a_control_character_in_a_source_error_does_not_break_the_file(self):
-        """Skip messages carry kubectl and gcloud stderr verbatim. ElementTree
+        """Skip messages carry kubectl and gcloud stderr verbatim. Escaping
         writes a C0 byte through, and one escape sequence would drop every row
         on the run that had a failure to report."""
         payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
@@ -972,6 +972,25 @@ class JunitOutput(unittest.TestCase):
         skipped = rows[pp.JUNIT_ROW_QUEUE].find("skipped")
         self.assertEqual("Deck: [31mgone[0m", skipped.get("message"))
         self.assertEqual("bell  here", rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
+
+    def test_markup_and_quotes_in_a_message_survive_the_round_trip(self):
+        """The file is serialised by hand (pool_pressure.py imports nothing from
+        `xml`), so a parser is the check that every character an attribute or
+        a text node has to escape comes back as it went in."""
+        hostile = "kubectl: <forbidden> \"pods\" & 'jobs'\n\ttab\r"
+        payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        payload["queue"]["read"] = False
+        payload["queue"]["error"] = hostile
+        payload["cause_text"] = [hostile]
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        skipped = rows[pp.JUNIT_ROW_QUEUE].find("skipped")
+        self.assertEqual(hostile, skipped.get("message"))
+        # A parser folds a carriage return in a text node to a newline (XML
+        # 1.0 end-of-line handling); in the attribute it is a character
+        # reference and comes back as written.
+        in_text = hostile.replace("\r", "\n")
+        self.assertEqual(in_text, skipped.text)
+        self.assertEqual(in_text, rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
 
     def test_the_skip_reason_is_in_the_attribute_and_the_text(self):
         """JUnit readers differ on which one they show."""
