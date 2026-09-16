@@ -222,7 +222,9 @@ rolling seven days, so an episode outlives the bad day by up to a week:
 ```
 
 It fires only on a reading that says so. The note also disappears when the
-artifact does, and that is the bot going blind, not the queue clearing.
+artifact does, and that is the bot going blind, not the queue clearing. It is
+owed to an episode that breached, not to a ⚪ one, which never claimed the
+queue was bad -- and a breach that goes ⚪ before it drains still gets it.
 
 Two ⚪ messages are about the monitoring, not the pool. `wait unknown` is the
 check running and failing to read how long recent runs waited -- its sweep

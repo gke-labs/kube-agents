@@ -340,7 +340,11 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     # "starting on time again" would assert what nothing measured. And only on
     # a reading: the note disappears when the artifact does, and that is the
     # bot going blind, not the queue draining.
-    elif not pool and (prev or {}).get("pool_verdict") == POOL_BREACH and pool_was_read(health):
+    #
+    # The question is whether this episode ever breached, not what it said
+    # last. A breach whose periodic then dies goes ⚪, and reading the last
+    # verdict would owe that episode no ✅ however the queue ends up.
+    elif not pool and (prev or {}).get("pool_breached") and pool_was_read(health):
         kinds.append(KIND_POOL_CLEAR)
 
     if in_digest_window(now, digest_hour, tz) and (prev or {}).get("last_digest_date") != local_date(now, tz):
@@ -920,8 +924,8 @@ def run(
     # case join, did staleness flip -- against what the readers have. A sent
     # change or recovery advances the state, condition, cause and case list;
     # a sent stale notice advances the stale bit; a sent digest advances the
-    # digest date; a sent pool note or clear advances the pool verdict, and
-    # only on a tick that read the artifact. Nothing else moves.
+    # digest date; a sent pool note or clear advances the pool verdict and the
+    # breached bit, and only on a tick that read the artifact. Nothing else moves.
     # A kind that failed, or was not due,
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
@@ -943,6 +947,14 @@ def run(
     told_pool = (KIND_POOL in sent or KIND_POOL not in kinds) and (
         KIND_POOL_CLEAR in sent or KIND_POOL_CLEAR not in kinds
     )
+    # `pool_verdict` cannot answer "did this episode breach": a breach that goes
+    # ⚪ overwrites it, and the ✅ is then owed to nobody. This bit outlives the
+    # ⚪ and only the clear drops it.
+    pool_breached = bool(before.get("pool_breached"))
+    if told_pool and pool_was_read(health):
+        pool_breached = pool_breached or (health.get("pool") or {}).get("verdict") == POOL_BREACH
+    if KIND_POOL_CLEAR in sent:
+        pool_breached = False
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,
         # fresh start is not announced later as a change.
@@ -968,6 +980,7 @@ def run(
             if told_pool and pool_was_read(health)
             else before.get("pool_verdict")
         ),
+        "pool_breached": pool_breached,
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),

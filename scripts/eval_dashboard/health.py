@@ -891,6 +891,24 @@ def _as_seconds(minutes) -> int | None:
     return int(minutes * SECONDS_PER_MINUTE) if isinstance(minutes, (int, float)) else None
 
 
+def _section(artifact: dict, key: str) -> dict:
+    """A named object out of the artifact, `{}` when it is anything else.
+
+    pool-pressure.json is another job's output and nothing validates its shape
+    on the way in. A wrong type raises inside adjudicate, and the Actions step
+    calling it has no continue-on-error, so one malformed artifact would stop
+    the dashboard and the chat bot every 15 minutes until someone noticed.
+    """
+    value = artifact.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _rows(trend: dict) -> list:
+    """The `days[]` array, `[]` when the artifact put something else there."""
+    days = trend.get("days")
+    return days if isinstance(days, list) else []
+
+
 def wait_text(seconds) -> str:
     """A measured wait: "24s" below a minute, "22 min" above. Whole minutes
     would print an ordinary 24-second wait as "0 min". post_health imports it
@@ -916,14 +934,16 @@ def _worst_breached_day(trend: dict, thresholds: dict) -> dict | None:
     p95 alone is still picked ahead of a quiet one. A row's own `breached` flag
     is what `trend.breached_days` is built from, sample minimum included.
     """
-    days = [d for d in (trend.get("days") or []) if isinstance(d, dict) and d.get("breached")]
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
     if not days:
         return None
-    limits = (thresholds.get("p50_minutes"), thresholds.get("p95_minutes"))
+    # Through _as_seconds on both sides: the ratio is the same in either unit,
+    # and it is the file's existing filter for a figure that is not a number.
+    limits = (_as_seconds(thresholds.get("p50_minutes")), _as_seconds(thresholds.get("p95_minutes")))
 
     def excess(row: dict) -> float:
         return max(
-            (row.get(key) or 0) / limit if limit else 0
+            (_as_seconds(row.get(key)) or 0) / limit if limit else 0
             for key, limit in zip(("p50_minutes", "p95_minutes"), limits)
         )
 
@@ -958,9 +978,9 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         # now, and a field that is present will eventually be rendered as
         # though it were current.
         return note
-    trend = artifact.get("trend") or {}
-    pool = artifact.get("pool") or {}
-    thresholds = artifact.get("thresholds") or {}
+    trend = _section(artifact, "trend")
+    pool = _section(artifact, "pool")
+    thresholds = _section(artifact, "thresholds")
     # The numbers that justify the verdict, not the window's. The periodic
     # breaches on a single day's row or on a run waiting past p95 right now
     # (pool_pressure.py's `breached_days or live_breach`) and never on the
@@ -972,7 +992,7 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "p50_s": _as_seconds(day.get("p50_minutes")),
         "p95_s": _as_seconds(day.get("p95_minutes")),
         "worst_s": _as_seconds(day.get("worst_minutes")),
-        "over_threshold": (artifact.get("queue") or {}).get("over_threshold") or 0,
+        "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": _as_seconds(thresholds.get("p50_minutes")),
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
         "free": pool.get("free"),
@@ -998,7 +1018,7 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
         return None
-    days = (artifact.get("trend") or {}).get("days") or []
+    days = _rows(_section(artifact, "trend"))
     latest = days[-1] if days and isinstance(days[-1], dict) else {}
     try:
         day = datetime.strptime(latest["day"], POOL_DAY_FORMAT).date()

@@ -804,6 +804,17 @@ class PoolNote(RunHarness):
         # message gets read as current whatever the caveat says.
         self.assertNotIn("22 min", self.opener.texts[0])
 
+    def test_a_crashed_check_has_no_last_reading_to_quote(self):
+        # The workflow's sentinel: the copy worked and the body is not the
+        # artifact, so health.py has no window_end. The job stopping and the
+        # job publishing nothing read alike until the message says which.
+        self.tick(pooled(verdict="STALE", measured_at=None), self.at(10))
+        self.assertEqual(
+            self.first()[0],
+            "⚪ *Smoke gate: pool check stopped* — ci-kube-agents-pool-pressure ran but published"
+            " no numbers. If the next one doesn't land, it needs checking.",
+        )
+
     def test_posted_once_per_episode(self):
         self.tick(pooled(), self.at(10))
         self.tick(pooled(), self.at(10, 15))
@@ -818,6 +829,16 @@ class PoolNote(RunHarness):
         self.tick(pooled(verdict="STALE"), self.at(10, 15))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪"])
         self.assertEqual(self.recorded()["pool_verdict"], "STALE")
+
+    def test_a_breach_that_goes_blind_before_it_drains_still_gets_its_clear(self):
+        # The commonest way a long episode ends: the periodic dies, the note
+        # goes ⚪, and the queue drains while nobody is measuring. Reading the
+        # last verdict would owe this episode no ✅ at all.
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(verdict="STALE"), self.at(10, 15))
+        self.tick(cleared(), self.at(10, 30))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪", "✅"])
+        self.assertFalse(self.recorded()["pool_breached"])
 
     def test_a_cleared_note_says_so_once_and_a_new_episode_is_its_own_message(self):
         # Rule 8 clears loudly where rule 7 stays quiet. The periodic judges a

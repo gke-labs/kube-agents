@@ -991,6 +991,51 @@ class PoolNote(unittest.TestCase):
         bare = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED))
         self.assertFalse(bare["metrics"]["queue_wait_read"])
 
+    def test_the_workflow_sentinel_reads_as_stale_with_nothing_to_quote(self):
+        # What ci-health.yml substitutes when the copy or the parse fails. It
+        # is a dict, so it counts as a reading, but it has no window_end --
+        # the same STALE the dead-man's switch gives, minus a last reading.
+        sentinel = {"note": "build 2099957253191766016 published no usable pool-pressure.json"}
+        result = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED), pool_pressure=sentinel)
+        self.assertEqual(
+            result["pool"],
+            {"since": health.iso(T0), "verdict": "STALE", "measured_at": None},
+        )
+        self.assertTrue(result["metrics"]["queue_wait_read"], "the fetch worked; the periodic did not")
+        self.assertIsNone(result["metrics"]["queue_wait_p50_s"])
+
+    def test_a_section_of_the_wrong_type_costs_the_figure_not_the_tick(self):
+        # Another job writes this file and nothing validates it on the way in.
+        # The step that calls adjudicate has no continue-on-error, so a raise
+        # here stops the dashboard and the bot every 15 minutes.
+        window = health.iso(T0)
+        for name, artifact in (
+            ("trend a list", {"trend": []}),
+            ("days a dict", {"trend": {"days": {"friday": 1}}}),
+            ("days a string", {"trend": {"days": "none"}}),
+            ("pool a string", {"pool": "full"}),
+            ("queue a list", {"queue": []}),
+            ("thresholds a list", {"thresholds": []}),
+            (
+                "a threshold as a string",
+                {
+                    "thresholds": {"p50_minutes": "15", "p95_minutes": "45"},
+                    "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": 22.0}]},
+                },
+            ),
+            (
+                "a day's minutes as a string",
+                {
+                    "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
+                    "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": "22"}]},
+                },
+            ),
+        ):
+            with self.subTest(name):
+                bad = {"window_end": window, "verdict": "BREACH"} | artifact
+                self.assertEqual(health.pool_note(bad, T0, None)["verdict"], "BREACH")
+                self.assertIsNone(health.pool_wait_p50_s(bad, T0))
+
     def test_an_episode_keeps_its_start_and_a_new_one_gets_a_new_start(self):
         first = pooled(verdict="BREACH", cause="CAPACITY")
         later = T0 + timedelta(hours=2)
