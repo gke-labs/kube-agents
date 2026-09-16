@@ -192,7 +192,9 @@ that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the cha
 
 ## When a rollback is refused
 
-The first two refusals happen before anything on the cluster moves. The third does not.
+The first two refusals happen before anything on the cluster moves. The other two land in the
+operator step after `N-1`'s CRDs are applied; Helm checks before it renders or applies anything,
+so the release itself keeps its last revision.
 
 - **The sources do not match the tag.** The checkout's `HEAD` is not the tag's commit, the tree
   has uncommitted changes, or the bundle's baked version is not the `--image-tag` given. Start
@@ -210,6 +212,17 @@ The first two refusals happen before anything on the cluster moves. The third do
   `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. The re-tag has no
   flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
   one pair published today, `0.5.0` to `0.4.0`, is not affected: `0.4.0`'s chart has no schema.
+- **`N`'s operator owns an object that `N-1`'s chart renders.** Helm refuses to adopt an object
+  that carries another manager's ownership labels (`exists and cannot be imported into the
+current release: invalid ownership metadata`). The `litellm-policy` NetworkPolicy is the case
+  in hand: every chart through `0.5.0` renders it, and from the first release after `0.5.0` the
+  operator creates and labels it instead, so a rollback from that release to `0.5.0` or earlier
+  is refused at the operator step's `helm upgrade`, with `N-1`'s CRDs already applied and the
+  release still at its last revision. The way through is the chart README's
+  [handoff](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#handing-litellm-policy-back-to-helm):
+  scale `N`'s operator to zero, relabel and annotate the object for Helm, then run the two
+  commands; the operator step adopts it. Put `N`'s CRDs back first if the refusal has already
+  happened, as for the schema case.
 
 A further refusal is a future one. The API server rejects a CRD whose `spec.versions` drops a
 version still listed in `status.storedVersions`, so if `N` introduced a new API version of the
