@@ -9,9 +9,9 @@ A rollback is an upgrade run from the older release's own checkout. There is no 
 `upgrade.sh` refuses to run unless the sources it runs from are the exact commit `--image-tag`
 names, so a move to `N-1` from a checkout or a release bundle runs `N-1`'s copy of the script,
 `N-1`'s chart and `N-1`'s CRDs against your install. Two of its three modes do that by Helm alone
-and never run Terraform; the third re-applies `N-1`'s Terraform composition. The supported
-rollback is the Helm-only pair below. The full mode is the GCP-level revert, and it needs a plan
-read first.
+and never run Terraform; the third re-applies `N-1`'s Terraform composition, Helm release
+included. The supported rollback is the Helm-only pair below. The full mode is the GCP-level
+revert, and it needs a plan read first.
 
 Because the script that runs is `N-1`'s, its timeouts and Helm flags are `N-1`'s too, and this
 page says where the published releases differ. The `curl | bash` one-liner is the exception: it
@@ -137,15 +137,24 @@ which has no sandbox, and the next forward upgrade renders the Secret again.
 
 Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the API server prunes
 them from the stored object, and `N-1`'s chart does not render them. The Helm values that produced
-them stay in the release's recorded values, which a later forward upgrade renders again, and which
-the schema refusal below also turns on.
+them stay in the release's recorded values: a later forward re-tag renders them again, the schema
+refusal below turns on them, and the full mode discards them.
 
-The agent's persistent volume. The harness step rolls the pod, and the volume follows it. At
-start-up the image copies its defaults onto the volume with `cp -ru`, which skips any file the
-volume holds that is newer than the image's, so the skills, procedures and cron definitions `N`'s
-image seeded stay at `N`'s copy; only the short list the entrypoint force-syncs (the default
-profile's own files and the shared scripts) follows `N-1`'s image. A skill `N` added that calls a
-tool `N-1`'s image does not carry therefore fails when used rather than disappearing.
+The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
+harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
+entrypoint's doing, and every published release's entrypoint does the same. Skills are not kept:
+on every start the entrypoint replaces the platform profile's `skills/`, and every cluster
+profile's, whole from the image, so a skill `N` added is gone at the first start after the
+harness step rather than staying and failing on use
+([Skills](/kube-agents/concepts/skills/#importing-external-skills) says the same of an injected
+skill). The platform profile's persona files, governance and hindsight configuration are
+overwritten with `N-1`'s copies too, though a governance file only `N` shipped stays, because
+that overlay prunes nothing; the default profile's persona files and the shared scripts are
+overwritten the same way. Cron definitions are merged per job id: `N-1`'s image wins every key
+it ships, the scheduler's own state stays, and a job only `N` shipped keeps its entry and keeps
+firing, now against `N-1`'s tools. The rest of what the image seeds is copied with `cp -ru`,
+which skips any file the volume holds that is newer, so those files stay at `N`'s copy, and the
+state the agent itself wrote is kept.
 
 ## Reverting GCP resources too
 
@@ -154,8 +163,14 @@ tool `N-1`'s image does not carry therefore fails when used rather than disappea
 ./upgrade.sh --upgrade-mode=full --image-tag <N-1>
 ```
 
-From the `N-1` checkout, the full mode re-applies `N-1`'s Terraform composition on top of the
-state `N` wrote, and its Helm half is the re-tag the pair above already did. This is the
+From the `N-1` checkout, the full mode applies `N-1`'s CRDs, then runs `terraform apply` on
+`N-1`'s composition on top of the state `N` wrote. Its Helm half is not the re-tag: the
+composition's own `helm_release` upgrades the release with `N-1`'s chart and the values `N-1`'s
+composition computes from `install.env`, and it sets neither `reuse_values` nor `reset_values`,
+so the values the release recorded are discarded rather than reused. Anything in them that the
+composition does not render goes with them: a value set by hand with `helm upgrade --set`, a key
+`N`'s composition added, and on a `0.4.0` rollback the `N` defaults the pair's `--reuse-values`
+kept. The plan lists that as the `helm_release` change, next to the GCP resources. This is the
 GCP-level revert: a resource `N`'s composition added is planned for destruction because `N-1`'s
 composition does not declare it, and a setting `N` changed goes back. Read the whole plan first.
 A plan that destroys a bucket, a KMS key or the cluster is a decision to take with what those
@@ -211,7 +226,10 @@ so the release itself keeps its last revision.
   from the `N` checkout with the same command the script uses,
   `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. The re-tag has no
   flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
-  one pair published today, `0.5.0` to `0.4.0`, is not affected: `0.4.0`'s chart has no schema.
+  full mode does, because its Helm release renders from the composition's values rather than the
+  recorded ones (the section above), at the price of a GCP-level apply and the plan read that
+  goes before it. The one pair published today, `0.5.0` to `0.4.0`, is not affected: `0.4.0`'s
+  chart has no schema.
 - **`N`'s operator owns an object that `N-1`'s chart renders.** Helm refuses to adopt an object
   that carries another manager's ownership labels (`exists and cannot be imported into the
 current release: invalid ownership metadata`). The `litellm-policy` NetworkPolicy is the case
