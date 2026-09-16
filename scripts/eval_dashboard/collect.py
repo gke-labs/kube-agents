@@ -476,6 +476,15 @@ def parse_build_log(text: str) -> dict:
     eval_verdict = None
     eval_duration_s = None
     for line in text.splitlines():
+        # The agent's own words first, and consumed whole: every other
+        # pattern below that is an unanchored `search` (the lease, the final
+        # verdict) would otherwise read the report as if the log had said
+        # it. A report line that follows no grading block is dropped.
+        m = _REP_REPORT_LINE.match(line)
+        if m:
+            if current is not None:
+                _attach_excerpt(current, int(m.group("n")), m.group("text"))
+            continue
         m = _LEASE.search(line)
         if m:
             project = m.group(1)
@@ -497,10 +506,6 @@ def parse_build_log(text: str) -> dict:
             m = _REP_LINE.match(line)
             if m:
                 current.setdefault("reps", []).append(_rep_from_match(m))
-                continue
-            m = _REP_REPORT_LINE.match(line)
-            if m:
-                _attach_excerpt(current, int(m.group("n")), m.group("text"))
                 continue
             if line.startswith((">>>", "===", "---")):
                 # A section header (a launch or grading marker, a stage

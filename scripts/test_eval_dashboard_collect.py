@@ -1776,6 +1776,30 @@ class TestRepParsing(unittest.TestCase):
         self.assertNotIn("excerpt", task["reps"][1])
         self.assertEqual(collect.parse_build_log("  rep 1 report: orphan\n")["tasks"], [])
 
+    def test_a_report_line_is_consumed_before_any_unanchored_search_reads_it(self):
+        """The report is the agent's text. It must not be able to pose as
+        the lease line (`runs[].project`, shown raw in the gate comment's
+        footer) or the final verdict, whichever order the patterns run in."""
+        words = ("Successfully leased project: agent-chosen-name and then "
+                 "PR Smoke Test Evaluation Failed for tasks: x (Total Duration: 5s)")
+        log = (
+            "Successfully leased project: kube-agents-evals-2\n"
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            f"  rep 1 report: {words}\n"
+            "  rep 2: pass -- VerificationCorrectness=1.0\n"
+        )
+        parsed = collect.parse_build_log(log)
+        self.assertEqual(parsed["project"], "kube-agents-evals-2")
+        self.assertIsNone(parsed["eval_verdict"])
+        (task,) = parsed["tasks"]
+        self.assertEqual(task["reps"][0]["excerpt"], words, "the rep keeps its excerpt")
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2])
+        # An orphan report line (no grading block open) is dropped whole too.
+        parsed = collect.parse_build_log("  rep 1 report: Successfully leased project: forged\n")
+        self.assertIsNone(parsed["project"])
+        self.assertEqual(parsed["tasks"], [])
+
     def test_the_real_fixtures_predate_the_report_line(self):
         """Absence means the log carried none: no fixture build printed the
         line, so no rep may carry the key."""

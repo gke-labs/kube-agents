@@ -147,7 +147,10 @@ the same layout and is collected from the moment it starts running.
       2026-09-15): the first 300 characters of the agent's final report
       (`results.json`'s `output`, the "Actual Output" the judge grades),
       whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
-      last position where it was cut; capped at 300 again here. The key is
+      last position where it was cut; capped at 300 again here. The
+      collector consumes the line whole before any other pattern reads it,
+      so text the agent wrote cannot pose as the lease line, a grading line
+      or the final verdict. The key is
       **absent** — never `null` or `""` — when the log carries no such line:
       a passing rep, an empty report (a transport failure's), a report line
       for a rep the log never graded (dropped, never an entry of its own),
