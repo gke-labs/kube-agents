@@ -1150,7 +1150,7 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 			// the per-cluster filename for dedup snapshots, and every install
 			// already on disk has this cluster's cache under that name. Renaming
 			// it would silently resume from an empty cache after an upgrade.
-			direct := targetCluster{Name: f.clusterName, Profile: "direct"}
+			direct := targetCluster{Name: f.clusterName, Profile: directProfile}
 			if len(candidates) == 1 {
 				covered := candidates[0]
 				clusters = removeProfile(clusters, covered.Profile)

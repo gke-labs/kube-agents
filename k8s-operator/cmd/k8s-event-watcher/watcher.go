@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -72,13 +73,30 @@ const (
 	preflightWatchVerb = "watch"
 
 	// preflightNoReason stands in for a review that came back denied with an
-	// empty status.reason; the log line names the verb either way.
-	preflightNoReason = "no reason given"
+	// empty status.reason. Kubernetes RBAC never sets one, so this is what
+	// the host cluster of every install prints when the pod's service account
+	// lacks the grant: the line says what an empty reason means and what to
+	// grant, rather than leaving the operator with a blank where the 403 it
+	// replaces (see awaitPermitted) named both remediation paths.
+	preflightNoReason = "no reason given (Kubernetes RBAC returns none; grant list and watch on events to this identity)"
 
 	// preflightDeniedFormat is the one line a denied preflight logs per check:
-	// cluster, resource, verb, hold, and the authorizer's reason, which on
-	// GKE names the missing IAM permission.
-	preflightDeniedFormat = "watcher: [%s] %s %s denied at preflight, holding %s before the next check: %s"
+	// cluster, resource, verb, the identity that was refused (see whoAmI),
+	// hold, and the authorizer's reason, which on GKE names the missing IAM
+	// permission.
+	preflightDeniedFormat = "watcher: [%s] %s %s denied at preflight for %s, holding %s before the next check: %s"
+
+	// directProfile is the Profile main.go gives the one cluster reached with
+	// the process's own credential rather than a token for the pod's Google
+	// identity; whoAmI reads it to say which of the two was refused when the
+	// API server will not name the identity itself.
+	directProfile = "direct"
+	// The two fallbacks whoAmI names in that case, and the shape it wraps
+	// them in with the reason the identity could not be read.
+	directIdentityFallback          = "the process's own credential (in a pod, its service account)"
+	profileIdentityFallback         = "the pod's Google identity"
+	preflightIdentityFallbackFormat = "%s (not named: SelfSubjectReview %s)"
+	preflightIdentityEmpty          = "returned no username"
 	// preflightInconclusiveFormat is the one line logged when the review
 	// could not decide, before falling through to building the informer.
 	preflightInconclusiveFormat = "watcher: [%s] preflight inconclusive, starting the informer anyway: %v"
@@ -281,7 +299,7 @@ func (w *watcher) awaitPermitted(ctx context.Context) error {
 		if reason == "" {
 			reason = preflightNoReason
 		}
-		log.Printf(preflightDeniedFormat, w.cluster.Name, preflightResource, verb, w.forbiddenHold, reason)
+		log.Printf(preflightDeniedFormat, w.cluster.Name, preflightResource, verb, w.whoAmI(ctx), w.forbiddenHold, reason)
 		if !holdOrDone(ctx, w.forbiddenHold) {
 			return fmt.Errorf("watcher: stopped while held at preflight (%s %s denied: %s): %w", preflightResource, verb, reason, ctx.Err())
 		}
@@ -345,6 +363,39 @@ func (w *watcher) preflight(ctx context.Context) (string, string, error) {
 		return verb, result.Status.Reason, nil
 	}
 	return "", "", nil
+}
+
+// whoAmI names the identity the preflight was refused as, so the denial line
+// can say who to grant the permission to. A held cluster never reaches the
+// reflector, so that line replaces the 403 the operator used to read, which
+// named the identity (`User "<gsa>@<project>.iam.gserviceaccount.com" cannot
+// list resource "events"`); without it a denial with no reason, which is what
+// RBAC returns, cannot be told apart between the pod's service account on the
+// host cluster and its Google identity on a profile cluster, and the two are
+// fixed in different places. The API server answers a SelfSubjectReview with
+// the username it authenticated the caller as — the Google identity's email
+// through GKE's authenticator, `system:serviceaccount:<ns>:<name>` for a
+// service-account token — and system:basic-user grants that review as it
+// does the access review. When it will not say (an older API server, a
+// stripped basic-user role), the line falls back to which credential this
+// cluster is reached with (see directProfile) and says why it could not do
+// better. Asked only on a denial, so an allowed cluster pays nothing.
+func (w *watcher) whoAmI(ctx context.Context) string {
+	review, err := w.client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	var why string
+	switch {
+	case err != nil:
+		why = err.Error()
+	case review.Status.UserInfo.Username == "":
+		why = preflightIdentityEmpty
+	default:
+		return review.Status.UserInfo.Username
+	}
+	source := profileIdentityFallback
+	if w.cluster.Profile == directProfile {
+		source = directIdentityFallback
+	}
+	return fmt.Sprintf(preflightIdentityFallbackFormat, source, why)
 }
 
 // newListWatch builds the informer's list and watch calls: the same

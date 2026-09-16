@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -196,6 +197,19 @@ func stubPreflight(client *fake.Clientset, deny, reason string, err error) *pref
 		return true, review, nil
 	})
 	return s
+}
+
+// stubIdentity answers whoAmI's SelfSubjectReview on a fake clientset with
+// username, or fails it with err when set.
+func stubIdentity(client *fake.Clientset, username string, err error) {
+	client.PrependReactor("create", "selfsubjectreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if err != nil {
+			return true, nil, err
+		}
+		review := action.(k8stesting.CreateAction).GetObject().(*authenticationv1.SelfSubjectReview)
+		review.Status.UserInfo.Username = username
+		return true, review, nil
+	})
 }
 
 // allowPreflight is what every test that is not about the preflight wants:
@@ -716,6 +730,39 @@ func countingListClient() (*fake.Clientset, *atomic.Int64) {
 	return client, &attempts
 }
 
+// whoAmI names the identity the API server authenticated, and when it cannot,
+// says which credential the cluster is reached with and why the name is
+// missing, so the denial line never shows a bare blank where the identity
+// should be.
+func TestWhoAmI(t *testing.T) {
+	cases := []struct {
+		name     string
+		profile  string
+		username string
+		err      error
+		want     string
+	}{
+		{name: "google identity named", profile: "gke_p_l_c", username: "sa@p.iam.gserviceaccount.com", want: "sa@p.iam.gserviceaccount.com"},
+		{name: "service account named", profile: "direct", username: "system:serviceaccount:kubeagents-system:kubeagents-platform-agent", want: "system:serviceaccount:kubeagents-system:kubeagents-platform-agent"},
+		{name: "review fails on the direct cluster", profile: "direct", err: errors.New("the server could not find the requested resource"),
+			want: "the process's own credential (in a pod, its service account) (not named: SelfSubjectReview the server could not find the requested resource)"},
+		{name: "review fails on a profile cluster", profile: "gke_p_l_c", err: errors.New("forbidden"),
+			want: "the pod's Google identity (not named: SelfSubjectReview forbidden)"},
+		{name: "review returns no username", profile: "gke_p_l_c", username: "",
+			want: "the pod's Google identity (not named: SelfSubjectReview returned no username)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			stubIdentity(client, tc.username, tc.err)
+			w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "c", Profile: tc.profile}, 0)
+			if got := w.whoAmI(context.Background()); got != tc.want {
+				t.Errorf("whoAmI() = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // A list the preflight says is denied never reaches the reflector: over a
 // window in which the default backoff would have relisted, no Event list is
 // attempted at all, one preflight line names the cluster, the verb and the
@@ -726,7 +773,8 @@ func TestRun_PreflightDeniedListBuildsNoInformer(t *testing.T) {
 	logs := captureLog(t)
 	client, lists := countingListClient()
 	stub := stubPreflight(client, "list", `requires one of ["container.events.list"] permission(s)`, nil)
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "denied"}, 0)
+	stubIdentity(client, "kubeagents-platform-agent@proj.iam.gserviceaccount.com", nil)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "denied", Profile: "gke_proj_us-central1_denied"}, 0)
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -746,7 +794,7 @@ func TestRun_PreflightDeniedListBuildsNoInformer(t *testing.T) {
 	if got := stub.reviews.Load(); got != 1 {
 		t.Errorf("want exactly one review per check for a denied list, got %d", got)
 	}
-	want := `[denied] events list denied at preflight, holding 1h0m0s before the next check: requires one of ["container.events.list"] permission(s)`
+	want := `[denied] events list denied at preflight for kubeagents-platform-agent@proj.iam.gserviceaccount.com, holding 1h0m0s before the next check: requires one of ["container.events.list"] permission(s)`
 	if got := strings.Count(logs.String(), want); got != 1 {
 		t.Errorf("want exactly one preflight line %q, got %d in:\n%s", want, got, logs.String())
 	}
@@ -769,12 +817,15 @@ func TestRun_PreflightDeniedListBuildsNoInformer(t *testing.T) {
 }
 
 // An identity that may list but not watch is held before its list: the line
-// names watch, both verbs were asked, and no Event list is attempted.
+// names watch, both verbs were asked, and no Event list is attempted. The
+// denial carries no reason, as RBAC's do, so the line says what that means
+// and, with the identity unnamed, which credential the cluster is reached by.
 func TestRun_PreflightDeniedWatchBuildsNoInformer(t *testing.T) {
 	logs := captureLog(t)
 	client, lists := countingListClient()
 	stub := stubPreflight(client, "watch", "", nil)
-	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only"}, 0)
+	stubIdentity(client, "", apierrors.NewNotFound(schema.GroupResource{Group: "authentication.k8s.io", Resource: "selfsubjectreviews"}, ""))
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only", Profile: "direct"}, 0)
 	w.forbiddenHold = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -783,7 +834,7 @@ func TestRun_PreflightDeniedWatchBuildsNoInformer(t *testing.T) {
 	rec := &transitionRecorder{}
 	go func() { done <- w.Run(ctx, rec.record) }()
 
-	want := "[list-only] events watch denied at preflight, holding 1h0m0s before the next check: no reason given"
+	want := "[list-only] events watch denied at preflight for the process's own credential (in a pod, its service account) (not named: SelfSubjectReview selfsubjectreviews.authentication.k8s.io \"\" not found), holding 1h0m0s before the next check: no reason given (Kubernetes RBAC returns none; grant list and watch on events to this identity)"
 	eventually(t, 10*time.Second, func() bool { return strings.Contains(logs.String(), want) }, "the preflight line naming watch")
 	time.Sleep(500 * time.Millisecond)
 
