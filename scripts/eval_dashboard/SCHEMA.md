@@ -672,9 +672,9 @@ it is set.
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, measured_at}` always, plus `{day, p50_s, p95_s,
-worst_s, over_threshold, threshold_p50_s, threshold_p95_s, free, total,
-cause, max_concurrency}` when `verdict` is `BREACH` or `UNMEASURED`. `day` and
-its three figures are the worst breached day's row, not the seven-day window —
+over_threshold, threshold_p50_s, threshold_p95_s, free, total, cause,
+max_concurrency}` when `verdict` is `BREACH` or `UNMEASURED`. `day` and
+its two figures are the worst breached day's row, not the seven-day window —
 the periodic breaches on a day or on runs queued past p95 right now, and the
 window sits back inside its own limit after one bad day. `day` is `null` when
 only the live queue breached; `over_threshold` counts those runs. A `STALE`

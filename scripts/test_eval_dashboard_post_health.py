@@ -100,7 +100,6 @@ def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:
         "day": "2026-09-03",
         "p50_s": 22 * 60,
         "p95_s": 61 * 60,
-        "worst_s": 175 * 60,
         "over_threshold": 0,
         "threshold_p50_s": 15 * 60,
         "threshold_p95_s": 45 * 60,
@@ -115,19 +114,19 @@ def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:
     return note | over
 
 
-def pooled(state="GREEN", wait_s=None, **note):
-    doc = health(state)
+def pooled(wait_s=None, **note):
+    doc = health()
     doc["pool"] = pool_note(**note)
     doc["metrics"]["queue_wait_p50_s"] = wait_s
     doc["metrics"]["queue_wait_read"] = True
     return doc
 
 
-def cleared(state="GREEN", wait_s=24):
+def cleared(wait_s=24):
     """The tick after an episode: the artifact was read, and the reading is
     fine. Distinct from a tick with no artifact at all, where the note also
     disappears but nothing has been learned."""
-    doc = health(state)
+    doc = health()
     doc["metrics"]["queue_wait_p50_s"] = wait_s
     doc["metrics"]["queue_wait_read"] = True
     return doc

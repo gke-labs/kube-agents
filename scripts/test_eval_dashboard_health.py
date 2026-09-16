@@ -904,13 +904,14 @@ def pressure(
     } | over
 
 
-def pooled(doc=None, now=T0, prev=None, posted=None, **artifact):
+def pooled(doc=None, now=T0, prev=None, posted=None, wall_clock=None, **artifact):
     return health.adjudicate(
         doc or data(),
         now,
         prev,
         health.Roster.fixed(ADMITTED),
         posted=posted,
+        wall_clock=wall_clock,
         pool_pressure=pressure(**artifact),
     )
 
@@ -933,7 +934,6 @@ class PoolNote(unittest.TestCase):
                 "day": "2026-09-06",
                 "p50_s": 1446,
                 "p95_s": 9438,
-                "worst_s": 10512,
                 "over_threshold": 0,
                 "threshold_p50_s": 900,
                 "threshold_p95_s": 2700,
@@ -1122,6 +1122,25 @@ class PoolNote(unittest.TestCase):
         )
         self.assertEqual(ended["pool"]["since"], health.iso(back))
 
+    def test_a_frozen_poster_start_does_not_date_the_next_episode(self):
+        # A muted poster returns before write_state, so pool_since holds the
+        # last episode's start for as long as the mute lasts. The tick that
+        # read the artifact and wrote no note is the one that ended it.
+        first = pooled(verdict="BREACH", cause="CAPACITY")
+        over_at = T0 + timedelta(hours=1)
+        over = pooled(now=over_at, prev=first, verdict="OK", window_end=over_at)
+        self.assertIsNone(over["pool"])
+        again = T0 + timedelta(days=2)
+        fresh = pooled(
+            now=again,
+            prev=over,
+            posted={"pool_since": first["pool"]["since"]},
+            verdict="BREACH",
+            cause="CAPACITY",
+            window_end=again,
+        )
+        self.assertEqual(fresh["pool"]["since"], health.iso(again), "a new episode, not the muted one's")
+
     def test_an_artifact_that_stopped_moving_carries_no_numbers(self):
         # latest-build.txt keeps resolving after the periodic dies, so a stale
         # window_end is the only signal that the numbers stopped.
@@ -1135,6 +1154,14 @@ class PoolNote(unittest.TestCase):
         )
         # Two missed hourly runs plus the job's own timeout: still fresh at 3h.
         self.assertEqual(pooled(verdict="BREACH", cause="CAPACITY", window_end=T0 - timedelta(hours=3))["pool"]["verdict"], "BREACH")
+
+    def test_the_artifact_ages_against_the_wall_clock_not_the_data_horizon(self):
+        # The branch every production tick takes: main() passes a wall clock
+        # unless --now. One Prow stall freezes data.json's horizon and the
+        # artifact together, so ageing against `now` never fires the switch.
+        stalled = pooled(verdict="BREACH", cause="CAPACITY", window_end=T0, wall_clock=T0 + timedelta(hours=4))
+        self.assertEqual(stalled["pool"]["verdict"], "STALE")
+        self.assertIsNone(stalled["metrics"]["queue_wait_p50_s"])
 
     def test_a_stale_artifact_also_drops_the_digest_number(self):
         self.assertIsNone(pooled(verdict="OK", window_end=T0 - timedelta(hours=4))["metrics"]["queue_wait_p50_s"])

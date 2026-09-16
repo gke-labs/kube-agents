@@ -521,7 +521,6 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "day": day["day"],
                 "p50_s": int(day["p50_minutes"] * 60),
                 "p95_s": int(day["p95_minutes"] * 60),
-                "worst_s": int(day["worst_minutes"] * 60),
                 "over_threshold": doc["queue"]["over_threshold"],
                 "threshold_p50_s": int(doc["thresholds"]["p50_minutes"] * 60),
                 "threshold_p95_s": int(doc["thresholds"]["p95_minutes"] * 60),

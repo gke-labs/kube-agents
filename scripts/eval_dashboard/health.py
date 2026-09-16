@@ -1003,7 +1003,6 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "day": day.get("day"),
         "p50_s": _as_seconds(day.get("p50_minutes")),
         "p95_s": _as_seconds(day.get("p95_minutes")),
-        "worst_s": _as_seconds(day.get("worst_minutes")),
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": _as_seconds(thresholds.get("p50_minutes")),
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
@@ -1407,7 +1406,14 @@ def adjudicate(
     # A tick that read no artifact writes no note, so the next one has no
     # `prev` to carry the episode start and stamps a fresh one. The poster
     # holds the start across those ticks; fall back to it before restarting.
-    carried = (prev or {}).get("pool") or {"since": (posted or {}).get("pool_since")}
+    # Only across those: a tick that read the artifact and wrote no note ended
+    # the episode, and the poster's copy outlives it whenever the state file
+    # stops being written -- muted, or a crash before write_state -- so
+    # carrying it would date the next episode from the last one.
+    carried = (prev or {}).get("pool")
+    if not carried:
+        ended = bool((prev or {}).get("metrics", {}).get("queue_wait_read"))
+        carried = None if ended else {"since": (posted or {}).get("pool_since")}
     pool = pool_note(pool_pressure, pool_clock, carried)
     if pool:
         evidence.append(pool_evidence(pool))

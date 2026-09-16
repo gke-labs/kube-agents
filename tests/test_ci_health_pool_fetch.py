@@ -44,7 +44,9 @@ class PoolFetchStepTest(unittest.TestCase):
         is unreadable, `artifact` None means the copy fails, `raw` is bytes
         copied verbatim -- what a crashed periodic leaves behind -- and
         `finished` False is a build still running."""
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        box = tempfile.TemporaryDirectory()
+        self.addCleanup(box.cleanup)
+        tmp = pathlib.Path(box.name)
         bin_dir = tmp / "bin"
         bin_dir.mkdir()
         cat = f'printf "%s\\n" {pointer}' if pointer is not None else "exit 1"
@@ -54,14 +56,16 @@ class PoolFetchStepTest(unittest.TestCase):
             payload = tmp / "payload.json"
             payload.write_text(json.dumps(artifact) if raw is None else raw)
             copy = f'cat "{payload}" > "${{@: -1}}"'
+        # Matched on the verb and the object it names, so the step asking for
+        # the wrong path falls through to exit 2 rather than being answered.
         (bin_dir / "gsutil").write_text(
             "#!/bin/bash\n"
             "shift  # -q\n"
-            'case "$1" in\n'
-            f"  cat) {cat} ;;\n"
-            f"  stat) exit {0 if finished else 1} ;;\n"
-            f"  cp) shift; {copy} ;;\n"
-            "  *) exit 2 ;;\n"
+            'case "$1 $2" in\n'
+            f'  "cat {LOGS}/latest-build.txt") {cat} ;;\n'
+            f'  "stat {LOGS}/{BUILD}/finished.json") exit {0 if finished else 1} ;;\n'
+            f'  "cp {LOGS}/{BUILD}/artifacts/pool-pressure.json") {copy} ;;\n'
+            '  *) echo "unexpected gsutil call: $*" >&2; exit 2 ;;\n'
             "esac\n"
         )
         (bin_dir / "gsutil").chmod(0o755)
