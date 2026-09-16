@@ -34,7 +34,14 @@ it, the managed-OTel scope on a cluster it created — and the GitHub App PEM im
 the Minty CLI so the key never enters Terraform state. Re-running the installer (or its `--menu`
 Day-2 panel's Save & Apply) reconciles every change through one `terraform apply`.
 
-## Quick Execution for AI Agents
+## Step 0: Ask the User — Dedicated Cluster vs. Existing Infrastructure
+
+Before executing any install command, ask the user whether they are deploying to a **new, dedicated GKE cluster (recommended)** or **adopting an existing cluster**:
+
+- **New / Dedicated Cluster (Recommended)**: Run `./install.sh --non-interactive` to provision the cluster and harness end-to-end.
+- **Existing Cluster / Infrastructure**: Never run unattended auto-apply (`./lifecycle.sh apply -auto-approve`). Always run `./install.sh --generate-only --non-interactive ...` so `terraform apply` does not mutate live resources without operator review. After generation, instruct the operator to run out-of-Terraform prerequisites and review the `terraform plan` (which `./lifecycle.sh apply` displays before prompting interactively for confirmation, or preview in advance via `./install.sh --dry-run` on Day 1 or `./lifecycle.sh plan` when remote GCS state already exists).
+
+## Quick Execution for AI Agents (New / Dedicated Cluster)
 
 For production installations, AI Agents and automated pipelines must target an official release version. When recommending commands to users or executing deployments, AI Agents must resolve the latest stable release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (e.g. `0.4.0`) and provide executable commands with that exact release version substituted, rather than leaving an unrendered `<RELEASE_VERSION>` placeholder:
 
@@ -76,16 +83,16 @@ cd kube-agents
 
 Do not clone `main` to deploy an official release: manifests and CRD schemas on `main` evolve continuously and diverge from released container images. Running install scripts against a mismatched checkout will fail `verify_local_source_ref` to prevent deploying incompatible manifests.
 
-## Generate-Only Mode
+## Generate-Only Mode (Mandatory for Existing Infrastructure)
 
-To generate configuration files (`install.env` and `terraform.tfvars`), run pre-apply validation checks, and hand off the apply to the operator without creating or mutating cloud resources, use `--generate-only`:
+When installing onto an existing cluster or shared infrastructure, use `--generate-only` to generate configuration files (`install.env` and `terraform.tfvars`), run pre-apply validation checks, and hand off the apply to the operator without creating or mutating cloud resources:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --generate-only \
   --non-interactive \
   --project-id="YOUR_GCP_PROJECT_ID" \
-  --cluster-name="platform-agent-host" \
+  --cluster-name="EXISTING_CLUSTER_NAME" \
   --region="us-central1"
 ```
 
@@ -93,7 +100,7 @@ In `--generate-only` mode, the installer:
 
 1. Writes `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-apply validation checks a real run does: the GitOps organization check, the service-account ownership check, and the existing-cluster node-pool and NetworkPolicy consent gates. A cluster needing `--migrate-node-pools` or `--enable-network-policy` is refused (`REFUSED_MISSING_NODE_POOL_MIGRATION`, `REFUSED_MISSING_NETWORK_POLICY`), as is one that cannot be described (`FAILED_PREFLIGHT_CLUSTER_UNREADABLE`). Step 1 has already written both files by then, so a refusal exits 1 leaving `install.env` and `terraform.tfvars` on disk — unvalidated, and with no handoff printed. Do not read the presence of `terraform.tfvars` as success; read the report status.
-3. Prints a checklist of out-of-Terraform prerequisites (CMEK database encryption, Workload Identity, NetworkPolicy, GitHub App PEM import, and OTel scope) and the `lifecycle.sh apply` command with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`).
+3. Prints a checklist of out-of-Terraform prerequisites (CMEK database encryption, Workload Identity, NetworkPolicy, GitHub App PEM import, and OTel scope) and the interactive `lifecycle.sh apply` command with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`), which displays the full `terraform plan` and pauses for operator confirmation before applying.
 4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
 
 The interactive wizard also offers the same choice by answering `g` at the final confirmation step.

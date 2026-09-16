@@ -15,11 +15,11 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 ## Table of Contents
 
-1. [Architecture & Overview](#architecture--overview)
-2. [Prerequisites & Tooling Matrix](#prerequisites--tooling-matrix)
-3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
+1. [Quick Start: Automated One-Liner Installation (Recommended)](#quick-start-automated-one-liner-installation-recommended)
    - [Generate-Only Mode (Recommended for Existing Infrastructure)](#generate-only-mode-recommended-for-existing-infrastructure)
    - [Non-Interactive & AI Agent Execution Mode](#non-interactive--ai-agent-execution-mode)
+2. [Architecture & Overview](#architecture--overview)
+3. [Prerequisites & Tooling Matrix](#prerequisites--tooling-matrix)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
 5. [The Shell Sandbox](#the-shell-sandbox)
@@ -36,7 +36,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 ---
 
-## Method 0: Zero-Friction One-Liner Installation (Fastest)
+## Quick Start: Automated One-Liner Installation (Recommended)
 
 Run the interactive one-liner installer directly in **Google Cloud Shell** or any authenticated bash terminal:
 
@@ -114,7 +114,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools` or `--enable-network-policy` is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
-   - **Terraform Apply execution** with remote state management via `lifecycle.sh`:
+   - **Terraform Apply execution** with remote state management via `lifecycle.sh` (which computes and displays the full `terraform plan` and prompts interactively for confirmation before applying; or preview in advance via `./install.sh --dry-run` on Day 1 or `./lifecycle.sh plan` when remote GCS state already exists):
      ```bash
      cd terraform/examples/full-install
      KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
@@ -124,7 +124,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 ### Non-Interactive & AI Agent Execution Mode
 
-For human operators, running the official release installer interactively (Method 0 above, or `./install.sh` inside an official release checkout or bundle) is strongly recommended on initial setup: it detects sensible defaults from your active `gcloud` session, prompts for mandatory cloud project and LLM provider credentials, and records configuration to `install.env`.
+For human operators, running the official release installer interactively (Quick Start above, or `./install.sh` inside an official release checkout or bundle) is strongly recommended on initial setup: it detects sensible defaults from your active `gcloud` session, prompts for mandatory cloud project and LLM provider credentials, and records configuration to `install.env`.
 
 For headless environments, automated CI scripts, and AI Agent harnesses where no interactive TTY is available, execute the release-pinned installer non-interactively by supplying explicit CLI flags:
 
@@ -150,7 +150,11 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --project-id="my-gcp-project"
 ```
 
-_Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
+_Guidance for AI Agents:_
+
+- **Ask Dedicated vs. Existing Cluster First**: Before executing an installation, AI Agents must ask the user whether they want to **stand up a new, dedicated GKE cluster (recommended)** or **install onto an existing GKE cluster**.
+- **Mandatory `--generate-only` for Existing Infrastructure**: When targeting an existing cluster or shared infrastructure, AI Agents must **never** run unattended `--non-interactive` auto-apply (`lifecycle.sh apply -auto-approve`). Instead, execute `install.sh` with `--generate-only --non-interactive` to generate `terraform.tfvars` and `install.env`, run pre-flight checks, and hand off to the human operator to run out-of-Terraform prerequisites and review the `terraform plan` (displayed interactively during `./lifecycle.sh apply`, or previewed via `./install.sh --dry-run` / `./lifecycle.sh plan`) before applying.
+- **Pin to Official Releases**: For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
 
 ---
 
@@ -166,9 +170,10 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 ## Prerequisites & Tooling Matrix
 
-Before beginning installation, ensure your environment meets the requirements for your chosen installation method:
+Before beginning installation, review the customer pre-installation checklist and ensure your workstation meets the requirements for your chosen installation method:
 
-- **Method 0 (Interactive One-Liner)** & **Method 1 (IaC via Terraform + Helm)**: Standard automated deployment using prebuilt container images.
+- **Pre-Installation Checklist & Decision Worksheet**: For customer-facing pre-work, decision matrices, and enterprise approval lead times (GCP Org Policies, Slack workspace admin queues, and Terraform state bucket security), see the [Pre-Installation Checklist & Decision Worksheet](docs/site/src/content/docs/install/prerequisites.md#pre-installation-checklist--decision-worksheet).
+- **Quick Start (Interactive One-Liner)** & **Method 1 (IaC via Terraform + Helm)**: Standard automated deployment using prebuilt container images.
 - **Method 2 (Manual Kubernetes / Kustomize)**: Advanced manual manifest deployment.
 - **Method 3 (Local Development & Testing)**: Building and running operator binaries and container images locally.
 
@@ -177,10 +182,10 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                   | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                                                                                      | **All Methods**                             |
 | **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                               | **All Methods** (GKE)                       |
 | **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                   | **All Methods**                             |
-| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                          | **Methods 0 & 1**                           |
-| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path and standalone chart install; the engine itself uses the Terraform Helm provider.                                                                                 | **Methods 0, 1, & 2**                       |
+| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                          | **Quick Start & Method 1**                  |
+| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path and standalone chart install; the engine itself uses the Terraform Helm provider.                                                                                 | **Quick Start, Method 1, & Method 2**       |
 | **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`.                                                                                                        | **All Methods**                             |
-| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                          | **Methods 0 & 1**                           |
+| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                          | **Quick Start & Method 1**                  |
 | **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                  | **All Methods**                             |
 | **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                         | **All Methods**                             |
 | **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`). | **Optional (CMEK / Backup Plan lifecycle)** |
@@ -196,7 +201,7 @@ NetworkPolicy enforcement, and the rest of the site's
 
 ## Method 1: The Install Engine — Terraform + Helm
 
-This is the engine [Method 0](#method-0-zero-friction-one-liner-installation-fastest) drives, usable
+This is the engine [Quick Start](#quick-start-automated-one-liner-installation-recommended) drives, usable
 directly when the install should live in version-controlled IaC (GitOps, CI-driven environments)
 instead of an interview. One `terraform apply` of the
 [`terraform/examples/full-install`](terraform/examples/full-install/README.md) composition
@@ -256,7 +261,7 @@ gcloud auth application-default login
 
 #### Step 3: Apply the Composition
 
-The interactive way is running the official release installer (Method 0 above, or `./install.sh` from this release checkout or unpacked bundle), which writes the
+The interactive way is running the official release installer (Quick Start above, or `./install.sh` from this release checkout or unpacked bundle), which writes the
 `terraform.tfvars` for you. Hand-driven:
 
 ```bash

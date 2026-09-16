@@ -2676,7 +2676,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
 class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
     """The configuration file has to land where every other front door looks.
 
-    Under `curl … | bash` -- Method 0 in INSTALL.md, the documented fastest
+    Under `curl … | bash` -- Quick Start in INSTALL.md, the documented fastest
     install -- ${BASH_SOURCE[0]} names no file, so a script-relative path
     resolves to whatever directory the operator was standing in.
     acquire_source_repo then clones to $HOME/kube-agents and cd's there, while
