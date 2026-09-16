@@ -285,7 +285,7 @@ ConfigMap changed, the checksum did not, the Deployment did not roll. The
 gateway mounts this with subPath, and a subPath ConfigMap mount never receives
 in-place updates, so the running pod would have kept the old file indefinitely.
 
-Takes a dict of provider, model, callbacks.
+Takes a dict of provider, model, callbacks, sampling.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
 model_list:
@@ -308,6 +308,24 @@ litellm_settings:
 */}}
 router_settings:
   default_litellm_params:
+{{- /*
+  Sampling defaults for every caller of this gateway. The agent sends no
+  temperature of its own -- 798 of 881 requests in a measured run carried no
+  sampling field at all -- so without this the provider default (~1.0)
+  applies and three identical requests return three different answers. A
+  default here reaches the platform agent, the per-cluster agents and their
+  workers alike, because all of them resolve model-default through this
+  router. A caller that sets its own value still wins, which is what keeps
+  this a default rather than a clamp.
+*/}}
+{{- with .sampling }}
+{{- if ne (toString .temperature) "" }}
+    temperature: {{ .temperature }}
+{{- end }}
+{{- if ne (toString .seed) "" }}
+    seed: {{ .seed }}
+{{- end }}
+{{- end }}
     cache_control_injection_points:
       - location: message
         role: system

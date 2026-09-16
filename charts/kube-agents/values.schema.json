@@ -204,6 +204,14 @@
         "podMonitoring": {
           "type": "boolean"
         },
+        "sampling": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "temperature": { "type": ["number", "string"] },
+            "seed": { "type": ["integer", "string"] }
+          }
+        },
         "responseCache": {
           "type": "string",
           "enum": ["", "conservative", "testing", "risky"]

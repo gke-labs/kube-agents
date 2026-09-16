@@ -216,6 +216,17 @@ litellm:
   # recorded. Off everywhere real: a cached completion measures the cache,
   # not the model, so this exists for eval-cost experiments only.
   responseCache: ""
+  # Sampling defaults the gateway applies to every model call that does not
+  # set its own. The agent sets none, so empty here means the provider's
+  # default (~1.0 on Gemini) and three identical requests return three
+  # different answers -- which is what makes a repeated eval unrepeatable.
+  # temperature: 0 makes repetitions far more comparable and is what the
+  # eval path sets; it is left empty by default so production behaviour is
+  # unchanged. seed is passed through to providers that honour it; Gemini
+  # accepts it and neither field guarantees byte-identical output on its own.
+  sampling:
+    temperature: ""
+    seed: ""
   # Where the sidecar's package comes from, pinned to an immutable snapshot
   # (a released version on PyPI; releases cannot be re-uploaded in place).
   # A runtime pull images.json cannot inventory, which is acceptable only
