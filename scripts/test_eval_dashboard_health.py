@@ -824,41 +824,75 @@ class SlowGate(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-def pressure(verdict="OK", cause=None, window_end=T0, p50=0.4, p95=0.5, today_p50=None, free=25, **over):
+def pressure(
+    verdict="OK",
+    cause=None,
+    window_end=T0,
+    p50=0.4,
+    p95=0.5,
+    today_p50=None,
+    free=25,
+    bad_day="2026-09-06",
+    bad_p50=24.1,
+    bad_p95=157.3,
+    over_threshold=0,
+    **over,
+):
     """pool-pressure.json in the shape the periodic publishes it.
 
-    `p50`/`p95` are the seven-day window the note quotes; `today_p50` is the
-    newest `days[]` row, which the digest reads instead. They are separate
-    arguments so a test can pin them to different values and catch a swap.
+    Three sets of numbers, deliberately far apart. `p50`/`p95` are the
+    seven-day window, which the periodic never judges on and which the note
+    must therefore not quote. `bad_p50`/`bad_p95` are the breached day's row,
+    which is what it judged and what the note owes the reader. `today_p50` is
+    the newest row, which only the digest reads. A test that swaps two of them
+    fails on the value.
     """
+    breach = verdict == "BREACH"
+    days = [
+        {
+            "day": "2026-09-07",
+            "runs": 65,
+            "p50_minutes": p50 if today_p50 is None else today_p50,
+            "p95_minutes": p95,
+            "worst_minutes": 2.5,
+            "max_concurrency": 30,
+            "breached": False,
+            "judged": True,
+        }
+    ]
+    if breach and bad_day:
+        # Oldest first, as the periodic writes them: the digest reads days[-1].
+        days.insert(
+            0,
+            {
+                "day": bad_day,
+                "runs": 12,
+                "p50_minutes": bad_p50,
+                "p95_minutes": bad_p95,
+                "worst_minutes": 175.2,
+                "max_concurrency": 30,
+                "breached": True,
+                "judged": True,
+            },
+        )
     return {
         "job": "pull-kube-agents-smoke-test",
         "window_start": health.iso(window_end - timedelta(days=7)),
         "window_end": health.iso(window_end),
         "max_concurrency": 30,
         "cause": cause,
-        "breached": verdict == "BREACH",
+        "breached": breach,
         "verdict": verdict,
         "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
         "pool": {"busy": 30 - free, "free": free, "total": 30, "in_transition": 0, "stranded": 0},
+        "queue": {"read": True, "waiting": over_threshold, "running": 3, "over_threshold": over_threshold},
         "trend": {
             "runs": 586,
             "p50_minutes": p50,
             "p95_minutes": p95,
             "worst_minutes": 175.2,
-            "days": [
-                {"day": "2026-09-06", "runs": 12, "p50_minutes": 99.0, "max_concurrency": 30, "breached": True, "judged": True},
-                {
-                    "day": "2026-09-07",
-                    "runs": 65,
-                    "p50_minutes": p50 if today_p50 is None else today_p50,
-                    "p95_minutes": p95,
-                    "worst_minutes": 2.5,
-                    "max_concurrency": 30,
-                    "breached": verdict == "BREACH",
-                    "judged": True,
-                },
-            ],
+            "days": days,
+            "breached_days": [bad_day] if breach and bad_day else [],
         },
     } | over
 
@@ -874,9 +908,13 @@ def pooled(doc=None, now=T0, prev=None, **artifact):
 
 
 class PoolNote(unittest.TestCase):
-    def test_a_breach_becomes_a_note_of_the_periodics_own_numbers(self):
-        # The #1069 incident's shape, in the units health.json stores.
-        result = pooled(verdict="BREACH", cause="CAPACITY", p50=24.1, p95=157.3, free=0)
+    def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
+        # The #1069 incident's shape. The seven-day window keeps its quiet
+        # default of 0.4/0.5 min throughout: the periodic breaches on a day's
+        # row or on the live queue and never on the aggregate, so a note built
+        # from the aggregate would print "24s against a 15 min limit" under
+        # "the pool is full, buy another project".
+        result = pooled(verdict="BREACH", cause="CAPACITY", free=0)
         self.assertEqual(result["state"], "GREEN", "a backed-up pool is a note, not a state")
         self.assertEqual(
             result["pool"],
@@ -884,10 +922,11 @@ class PoolNote(unittest.TestCase):
                 "since": health.iso(T0),
                 "verdict": "BREACH",
                 "measured_at": health.iso(T0),
-                "runs": 586,
+                "day": "2026-09-06",
                 "p50_s": 1446,
                 "p95_s": 9438,
                 "worst_s": 10512,
+                "over_threshold": 0,
                 "threshold_p50_s": 900,
                 "threshold_p95_s": 2700,
                 "free": 0,
@@ -897,8 +936,44 @@ class PoolNote(unittest.TestCase):
             },
         )
         self.assertIn(
-            "backed-up pool: median wait 24 min (p95 157 min) against thresholds of 15/45 min; 0 of 30 projects free",
+            "backed-up pool: 2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
+            " 0 of 30 projects free",
             result["evidence"],
+        )
+
+    def test_the_worst_breached_day_wins_even_when_it_breached_on_p95_alone(self):
+        # Excess over either limit, so a day that went over on p95 only is
+        # still picked ahead of a quieter day that went over on p50.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY", bad_p50=16.0, bad_p95=46.0)
+        artifact["trend"]["days"].insert(
+            1,
+            {"day": "2026-09-06b", "runs": 9, "p50_minutes": 2.0, "p95_minutes": 300.0,
+             "worst_minutes": 301.0, "max_concurrency": 30, "breached": True, "judged": True},
+        )
+        note = health.pool_note(artifact, T0, None)
+        self.assertEqual(note["day"], "2026-09-06b")
+        self.assertEqual(note["p50_s"], 120, "the day's own median, low though it is")
+        self.assertEqual(note["p95_s"], 18000)
+
+    def test_a_breach_with_no_bad_day_quotes_the_runs_queued_right_now(self):
+        # pool_pressure.py breaches on `breached_days or live_breach`, so one
+        # run stuck past p95 breaches a week that has no bad day in it at all.
+        result = pooled(verdict="BREACH", cause="CAPACITY", free=0, bad_day=None, over_threshold=3)
+        note = result["pool"]
+        self.assertIsNone(note["day"])
+        self.assertIsNone(note["p50_s"], "no day breached, so there is no day's median to quote")
+        self.assertEqual(note["over_threshold"], 3)
+        self.assertIn(
+            "backed-up pool: 3 runs waiting now past 45 min; 0 of 30 projects free",
+            result["evidence"],
+        )
+
+    def test_a_breach_on_both_counts_reports_both(self):
+        note = pooled(verdict="BREACH", cause="CAPACITY", over_threshold=1)["pool"]
+        self.assertEqual(
+            health.pool_measurement(note),
+            "2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
+            " 1 run waiting now past 45 min",
         )
 
     def test_a_fresh_pass_and_a_missing_artifact_are_both_silent(self):
@@ -909,9 +984,9 @@ class PoolNote(unittest.TestCase):
         self.assertFalse(any(line.startswith("backed-up pool") for line in bare["evidence"]), bare["evidence"])
 
     def test_an_episode_keeps_its_start_and_a_new_one_gets_a_new_start(self):
-        first = pooled(verdict="BREACH", cause="CAPACITY", p50=24.1)
+        first = pooled(verdict="BREACH", cause="CAPACITY")
         later = T0 + timedelta(hours=2)
-        held = pooled(now=later, prev=first, verdict="BREACH", cause="CAPACITY", p50=20.0, window_end=later)
+        held = pooled(now=later, prev=first, verdict="BREACH", cause="CAPACITY", bad_p50=20.0, window_end=later)
         self.assertEqual(held["pool"]["since"], health.iso(T0))
         self.assertEqual(held["pool"]["p50_s"], 1200, "the numbers are this tick's")
         cleared = pooled(now=later, prev=held, verdict="OK", window_end=later)

@@ -289,7 +289,8 @@ SLOW_CLEAR_FACTOR = 1.1
 #
 # POOL_STALE_AFTER is the dead-man's switch: latest-build.txt keeps resolving
 # after the periodic dies, so a stopped job reads as an unchanging healthy
-# artifact. Two missed runs plus the job's timeout, and the note says so.
+# artifact. Two missed hourly runs plus the job's 30m timeout is 2.5h, rounded
+# up so a run that starts late is not a stale reading.
 POOL_STALE_AFTER = timedelta(hours=3)
 POOL_BREACH = "BREACH"
 POOL_UNMEASURED = "UNMEASURED"
@@ -898,6 +899,27 @@ def _whole_minutes(seconds) -> str:
     return "?" if seconds is None else str(seconds // SECONDS_PER_MINUTE)
 
 
+def _worst_breached_day(trend: dict, thresholds: dict) -> dict | None:
+    """The `days[]` row that breached hardest, or None if no day did.
+
+    Hardest is the largest excess over either limit, so a day that went over on
+    p95 alone is still picked ahead of a quiet one. A row's own `breached` flag
+    is what `trend.breached_days` is built from, sample minimum included.
+    """
+    days = [d for d in (trend.get("days") or []) if isinstance(d, dict) and d.get("breached")]
+    if not days:
+        return None
+    limits = (thresholds.get("p50_minutes"), thresholds.get("p95_minutes"))
+
+    def excess(row: dict) -> float:
+        return max(
+            (row.get(key) or 0) / limit if limit else 0
+            for key, limit in zip(("p50_minutes", "p95_minutes"), limits)
+        )
+
+    return max(days, key=excess)
+
+
 def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict | None:
     """Rule 8: the note's numbers while the pool is backed up, else None.
 
@@ -929,11 +951,18 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     trend = artifact.get("trend") or {}
     pool = artifact.get("pool") or {}
     thresholds = artifact.get("thresholds") or {}
+    # The numbers that justify the verdict, not the window's. The periodic
+    # breaches on a single day's row or on a run waiting past p95 right now
+    # (pool_pressure.py's `breached_days or live_breach`) and never on the
+    # seven-day aggregate, which after one bad day sits back inside its own
+    # limit -- printing it under "onboard a project" contradicts the alert.
+    day = _worst_breached_day(trend, thresholds) or {}
     return note | {
-        "runs": trend.get("runs"),
-        "p50_s": _as_seconds(trend.get("p50_minutes")),
-        "p95_s": _as_seconds(trend.get("p95_minutes")),
-        "worst_s": _as_seconds(trend.get("worst_minutes")),
+        "day": day.get("day"),
+        "p50_s": _as_seconds(day.get("p50_minutes")),
+        "p95_s": _as_seconds(day.get("p95_minutes")),
+        "worst_s": _as_seconds(day.get("worst_minutes")),
+        "over_threshold": (artifact.get("queue") or {}).get("over_threshold") or 0,
         "threshold_p50_s": _as_seconds(thresholds.get("p50_minutes")),
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
         "free": pool.get("free"),
@@ -972,11 +1001,30 @@ def pool_evidence(pool: dict) -> str:
     if pool["verdict"] == POOL_UNMEASURED:
         return "pool pressure: the hourly check ran but could not measure the queue wait"
     return (
-        f"backed-up pool: median wait {wait_text(pool['p50_s'])}"
-        f" (p95 {wait_text(pool['p95_s'])}) against thresholds of"
-        f" {_whole_minutes(pool['threshold_p50_s'])}/{_whole_minutes(pool['threshold_p95_s'])} min;"
+        f"backed-up pool: {pool_measurement(pool)};"
         f" {pool['free']} of {pool['total']} projects free"
     )
+
+
+def pool_measurement(pool: dict) -> str:
+    """Where the breach is, in the periodic's own terms: the worst day, the
+    live queue, or both. post_health and the page read the same two fields."""
+    parts = []
+    if pool.get("day"):
+        parts.append(
+            f"{pool['day']} median {wait_text(pool['p50_s'])} against"
+            f" {_whole_minutes(pool['threshold_p50_s'])} min,"
+            f" p95 {wait_text(pool['p95_s'])} against"
+            f" {_whole_minutes(pool['threshold_p95_s'])}"
+        )
+    if pool.get("over_threshold"):
+        parts.append(
+            f"{pool['over_threshold']} run{'' if pool['over_threshold'] == 1 else 's'}"
+            f" waiting now past {_whole_minutes(pool['threshold_p95_s'])} min"
+        )
+    # A BREACH always has one or the other; this is what a contract violation
+    # reads as, rather than a sentence with a blank in it.
+    return "; ".join(parts) or "the periodic reported a breach with no day and no live queue"
 
 
 # --------------------------------------------------------------------------- #

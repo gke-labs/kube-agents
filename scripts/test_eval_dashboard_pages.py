@@ -203,18 +203,22 @@ class HealthInputsTest(unittest.TestCase):
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
-        # The rule-8 note, same treatment: the five fields the lede reads, and
+        # The rule-8 note, same treatment: the eight fields the lede reads, and
         # a verdict the page does not know about is dropped rather than shown.
         self.assertIsNone(minimal["pool"])
         note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
-                "p50_s": 1320, "p95_s": 3660, "threshold_p50_s": 900, "free": 0, "total": 30, "cause": "CAPACITY"}
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "over_threshold": 2, "threshold_p50_s": 900,
+                "threshold_p95_s": 2700, "free": 0, "total": 30, "cause": "CAPACITY"}
         self.assertEqual(
             render.normalize_health(health_doc("GREEN", pool=note))["pool"],
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
-             "p50_s": 1320, "threshold_p50_s": 900},
+             "day": "2026-09-07", "p50_s": 1320, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"verdict": "WEDGED"}))["pool"]["verdict"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"p50_s": "ages"}))["pool"]["p50_s"])
+        # `day` is printed verbatim, so it is shape-checked and not merely
+        # type-checked.
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"day": "yesterday"}))["pool"]["day"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=[]))["pool"])
 
     def test_load_health_degrades_on_absent_or_broken_files(self):
@@ -638,8 +642,8 @@ class BrowserTest(unittest.TestCase):
         # health.py's rule-8 note, dated 8:00 AM ET on the page's Tuesday.
         # Unlike 🐢 it also rides on an incident lede, so both are rendered.
         note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
-                "p50_s": 1320, "threshold_p50_s": 900}
-        sentence = "Runs are waiting to start since Tue 8:00 AM ET: a median wait of 22 min against a 15 min limit. Runs still pass; /retest makes the queue longer."
+                "day": "2026-09-07", "p50_s": 1320, "threshold_p50_s": 900, "threshold_p95_s": 2700}
+        sentence = "Runs are waiting to start since Tue 8:00 AM ET: a median wait of 22 min on 2026-09-07 against a 15 min limit. Runs still pass; /retest makes the queue longer."
         healthy = dom_text(render_to(pathlib.Path(self.tmp.name) / "pool", self.data, health=health_doc("GREEN", pool=note)) / "index.html")
         self.assertIn("Smoke gate is healthy", healthy)
         self.assertIn(sentence, healthy)
@@ -651,12 +655,29 @@ class BrowserTest(unittest.TestCase):
         # sub-minute median that whole minutes would print as "0 min".
         quick = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolquick", self.data,
                                    health=health_doc("GREEN", pool=note | {"p50_s": 24})) / "index.html")
-        self.assertIn("a median wait of 24s against a 15 min limit", quick)
+        self.assertIn("a median wait of 24s on 2026-09-07 against a 15 min limit", quick)
+        # A breach with no bad day in the week -- one run stuck past p95 right
+        # now -- has no median to quote and counts the queue instead.
+        live = dom_text(render_to(pathlib.Path(self.tmp.name) / "poollive", self.data,
+                                  health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", live)
+        # A `day` that is not a date never reaches the sentence -- render.py
+        # drops it on shape, pages.js again on the way in -- and the live queue
+        # is what is left to quote.
+        junk = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooljunk", self.data,
+                                  health=health_doc("GREEN", pool=note | {"day": "yesterday", "over_threshold": 3})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", junk)
+        self.assertNotIn("yesterday", junk)
         # A stopped periodic says so instead of quoting a reading hours old.
         stale = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolstale", self.data,
                                    health=health_doc("GREEN", pool={"verdict": "STALE", "measured_at": "2026-09-08T13:23:00+00:00"})) / "index.html")
         self.assertIn("No pool numbers since Tue 9:23 AM ET: the hourly pool check has stopped reporting.", stale)
         self.assertNotIn("median wait", stale)
+        # ... and a periodic that ran and published nothing has no reading to
+        # date, so the sentence drops the clause rather than printing a blank.
+        blind = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolblind", self.data,
+                                   health=health_doc("GREEN", pool={"verdict": "STALE"})) / "index.html")
+        self.assertIn("No pool numbers: the hourly pool check has stopped reporting.", blind)
         control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notpool", self.data, health=health_doc("GREEN")) / "index.html")
         self.assertNotIn("Runs are waiting to start", control)
 

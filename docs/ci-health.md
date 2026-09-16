@@ -13,8 +13,8 @@ the dashboard's Brief bakes that verdict and its history (`render.py --health`,
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)) or when runs are waiting to start
-([below](#a-backed-up-pool)).
+([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
+one when they stop ([below](#a-backed-up-pool)).
 The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
@@ -195,27 +195,42 @@ causes have four different remedies and one of them spends money:
 ```text
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
 Consider onboarding a project.
-Median wait 22 min against a 15 min limit; p95 61 min against 45.
+Worst day 2026-09-06: median wait 24 min against a 15 min limit; p95 157 min against 45.
+2 runs waiting right now, past the 45 min p95 limit.
 Runs still pass; /retest makes the queue longer.
 ```
 
-`concurrency cap` (the cap is below the pool size — raise it), `runs not
-starting` (projects were free and the cap was not the limit, so the delay is
-Prow's; the message names the build cluster) and `queue backed up` (the job
-could not read how many projects were in use) carry the same three lines
+Those are the numbers the verdict was reached on. The periodic breaches on a
+day's row or on runs queued past p95 right now, never on the seven-day window,
+which one bad day leaves inside its own limit. A breach on only one of the two
+carries only that line.
+
+`concurrency cap` (raise it), `runs not starting` (projects were free, so the
+delay is Prow's; the message names the build cluster) and `queue backed up`
+(the job could not read how many projects were in use) carry the same lines
 under a different first one.
 
-Two ⚪ messages are about the monitoring rather than the pool: `wait unknown`
-when the hourly check ran and could not read the queue, and `pool check
-stopped` when `window_end` is more than 3 hours old — two missed runs plus the
-job's own timeout. The stopped message carries **no numbers at all**:
-`latest-build.txt` keeps resolving after the periodic dies, so a stopped job
-reads as an unchanging healthy artifact, and a figure hours old gets read as
-current whatever the caveat says.
+Unlike the slow note, this one also says when it is over. The window is a
+rolling seven days, so an episode outlives the bad day by up to a week:
+
+```text
+✅ Smoke gate: queue clear — runs are starting on time again, typical wait 24s.
+```
+
+It fires only on a reading that says so. The note also disappears when the
+artifact does, and that is the bot going blind, not the queue clearing.
+
+Two ⚪ messages are about the monitoring, not the pool. `wait unknown` is the
+check running and failing to read the queue. `pool check stopped` is
+`window_end` more than 3 hours old, or a build that published no artifact at
+all. Both link to the periodic's job history, which tells the two apart. The
+stopped message carries **no numbers**: `latest-build.txt` keeps resolving
+after the periodic dies, so a stopped job reads as an unchanging healthy
+artifact.
 
 The digest carries the median wait every morning whether or not anything is
 wrong (`typical wait`, beside `typical run`), and repeats a one-line version
-of the note while it lasts. The Brief's lede carries the same sentence. There
+of the note while it lasts. The Brief's lede carries the same numbers. There
 is no tile for it: the tiles recompute for the reader's date range, and the
 wait is a fixed 24-hour figure that is not in the run data.
 
@@ -319,8 +334,9 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `stale`, `metrics`, `dashboard_url`,
-`generated_at` — plus `tick`, the ISO 8601 UTC time the line was appended.
+`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `metrics`,
+`dashboard_url`, `generated_at` — plus `tick`, the ISO 8601 UTC time the line
+was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled
 refresh shows as many ticks sharing one `generated_at`. GCS has no append: the
 workflow downloads the object (a missing one is the first tick), appends with

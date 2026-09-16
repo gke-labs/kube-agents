@@ -89,15 +89,18 @@ def slow(**note):
 
 def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:00", **over):
     """health.py's rule-8 note. The default is the #1069 incident's shape: a
-    full pool, a 22-minute median against the runbook's 15."""
+    full pool, and a 22-minute median on 2026-09-03 against the runbook's 15.
+    The numbers are that day's row, never the seven-day window -- the window
+    is not what the periodic breached on."""
     note = {
         "since": since,
         "verdict": verdict,
         "measured_at": "2026-09-04T11:23:00+00:00",
-        "runs": 586,
+        "day": "2026-09-03",
         "p50_s": 22 * 60,
         "p95_s": 61 * 60,
         "worst_s": 175 * 60,
+        "over_threshold": 0,
         "threshold_p50_s": 15 * 60,
         "threshold_p95_s": 45 * 60,
         "free": 0,
@@ -114,6 +117,15 @@ def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:
 def pooled(state="GREEN", wait_s=None, **note):
     doc = health(state)
     doc["pool"] = pool_note(**note)
+    doc["metrics"]["queue_wait_p50_s"] = wait_s
+    return doc
+
+
+def cleared(state="GREEN", wait_s=24):
+    """The tick after an episode: the artifact was read, and the reading is
+    fine. Distinct from a tick with no artifact at all, where the note also
+    disappears but nothing has been learned."""
+    doc = health(state)
     doc["metrics"]["queue_wait_p50_s"] = wait_s
     return doc
 
@@ -606,7 +618,16 @@ class Digest(RunHarness):
         self.tick(pooled(wait_s=22 * 60), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[1].split("\n")[1],
-            "⏳ Queue backed up — median wait 22 min against a 15 min limit.",
+            "⏳ Queue backed up — median wait 22 min on 2026-09-03 against a 15 min limit.",
+        )
+
+    def test_digest_counts_the_queue_when_no_day_breached(self):
+        live = {"day": None, "p50_s": None, "p95_s": None, "over_threshold": 2}
+        self.tick(pooled(wait_s=24, **live), T0.replace(hour=7))
+        self.tick(pooled(wait_s=24, **live), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
+            "⏳ Queue backed up — 2 runs waiting past the 45 min p95 limit.",
         )
 
     def test_digest_says_the_numbers_stopped_rather_than_quoting_them(self):
@@ -688,9 +709,29 @@ class PoolNote(RunHarness):
             lines[0],
             "⏳ *Smoke gate: pool full* — all 30 projects are leased and runs are queuing. Consider onboarding a project.",
         )
-        self.assertEqual(lines[1], "Median wait 22 min against a 15 min limit; p95 61 min against 45.")
+        self.assertEqual(
+            lines[1],
+            "Worst day 2026-09-03: median wait 22 min against a 15 min limit; p95 61 min against 45.",
+        )
         self.assertEqual(lines[2], "Runs still pass; /retest makes the queue longer.")
         self.assertEqual(lines[3], f"{URL}#view=agent")
+
+    def test_a_breach_with_no_bad_day_counts_the_runs_queued_right_now(self):
+        # One run stuck past p95 breaches a week with no bad day in it, and
+        # then there is no day's median to print -- only the live queue.
+        self.tick(pooled(day=None, p50_s=None, p95_s=None, over_threshold=3), self.at(10))
+        lines = self.first()
+        self.assertEqual(lines[1], "3 runs waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[2], "Runs still pass; /retest makes the queue longer.")
+
+    def test_a_breach_on_a_day_and_on_the_live_queue_reports_both(self):
+        self.tick(pooled(over_threshold=1), self.at(10))
+        lines = self.first()
+        self.assertEqual(
+            lines[1],
+            "Worst day 2026-09-03: median wait 22 min against a 15 min limit; p95 61 min against 45.",
+        )
+        self.assertEqual(lines[2], "1 run waiting right now, past the 45 min p95 limit.")
 
     def test_the_cap_message_names_the_cap_and_the_pool_it_is_below(self):
         self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26), self.at(10))
@@ -709,7 +750,7 @@ class PoolNote(RunHarness):
             "⏳ *Smoke gate: runs not starting* — 4 of 30 projects were free, so this looks like Prow rather than the pool.",
         )
         self.assertEqual(lines[1], "Check the build cluster: kube-agents-prow, project kube-agents-prow.")
-        self.assertIn("Median wait 22 min", lines[2])
+        self.assertIn("median wait 22 min", lines[2])
 
     def test_an_unreadable_pool_asks_for_nothing(self):
         self.tick(pooled(cause="UNKNOWN"), self.at(10))
@@ -727,7 +768,10 @@ class PoolNote(RunHarness):
         self.tick(pooled(verdict="UNMEASURED"), self.at(10))
         self.assertEqual(
             self.opener.texts[0],
-            "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read the queue.",
+            "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read the queue."
+            # Its own job's history: there is no number for the dashboard to
+            # show, so every message in this family ends somewhere useful.
+            f"\n{post_health.POOL_JOB_HISTORY_URL}",
         )
 
     def test_a_stopped_check_names_the_job_and_quotes_no_numbers(self):
@@ -759,13 +803,39 @@ class PoolNote(RunHarness):
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪"])
         self.assertEqual(self.recorded()["pool_verdict"], "STALE")
 
-    def test_a_cleared_note_is_not_news_and_a_new_episode_is(self):
+    def test_a_cleared_note_says_so_once_and_a_new_episode_is_its_own_message(self):
+        # Rule 8 clears loudly where rule 7 stays quiet. The periodic judges a
+        # rolling seven-day window, so an episode outlives the bad day by up
+        # to a week and "it is over" is the news, not noise.
+        self.tick(pooled(), self.at(10))
+        self.tick(cleared(), self.at(10, 15))
+        self.assertEqual(
+            self.opener.texts[1],
+            "✅ *Smoke gate: queue clear* — runs are starting on time again, typical wait 24s.",
+        )
+        self.assertIsNone(self.recorded()["pool_verdict"])
+        self.tick(cleared(), self.at(10, 30))
+        self.assertEqual(len(self.opener.requests), 2, "said once, like the note itself")
+        self.tick(pooled(since="2026-09-04T14:30:00+00:00"), self.at(15))
+        self.assertEqual(len(self.opener.requests), 3)
+
+    def test_a_note_that_goes_with_the_artifact_clears_silently(self):
+        # The note also disappears when the artifact does, and the bot losing
+        # sight of the queue is not the queue recovering.
         self.tick(pooled(), self.at(10))
         self.tick(health(), self.at(10, 15))
         self.assertEqual(len(self.opener.requests), 1)
         self.assertIsNone(self.recorded()["pool_verdict"])
-        self.tick(pooled(since="2026-09-04T14:30:00+00:00"), self.at(15))
-        self.assertEqual(len(self.opener.requests), 2)
+
+    def test_a_failed_clear_is_retried_next_tick(self):
+        self.tick(pooled(), self.at(10))
+        rc, err = self.tick(cleared(), self.at(10, 15), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(rc, 1)
+        self.assertIn("failed to post: pool_clear", err)
+        self.assertEqual(self.recorded()["pool_verdict"], "BREACH", "not told yet")
+        self.tick(cleared(), self.at(10, 30))
+        self.assertEqual(self.opener.texts[-1].split(" ")[0], "✅")
+        self.assertIsNone(self.recorded()["pool_verdict"])
 
     def test_a_failed_note_is_retried_next_tick(self):
         self.tick(health(), self.at(9))
@@ -789,7 +859,7 @@ class PoolNote(RunHarness):
         # The gate breaches on p50 or p95, so a p95-only breach carries an
         # ordinary median; whole minutes would render it "0 min".
         self.tick(pooled(p50_s=24), self.at(10))
-        self.assertIn("Median wait 24s against a 15 min limit", self.opener.texts[0])
+        self.assertIn("median wait 24s against a 15 min limit", self.opener.texts[0])
 
 
 # --------------------------------------------------------------------------- #

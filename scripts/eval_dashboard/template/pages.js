@@ -76,6 +76,9 @@ const PAGE = {
   // health.py's pool verdicts (rule 8). The verdict picks the lede's
   // sentence, so an unrecognised one renders nothing rather than guessing.
   poolVerdicts: ["BREACH", "UNMEASURED", "STALE"],
+  // The breached day, as pool_pressure.py buckets it: a UTC calendar date.
+  // The lede prints it verbatim, so it is shape-checked and not only typed.
+  poolDayRe: /^\d{4}-\d{2}-\d{2}$/,
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
@@ -226,8 +229,11 @@ function normalizeHealth(raw) {
       verdict: PAGE.poolVerdicts.includes(pool.verdict) ? pool.verdict : null,
       since: parseIso(pool.since) != null ? pool.since : null,
       measured_at: parseIso(pool.measured_at) != null ? pool.measured_at : null,
+      day: typeof pool.day === "string" && PAGE.poolDayRe.test(pool.day) ? pool.day : null,
       p50_s: count(pool.p50_s),
+      over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
+      threshold_p95_s: count(pool.threshold_p95_s),
     } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
@@ -252,12 +258,24 @@ function poolSentence(h) {
   const p = h && h.pool;
   if (!p || !p.verdict) return "";
   if (p.verdict === "STALE") {
-    return ` No pool numbers since ${esc(et(parseIso(p.measured_at)))}: the hourly pool check has stopped reporting.`;
+    // No timestamp when the periodic ran and published nothing: there is no
+    // last reading to date.
+    const since = p.measured_at ? ` since ${esc(et(parseIso(p.measured_at)))}` : "";
+    return ` No pool numbers${since}: the hourly pool check has stopped reporting.`;
   }
   if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read it.";
-  if (p.p50_s == null || p.threshold_p50_s == null) return "";
+  // What tripped the verdict, which is a single day's row or the live queue --
+  // never the seven-day window, which one bad day leaves inside its own limit.
   const since = p.since ? ` since ${esc(et(parseIso(p.since)))}` : "";
-  return ` Runs are waiting to start${since}: a median wait of ${waitText(p.p50_s)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit. Runs still pass; /retest makes the queue longer.`;
+  let found = "";
+  if (p.day != null && p.p50_s != null && p.threshold_p50_s != null) {
+    found = `a median wait of ${waitText(p.p50_s)} on ${esc(p.day)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit`;
+  } else if (p.over_threshold && p.threshold_p95_s != null) {
+    found = `${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`;
+  } else {
+    return "";
+  }
+  return ` Runs are waiting to start${since}: ${found}. Runs still pass; /retest makes the queue longer.`;
 }
 
 /* ---- URL contract ---- */

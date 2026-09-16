@@ -109,10 +109,10 @@ DEFAULT_WINDOW_HOURS = 24
 DEFAULT_SLOW_BASELINE_DAYS = 7
 
 # pool-pressure.json's vocabulary (scripts/pool_pressure.py owns it), carried
-# through health.json's `pool` note. Mirrored rather than imported: importing
-# it would put pool_pressure.py in the diff, and that costs the eval matrix.
-# The four causes have four different remedies, one of which spends money, so
-# the message branches on them rather than printing the label.
+# through health.json's `pool` note. Copied rather than imported, and
+# test_integration_contracts.py fails if the copy drifts. The four causes have
+# four different remedies, one of which spends money, so the message branches
+# on them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
@@ -123,8 +123,9 @@ KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
 KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
+KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
-TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_SLOW, KIND_POOL)
+TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_SLOW, KIND_POOL, KIND_POOL_CLEAR)
 
 # Where the message goes. The space is a resource name, the token a bearer
 # credential minted by the workflow; the webhook is the legacy alternative.
@@ -318,6 +319,15 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     pool = health.get("pool") or {}
     if pool and pool.get("verdict") != (prev or {}).get("pool_verdict"):
         kinds.append(KIND_POOL)
+    # Unlike rule 7, rule 8 says when it is over. The periodic judges a rolling
+    # seven-day window, so an episode outlives the bad day by up to a week and
+    # "it cleared" is news rather than noise. Only on a reading, though: the
+    # note also disappears when the artifact does, and that is the bot going
+    # blind. `queue_wait_p50_s` is set from the same fresh artifact, and is
+    # None on the one OK reading that has no runs to average -- a window with
+    # no runs at all, where staying quiet is the right answer anyway.
+    elif not pool and (prev or {}).get("pool_verdict") and (health.get("metrics") or {}).get("queue_wait_p50_s") is not None:
+        kinds.append(KIND_POOL_CLEAR)
 
     if in_digest_window(now, digest_hour, tz) and (prev or {}).get("last_digest_date") != local_date(now, tz):
         kinds.append(KIND_DIGEST)
@@ -541,13 +551,26 @@ def render_slow(health: dict) -> str:
     )
 
 
-def pool_numbers(pool: dict) -> str:
-    """The wait with each figure beside its own limit. "against 15/45" makes
-    the reader pair four numbers positionally, and gets it wrong."""
-    return (
-        f"Median wait {wait_text(pool.get('p50_s'))} against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
-        f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
-    )
+def pool_numbers(pool: dict) -> list[str]:
+    """What tripped the verdict, with each figure beside its own limit.
+    "against 15/45" makes the reader pair four numbers positionally, and gets
+    it wrong. The periodic breaches on a day's row, on runs queued past p95
+    right now, or on both, so the message quotes whichever it was -- the
+    seven-day window it is not judged on can sit well inside its own limit."""
+    lines = []
+    if pool.get("day"):
+        lines.append(
+            f"Worst day {pool['day']}: median wait {wait_text(pool.get('p50_s'))}"
+            f" against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
+            f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
+        )
+    waiting = pool.get("over_threshold") or 0
+    if waiting:
+        lines.append(
+            f"{waiting} run{'' if waiting == 1 else 's'} waiting right now,"
+            f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
+        )
+    return lines
 
 
 def pool_cause_text(pool: dict) -> str:
@@ -588,26 +611,48 @@ def render_pool(health: dict) -> str:
     if pool.get("verdict") == POOL_STALE:
         # No numbers: a reading hours old is not evidence about now, and a
         # figure in the message gets read as current whatever the caveat says.
+        measured = parse_iso(pool.get("measured_at"))
+        # Two ways to stop: the job stops running, or it runs and publishes
+        # nothing. The second has no last reading to quote, and the link is
+        # what tells them apart.
+        lost = (
+            f"last reading {clock(measured)}; {POOL_PRESSURE_JOB} runs hourly and has missed the last few"
+            if measured
+            else f"{POOL_PRESSURE_JOB} ran but published no numbers"
+        )
         return "\n".join(
             [
-                f"⚪ *Smoke gate: pool check stopped* — last reading {clock(parse_iso(pool.get('measured_at')))};"
-                f" {POOL_PRESSURE_JOB} runs hourly and has missed the last few."
+                f"⚪ *Smoke gate: pool check stopped* — {lost}."
                 " If the next one doesn't land, it needs checking.",
                 POOL_JOB_HISTORY_URL,
             ]
         )
     if pool.get("verdict") == POOL_UNMEASURED:
-        return "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read the queue."
+        return "\n".join(
+            [
+                "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read the queue.",
+                # Its own job's history, not the dashboard: the dashboard has
+                # no number to show when this is the message.
+                POOL_JOB_HISTORY_URL,
+            ]
+        )
     return "\n".join(
         [
             f"⏳ {pool_cause_text(pool)}",
-            pool_numbers(pool),
+            *pool_numbers(pool),
             "Runs still pass; /retest makes the queue longer.",
             # The agent view, for the same reason render_slow uses it: the
             # note starts on a tick that names no incident.
             dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
+
+
+def render_pool_clear(health: dict) -> str:
+    """The episode's end. No limits and no cause -- the episode is over, and
+    the digest's `typical wait` is where the numbers live from here."""
+    wait = (health.get("metrics") or {}).get("queue_wait_p50_s")
+    return f"✅ *Smoke gate: queue clear* — runs are starting on time again, typical wait {wait_text(wait)}."
 
 
 def short_cause(prev: dict) -> str:
@@ -649,15 +694,20 @@ def pool_digest_line(pool: dict) -> str:
     under a summary cannot branch four ways, and the alert already named it."""
     verdict = pool.get("verdict")
     if verdict == POOL_STALE:
-        return (
-            f"⚪ No pool numbers since {clock(parse_iso(pool.get('measured_at')))}"
-            f" — {POOL_PRESSURE_JOB} has stopped reporting."
-        )
+        measured = parse_iso(pool.get("measured_at"))
+        since = f" since {clock(measured)}" if measured else ""
+        return f"⚪ No pool numbers{since} — {POOL_PRESSURE_JOB} has stopped reporting."
     if verdict == POOL_UNMEASURED:
         return "⚪ Queue wait unknown — the hourly pool check couldn't read it."
+    if pool.get("over_threshold") and not pool.get("day"):
+        waiting = pool["over_threshold"]
+        return (
+            f"⏳ Queue backed up — {waiting} run{'' if waiting == 1 else 's'} waiting"
+            f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
+        )
     return (
-        f"⏳ Queue backed up — median wait {wait_text(pool.get('p50_s'))}"
-        f" against a {minutes_text(pool.get('threshold_p50_s'))} min limit."
+        f"⏳ Queue backed up — median wait {wait_text(pool.get('p50_s'))} on"
+        f" {pool.get('day', '?')} against a {minutes_text(pool.get('threshold_p50_s'))} min limit."
     )
 
 
@@ -706,6 +756,8 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_slow(health)
     if kind == KIND_POOL:
         return render_pool(health)
+    if kind == KIND_POOL_CLEAR:
+        return render_pool_clear(health)
     return render_change(health, prev, issue)
 
 
@@ -855,8 +907,12 @@ def run(
     told_stale = KIND_STALE in sent
     told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
     # The pool note records its verdict rather than a bit, because a verdict
-    # change inside one episode is its own message (see decide).
-    told_pool = KIND_POOL in sent or KIND_POOL not in kinds
+    # change inside one episode is its own message (see decide). The clear is
+    # held to the same bar: dropping the verdict on a send that failed would
+    # lose the only "it is over" the space ever gets.
+    told_pool = (KIND_POOL in sent or KIND_POOL not in kinds) and (
+        KIND_POOL_CLEAR in sent or KIND_POOL_CLEAR not in kinds
+    )
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,
         # fresh start is not announced later as a change.

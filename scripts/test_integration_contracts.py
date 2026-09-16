@@ -18,10 +18,15 @@ Contracts that each fail silently today when the two sides drift:
 * The flaky-check notifier's roster is the inverse: every pull-request check
   is either watched or named as excluded with a reason; a new check that is
   neither has its re-runs recorded nowhere, and nothing says so.
+* The CI-health bot reads the pool-pressure periodic's artifact instead of
+  importing it, so a renamed field raises nothing: it blanks every number in
+  the Chat note and sends the fallback message.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -30,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +72,12 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     "Risk Classification",
 )
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
+REPO_SCRIPTS = REPO_ROOT / "scripts"
+# The pool-pressure periodic's captured breach day, replayed here to get a real
+# pool-pressure.json. test_pool_pressure.py drives the same pair.
+POOL_PRESSURE_FIXTURE = REPO_SCRIPTS / "testdata" / "pool_pressure" / "breach"
+POOL_PRESSURE_AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
+POOL_PRESSURE_WINDOW_DAYS = 1
 
 
 def _yaml():
@@ -435,6 +447,105 @@ class WorkflowNameJoinTest(unittest.TestCase):
             consumer,
             "the poster downloads an artifact name the producer no longer uploads",
         )
+
+
+class PoolPressureArtifactContractTest(unittest.TestCase):
+    """The CI-health bot's rule-8 note against the artifact it reads (#1607).
+
+    Nothing imports pool_pressure.py: health.py takes its verdict, cause and
+    numbers as given, post_health.py copies its cause labels. A rename there
+    raises nothing here, so this replays the periodic over its captured breach
+    day and joins the two sides on the result.
+    """
+
+    def _modules(self):
+        sys.path.insert(0, str(REPO_SCRIPTS))
+        import pool_pressure
+        from eval_dashboard import health, post_health
+
+        return pool_pressure, health, post_health
+
+    def _artifact(self, pool_pressure):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            pool_pressure.measure(
+                from_dir=str(POOL_PRESSURE_FIXTURE),
+                as_of=POOL_PRESSURE_AS_OF,
+                window_days=POOL_PRESSURE_WINDOW_DAYS,
+                as_json=True,
+            )
+        return json.loads(buffer.getvalue())
+
+    def test_the_cause_labels_post_health_branches_on_are_the_periodics(self):
+        pool_pressure, _, post_health = self._modules()
+        self.assertEqual(
+            (pool_pressure.CAUSE_CAPACITY, pool_pressure.CAUSE_CONCURRENCY_CAP, pool_pressure.CAUSE_CONTROL_PLANE),
+            (post_health.CAUSE_CAPACITY, post_health.CAUSE_CONCURRENCY_CAP, post_health.CAUSE_CONTROL_PLANE),
+            "the copy has drifted: the message names no remedy for a cause the periodic still emits",
+        )
+        # UNKNOWN is not copied, nor is a label added later; both must reach
+        # the fallback message rather than one of the three remedies.
+        for cause in (pool_pressure.CAUSE_UNKNOWN, "SOMETHING_NEW"):
+            self.assertIn("cause unclear", post_health.pool_cause_text({"cause": cause}), cause)
+
+    def test_the_verdicts_health_reads_are_the_periodics(self):
+        pool_pressure, health, _ = self._modules()
+        self.assertEqual(pool_pressure.VERDICT_BREACH, health.POOL_BREACH)
+        self.assertEqual(pool_pressure.VERDICT_UNMEASURED, health.POOL_UNMEASURED)
+        # STALE is health.py's own word: an artifact cannot report that it
+        # stopped being written, so the note overrides the verdict it carries.
+        # A periodic emitting STALE would make that override look like agreement.
+        self.assertNotIn(
+            health.POOL_STALE,
+            (pool_pressure.VERDICT_OK, pool_pressure.VERDICT_BREACH, pool_pressure.VERDICT_UNMEASURED),
+        )
+
+    def test_the_note_quotes_the_periodics_own_numbers(self):
+        """Every figure in the note, against the field it came from.
+
+        The fixture breached on p95 alone and had two runs queued at the time,
+        so it covers both halves of the breach rule. Its window is one day
+        long, so the day's row and the seven-day aggregate hold the same
+        numbers here: which of the two the note quotes is pinned in
+        test_eval_dashboard_health.py, not here.
+        """
+        pool_pressure, health, _ = self._modules()
+        doc = self._artifact(pool_pressure)
+        self.assertEqual(pool_pressure.VERDICT_BREACH, doc["verdict"], "the fixture is the captured breach day")
+        day, = doc["trend"]["days"]
+        note = health.pool_note(doc, POOL_PRESSURE_AS_OF, None)
+        self.assertEqual(
+            {
+                "verdict": doc["verdict"],
+                "cause": doc["cause"],
+                "day": day["day"],
+                "p50_s": int(day["p50_minutes"] * 60),
+                "p95_s": int(day["p95_minutes"] * 60),
+                "worst_s": int(day["worst_minutes"] * 60),
+                "over_threshold": doc["queue"]["over_threshold"],
+                "threshold_p50_s": int(doc["thresholds"]["p50_minutes"] * 60),
+                "threshold_p95_s": int(doc["thresholds"]["p95_minutes"] * 60),
+                "free": doc["pool"]["free"],
+                "total": doc["pool"]["total"],
+                "max_concurrency": doc["max_concurrency"],
+            },
+            {key: note[key] for key in note if key not in ("since", "measured_at")},
+        )
+        self.assertEqual(health.parse_iso(doc["window_end"]), health.parse_iso(note["measured_at"]))
+        # The digest reads the newest day's row, not the seven-day aggregate.
+        self.assertEqual(int(day["p50_minutes"] * 60), health.pool_wait_p50_s(doc, POOL_PRESSURE_AS_OF))
+
+    def test_a_field_the_periodic_stops_writing_is_not_quietly_zero(self):
+        """A renamed field reads as absent, and absent must not print as a
+        number: "0 of 30 projects free" is a sentence the reader believes."""
+        pool_pressure, health, post_health = self._modules()
+        doc = self._artifact(pool_pressure)
+        doc["pool"].pop("free")
+        doc["queue"].pop("over_threshold")
+        note = health.pool_note(doc, POOL_PRESSURE_AS_OF, None)
+        self.assertIsNone(note["free"])
+        self.assertEqual(0, note["over_threshold"], "no live queue is a real reading of zero")
+        self.assertNotIn("0 of", post_health.render_pool({"pool": note}))
 
 
 if __name__ == "__main__":
