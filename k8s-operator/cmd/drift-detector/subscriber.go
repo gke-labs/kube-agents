@@ -93,6 +93,51 @@ const (
 	// either form for the same reason.
 	subscriptionPathPrefix = "projects/"
 
+	// defaultBatchJoinBudget bounds the total time one batch may spend handling
+	// records, which since T3 means the live-object lookups the join performs.
+	//
+	// It exists because joinRequestTimeout bounds one lookup and the batch
+	// settles only after every record in it has been handled: at the 100-message
+	// default a batch of slow lookups would run for far longer than any ack
+	// deadline, and Pub/Sub would redeliver the whole batch while this process
+	// was still working on it -- producing duplicate drift lines, and at T4 a
+	// duplicate inject per cycle, for as long as the control plane stayed slow.
+	//
+	// Thirty seconds is half the drift-pubsub module's 60-second deadline,
+	// leaving the rest for the Ack round trip. It is the default rather than the
+	// value because the deadline it is sized against is a Terraform variable and
+	// this is a Go constant: an operator pointing the detector at a subscription
+	// created outside the module gets Pub/Sub's own 10-second default, and
+	// --batch-join-budget is how they bring the two back into line without
+	// rebuilding the image.
+	//
+	// Exceeding it is not an error. The remaining lookups fail fast against the
+	// expired context and their records are forwarded unenriched and counted,
+	// which is the same fail-open stance the join takes everywhere else.
+	defaultBatchJoinBudget = 30 * time.Second
+
+	// batchJoinBudgetCeiling is the largest budget worth accepting. Pub/Sub's
+	// own maximum ackDeadlineSeconds is 600, and a budget at or above the whole
+	// deadline guarantees the redelivery it exists to prevent, so the ceiling
+	// sits at half of it -- the same relationship the default has to the
+	// module's 60.
+	batchJoinBudgetCeiling = 300 * time.Second
+
+	// ackDeadlineProbeTimeout bounds the one subscriptions.get made at startup
+	// to read the deadline the budget has to fit inside. Short because the probe
+	// is advisory: its only output is a log line, and a detector that waited on
+	// a slow control plane to print one would delay the first batch for nothing.
+	ackDeadlineProbeTimeout = 10 * time.Second
+
+	// maxBudgetShareOfAckDeadline is the largest share of the ack deadline a
+	// batch's join budget should take, as a divisor. Pub/Sub starts the deadline
+	// at delivery and the batch is settled only once its Ack returns, so the
+	// remainder is what that round trip runs in -- and a budget equal to the
+	// whole deadline has already overrun by the time the ack is sent. Half is
+	// the relationship defaultBatchJoinBudget is sized on, 30s against the
+	// drift-pubsub module's 60.
+	maxBudgetShareOfAckDeadline = 2
+
 	// settleGracePeriod bounds the ack and nack calls issued while shutting
 	// down. The pull loop's context is already cancelled by then, so settling
 	// on it would abort: up to maxMessages records would be handled and then
@@ -100,6 +145,50 @@ const (
 	// restart.
 	settleGracePeriod = 10 * time.Second
 )
+
+// ackDeadlineWarning says why a join budget does not fit a subscription's ack
+// deadline, or returns "" when it does. Split from the probe that fetches the
+// deadline so the arithmetic is testable without a subscription.
+func ackDeadlineWarning(budget, deadline time.Duration) string {
+	// No deadline reported. Nothing to compare against, and substituting a
+	// default here would warn about a number nobody configured.
+	if deadline <= 0 {
+		return ""
+	}
+	safe := deadline / maxBudgetShareOfAckDeadline
+	if budget <= safe {
+		return ""
+	}
+	// "may", not "will". The threshold is half the deadline but redelivery needs
+	// the handling *and* the Ack round trip to exceed the whole of it, so a 40s
+	// budget against a 60s deadline trips this and will not actually redeliver.
+	// What the budget has spent is the margin, and an operator told a margin was
+	// a certainty lowers it and loses enrichment to avoid a problem they do not
+	// have.
+	return fmt.Sprintf("--batch-join-budget=%s leaves too little of the subscription's %s ack deadline for the batch to be acked in, so Pub/Sub may redeliver batches this process is still working on; pass %s or less, or raise the subscription's ackDeadlineSeconds", budget, deadline, safe)
+}
+
+// ackDeadlinePreflight reads the subscription's own ack deadline through read
+// and returns the one line to log about it: that the budget does not fit, or
+// that the deadline could not be read, or "" when it fits and there is nothing
+// to say.
+//
+// Split out of realMain rather than inlined there because the two ways this
+// check dies are both silent. A conversion bug in the reader warns every install
+// on every boot about a deadline nobody configured, and deleting the comparison
+// turns the check off for everybody; neither reddens anything while the block
+// sits in a function no test can call. Taking the reader as a function rather
+// than a messageSource keeps that reachable without widening the interface for
+// one caller.
+func ackDeadlinePreflight(ctx context.Context, read func(context.Context) (time.Duration, error), budget time.Duration) string {
+	probeCtx, cancel := context.WithTimeout(ctx, ackDeadlineProbeTimeout)
+	defer cancel()
+	deadline, err := read(probeCtx)
+	if err != nil {
+		return fmt.Sprintf("could not read the subscription's ack deadline (%v); --batch-join-budget=%s is unchecked against it", err, budget)
+	}
+	return ackDeadlineWarning(budget, deadline)
+}
 
 // receivedMessage is one Pub/Sub message with its payload already decoded.
 // The REST API delivers the body base64-encoded; nothing downstream should
@@ -125,10 +214,20 @@ type messageSource interface {
 // google.golang.org/api is already a direct dependency of this module, for the
 // GKE Container API the event watcher calls. What that costs is StreamingPull:
 // synchronous pull does not extend the ack deadline on a message being worked,
-// and has no built-in flow control. Neither matters here, because the detector
-// acks on parse -- a sub-millisecond step, against a 60-second deadline -- and
-// pulls a bounded batch at a time. If the ack ever moves to after the
-// managedFields join in T3, revisit this.
+// and has no built-in flow control.
+//
+// The ack now follows the managedFields join rather than the parse, so the first
+// of those does bite: a batch holds its messages for as long as its lookups take,
+// with nothing extending the deadline underneath it. What keeps that bounded is
+// the joinBudget below (--batch-join-budget), which caps the whole batch at half
+// the module's ack deadline by default and lets the remaining lookups fail open
+// rather than overrun. Flow control is
+// still bounded by pulling maxMessages at a time and never overlapping batches.
+//
+// Moving to StreamingPull would replace that cap with deadline extension, and
+// becomes worth the dependency if handling ever grows past what one budget can
+// hold -- a per-record inject at T4, or a fan-in doing several clusters' lookups
+// per record.
 type pubsubSource struct {
 	service      *pubsub.Service
 	subscription string
@@ -158,6 +257,20 @@ func subscriptionPath(project, subscription string) string {
 		return subscription
 	}
 	return fmt.Sprintf(subscriptionPathFormat, project, subscription)
+}
+
+// AckDeadline reads the subscription's configured ack deadline, so the caller
+// can check --batch-join-budget against the install it is actually pointed at
+// rather than against the compile-time ceiling. Advisory: the caller logs what
+// comes back and pulls either way, because roles/pubsub.subscriber alone does
+// not carry subscriptions.get and a detector whose IAM stops at the pull still
+// has to run.
+func (p *pubsubSource) AckDeadline(ctx context.Context) (time.Duration, error) {
+	sub, err := p.service.Projects.Subscriptions.Get(p.subscription).Context(ctx).Do()
+	if err != nil {
+		return 0, fmt.Errorf("get %s: %w", p.subscription, err)
+	}
+	return time.Duration(sub.AckDeadlineSeconds) * time.Second, nil
 }
 
 func (p *pubsubSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
@@ -217,10 +330,18 @@ func (p *pubsubSource) Nack(ctx context.Context, ackIDs []string) error {
 	return nil
 }
 
-// recordHandler consumes one parsed audit record. T3 enriches and T4 injects
-// behind this signature; what ships behind it today is driftFilter.Handle,
-// which classifies and then forwards what survives to logActionable.
-type recordHandler func(AuditRecord)
+// recordHandler consumes one parsed audit record. T4 injects behind this
+// signature; what ships behind it today is driftFilter.Handle, which classifies
+// and then forwards what survives to the T3 join.
+//
+// The context is the pull loop's, so a handler doing network I/O -- which the
+// join does, one lookup per forwarded record -- is interrupted by SIGTERM
+// rather than holding shutdown open for its timeout. It is deliberately not the
+// settle context: an in-flight lookup abandoned at shutdown leaves its message
+// acked and its drift unreported, which matches what realMain already documents
+// about an interrupted batch, and is preferable to delaying the ack of every
+// other message in the batch behind it.
+type recordHandler func(context.Context, AuditRecord)
 
 // subscriberCounts is what the loop has done since it started. Exported
 // through the log on shutdown, and the shape a metrics exporter will read.
@@ -252,11 +373,24 @@ type subscriber struct {
 	// test can drive the branch without waiting a quarter of an hour.
 	idleReport time.Duration
 
+	// joinBudget bounds one batch's handling. Unlike idleReport it is a
+	// constructor argument rather than a field a test pokes, because realMain
+	// fills it from --batch-join-budget: the ack deadline it has to fit inside
+	// is a Terraform variable, so the value cannot be fixed at compile time.
+	// Taking it here makes dropping that wiring a compile error instead of a
+	// binary that prints the requested budget and runs on the default.
+	joinBudget time.Duration
+
 	// now is the clock idleReport is measured against. nil means time.Now.
 	now func() time.Time
 }
 
-func newSubscriber(source messageSource, handle recordHandler, maxMessages int64) *subscriber {
+// newSubscriber builds the loop. joinBudget is not defaulted when it is zero or
+// negative, the way maxMessages is: realMain rejects those at startup, so the
+// only caller that can pass one is a test, and a zero that silently became
+// thirty seconds would hide exactly the wiring bug this argument exists to
+// prevent.
+func newSubscriber(source messageSource, handle recordHandler, maxMessages int64, joinBudget time.Duration) *subscriber {
 	if maxMessages <= 0 {
 		maxMessages = defaultMaxMessages
 	}
@@ -266,6 +400,7 @@ func newSubscriber(source messageSource, handle recordHandler, maxMessages int64
 		maxMessages: maxMessages,
 		idleWait:    idlePollInterval,
 		idleReport:  idleReportInterval,
+		joinBudget:  joinBudget,
 	}
 }
 
@@ -337,12 +472,19 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 	skipped := 0
 	var firstSkip error
 
+	// The whole batch's handling shares one budget, so no batch can hold its
+	// messages past the ack deadline however slow the cluster is. Derived from
+	// the pull loop's context rather than replacing it: a SIGTERM still cuts the
+	// batch short.
+	handleCtx, cancelHandle := context.WithTimeout(ctx, s.joinBudget)
+	defer cancelHandle()
+
 	for _, msg := range messages {
 		record, err := parseAuditEntry(msg.Data)
 		switch {
 		case err == nil:
 			s.counts.Parsed++
-			s.handle(record)
+			s.handle(handleCtx, record)
 			ackIDs = append(ackIDs, msg.AckID)
 
 		case errors.Is(err, errNotKubernetesAudit), errors.Is(err, errNoResourceName):
@@ -421,30 +563,6 @@ func logCountsProgress(handled int, counts TierCounts, unattributed []string) {
 func logIdle(interval time.Duration, counts subscriberCounts) {
 	log.Printf("%s: idle, no messages delivered in %s (parsed=%d skipped=%d failed=%d)",
 		commandName, interval, counts.Parsed, counts.Skipped, counts.Failed)
-}
-
-// logActionable is T2's terminal handler: a record that survived the tier and
-// outcome filters, which is a successful change made by a person. T3 replaces
-// this with the managedFields join and T4 with the inject.
-func logActionable(record AuditRecord) {
-	// method= carries the fully qualified audit method, which is the only field
-	// here that names the API group and version: Resource.String() renders
-	// namespace/resource/name/subresource and drops both, so without it a DRIFT
-	// line for "prod/widgets/foo" cannot be told from a same-named CRD in
-	// another group. It is also the string to paste back into a
-	// `gcloud logging read` filter to find the entry again.
-	log.Printf("drift-detector: DRIFT cluster=%s project=%s location=%s principal=%q method=%s verb=%s resource=%s user_agent=%q timestamp=%s insert_id=%s",
-		record.Cluster,
-		record.Project,
-		record.Location,
-		record.Principal,
-		record.MethodName,
-		record.Verb,
-		record.Resource.String(),
-		record.UserAgent,
-		record.Timestamp.Format(time.RFC3339),
-		record.InsertID,
-	)
 }
 
 // logDroppedRecord reports one filtered record, behind --log-dropped. The tier

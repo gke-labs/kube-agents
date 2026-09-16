@@ -1,0 +1,709 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log"
+	"strings"
+	"testing"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+)
+
+// stubGetter is the objectGetter the join is driven with. Narrowing
+// dynamic.Interface to one method is what makes this three lines instead of a
+// fake cluster.
+type stubGetter struct {
+	obj  *unstructured.Unstructured
+	err  error
+	refs []ResourceRef
+	// block, when set, is waited on before returning, so a test can prove the
+	// lookup context is bounded.
+	block <-chan struct{}
+}
+
+func (g *stubGetter) Get(ctx context.Context, ref ResourceRef) (*unstructured.Unstructured, error) {
+	g.refs = append(g.refs, ref)
+	if g.block != nil {
+		select {
+		case <-g.block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return g.obj, g.err
+}
+
+// joinRecord is a record that reaches the lookup: named object, non-delete
+// verb, and the joiner's own cluster.
+func joinRecord() AuditRecord {
+	return AuditRecord{
+		Principal: "ada@example.com",
+		Cluster:   "prod-a",
+		Project:   "example-project",
+		Location:  "us-central1",
+		Verb:      "patch",
+		Timestamp: time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC),
+		Resource: ResourceRef{
+			Group:     "apps",
+			Version:   "v1",
+			Namespace: "prod",
+			Resource:  "deployments",
+			Name:      "api",
+		},
+	}
+}
+
+// joinCluster is the identity joinRecord's cluster fields spell out, so a
+// joiner built with it treats that record as local.
+func joinCluster() clusterIdentity {
+	return clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-a"}
+}
+
+// notFound is the error a dynamic client returns for a missing object.
+func notFound() error {
+	return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, "api")
+}
+
+func TestJoinOutcomes(t *testing.T) {
+	obj := managedFieldsObject(entry("kubectl-edit", "Update", "", `{"f:spec":{"f:replicas":{}}}`, nil))
+
+	for _, tc := range []struct {
+		name    string
+		getter  objectGetter
+		cluster clusterIdentity
+		mutate  func(*AuditRecord)
+		want    joinOutcome
+		// wantLookup says whether the getter should have been called at all.
+		wantLookup bool
+	}{
+		{
+			name:       "a successful lookup enriches",
+			getter:     &stubGetter{obj: obj},
+			cluster:    joinCluster(),
+			want:       joinEnriched,
+			wantLookup: true,
+		},
+		{
+			name:    "a delete has no object left to fetch",
+			getter:  &stubGetter{obj: obj},
+			cluster: joinCluster(),
+			mutate:  func(r *AuditRecord) { r.Verb = deleteVerb },
+			want:    joinNoObject,
+		},
+		{
+			name:    "a create with no assigned name cannot be addressed",
+			getter:  &stubGetter{obj: obj},
+			cluster: joinCluster(),
+			mutate:  func(r *AuditRecord) { r.Resource.Name = "" },
+			want:    joinNoObject,
+		},
+		{
+			name:    "a record from a differently named cluster is not looked up here",
+			getter:  &stubGetter{obj: obj},
+			cluster: joinCluster(),
+			mutate:  func(r *AuditRecord) { r.Cluster = "prod-b" },
+			want:    joinUnreachable,
+		},
+		{
+			// The case a name-only guard gets wrong. A GKE cluster name is
+			// unique within a project and location, so "prod-a" in two regions
+			// is ordinary -- and the lookup would succeed, returning a real
+			// object of that name whose ownership belongs to a different
+			// cluster entirely. Nothing downstream could tell.
+			name:    "a same-named cluster in another location is a different cluster",
+			getter:  &stubGetter{obj: obj},
+			cluster: joinCluster(),
+			mutate:  func(r *AuditRecord) { r.Location = "europe-west1" },
+			want:    joinUnreachable,
+		},
+		{
+			name:    "a same-named cluster in another project is a different cluster",
+			getter:  &stubGetter{obj: obj},
+			cluster: joinCluster(),
+			mutate:  func(r *AuditRecord) { r.Project = "other-project" },
+			want:    joinUnreachable,
+		},
+		{
+			// An incompletely labelled record is refused rather than assumed
+			// local: the alternative is enriching it from whatever object of
+			// that name this cluster happens to hold.
+			name:    "a record with no location cannot be placed",
+			getter:  &stubGetter{obj: obj},
+			cluster: joinCluster(),
+			mutate:  func(r *AuditRecord) { r.Location = "" },
+			want:    joinUnreachable,
+		},
+		{
+			name:    "no getter means no join",
+			getter:  nil,
+			cluster: joinCluster(),
+			want:    joinUnreachable,
+		},
+		{
+			name:       "NotFound means the object has since been removed",
+			getter:     &stubGetter{err: notFound()},
+			cluster:    joinCluster(),
+			want:       joinGone,
+			wantLookup: true,
+		},
+		{
+			name:       "any other error is a failed lookup",
+			getter:     &stubGetter{err: errors.New("forbidden")},
+			cluster:    joinCluster(),
+			want:       joinFailed,
+			wantLookup: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			record := joinRecord()
+			if tc.mutate != nil {
+				tc.mutate(&record)
+			}
+
+			var forwarded []DriftEvent
+			j := newJoiner(tc.getter, tc.cluster, nil, func(_ context.Context, e DriftEvent) {
+				forwarded = append(forwarded, e)
+			})
+			j.Handle(context.Background(), record)
+
+			if len(forwarded) != 1 {
+				t.Fatalf("forwarded %d events, want 1 -- the join fails open and forwards every outcome", len(forwarded))
+			}
+			if got := forwarded[0].Outcome; got != tc.want {
+				t.Errorf("Outcome = %q, want %q", got, tc.want)
+			}
+			if forwarded[0].Record.Principal != record.Principal {
+				t.Errorf("Record.Principal = %q, want the record forwarded unchanged", forwarded[0].Record.Principal)
+			}
+
+			if stub, ok := tc.getter.(*stubGetter); ok {
+				if got := len(stub.refs) > 0; got != tc.wantLookup {
+					t.Errorf("lookup performed = %v, want %v", got, tc.wantLookup)
+				}
+			}
+		})
+	}
+}
+
+func TestJoinForwardsTheLookupError(t *testing.T) {
+	wantErr := errors.New("deployments.apps is forbidden")
+	var got DriftEvent
+	j := newJoiner(&stubGetter{err: wantErr}, joinCluster(), nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.Handle(context.Background(), joinRecord())
+
+	if !errors.Is(got.LookupError, wantErr) {
+		t.Errorf("LookupError = %v, want %v -- a failed join has to say why", got.LookupError, wantErr)
+	}
+}
+
+func TestJoinPassesTheAuditResourceStraightThrough(t *testing.T) {
+	// T1 kept the audit log's plural resource rather than converting to a Kind
+	// so that no RESTMapper is needed here. If that ever changes, this is the
+	// test that says what depended on it.
+	stub := &stubGetter{obj: &unstructured.Unstructured{}}
+	j := newJoiner(stub, joinCluster(), nil, func(context.Context, DriftEvent) {})
+	record := joinRecord()
+	j.Handle(context.Background(), record)
+
+	if len(stub.refs) != 1 {
+		t.Fatalf("getter called %d times, want 1", len(stub.refs))
+	}
+	if stub.refs[0] != record.Resource {
+		t.Errorf("getter received %+v, want %+v", stub.refs[0], record.Resource)
+	}
+}
+
+func TestJoinCountsEveryOutcome(t *testing.T) {
+	j := newJoiner(&stubGetter{err: notFound()}, joinCluster(), nil, func(context.Context, DriftEvent) {})
+
+	j.Handle(context.Background(), joinRecord()) // gone
+
+	elsewhere := joinRecord()
+	elsewhere.Cluster = "prod-b"
+	j.Handle(context.Background(), elsewhere) // unreachable
+
+	removed := joinRecord()
+	removed.Verb = deleteVerb
+	j.Handle(context.Background(), removed) // no_object
+	j.Handle(context.Background(), removed) // no_object
+
+	counts := j.Counts()
+	if counts.Gone != 1 || counts.Unreachable != 1 || counts.NoObject != 2 {
+		t.Errorf("counts = %+v, want gone=1 unreachable=1 no_object=2", counts)
+	}
+	if counts.Enriched != 0 || counts.Failed != 0 {
+		t.Errorf("counts = %+v, want enriched and failed at zero", counts)
+	}
+}
+
+func TestJoinCountsStringAlwaysNamesEveryOutcome(t *testing.T) {
+	// A zero that is absent reads as a category that did not apply; a zero that
+	// is printed reads as one that did not happen.
+	got := joinCounts{}.String()
+	for _, outcome := range []joinOutcome{joinEnriched, joinNoObject, joinGone, joinUnreachable, joinFailed} {
+		if !strings.Contains(got, string(outcome)+"=") {
+			t.Errorf("joinCounts.String() = %q, want it to name %q", got, outcome)
+		}
+	}
+}
+
+func TestJoinBoundsTheLookup(t *testing.T) {
+	// A control plane that has stopped answering must not hold the batch past
+	// the Pub/Sub ack deadline, so the lookup carries its own timeout rather
+	// than inheriting only the pull loop's context.
+	blocked := make(chan struct{})
+	defer close(blocked)
+
+	var got DriftEvent
+	j := newJoiner(&stubGetter{block: blocked}, joinCluster(), nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.timeout = time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		j.Handle(context.Background(), joinRecord())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Handle did not return: the lookup is not bounded by joiner.timeout")
+	}
+	if got.Outcome != joinFailed {
+		t.Errorf("Outcome = %q, want %q for a lookup that timed out", got.Outcome, joinFailed)
+	}
+}
+
+func TestReconciledBy(t *testing.T) {
+	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	before := changedAt.Add(-time.Hour)
+	after := changedAt.Add(time.Minute)
+
+	for _, tc := range []struct {
+		name        string
+		managers    map[string]bool
+		owners      []fieldOwner
+		wantClaim   bool
+		wantManager string
+	}{
+		{
+			name:        "a configured manager writing after the change is a reconcile",
+			managers:    map[string]bool{"argocd-controller": true},
+			owners:      []fieldOwner{{Manager: "argocd-controller", UpdatedAt: after}},
+			wantClaim:   true,
+			wantManager: "argocd-controller",
+		},
+		{
+			name:        "a write in the same instant counts, because the two clocks are different components",
+			managers:    map[string]bool{"argocd-controller": true},
+			owners:      []fieldOwner{{Manager: "argocd-controller", UpdatedAt: changedAt}},
+			wantClaim:   true,
+			wantManager: "argocd-controller",
+		},
+		{
+			name:      "a configured manager that last wrote before the change is not a reconcile",
+			managers:  map[string]bool{"argocd-controller": true},
+			owners:    []fieldOwner{{Manager: "argocd-controller", UpdatedAt: before}},
+			wantClaim: false,
+		},
+		{
+			name:      "an unconfigured detector makes no claim at all",
+			managers:  nil,
+			owners:    []fieldOwner{{Manager: "argocd-controller", UpdatedAt: after}},
+			wantClaim: false,
+		},
+		{
+			name:      "a manager that is not the configured one does not count",
+			managers:  map[string]bool{"argocd-controller": true},
+			owners:    []fieldOwner{{Manager: "kubectl-edit", UpdatedAt: after}},
+			wantClaim: false,
+		},
+		{
+			name:     "a configured manager with no recorded time is skipped, not guessed at",
+			managers: map[string]bool{"argocd-controller": true},
+			owners:   []fieldOwner{{Manager: "argocd-controller"}},
+			// Guessing "after" hides real drift; guessing "before" invents a
+			// reconcile that never happened.
+			wantClaim: false,
+		},
+		{
+			name:     "matching is case-sensitive, because a manager name is not a DNS name",
+			managers: map[string]bool{"argocd-controller": true},
+			owners:   []fieldOwner{{Manager: "ArgoCD-Controller", UpdatedAt: after}},
+			// Two clients really can differ only in case.
+			wantClaim: false,
+		},
+		{
+			name:     "the claim names the manager behind it, not the first owner",
+			managers: map[string]bool{"flux": true},
+			owners: []fieldOwner{
+				{Manager: "kubectl-edit", UpdatedAt: after},
+				{Manager: "flux", UpdatedAt: after},
+			},
+			wantClaim:   true,
+			wantManager: "flux",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j := newJoiner(nil, joinCluster(), tc.managers, func(context.Context, DriftEvent) {})
+			claim, manager := j.reconciledBy(tc.owners, changedAt)
+
+			if claim != tc.wantClaim {
+				t.Errorf("Reconciled = %v, want %v", claim, tc.wantClaim)
+			}
+			if manager != tc.wantManager {
+				t.Errorf("ReconciledBy = %q, want %q", manager, tc.wantManager)
+			}
+			if !claim && manager != "" {
+				t.Errorf("ReconciledBy = %q with no claim, want empty", manager)
+			}
+		})
+	}
+}
+
+func TestReconciledByDoesNotInventAClaimFromTwoMissingTimes(t *testing.T) {
+	// The zero-time skip in reconciledBy is only load-bearing here. Against a
+	// real changedAt a zero UpdatedAt sorts before it and declines the claim by
+	// accident; when the record's own timestamp is also zero, neither is before
+	// the other, "at or after" reads true, and the detector reports a reconcile
+	// built entirely out of values it does not have.
+	//
+	// A record with no timestamp is what a payload whose time field did not
+	// parse leaves behind -- json.Unmarshal zeroes what it cannot match.
+	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+
+	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller"}}, time.Time{})
+	if claim {
+		t.Errorf("Reconciled = true by %q, want no claim when neither the change nor the manager has a time", manager)
+	}
+}
+
+func TestReconciledByFindsAReconcileInTheSameSecondAsTheChange(t *testing.T) {
+	// The case the "at or after" rule exists for, and the one a raw comparison
+	// gets wrong. A managedFields time survives only to the whole second --
+	// metav1.Time marshals with time.RFC3339, which has no fractional part --
+	// while an audit timestamp arrives from Cloud Logging with nanoseconds. So a
+	// reconcile 300ms after the change is stored as the start of that second,
+	// which sorts *before* the change and reads as "already there".
+	//
+	// Written with a sub-second changedAt because that is the only way to see
+	// it: every other timestamp in this file lands on a second boundary, where
+	// truncation is a no-op and the bug is invisible.
+	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 600_000_000, time.UTC)
+	reconciledAt := changedAt.Truncate(time.Second) // what the API server returns
+
+	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+
+	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: reconciledAt}}, changedAt)
+	if !claim {
+		t.Error("Reconciled = false, want true: a GitOps write in the same second as the change is the reconcile")
+	}
+	if manager != "argocd-controller" {
+		t.Errorf("ReconciledBy = %q, want argocd-controller", manager)
+	}
+}
+
+func TestReconciledByStillDeclinesAWriteFromAnEarlierSecond(t *testing.T) {
+	// The other side of the truncation: flooring the audit timestamp must not
+	// widen the window past the second the change landed in. A manager that last
+	// wrote a second earlier reconciled something else.
+	changedAt := time.Date(2026, 9, 16, 12, 0, 1, 600_000_000, time.UTC)
+	earlier := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+
+	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+
+	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: earlier}}, changedAt); claim {
+		t.Errorf("Reconciled = true by %q, want no claim for a write from the previous second", manager)
+	}
+}
+
+func TestJoinSetsReconciledFromTheLiveObject(t *testing.T) {
+	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	reconciledAt := changedAt.Add(time.Minute)
+	obj := managedFieldsObject(
+		entry("kubectl-edit", "Update", "", `{"f:spec":{"f:replicas":{}}}`, &changedAt),
+		entry("argocd-controller", "Apply", "", `{"f:spec":{"f:replicas":{}}}`, &reconciledAt),
+	)
+
+	var got DriftEvent
+	j := newJoiner(&stubGetter{obj: obj}, joinCluster(), parseGitopsManagers("argocd-controller"),
+		func(_ context.Context, e DriftEvent) { got = e })
+
+	record := joinRecord()
+	record.Timestamp = changedAt
+	j.Handle(context.Background(), record)
+
+	if got.Outcome != joinEnriched {
+		t.Fatalf("Outcome = %q, want %q", got.Outcome, joinEnriched)
+	}
+	if len(got.Owners) != 2 {
+		t.Errorf("Owners = %v, want both managedFields entries", got.Owners)
+	}
+	if !got.Reconciled || got.ReconciledBy != "argocd-controller" {
+		t.Errorf("Reconciled = %v by %q, want true by argocd-controller", got.Reconciled, got.ReconciledBy)
+	}
+}
+
+func TestParseGitopsManagers(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{name: "empty is unconfigured", value: "", want: nil},
+		{name: "whitespace only is unconfigured", value: " , ", want: nil},
+		{name: "entries are trimmed", value: "argocd-controller, flux ", want: []string{"argocd-controller", "flux"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseGitopsManagers(tc.value)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseGitopsManagers(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+			for _, name := range tc.want {
+				if !got[name] {
+					t.Errorf("parseGitopsManagers(%q) did not contain %q", tc.value, name)
+				}
+			}
+		})
+	}
+}
+
+// liveObject builds an object the fake dynamic client's tracker will serve.
+func liveObject(apiVersion, kind, namespace, name string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetAPIVersion(apiVersion)
+	obj.SetKind(kind)
+	if namespace != "" {
+		obj.SetNamespace(namespace)
+	}
+	obj.SetName(name)
+	obj.SetManagedFields([]metav1.ManagedFieldsEntry{
+		entry("kubectl-edit", "Update", "", `{"f:spec":{"f:replicas":{}}}`, nil),
+	})
+	return obj
+}
+
+func TestDynamicGetterReachesTheObjectTheRecordNames(t *testing.T) {
+	deployment := liveObject("apps/v1", "Deployment", "prod", "api")
+	node := liveObject("v1", "Node", "", "gke-node-1")
+
+	deploymentGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	nodeGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
+
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			deploymentGVR: "DeploymentList",
+			nodeGVR:       "NodeList",
+		},
+		deployment, node,
+	)
+	getter := dynamicGetter{client: client}
+
+	for _, tc := range []struct {
+		name string
+		ref  ResourceRef
+		// wantSubresource is what the API call should ask for, which is never
+		// the audited subresource: a write to "status" changes the parent
+		// object, whose managedFields carries the status claim as its own
+		// entry, and asking for the subresource returns a body with no
+		// managedFields at all.
+		wantSubresource string
+	}{
+		{
+			name: "a namespaced object",
+			ref:  ResourceRef{Group: "apps", Version: "v1", Namespace: "prod", Resource: "deployments", Name: "api"},
+		},
+		{
+			name: "a cluster-scoped object takes the un-namespaced path",
+			ref:  ResourceRef{Group: "", Version: "v1", Resource: "nodes", Name: "gke-node-1"},
+		},
+		{
+			name: "a subresource write fetches the parent",
+			ref:  ResourceRef{Group: "apps", Version: "v1", Namespace: "prod", Resource: "deployments", Name: "api", Subresource: "status"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client.Fake.ClearActions()
+
+			got, err := getter.Get(context.Background(), tc.ref)
+			if err != nil {
+				t.Fatalf("Get returned error: %v", err)
+			}
+			if got.GetName() != tc.ref.Name {
+				t.Errorf("fetched %q, want %q", got.GetName(), tc.ref.Name)
+			}
+			if len(got.GetManagedFields()) == 0 {
+				t.Error("fetched object carries no managedFields, which is the whole point of the lookup")
+			}
+
+			actions := client.Fake.Actions()
+			if len(actions) != 1 {
+				t.Fatalf("recorded %d actions, want 1", len(actions))
+			}
+			if got := actions[0].GetSubresource(); got != tc.wantSubresource {
+				t.Errorf("requested subresource %q, want %q", got, tc.wantSubresource)
+			}
+			if got := actions[0].GetNamespace(); got != tc.ref.Namespace {
+				t.Errorf("requested namespace %q, want %q", got, tc.ref.Namespace)
+			}
+			if got := actions[0].GetResource().Resource; got != tc.ref.Resource {
+				t.Errorf("requested resource %q, want the audit log's plural %q", got, tc.ref.Resource)
+			}
+		})
+	}
+}
+
+func TestDynamicGetterReportsNotFoundAsNotFound(t *testing.T) {
+	// joinGone depends on apierrors.IsNotFound recognising what the client
+	// returns; anything else would be counted as a failed lookup.
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			{Group: "apps", Version: "v1", Resource: "deployments"}: "DeploymentList",
+		},
+	)
+
+	_, err := dynamicGetter{client: client}.Get(context.Background(),
+		ResourceRef{Group: "apps", Version: "v1", Namespace: "prod", Resource: "deployments", Name: "absent"})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("Get returned %v, want a NotFound the join can classify as gone", err)
+	}
+}
+
+func TestLogDriftEventFormat(t *testing.T) {
+	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name    string
+		event   DriftEvent
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "an enriched event carries its owners",
+			event: DriftEvent{
+				Record:  AuditRecord{Principal: "ada@example.com", Cluster: "prod-a", MethodName: "io.k8s.apps.v1.deployments.patch", Verb: "patch", Timestamp: changedAt},
+				Outcome: joinEnriched,
+				Owners:  []fieldOwner{{Manager: "kubectl-edit", Operation: "Update", Paths: []string{"spec.replicas"}}},
+			},
+			want: []string{
+				`principal="ada@example.com"`,
+				"method=io.k8s.apps.v1.deployments.patch",
+				"join=enriched",
+				`owners=["kubectl-edit(Update)=[spec.replicas]"]`,
+			},
+			notWant: []string{"reconciled_by="},
+		},
+		{
+			name: "a reconciled event names the manager",
+			event: DriftEvent{
+				Record:       AuditRecord{Timestamp: changedAt},
+				Outcome:      joinEnriched,
+				Owners:       []fieldOwner{{Manager: "flux", Operation: "Apply"}},
+				Reconciled:   true,
+				ReconciledBy: "flux",
+			},
+			want: []string{`reconciled_by="flux"`},
+		},
+		{
+			name: "an enriched object nothing has ever managed says so",
+			event: DriftEvent{
+				Record:  AuditRecord{Timestamp: changedAt},
+				Outcome: joinEnriched,
+			},
+			want: []string{"owners=[" + noOwnersLabel + "]"},
+		},
+		{
+			name: "a failed lookup carries its error and no owners field",
+			event: DriftEvent{
+				Record:      AuditRecord{Timestamp: changedAt},
+				Outcome:     joinFailed,
+				LookupError: errors.New("forbidden"),
+			},
+			want:    []string{"join=failed", `lookup_error="forbidden"`},
+			notWant: []string{"owners="},
+		},
+		{
+			name: "an unreachable record is still a DRIFT line",
+			event: DriftEvent{
+				Record:  AuditRecord{Cluster: "prod-b", Timestamp: changedAt},
+				Outcome: joinUnreachable,
+			},
+			want:    []string{"DRIFT", "cluster=prod-b", "join=unreachable"},
+			notWant: []string{"owners=", "lookup_error="},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log.SetOutput(&buf)
+			log.SetFlags(0)
+			t.Cleanup(func() {
+				log.SetOutput(io.Discard)
+				log.SetFlags(log.LstdFlags)
+			})
+
+			logDriftEvent(context.Background(), tc.event)
+
+			got := buf.String()
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("log line %q, want it to contain %q", got, want)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(got, notWant) {
+					t.Errorf("log line %q, want it not to contain %q", got, notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderOwnersJoinsEveryClaim(t *testing.T) {
+	got := renderOwners([]fieldOwner{
+		{Manager: "kubectl-edit", Operation: "Update", Paths: []string{"spec.replicas"}},
+		{Manager: "argocd-controller", Operation: "Apply", Paths: []string{"spec.template"}},
+	})
+	want := `"kubectl-edit(Update)=[spec.replicas]" "argocd-controller(Apply)=[spec.template]"`
+	if got != want {
+		t.Errorf("renderOwners = %q, want %q", got, want)
+	}
+}
+
+// The separator is a space and neither half of a claim is constrained to be
+// space-free -- a field manager is validated only for length and printable
+// characters, and a merge key renders the object's own field value. Unquoted,
+// this one claim reads as three.
+func TestRenderOwnersQuotesAClaimContainingSpaces(t *testing.T) {
+	got := renderOwners([]fieldOwner{
+		{Manager: "my tool", Operation: "Update", Paths: []string{"spec.containers[name=my app].image"}},
+	})
+	want := `"my tool(Update)=[spec.containers[name=my app].image]"`
+	if got != want {
+		t.Errorf("renderOwners = %q, want %q", got, want)
+	}
+}
