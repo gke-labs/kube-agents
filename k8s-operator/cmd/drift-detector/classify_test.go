@@ -248,10 +248,17 @@ func TestClassifyPrincipals(t *testing.T) {
 		{"app engine service account", "example-project@appspot.gserviceaccount.com", "", "", TierAutomation},
 		{"cloudservices agent", "000000000000@cloudservices.gserviceaccount.com", "", "", TierAutomation},
 
+		// The suffix is a DNS domain, so it is matched case-insensitively.
+		// Unfolded, this principal misses the automation rule, carries an "@",
+		// and is reported as a person making an out-of-band change.
+		{"service account domain in upper case", "deployer@example-project.iam.GSERVICEACCOUNT.COM", "", "", TierAutomation},
+		{"service account domain in mixed case", "deployer@example-project.iam.GServiceAccount.Com", "", "", TierAutomation},
+
 		// The leading dot in the suffix is what keeps the match on a domain
 		// boundary. Without it this lookalike would be swallowed as automation
-		// and never looked at again.
+		// and never looked at again. Folding the case must not widen it.
 		{"lookalike domain is not a service account", "mallory@evilgserviceaccount.com", "", "", TierHuman},
+		{"upper-case lookalike is not a service account", "mallory@EVILGSERVICEACCOUNT.COM", "", "", TierHuman},
 		{"allowlisted bare name", "kubelet-nodepool-bootstrap", "kubelet-nodepool-bootstrap", "", TierAutomation},
 		{"allowlist is exact, not a prefix", "kubelet-nodepool-bootstrap-2", "kubelet-nodepool-bootstrap", "", TierUnattributed},
 		{"human with any domain by default", "ada@example.com", "", "", TierHuman},
@@ -259,6 +266,28 @@ func TestClassifyPrincipals(t *testing.T) {
 		{"human outside configured domain", "mallory@evil.test", "", "example.com", TierUnattributed},
 		{"domain match cannot straddle the boundary", "ada@notexample.com", "", "example.com", TierUnattributed},
 		{"configured domain tolerates a leading @", "ada@example.com", "", "@example.com", TierHuman},
+
+		// ".example.com" is how a domain-and-its-subtree is written elsewhere,
+		// so an operator reaches for it. Stored verbatim it becomes
+		// "@.example.com" and matches nothing at all -- every person in the
+		// fleet filed as unattributed, with nothing in the log saying why.
+		{"configured domain tolerates a leading dot", "ada@example.com", "", ".example.com", TierHuman},
+		{"configured domain tolerates both", "ada@example.com", "", "@.example.com", TierHuman},
+
+		// Tolerating the dot is not the same as honouring it: the match stays
+		// on the exact domain either way, and an organisation using subdomains
+		// lists them. These two pin that down, because widening it silently
+		// would widen what the detector reports as somebody's drift.
+		{"configured domain does not match a subdomain", "ada@corp.example.com", "", "example.com", TierUnattributed},
+		{"leading dot does not add subdomain matching", "ada@corp.example.com", "", ".example.com", TierUnattributed},
+		{"subdomains are matched by listing them", "ada@corp.example.com", "", "corp.example.com,eng.example.com", TierHuman},
+
+		// "@" alone is not an account. Testing for the character's presence
+		// rather than for a local part and a domain admits all three of these.
+		{"bare separator is not human", "@", "", "", TierUnattributed},
+		{"missing domain is not human", "ada@", "", "", TierUnattributed},
+		{"missing local part is not human", "@example.com", "", "", TierUnattributed},
+
 		{"no domain and no rule is unattributed", "some-bootstrap-identity", "", "", TierUnattributed},
 		{"allowlist beats the domain test", "ci-runner@example.com", "ci-runner@example.com", "example.com", TierAutomation},
 		{"system beats the allowlist", "system:foo", "system:foo", "", TierSystem},

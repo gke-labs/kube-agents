@@ -39,6 +39,22 @@ const (
 	// without this the loop spins against the API.
 	idlePollInterval = 5 * time.Second
 
+	// idleReportInterval is how long the loop goes delivering nothing before it
+	// says so. Without it a detector whose subscription is empty is completely
+	// silent: an empty Pull is not an error, so there is no retry line, no
+	// batch-skip line, and no progress line either, because the progress line
+	// is driven from driftFilter.Handle and a record that never arrives never
+	// reaches it. A Log Router sink whose filter stopped matching therefore
+	// reads exactly like a fleet nobody is changing -- and it is the failure
+	// this whole pipeline is least able to notice, because "no drift" is the
+	// expected steady state.
+	//
+	// Deliberately the same length as countsLogMaxInterval: between the two,
+	// the pod logs something every fifteen minutes in every state it can be in,
+	// which is the property an operator actually wants and neither delivers
+	// alone.
+	idleReportInterval = countsLogMaxInterval
+
 	// unattributedListSeparator joins the principal names in a progress line.
 	// A comma and a space rather than a space alone, because an entry is
 	// "principal=count" and unattributedOverflowLabel contains spaces.
@@ -230,6 +246,14 @@ type subscriber struct {
 	maxMessages int64
 	idleWait    time.Duration
 	counts      subscriberCounts
+
+	// idleReport is how long the loop tolerates delivering nothing before
+	// logging that fact. A field rather than the constant read directly, so a
+	// test can drive the branch without waiting a quarter of an hour.
+	idleReport time.Duration
+
+	// now is the clock idleReport is measured against. nil means time.Now.
+	now func() time.Time
 }
 
 func newSubscriber(source messageSource, handle recordHandler, maxMessages int64) *subscriber {
@@ -241,12 +265,27 @@ func newSubscriber(source messageSource, handle recordHandler, maxMessages int64
 		handle:      handle,
 		maxMessages: maxMessages,
 		idleWait:    idlePollInterval,
+		idleReport:  idleReportInterval,
 	}
 }
 
+// clock reads the loop's injectable time source.
+func (s *subscriber) clock() time.Time {
+	if s.now == nil {
+		return time.Now()
+	}
+	return s.now()
+}
+
 // Run pulls until the context is cancelled, returning the context's error.
+//
+// lastDelivery starts at the current time rather than the zero value, so the
+// first idle line is owed idleReportInterval after start-up instead of on the
+// first empty pull. The startup line has already said the loop is alive; the
+// idle line's job is to keep saying it.
 func (s *subscriber) Run(ctx context.Context) error {
 	backoff := pullBackoffInitial
+	lastDelivery := s.clock()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -268,6 +307,12 @@ func (s *subscriber) Run(ctx context.Context) error {
 		backoff = pullBackoffInitial
 
 		if len(messages) == 0 {
+			// Reset on report rather than only on delivery, so a subscription
+			// that stays empty says so every interval instead of once.
+			if now := s.clock(); now.Sub(lastDelivery) >= s.idleReport {
+				logIdle(s.idleReport, s.counts)
+				lastDelivery = now
+			}
 			if !sleepCtx(ctx, s.idleWait) {
 				return ctx.Err()
 			}
@@ -275,6 +320,11 @@ func (s *subscriber) Run(ctx context.Context) error {
 		}
 
 		s.processBatch(ctx, messages)
+		// After the batch, not before: a subscription delivering steadily must
+		// never report itself idle, and settling a full batch is the slowest
+		// step in the loop. Reading the clock on the near side would start the
+		// interval before the work rather than at the end of it.
+		lastDelivery = s.clock()
 	}
 }
 
@@ -358,6 +408,19 @@ func logCountsProgress(handled int, counts TierCounts, unattributed []string) {
 	}
 	log.Printf("%s: progress handled=%d (%s) unattributed_principals=[%s]",
 		commandName, handled, counts, strings.Join(unattributed, unattributedListSeparator))
+}
+
+// logIdle reports that the subscription has delivered nothing for a while.
+//
+// The running totals go out with it because they are what separates the two
+// cases an operator has to tell apart: a detector that has been working and
+// has gone quiet carries non-zero counts, while one whose sink or subscription
+// was never wired up correctly reports zeroes and has done since it started.
+// Without them the line says the process is alive, which is the less useful
+// half of the question.
+func logIdle(interval time.Duration, counts subscriberCounts) {
+	log.Printf("%s: idle, no messages delivered in %s (parsed=%d skipped=%d failed=%d)",
+		commandName, interval, counts.Parsed, counts.Skipped, counts.Failed)
 }
 
 // logActionable is T2's terminal handler: a record that survived the tier and

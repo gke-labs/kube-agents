@@ -27,14 +27,14 @@ go run ./k8s-operator/cmd/drift-detector --project "$PROJECT_ID"
 Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
 agent pod, the Workload Identity the `drift-pubsub` module grants it to.
 
-| Flag                      | Default                          | Notes                                                                                                 |
-| ------------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `--project`               | —                                | Required. The project holding the subscription.                                                       |
-| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                       |
-| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                         |
-| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries. |
-| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Empty means any principal carrying a domain.        |
-| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                    |
+| Flag                      | Default                          | Notes                                                                                                                                                |
+| ------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--project`               | —                                | Required. The project holding the subscription.                                                                                                      |
+| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                      |
+| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                        |
+| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                |
+| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain. |
+| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                   |
 
 ## Classification
 
@@ -56,6 +56,20 @@ there is something to write the next rule from.
 The service-account match is the whole `.gserviceaccount.com` domain. The Google-managed accounts —
 `<number>-compute@developer`, `@cloudbuild`, `@appspot`, `@cloudservices` — carry no `iam` label, so
 matching `.iam.gserviceaccount.com` alone would send a Cloud Build pipeline to the human tier.
+
+**Domains are folded, usernames are not.** Both domain tests — the service-account suffix and
+`--human-domains` — are case-insensitive, because DNS is, and an unfolded suffix sends
+`deployer@proj.iam.GSERVICEACCOUNT.COM` to the human tier on the strength of its `@`.
+`--automation-principals` matches the whole principal and is deliberately exact: a Kubernetes
+username is case-sensitive by specification.
+
+`--human-domains` matches the exact domain rather than its subtree, so `example.com` does not cover
+`ada@corp.example.com` and an organisation using subdomains lists them. Widening it would widen what
+the detector reports as somebody's drift, and no fleet measured here spreads its accounts that way;
+the misses are not silent either, since an unmatched principal lands in `unattributed` and is logged
+by name. A leading `@` or `.` on a configured value is stripped before matching, so `.example.com` —
+the conventional way to write a domain elsewhere, and therefore what an operator reaches for — is
+the same configuration as `example.com` rather than one that quietly matches nothing at all.
 
 **Two identities this cannot see through**, both of which fail closed — a real change classified as
 a machine and dropped, rather than a false report. A person acting through a ServiceAccount token
@@ -125,6 +139,14 @@ rather than the figure. The unfiltered stream hit the cap inside 15 minutes on a
 so it is at least 11 a second, and the sink filter is what stands between the two. That range is
 also why the progress line has a time bound as well as a record count: 10,000 records is seventeen
 minutes at the top of it and close to four hours at the bottom.
+
+The progress line covers a cluster nobody is changing; it cannot cover a subscription delivering
+nothing, because it is emitted from the filter and a record that never arrives never reaches it. An
+empty pull is not an error either, so a sink whose filter stopped matching produces no output of any
+kind. `subscriber.Run` therefore reports an idle line on the same fifteen-minute bound, carrying the
+running totals — zeroes since start-up mean the pipeline was never wired up, non-zero ones mean it
+worked and has gone quiet. Between the two, the pod logs something every fifteen minutes in every
+state it can be in.
 
 The absolute human number is close to the spike's estimate of seven a day per cluster; the
 denominator differs by orders of magnitude, which is what makes the filter worth building. Human

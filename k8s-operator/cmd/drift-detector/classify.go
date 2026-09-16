@@ -80,6 +80,18 @@ const (
 	// "ada@notexample.com".
 	domainPrefix = emailLocalDomainSeparator
 
+	// domainLabelSeparator separates the labels of a DNS name, and is stripped
+	// from the front of a configured --human-domains value.
+	//
+	// ".example.com" is the conventional way to write a domain elsewhere --
+	// cookie scopes, TLS name constraints, no_proxy -- so it is what an
+	// operator reaches for, and without this it is stored as "@.example.com"
+	// and matches nothing, ever, with no error: every person in the fleet is
+	// filed as unattributed while the detector reports healthy. Stripping it
+	// makes ".example.com" behave exactly as "example.com" does. It does not
+	// make either one match subdomains; isHuman says why not.
+	domainLabelSeparator = "."
+
 	// unauthenticatedPrincipalLabel stands in for the empty principal in the
 	// unattributed list. The empty string renders as "=120" there, which names
 	// nothing an operator could act on, and unlike every other entry in that
@@ -99,9 +111,10 @@ const (
 	//
 	// It counts delivered records, so it breaks the silence of a fleet with no
 	// human changes but not the silence of a subscription delivering nothing at
-	// all. A sink whose filter stopped matching produces no pull error and no
-	// batch-skip line, so that case needs the idle reporting in the subscriber
-	// loop rather than this.
+	// all -- neither half of the interval below can fire on a stream that never
+	// reaches Handle. A sink whose filter stopped matching produces no pull
+	// error and no batch-skip line either, so that case is covered by
+	// idleReportInterval in subscriber.Run and not here.
 	countsLogInterval = 10000
 
 	// countsLogMaxInterval bounds the same report in time, because a record
@@ -114,8 +127,11 @@ const (
 	// It also closes a silent window T1 did not have. T1 logged a line per
 	// parsed record; T2 forwards only successful human writes, of which the
 	// measured 15-minute windows contained none, so between the startup line
-	// and the first progress line the pod log is empty and a healthy detector
-	// is indistinguishable from a broken sink.
+	// and the first progress line the pod log would otherwise be empty on a
+	// cluster that is working perfectly. What it does not close is the window
+	// where nothing is delivered at all: this fires from Handle, so a broken
+	// sink never reaches it. subscriber.Run's idleReportInterval is that half,
+	// and the two are deliberately the same length.
 	//
 	// Fifteen minutes is the measurement window the tier ratios were taken
 	// over, and 96 lines a day is nothing next to the stream being counted.
@@ -236,8 +252,15 @@ func NewClassifier(automationPrincipals, humanDomains string) *Classifier {
 		//
 		// Stored with the separator attached so the match is a suffix test
 		// that cannot straddle the domain boundary.
+		//
+		// Both an "@" and a leading "." are stripped before it is reattached,
+		// so "example.com", "@example.com" and ".example.com" are one domain
+		// written three ways rather than three configurations, one of which
+		// silently matches nothing. See domainLabelSeparator.
 		domain := strings.ToLower(d)
-		c.humanDomains = append(c.humanDomains, domainPrefix+strings.TrimPrefix(domain, domainPrefix))
+		domain = strings.TrimPrefix(domain, domainPrefix)
+		domain = strings.TrimPrefix(domain, domainLabelSeparator)
+		c.humanDomains = append(c.humanDomains, domainPrefix+domain)
 	}
 	return c
 }
@@ -280,7 +303,15 @@ func (c *Classifier) Classify(principal string) Tier {
 	if _, ok := c.automation[principal]; ok {
 		return TierAutomation
 	}
-	if strings.HasSuffix(principal, gcpServiceAccountSuffix) {
+	// Folded, for the reason isHuman folds --human-domains: this is a suffix
+	// test against a DNS domain, and DNS is case-insensitive. Unfolded,
+	// "deployer@proj.iam.GSERVICEACCOUNT.COM" misses here, carries an "@", and
+	// passes the human test -- a service account reported as a person making an
+	// out-of-band change, which is the false positive the automation tier
+	// exists to prevent. The two rules above are not folded and should not be:
+	// both match a Kubernetes username, which is case-sensitive by
+	// specification, rather than a domain.
+	if strings.HasSuffix(strings.ToLower(principal), gcpServiceAccountSuffix) {
 		return TierAutomation
 	}
 	if c.isHuman(principal) {
@@ -301,9 +332,17 @@ func (c *Classifier) isHuman(principal string) bool {
 		// which GKE forwards as given. Unfolded, Ada@Corp.Example.com misses
 		// the suffix and a real human change is filed as unattributed.
 		//
-		// Only the domain comparison is folded. The automation set above is
-		// matched on the whole principal and is deliberately case-sensitive,
-		// because a Kubernetes username is case-sensitive by specification.
+		// The match is the exact domain and not its subtree:
+		// --human-domains=example.com does not match "ada@corp.example.com".
+		// An organisation whose accounts live under subdomains lists them,
+		// which the comma-separated flag is for. Widening this to a subtree
+		// would be a one-line change and is deliberately not made: the flag is
+		// what narrows the human tier, so every principal it newly admits is a
+		// record the detector newly reports as somebody's drift, and there is
+		// no measured fleet here whose accounts are spread across subdomains
+		// to say the trade is worth making. The misses are not silent -- an
+		// unmatched principal lands in TierUnattributed and is logged by name,
+		// which is the list an operator reads to find the domain they left out.
 		lowered := strings.ToLower(principal)
 		for _, d := range c.humanDomains {
 			if strings.HasSuffix(lowered, d) {
@@ -312,7 +351,14 @@ func (c *Classifier) isHuman(principal string) bool {
 		}
 		return false
 	}
-	return strings.Contains(principal, emailLocalDomainSeparator)
+	// A domain means an "@" with something on both sides of it. Testing only
+	// for the character's presence admits "@", "ada@" and "@example.com" as
+	// people; none of the three is an account, and the last two are the shapes
+	// a truncated principal takes. LastIndex rather than Index because a quoted
+	// local part may itself contain an "@", and the domain is whatever follows
+	// the final one.
+	at := strings.LastIndex(principal, emailLocalDomainSeparator)
+	return at > 0 && at < len(principal)-1
 }
 
 // nonDeclarativeSubresources are subresources whose write verbs act on a
@@ -453,6 +499,19 @@ func (u *UnattributedPrincipals) Sorted() []string {
 // driftFilter is T2's handler: it classifies each parsed record, counts it,
 // and forwards only the ones that represent a real human change. It sits
 // behind recordHandler, so the subscriber loop is unchanged.
+//
+// Not safe for concurrent use, and nothing guards that. Handle mutates
+// handled, counts.ByTier and unattributed.seen without a lock, which is sound
+// only because there is exactly one caller: subscriber.Run pulls, calls
+// processBatch, and processBatch walks the batch in the same goroutine. The
+// Classifier it holds is stateless and is safe to share; this is not.
+//
+// It is called out because the obvious next step makes it wrong. T3's
+// managedFields join is a per-record API call against the cluster, which is
+// the point at which handling a batch concurrently starts to look worthwhile
+// -- and a concurrent Handle races two maps and a counter, producing a torn
+// tally at best and a runtime map-write panic at worst. Whoever makes that
+// change owns adding the mutex, or moving the counting behind a channel.
 type driftFilter struct {
 	classifier   *Classifier
 	counts       TierCounts

@@ -15,11 +15,35 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer collects log output written from the goroutine running Run while
+// the test goroutine reads it. A bare bytes.Buffer races under -race here,
+// because log.SetOutput hands the writer to whichever goroutine is logging.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
 
 // fakeSource stands in for the subscription. It hands out one batch per Pull
 // and records how each message was settled.
@@ -206,6 +230,130 @@ func TestRunBacksOffOnPullError(t *testing.T) {
 	// and then waits. More than a couple means it is spinning.
 	if source.pulls > 2 {
 		t.Errorf("pulled %d times while backing off, want at most 2", source.pulls)
+	}
+}
+
+// TestRunReportsAnIdleSubscription pins the only signal a detector gives when
+// its subscription delivers nothing at all. An empty Pull is not an error, so
+// there is no retry line; no message means no batch-skip line; and the progress
+// line is driven from driftFilter.Handle, which a record that never arrives
+// never reaches. Without this branch a Log Router sink whose filter stopped
+// matching reads in the pod log exactly like a fleet nobody is changing, which
+// is the steady state -- so nobody looks.
+func TestRunReportsAnIdleSubscription(t *testing.T) {
+	var buf syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	sub := newSubscriber(&fakeSource{}, func(AuditRecord) {}, defaultMaxMessages)
+	sub.idleWait = time.Millisecond
+
+	// A clock that jumps a whole interval per reading, so the branch is reached
+	// without the test waiting a quarter of an hour. Read only from the loop's
+	// goroutine, so the counter needs no lock.
+	ticks := 0
+	sub.now = func() time.Time {
+		ticks++
+		return time.Unix(0, 0).Add(time.Duration(ticks) * idleReportInterval)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+
+	logged := false
+	for i := 0; i < 2000 && !logged; i++ {
+		logged = strings.Contains(buf.String(), "idle, no messages delivered")
+		if !logged {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	<-done
+
+	if !logged {
+		t.Fatalf("no idle line after the interval elapsed; log = %q", buf.String())
+	}
+	// The totals are what separate "working, and quiet right now" from "never
+	// received anything since it started", which is the case worth paging on.
+	if !strings.Contains(buf.String(), "parsed=0 skipped=0 failed=0") {
+		t.Errorf("idle line does not carry the running totals; log = %q", buf.String())
+	}
+}
+
+// TestRunDoesNotReportIdleBeforeTheInterval guards the other side: the line is
+// owed once an interval has passed, not on every empty poll. idlePollInterval
+// is five seconds, so an unguarded report would be 17,000 lines a day saying
+// nothing.
+func TestRunDoesNotReportIdleBeforeTheInterval(t *testing.T) {
+	var buf syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	sub := newSubscriber(&fakeSource{}, func(AuditRecord) {}, defaultMaxMessages)
+	sub.idleWait = time.Millisecond
+
+	// A clock that never advances: the loop polls repeatedly and no interval
+	// ever elapses.
+	frozen := time.Unix(0, 0)
+	sub.now = func() time.Time { return frozen }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := sub.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run returned %v, want context.DeadlineExceeded", err)
+	}
+
+	if strings.Contains(buf.String(), "idle") {
+		t.Errorf("idle line printed before the interval elapsed; log = %q", buf.String())
+	}
+}
+
+// TestRunIdleIntervalRestartsAfterADelivery is the case a mutation of the two
+// tests above slips through: both use a subscription that delivers nothing, so
+// neither notices if Run forgets to reset the interval once a batch arrives.
+// Forgotten, the clock still runs from start-up, and a detector that is pulling
+// records perfectly well announces itself idle a quarter of an hour in -- a
+// false statement in the log, and worse than the silence it replaced, because
+// it is the line an operator would act on.
+func TestRunIdleIntervalRestartsAfterADelivery(t *testing.T) {
+	var buf syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	source := &fakeSource{batches: [][]receivedMessage{
+		{{AckID: "ack-1", Data: []byte(humanPatchEntry)}},
+	}}
+
+	// The clock jumps a whole interval the moment a record is handled and then
+	// stands still, so what the assertion turns on is which side of that jump
+	// lastDelivery was read on -- nothing else. Both the handler and the clock
+	// run on the loop's goroutine, so the flag needs no lock.
+	base := time.Unix(0, 0)
+	delivered := false
+	sub := newSubscriber(source, func(AuditRecord) { delivered = true }, defaultMaxMessages)
+	sub.idleWait = time.Millisecond
+	sub.now = func() time.Time {
+		if delivered {
+			return base.Add(idleReportInterval)
+		}
+		return base
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := sub.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run returned %v, want context.DeadlineExceeded", err)
+	}
+
+	if got := sub.Counts().Parsed; got != 1 {
+		t.Fatalf("parsed = %d, want 1: the batch never reached the handler", got)
+	}
+	if strings.Contains(buf.String(), "idle") {
+		t.Errorf("reported idle after delivering a record; log = %q", buf.String())
 	}
 }
 
