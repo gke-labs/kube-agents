@@ -2587,19 +2587,43 @@ def parse_declarations(
     return out
 
 
+def _symlinked_component(tree: Path, relative: str) -> str | None:
+    """The first component of `relative` under `tree` that is a symlink, or None.
+
+    Repo-relative, for the warning that names it.
+    """
+    probe = Path(tree)
+    for part in PurePosixPath(relative).parts:
+        probe = probe / part
+        if probe.is_symlink():
+            return probe.relative_to(tree).as_posix()
+    return None
+
+
 def read_intent_paths(tree: Path, repo: str) -> list[str]:
     """The repo-relative prefixes `.kube-agents/intent.yaml` bounds the search to.
 
-    An empty list means the whole tree, and stderr says why: the file is
-    absent, is not YAML, has no `paths` list, or names a path the
-    remediation-path rules refuse. Any one bad path discards the whole bound
-    rather than the one path, because a bound that silently narrowed itself
-    would read as the owner's choice.
+    An empty list means the whole tree, and stderr says why: the file (or its
+    directory) is a symlink, is absent, is not YAML, has no `paths` list, or
+    names a path the remediation-path rules refuse. Any one bad path discards
+    the whole bound rather than the one path, because a bound that silently
+    narrowed itself would read as the owner's choice.
     """
     import yaml
 
     intent = tree / INTENT_FILE
     where = f"{repo}:{INTENT_FILE}"
+    # Before `is_file`, which follows a link. A directory-mode tree is a real
+    # clone and git materialises a committed symlink, so the one file that
+    # sets the bound is held to the rule `note_paths` applies to every note:
+    # a link is a path out of the copy the bound is checked against.
+    linked = _symlinked_component(tree, INTENT_FILE)
+    if linked is not None:
+        log(
+            f"WARNING: {where}: `{linked}` is a symbolic link, which is never "
+            "followed; searching the whole tree."
+        )
+        return []
     if not intent.is_file():
         log(f"{where}: absent; searching the whole tree.")
         return []

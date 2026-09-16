@@ -5337,6 +5337,31 @@ class TestIntentPaths(unittest.TestCase):
                 self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
                 self.assertIn("searching the whole tree", err)
 
+    def test_a_symlinked_intent_file_or_directory_is_never_followed(self):
+        # git materialises a committed symlink in a directory-mode clone, and
+        # `is_file` and `read_text` both follow one. The bound must come from
+        # inside the copy, so a link at either component is the whole tree
+        # with a warning — and the target, however valid, is never read.
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        outside = Path(elsewhere.name) / "intent.yaml"
+        outside.write_text("paths:\n  - knowledge/\n", encoding="utf-8")
+        for label, link, target in (
+            ("the file", ".kube-agents/intent.yaml", outside),
+            ("its directory", ".kube-agents", outside.parent),
+        ):
+            with self.subTest(label):
+                (self.tree / link).parent.mkdir(parents=True, exist_ok=True)
+                (self.tree / link).symlink_to(target)
+                paths, err = self.read()
+                (self.tree / link).unlink()
+                if (self.tree / link).parent != self.tree:
+                    (self.tree / link).parent.rmdir()
+                self.assertEqual(paths, [])
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
+                self.assertIn(f"`{link}` is a symbolic link", err)
+                self.assertIn("searching the whole tree", err)
+
     def test_the_walk_skips_git_and_symlinks(self):
         self.write("knowledge/a.md", "")
         self.write(".git/HOOKS.md", "")
