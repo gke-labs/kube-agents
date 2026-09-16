@@ -119,19 +119,24 @@ class RevalidationTest(unittest.TestCase):
         self._git("init", "-q", "-b", "main")
         self._git("config", "user.name", "fixture")
         self._git("config", "user.email", "fixture@example.invalid")
-        self.c1 = self._commit("c1", {"code.py": "v1", "docs/a.md": "v1", "README.md": "v1"})
+        self.c1 = self._commit("c1", {"agents/platform/SOUL.md": "v1", "docs/a.md": "v1", "README.md": "v1"})
         self.c2 = self._commit("c2", {"docs/a.md": "v2"})
         self.c3 = self._commit("c3", {"README.md": "v2"})
         self.c4 = self._commit("c4", {"docs/b.md": "v1"})
-        self.c5 = self._commit("c5", {"code.py": "v2"})
+        self.c5 = self._commit("c5", {"agents/platform/SOUL.md": "v2"})
         self.c6 = self._commit(
-            "c6", {"docs-evil.go": "v1", "sub/notes.md": "v1", "bench/OWNERS": "v1"}
+            "c6", {"agents-notes.md": "v1", "sub/notes.md": "v1", "bench/OWNERS": "v1"}
         )
         # c7 renames a non-inert file to an inert destination without editing
         # it -- 100% similarity, so git's rename detection would collapse it
         # to the destination path alone.
-        self._git("mv", "code.py", "docs/moved.md")
+        self._git("mv", "agents/platform/SOUL.md", "docs/moved.md")
         self.c7 = self._commit("c7", {})
+        # c9 is the class inverting the predicate added: paths the old
+        # denylist ran the eval for and the allowlist revalidates.
+        self.c9 = self._commit(
+            "c9", {"terraform/modules/gke-cluster/main.tf": "v1", "tests/test_x.py": "v1"}
+        )
 
     def _git(self, *args):
         subprocess.run(
@@ -247,7 +252,7 @@ class RevalidationTest(unittest.TestCase):
 
     # ── the one path that skips ──────────────────────────────────────────────
 
-    def test_green_history_plus_inert_deltas_reuses_the_verdict(self):
+    def test_green_history_plus_unmeasured_deltas_reuses_the_verdict(self):
         ls = self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -255,7 +260,7 @@ class RevalidationTest(unittest.TestCase):
         # Both delta file lists and the predicate are in the log.
         self.assertIn("docs/b.md", proc.stdout)
         self.assertIn("docs/a.md", proc.stdout)
-        self.assertIn("REVALIDATION_INERT_PATHS", proc.stdout)
+        self.assertIn("REVALIDATION_RUNTIME_PATHS", proc.stdout)
 
     def test_the_revalidated_log_line_shape_is_pinned(self):
         """Humans grep build logs for this line (and future collector support
@@ -284,13 +289,13 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"cat {prefix}/200/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/started.json", calls)
 
-    def test_identical_shas_are_trivially_inert(self):
+    def test_identical_shas_have_nothing_to_measure(self):
         """An empty delta means that side's tree is byte-identical to the one
         the green verdict graded -- reuse is correct, not an edge case."""
         ls = self._plant_history([("200", True, self.c2, self.c4)])
         proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
-        self.assertIn("trivially inert", proc.stdout)
+        self.assertIn("nothing to measure", proc.stdout)
 
     def test_the_newest_green_wins_and_the_sort_is_numeric(self):
         """Build 90 sorts after 1000 lexicographically; picking it here would
@@ -340,37 +345,51 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("no readable started.json", proc.stdout)
 
     def test_a_non_inert_file_in_the_head_delta_is_a_full_run(self):
-        # prev_head c1 -> cur_head c5 touches code.py alongside inert files.
+        # prev_head c1 -> cur_head c5 touches a prompt alongside inert files.
         ls = self._plant_history([("200", True, self.c2, self.c1)])
         proc = self._run(cur_head=self.c5, cur_base=self.c2, ls_file=ls)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
-        self.assertIn("code.py", proc.stdout)
+        self.assertIn("agents/platform/SOUL.md", proc.stdout)
 
     def test_a_non_inert_file_in_the_base_delta_is_a_full_run(self):
-        # Head side identical; main moved c1 -> c5, which touches code.py.
+        # Head side identical; main moved c1 -> c5, which touches a prompt.
         ls = self._plant_history([("200", True, self.c1, self.c4)])
         proc = self._run(cur_head=self.c4, cur_base=self.c5, ls_file=ls)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
-        self.assertIn("code.py", proc.stdout)
+        self.assertIn("agents/platform/SOUL.md", proc.stdout)
 
-    def test_the_inert_regex_is_root_anchored(self):
-        """docs-evil.go must not ride the docs/ branch, a .md below the root
-        is prompt content, and bench/OWNERS is not the root OWNERS file."""
+    def test_the_runtime_regex_is_root_anchored(self):
+        """bench/OWNERS is measured and forces a full run; agents-notes.md
+        merely starts with a covered prefix and must not be taken for one."""
         ls = self._plant_history([("200", True, self.c2, self.c4)])
         proc = self._run(cur_head=self.c6, cur_base=self.c2, ls_file=ls)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
-        for survivor in ("docs-evil.go", "sub/notes.md", "bench/OWNERS"):
-            self.assertIn(survivor, proc.stdout)
+        survivors = proc.stdout.split("files the eval measures changed", 1)[1]
+        self.assertIn("bench/OWNERS", survivors)
+        for ignored in ("agents-notes.md", "sub/notes.md"):
+            self.assertNotIn(ignored, survivors)
+
+    def test_a_newly_permitted_path_revalidates_through_the_script(self):
+        """terraform/ and tests/ are what inverting the predicate added.
+
+        The pattern assertions elsewhere compile it with Python `re`; this one
+        drives the real script, so a regression in the shell predicate cannot
+        hide behind a passing regex test.
+        """
+        ls = self._plant_history([("200", True, self.c7, self.c7)])
+        proc = self._run(cur_head=self.c9, cur_base=self.c7, ls_file=ls)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertIn("terraform/modules/gke-cluster/main.tf", proc.stdout)
 
     def test_a_rename_to_an_inert_path_is_a_full_run(self):
-        """`git mv code.py docs/moved.md` deletes non-inert content. With
+        """`git mv agents/... docs/moved.md` deletes prompt content. With
         rename detection on, the diff would list only the inert destination
         and the deletion would ride a reused green -- the --no-renames flag
         is what keeps the source path visible to the predicate."""
         ls = self._plant_history([("200", True, self.c2, self.c6)])
         proc = self._run(cur_head=self.c7, cur_base=self.c2, ls_file=ls)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
-        self.assertIn("code.py", proc.stdout)
+        self.assertIn("agents/platform/SOUL.md", proc.stdout)
 
     def test_a_forged_green_record_without_a_github_status_is_a_full_run(self):
         """The cross-PR forgery from kube-agents-bot's review: a fabricated
