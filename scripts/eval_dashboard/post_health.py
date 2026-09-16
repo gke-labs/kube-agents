@@ -326,12 +326,16 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     if health.get("slow") and not (prev or {}).get("slow"):
         kinds.append(KIND_SLOW)
 
-    # Rule 8, the same once-per-episode rule -- plus one re-post when the
-    # verdict changes inside an episode. `since` carries across a change, so
-    # without this a breach whose periodic then died would go quiet on the
-    # one fact the reader needs: the numbers stopped.
+    # Rule 8, once per episode, plus a re-post when the verdict changes or on a
+    # cause not yet named this episode. The cause picks the remedy and is
+    # recomputed from live occupancy hourly, so a long breach can switch from
+    # "onboard a project" to "raise the cap" with the verdict unchanged. Each
+    # cause once, since occupancy crosses zero repeatedly.
     pool = health.get("pool") or {}
-    if pool and pool.get("verdict") != (prev or {}).get("pool_verdict"):
+    told = prev or {}
+    if pool and (
+        pool.get("verdict") != told.get("pool_verdict") or pool.get("cause") not in (told.get("pool_causes") or [])
+    ):
         kinds.append(KIND_POOL)
     # Unlike rule 7, rule 8 says when it is over. The periodic judges a rolling
     # seven-day window, so an episode outlives the bad day by up to a week and
@@ -962,6 +966,13 @@ def run(
         pool_breached = pool_breached or (health.get("pool") or {}).get("verdict") == POOL_BREACH
     if KIND_POOL_CLEAR in sent:
         pool_breached = False
+    # The causes this episode has named. Appended only on a send, so a failed
+    # one is retried; emptied when a reading shows the episode over.
+    pool_causes = list(before.get("pool_causes") or [])
+    if KIND_POOL in sent and (health.get("pool") or {}).get("cause") not in pool_causes:
+        pool_causes.append((health.get("pool") or {}).get("cause"))
+    if not health.get("pool") and pool_was_read(health):
+        pool_causes = []
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,
         # fresh start is not announced later as a change.
@@ -988,6 +999,7 @@ def run(
             else before.get("pool_verdict")
         ),
         "pool_breached": pool_breached,
+        "pool_causes": pool_causes,
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),

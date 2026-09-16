@@ -839,6 +839,44 @@ class PoolNote(RunHarness):
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪"])
         self.assertEqual(self.recorded()["pool_verdict"], "STALE")
 
+    def test_a_cause_that_changes_inside_an_episode_is_told_again(self):
+        # The cause picks the remedy and is recomputed from live occupancy every
+        # hour, so a week-long breach switches from "onboard a project" to
+        # "raise the cap" with the verdict unchanged. Only this message carries
+        # a remedy; the digest line and the Brief sentence are cause-free.
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(11))
+        self.assertEqual(len(self.opener.requests), 2)
+        self.assertIn("pool full", self.opener.texts[0])
+        self.assertIn("concurrency cap", self.opener.texts[1])
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP"])
+
+    def test_a_cause_the_episode_already_named_is_not_repeated(self):
+        # Free projects cross zero repeatedly inside one episode, so CAPACITY
+        # comes back within the hour. The second one says nothing the first did
+        # not, and rule 8 is a once-per-episode note.
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(11))
+        self.tick(pooled(), self.at(12))
+        self.assertEqual(len(self.opener.requests), 2)
+
+    def test_a_cause_is_recorded_only_once_the_message_is_sent(self):
+        # A failed send must be retried, so the remedy is not marked told.
+        self.opener.statuses = [500]
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(), self.at(10, 15))
+        self.assertEqual(len(self.opener.requests), 2, "retried")
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"])
+
+    def test_a_new_episode_names_its_remedy_again(self):
+        # The list is the episode's, not the channel's memory: the same cause a
+        # month later is news.
+        self.tick(pooled(), self.at(10))
+        self.tick(cleared(), self.at(10, 15))
+        self.assertEqual(self.recorded()["pool_causes"], [])
+        self.tick(pooled(), self.at(10, 30))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "✅", "⏳"])
+
     def test_a_breach_that_goes_blind_before_it_drains_still_gets_its_clear(self):
         # The commonest way a long episode ends: the periodic dies, the note
         # goes ⚪, and the queue drains while nobody is measuring. Reading the
