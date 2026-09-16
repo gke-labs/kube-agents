@@ -262,7 +262,8 @@ Applying this stack is what makes it true. It provisions
 the project and nothing else, and grants `roles/iam.serviceAccountTokenCreator` on that
 account to the members in `var.fleet_reader_token_creators` — which defaults to
 `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, the identity every
-presubmit runs as. `hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
+presubmit runs as, and `eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com`,
+the nightly periodic's. `hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
 account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential
 naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
 `kubectl` asks for one.

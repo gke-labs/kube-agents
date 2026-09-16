@@ -264,12 +264,24 @@ done
 # and the build. Without these it leases a fully provisioned project and dies on
 # the first gcloud call (gke-labs/kube-agents#966).
 #
+# The nightly periodic (ci-kube-agents-eval-nightly) runs the same
+# hack/ci-eval-pr.sh against a leased project as its own identity,
+# eval-baseline-recorder@kube-agents-prow, kept apart from the presubmit's so
+# the baseline store can grant it a write the presubmit never holds
+# (docs/designs/eval-scorer.md). In the pool the two need the same set: a
+# project granting only the presubmit's account leases fine and dies at
+# get-credentials the first night it is drawn, as kube-agents-evals-10 did on
+# 2026-09-16 (gke-labs/kube-agents#1491). The same twelve, not a subset -- the
+# run is the same script end to end, so a partial grant fails at a later step
+# on a later night instead.
+#
 # The set kube-agents-evals holds, kept as measured rather than trimmed. No
 # Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
 # `gcloud builds submit` as substitutions, so Cloud Build does the push and the
 # GKE nodes do the pull. This account touches the registry at no point.
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
-echo "Granting the Prow runner access to ${PROJECT_ID}..."
+NIGHTLY_RUNNER_SA="serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+echo "Granting the Prow and nightly runners access to ${PROJECT_ID}..."
 for role in \
   roles/cloudbuild.builds.editor \
   roles/cloudbuild.builds.viewer \
@@ -283,10 +295,12 @@ for role in \
   roles/serviceusage.serviceUsageConsumer \
   roles/storage.admin \
   roles/viewer; do
-  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="${PROW_RUNNER_SA}" \
-    --role="${role}" \
-    --quiet >/dev/null
+  for member in "${PROW_RUNNER_SA}" "${NIGHTLY_RUNNER_SA}"; do
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+      --member="${member}" \
+      --role="${role}" \
+      --quiet >/dev/null
+  done
 done
 
 # ─── Artifact Registry Creation & Cleanup Policy ──────────────────────────────

@@ -92,11 +92,14 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
 - **Reader on the cache images**, in the Prow project's Artifact Registry repository that holds `hack/ci-deploy.sh`'s default `CACHE_IMAGE` and the `:buildcache` manifests beside it — a repository at location `us`, not `us-central1`, and not in the pool project. Both identities need `roles/artifactregistry.reader` there, and the verifier fails the project if either is missing:
   - `${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`
   - `${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`
-- **The Prow runner's access to the project.** Every other grant on this page is for an identity inside the project. This one is not: the presubmit runs on the Prow build cluster as the Prow runner's service account (`PROW_RUNNER_SA` in `scripts/provision_ci_pool_project.sh`, `PROW_RUNNER_MEMBER` in the verifier), leases the project, and reaches in to fetch cluster credentials, apply the chart, submit the build and read the logs back. Nothing in the project's own configuration implies it, which is how projects 4 to 6 were provisioned, verified green and registered without it — until a lease of `kube-agents-evals-6` died on `Required "container.clusters.get" permission(s)` ([#966](https://github.com/gke-labs/kube-agents/pull/966)). Grant all twelve:
+- **The runners' access to the project.** Every other grant on this page is for an identity inside the project. These are not: the presubmit runs on the Prow build cluster as the Prow runner's service account (`PROW_RUNNER_SA` in `scripts/provision_ci_pool_project.sh`, `PROW_RUNNER_MEMBER` in the verifier), and the nightly periodic runs the same `hack/ci-eval-pr.sh` as its own (`NIGHTLY_RUNNER_SA` / `NIGHTLY_RUNNER_MEMBER`; why it is a separate account is in [`designs/eval-scorer.md`](designs/eval-scorer.md)). Each leases the project and reaches in to fetch cluster credentials, apply the chart, submit the build and read the logs back. Nothing in the project's own configuration implies either, which is how projects 4 to 6 were provisioned, verified green and registered without the first — until a lease of `kube-agents-evals-6` died on `Required "container.clusters.get" permission(s)` ([#966](https://github.com/gke-labs/kube-agents/pull/966)) — and how the whole pool stood without the second until the nightly's second run leased `kube-agents-evals-10` and died on the same denial ([#1491](https://github.com/gke-labs/kube-agents/issues/1491)). Grant all twelve to both:
 
   ```bash
-  # PROW_RUNNER_SA is the member scripts/provision_ci_pool_project.sh grants.
+  # The members scripts/provision_ci_pool_project.sh grants. The nightly needs
+  # the same twelve, not a subset: it runs the same script end to end, so a
+  # partial grant fails at a later step on a later night instead of here.
   PROW_RUNNER_SA="$(sed -n 's/^PROW_RUNNER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
+  NIGHTLY_RUNNER_SA="$(sed -n 's/^NIGHTLY_RUNNER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
   for role in roles/cloudbuild.builds.editor roles/cloudbuild.builds.viewer \
               roles/container.admin roles/container.developer \
               roles/iam.serviceAccountAdmin roles/iam.serviceAccountUser \
@@ -104,13 +107,21 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
               roles/resourcemanager.projectIamAdmin \
               roles/serviceusage.serviceUsageConsumer \
               roles/storage.admin roles/viewer; do
-    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-      --member="${PROW_RUNNER_SA}" \
-      --role="${role}" --quiet >/dev/null
+    for member in "${PROW_RUNNER_SA}" "${NIGHTLY_RUNNER_SA}"; do
+      gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member="${member}" \
+        --role="${role}" --quiet >/dev/null
+    done
   done
+  # The nightly also borrows the seeded-fleet reader (section 6.1). Re-applying
+  # bench/tf/fleet grants this; the line is for a project holder without the
+  # fleet state to hand, and a later apply keeps it.
+  gcloud iam service-accounts add-iam-policy-binding \
+    "seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com" --project="${PROJECT_ID}" \
+    --member="${NIGHTLY_RUNNER_SA}" --role="roles/iam.serviceAccountTokenCreator" --quiet >/dev/null
   ```
 
-  `scripts/provision_ci_pool_project.sh` makes this grant for any project it onboards; the block above is for repairing one provisioned before it did. The list is what `kube-agents-evals` holds, kept as measured rather than trimmed so a new project matches one a presubmit has passed on. It is not minimal — `container.admin` subsumes `container.developer`, `viewer` subsumes `logging.viewer` and `cloudbuild.builds.viewer`. No Artifact Registry role is in it: `hack/ci-deploy.sh` builds and pushes through `gcloud builds submit`, so Cloud Build holds the registry credentials and the runner never touches the registry itself.
+  `scripts/provision_ci_pool_project.sh` makes these grants for any project it onboards; the block above is for repairing one provisioned before it did — before #966 for the Prow runner's, before #1491 for the nightly's, which is every project onboarded up to 2026-09-16. Every command in it is idempotent, so running it against a project that already holds part of the set changes only what is missing. The list is what `kube-agents-evals` holds, kept as measured rather than trimmed so a new project matches one a presubmit has passed on. It is not minimal — `container.admin` subsumes `container.developer`, `viewer` subsumes `logging.viewer` and `cloudbuild.builds.viewer`. No Artifact Registry role is in it: `hack/ci-deploy.sh` builds and pushes through `gcloud builds submit`, so Cloud Build holds the registry credentials and neither runner touches the registry itself.
 
 - **The platform agent's project roles, checked in both directions.** The agent under test authenticates as `kubeagents-platform-gsa@${PROJECT_ID}`, so this is the one set on this page where an _extra_ role fails the project as well as a missing one. The read-only roles come from `local.read_only_roles` in [`terraform/examples/full-install`](../terraform/examples/full-install/README.md), which is what the install passes to the IAM module — the module's own `project_roles` default is never read on that path. The verifier hardcodes the list as `PLATFORM_GSA_ROLES` so it can run without a Terraform toolchain, and a unit test asserts both the composition and the module default match it, so narrowing either fails in CI rather than failing every project weeks later.
 
@@ -288,9 +299,9 @@ A half-finished apply is the case to watch for. The stack's Kubernetes provider 
 
 ### 6.1 A read-only credential for the checks
 
-An eval run reads the fleet to confirm its fixtures survived; it has no business being able to change them, and a safeguard is worth less when the credential that checks it could also have caused what it is checking for. The apply above handles this: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` with `roles/container.viewer` and nothing else, and binds `roles/iam.serviceAccountTokenCreator` on that account to `fleet_reader_token_creators`, which defaults to the Prow identity. `hack/ci-eval-pr.sh` already exports `FLEET_READONLY_SA` pointing at the account, so `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential naming `hack/fleet-reader-credential.sh`, which impersonates that account whenever `kubectl` asks for a token. It is an exec plugin rather than a token in the file because a minted token lives one hour and a presubmit runs for three.
+An eval run reads the fleet to confirm its fixtures survived; it has no business being able to change them, and a safeguard is worth less when the credential that checks it could also have caused what it is checking for. The apply above handles this: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` with `roles/container.viewer` and nothing else, and binds `roles/iam.serviceAccountTokenCreator` on that account to `fleet_reader_token_creators`, which defaults to both runner identities, the presubmit's and the nightly's (`RUNNERS` in the verifier). `hack/ci-eval-pr.sh` already exports `FLEET_READONLY_SA` pointing at the account, so `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential naming `hack/fleet-reader-credential.sh`, which impersonates that account whenever `kubectl` asks for a token. It is an exec plugin rather than a token in the file because a minted token lives one hour and a presubmit runs for three.
 
-That default landed after the pool was provisioned. A project applied before it lacks the binding — and the oldest three lack the account as well, since it postdates them — so `hack/fleet-kubeconfigs.sh` warns per cluster and the kubeconfigs keep the runner's own `roles/container.admin` on a fleet every open pull request shares; there are no in-cluster RoleBindings to narrow, GKE's IAM webhook is the whole authorization path. Section 7's check fails either case, and re-applying the stack against the project is the repair for both.
+That default landed after the pool was provisioned. A project applied before it lacks the binding — and the oldest three lack the account as well, since it postdates them — so `hack/fleet-kubeconfigs.sh` warns per cluster and the kubeconfigs keep the runner's own `roles/container.admin` on a fleet every open pull request shares; there are no in-cluster RoleBindings to narrow, GKE's IAM webhook is the whole authorization path. Section 7's check fails either case, and re-applying the stack against the project is the repair for both. The nightly's entry landed later still ([#1491](https://github.com/gke-labs/kube-agents/issues/1491)), so a project applied between the two has the account and the presubmit's binding but not the nightly's; the check names the member that is missing, and the repair is the same re-apply, or the one-line grant that closes section 3's block.
 
 ## 7. Pre-flight verification
 

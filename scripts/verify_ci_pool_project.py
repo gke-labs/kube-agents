@@ -196,6 +196,26 @@ AR_PULLER_ROLES = AR_WRITER_ROLES | {"roles/artifactregistry.reader"}
 # `Required "container.clusters.get" permission(s)`.
 PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
+# The nightly periodic (ci-kube-agents-eval-nightly) runs the same
+# hack/ci-eval-pr.sh against a leased project as its own identity, kept apart
+# from the presubmit's so the baseline store can grant it a write the presubmit
+# never holds (docs/designs/eval-scorer.md). Apart in kube-agents-prow, equal in
+# the pool: on 2026-09-16 the second nightly leased kube-agents-evals-10 and
+# died at get-credentials on the same `container.clusters.get` denial as #966,
+# holding no role there at all (gke-labs/kube-agents#1491).
+NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+
+# Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
+# as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
+# project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
+# missing grant is reported under its label. Kept equal to the grant loop in
+# scripts/provision_ci_pool_project.sh and to bench/tf/fleet's
+# `fleet_reader_token_creators` default by scripts/test_verify_ci_pool_project.py.
+RUNNERS = (
+    ("The Prow runner", "a presubmit", PROW_RUNNER_MEMBER),
+    ("The nightly runner", "the nightly periodic", NIGHTLY_RUNNER_MEMBER),
+)
+
 # The set kube-agents-evals holds, matched literally rather than by permission.
 # Not minimal -- container.admin subsumes container.developer, viewer subsumes
 # logging.viewer and cloudbuild.builds.viewer -- but the point is that a new
@@ -735,7 +755,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
+    """Verify Workload Identity, both runners' and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     passed = True
@@ -826,7 +846,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         if not _record_unreadable(
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
-            f"Could not read the project IAM policy on {project_id}, so the Prow runner's twelve roles, "
+            f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -838,7 +858,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             policy = _load_json(out)
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
-            prow_held = set()
+            runner_held = {member: set() for _, _, member in RUNNERS}
             platform_held = set()
             litellm_held = set()
             public_held = set()
@@ -858,22 +878,24 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                 # gap to close before one does rather than a live hole.
                 if b.get("condition"):
                     continue
-                if PROW_RUNNER_MEMBER in members:
-                    prow_held.add(b.get("role"))
+                for _, _, member in RUNNERS:
+                    if member in members:
+                        runner_held[member].add(b.get("role"))
                 if platform_member in members:
                     platform_held.add(b.get("role"))
                 if litellm_member in members:
                     litellm_held.add(b.get("role"))
 
-            missing = PROW_RUNNER_ROLES - prow_held
-            if missing:
-                passed = False
-                details.append(
-                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
-                    f"{len(missing)} role(s) on {project_id}: {', '.join(sorted(missing))}. "
-                    "A presubmit authenticates as this account after leasing the project, so it "
-                    "will fail on the first gcloud call rather than at registration"
-                )
+            for label, job, member in RUNNERS:
+                missing = PROW_RUNNER_ROLES - runner_held[member]
+                if missing:
+                    passed = False
+                    details.append(
+                        f"{label} ({member.split(':', 1)[1]}) is missing "
+                        f"{len(missing)} role(s) on {project_id}: {', '.join(sorted(missing))}. "
+                        f"{job[0].upper()}{job[1:]} authenticates as this account after leasing the "
+                        "project, so it will fail on the first gcloud call rather than at registration"
+                    )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
@@ -1000,19 +1022,19 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         fleet_reader_checked = True
         try:
             policy = _load_json(out)
-            token_creator_bound = any(
-                b.get("role") == "roles/iam.serviceAccountTokenCreator"
-                and PROW_RUNNER_MEMBER in b.get("members", [])
-                for b in policy.get("bindings", [])
-            )
-            if not token_creator_bound:
-                passed = False
-                details.append(
-                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
-                    f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so every "
-                    f"fleet check in this project runs under the runner's own read-write "
-                    f"credential. Re-apply bench/tf/fleet against {project_id}."
-                )
+            token_creators = set()
+            for b in policy.get("bindings", []):
+                if b.get("role") == "roles/iam.serviceAccountTokenCreator":
+                    token_creators.update(b.get("members", []))
+            for label, _, member in RUNNERS:
+                if member not in token_creators:
+                    passed = False
+                    details.append(
+                        f"{label} ({member.split(':', 1)[1]}) is missing "
+                        f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so every "
+                        f"fleet check it runs in this project runs under its own read-write "
+                        f"credential. Re-apply bench/tf/fleet against {project_id}."
+                    )
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
@@ -1021,7 +1043,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     partial = _partial_summary(
         [
             ("the Workload Identity binding", wi_checked),
-            ("the Prow runner and platform GSA project roles", roles_checked),
+            ("the runners' and platform GSA project roles", roles_checked),
             ("the cross-project AR reader grants", prow_checked),
             ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
@@ -1032,7 +1054,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         message = partial
     else:
         message = (
-            "Workload Identity, Prow runner and platform GSA project roles, "
+            "Workload Identity, both runners' and platform GSA project roles, "
             "cross-project AR reader grants, and the fleet reader's token-creator "
             "binding verified"
         )
