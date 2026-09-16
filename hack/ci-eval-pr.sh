@@ -715,8 +715,9 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # own.
 #
 # The other half is the token-creator grant -- `fleet_reader_token_creators`
-# in bench/tf/fleet/variables.tf, which now defaults to the Prow runner, so an
-# apply of that stack grants it. In a project whose fleet was applied before
+# in bench/tf/fleet/variables.tf, which defaults to both runners, the
+# presubmit's and the nightly's, so an apply of that stack grants each. In a
+# project whose fleet was applied before
 # that default landed, `gcloud auth print-access-token
 # --impersonate-service-account` fails, fleet-kubeconfigs.sh warns per cluster,
 # and the role kubeconfigs keep the runner's own read-write credential. That is

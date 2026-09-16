@@ -240,8 +240,9 @@ and in another pull request's logs.
 
 The checks are enforced in a project whose fleet has been re-applied. `bench/tf/fleet`
 provisions `seeded-fleet-reader@<project>` with `roles/container.viewer` and nothing
-else, and `fleet_reader_token_creators` defaults to the Prow runner, so an apply lets
-`hack/fleet-kubeconfigs.sh` write per-role kubeconfigs that impersonate the reader. A
+else, and `fleet_reader_token_creators` defaults to both runners, the presubmit's and the
+nightly's, so an apply lets `hack/fleet-kubeconfigs.sh` write per-role kubeconfigs that
+impersonate the reader. A
 check on such a project cannot write what it grades.
 
 No pool project is in that state yet. Every one had its fleet applied before that
