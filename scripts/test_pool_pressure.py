@@ -815,11 +815,8 @@ class JsonOutput(unittest.TestCase):
 class JunitOutput(unittest.TestCase):
     """The --junit file is what the TestGrid tab reads, so it is an interface.
 
-    Its `testgrid-in-cell-metric: value` annotation prints and graphs the
-    `value` property per row. Two shapes are pinned here because each would
-    mislead quietly: a metric row that can fail double-alerts beside the
-    verdict row, and a zero written for a number that was not measured graphs
-    as a healthy reading.
+    The row design and the reasons for it are with the JUNIT_* constants in
+    pool_pressure.py; every shape they argue for is pinned here.
     """
 
     def _junit(self, **kwargs):
@@ -874,8 +871,6 @@ class JunitOutput(unittest.TestCase):
         self.assertEqual(str(payload["pool"]["free"]), self._value(rows[pp.JUNIT_ROW_FREE]))
 
     def test_only_the_verdict_row_can_fail(self):
-        """TestGrid counts consecutive failures per row. A metric row that
-        failed too would alert about the breach the verdict row already is."""
         _, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
         for name, case in self._rows(root).items():
             if name != pp.JUNIT_ROW_VERDICT:
@@ -930,8 +925,6 @@ class JunitOutput(unittest.TestCase):
                          rows[pp.JUNIT_ROW_VERDICT].find("failure").get("message"))
 
     def test_a_window_with_no_runs_skips_the_setup_rows_rather_than_writing_zero(self):
-        """The sweep read GCS and found nothing. Its percentiles are 0.0, which
-        would graph as an instant queue on a day nothing ran."""
         code, root = self._junit(from_dir=QUIET_DIR,
                                  as_of=datetime(2020, 1, 1, tzinfo=timezone.utc),
                                  window_days=1)
@@ -943,6 +936,51 @@ class JunitOutput(unittest.TestCase):
             self.assertIsNotNone(skipped, name)
             self.assertEqual(pp.JUNIT_NO_RUNS_MESSAGE, skipped.get("message"))
             self.assertIsNone(self._value(rows[name]), name)
+
+    def _payload(self, **kwargs):
+        _, out = run(as_json=True, **kwargs)
+        return json.loads(out)
+
+    def test_a_sweep_the_deadline_cut_short_skips_the_setup_rows(self):
+        """The text report and --json both flag a truncated sweep; the graph
+        cannot, so a percentile over fewer days than the row names is not
+        written. `--from-dir` never truncates, so the summary is edited."""
+        payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        payload["trend"]["truncated"] = True
+        payload["trend"]["window_start"] = "2026-08-27T00:00:00Z"
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        for name in (pp.JUNIT_ROW_P50, pp.JUNIT_ROW_P95):
+            skipped = rows[name].find("skipped")
+            self.assertIsNotNone(skipped, name)
+            self.assertIn("2026-08-27T00:00:00Z", skipped.get("message"))
+            self.assertIn("ran out of time", skipped.get("message"))
+            self.assertIsNone(self._value(rows[name]), name)
+        # The other rows do not depend on the sweep's window.
+        self.assertEqual("150.0", self._value(rows[pp.JUNIT_ROW_QUEUE]))
+        self.assertIsNotNone(rows[pp.JUNIT_ROW_VERDICT].find("failure"))
+
+    def test_a_control_character_in_a_source_error_does_not_break_the_file(self):
+        """Skip messages carry kubectl and gcloud stderr verbatim. ElementTree
+        writes a C0 byte through, and one escape sequence would drop every row
+        on the run that had a failure to report."""
+        payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        payload["queue"]["read"] = False
+        payload["queue"]["error"] = "Deck: \x1b[31mgone\x1b[0m\x00"
+        payload["cause_text"] = ["bell \x07 here"]
+        root = ET.fromstring(pp.junit_report(payload))
+        rows = self._rows(root)
+        skipped = rows[pp.JUNIT_ROW_QUEUE].find("skipped")
+        self.assertEqual("Deck: [31mgone[0m", skipped.get("message"))
+        self.assertEqual("bell  here", rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
+
+    def test_the_skip_reason_is_in_the_attribute_and_the_text(self):
+        """JUnit readers differ on which one they show."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink(os.path.join(BREACH_DIR, "prowjobs"), os.path.join(tmp, "prowjobs"))
+            _, root = self._junit(from_dir=tmp, as_of=BREACH_AS_OF, window_days=1)
+        skipped = self._rows(root)[pp.JUNIT_ROW_FREE].find("skipped")
+        self.assertEqual(skipped.get("message"), skipped.text)
+        self.assertIn("boskos.json", skipped.text)
 
     def test_the_verdict_row_names_the_cause_when_a_breach_has_one(self):
         with tempfile.TemporaryDirectory() as tmp:

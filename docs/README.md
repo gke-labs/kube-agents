@@ -214,7 +214,7 @@ identifier appears, add its source here.
 | Who may set the `approved` label on a change | `OWNERS`, `hack/OWNERS`, and `OWNERS_ALIASES` |
 | Which labels Tide merges on, and which Prow presubmits gate | `prow/oss/config.yaml` and `prow/prowjobs/gke-labs/kube-agents/` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository |
 | Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`) and the `triage` permission grant | external tide automation and GitHub repo settings (not in-tree); named in `AGENTS.md` and `agents/contributor/AGENTS.md` |
-| Queue-wait thresholds that justify onboarding an eval project, and the window they run over | `scripts/pool_pressure.py` |
+| Queue-wait thresholds that justify onboarding an eval project, the window they run over, and the JUnit row names and metric property the TestGrid tab reads | `scripts/pool_pressure.py` |
 | Presubmit-gate health rules (windows, thresholds, hysteresis), the Chat posting variables and the digest hour | `scripts/eval_dashboard/health.py`, `scripts/eval_dashboard/post_health.py` and `.github/workflows/ci-health.yml` |
 | The eval dashboard's roster-page contract (the `demoted YYYY-MM-DD` phrase inside a `- **case-name** —` hold-out bullet), its page files and its URL parameter vocabularies | `ROSTER_ENTRY_RE` / `DEMOTED_RE` and `PAGES` in `scripts/eval_dashboard/render.py`; `linkState()` in `scripts/eval_dashboard/template/pages.js` |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |

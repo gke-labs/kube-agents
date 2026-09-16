@@ -309,11 +309,26 @@ JUNIT_ROW_NAMES = (
     JUNIT_ROW_QUEUE,
     JUNIT_ROW_FREE,
 )
-# The setup rows' skip message when the sweep read GCS and found no runs; the
-# trend source carries no error string in that case.
+# The setup rows are also skipped, not graphed, when the number does not cover
+# the window the row names: a sweep that read GCS and found no runs has
+# percentiles of zero, and a sweep the deadline cut short has percentiles over
+# fewer days that would sit on the graph beside whole-window points and read as
+# one of them. The trend source carries no error string in either case.
 JUNIT_NO_RUNS_MESSAGE = "no runs were created in the window"
+JUNIT_TRUNCATED_MESSAGE = (
+    "the sweep ran out of time and covers only {window_start} onward, "
+    "not the whole window"
+)
 JUNIT_ENCODING = "utf-8"
 JUNIT_INDENT = "  "
+# Skip messages and the failure body carry raw stderr from kubectl and gcloud.
+# ElementTree escapes markup but writes any other control byte through, and one
+# escape sequence makes the whole file unparseable -- every row gone on exactly
+# the run that had a source failure to report. Everything outside XML 1.0's
+# Char production is dropped before it reaches an attribute or text node.
+XML_INVALID_CHARS = re.compile(
+    "[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
+)
 
 
 def _gap(start: Optional[datetime], end: Optional[datetime]) -> Optional[float]:
@@ -1597,18 +1612,22 @@ def _junit_value(case: ET.Element, value) -> None:
     )
 
 
+def _xml_text(text: Optional[str]) -> str:
+    return XML_INVALID_CHARS.sub("", text or "")
+
+
 def _junit_skip(case: ET.Element, message: Optional[str]) -> None:
-    ET.SubElement(case, "skipped", message=message or SEGMENT_UNMEASURED)
+    # The reason goes in both places because JUnit readers differ on which
+    # they show: the attribute is the schema's, the text is what several print.
+    reason = _xml_text(message) or SEGMENT_UNMEASURED
+    ET.SubElement(case, "skipped", message=reason).text = reason
 
 
 def junit_report(summary: dict) -> str:
     """The run as JUnit, one <testcase> per row, from the same data --json emits.
 
-    Five rows in a fixed order. The verdict row fails exactly when the run exits
-    non-zero -- a breach and an unmeasured run both -- with the cause in the
-    message so a red cell reads without opening the build log. The four metric
-    rows never fail; each carries its number as the property TestGrid graphs, or
-    is skipped with the source's error when the number was not measured.
+    The rows, what may fail, and why a number the run could not measure is a
+    skipped row rather than a zero are with the JUNIT_* constants above.
     """
     trend = summary["trend"]
     queue = summary["queue"]
@@ -1621,13 +1640,20 @@ def junit_report(summary: dict) -> str:
         message = summary["verdict"]
         if summary["cause"]:
             message += f" ({summary['cause']})"
-        failure = ET.SubElement(verdict, "failure", message=message)
-        failure.text = "\n".join(summary["cause_text"]) or (trend["error"] or "")
+        failure = ET.SubElement(verdict, "failure", message=_xml_text(message))
+        failure.text = _xml_text("\n".join(summary["cause_text"]) or trend["error"])
 
-    # A window the sweep read and found empty has percentiles of zero, which
-    # would graph as an instant queue on a day nothing ran.
-    setup_measured = trend["read"] and trend["runs"] > 0
-    setup_skip = trend["error"] if not trend["read"] else JUNIT_NO_RUNS_MESSAGE
+    # Skipped unless the percentile covers the window the row names; the
+    # constants above say why an empty or a cut-short window is not graphed.
+    if not trend["read"]:
+        setup_measured, setup_skip = False, trend["error"]
+    elif trend["truncated"]:
+        setup_measured = False
+        setup_skip = JUNIT_TRUNCATED_MESSAGE.format(window_start=trend["window_start"])
+    elif trend["runs"] == 0:
+        setup_measured, setup_skip = False, JUNIT_NO_RUNS_MESSAGE
+    else:
+        setup_measured, setup_skip = True, None
     for name, key in ((JUNIT_ROW_P50, "p50_minutes"), (JUNIT_ROW_P95, "p95_minutes")):
         case = _junit_case(suite, name)
         if setup_measured:
@@ -1834,9 +1860,8 @@ def main() -> int:
         metavar="PATH",
         help=(
             "also write the findings as a JUnit file at this path, one test case "
-            "per row, for TestGrid's in-cell metric. Only the verdict row can "
-            "fail, and it fails exactly when the exit code is non-zero; a number "
-            "the run could not measure is a skipped row rather than a zero. The "
+            "per row, for the TestGrid tab's in-cell metric. Only the verdict row "
+            "can fail; a number the run could not measure is a skipped row. The "
             "exit code is unchanged."
         ),
     )
