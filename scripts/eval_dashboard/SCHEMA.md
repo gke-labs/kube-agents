@@ -156,10 +156,13 @@ the same layout and is collected from the moment it starts running.
       for a rep the log never graded (dropped, never an entry of its own),
       and every build graded before the line existed. `classify.py`'s
       `excerpt_of` reads it into the Brief's "What the agent saw" quote, the
-      run page's case card and a case's `last_failure`; nothing is quoted
-      when it is absent. The PR gate comment's Reason line stays the
-      grader's `reason` and falls back to the excerpt only for a rep that
-      has no reason at all.
+      run page's case card and a case's `last_failure`, always from the
+      repetition whose `reason` is shown, so the quote and the check beside
+      it come from the same run of the agent; nothing is quoted when that
+      rep has none (when no rep carries a reason, the first excerpt on
+      record stands). The PR gate comment's Reason line stays the grader's
+      `reason` and falls back to the excerpt only for a rep that has no
+      reason at all.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;

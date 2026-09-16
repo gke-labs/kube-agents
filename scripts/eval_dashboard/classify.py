@@ -363,23 +363,37 @@ def clean_reason(reason: str | None) -> str:
     return REASON_SCORE_PREFIX_RE.sub("", reason or "").strip()
 
 
-def first_reason(task: dict) -> str:
-    """The first graded failure's reason, else the first storm rep's."""
+def reason_rep(task: dict) -> dict | None:
+    """The repetition whose reason the pages show: the first graded failure
+    with a reason, else the first rep of any kind with one; None when no
+    rep carries a reason."""
     graded = [r for r in task_reps(task) if rep_kind(r) == "fail" and r.get("reason")]
     other = [r for r in task_reps(task) if r.get("reason")]
     for rep in graded + other:
-        return clean_reason(rep.get("reason"))
-    return ""
+        return rep
+    return None
+
+
+def first_reason(task: dict) -> str:
+    """The first graded failure's reason, else the first storm rep's."""
+    rep = reason_rep(task)
+    return clean_reason(rep.get("reason")) if rep else ""
 
 
 def excerpt_of(task: dict) -> str | None:
-    """A report excerpt, when a collector ever records one (additive,
-    optional: ``tasks[].excerpt`` or ``reps[].excerpt``). Never invented."""
+    """A report excerpt, when the collector recorded one (additive, optional):
+    ``tasks[].excerpt``, else the ``excerpt`` of the repetition whose reason
+    ``first_reason`` shows, so the quote and the check beside it come from
+    the same run of the agent: a rep that said nothing quotes nothing, and
+    another rep's words never stand in. When no rep carries a reason there
+    is nothing to pair with, and the first rep's excerpt stands (the gate
+    comment's fallback for a rep with no reason). Never invented."""
     if isinstance(task.get("excerpt"), str) and task["excerpt"].strip():
         return task["excerpt"].strip()
-    for rep in task_reps(task):
-        if isinstance(rep.get("excerpt"), str) and rep["excerpt"].strip():
-            return rep["excerpt"].strip()
+    rep = reason_rep(task)
+    for candidate in [rep] if rep else task_reps(task):
+        if isinstance(candidate.get("excerpt"), str) and candidate["excerpt"].strip():
+            return candidate["excerpt"].strip()
     return None
 
 
