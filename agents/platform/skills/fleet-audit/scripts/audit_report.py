@@ -626,6 +626,10 @@ DECLARED_INTENT_SOURCES_KEY = "declared_intent_sources"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
 FRONTMATTER_DELIMITER = "---"
+# U+FEFF: what an editor that writes a UTF-8 byte-order mark puts before the
+# first `---`. `str.strip()` does not remove it (it is not whitespace), so it
+# is dropped by name before the delimiter check.
+UTF8_BOM = "\ufeff"
 FRONTMATTER_END_DELIMITERS = ("---", "...")
 OKF_TYPE_KEY = "type"
 OKF_TITLE_KEY = "title"
@@ -2462,8 +2466,11 @@ def _split_note(text: str) -> tuple[str, str] | None:
 
     None for a file that does not open with the delimiter, or opens one and
     never closes it: neither is an OKF note, and neither declares anything.
+    A leading UTF-8 byte-order mark is not part of the first line: without
+    this a note saved by an editor that writes one would be read, counted
+    as searched and declare nothing, with no warning anywhere.
     """
-    lines = normalise_newlines(text).split("\n")
+    lines = normalise_newlines(text).lstrip(UTF8_BOM).split("\n")
     if not lines or lines[0].strip() != FRONTMATTER_DELIMITER:
         return None
     for index in range(1, len(lines)):

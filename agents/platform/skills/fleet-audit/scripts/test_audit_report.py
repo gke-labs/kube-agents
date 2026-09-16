@@ -5209,6 +5209,17 @@ class TestDeclarationParsing(unittest.TestCase):
         self.assertIsNone(audit_report.split_frontmatter("---\ntype: x\n"))
         self.assertEqual(audit_report.split_frontmatter("---\ntype: x\n...\n"), "type: x")
 
+    def test_a_utf8_byte_order_mark_before_the_delimiter_is_not_part_of_it(self):
+        # `str.strip()` leaves U+FEFF in place, so without the explicit strip the
+        # note would read as having no frontmatter and declare nothing, quietly.
+        entries, err = parse("\ufeff" + note([declaration()]))
+        self.assertEqual(err, "")
+        self.assertEqual([e["check"] for e in entries], ["no-pdb"])
+        self.assertEqual(entries[0]["excerpt"], "checkout-gateway runs unbudgeted")
+        self.assertEqual(audit_report.split_frontmatter("\ufeff---\ntype: x\n---\n"), "type: x")
+        # Only a leading mark is the encoder's; one inside the text stays text.
+        self.assertIsNone(audit_report.split_frontmatter("x\ufeff---\ntype: x\n---\n"))
+
     def test_the_excerpt_falls_back_to_the_first_heading_then_the_path(self):
         heading, _ = parse(note([declaration()], title=None, body="\n# Checkout runs without a budget\n"))
         self.assertEqual(heading[0]["excerpt"], "Checkout runs without a budget")
@@ -5244,6 +5255,14 @@ class TestIntentPaths(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             paths = audit_report.read_intent_paths(self.tree, "acme/fleet")
         return paths, err.getvalue()
+
+    def test_a_byte_order_mark_before_the_list_still_bounds_the_walk(self):
+        # PyYAML drops a leading U+FEFF itself; this pins that the intent file
+        # written by a BOM-emitting editor is the owner's bound, not a warning.
+        self.write(".kube-agents/intent.yaml", "\ufeffpaths:\n  - knowledge/\n")
+        paths, err = self.read()
+        self.assertEqual(paths, ["knowledge"])
+        self.assertEqual(err, "")
 
     def test_a_valid_list_bounds_the_walk(self):
         self.write(".kube-agents/intent.yaml", "paths:\n  - knowledge/\n  - docs/intent.md\n")
@@ -5416,6 +5435,18 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
             [{"repo": "acme/fleet", "ref": None, "paths": ["knowledge"]}],
         )
         self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_note_saved_with_a_byte_order_mark_still_declares(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        target = self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        target.write_bytes(b"\xef\xbb\xbf" + target.read_bytes())
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            [(e["path"], e["check"], e["excerpt"]) for e in self.filed()],
+            [("knowledge/checkout.md", "no-pdb", "checkout-gateway runs unbudgeted")],
+        )
+        self.assertNotIn("WARNING", self.err)
 
     def test_no_sha_for_the_checkout_leaves_it_unsearched(self):
         # The recorder answers `git rev-parse HEAD` with nothing.
