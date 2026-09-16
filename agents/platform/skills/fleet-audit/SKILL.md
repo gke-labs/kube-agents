@@ -727,8 +727,8 @@ The withhold binds the direct-ask path too: `remediate --finding <id>` applies i
 record and refuses a withheld id by name, because a pull request for a posture the ledger says was
 held back would contradict the ledger. It applies the harness's declarations the same way, and
 refuses an id a declaration covers for the same reason. A `/remediate` comment naming a withheld
-posture is deferred, not refused — see the answers list under
-[Remediation pull requests](#remediation-pull-requests).
+posture is deferred, not refused, and one naming a declared posture is refused with the declaring
+file named — see the answers list under [Remediation pull requests](#remediation-pull-requests).
 
 ## Evidence rules
 
@@ -840,7 +840,11 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   failed and the next run will retry. "3 requests processed" is indistinguishable from "3 requests
   silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
-  finding that is not in the current document, or one naming a non-`manifest` finding.
+  finding that is not in the current document, one naming a non-`manifest` finding, or one naming
+  a posture a repository declaration covers, the model's entry or the harness's: the reply names
+  the declaring `repo:path`, on the findings branch and the clean branch alike, since neither
+  "typo" nor "no longer reproduces" is true of it. Removing the declaration brings the finding
+  back, and a new request then opens it.
 - **Deferred**, when the target is a posture this run withheld for want of a declared-intent search
   ([`declared_intent_searched`](#declared_intent_searched)) — on the findings branch and on the clean
   branch alike, since "no longer reproduces" would be false there. One reply says the request is on

@@ -6036,6 +6036,85 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(len(self.stdout_json()["prs_opened"]), 1)
 
+    # -- a standing /remediate on a declared posture ---------------------------
+
+    def ledger_with(self, *comments):
+        self.harness.replies.update(
+            {
+                "issue list": self.issue_list(),
+                "--json comments": json.dumps({"comments": list(comments)}),
+            }
+        )
+
+    def test_a_ledger_request_for_a_declared_posture_is_refused_with_the_file_named(self):
+        """The id was right and the posture is declared: neither "typo" nor a hold.
+
+        The join takes the posture out of `findings` before the ledger's
+        comments are parsed, so read against `findings` alone the request
+        would fall to "not a finding in the current report". It is refused on
+        the permanent marker with the declaring file named, as the CLI path
+        refuses `--finding`, because a declaration is the owner's standing
+        choice and the request does not stay open against it.
+        """
+        self.record()
+        self.file(self.entry())
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
+        self.assertIn("Declared intent", refusals[0])
+        self.assertNotIn("typo", refusals[0])
+        self.assertNotIn("may have been resolved", refusals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+        self.assertNotIn(
+            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+        )
+
+    def test_a_clean_run_refuses_a_request_for_a_declared_posture(self):
+        # The one finding was the declared posture, so the run lands on the
+        # CLEAN branch with no gap. "No longer reproduces" would be false — it
+        # reproduces and is listed under Declared intent — so the request is
+        # refused there too, with the file named, and not acked.
+        self.record()
+        self.file(self.entry())
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        postures = [f for f in posture_and_fault_findings() if f["check"] == "no-pdb"]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn("no longer reproduces", body)
+
+    def test_a_model_written_declared_entry_refuses_a_request_the_same_way(self):
+        # The classifier reads `declared[]` whole, not only what the harness
+        # moved: an entry the model wrote covers its posture just as well.
+        entry = make_declared(check="no-pdb", obj="Deployment/checkout-gateway",
+                              repo="acme/fleet", path="knowledge/model.md")
+        target = derived_id(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway")
+        requests = audit_report.parse_remediate_commands(
+            [comment(f"/remediate {target}")], findings=[], declared=[entry]
+        )
+        self.assertEqual(requests.targets, [])
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertFalse(requests.refusals[0].get("deferred"))
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`acme/fleet:knowledge/model.md`", reason)
+        self.assertNotIn("typo", reason)
+        # Without `declared` the same request reads as a typo: the fixture
+        # shows what the argument changes.
+        bare = audit_report.parse_remediate_commands([comment(f"/remediate {target}")], findings=[])
+        self.assertIn("typo", bare.refusals[0]["reasons"][0])
+
     def test_a_run_with_nothing_but_declared_postures_is_clean(self):
         self.record()
         self.file(self.entry(), self.entry(check="no-hpa", obj="Deployment/api"))

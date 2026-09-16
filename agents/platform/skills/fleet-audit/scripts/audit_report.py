@@ -3504,8 +3504,39 @@ def deferral_reason(target: str) -> str:
     )
 
 
+def declared_reason(target: str, entry: dict) -> str:
+    """Why a `/remediate` on a declared posture is refused, with the file that covers it.
+
+    A refusal, not a deferral: a declaration is an owner's standing choice,
+    not a gap the next run fills, so the request does not stay open against
+    it. The reason names the file, because removing the item there is what
+    brings the finding back, and a fresh request then opens it.
+    """
+    declaration = entry.get("declaration") or {}
+    return (
+        f"`{target}` is a posture a repository declaration covers — "
+        f"`{declaration.get('repo', '')}:{declaration.get('path', '')}` — so this "
+        "run lists it under _Declared intent_ rather than as a finding, and a "
+        "pull request for it would contradict the ledger. Remove the "
+        "declaration; the finding returns on the next run, and a new request "
+        "then opens it"
+    )
+
+
+def declared_by_id(declared: list[dict] | None) -> dict[str, dict]:
+    """Each `declared[]` entry under the id the finding it covers would carry.
+
+    The model's entries and the harness's moves alike: both carry the four
+    identity fields, so the id is derived the same way a finding's is.
+    """
+    return {derive_finding_id(entry): entry for entry in declared or []}
+
+
 def parse_remediate_commands(
-    comments: list[dict], findings: list[dict], withheld: list[dict] | None = None
+    comments: list[dict],
+    findings: list[dict],
+    withheld: list[dict] | None = None,
+    declared: list[dict] | None = None,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -3513,7 +3544,10 @@ def parse_remediate_commands(
     posted once per comment and marked with that comment's node id. An entry
     carrying `deferred: True` is not a refusal: it names a posture `finish`
     withheld this run, and `reply_to_refusals` answers it on the deferred
-    marker, which nothing reads as "answered", so the request stands.
+    marker, which nothing reads as "answered", so the request stands. A
+    target in `declared` — a posture a repository declaration covers, listed
+    on the ledger under Declared intent — is refused with that file named,
+    never as a typo.
 
     `accepted_by_comment` exists so a request that *worked* gets an answer too.
     A command that silently succeeds is indistinguishable from one that was
@@ -3539,6 +3573,12 @@ def parse_remediate_commands(
     # false reason — the requester would be told their id was a typo, and the
     # request would never be revisited when the posture returns.
     withheld_ids = {str(f.get("id", "")) for f in withheld or []}
+    # The postures a declaration covers, which `finish` lists under Declared
+    # intent instead of `findings`. A target among them is not a typo either:
+    # the id was right, and the answer names the file that covers it. Refused
+    # on the permanent marker, unlike a withheld one, because a declaration is
+    # an owner's standing choice rather than a gap the next run fills.
+    covered = declared_by_id(declared)
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -3638,6 +3678,9 @@ def parse_remediate_commands(
             target = raw.strip().strip("`")
             if target in withheld_ids:
                 deferred.append(deferral_reason(target))
+                continue
+            if target in covered:
+                reasons.append(declared_reason(target, covered[target]))
                 continue
             if not target:
                 # An empty target is not a wildcard. Reading it as one would
@@ -8256,11 +8299,18 @@ def handle_finish(args: argparse.Namespace) -> None:
             # it.
             # A request naming a posture this run withheld is not answered
             # with "no longer reproduces": the harness is holding it, not the
-            # fleet, so it is deferred on its own marker and stays open.
+            # fleet, so it is deferred on its own marker and stays open. One
+            # naming a posture a declaration covers is refused with the file
+            # named, as on the findings branch: the posture reproduces and is
+            # listed under Declared intent. The hold is checked first because
+            # its marker is not an answer and the refusal's is.
             withheld_ids = set(finding_ids(withheld))
+            covered_by_id = declared_by_id(declared)
             clean_comments = fetch_issue_comments(repo, existing_issue)
             for request in unanswered_remediate_comments(clean_comments):
-                held = [t for t in request.get("targets") or [] if t in withheld_ids]
+                targets = request.get("targets") or []
+                held = [t for t in targets if t in withheld_ids]
+                covered = [t for t in targets if t in covered_by_id]
                 if held:
                     reply_to_deferrals(
                         repo,
@@ -8270,6 +8320,23 @@ def handle_finish(args: argparse.Namespace) -> None:
                                 "comment_id": request.get("comment_id", ""),
                                 "author": request.get("author", "someone"),
                                 "reasons": [deferral_reason(t) for t in held],
+                            }
+                        ],
+                        clean_comments,
+                        now,
+                    )
+                    continue
+                if covered:
+                    reply_to_refusals(
+                        repo,
+                        existing_issue,
+                        [
+                            {
+                                "comment_id": request.get("comment_id", ""),
+                                "author": request.get("author", "someone"),
+                                "reasons": [
+                                    declared_reason(t, covered_by_id[t]) for t in covered
+                                ],
                             }
                         ],
                         clean_comments,
@@ -8450,7 +8517,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     }
 
     ledger_comments = fetch_issue_comments(repo, existing_issue) if existing_issue else []
-    requests = parse_remediate_commands(ledger_comments, findings, withheld)
+    requests = parse_remediate_commands(ledger_comments, findings, withheld, declared)
     plan = promotion_candidates(
         findings,
         pr_by_finding,
