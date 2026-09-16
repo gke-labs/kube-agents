@@ -39,18 +39,19 @@ def step_script() -> str:
 
 
 class PoolFetchStepTest(unittest.TestCase):
-    def run_step(self, pointer=BUILD, artifact=READING):
+    def run_step(self, pointer=BUILD, artifact=READING, raw=None):
         """The step against a stub gsutil. `pointer` None means latest-build.txt
-        is unreadable, `artifact` None means the copy fails."""
+        is unreadable, `artifact` None means the copy fails, and `raw` is bytes
+        copied verbatim -- what a crashed periodic leaves behind."""
         tmp = pathlib.Path(tempfile.mkdtemp())
         bin_dir = tmp / "bin"
         bin_dir.mkdir()
         cat = f'printf "%s\\n" {pointer}' if pointer is not None else "exit 1"
-        if artifact is None:
+        if artifact is None and raw is None:
             copy = "exit 1"
         else:
             payload = tmp / "payload.json"
-            payload.write_text(json.dumps(artifact))
+            payload.write_text(json.dumps(artifact) if raw is None else raw)
             copy = f'cat "{payload}" > "${{@: -1}}"'
         (bin_dir / "gsutil").write_text(
             "#!/bin/bash\n"
@@ -90,6 +91,18 @@ class PoolFetchStepTest(unittest.TestCase):
         self.assertNotIn("window_end", written)
         self.assertNotIn("verdict", written)
         self.assertIn(BUILD, written["note"])
+
+    def test_an_artifact_that_copies_but_does_not_parse_gets_the_same_treatment(self):
+        """The periodic redirects into the file before it runs, so a crash
+        publishes a 0-byte object and `gsutil cp` copies it happily. Left
+        alone, health.py reads a bare `{}` as no artifact at all -- the one
+        reading that means "not wired up"."""
+        for name, content in (("empty", ""), ("truncated", '{"verdict": "OK", "trend": {'), ("html", "<html>nope")):
+            with self.subTest(name):
+                written = self.run_step(artifact=None, raw=content)
+                self.assertIsNotNone(written, "an unusable artifact must not read as 'not wired up'")
+                self.assertNotIn("window_end", written)
+                self.assertIn(BUILD, written["note"])
 
     def test_the_step_never_fails_the_job(self):
         """Every path exits 0, and the step is `continue-on-error` besides: a

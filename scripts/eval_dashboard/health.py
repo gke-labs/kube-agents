@@ -296,6 +296,12 @@ POOL_BREACH = "BREACH"
 POOL_UNMEASURED = "UNMEASURED"
 POOL_STALE = "STALE"
 SECONDS_PER_MINUTE = 60
+# pool_pressure.py buckets waits by UTC calendar day and emits no row for a day
+# with no runs, so the newest row is not always the newest day. "Last 24h" from
+# window_end spans two such days; a row older than that is a different day's
+# number under the digest's heading.
+POOL_DIGEST_DAYS = 2
+POOL_DAY_FORMAT = "%Y-%m-%d"
 
 # --- Roster ------------------------------------------------------------------
 # The admitted roster is the source of truth for what can red a pull request
@@ -894,9 +900,13 @@ def wait_text(seconds) -> str:
     return f"{int(seconds)}s" if seconds < SECONDS_PER_MINUTE else f"{seconds // SECONDS_PER_MINUTE} min"
 
 
-def _whole_minutes(seconds) -> str:
-    """A threshold, which the runbook always states in whole minutes."""
-    return "?" if seconds is None else str(seconds // SECONDS_PER_MINUTE)
+def minutes_text(seconds) -> str:
+    """A threshold, which the runbook always states in whole minutes.
+
+    post_health imports it, as it does wait_text, so the chat message and the
+    evidence line cannot drift.
+    """
+    return "?" if seconds is None else str(int(seconds // SECONDS_PER_MINUTE))
 
 
 def _worst_breached_day(trend: dict, thresholds: dict) -> dict | None:
@@ -980,7 +990,8 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
 
     `trend.p50_minutes` is the seven-day figure and belongs to the note; the
     digest headline says "last 24h", so it reads the last `days[]` row. None
-    when there is no artifact or it is too old to describe the last day.
+    when there is no artifact, it is too old, or its newest row predates the
+    heading -- a quiet weekend would otherwise print Friday's median as today's.
     """
     if not isinstance(artifact, dict):
         return None
@@ -989,6 +1000,12 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
         return None
     days = (artifact.get("trend") or {}).get("days") or []
     latest = days[-1] if days and isinstance(days[-1], dict) else {}
+    try:
+        day = datetime.strptime(latest["day"], POOL_DAY_FORMAT).date()
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (measured.date() - day).days >= POOL_DIGEST_DAYS:
+        return None
     return _as_seconds(latest.get("p50_minutes"))
 
 
@@ -999,7 +1016,7 @@ def pool_evidence(pool: dict) -> str:
             " the hourly pool-pressure job has missed the last few"
         )
     if pool["verdict"] == POOL_UNMEASURED:
-        return "pool pressure: the hourly check ran but could not measure the queue wait"
+        return "pool pressure: the hourly check ran but could not read how long recent runs waited"
     return (
         f"backed-up pool: {pool_measurement(pool)};"
         f" {pool['free']} of {pool['total']} projects free"
@@ -1013,14 +1030,14 @@ def pool_measurement(pool: dict) -> str:
     if pool.get("day"):
         parts.append(
             f"{pool['day']} median {wait_text(pool['p50_s'])} against"
-            f" {_whole_minutes(pool['threshold_p50_s'])} min,"
+            f" {minutes_text(pool['threshold_p50_s'])} min,"
             f" p95 {wait_text(pool['p95_s'])} against"
-            f" {_whole_minutes(pool['threshold_p95_s'])}"
+            f" {minutes_text(pool['threshold_p95_s'])}"
         )
     if pool.get("over_threshold"):
         parts.append(
             f"{pool['over_threshold']} run{'' if pool['over_threshold'] == 1 else 's'}"
-            f" waiting now past {_whole_minutes(pool['threshold_p95_s'])} min"
+            f" waiting now past {minutes_text(pool['threshold_p95_s'])} min"
         )
     # A BREACH always has one or the other; this is what a contract violation
     # reads as, rather than a sentence with a blank in it.
@@ -1350,7 +1367,10 @@ def adjudicate(
     # a different job's measurement of different data, so it cannot be this
     # incident's own symptom, and when leases are the incident it is the
     # explanation.
-    pool = pool_note(pool_pressure, now, (prev or {}).get("pool") or None)
+    # Aged against the wall clock: `now` is data.json's horizon, and one Prow
+    # stall freezes it and the artifact together, so the switch never fires.
+    pool_clock = wall_clock or now
+    pool = pool_note(pool_pressure, pool_clock, (prev or {}).get("pool") or None)
     if pool:
         evidence.append(pool_evidence(pool))
     stale_after = DEFAULT_STALE_AFTER
@@ -1384,7 +1404,12 @@ def adjudicate(
     }
     # Beside the digest's other 24h numbers, but not derived from the runs
     # `metrics` reads -- the wait comes from the periodic, not from data.json.
-    out["metrics"]["queue_wait_p50_s"] = pool_wait_p50_s(pool_pressure, now)
+    out["metrics"]["queue_wait_p50_s"] = pool_wait_p50_s(pool_pressure, pool_clock)
+    # Whether the artifact was there at all, which no other field answers: the
+    # note is None both for a healthy pool and for a fetch that failed, and
+    # queue_wait_p50_s is None on a quiet day too. The poster needs the
+    # difference -- going blind must not read as the episode ending.
+    out["metrics"]["queue_wait_read"] = isinstance(pool_pressure, dict)
     if age is not None:
         out["metrics"]["data_age_s"] = int(age.total_seconds())
     return out

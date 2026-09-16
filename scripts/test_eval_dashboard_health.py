@@ -983,6 +983,14 @@ class PoolNote(unittest.TestCase):
         self.assertIsNone(bare["metrics"]["queue_wait_p50_s"])
         self.assertFalse(any(line.startswith("backed-up pool") for line in bare["evidence"]), bare["evidence"])
 
+    def test_the_read_flag_separates_a_healthy_pool_from_a_missing_artifact(self):
+        # Both leave `pool` null, and a stale artifact leaves the digest
+        # number null too; only this bit says the fetch worked.
+        self.assertTrue(pooled(verdict="OK")["metrics"]["queue_wait_read"])
+        self.assertTrue(pooled(verdict="OK", window_end=T0 - timedelta(hours=4))["metrics"]["queue_wait_read"])
+        bare = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED))
+        self.assertFalse(bare["metrics"]["queue_wait_read"])
+
     def test_an_episode_keeps_its_start_and_a_new_one_gets_a_new_start(self):
         first = pooled(verdict="BREACH", cause="CAPACITY")
         later = T0 + timedelta(hours=2)
@@ -1017,7 +1025,7 @@ class PoolNote(unittest.TestCase):
     def test_unmeasured_is_a_note_even_though_nothing_breached(self):
         result = pooled(verdict="UNMEASURED")
         self.assertEqual(result["pool"]["verdict"], "UNMEASURED")
-        self.assertIn("pool pressure: the hourly check ran but could not measure the queue wait", result["evidence"])
+        self.assertIn("pool pressure: the hourly check ran but could not read how long recent runs waited", result["evidence"])
 
     def test_the_digest_wait_is_todays_median_not_the_seven_day_one(self):
         # "last 24h" in the headline: the seven-day median under it would be a

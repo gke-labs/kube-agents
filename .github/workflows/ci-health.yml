@@ -11,8 +11,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the state changes plus one digest a day (scripts/eval_dashboard/
 # post_health.py). docs/ci-health.md explains the states, the rules and the
 # advice each one carries. The data and the verdict are fresh together; the
-# only periodic in the loop is pool-pressure, whose artifact is optional and
-# whose absence just drops the queue-wait note (#1607). The order is adjudicate ->
+# one input fetched outside that collect is pool-pressure's hourly artifact
+# (#1607), and it is optional -- its absence just drops the queue-wait note.
+# The order is adjudicate ->
 # upload health.json -> append history -> render -> publish -> post ->
 # comment, so the Brief a reader opens from a message already shows the
 # verdict the message names.
@@ -270,8 +271,13 @@ jobs:
           mkdir -p work
           build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt") || exit 0
           [ -n "$build" ] || exit 0
-          if ! gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json; then
-            # The pointer moved to a build that published nothing, so the
+          # The periodic opens the file with a shell redirect before it runs,
+          # so a crash publishes a 0-byte object that copies fine. Parsing is
+          # the only check that catches it, and it costs nothing on the object
+          # health.py is about to parse anyway.
+          if ! gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
+            || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' work/pool-pressure.json 2>/dev/null; then
+            # The pointer moved to a build that published nothing usable, so the
             # periodic is running and failing. Ageing `window_end` cannot catch
             # that -- an artifact never written never gets old -- and staying
             # quiet would read as "not wired up". A document with no reading in
@@ -279,7 +285,7 @@ jobs:
             # we simply cannot read gets the same treatment on purpose: either
             # way the bot has lost sight of the queue, and the message links to
             # the job's history, which distinguishes the two.
-            printf '{"note": "build %s published no pool-pressure.json"}\n' "$build" \
+            printf '{"note": "build %s published no usable pool-pressure.json"}\n' "$build" \
               > work/pool-pressure.json
           fi
 

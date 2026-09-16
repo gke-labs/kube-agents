@@ -29,13 +29,16 @@ OUTAGE lacks or the one a build-cluster node loss owes the cluster owner
 (`gate_issue.py`), and appends `health.json` to a history feed. A
 `workflow_dispatch` of the same workflow is the on-demand refresh button.
 
-Every message ends with a deep link into the dashboard:
+Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
 digest, and the bare `index.html#view=agent` for the slow-gate and pool notes,
-whose start is a tick that names no incident. The `pool check stopped` message
-links to the periodic's job history instead, the one place that shows whether
-it has started running again. The scope rides in the URL
+which report no incident and so have no window to scope a link to. The two
+that say the pool check itself is not reporting — `wait unknown` and `pool
+check stopped` — link to the periodic's job history instead, the one place
+that shows whether it has started running again. `queue clear` and the two
+data-freshness messages carry no link: what they report is the absence of
+something to show. The scope rides in the URL
 fragment because the host's login redirect drops a query string and a browser
 carries the fragment through the redirect.
 The contract, and the older `?cases=…#gate` form the pages still read (it
@@ -98,9 +101,10 @@ what keeps the replay fixtures cut before the field valid.
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
 PR-caused reds and infra reds (setup deaths and lost pods are folded into the
-infra count) and the typical run length. `health.json`'s `metrics` keeps the
-rest — green rate, wall clock p50/p90, the infra-rep rate, `setup_deaths`,
-`lost_pods`.
+infra count), the typical run length and the typical wait before a run starts.
+`health.json`'s `metrics` keeps the rest — green rate, wall clock p50/p90,
+`queue_wait_p50_s` and whether it was read at all, the infra-rep rate,
+`setup_deaths`, `lost_pods`.
 
 A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
@@ -221,7 +225,8 @@ It fires only on a reading that says so. The note also disappears when the
 artifact does, and that is the bot going blind, not the queue clearing.
 
 Two ⚪ messages are about the monitoring, not the pool. `wait unknown` is the
-check running and failing to read the queue. `pool check stopped` is
+check running and failing to read how long recent runs waited -- its sweep
+over the window, not the live pool. `pool check stopped` is
 `window_end` more than 3 hours old, or a build that published no artifact at
 all. Both link to the periodic's job history, which tells the two apart. The
 stopped message carries **no numbers**: `latest-build.txt` keeps resolving

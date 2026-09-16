@@ -231,6 +231,7 @@ function normalizeHealth(raw) {
       measured_at: parseIso(pool.measured_at) != null ? pool.measured_at : null,
       day: typeof pool.day === "string" && PAGE.poolDayRe.test(pool.day) ? pool.day : null,
       p50_s: count(pool.p50_s),
+      p95_s: count(pool.p95_s),
       over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
       threshold_p95_s: count(pool.threshold_p95_s),
@@ -263,19 +264,25 @@ function poolSentence(h) {
     const since = p.measured_at ? ` since ${esc(et(parseIso(p.measured_at)))}` : "";
     return ` No pool numbers${since}: the hourly pool check has stopped reporting.`;
   }
-  if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read it.";
+  if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read how long recent runs waited.";
   // What tripped the verdict, which is a single day's row or the live queue --
   // never the seven-day window, which one bad day leaves inside its own limit.
   const since = p.since ? ` since ${esc(et(parseIso(p.since)))}` : "";
-  let found = "";
-  if (p.day != null && p.p50_s != null && p.threshold_p50_s != null) {
-    found = `a median wait of ${waitText(p.p50_s)} on ${esc(p.day)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit`;
-  } else if (p.over_threshold && p.threshold_p95_s != null) {
-    found = `${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`;
-  } else {
-    return "";
+  // Both halves, like post_health.pool_numbers: a day can breach on p95 with a
+  // compliant median, and quoting the median alone puts a passing number
+  // forward as the evidence.
+  const found = [];
+  if (p.day != null && p.p50_s != null && p.p95_s != null && p.threshold_p50_s != null && p.threshold_p95_s != null) {
+    found.push(
+      `on ${esc(p.day)} the median wait was ${waitText(p.p50_s)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit` +
+        `, p95 ${waitText(p.p95_s)} against ${Math.floor(p.threshold_p95_s / 60)}`,
+    );
   }
-  return ` Runs are waiting to start${since}: ${found}. Runs still pass; /retest makes the queue longer.`;
+  if (p.over_threshold && p.threshold_p95_s != null) {
+    found.push(`${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`);
+  }
+  if (!found.length) return "";
+  return ` Runs are waiting to start${since}: ${found.join("; ")}. Runs still pass; /retest makes the queue longer.`;
 }
 
 /* ---- URL contract ---- */

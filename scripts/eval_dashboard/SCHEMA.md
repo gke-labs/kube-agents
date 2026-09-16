@@ -684,7 +684,11 @@ the pages read `verdict`, `since`, `measured_at`, `day`, `p50_s`,
 `over_threshold`, `threshold_p50_s` and `threshold_p95_s` for one sentence on
 the Brief's healthy headline and on the last-24-hours view.
 `metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
-`null`; it is not derived from the runs.
+`null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
+the artifact was there at all. Nothing else answers that: `pool` is `null` for a
+healthy pool and for a failed fetch alike, and `queue_wait_p50_s` is `null` on a
+day with no runs. The poster needs the difference — going blind must not read as
+the episode ending.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

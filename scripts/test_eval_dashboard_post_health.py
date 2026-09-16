@@ -57,6 +57,7 @@ def health(state="GREEN", cause="", cases=(), since="2026-09-04T03:30:00+00:00",
         "pool": None,
         "metrics": {
             "queue_wait_p50_s": None,
+            "queue_wait_read": False,
             "window_hours": 24,
             "full_runs": 31,
             "prs": 19,
@@ -118,6 +119,7 @@ def pooled(state="GREEN", wait_s=None, **note):
     doc = health(state)
     doc["pool"] = pool_note(**note)
     doc["metrics"]["queue_wait_p50_s"] = wait_s
+    doc["metrics"]["queue_wait_read"] = True
     return doc
 
 
@@ -127,6 +129,7 @@ def cleared(state="GREEN", wait_s=24):
     disappears but nothing has been learned."""
     doc = health(state)
     doc["metrics"]["queue_wait_p50_s"] = wait_s
+    doc["metrics"]["queue_wait_read"] = True
     return doc
 
 
@@ -618,7 +621,19 @@ class Digest(RunHarness):
         self.tick(pooled(wait_s=22 * 60), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[1].split("\n")[1],
-            "⏳ Queue backed up — median wait 22 min on 2026-09-03 against a 15 min limit.",
+            "⏳ Queue backed up — worst day 2026-09-03: median wait 22 min against a 15 min limit;"
+            " p95 61 min against 45.",
+        )
+
+    def test_the_digest_line_carries_the_half_that_breached(self):
+        # A day breaches on p50 or p95, so the median alone can be a passing
+        # number standing in as the reason the line is there at all.
+        self.tick(pooled(wait_s=24, p50_s=24), T0.replace(hour=7))
+        self.tick(pooled(wait_s=24, p50_s=24), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
+            "⏳ Queue backed up — worst day 2026-09-03: median wait 24s against a 15 min limit;"
+            " p95 61 min against 45.",
         )
 
     def test_digest_counts_the_queue_when_no_day_breached(self):
@@ -768,7 +783,8 @@ class PoolNote(RunHarness):
         self.tick(pooled(verdict="UNMEASURED"), self.at(10))
         self.assertEqual(
             self.opener.texts[0],
-            "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read the queue."
+            "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read how long"
+            " recent runs waited."
             # Its own job's history: there is no number for the dashboard to
             # show, so every message in this family ends somewhere useful.
             f"\n{post_health.POOL_JOB_HISTORY_URL}",
@@ -824,6 +840,18 @@ class PoolNote(RunHarness):
         # sight of the queue is not the queue recovering.
         self.tick(pooled(), self.at(10))
         self.tick(health(), self.at(10, 15))
+        self.assertEqual(len(self.opener.requests), 1)
+        # The episode survives the gap: forgetting it here would re-post the
+        # same breach the tick the fetch recovers.
+        self.assertEqual(self.recorded()["pool_verdict"], "BREACH")
+        self.tick(pooled(), self.at(10, 30))
+        self.assertEqual(len(self.opener.requests), 1, "still the same episode")
+
+    def test_a_monitoring_episode_ends_without_claiming_a_recovery(self):
+        # ⚪ never said the queue was bad, so "starting on time again" would
+        # assert what nothing measured.
+        self.tick(pooled(verdict="STALE"), self.at(10))
+        self.tick(cleared(), self.at(10, 15))
         self.assertEqual(len(self.opener.requests), 1)
         self.assertIsNone(self.recorded()["pool_verdict"])
 

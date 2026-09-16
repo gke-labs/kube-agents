@@ -203,7 +203,7 @@ class HealthInputsTest(unittest.TestCase):
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
-        # The rule-8 note, same treatment: the eight fields the lede reads, and
+        # The rule-8 note, same treatment: the nine fields the lede reads, and
         # a verdict the page does not know about is dropped rather than shown.
         self.assertIsNone(minimal["pool"])
         note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
@@ -212,7 +212,8 @@ class HealthInputsTest(unittest.TestCase):
         self.assertEqual(
             render.normalize_health(health_doc("GREEN", pool=note))["pool"],
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
-             "day": "2026-09-07", "p50_s": 1320, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
+             "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "over_threshold": 2, "threshold_p50_s": 900,
+             "threshold_p95_s": 2700},
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"verdict": "WEDGED"}))["pool"]["verdict"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"p50_s": "ages"}))["pool"]["p50_s"])
@@ -642,8 +643,9 @@ class BrowserTest(unittest.TestCase):
         # health.py's rule-8 note, dated 8:00 AM ET on the page's Tuesday.
         # Unlike 🐢 it also rides on an incident lede, so both are rendered.
         note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
-                "day": "2026-09-07", "p50_s": 1320, "threshold_p50_s": 900, "threshold_p95_s": 2700}
-        sentence = "Runs are waiting to start since Tue 8:00 AM ET: a median wait of 22 min on 2026-09-07 against a 15 min limit. Runs still pass; /retest makes the queue longer."
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "threshold_p50_s": 900, "threshold_p95_s": 2700}
+        sentence = ("Runs are waiting to start since Tue 8:00 AM ET: on 2026-09-07 the median wait was 22 min against"
+                    " a 15 min limit, p95 61 min against 45. Runs still pass; /retest makes the queue longer.")
         healthy = dom_text(render_to(pathlib.Path(self.tmp.name) / "pool", self.data, health=health_doc("GREEN", pool=note)) / "index.html")
         self.assertIn("Smoke gate is healthy", healthy)
         self.assertIn(sentence, healthy)
@@ -651,11 +653,18 @@ class BrowserTest(unittest.TestCase):
         # message's own link lands; the incident brief keeps its own lede.
         out = render_to(pathlib.Path(self.tmp.name) / "poolred", self.data, health=health_doc("OUTAGE", pool=note))
         self.assertIn(sentence, dom_text(out / "index.html", fragment="#view=agent"))
-        # The gate breaches on p50 or p95, so a p95-only breach carries a
-        # sub-minute median that whole minutes would print as "0 min".
+        # The gate breaches on p50 or p95, so a p95-only breach carries an
+        # ordinary median -- sub-minute here, which whole minutes would print
+        # as "0 min". The sentence has to carry the half that breached; the
+        # median alone reads as a passing number offered as the evidence.
         quick = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolquick", self.data,
                                    health=health_doc("GREEN", pool=note | {"p50_s": 24})) / "index.html")
-        self.assertIn("a median wait of 24s on 2026-09-07 against a 15 min limit", quick)
+        self.assertIn("on 2026-09-07 the median wait was 24s against a 15 min limit, p95 61 min against 45", quick)
+        # A day and the live queue can breach together, as the ⏳ message's two
+        # lines do; the lede has one sentence, so it joins them.
+        both = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolboth", self.data,
+                                  health=health_doc("GREEN", pool=note | {"over_threshold": 2})) / "index.html")
+        self.assertIn("p95 61 min against 45; 2 runs queued past the 45 min limit.", both)
         # A breach with no bad day in the week -- one run stuck past p95 right
         # now -- has no median to quote and counts the queue instead.
         live = dom_text(render_to(pathlib.Path(self.tmp.name) / "poollive", self.data,
