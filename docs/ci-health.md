@@ -388,9 +388,9 @@ configured" and exits 0 before it would file a tracking issue, the comment
 step on pull requests is skipped, and the refresh, the verdict and the
 `health.json` upload carry on. It exits before writing `health-state.json`
 too, so what the poster remembers stands still while muted: an alert already
-sent stays sent. The dashboard is unaffected — `health.json` carries the pool
-episode's start — and a start frozen by the mute is not reused for a later
-episode. An incoming-webhook URL in Secret Manager
+sent stays sent. The dashboard is unaffected — the pool episode's start rides
+in `health.json`, which is written every tick, not in the state file.
+An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.

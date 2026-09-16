@@ -688,7 +688,9 @@ the Brief's healthy headline and on the last-24-hours view.
 the artifact was there at all. Nothing else answers that: `pool` is `null` for a
 healthy pool and for a failed fetch alike, and `queue_wait_p50_s` is `null` on a
 day with no runs. The poster needs the difference — going blind must not read as
-the episode ending.
+the episode ending. `metrics.pool_since` is the open episode's start, held
+across the ticks that read no artifact and so write no `pool`, and `null` once
+a tick reads one and writes none, which is the episode ending.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

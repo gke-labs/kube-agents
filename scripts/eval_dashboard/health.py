@@ -1404,17 +1404,12 @@ def adjudicate(
     # stall freezes it and the artifact together, so the switch never fires.
     pool_clock = wall_clock or now
     # A tick that read no artifact writes no note, so the next one has no
-    # `prev` to carry the episode start and stamps a fresh one. The poster
-    # holds the start across those ticks; fall back to it before restarting.
-    # Only across those: a tick that read the artifact and wrote no note ended
-    # the episode, and the poster's copy outlives it whenever the state file
-    # stops being written -- muted, or a crash before write_state -- so
-    # carrying it would date the next episode from the last one.
-    carried = (prev or {}).get("pool")
-    if not carried:
-        ended = bool((prev or {}).get("metrics", {}).get("queue_wait_read"))
-        carried = None if ended else {"since": (posted or {}).get("pool_since")}
-    pool = pool_note(pool_pressure, pool_clock, carried)
+    # `prev` note to take the episode start from. health.json carries it
+    # across those ticks itself: it is written every tick, muted or not,
+    # where the poster's state file freezes on a mute or a crash and would
+    # hand a later episode an older episode's start.
+    held = ((prev or {}).get("pool") or {}).get("since") or ((prev or {}).get("metrics") or {}).get("pool_since")
+    pool = pool_note(pool_pressure, pool_clock, {"since": held})
     if pool:
         evidence.append(pool_evidence(pool))
     stale_after = DEFAULT_STALE_AFTER
@@ -1454,6 +1449,10 @@ def adjudicate(
     # queue_wait_p50_s is None on a quiet day too. The poster needs the
     # difference -- going blind must not read as the episode ending.
     out["metrics"]["queue_wait_read"] = isinstance(pool_pressure, dict)
+    # The open episode's start, kept only across blind ticks: a tick that read
+    # the artifact and wrote no note ended the episode, so the next breach is
+    # a new one and starts from its own clock.
+    out["metrics"]["pool_since"] = pool["since"] if pool else (None if out["metrics"]["queue_wait_read"] else held)
     if age is not None:
         out["metrics"]["data_age_s"] = int(age.total_seconds())
     return out

@@ -1100,46 +1100,37 @@ class PoolNote(unittest.TestCase):
     def test_a_blind_tick_does_not_restart_the_episode(self):
         # The in-flight skip makes a missing artifact an hourly event, so a
         # start carried only through the previous note would reset about every
-        # hour. The poster holds it across; health.py reads it back.
+        # hour. health.json holds it in metrics.pool_since across those ticks.
         first = pooled(verdict="BREACH", cause="CAPACITY")
         blind_at = T0 + timedelta(minutes=15)
         blind = health.adjudicate(data(), blind_at, first, health.Roster.fixed(ADMITTED))
         self.assertIsNone(blind["pool"], "no artifact is no note")
+        self.assertEqual(blind["metrics"]["pool_since"], health.iso(T0), "the start outlives the note")
         back = blind_at + timedelta(minutes=15)
-        carried = pooled(
-            now=back,
-            prev=blind,
-            posted={"pool_since": first["pool"]["since"]},
-            verdict="BREACH",
-            cause="CAPACITY",
-            window_end=back,
-        )
+        carried = pooled(now=back, prev=blind, verdict="BREACH", cause="CAPACITY", window_end=back)
         self.assertEqual(carried["pool"]["since"], health.iso(T0), "one episode, not two")
-        # The poster drops the start on a tick that read an artifact and wrote
-        # no note, so an episode that really ended does not come back.
-        ended = pooled(
-            now=back, prev=blind, posted={"pool_since": None}, verdict="BREACH", cause="CAPACITY", window_end=back
-        )
-        self.assertEqual(ended["pool"]["since"], health.iso(back))
 
-    def test_a_frozen_poster_start_does_not_date_the_next_episode(self):
-        # A muted poster returns before write_state, so pool_since holds the
-        # last episode's start for as long as the mute lasts. The tick that
-        # read the artifact and wrote no note is the one that ended it.
+    def test_a_read_tick_with_no_note_ends_the_episode_for_good(self):
+        # The counterpart: an episode that really ended must not come back,
+        # however many blind ticks follow it.
         first = pooled(verdict="BREACH", cause="CAPACITY")
         over_at = T0 + timedelta(hours=1)
         over = pooled(now=over_at, prev=first, verdict="OK", window_end=over_at)
         self.assertIsNone(over["pool"])
+        self.assertIsNone(over["metrics"]["pool_since"], "a reading with no note is the episode over")
+        blind_at = over_at + timedelta(minutes=15)
+        blind = health.adjudicate(data(), blind_at, over, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(blind["metrics"]["pool_since"], "a blind tick holds nothing when nothing is open")
         again = T0 + timedelta(days=2)
-        fresh = pooled(
-            now=again,
-            prev=over,
-            posted={"pool_since": first["pool"]["since"]},
-            verdict="BREACH",
-            cause="CAPACITY",
-            window_end=again,
-        )
-        self.assertEqual(fresh["pool"]["since"], health.iso(again), "a new episode, not the muted one's")
+        fresh = pooled(now=again, prev=blind, verdict="BREACH", cause="CAPACITY", window_end=again)
+        self.assertEqual(fresh["pool"]["since"], health.iso(again), "a new episode, dated from itself")
+
+    def test_a_previous_document_with_no_metrics_does_not_stop_the_tick(self):
+        # load_json checks that health.json is a dict and nothing more, and
+        # the adjudicate step is not continue-on-error: a null field here
+        # stops the dashboard and the bot every 15 minutes.
+        note = pooled(prev={"metrics": None}, verdict="BREACH", cause="CAPACITY")["pool"]
+        self.assertEqual(note["since"], health.iso(T0))
 
     def test_an_artifact_that_stopped_moving_carries_no_numbers(self):
         # latest-build.txt keeps resolving after the periodic dies, so a stale

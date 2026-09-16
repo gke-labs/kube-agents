@@ -988,10 +988,6 @@ def run(
             else before.get("pool_verdict")
         ),
         "pool_breached": pool_breached,
-        # Not a posting decision: this is the clock health.py stamps the note
-        # with, so it follows the reading rather than the send. A read with no
-        # note is the episode ending; no reading keeps what was there.
-        "pool_since": ((health.get("pool") or {}).get("since") if pool_was_read(health) else before.get("pool_since")),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),
