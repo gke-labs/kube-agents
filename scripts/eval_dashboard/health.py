@@ -890,12 +890,17 @@ def slow_evidence(slow: dict) -> str:
 def _as_seconds(minutes) -> int | None:
     """pool-pressure.json reports minutes; health.json stores seconds.
 
-    `json.loads` accepts `Infinity` and `NaN` and `int()` raises on both, so
-    only a finite real number is a figure. Bools are a data error rather than
-    1 and 0, as render.is_number already has it.
+    The product is what gets checked, not the input: json.loads returns both
+    `1e308`, finite until multiplied, and integers no float can hold. Bools
+    are a data error rather than 1 and 0, as render.is_number has it.
     """
-    numeric = isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and math.isfinite(minutes)
-    return int(minutes * SECONDS_PER_MINUTE) if numeric else None
+    if not isinstance(minutes, (int, float)) or isinstance(minutes, bool):
+        return None
+    try:
+        seconds = float(minutes) * SECONDS_PER_MINUTE
+    except OverflowError:  # an int too large to be a float
+        return None
+    return int(seconds) if math.isfinite(seconds) else None
 
 
 def _section(artifact: dict, key: str) -> dict:
@@ -1350,7 +1355,8 @@ def adjudicate(
     poster's state file (post_health.py), read for the tracking issue the
     bot filed: it rides in `issue` and the advice while the state is not
     GREEN and the condition is the one it was filed for (issue_for), and is
-    dropped on recovery. `pool_pressure` is the pool-pressure periodic's
+    dropped on recovery; it also holds the pool episode's start across a tick
+    that read no artifact. `pool_pressure` is the pool-pressure periodic's
     artifact (rule 8); absent, the note and the digest's wait are None.
     """
     if runs is None:
@@ -1397,7 +1403,11 @@ def adjudicate(
     # Aged against the wall clock: `now` is data.json's horizon, and one Prow
     # stall freezes it and the artifact together, so the switch never fires.
     pool_clock = wall_clock or now
-    pool = pool_note(pool_pressure, pool_clock, (prev or {}).get("pool") or None)
+    # A tick that read no artifact writes no note, so the next one has no
+    # `prev` to carry the episode start and stamps a fresh one. The poster
+    # holds the start across those ticks; fall back to it before restarting.
+    carried = (prev or {}).get("pool") or {"since": (posted or {}).get("pool_since")}
+    pool = pool_note(pool_pressure, pool_clock, carried)
     if pool:
         evidence.append(pool_evidence(pool))
     stale_after = DEFAULT_STALE_AFTER

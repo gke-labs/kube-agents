@@ -856,6 +856,20 @@ class PoolNote(RunHarness):
         self.tick(pooled(since="2026-09-04T14:30:00+00:00"), self.at(15))
         self.assertEqual(len(self.opener.requests), 3)
 
+    def test_the_episode_start_follows_the_reading_not_the_send(self):
+        # health.py reads this back so one episode stays one episode. It is a
+        # clock, not a message, so a send that failed still records it.
+        self.tick(health(), self.at(9))
+        rc, _ = self.tick(pooled(), self.at(10), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.recorded()["pool_since"], "2026-09-04T09:00:00+00:00")
+        # No artifact is no reading, so the start is held rather than dropped.
+        self.tick(health(), self.at(10, 15))
+        self.assertEqual(self.recorded()["pool_since"], "2026-09-04T09:00:00+00:00")
+        # A reading with no note is the episode over.
+        self.tick(cleared(), self.at(10, 30))
+        self.assertIsNone(self.recorded()["pool_since"])
+
     def test_a_note_that_goes_with_the_artifact_clears_silently(self):
         # The note also disappears when the artifact does, and the bot losing
         # sight of the queue is not the queue recovering.

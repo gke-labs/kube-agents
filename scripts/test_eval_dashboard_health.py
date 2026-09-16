@@ -55,9 +55,13 @@ CASE_NOTES = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "case-
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 8, 0, 0, tzinfo=UTC)
-# What json.loads returns for the `Infinity` and `NaN` literals it accepts.
+# Figures json.loads produces that int() cannot take: the `Infinity` and `NaN`
+# literals it accepts, a finite float whose product with 60 is not, and an
+# integer no float can hold.
 INF = float("inf")
 NAN = float("nan")
+OVERFLOWS = 1e308
+HUGE_INT = 10**400
 
 CRASHLOOP_TRIO = [
     "cluster-agent-crashloop-debug",
@@ -900,12 +904,13 @@ def pressure(
     } | over
 
 
-def pooled(doc=None, now=T0, prev=None, **artifact):
+def pooled(doc=None, now=T0, prev=None, posted=None, **artifact):
     return health.adjudicate(
         doc or data(),
         now,
         prev,
         health.Roster.fixed(ADMITTED),
+        posted=posted,
         pool_pressure=pressure(**artifact),
     )
 
@@ -1033,9 +1038,8 @@ class PoolNote(unittest.TestCase):
                     "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": "22"}]},
                 },
             ),
-            # json.loads accepts Infinity and NaN, and int() raises on both.
-            # These rows are dated to T0 so the digest figure is really read:
-            # a row two days back leaves before _as_seconds on POOL_DIGEST_DAYS.
+            # Rows dated to T0 so the digest figure is really read: a row two
+            # days back leaves before _as_seconds on POOL_DIGEST_DAYS.
             *(
                 (
                     f"a day's minutes {name}",
@@ -1044,7 +1048,13 @@ class PoolNote(unittest.TestCase):
                         "trend": {"days": [{"day": "2026-09-08", "breached": True, "p50_minutes": value}]},
                     },
                 )
-                for name, value in (("infinite", INF), ("NaN", NAN), ("a bool", True))
+                for name, value in (
+                    ("infinite", INF),
+                    ("NaN", NAN),
+                    ("a bool", True),
+                    ("overflowing on the way to seconds", OVERFLOWS),
+                    ("an integer too large to be a float", HUGE_INT),
+                )
             ),
             (
                 "a threshold infinite",
@@ -1072,6 +1082,31 @@ class PoolNote(unittest.TestCase):
             pooled(now=again, prev=cleared, verdict="BREACH", cause="CAPACITY", window_end=again)["pool"]["since"],
             health.iso(again),
         )
+
+    def test_a_blind_tick_does_not_restart_the_episode(self):
+        # The in-flight skip makes a missing artifact an hourly event, so a
+        # start carried only through the previous note would reset about every
+        # hour. The poster holds it across; health.py reads it back.
+        first = pooled(verdict="BREACH", cause="CAPACITY")
+        blind_at = T0 + timedelta(minutes=15)
+        blind = health.adjudicate(data(), blind_at, first, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(blind["pool"], "no artifact is no note")
+        back = blind_at + timedelta(minutes=15)
+        carried = pooled(
+            now=back,
+            prev=blind,
+            posted={"pool_since": first["pool"]["since"]},
+            verdict="BREACH",
+            cause="CAPACITY",
+            window_end=back,
+        )
+        self.assertEqual(carried["pool"]["since"], health.iso(T0), "one episode, not two")
+        # The poster drops the start on a tick that read an artifact and wrote
+        # no note, so an episode that really ended does not come back.
+        ended = pooled(
+            now=back, prev=blind, posted={"pool_since": None}, verdict="BREACH", cause="CAPACITY", window_end=back
+        )
+        self.assertEqual(ended["pool"]["since"], health.iso(back))
 
     def test_an_artifact_that_stopped_moving_carries_no_numbers(self):
         # latest-build.txt keeps resolving after the periodic dies, so a stale

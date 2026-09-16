@@ -925,7 +925,10 @@ def run(
     # change or recovery advances the state, condition, cause and case list;
     # a sent stale notice advances the stale bit; a sent digest advances the
     # digest date; a sent pool note or clear advances the pool verdict and the
-    # breached bit, and only on a tick that read the artifact. Nothing else moves.
+    # breached bit, and only on a tick that read the artifact. The pool
+    # episode's start rides beside them on any tick that read one, sent or
+    # not: health.py reads it back, and it is a clock, not a message.
+    # Nothing else moves.
     # A kind that failed, or was not due,
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
@@ -981,6 +984,10 @@ def run(
             else before.get("pool_verdict")
         ),
         "pool_breached": pool_breached,
+        # Not a posting decision: this is the clock health.py stamps the note
+        # with, so it follows the reading rather than the send. A read with no
+        # note is the episode ending; no reading keeps what was there.
+        "pool_since": ((health.get("pool") or {}).get("since") if pool_was_read(health) else before.get("pool_since")),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),
