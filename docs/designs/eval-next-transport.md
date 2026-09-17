@@ -259,9 +259,10 @@ matrix in `hack/ci-eval-pr.sh` is unchanged.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
-The next stack still has holes independent of any case (no resource requests on any A2A pod, a
-gateway with no backend until the adapter lands, images in a private registry), and a default-on
-flip would red every pull request for reasons none of them caused. And until a case sends through
+The next stack still has holes independent of any case (no resource requests on the NATS,
+gateway or provisioning pods, a gateway with no backend until the adapter lands, images in a
+private registry), and a default-on flip would red every pull request for reasons none of them
+caused. And until a case sends through
 the gateway, a run under `next` measures nothing a run under `today` does not; the flag exists so
 the matrix can be run against `next` on demand while stage 1 lands.
 
