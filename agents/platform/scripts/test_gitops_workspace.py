@@ -1117,6 +1117,40 @@ class TestContextRepos(WorkspaceTestCase):
                 self.assertIn("skips this repository", joined)
                 self.assertNotIn("reading HEAD", joined)
 
+    def test_an_empty_ref_is_refused_rather_than_read_as_no_pin(self):
+        # `"ref": ""` is what a template with an unset variable emits, and
+        # the pin it lost is exactly the one the default branch must not
+        # stand in for. It is refused like any value that is not a branch
+        # name: the entry carries it under `refused_ref`, the repository is
+        # skipped and owed, and the ledger names it until the key is removed
+        # or filled. Only an absent key reads the default branch.
+        for empty in ("", "   "):
+            with self.subTest(ref=repr(empty)):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": empty}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": empty}],
+                        )
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(empty), joined)
+        # An absent key is the one spelling of "no pin".
+        context = json.dumps([{"type": "github", "url": "https://github.com/acme/terraform-live"}])
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "acme/terraform-live", "ref": None}],
+            )
+
     def test_a_non_github_entry_is_skipped_from_the_entries_too(self):
         context = (
             '[{"type": "gitlab", "url": "https://gitlab.com/acme/live", "ref": "main"}, '

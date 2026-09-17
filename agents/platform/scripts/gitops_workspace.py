@@ -828,6 +828,9 @@ def _context_ref(item: dict, url: str, key: str) -> tuple[str | None, str | None
     raw = item.get(CONTEXT_REF_KEY)
     if raw is None or key != CONTEXT_REPOS_KEY:
         return None, None
+    # Only an absent key means "no pin". An empty or blank value is refused
+    # with the rest: it is what a template with an unset variable emits, and
+    # the pin it lost is the one the default branch must not stand in for.
     ref = str(raw).strip()
     if is_valid_ref(ref):
         return ref, None
