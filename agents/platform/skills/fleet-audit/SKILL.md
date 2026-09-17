@@ -249,19 +249,25 @@ All three exit 2 in directory mode, where the clone already holds the file.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with eleven fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+JSON line with twelve fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
 `partial`, `coverage_gaps`, `silent_ok`, `declared`, the number of postures a repository
-declaration kept off the ledger (it never decides silence), and `postures_withheld`, the ids of the
+declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see
-[`declared_intent_searched`](#declared_intent_searched)):
+[`declared_intent_searched`](#declared_intent_searched)), and `unaccounted`, the ids of the previous
+findings a clean run was refused its close over (empty on every other outcome; see
+[The clean run](#the-clean-run)):
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
+- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
+  — zero findings, but the ledger was **not** closed: it carried findings this run's own `checks_run`
+  commands name and the document neither reports nor explains. Not a clean result; report it as
+  [The clean run](#the-clean-run) says.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or gh side effects. It applies the same grouping and the same
@@ -451,6 +457,28 @@ field, and publishes nothing:
   forbids — a check you could have run and did not is a `limitations` note and a real gap. Every
   entry is published in the ledger under _Not applicable_, with its reason, where a reviewer who
   knows the cluster can call an excuse for what it is.
+
+- `resolved_because` is **optional**, and is how a run that found nothing says why a finding the
+  ledger was carrying is gone. One entry per previous finding, carrying the same four identity
+  fields a finding has and a `reason` of at least sixteen characters saying what the command showed:
+
+  ```json
+  "resolved_because": [
+    {
+      "check": "cluster-admin-binding",
+      "cluster": "prod-us-east",
+      "object": "ClusterRoleBinding/debug-binding",
+      "reason": "kubectl get clusterrolebinding debug-binding returned NotFound; the binding was deleted on 2026-09-16."
+    }
+  ]
+  ```
+
+  `check` must be a slug in the SOP's roster, `cluster` must be in `scope.clusters`, `namespace` is
+  omitted for a cluster-scoped object, and the entry's identity may not also be a finding in the
+  same document. Nothing here renders on the ledger; the entry exists so `finish` can tell "fixed"
+  from "not written down" before it closes one (see [The clean run](#the-clean-run)). Write it only
+  for a finding you re-ran the check for and saw gone — it is a statement in a public issue, the
+  same as a `checks_run` command.
 
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
@@ -870,9 +898,13 @@ write this section; you supply the commands and the harness publishes them.
 
 If the audit finds nothing, still call `finish` with `"findings": []` and a populated
 `scope.clusters`. With complete coverage the harness answers any `/remediate` still standing
-unanswered in the thread, comments the date and the clusters covered, closes the ledger issue **as
-completed**, and closes every remediation pull request still open for the stream. The answers come
-first, deliberately: a reply posted after the close would land on an issue nobody is watching.
+unanswered in the thread, comments the date, the clusters covered and the same _How this run
+checked the fleet_ table the ledger body carries, closes the ledger issue **as completed**, and
+closes every remediation pull request still open for the stream. The answers come first,
+deliberately: a reply posted after the close would land on an issue nobody is watching. The table
+is there because a clean run does not rewrite the body: the comment is the only place the commands
+behind an all-clear are published, and an all-clear nobody can re-run is one nobody can audit
+after the fact.
 
 **Zero findings plus a coverage gap is not a clean run, and it is not silent even on a stream with
 no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
@@ -880,6 +912,21 @@ rather than the all-clear phrasing — so the run leaves a durable artifact sayi
 see. Without this, a stream that inspected nothing produced no issue, no comment, and nothing to
 notice: four streams did exactly that on 2026-08-03, and the only reason it surfaced is that a fifth
 happened to have a ledger open from the day before.
+
+**Zero findings over a finding the run looked at again is not a clean run either.** Before it
+closes, `finish` reads the previous body. For every finding it carried, if a command in this run's
+`checks_run` on that cluster names the finding's object — `debug-binding` in
+`kubectl get clusterrolebinding debug-binding`, not in a fleet-wide `get clusterrolebindings -A` —
+and the document neither reports the finding again nor carries a `resolved_because` entry for it,
+the run either saw it gone or left it out, and from the document the two are the same absence. The
+ledger stays open and gets a comment naming each such finding and the command that named it, no
+remediation pull request is closed, and `finish` returns `status: "HELD"` with `resolved: 0`,
+`silent_ok: false` and the ids in `unaccounted`. Report it as you would a partial run — the ledger
+URL and the held ids — and on the next run either report the finding or, if you re-ran its check
+and saw the object gone, say so in `resolved_because`. On 2026-09-16 a compliance run closed its
+ledger as clean over a live cluster-admin binding its own `checks_run` claimed to have checked; this
+is the guard that turns that close into a held ledger. It cannot see a padded `checks_run` whose
+commands name nothing in particular — that stays a red line, below.
 
 A clean run is usually not news, and the closed issue is the record — but "clean" alone does not
 decide it. **`finish` decides it, and returns the answer as `silent_ok`.** Read the flag; do not
@@ -889,7 +936,8 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no coverage gap, and no remediation pull request opened or closed.
+> new, nothing resolved, no coverage gap, no held close, and no remediation pull request opened or
+> closed.
 
 Two rules follow, and they are the whole rule:
 
@@ -900,13 +948,16 @@ Two rules follow, and they are the whole rule:
   kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
 
-Two clean runs come back `silent_ok: false`, and both matter:
+Three zero-finding runs come back `silent_ok: false`, and all of them matter:
 
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
   fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
   swallowing this one would leave the operator hearing only bad news.
 - **`partial: true`** — the ledger stayed open because the fleet was not fully read. "I found
   nothing" and "I could not look" must not arrive as the same silence.
+- **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
+  carrying. "I found nothing" and "I did not write it down" must not arrive as the same silence
+  either.
 
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: if the
 previous ledger body could not be read, the delta is unknowable, so it announces nothing rather than
