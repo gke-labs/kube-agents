@@ -303,8 +303,9 @@ in the data instead.
 Field paths are rendered from `FieldsV1` with the list selector intact —
 `spec.containers[name=app].image`, not `spec.containers.image`, which does not say which container
 drifted. A manager that owns a whole object owns hundreds of leaves, so `maxReportedPaths` truncates
-the rendered list at twelve with a trailing `...`; the cap is on the output only, and the ownership
-decision reads every path.
+the rendered list at twelve and appends `...` as a thirteenth entry — behind a comma, because a path
+can itself end in a selector and `containers[name=app]...` would read as a path rather than as the
+marker. The cap is on the output only, and the ownership decision reads every path.
 
 **Those selectors put object field values in the log.** Two of the three `FieldsV1` list forms carry
 data rather than structure: `k:` holds the merge key's value and `v:` holds a whole scalar entry, so

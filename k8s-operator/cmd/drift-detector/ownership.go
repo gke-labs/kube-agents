@@ -84,7 +84,10 @@ const (
 	maxReportedPaths = 12
 
 	// pathOverflowSuffix is appended when maxReportedPaths truncates, so a
-	// truncated list is never mistaken for a complete one.
+	// truncated list is never mistaken for a complete one. It is appended behind
+	// a reportedPathSeparator rather than onto the last path: field paths can end
+	// in a list selector, and "containers[name=pause]..." reads as a path this
+	// parser rendered oddly rather than as the marker saying more were cut.
 	pathOverflowSuffix = "..."
 )
 
@@ -127,7 +130,7 @@ func (o fieldOwner) String() string {
 	suffix := ""
 	if len(paths) > maxReportedPaths {
 		paths = paths[:maxReportedPaths]
-		suffix = pathOverflowSuffix
+		suffix = reportedPathSeparator + pathOverflowSuffix
 	}
 	name := o.Manager
 	if o.Subresource != "" {

@@ -220,11 +220,15 @@ func TestFieldOwnerStringTruncatesLongPathLists(t *testing.T) {
 	owner := fieldOwner{Manager: "argocd-controller", Operation: "Apply", Paths: paths}
 
 	got := owner.String()
-	if !strings.HasSuffix(got, pathOverflowSuffix+"]") {
-		t.Errorf("String() = %q, want it to end in the overflow marker", got)
+	// The marker is its own entry in the list, not a tail on the last path: a
+	// path can end in a list selector, and "containers[name=pause]..." reads as
+	// a badly rendered path rather than as a truncation.
+	if !strings.HasSuffix(got, ","+pathOverflowSuffix+"]") {
+		t.Errorf("String() = %q, want it to end in a separated overflow marker", got)
 	}
-	if n := strings.Count(got, ","); n != maxReportedPaths-1 {
-		t.Errorf("String() rendered %d separators, want %d paths worth", n, maxReportedPaths)
+	if n := strings.Count(got, ","); n != maxReportedPaths {
+		t.Errorf("String() rendered %d separators, want %d (%d paths plus the marker)",
+			n, maxReportedPaths, maxReportedPaths)
 	}
 	if strings.Contains(got, paths[maxReportedPaths]) {
 		t.Errorf("String() = %q, want the path past the cap omitted", got)

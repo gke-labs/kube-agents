@@ -334,13 +334,20 @@ func (p *pubsubSource) Nack(ctx context.Context, ackIDs []string) error {
 // signature; what ships behind it today is driftFilter.Handle, which classifies
 // and then forwards what survives to the T3 join.
 //
-// The context is the pull loop's, so a handler doing network I/O -- which the
-// join does, one lookup per forwarded record -- is interrupted by SIGTERM
-// rather than holding shutdown open for its timeout. It is deliberately not the
-// settle context: an in-flight lookup abandoned at shutdown leaves its message
-// acked and its drift unreported, which matches what realMain already documents
-// about an interrupted batch, and is preferable to delaying the ack of every
-// other message in the batch behind it.
+// The context is derived from the pull loop's, so a handler doing network I/O
+// -- which the join does, one lookup per forwarded record -- is interrupted by
+// SIGTERM rather than holding shutdown open for its timeout. It is deliberately
+// not the settle context: an in-flight lookup abandoned at shutdown leaves its
+// message acked and its drift unreported, which matches what realMain already
+// documents about an interrupted batch, and is preferable to delaying the ack of
+// every other message in the batch behind it.
+//
+// Derived rather than passed through, because processBatch also puts the batch's
+// join budget on it. A handler is therefore cut short by whichever comes first,
+// and the budget is the one that fires in ordinary running: it is shared by the
+// whole batch, so the last record of a slow batch can be handed a context that
+// is already close to expiry. A handler that treats a deadline as a bug rather
+// than as the ordinary end of its turn will be wrong most of the time it fires.
 type recordHandler func(context.Context, AuditRecord)
 
 // subscriberCounts is what the loop has done since it started. Exported
