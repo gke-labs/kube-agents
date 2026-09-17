@@ -116,44 +116,27 @@ marker files in the profile home (`HERMES_HOME` under this roster is
 first tick and holding the anchor time, and `.feedback_prompt_sent`, claimed
 with `O_EXCL` before anything reaches stdout, the same claim
 `bootstrap_delivery.py` makes and for the same reason, holding the time of the
-latest attempt and the count. Both sit on the data volume, which survives
+claim. Both sit on the data volume, which survives
 restarts and image rolls and dies only with an uninstall, so an upgrade is not
 a new install.
 
 Printing is not delivering: the relay runs after the script, and a claim taken
 on a day the relay, the Session KV server or the chat platform was down, or on
-an install that had bound no chat platform yet, would spend the one message on
-nothing. So the script reads the scheduler's own record of the run that
-carried the latest attempt, `last_delivery_error` on its entry in this
-profile's `cron/jobs.json`, the field `chat_delivery_watch.py` grades, and
-when that run graded as a hard failure (nothing reached any platform) it
-prints the message again on the next tick and rewrites the marker, under a
-lock on the marker so two racing runs cannot both retry. A record that says
-delivered, partial or degraded (it landed somewhere), a run the scheduler
-never recorded, or a store it cannot read ends the retries, in the direction
-of never posting twice. The record has to be of a run that exited 0
-(`last_status: ok`): a failed run of this job (a malformed delay) has its
-failure summary relayed too, and that outcome lands in the same field, so
-without the check a 502 on the summary would read as the post failing after it
-had landed. There is no cap on the attempts. `chat-delivery-watch` counts
-them like any other job's failed runs, so an outage that lasts past its
-threshold opens the ledger issue as usual, and the post that finally lands
-clears the streak as any other job's delivery does; a capped job would go
-silent for good at the cap, and a silent run never clears a streak, so the
-ledger issue would name this job for the life of the install. Every attempt
-is a Chat Agent turn, whatever the install has bound: the ticker enables the
-relay for every cron child, and the relay composes the message before it
-learns which platforms are there, so an install with no working chat platform
-pays one composition a day from the day the prompt falls due until a platform
-is bound or `FEEDBACK_PROMPT_ENABLED=false` switches the job off, and an
-install with one bound pays it for the length of a relay or platform outage;
-that is what every scheduled report's delivery costs on the same install, and
-the ledger already names every one of them there. The store holds one record
-per job, so a run of this job that is not an attempt (a tick with the knob
-off, a failed run) overwrites the attempt's record and ends the retries the
-same way; and a partial delivery (one platform of several) ends them too,
-after which the silent runs leave whatever streak the ledger had counted
-where it stands. The clock starts at the first
+an install that had bound no chat platform yet, spends the one message on
+nothing. The script does not read the scheduler's record of that delivery
+(`last_delivery_error` on its entry in this profile's `cron/jobs.json`, the
+field `chat_delivery_watch.py` grades) to post again, because the record
+cannot tell a post that landed from one that did not: a `hermes send` that
+posts, exits 0 and prints no readable message id is recorded as `composed but
+not delivered`, the same words as a send that failed, and so is a relay that
+raises or times out after the post has gone out. A retry on that record posts
+the request twice, and a message in a channel cannot be taken back. So the
+job fails in the direction of at most once: a post the scheduler recorded as
+undelivered is a lost request, which `chat-delivery-watch` counts like any
+other failed delivery, and which an operator sends again by removing
+`.feedback_prompt_sent` from the profile home, after which the next tick
+claims afresh. One Chat Agent composition is all the job ever costs, on the
+one tick that prints. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets
