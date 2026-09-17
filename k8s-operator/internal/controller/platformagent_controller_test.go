@@ -51,6 +51,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -4883,7 +4884,7 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	ctx := context.Background()
 
 	// 0. Sync with empty managed_repos on fresh ConfigMap — should be a no-op and preserve unmanaged-static.yaml
-	err := r.syncGithubTokenMinterConfigMap(ctx, agent, "")
+	err := r.syncGithubTokenMinterConfigMap(ctx, agent, "", "")
 	if err != nil {
 		t.Fatalf("syncGithubTokenMinterConfigMap with empty repos failed: %v", err)
 	}
@@ -4897,7 +4898,7 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	}
 
 	// 1. Sync with managed_repos JSON: repo-1 and repo-2
-	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/test-org/repo-2"}]`)
+	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/test-org/repo-2"}]`, "")
 	if err != nil {
 		t.Fatalf("syncGithubTokenMinterConfigMap failed: %v", err)
 	}
@@ -4934,7 +4935,7 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	}
 
 	// 2. Remove repo-2 from managed_repos
-	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`)
+	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`, "")
 	if err != nil {
 		t.Fatalf("syncGithubTokenMinterConfigMap failed: %v", err)
 	}
@@ -4961,7 +4962,7 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	}
 
 	// 3. Sync with managed_repos including a cross-org repo (other-org/other-repo) — should skip creating other-repo.yaml
-	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`)
+	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, "")
 	if err != nil {
 		t.Fatalf("syncGithubTokenMinterConfigMap failed with cross-org repo: %v", err)
 	}
@@ -4991,7 +4992,7 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 			},
 		},
 	}
-	err = r.syncGithubTokenMinterConfigMap(ctx, agentInferred, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/forbidden-org/forbidden-repo"}]`)
+	err = r.syncGithubTokenMinterConfigMap(ctx, agentInferred, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/forbidden-org/forbidden-repo"}]`, "")
 	if err != nil {
 		t.Fatalf("syncGithubTokenMinterConfigMap with inferred org failed: %v", err)
 	}
@@ -5037,7 +5038,7 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 	ctx := context.Background()
 
 	// Reconcile with managed_repos containing repo-1 and repo-2
-	err := r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/test-org/repo-2"}]`)
+	err := r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/test-org/repo-2"}]`, "")
 	if err != nil {
 		t.Fatalf("syncGithubTokenMinterConfigMap failed: %v", err)
 	}
@@ -5057,6 +5058,321 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 	expectedAnn := "repo-1.yaml,repo-2.yaml"
 	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != expectedAnn {
 		t.Errorf("expected annotation %q, got %q", expectedAnn, ann)
+	}
+}
+
+// The base template as the chart renders it since the read scope was added: a
+// write scope and a read scope, both listing the primary repository. Written
+// with sigs.k8s.io/yaml in mind -- the read-only rendering re-marshals it with
+// sorted keys, so the expectations below are built from a parse rather than
+// from a string.
+const minterTemplateWithReadScope = `version: 'minty.abcxyz.dev/v2'
+rule:
+  if: "assertion.iss == 'https://accounts.google.com'"
+scope:
+  platform-agent-scope:
+    rule:
+      if: "assertion.email in ['agent@example.iam.gserviceaccount.com']"
+    repositories:
+      - 'default-repo'
+    permissions:
+      contents: 'write'
+      pull_requests: 'write'
+      issues: 'write'
+  platform-agent-read-scope:
+    rule:
+      if: "assertion.email in ['agent@example.iam.gserviceaccount.com']"
+    repositories:
+      - 'default-repo'
+    permissions:
+      contents: 'read'
+`
+
+// parsedMinterPolicy unmarshals a rendered policy so a test can assert on its
+// structure rather than on the key order sigs.k8s.io/yaml chose.
+func parsedMinterPolicy(t *testing.T, rendered string) map[string]interface{} {
+	t.Helper()
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatalf("rendered policy does not parse: %v\n%s", err, rendered)
+	}
+	return doc
+}
+
+func minterPolicyScopes(t *testing.T, rendered string) map[string]interface{} {
+	t.Helper()
+	scopes, ok := parsedMinterPolicy(t, rendered)["scope"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("rendered policy has no scope map:\n%s", rendered)
+	}
+	return scopes
+}
+
+func TestRenderReadOnlyPolicy(t *testing.T) {
+	rendered, ok := renderReadOnlyPolicy(minterTemplateWithReadScope, []string{"tf-live", "tf-modules"})
+	if !ok {
+		t.Fatal("expected the template with a read scope to render")
+	}
+	doc := parsedMinterPolicy(t, rendered)
+	if doc["version"] != "minty.abcxyz.dev/v2" {
+		t.Errorf("expected version to be carried over, got %v", doc["version"])
+	}
+	if rule, _ := doc["rule"].(map[string]interface{}); rule["if"] != "assertion.iss == 'https://accounts.google.com'" {
+		t.Errorf("expected the top-level rule to be carried over, got %v", doc["rule"])
+	}
+	scopes := minterPolicyScopes(t, rendered)
+	if len(scopes) != 1 {
+		t.Fatalf("expected exactly the read scope, got %v", scopes)
+	}
+	readScope, ok := scopes["platform-agent-read-scope"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected platform-agent-read-scope, got %v", scopes)
+	}
+	if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live tf-modules]" {
+		t.Errorf("expected the context repositories, got %s", got)
+	}
+	if got := fmt.Sprint(readScope["permissions"]); got != "map[contents:read]" {
+		t.Errorf("expected contents: read alone, got %s", got)
+	}
+	if rule, _ := readScope["rule"].(map[string]interface{}); rule["if"] != "assertion.email in ['agent@example.iam.gserviceaccount.com']" {
+		t.Errorf("expected the scope rule to be carried over, got %v", readScope["rule"])
+	}
+	if strings.Contains(rendered, "write") {
+		t.Errorf("a read-only policy must not carry a write permission:\n%s", rendered)
+	}
+
+	// Stable across calls: the sync compares rendered content to decide whether
+	// to update, so a rendering that moved between reconciles would write on
+	// every pass.
+	again, _ := renderReadOnlyPolicy(minterTemplateWithReadScope, []string{"tf-live", "tf-modules"})
+	if again != rendered {
+		t.Errorf("rendering is not stable:\n%s\n---\n%s", rendered, again)
+	}
+
+	// A template that predates the read scope renders nothing.
+	for name, template := range map[string]string{
+		"write scope only": "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n",
+		"no scope map":     "version: 'minty.abcxyz.dev/v2'\n",
+		"not yaml":         "{{{",
+		"empty":            "",
+	} {
+		if _, ok := renderReadOnlyPolicy(template, []string{"tf-live"}); ok {
+			t.Errorf("%s: expected no rendering", name)
+		}
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data:       map[string]string{"default.yaml": minterTemplateWithReadScope},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	key := client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}
+	updatedCM := &corev1.ConfigMap{}
+
+	managed := `[{"type":"github","url":"https://github.com/test-org/gitops"}]`
+
+	// 1. A context repository renders a read-only key; the managed one keeps the write rendering.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	contextScopes := minterPolicyScopes(t, updatedCM.Data["tf-live.yaml"])
+	if _, hasWrite := contextScopes["platform-agent-scope"]; hasWrite || len(contextScopes) != 1 {
+		t.Errorf("expected tf-live.yaml to carry the read scope alone, got %v", contextScopes)
+	}
+	readScope := contextScopes["platform-agent-read-scope"].(map[string]interface{})
+	if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live]" {
+		t.Errorf("expected tf-live.yaml to list the context repositories, got %s", got)
+	}
+	if got := fmt.Sprint(readScope["permissions"]); got != "map[contents:read]" {
+		t.Errorf("expected contents: read, got %s", got)
+	}
+	managedScopes := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])
+	if _, hasWrite := managedScopes["platform-agent-scope"]; !hasWrite {
+		t.Errorf("expected gitops.yaml to keep the write scope, got %v", managedScopes)
+	}
+	if got := fmt.Sprint(managedScopes["platform-agent-scope"].(map[string]interface{})["repositories"]); got != "[gitops]" {
+		t.Errorf("expected the managed policy to list managed repositories only, got %s", got)
+	}
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml,tf-live.yaml" {
+		t.Errorf("expected both keys tracked, got %q", ann)
+	}
+	if updatedCM.Data["default.yaml"] != minterTemplateWithReadScope {
+		t.Errorf("default.yaml must not be rewritten")
+	}
+
+	// 2. A second reconcile with the same lists changes nothing.
+	before := updatedCM.ResourceVersion
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if updatedCM.ResourceVersion != before {
+		t.Errorf("expected an unchanged ConfigMap to be left alone")
+	}
+
+	// 3. A repository in both lists is managed: write rendering, and absent from the read list.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed,
+		`[{"type":"github","url":"https://github.com/test-org/gitops"},{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if _, hasWrite := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])["platform-agent-scope"]; !hasWrite {
+		t.Errorf("a repository in both lists must keep its write policy")
+	}
+	readScope = minterPolicyScopes(t, updatedCM.Data["tf-live.yaml"])["platform-agent-read-scope"].(map[string]interface{})
+	if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live]" {
+		t.Errorf("expected the managed repository to stay out of the read-only list, got %s", got)
+	}
+
+	// 4. Removing the context entry prunes its key; a cross-org entry never renders one.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed,
+		`[{"type":"github","url":"https://github.com/other-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if _, exists := updatedCM.Data["tf-live.yaml"]; exists {
+		t.Errorf("expected tf-live.yaml pruned once the same-org entry is gone")
+	}
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml" {
+		t.Errorf("expected only the managed key tracked, got %q", ann)
+	}
+
+	// 5. Context entries alone, with no managed repository, still render.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, "",
+		`[{"type":"github","url":"https://github.com/test-org/tf-live"},{"type":"github","url":"https://github.com/test-org/tf-modules"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	for _, name := range []string{"tf-live.yaml", "tf-modules.yaml"} {
+		readScope = minterPolicyScopes(t, updatedCM.Data[name])["platform-agent-read-scope"].(map[string]interface{})
+		if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live tf-modules]" {
+			t.Errorf("%s: expected every same-org context repository, got %s", name, got)
+		}
+	}
+	if _, exists := updatedCM.Data["gitops.yaml"]; exists {
+		t.Errorf("expected gitops.yaml pruned once unregistered")
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_ContextReposNeedTheReadScope(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	// A default.yaml from before the read scope existed.
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data: map[string]string{
+			"default.yaml": "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'gitops'\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent,
+		`[{"type":"github","url":"https://github.com/test-org/gitops"}]`,
+		`[{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	updatedCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if _, exists := updatedCM.Data["tf-live.yaml"]; exists {
+		t.Errorf("a template without the read scope must render no context policy; a write policy for a context repository would be worse than none")
+	}
+	if _, exists := updatedCM.Data["gitops.yaml"]; !exists {
+		t.Errorf("the managed rendering must be unaffected")
+	}
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml" {
+		t.Errorf("expected only the managed key tracked, got %q", ann)
+	}
+}
+
+func TestReconcileGitopsStateConfigMap_SyncsContextRepos(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org", GitRepo: "test-org/gitops"},
+				},
+			},
+		},
+	}
+	// The gitops-state ConfigMap as an administrator leaves it: the seeded
+	// managed_repos and a hand-added context_repos.
+	stateCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://github.com/test-org/gitops"}]`,
+			"context_repos": `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`,
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data:       map[string]string{"default.yaml": minterTemplateWithReadScope},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, stateCM, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	updatedCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	scopes := minterPolicyScopes(t, updatedCM.Data["tf-live.yaml"])
+	if _, ok := scopes["platform-agent-read-scope"]; !ok || len(scopes) != 1 {
+		t.Errorf("expected the reconcile to render tf-live.yaml read-only, got %v", scopes)
+	}
+	if _, ok := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])["platform-agent-scope"]; !ok {
+		t.Errorf("expected the reconcile to render gitops.yaml with the write scope")
+	}
+	// The reconcile does not touch context_repos itself.
+	state := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "test-agent-gitops-state", Namespace: "test-ns"}, state); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if state.Data["context_repos"] != stateCM.Data["context_repos"] {
+		t.Errorf("context_repos must be left as the administrator wrote it, got %q", state.Data["context_repos"])
 	}
 }
 

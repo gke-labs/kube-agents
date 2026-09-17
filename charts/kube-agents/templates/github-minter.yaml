@@ -51,6 +51,12 @@ metadata:
     iam.gke.io/gcp-service-account: {{ $m.gsaName }}@{{ $projectId }}.iam.gserviceaccount.com
 automountServiceAccountToken: false
 ---
+# Two scopes per policy. `platform-agent-scope` is the write token the agent's
+# managed repositories ride; `platform-agent-read-scope` grants `contents: read`
+# alone and is what the operator renders for each `context_repos` entry, so
+# the broker can clone a private context repository without holding a write
+# token for it. The operator reads the read scope out of default.yaml; a
+# ConfigMap without it renders no context policies.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -73,6 +79,13 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+      platform-agent-read-scope:
+        rule:
+          if: "assertion.email in ['{{ $allowedSa }}']"
+        repositories:
+          - '{{ $repo }}'
+        permissions:
+          contents: 'read'
   {{ $repo }}.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
@@ -87,6 +100,13 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+      platform-agent-read-scope:
+        rule:
+          if: "assertion.email in ['{{ $allowedSa }}']"
+        repositories:
+          - '{{ $repo }}'
+        permissions:
+          contents: 'read'
 ---
 apiVersion: apps/v1
 kind: Deployment
