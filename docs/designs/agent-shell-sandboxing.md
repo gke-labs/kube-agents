@@ -1501,17 +1501,18 @@ against different volumes, but a directory the agent pod created still does not 
 here, which is the subject of the section above. What neither closes is content: a script
 that expects to _read_ something the agent pod put at `/opt/data` still finds nothing.
 
-Enumerating what the sandbox legitimately needs sorts the references into six classes
-with four delivery mechanisms.
+Enumerating what the sandbox legitimately needs sorts the references into the classes below,
+each with its delivery mechanism.
 
-| What                                         | Where it comes from                                | Why                                           |
-| -------------------------------------------- | -------------------------------------------------- | --------------------------------------------- |
-| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                             | read into the prompt, never through the shell |
-| Skills, including their `scripts/`           | baked at `/opt/defaults`, synced by the entrypoint | the existing sync delivers the wrong tree     |
-| Governance SOPs                              | the same bake and sync                             | static, versioned with the repo               |
-| The shell-invoked subset of `scripts/`       | the same bake and sync, as an allowlist            | static, and the subset is small               |
-| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod             | per-install content, rendered by the operator |
-| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime                  | data, not delivery                            |
+| What                                         | Where it comes from                                | Why                                                                           |
+| -------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                             | read into the prompt, never through the shell                                 |
+| Capability criteria (`capabilities/`)        | stays in the agent pod                             | read and written in-process by `capability_criteria`, never through the shell |
+| Skills, including their `scripts/`           | baked at `/opt/defaults`, synced by the entrypoint | the existing sync delivers the wrong tree                                     |
+| Governance SOPs                              | the same bake and sync                             | static, versioned with the repo                                               |
+| The shell-invoked subset of `scripts/`       | the same bake and sync, as an allowlist            | static, and the subset is small                                               |
+| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod             | per-install content, rendered by the operator                                 |
+| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime                  | data, not delivery                                                            |
 
 **The persona stays behind, and that is a property rather than an omission.** Nothing
 writes `SOUL.md` through the shell. The only writer is
