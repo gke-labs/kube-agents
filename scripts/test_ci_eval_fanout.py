@@ -157,7 +157,12 @@ class DelegationCeilingTest(unittest.TestCase):
 
     def test_the_unit_exports_its_own_ceiling_before_launching_the_bench(self):
         unit = lifted("run_one_unit")
-        export = 'export AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"'
+        # Assigned, then exported (SC2155: an `export X="$(...)"` masks the
+        # command's exit status).
+        export = (
+            'AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"\n'
+            "  export AGENT_DELEGATION_TIMEOUT"
+        )
         self.assertIn(export, unit)
         # Exported before the bench runs, not after it: the position is the
         # whole point of the line.

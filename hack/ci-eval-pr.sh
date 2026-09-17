@@ -1769,7 +1769,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   export BENCH_NO_INFRA="false"
   # Per unit, inside this subshell, so the audit units' longer ceiling never
   # leaks to a sibling lane; see unit_delegation_timeout.
-  export AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
+  AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
+  export AGENT_DELEGATION_TIMEOUT
   local start end dir
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
