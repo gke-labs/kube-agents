@@ -4,8 +4,8 @@ Run: python3 -m unittest agents/platform/scripts/test_feedback_prompt.py
 
 The property that matters is "once delivered": every tick but one prints nothing,
 the one that prints claims a marker first, and a print the scheduler recorded
-as undelivered is repeated until one lands or the attempts run out. The clock
-and the scheduler's store are injected, so a week passes in a call.
+as undelivered is repeated until one lands. The clock and the scheduler's store
+are injected, so a week passes in a call.
 """
 
 import contextlib
@@ -210,11 +210,46 @@ class FailureTest(FeedbackPromptCase):
         self.assertIn(fp.SENT_MARKER, err)
         self.assertFalse(self.sent().exists())
 
+    def test_a_marker_whose_payload_failed_to_write_is_not_left_behind(self):
+        # The create and the write are two operations. An empty sent marker
+        # left by a failed write would read on every later tick as a claim no
+        # run can retry, and the prompt would be lost for good; the failed run
+        # exits 1 (reported in chat) and the next tick claims afresh.
+        self.tick(T0)
+        refuse = unittest.mock.Mock(side_effect=OSError(28, "No space left on device"))
+        with unittest.mock.patch.object(fp.os, "write", refuse):
+            code, out, err = self.tick(T0 + WEEK)
+        self.assertEqual((1, ""), (code, out))
+        self.assertIn(fp.SENT_MARKER, err)
+        self.assertFalse(self.sent().exists())
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual(fp.MESSAGE, out)
+
+    def test_a_short_write_of_a_marker_is_a_failure_that_leaves_nothing_behind(self):
+        # A partial payload ("17896") would parse as a time and anchor or claim
+        # wrongly, so it is treated like a refused write.
+        short = unittest.mock.Mock(side_effect=lambda fd, data: len(data) - 1)
+        with unittest.mock.patch.object(fp.os, "write", short):
+            code, out, err = self.tick(T0)
+        self.assertEqual((1, ""), (code, out))
+        self.assertIn(fp.ARMED_MARKER, err)
+        self.assertFalse(self.armed().exists())
+        code, out, _ = self.tick(T0)
+        self.assertEqual((0, ""), (code, out))
+        self.assertTrue(self.armed().exists())
+
     def test_the_home_comes_from_hermes_home(self):
         os.environ[fp.HOME_ENV] = str(self.home)
         with contextlib.redirect_stdout(io.StringIO()):
             fp.main(now=T0)
         self.assertTrue(self.armed().exists())
+
+    def test_the_default_home_is_the_profile_home_the_ticker_uses(self):
+        # `profile_cron_tick.py` runs this roster with HERMES_HOME set to the
+        # platform profile's home; a hand run in the container without that
+        # environment must find the same markers, not start a second pair
+        # under the gateway's `/opt/data`.
+        self.assertEqual("/opt/data/profiles/platform", fp.DEFAULT_HOME)
 
 
 RELAY_502 = (
@@ -237,11 +272,11 @@ class RetryTest(FeedbackPromptCase):
         self.assertEqual(fp.MESSAGE, out)
         self.assertEqual(fp.claim_record(T0 + WEEK, 1), self.sent().read_text())
 
-    def record(self, run_at: float, error: str | None, job_id: str = fp.JOB_ID):
+    def record(self, run_at: float, error: str | None, job_id: str = fp.JOB_ID, status: str = "ok"):
         """What the scheduler leaves in the profile store after the run at ``run_at``."""
         store = self.home / fp.STORE_PATH
         store.parent.mkdir(parents=True, exist_ok=True)
-        entry = {"id": job_id, "last_run_at": iso(run_at), "last_status": "ok", "last_delivery_error": error}
+        entry = {"id": job_id, "last_run_at": iso(run_at), "last_status": status, "last_delivery_error": error}
         store.write_text(json.dumps({"jobs": [{"id": "other-job", "last_delivery_error": RELAY_502}, entry]}))
 
     def test_a_recorded_hard_failure_is_retried_on_the_next_tick(self):
@@ -286,18 +321,32 @@ class RetryTest(FeedbackPromptCase):
         _, out, _ = self.tick(T0 + WEEK + 86400)
         self.assertEqual("", out)
 
-    def test_retries_stop_after_the_attempt_cap(self):
+    def test_a_failed_runs_relayed_summary_is_not_the_attempts_record(self):
+        # Day 7 lands. Later a run of this job fails (a malformed delay) and
+        # its failure summary is relayed on a day the relay is down: same
+        # fields, a hard error, a later stamp. That is not the attempt's
+        # record, and the message must not go a second time.
+        self.record(T0 + WEEK + 77, None)
+        self.record(T0 + WEEK + 3 * 86400, RELAY_502, status="error")
+        _, out, _ = self.tick(T0 + WEEK + 4 * 86400)
+        self.assertEqual("", out)
+        self.assertEqual(fp.claim_record(T0 + WEEK, 1), self.sent().read_text())
+
+    def test_retries_have_no_cap(self):
+        # A capped job goes silent for good at the cap, and a silent run never
+        # clears the streak chat_delivery_watch keeps, so the ledger issue would
+        # name this job for the life of the install. Retried until one lands,
+        # the landing clears it like any other job's delivery.
         attempted_at = T0 + WEEK
-        for attempt in range(2, fp.MAX_ATTEMPTS + 1):
+        for attempt in range(2, 31):
             self.record(attempted_at + 77, RELAY_502)
             attempted_at += 86400
             _, out, _ = self.tick(attempted_at)
             self.assertEqual(fp.MESSAGE, out, attempt)
             self.assertEqual(fp.claim_record(attempted_at, attempt), self.sent().read_text())
-        self.record(attempted_at + 77, RELAY_502)
+        self.record(attempted_at + 77, None)
         _, out, _ = self.tick(attempted_at + 86400)
         self.assertEqual("", out)
-        self.assertEqual(fp.claim_record(attempted_at, fp.MAX_ATTEMPTS), self.sent().read_text())
 
     def test_a_racing_run_after_a_retry_sees_no_record_for_it_and_stays_silent(self):
         self.record(T0 + WEEK + 77, RELAY_502)
@@ -321,6 +370,31 @@ class RetryTest(FeedbackPromptCase):
         self.assertEqual((T0, 1), fp.parse_claim(f"{T0:.0f}\n"))
         self.assertIsNone(fp.parse_claim("claimed elsewhere\n"))
         self.assertIsNone(fp.parse_claim(""))
+
+
+class StampTest(FeedbackPromptCase):
+    """The markers hold whole seconds, floored: a rounded-up second would outrun the record."""
+
+    def test_a_stamp_is_the_second_the_time_fell_in(self):
+        self.assertEqual("1789615518", fp.stamp(1789615518.630110))
+        self.assertEqual("1789615518", fp.stamp(1789615518.0))
+
+    def test_a_stamp_that_follows_the_attempt_within_the_second_is_its_record(self):
+        # Seen on the robot install: the script's clock read 18.63, the
+        # scheduler's stamp 18.78. With no adapter to run (no chat platform
+        # bound) the gap is that small every time, and a marker rounded to 19
+        # would read that stamp as an earlier run and never retry.
+        self.tick(T0)
+        attempted_at = T0 + WEEK + 0.63
+        _, out, _ = self.tick(attempted_at)
+        self.assertEqual(fp.MESSAGE, out)
+        self.assertEqual(f"{T0 + WEEK:.0f}\n1\n", self.sent().read_text())
+        store = self.home / fp.STORE_PATH
+        store.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"id": fp.JOB_ID, "last_run_at": iso(attempted_at + 0.157), "last_status": "ok", "last_delivery_error": RELAY_502}
+        store.write_text(json.dumps({"jobs": [entry]}))
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual(fp.MESSAGE, out)
 
 
 class MessageTest(unittest.TestCase):

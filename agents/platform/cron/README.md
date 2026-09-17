@@ -131,12 +131,20 @@ prints the message again on the next tick and rewrites the marker, under a
 lock on the marker so two racing runs cannot both retry. A record that says
 delivered, partial or degraded (it landed somewhere), a run the scheduler
 never recorded, or a store it cannot read ends the retries, in the direction
-of never posting twice. The retries stop after fourteen attempts in all, two
-weeks of daily ticks, because each attempt is a Chat Agent composition and an
-install that has bound no chat platform in that time is not one the message
-can reach. `chat-delivery-watch` counts the failed attempts like any other
-job's, so a relay outage that lasts past its threshold opens the ledger issue
-as usual. The clock starts at the first
+of never posting twice. The record has to be of a run that exited 0
+(`last_status: ok`): a failed run of this job (a malformed delay) has its
+failure summary relayed too, and that outcome lands in the same field, so
+without the check a 502 on the summary would read as the post failing after it
+had landed. There is no cap on the attempts. `chat-delivery-watch` counts
+them like any other job's failed runs, so an outage that lasts past its
+threshold opens the ledger issue as usual, and the post that finally lands
+clears the streak as any other job's delivery does; a capped job would go
+silent for good at the cap, and a silent run never clears a streak, so the
+ledger issue would name this job for the life of the install. On an install
+with no chat platform bound the scheduler records the failure before any
+adapter runs, so a retry there costs no Chat Agent turn; a relay or platform
+outage on an install with one bound costs one composition a day until it
+ends. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets

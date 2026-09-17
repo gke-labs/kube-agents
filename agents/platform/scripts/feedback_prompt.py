@@ -36,10 +36,21 @@ again and the marker rewritten with the new attempt, under a lock on the marker
 so two racing runs cannot both retry; a record that says delivered, partial or
 degraded (it landed somewhere), a run the scheduler never recorded, or an
 unreadable store ends the retries, in the direction of not posting twice. The
-retries stop after ``MAX_ATTEMPTS`` in all, because every attempt is a Chat
-Agent composition and an install that has bound no chat platform in two weeks
-of daily tries is not one this message can reach. The text is a constant, so a
-lost message is nothing to recover; only the posting is retried.
+record has to be of a run that exited 0 (``last_status`` ok), because this
+script prints only on that path and a failed run of this job (a malformed
+delay, a marker the volume refuses) has its failure summary relayed too, with
+the outcome in the same field: without that check a 502 on the summary would
+read as the post failing after it had landed, and the message would go twice.
+
+There is no cap on the attempts. A capped job goes silent for good once the
+cap is reached, and a silent run never clears the streak
+``chat_delivery_watch.py`` keeps for it, so the ledger issue would name this
+job for the life of the install; retried until one lands, the post that lands
+clears the streak as any other job's delivery does. On an install with no chat
+platform bound the scheduler records the failure before any adapter runs, so a
+retry there costs no Chat Agent turn; a relay or platform outage on an install
+with one bound costs one composition a day until it ends. The text is a
+constant, so a lost message is nothing to recover; only the posting is retried.
 
 Both markers live on the data volume, which survives pod restarts and image
 rolls and is deleted only by an uninstall. That is what makes an upgrade not
@@ -74,8 +85,10 @@ The form URL is a constant, not a knob: the published short link is the only
 address the maintainers hand out, and it redirects wherever the form lives.
 """
 
+import errno
 import fcntl
 import json
+import math
 import os
 import re
 import sys
@@ -85,12 +98,15 @@ from pathlib import Path
 # A sibling in `$HERMES_HOME/scripts`, this script's own directory and therefore
 # `sys.path[0]` when the scheduler runs it. It owns the grading of a
 # `last_delivery_error`, from the strings the chat adapter produces.
-from chat_delivery_watch import GRADE_HARD, grade_error, is_delivered_note, parse_iso
+from chat_delivery_watch import GRADE_HARD, STATUS_OK, grade_error, is_delivered_note, parse_iso
 
 HOME_ENV = "HERMES_HOME"
-# What the ticker sets HERMES_HOME to for this roster is the profile home;
-# the default is the gateway's, for a hand run outside the tick.
-DEFAULT_HOME = "/opt/data"
+# What the ticker sets HERMES_HOME to for this roster is the profile home,
+# `profiles/platform` under the data volume (`profile_cron_tick.py`). The
+# default is that same path rather than the gateway's `/opt/data`, so a hand
+# run in the container without the ticker's environment reads and writes the
+# markers the scheduled ticks use, not a second pair under the gateway's home.
+DEFAULT_HOME = "/opt/data/profiles/platform"
 
 ENABLED_ENV = "FEEDBACK_PROMPT_ENABLED"
 DELAY_ENV = "FEEDBACK_PROMPT_DELAY"
@@ -118,11 +134,8 @@ MARKER_MODE = 0o644
 JOB_ID = "feedback-prompt"
 STORE_PATH = Path("cron") / "jobs.json"
 LAST_RUN_AT_FIELD = "last_run_at"
+LAST_STATUS_FIELD = "last_status"
 LAST_DELIVERY_ERROR_FIELD = "last_delivery_error"
-# Attempts in all, the first included: two weeks of daily ticks. Each one is a
-# Chat Agent composition, and an install that has bound no chat platform after
-# two weeks of tries is not one this message can reach.
-MAX_ATTEMPTS = 14
 FIRST_ATTEMPT = 1
 
 LOG_PREFIX = "feedback_prompt"
@@ -174,21 +187,44 @@ def due(anchored_at: float, now: float, delay: int) -> bool:
     return now - anchored_at >= delay - slack
 
 
+def stamp(at: float) -> str:
+    """A time as the whole second it fell in, the form both markers hold it in.
+
+    Floored, never rounded. The scheduler stamps ``last_run_at`` after the run,
+    and when no adapter ran (no chat platform bound) that stamp follows this
+    script's clock by a fraction of a second; a time rounded up to the next
+    second would then sit after its own record, which ``delivery_failed``
+    reads as the record of an earlier run, and the attempt would never be
+    retried.
+    """
+    return str(math.floor(at))
+
+
 def _create_exclusive(path: Path, content: str) -> bool:
     """Create ``path`` holding ``content`` unless it exists. True if this call created it.
 
     ``O_CREAT | O_EXCL`` is one filesystem operation, so "does it exist?" and "it
     exists now, and it is mine" are indivisible. Raises ``OSError`` for anything
-    other than the file already being there.
+    other than the file already being there. A create that succeeds and a
+    payload that does not (the volume full, say) removes the file again before
+    raising: an empty marker left behind would read on every later tick as a
+    claim no run can retry, and the prompt would be lost for good.
     """
     try:
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, MARKER_MODE)
     except FileExistsError:
         return False
+    data = content.encode("utf-8")
     try:
-        os.write(fd, content.encode("utf-8"))
-    finally:
-        os.close(fd)
+        try:
+            written = os.write(fd, data)
+        finally:
+            os.close(fd)
+        if written != len(data):
+            raise OSError(errno.ENOSPC, f"{os.strerror(errno.ENOSPC)}: wrote {written} of {len(data)} bytes", str(path))
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
     return True
 
 
@@ -201,7 +237,7 @@ def anchor(home: Path, now: float) -> float | None:
     somebody truncated by hand still anchors rather than re-arming forever.
     """
     marker = home / ARMED_MARKER
-    if _create_exclusive(marker, f"{now:.0f}\n"):
+    if _create_exclusive(marker, f"{stamp(now)}\n"):
         return None
     try:
         return float(marker.read_text(encoding="utf-8").strip())
@@ -211,7 +247,7 @@ def anchor(home: Path, now: float) -> float | None:
 
 def claim_record(attempted_at: float, attempts: int) -> str:
     """What the sent marker holds: the latest attempt's time, then the count."""
-    return f"{attempted_at:.0f}\n{attempts}\n"
+    return f"{stamp(attempted_at)}\n{attempts}\n"
 
 
 def parse_claim(text: str) -> tuple[float, int] | None:
@@ -236,12 +272,14 @@ def parse_claim(text: str) -> tuple[float, int] | None:
 def delivery_failed(store: Path, attempted_at: float) -> bool:
     """Whether the scheduler recorded the run that carried the attempt as undelivered.
 
-    True only on positive evidence: the store parses, carries this job, its
-    ``last_run_at`` (stamped after delivery) is at or after the attempt, and its
+    True only on positive evidence: the store parses, carries this job, the
+    record is of a run that exited 0 (the only kind that prints; a failed run's
+    relayed failure summary writes the same fields), its ``last_run_at``
+    (stamped after delivery) is at or after the attempt, and its
     ``last_delivery_error`` grades as a hard failure (nothing reached any
     platform). A delivered note, a partial or degraded delivery, a record of an
-    earlier run, or no readable record is False: the message may have landed,
-    and posting it twice costs more than a lost retry.
+    earlier run or of a failed run, or no readable record is False: the message
+    may have landed, and posting it twice costs more than a lost retry.
     """
     try:
         data = json.loads(store.read_text(encoding="utf-8"))
@@ -253,6 +291,8 @@ def delivery_failed(store: Path, attempted_at: float) -> bool:
     for job in jobs:
         if not isinstance(job, dict) or job.get("id") != JOB_ID:
             continue
+        if job.get(LAST_STATUS_FIELD) != STATUS_OK:
+            return False
         recorded_at = parse_iso(job.get(LAST_RUN_AT_FIELD))
         if recorded_at is None or recorded_at.timestamp() < attempted_at:
             return False
@@ -279,7 +319,7 @@ def _claim_retry(marker: Path, store: Path, now: float) -> bool:
         if claim is None:
             return False
         attempted_at, attempts = claim
-        if attempts >= MAX_ATTEMPTS or not delivery_failed(store, attempted_at):
+        if not delivery_failed(store, attempted_at):
             return False
         handle.seek(0)
         handle.truncate()
@@ -326,7 +366,7 @@ def main(home: Path | None = None, now: float | None = None) -> int:
         sys.stderr.write(f"{LOG_PREFIX}: cannot write {marker}: {exc}\n")
         return 1
     if not claimed:
-        return 0  # delivered, or being retried by a racing run, or out of attempts
+        return 0  # delivered, or being retried by a racing run
 
     sys.stdout.write(MESSAGE)
     sys.stdout.flush()
