@@ -55,6 +55,7 @@ PROFILES_BASE = HERMES_HOME / "profiles"
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
+CLUSTER_PROFILE_PREFIX = "cluster-"
 
 # Non-cluster profiles that live under $HERMES_HOME/profiles but are never
 # managed as Cluster Agents: the front-door router (`default`) and the Platform
@@ -472,13 +473,34 @@ def delete_profile(name: str) -> None:
         shutil.rmtree(home, ignore_errors=True)
 
 
-def list_profiles() -> list[str]:
-    """Return sorted names of managed Cluster Agent profiles (excludes reserved profiles)."""
+def list_profiles(include_incomplete: bool = False) -> list[str]:
+    """Return sorted names of managed Cluster Agent profiles.
+
+    By default (include_incomplete=False), returns only fully scaffolded profiles:
+    profiles whose directory name starts with 'cluster-', not in RESERVED_PROFILES,
+    carrying a valid 'USER.md' identity file, and having readable cluster_identity
+    in config.yaml.
+
+    When include_incomplete=True, returns all directories under PROFILES_BASE
+    excluding RESERVED_PROFILES, allowing reconciliation to detect and repair
+    incomplete scaffolds.
+    """
     if not PROFILES_BASE.is_dir():
         return []
-    return sorted(
-        p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
-    )
+    if include_incomplete:
+        return sorted(
+            p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
+        )
+    valid = []
+    for p in PROFILES_BASE.iterdir():
+        if not p.is_dir() or p.name in RESERVED_PROFILES or not p.name.startswith(CLUSTER_PROFILE_PREFIX):
+            continue
+        if not (p / "USER.md").is_file():
+            continue
+        if read_cluster_identity(p) is None:
+            continue
+        valid.append(p.name)
+    return sorted(valid)
 
 
 def cmd_delete(args: argparse.Namespace) -> None:
@@ -487,8 +509,9 @@ def cmd_delete(args: argparse.Namespace) -> None:
     print(name)
 
 
-def cmd_list(_args: argparse.Namespace) -> None:
-    for name in list_profiles():
+def cmd_list(args: argparse.Namespace) -> None:
+    include_incomplete = getattr(args, "all", False)
+    for name in list_profiles(include_incomplete=include_incomplete):
         print(name)
 
 
@@ -518,7 +541,12 @@ def main() -> None:
         sp.add_argument("--cluster", required=True)
         sp.add_argument("--location", required=True)
 
-    sub.add_parser("list", help="List existing cluster profiles")
+    list_parser = sub.add_parser("list", help="List existing cluster profiles")
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
+    )
 
     args = parser.parse_args()
     handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}

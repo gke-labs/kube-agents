@@ -504,10 +504,18 @@ class ListProfilesReservedTest(unittest.TestCase):
     def test_reserved_profiles_excluded(self):
         base = Path(tempfile.mkdtemp()) / "profiles"
         for name in ("default", "platform", "cluster-a", "cluster-b"):
-            (base / name).mkdir(parents=True)
+            p = base / name
+            p.mkdir(parents=True)
+            if name.startswith("cluster-"):
+                (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+                (p / "config.yaml").write_text(
+                    "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                    encoding="utf-8",
+                )
         (base / "a-file").write_text("not a dir")
         with mock.patch.object(cap, "PROFILES_BASE", base):
             self.assertEqual(cap.list_profiles(), ["cluster-a", "cluster-b"])
+            self.assertEqual(cap.list_profiles(include_incomplete=True), ["cluster-a", "cluster-b"])
 
 
 class ClusterExistsTest(unittest.TestCase):

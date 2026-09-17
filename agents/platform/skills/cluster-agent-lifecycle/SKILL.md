@@ -39,14 +39,18 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
    - **If the request does NOT name a cluster** (names only a namespace or workload):
      **Do not ask the user which cluster before searching.** You have fleet-wide read visibility and per-cluster Cluster Agents; the user does not. Resolve the cluster before asking:
-     1. **Enumerate the fleet:** list active Cluster Agent profiles:
+     1. **Enumerate the fleet:** list active, fully scaffolded Cluster Agent profiles. Run:
         ```bash
         python3 /opt/data/scripts/cluster_agent_profile.py list
         ```
-     2. **Fan out a read-only existence check:** create one card per profile in one burst (no `parents`), asking each Cluster Agent whether the target namespace/workload exists on its cluster (e.g. `kanban_create(assignee="<profile>", title="Check existence: <workload> in <namespace>", body="Check whether namespace '<namespace>' or workload '<workload>' exists on this cluster. Return existence: true/false in metadata and result.")`).
-     3. **Evaluate the findings:**
+        (In the sandbox, this reads the mirrored roster on the persistent volume; you can also inspect `/opt/data/profiles/cluster-*/USER.md` directly).
+     2. **Fan out read-only existence checks:** create one card per profile in one burst **with no `parents`**, asking each Cluster Agent whether the target namespace/workload exists on its cluster (e.g. `kanban_create(assignee="<profile>", title="Check existence: <workload> in <namespace>", body="Check whether namespace '<namespace>' or workload '<workload>' exists on this cluster. Return existence: true/false in metadata and result.")`).
+     3. **Wait and poll to settlement:** poll each probe card with `kanban_show(<id>)` (`sleep 60` between rounds per `SOUL.md` §6) until **all** fanned-out probe cards are settled (`done`, `archived`, or `blocked`). Do not attempt to complete your own card or proceed while probe cards are still running — the gateway refuses completion while child cards are active.
+     4. **Evaluate the findings:**
+        - A probe that completes with `existence: true` (or confirms workload presence in `result` or `metadata`) counts as a match.
+        - A probe that blocks (e.g. `needs_input`), fails, or times out does **not** count as a match for the target workload. Record any blocked/failed probe in your synthesis.
         - **Exactly one cluster matches:** proceed to step 2 to delegate the debugging investigation to that cluster's profile. In your report, state clearly which cluster was resolved and how (e.g. *"Resolved `payments-api` in namespace `seeded-debug` to cluster `seeded-a` after fleet discovery"*). Never resolve silently.
-        - **Zero or multiple clusters match:** *then* ask the user for clarification, stating explicitly which clusters were checked and what was found. Ask only after looking.
+        - **Zero clusters match, multiple clusters match, or probes block/fail leaving ambiguity:** *then* ask the user for clarification, stating explicitly which clusters were checked and what was found on each (including any clusters where the probe blocked or failed). Ask only after looking.
 
 2. **Create the card** with the request in the body:
 

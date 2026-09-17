@@ -533,6 +533,18 @@ class ListProfilesTest(unittest.TestCase):
         self.patcher.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def _scaffold(self, name: str, user_md: bool = True, identity: bool = True):
+        p = self.tmp / name
+        p.mkdir(parents=True, exist_ok=True)
+        if user_md:
+            (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+        if identity:
+            (p / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                encoding="utf-8",
+            )
+        return p
+
     def test_nonexistent_directory_returns_empty(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
         self.assertEqual(cap.list_profiles(), [])
@@ -541,19 +553,118 @@ class ListProfilesTest(unittest.TestCase):
         (self.tmp / "default").mkdir()
         (self.tmp / "platform").mkdir()
         (self.tmp / "not-a-dir.txt").touch()
-        (self.tmp / "cluster-beta").mkdir()
-        (self.tmp / "cluster-alpha").mkdir()
+        self._scaffold("cluster-beta")
+        self._scaffold("cluster-alpha")
 
         self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
 
+    def test_incomplete_profiles_excluded_by_default(self):
+        self._scaffold("cluster-ready")
+        self._scaffold("cluster-no-user", user_md=False, identity=True)
+        self._scaffold("cluster-no-identity", user_md=True, identity=False)
+
+        self.assertEqual(cap.list_profiles(), ["cluster-ready"])
+        self.assertEqual(
+            cap.list_profiles(include_incomplete=True),
+            ["cluster-no-identity", "cluster-no-user", "cluster-ready"],
+        )
+
     def test_cmd_list_prints_sorted(self):
-        (self.tmp / "cluster-zeta").mkdir()
-        (self.tmp / "cluster-beta").mkdir()
+        self._scaffold("cluster-zeta")
+        self._scaffold("cluster-beta")
+        self._scaffold("cluster-halfbuilt", user_md=False)
 
         out = io.StringIO()
         with mock.patch("sys.stdout", out):
-            cap.cmd_list(mock.MagicMock())
+            cap.cmd_list(mock.MagicMock(all=False))
         self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
+
+        out_all = io.StringIO()
+        with mock.patch("sys.stdout", out_all):
+            cap.cmd_list(mock.MagicMock(all=True))
+        self.assertEqual(out_all.getvalue(), "cluster-beta\ncluster-halfbuilt\ncluster-zeta\n")
+
+
+class SandboxStubTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.stub_path = repo_root / "deploy" / "sandbox" / "agent-pod-only-stub.py"
+        self.assertTrue(self.stub_path.is_file(), f"missing {self.stub_path}")
+        self.tmp = Path(tempfile.mkdtemp(prefix="sandbox-stub-test-"))
+        self.profiles = self.tmp / "profiles"
+        self.profiles.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_stub(self, script_name: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ, "HERMES_HOME": str(self.tmp)}
+        # argv[0] is simulated via symlink or executing python directly
+        cmd = [sys.executable, str(self.stub_path), *args]
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            # Pass custom argv[0] through python if possible, or test via wrapper
+        )
+
+    def test_stub_list_enumerates_mirrored_roster(self):
+        # Create a ready cluster profile with USER.md and an incomplete one without
+        p_ready = self.profiles / "cluster-ready"
+        p_ready.mkdir()
+        (p_ready / "USER.md").write_text("- project: p\n- cluster: ready\n- location: l\n")
+
+        p_no_user = self.profiles / "cluster-no-user"
+        p_no_user.mkdir()
+
+        p_platform = self.profiles / "platform"
+        p_platform.mkdir()
+
+        # Run with argv[0] matching cluster_agent_profile.py
+        wrapper = self.tmp / "cluster_agent_profile.py"
+        wrapper.symlink_to(self.stub_path)
+
+        res = subprocess.run(
+            [sys.executable, str(wrapper), "list"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HERMES_HOME": str(self.tmp)},
+            check=False,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.stdout.strip(), "cluster-ready")
+
+    def test_stub_name_derives_canonical_profile_name(self):
+        wrapper = self.tmp / "cluster_agent_profile.py"
+        wrapper.symlink_to(self.stub_path)
+
+        res = subprocess.run(
+            [sys.executable, str(wrapper), "name", "--project", "my-prj", "--cluster", "k8s", "--location", "us-east1"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HERMES_HOME": str(self.tmp)},
+            check=False,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.stdout.strip(), "cluster-my-prj-k8s-us-east1")
+
+    def test_stub_mutation_refuses_with_roster_guidance(self):
+        wrapper = self.tmp / "cluster_agent_profile.py"
+        wrapper.symlink_to(self.stub_path)
+
+        res = subprocess.run(
+            [sys.executable, str(wrapper), "create", "--name", "x"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HERMES_HOME": str(self.tmp)},
+            check=False,
+        )
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res.stderr)
+        self.assertIn("cluster_agent_profile.py list", res.stderr)
+        self.assertIn("/opt/data/profiles/cluster-*/USER.md", res.stderr)
 
 
 class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
@@ -568,8 +679,18 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
     def test_delegation_handles_unnamed_cluster_via_fleet_enumeration(self):
         # The procedure must explicitly guide resolution when the cluster name is omitted (#953).
         self.assertIn("cluster_agent_profile.py list", self.content)
+        # Must document inspecting mirrored roster in the sandbox
+        self.assertIn("/opt/data/profiles/cluster-*/USER.md", self.content)
         # Must instruct checking before asking the user
         self.assertIn("existence", self.content.lower())
+        # Must instruct polling to settlement and waiting before completing
+        self.assertIn("settlement", self.content.lower())
+        self.assertIn("sleep 60", self.content)
+        # Must define that blocked or failed probes do not count as a match
+        self.assertRegex(
+            self.content,
+            r"[Bb]locked.*not.*match|[Dd]o(es)?\s+(\*\*)?not(\*\*)?\s+count as a match",
+        )
         # Must instruct asking only after searching / looking
         self.assertRegex(
             self.content,
