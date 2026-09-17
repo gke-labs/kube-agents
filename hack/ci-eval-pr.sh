@@ -636,6 +636,8 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 # baseline store the gate compares against is built from PASSING runs on main,
 # and those are exactly the records the old failure-only trap threw away. It
 # cannot precede the `$?` capture, so it sits immediately after it.
+# collect_litellm_log is here for the same reason -- see its comment in
+# ci-env.sh -- and both leave `$?` alone for the dumper below.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -653,6 +655,7 @@ profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
   collect_bench_results
+  collect_litellm_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure

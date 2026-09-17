@@ -89,6 +89,30 @@ collect_bench_results() {
   cp results_*.json "${artifact_dir}/" 2>/dev/null || true
 }
 
+# ─── LiteLLM Log Collection (runs on PASS as well as on failure) ───────────────
+# The model path runs through LiteLLM, and with vertex_ai its failure domain
+# (Workload Identity token fetch, aiplatform 403s, model 404s, upstream 429s)
+# is visible only in this pod's log -- the gateway just relays the text.
+#
+# This used to live inside dump_prow_artifacts_on_failure, so no green run ever
+# kept one. That makes the 429 rate measurable only on runs that already broke,
+# which is the wrong half: tuning EVAL_TASK_PARALLELISM needs the rate on runs
+# that PASS, to tell "more load, same errors" from "more load, more errors".
+#
+# Callers must invoke this BEFORE dump_prow_artifacts_on_failure, for the same
+# `$?` reason as collect_bench_results above. A red eval run captures twice --
+# once here, once from the dumper -- and the second write is the fresher log.
+collect_litellm_log() {
+  local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
+  local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
+  mkdir -p "${artifact_dir}" || true
+  # 1000 lines covered a deploy-time failure, which is all this used to see. A
+  # full fan-out emits far more than that, and truncation would silently
+  # undercount the errors this is now collected to count.
+  kubectl logs deployment/litellm -n "${ns}" --tail=20000 \
+    > "${artifact_dir}/litellm.log" 2>&1 || true
+}
+
 # ─── Shared Artifact Collection Handler for Prow Job Failures ───────────────────
 dump_prow_artifacts_on_failure() {
   local exit_code=$?
@@ -114,10 +138,7 @@ dump_prow_artifacts_on_failure() {
     kubectl logs deployment/platform-agent-gateway -n "${ns}" --tail=2000 > "${artifact_dir}/platform-agent-gateway.log" 2>&1 || true
     kubectl logs deployment/platform-agent-gateway -n "${ns}" --previous --tail=1000 > "${artifact_dir}/platform-agent-gateway-previous-crash.log" 2>&1 || true
     kubectl logs deployment/kube-agents-controller-manager -n "${ns}" --tail=1000 > "${artifact_dir}/controller-manager.log" 2>&1 || true
-    # The model path runs through LiteLLM, and with vertex_ai its failure
-    # domain (Workload Identity token fetch, aiplatform 403s, model 404s)
-    # is visible only in this pod's log -- the gateway just relays the text.
-    kubectl logs deployment/litellm -n "${ns}" --tail=1000 > "${artifact_dir}/litellm.log" 2>&1 || true
+    collect_litellm_log
     # The gateway capture above reads the pod's default container (platform-agent);
     # a dropped port-forward stream is only visible from the auth sidecar's side.
     kubectl logs deployment/platform-agent-gateway -c agent-api-auth -n "${ns}" --tail=2000 > "${artifact_dir}/agent-api-auth.log" 2>&1 || true
