@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -87,10 +88,14 @@ const (
 	// a create whose name the API server had not assigned when it was audited.
 	joinNoObject joinOutcome = "no_object"
 
-	// joinGone is a lookup that returned NotFound. The object existed when the
-	// call was audited and does not now, so something removed it in between.
-	// Still forwarded: the audited change happened, and an object that has
-	// since been deleted is a stronger signal than a quiet one, not a weaker.
+	// joinGone is a lookup for which the cluster served the path and answered
+	// NotFound. The object existed when the call was audited and does not now,
+	// so something removed it in between. Still forwarded: the audited change
+	// happened, and an object that has since been deleted is a stronger signal
+	// than a quiet one, not a weaker.
+	//
+	// "Served the path" is the load-bearing half -- pathNotServed says why a 404
+	// is not on its own enough to conclude this.
 	joinGone joinOutcome = "gone"
 
 	// joinUnreachable is a record for a cluster this process has no client for.
@@ -334,7 +339,7 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 
 	obj, err := j.getter.Get(lookupCtx, record.Resource)
 	switch {
-	case apierrors.IsNotFound(err):
+	case apierrors.IsNotFound(err) && !pathNotServed(err):
 		event.Outcome = joinGone
 		return event
 	case err != nil:
@@ -347,6 +352,43 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 	event.Owners = ownership(obj)
 	event.Reconciled, event.ReconciledBy = j.reconciledBy(event.Owners, record.Timestamp)
 	return event
+}
+
+// pathNotServed reports whether a NotFound says the cluster does not serve the
+// request path at all, rather than that the object is absent from it.
+//
+// Both arrive as a 404 and both satisfy apierrors.IsNotFound, which classifies
+// on the status code. An unserved group, version or resource is answered by the
+// API server's generic handler with a body that is not a Status, and client-go
+// synthesises the error from the code alone (NewGenericServerResponse). The two
+// differ in one place: that synthesised error carries a cause of type
+// CauseTypeUnexpectedServerResponse, because rest.Request builds it with
+// isUnexpectedResponse set, while a Status the API server really sent for a
+// missing object carries no causes.
+//
+// This matters here and not in most clients because the join has no RESTMapper
+// -- the group, version and resource come straight out of the audit record, so
+// nothing has checked that the cluster still serves them. A CRD uninstalled, or
+// a served version retired, between the audited write and the lookup reaches
+// this point as a 404, and counting it gone would report that the object was
+// deleted about an object that is standing under another version. Reported
+// failed instead, with the error attached, which is the outcome that says the
+// lookup did not answer the question.
+func pathNotServed(err error) bool {
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	details := status.Status().Details
+	if details == nil {
+		return false
+	}
+	for _, cause := range details.Causes {
+		if cause.Type == metav1.CauseTypeUnexpectedServerResponse {
+			return true
+		}
+	}
+	return false
 }
 
 // reconciledBy reports whether a configured GitOps manager wrote to the object

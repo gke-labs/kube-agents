@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"strings"
@@ -95,6 +96,19 @@ func joinCluster() clusterIdentity {
 // notFound is the error a dynamic client returns for a missing object.
 func notFound() error {
 	return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, "api")
+}
+
+// unservedPathNotFound is the error client-go builds when the API server
+// answers a 404 with a body that is not a Status, which is how an unserved
+// group, version or resource is refused. Constructed the way rest.Request
+// constructs it, with isUnexpectedResponse set -- that last argument is the
+// whole difference from notFound() above, and it is what pathNotServed reads.
+func unservedPathNotFound() error {
+	return apierrors.NewGenericServerResponse(
+		404, "get",
+		schema.GroupResource{Group: "helm.toolkit.fluxcd.io", Resource: "helmreleases"},
+		"api", "404 page not found", 0, true,
+	)
 }
 
 func TestJoinOutcomes(t *testing.T) {
@@ -177,6 +191,13 @@ func TestJoinOutcomes(t *testing.T) {
 			getter:     &stubGetter{err: notFound()},
 			cluster:    joinCluster(),
 			want:       joinGone,
+			wantLookup: true,
+		},
+		{
+			name:       "a NotFound for a path the cluster does not serve is a failed lookup, not a removal",
+			getter:     &stubGetter{err: unservedPathNotFound()},
+			cluster:    joinCluster(),
+			want:       joinFailed,
 			wantLookup: true,
 		},
 		{
@@ -741,6 +762,31 @@ func TestDynamicGetterReportsNotFoundAsNotFound(t *testing.T) {
 		ResourceRef{Group: "apps", Version: "v1", Namespace: "prod", Resource: "deployments", Name: "absent"})
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("Get returned %v, want a NotFound the join can classify as gone", err)
+	}
+}
+
+func TestPathNotServedSeparatesTheTwoKindsOf404(t *testing.T) {
+	// Both are NotFound as far as the status code goes, which is why the join
+	// cannot classify on apierrors.IsNotFound alone.
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "a missing object", err: notFound(), want: false},
+		{name: "a path the cluster does not serve", err: unservedPathNotFound(), want: true},
+		{name: "a wrapped unserved path", err: fmt.Errorf("lookup: %w", unservedPathNotFound()), want: true},
+		{name: "not an API error at all", err: errors.New("dial tcp: connection refused"), want: false},
+		{name: "no error", err: nil, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !apierrors.IsNotFound(tc.err) && tc.want {
+				t.Fatalf("test setup: %v is not even a NotFound, so the join would never consult pathNotServed", tc.err)
+			}
+			if got := pathNotServed(tc.err); got != tc.want {
+				t.Errorf("pathNotServed(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
