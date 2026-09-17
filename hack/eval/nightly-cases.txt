@@ -211,3 +211,9 @@
 # than a cluster-agent one because AGENT_SERVICE_NAME is a single global
 # target (A2), which shapes what the case asserts rather than blocking it.
 ./tasks/cluster-agent-crashloop-fix-request/task.yaml
+
+# Issue #953: unlocated cluster crashloop debugging (omits "Find the cluster it is
+# running on", requiring the Platform Agent to discover the target cluster via fleet
+# enumeration before delegating to the cluster agent).
+./tasks/cluster-agent-unlocated-crashloop-debug/task.yaml
+

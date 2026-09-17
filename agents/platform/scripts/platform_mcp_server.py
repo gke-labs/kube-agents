@@ -1168,6 +1168,31 @@ def findings_publication(
     )
 
 
+@mcp.tool()
+def list_cluster_profiles() -> str:
+    """List the provisioned Cluster Agent profiles for managed GKE clusters.
+
+    Returns the newline-separated list of active, fully scaffolded Cluster Agent
+    Hermes profile names (excluding default and platform profiles).
+    """
+    from cluster_agent_profile import list_profiles
+    profiles = list_profiles()
+    return "\n".join(profiles)
+
+
+@mcp.tool()
+def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
+    """Derive the canonical Cluster Agent profile name for a GKE cluster.
+
+    Args:
+        project: GCP Project ID.
+        cluster: GKE cluster name.
+        location: GKE cluster location/region/zone.
+    """
+    from cluster_agent_profile import profile_name
+    return profile_name(project, cluster, location)
+
+
 def start_session_kv_server() -> None:
     """Start the session metadata HTTP resolver when the MCP server starts."""
     try:

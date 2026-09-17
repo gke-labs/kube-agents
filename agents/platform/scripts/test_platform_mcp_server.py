@@ -1307,5 +1307,21 @@ class TestFindingsTransport(unittest.TestCase):
         self.assertNotIn("content-type", sent["headers"])
 
 
+class TestClusterProfileTools(unittest.TestCase):
+    @patch("cluster_agent_profile.list_profiles")
+    def test_list_cluster_profiles_calls_list_profiles(self, mock_list):
+        mock_list.return_value = ["cluster-a", "cluster-b"]
+        result = platform_mcp_server.list_cluster_profiles()
+        mock_list.assert_called_once_with()
+        self.assertEqual(result, "cluster-a\ncluster-b")
+
+    @patch("cluster_agent_profile.profile_name")
+    def test_get_cluster_profile_name_calls_profile_name(self, mock_pname):
+        mock_pname.return_value = "cluster-myproj-myclust-us-central1"
+        result = platform_mcp_server.get_cluster_profile_name("myproj", "myclust", "us-central1")
+        mock_pname.assert_called_once_with("myproj", "myclust", "us-central1")
+        self.assertEqual(result, "cluster-myproj-myclust-us-central1")
+
+
 if __name__ == '__main__':
     unittest.main()
