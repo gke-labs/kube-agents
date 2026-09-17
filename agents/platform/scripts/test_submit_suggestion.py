@@ -1143,19 +1143,30 @@ class TestContentMode(SubmitSuggestionTestCase):
     def test_submit_content_when_base_omitted_resolves_fallback_and_refuses_when_branch_matches(self):
         prepared = self.prepare_content(branch="platform-agent/fix-netpol")
         # When --base is omitted, open_handle falls back to gitops_workspace.resolve_base_branch() (#1498).
-        # We test with environment clear and mock resolve_base_branch to return a custom non-protected branch name.
+        # 1. With CREDENTIAL_PROXY_BASE_BRANCH configured, client-side check refuses matching branch before calling broker.
         custom_base = "custom-release-base"
         prepared["branch"] = custom_base
         source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
         self.verbs.clear()
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": custom_base}):
+            with self.assertRaises(ValueError) as ctx:
+                self.submit_content(prepared, source, base=None)
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+            self.assertIn("is a protected base or run branch", str(ctx.exception))
+            self.assertNotIn("commit", self.verbs)
+            self.assertNotIn("push", self.verbs)
+
+        # 2. When --base and env overrides are omitted, open_handle falls back to "main".
+        # If the repository default branch is non-main (e.g. release-trunk), the client permits
+        # the submission call and the broker authoritatively refuses it upon commit/push.
+        prepared2 = self.prepare_content(branch="release-trunk")
+        source2 = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
+        self.verbs.clear()
         with patch.dict(os.environ, {}, clear=True):
-            with patch.object(gitops_workspace, "resolve_base_branch", return_value=custom_base):
-                with self.assertRaises(ValueError) as ctx:
-                    self.submit_content(prepared, source, base=None)
-                self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
-                self.assertIn("is the same as base branch", str(ctx.exception))
-                self.assertNotIn("commit", self.verbs)
-                self.assertNotIn("push", self.verbs)
+            with patch.object(self.store, "commit", side_effect=content_workspace.ContentWorkspaceError("broker refusal: 'release-trunk' matches default branch")):
+                with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as ctx:
+                    self.submit_content(prepared2, source2, base=None)
+                self.assertIn("broker refusal", str(ctx.exception))
 
     def test_prepare_content_preserves_remote_default_branch_when_master(self):
         # A repository whose default trunk is `master` rather than `main` must not have

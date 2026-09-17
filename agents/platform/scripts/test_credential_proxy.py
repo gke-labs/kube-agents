@@ -1607,11 +1607,35 @@ class GitHardeningTest(unittest.TestCase):
         repo_alias = self.repository(executor, name="repo_alias")
         self.append_repository_config(
             repo_alias,
-            "\n[alias]\n\tstatus-alias = status --short\n",
+            "\n[alias]\n\tstatus-alias = status --short\n\tbroken-chain = undefined-target\n",
         )
         violation, exec_argv = executor.resolve_git_command(["git", "status-alias"], cwd=str(repo_alias))
         self.assertIsNone(violation)
         self.assertEqual(["git", "status", "--short"], exec_argv)
+
+        # Alias chain ending in an undefined target is refused as an undefined alias (#1498)
+        violation, _ = executor.resolve_git_command(["git", "broken-chain"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("undefined alias target (undefined_alias)", violation or "")
+
+        # Non-builtin or read verbs that are not aliases are permitted under the denylist policy (#1498)
+        violation, exec_argv = executor.resolve_git_command(["git", "gc"], cwd=str(repo_alias))
+        self.assertIsNone(violation)
+        self.assertEqual(["git", "gc"], exec_argv)
+
+        # Abbreviated push options like --rep consume separate values and refuse refspec-less pushes (#1498)
+        v_rep = executor.git_lease_violation(["git", "push", "--rep", "custom_remote", "origin"], cwd=str(repo_alias))
+        self.assertIsNotNone(v_rep)
+        self.assertIn("without an explicit destination refspec is refused", v_rep or "")
+
+        # Pushes from a subdirectory with -C .. redirect resolve cwd correctly without double redirect (#1498)
+        sub_dir = clone_dir / "subdir"
+        sub_dir.mkdir()
+        executor.require_git_lease = False
+        v_sub = executor.git_lease_violation(["git", "-C", "..", "push", "origin", "HEAD:release-trunk"], cwd=str(sub_dir))
+        self.assertIsNotNone(v_sub)
+        self.assertIn("to protected branch 'release-trunk' is refused", v_sub or "")
+        executor.require_git_lease = True
 
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
         # `_execute` refuses a cwd outside the shared workspace and the lease

@@ -270,14 +270,15 @@ def handle_prepare(args) -> int:
 def open_handle(args) -> "credential_proxy_client.Workspace":
     """Rebuild a client-side Workspace around a handle `prepare` printed.
 
-    The handle is the whole state. `base`/`baseSha` are carried back only so the
-    caller can pass `--base-sha` to the conflict check; nothing here holds a
-    directory, which is what makes a second process able to pick the session up.
+    The handle is the whole state. In content mode, the client does not hold
+    a local clone; when `--base` is omitted, base branch resolution falls back to
+    gitops_workspace.resolve_base_branch() (honoring CREDENTIAL_PROXY_BASE_BRANCH /
+    GITOPS_BASE_BRANCH or defaulting to 'main'). For repositories where the remote
+    default branch is non-main (e.g. 'release-trunk'), the broker authoritatively
+    validates and refuses pushes against the default trunk upon commit (#1498).
     """
     resolved_base = (
         getattr(args, "base", None)
-        or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH")
-        or os.environ.get("GITOPS_BASE_BRANCH")
         or gitops_workspace.resolve_base_branch()
         or ""
     )

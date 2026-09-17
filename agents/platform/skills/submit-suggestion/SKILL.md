@@ -201,7 +201,7 @@ directory `--body-file` reads from, and outside `$SCRATCH` — everything under
 ```
 
 Add `--delete <path>` (repeatable) to remove a file the repository has.
-`--base` carries the base branch from `prepare` so the client can refuse if `--branch` matches it before contacting the broker (falling back to `GITOPS_BASE_BRANCH` / `CREDENTIAL_PROXY_BASE_BRANCH` or default branch if omitted).
+`--base` carries the base branch from `prepare` so the client can refuse if `--branch` matches it before contacting the broker (falling back to `CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH` or `main` if omitted; on non-main default branches without `--base`, the broker authoritatively validates and refuses pushes against the repository's default branch upon commit).
 `--base-sha` is what makes the broker refuse rather than overwrite when somebody
 else changed one of these same files while you were working; without it the last
 writer wins. Drop it only when you are deliberately replacing whatever is there.

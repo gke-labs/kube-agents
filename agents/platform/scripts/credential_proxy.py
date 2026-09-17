@@ -2105,29 +2105,40 @@ def _git_refused_name(argument: str) -> str:
 
 
 def _detect_repo_default_branch(repo_dir: Path | None, remote: str = "origin") -> str | None:
+    """Best-effort detection of remote default branch from local clone ref metadata (#1498).
+
+    Reads refs/remotes/<remote>/HEAD directly without subprocess or network calls.
+    On repositories with non-standard default trunks, this local detection acts as a
+    cooperative guard against accidental pushes; authoritative protection against
+    deliberate workspace ref manipulation requires setting CREDENTIAL_PROXY_BASE_BRANCH
+    or GITOPS_BASE_BRANCH.
+    """
     if not repo_dir:
         return None
     repo_root = _find_repo_root(repo_dir) or Path(repo_dir)
-    # Read refs/remotes/<remote>/HEAD directly without subprocess or network calls (#1498).
-    # In git, remote tracking HEADs are stored as loose ref files:
-    # .git/refs/remotes/<remote>/HEAD containing e.g. "ref: refs/remotes/origin/main"
-    for head_candidate in (
-        repo_root / ".git" / "refs" / "remotes" / remote / "HEAD",
-        repo_root / "refs" / "remotes" / remote / "HEAD",
-    ):
-        try:
-            if head_candidate.is_file():
-                text = head_candidate.read_text(encoding="utf-8").strip()
-                prefix = f"ref: refs/remotes/{remote}/"
-                if text.startswith(prefix):
-                    branch = text[len(prefix):].strip()
-                    if branch:
-                        return branch
-                if text.startswith("ref:"):
-                    ref = text.split(":", 1)[1].strip()
-                    return ref.split("/")[-1]
-        except Exception:
-            pass
+    remotes = [remote] if remote == "origin" else [remote, "origin"]
+    for rem in remotes:
+        for head_candidate in (
+            repo_root / ".git" / "refs" / "remotes" / rem / "HEAD",
+            repo_root / "refs" / "remotes" / rem / "HEAD",
+        ):
+            try:
+                if head_candidate.is_file():
+                    text = head_candidate.read_text(encoding="utf-8").strip()
+                    prefix = f"ref: refs/remotes/{rem}/"
+                    if text.startswith(prefix):
+                        branch = text[len(prefix):].strip()
+                        if branch:
+                            return branch
+                    if text.startswith("ref: refs/heads/"):
+                        branch = text[len("ref: refs/heads/"):].strip()
+                        if branch:
+                            return branch
+                    if text.startswith("ref:"):
+                        ref = text.split(":", 1)[1].strip()
+                        return ref.split("/")[-1]
+            except Exception:
+                pass
     return None
 
 
@@ -2198,13 +2209,35 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
         if arg.startswith("--repo="):
             idx += 1
             continue
-        if arg.startswith("-"):
-            if (
-                arg in ("-o", "--push-option", "--receive-pack", "--exec")
-                and idx + 1 < len(push_args)
-            ):
+        if arg == "-o":
+            if idx + 1 < len(push_args):
                 idx += 2
                 continue
+            idx += 1
+            continue
+        if arg.startswith("-o") and len(arg) > 2:
+            idx += 1
+            continue
+        if arg.startswith("--"):
+            opt_name, sep, _ = arg.partition("=")
+            if (
+                any(
+                    opt.startswith(opt_name)
+                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules")
+                )
+                or opt_name == "--rep"
+            ):
+                if sep:
+                    idx += 1
+                    continue
+                if idx + 1 < len(push_args):
+                    idx += 2
+                    continue
+                idx += 1
+                continue
+            idx += 1
+            continue
+        if arg.startswith("-"):
             idx += 1
             continue
         positional.append(arg)
@@ -2216,9 +2249,6 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
 
     if cwd:
         repo_dir = Path(cwd).resolve()
-        _, redirects = _git_plan(argv)
-        for redirect in redirects:
-            repo_dir = (repo_dir / redirect).resolve()
         detected_default = _detect_repo_default_branch(repo_dir, remote=remote_name)
         if detected_default:
             norm_def = detected_default.strip().lower()
@@ -2498,7 +2528,11 @@ def _read_repo_alias(
             return ["!error"]
 
         if proc.returncode == 1 and not proc.stderr:
-            # Not an alias in git config
+            # Not an alias in git config.
+            # If we already accumulated alias tokens, the chain terminated at an undefined
+            # subcommand name that is not a git builtin: fail closed (#1498).
+            if accumulated_tokens and current_name not in GIT_BUILTIN_SUBCOMMANDS:
+                return ["!undefined_alias", current_name]
             break
         elif proc.returncode != 0:
             # Fatal error, syntax error, excessive include depth: fail closed!
@@ -3230,10 +3264,11 @@ class CommandExecutor:
         alias_expansion = _read_repo_alias(candidate, subcommand, executor=self)
         if alias_expansion:
             if alias_expansion[0].startswith("!"):
-                if alias_expansion[0] in ("!cycle", "!max_depth", "!config_error", "!error", "!shlex_error"):
+                if alias_expansion[0] in ("!cycle", "!max_depth", "!config_error", "!error", "!shlex_error", "!undefined_alias"):
+                    err_code = alias_expansion[0][1:]
                     return (
-                        f"`git` alias recursion or configuration error ({alias_expansion[0][1:]}) is refused: "
-                        "aliases must expand cleanly without cycles, errors, or exceeding depth.",
+                        f"`git` alias recursion, configuration error, or undefined alias target ({err_code}) is refused: "
+                        "aliases must expand cleanly without cycles, errors, exceeding depth, or undefined targets.",
                         argv,
                     )
                 return (
@@ -3256,11 +3291,6 @@ class CommandExecutor:
             subcommand, _ = _git_plan(expanded_argv)
             execution_argv = expanded_argv
         else:
-            if subcommand and subcommand not in GIT_BUILTIN_SUBCOMMANDS:
-                return (
-                    f"`git {subcommand}` is not a recognized git subcommand or alias.",
-                    argv,
-                )
             push_violation = git_push_violation(argv, cwd=candidate)
             if push_violation is not None:
                 return push_violation, argv
