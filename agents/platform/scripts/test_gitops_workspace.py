@@ -1234,6 +1234,27 @@ class TestContextRepos(WorkspaceTestCase):
             )
             self.assertEqual(gitops_workspace.get_context_github_repos(), ["Acme/Live"])
 
+    def test_the_managed_list_keeps_two_spellings_of_one_slug_as_its_readers_compare_them(self):
+        # The fold above is the context list's: its readers key on the
+        # lowercased slug. The managed list's readers compare the spelling
+        # exactly (the `--repo` allowlists in `audit_report.py`,
+        # `submit_suggestion.py` and `pr_conversation.py`, the token scope
+        # in `github_token_refresh.py`), so folding that list would refuse
+        # a `--repo` spelt the way its second entry is. It dedups exactly,
+        # as it did before the context list existed.
+        managed = (
+            '[{"type": "github", "url": "https://github.com/Acme/Fleet"}, '
+            '{"type": "github", "url": "https://github.com/acme/fleet"}, '
+            '{"type": "github", "url": "https://github.com/acme/fleet"}]'
+        )
+        state_file = self.mount(managed_repos=managed)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(), ["Acme/Fleet", "acme/fleet"]
+            )
+
     def test_validate_repo_org_matching_primary_org(self):
         with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
             self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")

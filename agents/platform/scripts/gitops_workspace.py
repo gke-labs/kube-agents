@@ -946,7 +946,9 @@ def get_context_repo_entries() -> list[dict[str, str]]:
     return _read_state_key(CONTEXT_REPOS_KEY)
 
 
-def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
+def _github_entries(
+    entries: list[dict[str, str]], key: str, *, fold_case: bool
+) -> list[dict]:
     """The GitHub entries in `entries` as `{repo, ref}`, in order, one per slug.
 
     An entry naming a forge this agent cannot drive is logged rather than
@@ -959,11 +961,14 @@ def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
 
     `ref` is the entry's branch pin or None. The first entry for a slug wins,
     ref included: two entries for one repository on two branches is one
-    repository read once, at the branch the first names. Slugs are compared
-    case-folded, as GitHub compares them, so `Acme/Live` and `acme/live` are
-    one entry too; the readers downstream key on the lowercased slug, and a
-    second entry that survived here would hand them the last ref, not the
-    first.
+    repository read once, at the branch the first names. With `fold_case`
+    the slugs are compared case-folded, as GitHub compares them, so
+    `Acme/Live` and `acme/live` are one entry too: the context list's readers
+    key on the lowercased slug, and a second entry that survived here would
+    hand them the last ref, not the first. The managed list passes False and
+    dedups on the spelling, because its readers compare the spelling exactly
+    (the `--repo` allowlists, the token scope): folding it would refuse a
+    `--repo` spelt the way an entry it dropped was.
     """
     res: list[dict] = []
     seen: set[str] = set()
@@ -983,8 +988,9 @@ def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
                 "Skipping %s repository %r: not a GitHub repository URL.", key, url
             )
             continue
-        if slug.lower() not in seen:
-            seen.add(slug.lower())
+        seen_as = slug.lower() if fold_case else slug
+        if seen_as not in seen:
+            seen.add(seen_as)
             out = {"repo": slug, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)}
             if entry.get(CONTEXT_REF_REFUSED_KEY) is not None:
                 out[CONTEXT_REF_REFUSED_KEY] = entry[CONTEXT_REF_REFUSED_KEY]
@@ -992,14 +998,20 @@ def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
     return res
 
 
-def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
+def _github_slugs(
+    entries: list[dict[str, str]], key: str, *, fold_case: bool
+) -> list[str]:
     """The GitHub `owner/name` slugs in `entries`, in order, without duplicates."""
-    return [entry["repo"] for entry in _github_entries(entries, key)]
+    return [entry["repo"] for entry in _github_entries(entries, key, fold_case=fold_case)]
 
 
 def get_managed_github_repos() -> list[str]:
-    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap."""
-    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY)
+    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap.
+
+    Two spellings of one slug are two entries here, as they were before the
+    context list existed: every reader of this list compares the spelling.
+    """
+    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False)
 
 
 def get_context_github_repos() -> list[str]:
@@ -1010,7 +1022,7 @@ def get_context_github_repos() -> list[str]:
     is one of them. Nothing goes the other way — this list never reaches
     `resolve_repo` or `get_managed_github_repos`.
     """
-    return _github_slugs(get_context_repo_entries(), CONTEXT_REPOS_KEY)
+    return _github_slugs(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
 
 
 def get_context_github_repo_entries() -> list[dict]:
@@ -1022,7 +1034,7 @@ def get_context_github_repo_entries() -> list[dict]:
     `refused_ref` instead, and that caller skips the repository. Same skip
     rule, same warning, same one-way relationship to the managed list.
     """
-    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY)
+    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
 
 
 def resolve_repo(workspace: str | Path | None = None) -> str:
