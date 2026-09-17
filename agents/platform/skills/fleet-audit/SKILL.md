@@ -659,8 +659,9 @@ until someone suppressed it by hand. The SOP's declared-intent step (`obtainabil
 §4a, the pilot) has two halves. The harness reads every repository in `declared_intent_repos` for
 OKF notes whose frontmatter carries a `declares:` list — items of `{check, namespace, object}` plus
 an optional `cluster`, `object` as `Kind/name` — within the paths each repository's
-`.kube-agents/intent.yaml` names, and `finish` moves every finding one covers here itself: an exact
-lookup on `(check, cluster, namespace, object)`, then on the fleet-wide `(check, namespace, object)`,
+`.kube-agents/intent.yaml` names, and `finish` moves every finding one covers here itself: a
+case-blind lookup on `(check, cluster, namespace, object)`, then on the fleet-wide
+`(check, namespace, object)`, compared as the finding id is (`deployment/api` joins `Deployment/api`),
 the finding's `cluster` and `title` kept and the note's `repo`, `path` and title as the declaration.
 For `hpa-cannot-scale`, the one slug that names both a posture and a fault, the join moves only the
 `min == max` shape, read off the severity the SOP fixes for it (`major`); a declaration matching the

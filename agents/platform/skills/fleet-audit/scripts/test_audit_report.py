@@ -6062,6 +6062,20 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         # And the harness's search record renders as the model's would have.
         self.assertIn(f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`", body)
 
+    def test_the_join_is_case_blind_as_the_finding_id_is(self):
+        # `deployment/checkout-gateway` is what kubectl prints and what the
+        # finding id `no-pdb.<cluster>.payments.deployment-checkout-gateway`
+        # shows; the shape check passes it, and an exact lookup matched
+        # nothing, so the posture published under a note that covers it.
+        self.record()
+        self.file(self.entry(obj="deployment/checkout-gateway", cluster="PROD-US-EAST"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The moved entry carries the finding's own spelling, not the note's.
+        self.assertIn("| `payments/Deployment/checkout-gateway` |", self.ledger_body())
+
     def test_a_cluster_scoped_entry_matches_only_its_cluster(self):
         self.record()
         self.file(self.entry(cluster="stage-eu"))

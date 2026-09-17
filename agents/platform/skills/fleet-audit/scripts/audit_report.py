@@ -2796,13 +2796,22 @@ def search_tree(
 
 
 def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
+    """The tuple a declaration and a finding are joined on, case-folded.
+
+    Folded because the finding's own identity is: `derive_finding_id` lowers
+    every segment, so the ledger prints `deployment-api` for `Deployment/api`
+    and treats the two spellings as one finding. An owner who writes the Kind
+    the way kubectl prints it, or copies it off the finding id, passes the
+    item shape check; an exact comparison here then matched nothing and the
+    posture published under a note that covers it.
+    """
     key = (
-        str(entry.get("check", "")),
-        str(entry.get("namespace") or ""),
-        str(entry.get("object", "")),
+        str(entry.get("check", "")).lower(),
+        str(entry.get("namespace") or "").lower(),
+        str(entry.get("object", "")).lower(),
     )
     if with_cluster:
-        return (str(entry.get(DECLARATION_CLUSTER_FIELD, "")),) + key
+        return (str(entry.get(DECLARATION_CLUSTER_FIELD, "")).lower(),) + key
     return key
 
 
@@ -2831,9 +2840,10 @@ def fold_searched_record(data: dict, record: dict | None) -> None:
 def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     """Move each finding a declaration covers into `declared[]`; return the moved.
 
-    The lookup is exact, on the fields the owner wrote: first
-    `(cluster, check, namespace, object)` against entries that name a cluster,
-    then `(check, namespace, object)` against fleet-wide ones. The first entry
+    The lookup is on the fields the owner wrote, compared case-blind as the
+    finding id compares them: first `(cluster, check, namespace, object)`
+    against entries that name a cluster, then `(check, namespace, object)`
+    against fleet-wide ones. The first entry
     wins in repository-then-path order, which is the order `start` wrote them
     in. Only a declarable check is looked up at all, so a fault stays a
     finding whatever a note says about it — and for `hpa-cannot-scale`, the
