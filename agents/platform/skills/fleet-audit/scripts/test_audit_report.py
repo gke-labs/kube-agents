@@ -6233,6 +6233,31 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
             self.assertNotIn("no longer reproduces", body)
 
+    def test_a_declared_posture_with_a_shortened_id_is_refused_and_not_a_typo(self):
+        # The id a finding carries, the ledger prints and a requester copies
+        # is `_shorten_id` of the derived string once the four fields overrun
+        # `MAX_FINDING_ID`; a 63-character namespace, the RFC 1123 maximum,
+        # does it alone. Keyed on the full id, the lookup missed the posture
+        # and the request fell through to the typo refusal.
+        namespace = "n" * 63
+        entry = make_declared(check="no-pdb", namespace=namespace, obj="Deployment/checkout-gateway",
+                              repo="acme/fleet", path="knowledge/long.md")
+        full = audit_report.derive_finding_id(entry)
+        target = audit_report._shorten_id(full)
+        self.assertNotEqual(target, full)
+        self.assertLessEqual(len(target), audit_report.MAX_FINDING_ID)
+        requests = audit_report.parse_remediate_commands(
+            [comment(f"/remediate {target}")], findings=[], declared=[entry]
+        )
+        self.assertEqual(requests.targets, [])
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertFalse(requests.refusals[0].get("deferred"))
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`acme/fleet:knowledge/long.md`", reason)
+        self.assertNotIn("typo", reason)
+        # The clean branch reads the same map.
+        self.assertIn(target, audit_report.declared_by_id([entry]))
+
     def test_a_model_written_declared_entry_refuses_a_request_the_same_way(self):
         # The classifier reads `declared[]` whole, not only what the harness
         # moved: an entry the model wrote covers its posture just as well.

@@ -3580,9 +3580,14 @@ def declared_by_id(declared: list[dict] | None) -> dict[str, dict]:
     """Each `declared[]` entry under the id the finding it covers would carry.
 
     The model's entries and the harness's moves alike: both carry the four
-    identity fields, so the id is derived the same way a finding's is.
+    identity fields, so the id is derived the same way a finding's is — and
+    shortened the same way, because the id a finding carries, the ledger
+    prints and a requester copies into `/remediate` is `_shorten_id` of the
+    derived string whenever that overruns `MAX_FINDING_ID`, which a
+    63-character namespace does on its own. Keyed on the full id, such a
+    posture missed here and was refused as a typo.
     """
-    return {derive_finding_id(entry): entry for entry in declared or []}
+    return {_shorten_id(derive_finding_id(entry)): entry for entry in declared or []}
 
 
 def parse_remediate_commands(
