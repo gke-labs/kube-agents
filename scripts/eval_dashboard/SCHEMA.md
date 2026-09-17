@@ -683,9 +683,10 @@ figures are never the seven-day window's — the periodic breaches on a day's ro
 or on runs queued past p95 right now, and the window sits back inside its own
 limit after one bad day. Exactly one of `window_hours` and `day` says which
 stretch they cover: the periodic's recent window when it had the runs to judge
-it, the worst breached day when it did not. A verdict lasts a week, so the
-recent window comes first — a Thursday incident evidenced by Monday reads as a
-contradiction. Both are `null` when only the live queue breached;
+it and went over a limit, the worst breached day otherwise. A verdict lasts a
+week, so the recent window comes first — a Thursday incident evidenced by
+Monday reads as a contradiction — but a compliant stretch is the same
+contradiction, only newer. Both are `null` when only the live queue breached;
 `over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
 periodic stopped publishing, and the last reading is not evidence about now.
 Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,

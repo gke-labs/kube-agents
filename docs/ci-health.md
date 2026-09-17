@@ -221,9 +221,10 @@ which one bad day leaves inside its own limit. A breach on only one of the two
 carries only that line.
 
 The stretch quoted is the last three hours, not the worst day, which a
-week-long verdict leaves up to six days older than the incident. Too quiet a
-stretch to judge — five runs, as a day's row needs — falls back to that day,
-and the label says which it was.
+week-long verdict leaves up to six days older than the incident. The three
+hours have to be over a limit themselves to be quoted, and hold five runs, as a
+day's row needs; otherwise the worst day is what is left to show, and the label
+says which it was.
 
 A ⏳ also needs runs waiting at the moment of the reading. The remedy is
 recomputed hourly from a live count of leased projects while the verdict stands

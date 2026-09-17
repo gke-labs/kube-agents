@@ -975,6 +975,39 @@ class PoolNote(unittest.TestCase):
         self.assertEqual(note["day"], "2026-09-06")
         self.assertEqual(note["p50_s"], 1446)
 
+    def test_a_recent_stretch_inside_both_limits_is_not_the_breach_evidence(self):
+        # Monday's row holds the verdict all week; by Thursday afternoon the
+        # last three hours are busy and fine. Quoting them would print "median
+        # wait 24s against a 15 min limit" under "queue backed up".
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 0.4,
+                  "p95_minutes": 0.5, "worst_minutes": 1.0}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertIsNone(note["window_hours"])
+        self.assertEqual(note["day"], "2026-09-06")
+        self.assertEqual(note["p50_s"], 1446)
+
+    def test_a_recent_stretch_over_p95_alone_is_still_the_breach_evidence(self):
+        # Either half, as a day's row breaches: a compliant median under a p95
+        # that is double the limit is a queue, not a quiet stretch.
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 2.0,
+                  "p95_minutes": 90.0, "worst_minutes": 120.0}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertEqual(note["window_hours"], 3)
+        self.assertEqual(note["p95_s"], 5400)
+
+    def test_a_live_breach_with_nothing_over_a_limit_carries_no_numbers(self):
+        # Runs queued past p95 right now are not in the sweep, so a live breach
+        # can have no breached day and a fine recent stretch. A span over no
+        # numbers reads "median wait ?"; pool_span returns None instead.
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 0.4,
+                  "p95_minutes": 0.5, "worst_minutes": 1.0}
+        note = pooled(verdict="BREACH", cause="CONTROL_PLANE", free=25,
+                      over_threshold=4, bad_day=None, recent=recent)["pool"]
+        self.assertIsNone(note["window_hours"])
+        self.assertIsNone(note["day"])
+        self.assertIsNone(health.pool_span(note))
+        self.assertEqual(health.pool_measurement(note), "4 runs waiting now past 45 min")
+
     def test_the_worst_breached_day_wins_even_when_it_breached_on_p95_alone(self):
         # Excess over either limit, so a day that went over on p95 only is
         # still picked ahead of a quieter day that went over on p50.

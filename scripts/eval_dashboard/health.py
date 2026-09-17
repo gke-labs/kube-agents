@@ -1065,6 +1065,21 @@ def minutes_text(seconds) -> str:
     return "?" if seconds is None else str(int(seconds // SECONDS_PER_MINUTE))
 
 
+def _over_limit(row: dict, thresholds: dict) -> bool:
+    """Whether a stretch's own percentiles are over either limit.
+
+    `days[]` rows carry the periodic's `breached` flag; the recent block does
+    not, because it is evidence and never a verdict. Strict `>` and either
+    half, as `DayRow.breached` compares. False when a limit is missing: the
+    question cannot be answered, and the periodic's own flagged day can.
+    """
+    limits = (_as_seconds(thresholds.get("p50_minutes")), _as_seconds(thresholds.get("p95_minutes")))
+    return any(
+        limit is not None and (_as_seconds(row.get(key)) or 0) > limit
+        for key, limit in zip(("p50_minutes", "p95_minutes"), limits)
+    )
+
+
 def _worst_breached_day(trend: dict, thresholds: dict) -> dict | None:
     """The `days[]` row that breached hardest, or None if no day did.
 
@@ -1125,17 +1140,19 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     # seven-day aggregate, which after one bad day sits back inside its own
     # limit -- printing it under "onboard a project" contradicts the alert.
     #
-    # The recent stretch comes first when it has the runs to be judged, because
-    # a verdict that lasts a week outlives the day that earned it: a Thursday
-    # incident is otherwise evidenced by Monday. Below the sample floor the
-    # periodic withholds the percentiles, and the worst breached day is what is
-    # left to show.
+    # The recent stretch comes first when it has the runs to be judged and is
+    # itself over a limit, because a verdict that lasts a week outlives the day
+    # that earned it: a Thursday incident is otherwise evidenced by Monday. It
+    # has to breach on its own to be quoted at all -- a stretch inside both
+    # limits is the same contradiction, only newer. Below the sample floor, or
+    # back inside them, the worst breached day is what is left to show.
     recent = _section(artifact, "recent")
-    day = {} if recent.get("judged") else (_worst_breached_day(trend, thresholds) or {})
-    source = recent if recent.get("judged") else day
+    quotable = bool(recent.get("judged")) and _over_limit(recent, thresholds)
+    day = {} if quotable else (_worst_breached_day(trend, thresholds) or {})
+    source = recent if quotable else day
     return note | {
         "day": day.get("day"),
-        "window_hours": recent.get("hours") if recent.get("judged") else None,
+        "window_hours": recent.get("hours") if quotable else None,
         "p50_s": _as_seconds(source.get("p50_minutes")),
         "p95_s": _as_seconds(source.get("p95_minutes")),
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
