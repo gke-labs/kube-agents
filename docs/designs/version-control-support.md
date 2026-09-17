@@ -1089,7 +1089,10 @@ around acquisition makes the second forge implement a method that does nothing
 and receive an argument nobody uses, and still leaves it nowhere to put the parts
 that are not empty.
 
-**So one member, which the forge constructs and owns:**
+**So one member, which the forge constructs and owns** — the ambient credential
+every credentialed verb makes current — with `read_credential(repo)` beside it
+as the per-clone counterpart the broker asks for when the repository is a
+registered context repository (§10, "Registered context repositories"):
 
 ```python
 # providers/credentials.py — shared, forge-neutral
@@ -1099,13 +1102,15 @@ class Credential(Protocol):
     def git_config(self, repo: str) -> tuple[tuple[str, str], ...]: ...
 ```
 
-`ensure` is "make yourself current, if that means anything to you." Two
-implementations cover both forges and, as far as anyone has proposed, the third:
+`ensure` is "make yourself current, if that means anything to you." Three
+implementations cover both forges and, as far as anyone has proposed, the third;
+the first two are ambient, the last is per clone:
 
-| Strategy               | `ensure`                                         | `headers`                        | `git_config`                                              |
-| ---------------------- | ------------------------------------------------ | -------------------------------- | --------------------------------------------------------- |
-| `BrokeredCredential`   | asks the broker's refresh route                  | none — the CLI carries it        | none — the CLI installs a helper                          |
-| `StaticFileCredential` | **nothing** — a long-lived token cannot go stale | reads the file, sends the header | the helper pin from [above](#gits-credential-has-no-seam) |
+| Strategy               | `ensure`                                              | `headers`                        | `git_config`                                                                                                    |
+| ---------------------- | ----------------------------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `BrokeredCredential`   | asks the broker's refresh route                       | none — the CLI carries it        | none — the CLI installs a helper                                                                                |
+| `StaticFileCredential` | **nothing** — a long-lived token cannot go stale      | reads the file, sends the header | the helper pin from [above](#gits-credential-has-no-seam)                                                       |
+| `MintedReadCredential` | asks the executor's read-only mint for one repository | none — the read path is a clone  | an `extraheader` on the forge's host, plus a `credential.helper` clear so the ambient helper is never consulted |
 
 GitHub takes the first, GitLab the second. **GitLab's `ensure` is `pass`**, and
 that is the point: a forge whose credential does not expire says so by choosing
@@ -1443,7 +1448,7 @@ agents/platform/scripts/
     validate.py            # the seven validators
     errors.py              # the status-to-guidance table, forge_error(status, detail)
     transport.py           # Transport protocol, CliTransport, HttpTransport
-    credentials.py         # Credential protocol, BrokeredCredential, StaticFileCredential
+    credentials.py         # Credential protocol, BrokeredCredential, StaticFileCredential, MintedReadCredential
     registry.py            # AVAILABLE, build_forges(config)
     github/
       __init__.py  forge.py  translate.py  errors.py

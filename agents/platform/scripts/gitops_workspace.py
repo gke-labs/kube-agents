@@ -75,11 +75,12 @@ DEFAULT_AGENT_HOME = "/opt/data"
 # repositories consulted for declared intent before an audit reports a
 # finding. It is a separate key, and nothing in this module merges it into the
 # managed list, which is what makes a context repository read-only by
-# construction: the push gate and the resolver never see it. The two readers it
-# does have read it for a read-only grant and nothing else — the operator
-# renders a `contents: read` minter policy per entry, and the broker's
-# content-mode clone presents the token minted from it (`repository_role` in
-# credential_proxy.py, consulted by no write path). A `role: context` marker
+# construction: the push gate and the resolver never see it. It has three
+# readers. Two read it for a read-only grant — the operator renders a
+# `contents: read` minter policy per entry, and the broker's content-mode clone
+# presents the token minted from it (`repository_role` in credential_proxy.py,
+# consulted by no write path) — and the fleet-audit helper (`audit_report.py
+# start`) reads it to tell the SOP which repositories to search. A `role: context` marker
 # inside `managed_repos` would instead be flattened by `_parse_repos_json` into
 # a writable entry. The operator's reconcile leaves keys it does not own alone,
 # so a hand-added `context_repos` survives it.

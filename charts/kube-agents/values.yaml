@@ -420,7 +420,8 @@ githubMinter:
   # KSA the chart renders.
   ksaName: kubeagents-github-minter
   gsaName: kubeagents-github-minter-gsa
-  # The GSA email allowed to request platform-agent-scope tokens. Empty
+  # The GSA email allowed to request tokens from either scope in the minty
+  # rule (platform-agent-scope and platform-agent-read-scope). Empty
   # derives kubeagents-platform-gsa@<harness.projectId>.iam.gserviceaccount.com.
   allowedServiceAccount: ""
   kms:
