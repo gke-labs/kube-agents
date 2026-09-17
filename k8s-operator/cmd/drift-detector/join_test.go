@@ -98,16 +98,25 @@ func notFound() error {
 	return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, "api")
 }
 
-// unservedPathNotFound is the error client-go builds when the API server
-// answers a 404 with a body that is not a Status, which is how an unserved
-// group, version or resource is refused. Constructed the way rest.Request
-// constructs it, with isUnexpectedResponse set -- that last argument is the
-// whole difference from notFound() above, and it is what pathNotServed reads.
-func unservedPathNotFound() error {
+// unservedPathFromMux is the error client-go builds when the request never
+// reaches an API group's handler and the mux answers in plain text, which is
+// what an unserved group and a retired CRD version do. rest.Request synthesises
+// it with isUnexpectedResponse set, so it carries a cause -- and, like every
+// other refusal of the path, no name.
+func unservedPathFromMux() error {
 	return apierrors.NewGenericServerResponse(
-		404, "get",
-		schema.GroupResource{Group: "helm.toolkit.fluxcd.io", Resource: "helmreleases"},
-		"api", "404 page not found", 0, true,
+		404, "get", schema.GroupResource{}, "", "404 page not found", 0, true,
+	)
+}
+
+// unservedPathFromGroupHandler is the same refusal from the other direction: an
+// unserved version or resource of a group the cluster does serve, answered with
+// a real Status and therefore no cause. Both shapes were read off a GKE control
+// plane; the empty name is the only thing they have in common, which is why
+// pathNotServed reads that and not the cause.
+func unservedPathFromGroupHandler() error {
+	return apierrors.NewGenericServerResponse(
+		404, "get", schema.GroupResource{}, "", "", 0, false,
 	)
 }
 
@@ -194,8 +203,15 @@ func TestJoinOutcomes(t *testing.T) {
 			wantLookup: true,
 		},
 		{
-			name:       "a NotFound for a path the cluster does not serve is a failed lookup, not a removal",
-			getter:     &stubGetter{err: unservedPathNotFound()},
+			name:       "a NotFound from a path the cluster does not serve is a failed lookup, not a removal",
+			getter:     &stubGetter{err: unservedPathFromMux()},
+			cluster:    joinCluster(),
+			want:       joinFailed,
+			wantLookup: true,
+		},
+		{
+			name:       "and so is the same refusal answered by the group's own handler",
+			getter:     &stubGetter{err: unservedPathFromGroupHandler()},
 			cluster:    joinCluster(),
 			want:       joinFailed,
 			wantLookup: true,
@@ -774,8 +790,9 @@ func TestPathNotServedSeparatesTheTwoKindsOf404(t *testing.T) {
 		want bool
 	}{
 		{name: "a missing object", err: notFound(), want: false},
-		{name: "a path the cluster does not serve", err: unservedPathNotFound(), want: true},
-		{name: "a wrapped unserved path", err: fmt.Errorf("lookup: %w", unservedPathNotFound()), want: true},
+		{name: "a path refused by the mux", err: unservedPathFromMux(), want: true},
+		{name: "a path refused by the group's handler", err: unservedPathFromGroupHandler(), want: true},
+		{name: "a wrapped unserved path", err: fmt.Errorf("lookup: %w", unservedPathFromMux()), want: true},
 		{name: "not an API error at all", err: errors.New("dial tcp: connection refused"), want: false},
 		{name: "no error", err: nil, want: false},
 	} {

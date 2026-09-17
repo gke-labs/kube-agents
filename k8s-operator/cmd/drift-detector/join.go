@@ -358,13 +358,20 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 // request path at all, rather than that the object is absent from it.
 //
 // Both arrive as a 404 and both satisfy apierrors.IsNotFound, which classifies
-// on the status code. An unserved group, version or resource is answered by the
-// API server's generic handler with a body that is not a Status, and client-go
-// synthesises the error from the code alone (NewGenericServerResponse). The two
-// differ in one place: that synthesised error carries a cause of type
-// CauseTypeUnexpectedServerResponse, because rest.Request builds it with
-// isUnexpectedResponse set, while a Status the API server really sent for a
-// missing object carries no causes.
+// on the status code alone. What separates them is whether the Status names an
+// object. A genuine absence is built by apierrors.NewNotFound and carries the
+// group, resource and name that were looked up. A refusal of the path comes
+// back through NewGenericServerResponse with an empty GroupResource, no name,
+// and the message "the server could not find the requested resource".
+//
+// The name is read rather than the CauseTypeUnexpectedServerResponse cause,
+// because that cause is set only when client-go synthesises the error from a
+// body that was not a Status, and the four ways a path can be unserved do not
+// agree on that. Measured against a GKE control plane: an unserved API group
+// and a CRD version whose `served` was turned off reach the mux and carry the
+// cause; an unserved version of a served group and an unserved resource of a
+// served group are answered by the group's own handler with a real Status and
+// carry no causes. All four leave the name empty.
 //
 // This matters here and not in most clients because the join has no RESTMapper
 // -- the group, version and resource come straight out of the audit record, so
@@ -373,22 +380,16 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 // this point as a 404, and counting it gone would report that the object was
 // deleted about an object that is standing under another version. Reported
 // failed instead, with the error attached, which is the outcome that says the
-// lookup did not answer the question.
+// lookup did not answer the question. An unrecognised shape falls that way too:
+// a Status that does not name what it could not find has not established that
+// the object is gone.
 func pathNotServed(err error) bool {
 	var status apierrors.APIStatus
 	if !errors.As(err, &status) {
 		return false
 	}
 	details := status.Status().Details
-	if details == nil {
-		return false
-	}
-	for _, cause := range details.Causes {
-		if cause.Type == metav1.CauseTypeUnexpectedServerResponse {
-			return true
-		}
-	}
-	return false
+	return details == nil || details.Name == ""
 }
 
 // reconciledBy reports whether a configured GitOps manager wrote to the object

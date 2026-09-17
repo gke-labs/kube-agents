@@ -244,11 +244,11 @@ join has a cluster to read. "The join is off" therefore does not mean "everythin
 | `unreachable` | The record names a live object this process cannot read: another cluster the subscription carries, or any cluster at all when no credentials are set. |
 | `failed`      | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                         |
 
-A 404 answers both of the last two, so they are told apart by shape rather than by status code: the
-API server returns a body that is not a `Status` for a path it does not serve, and the error
-client-go builds from that carries a cause saying so. Without the distinction a CRD uninstalled — or
-a served version retired — between the audited write and the lookup would be reported `gone`, which
-says the object was deleted about an object still standing under another version.
+A 404 answers both of the last two, so they are told apart by what the error names rather than by
+its status code: a genuine absence names the group, resource and object that were looked up, while
+a refusal of the path names nothing. Without the distinction a CRD uninstalled — or a served
+version retired — between the audited write and the lookup would be reported `gone`, which says the
+object was deleted about an object still standing under another version.
 
 **The join fails open, and that is the opposite of what classification does.** The tier filter drops
 anything it cannot prove is a human change, because a false report costs an operator's attention.
