@@ -710,10 +710,12 @@ class B6NoSelfApproval(unittest.TestCase):
     def test_B6_every_guarded_path_in_the_template_has_an_owner(self) -> None:
         """A CODEOWNERS entry that covers nothing is the trap this avoids.
 
-        The four path classes the branch-protection note calls guarded --
-        provisioning, agents, namespaces and policy -- each need a rule, or
-        the ruleset that requires code-owner review on them requires review
-        from nobody.
+        The six path classes the branch-protection note calls guarded --
+        provisioning, agents, namespaces, policy, knowledge and .kube-agents
+        -- each need a rule, or the ruleset that requires code-owner review on
+        them requires review from nobody. The last two are the declared-intent
+        pair: a knowledge/ note can move an audit posture off the ledger, and
+        .kube-agents/intent.yaml decides which paths' notes can.
         """
         text = h.text("codeowners_example")
         rules = [
@@ -721,7 +723,7 @@ class B6NoSelfApproval(unittest.TestCase):
             for line in text.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-        for guarded in ("provisioning", "agents", "namespaces", "policy"):
+        for guarded in ("provisioning", "agents", "namespaces", "policy", "knowledge", ".kube-agents"):
             with self.subTest(path=guarded):
                 self.assertTrue(
                     any(guarded in rule for rule in rules),
