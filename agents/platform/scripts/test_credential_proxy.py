@@ -1625,10 +1625,15 @@ class GitHardeningTest(unittest.TestCase):
         self.assertIsNotNone(violation)
         self.assertIn("undefined alias target (undefined_alias)", violation or "")
 
-        # Non-builtin or read verbs that are not aliases are permitted under the denylist policy (#1498)
+        # Recognized builtins that are not aliases are permitted and execute directly (#1498)
         violation, exec_argv = executor.resolve_git_command(["git", "gc"], cwd=str(repo_alias))
         self.assertIsNone(violation)
         self.assertEqual(["git", "gc"], exec_argv)
+
+        # Unknown subcommands that are not recognized git builtins or defined aliases fail closed (#1498)
+        violation, _ = executor.resolve_git_command(["git", "zz-unknown"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("not a recognized git subcommand or alias", violation or "")
 
         # Abbreviated push options like --rep consume separate values and refuse refspec-less pushes (#1498)
         v_rep = executor.git_lease_violation(["git", "push", "--rep", "custom_remote", "origin"], cwd=str(repo_alias))

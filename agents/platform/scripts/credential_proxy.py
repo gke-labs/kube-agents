@@ -2386,15 +2386,23 @@ GIT_BUILTIN_SUBCOMMANDS = (
             "archive",
             "bisect",
             "blame",
+            "bugreport",
             "bundle",
             "cat-file",
             "check-attr",
             "check-ignore",
             "check-mailmap",
             "check-ref-format",
+            "checkout-index",
+            "commit-graph",
+            "commit-tree",
             "config",
             "count-objects",
+            "credential",
+            "credential-cache",
+            "credential-store",
             "describe",
+            "diagnose",
             "diff",
             "diff-files",
             "diff-index",
@@ -2402,25 +2410,37 @@ GIT_BUILTIN_SUBCOMMANDS = (
             "difftool",
             "fast-export",
             "fast-import",
+            "fmt-merge-msg",
             "for-each-ref",
             "for-each-repo",
             "format-patch",
             "fsck",
+            "gc",
             "grep",
             "hash-object",
             "help",
+            "hook",
             "init",
+            "interpret-trailers",
+            "lfs",
             "log",
             "ls-files",
             "ls-remote",
             "ls-tree",
+            "maintenance",
             "merge-base",
+            "merge-file",
+            "merge-index",
+            "merge-one-file",
             "merge-tree",
             "name-rev",
             "notes",
+            "pack-refs",
             "patch-id",
+            "prune",
             "push",
             "range-diff",
+            "read-tree",
             "reflog",
             "remote",
             "repack",
@@ -2436,12 +2456,14 @@ GIT_BUILTIN_SUBCOMMANDS = (
             "stripspace",
             "symbolic-ref",
             "tag",
+            "update-index",
             "var",
             "verify-commit",
             "verify-pack",
             "verify-tag",
             "version",
             "whatchanged",
+            "write-tree",
         }
     )
 )
@@ -3253,8 +3275,9 @@ class CommandExecutor:
         """Why this git command may not run here, or None if it may, along with the execution argv.
 
         When an alias is present, returns the checked expansion as execution argv so execution
-        does not re-read .git/config at execution time (preventing TOCTOU races between check
-        and execute where an agent modifies .git/config after check passes).
+        does not re-read .git/config at execution time. Unknown subcommands that are neither recognized
+        git builtins nor defined aliases fail closed, preventing TOCTOU races between check and execute
+        where an agent modifies .git/config after check passes (#1498).
         """
         if not argv or Path(argv[0]).name != "git":
             return None, argv
@@ -3294,6 +3317,11 @@ class CommandExecutor:
             subcommand, _ = _git_plan(expanded_argv)
             execution_argv = expanded_argv
         else:
+            if subcommand and subcommand not in GIT_BUILTIN_SUBCOMMANDS:
+                return (
+                    f"`git {subcommand}` is not a recognized git subcommand or alias.",
+                    argv,
+                )
             push_violation = git_push_violation(argv, cwd=candidate)
             if push_violation is not None:
                 return push_violation, argv
