@@ -477,7 +477,6 @@ save_secret_env_var() {
 # a path read out of install.env.
 expand_tilde_path() {
   local path="$1"
-  # shellcheck disable=SC2088 # Tilde is matched literally in case pattern
   case "$path" in
     # The slash sits outside the quotes so shellcheck's SC2088 stays enforced in
     # this block rather than being suppressed across it. The tilde stays quoted
