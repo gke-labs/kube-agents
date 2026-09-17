@@ -3511,8 +3511,10 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// prompt's two per-install settings (`feedback_prompt.py`, a `no_agent`
 	// cron script). The first turns one fixed chat message off, the second
 	// moves when it is sent; neither names a path, a URL, a credential or an
-	// image, and a value that does not parse falls back to the default in the
-	// script, so an arbitrary value reaches nothing but that one message.
+	// image, and a value that does not parse fails the run (exit 1, the reason
+	// on stderr, reported in chat like any other script failure) before the
+	// script arms or prints, so an arbitrary value reaches nothing but that
+	// one message and its own failure report.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
