@@ -5644,6 +5644,32 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         # The temporary destination is gone once the read is done.
         self.assertEqual(self.temp_dirs(), [])
 
+    def test_a_ref_on_the_gitops_repository_itself_is_ignored_in_content_mode(self):
+        # Directory mode reads the GitOps repository from the checkout `start`
+        # just reset, so a `ref` on a context entry naming it changes nothing
+        # there. Content mode clones it through the sibling script, where a
+        # `--ref` would read, and credit as `acme/fleet@<sha>`, a branch the
+        # run does not publish against. The pin is dropped: no `--ref` on
+        # either step, the repository owed and read once, its source unpinned.
+        self.patch_attr("detect_content_mode", lambda: True)
+        self.context("acme/fleet", ref="release-2026")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "knowledge/checkout.md", note([declaration()]))
+        self.harness.replies["--repo acme/fleet"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet"])
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}]
+        )
+        self.assertEqual(payload["declared_intent_unsearched"], [])
+        calls = self.clone_calls()
+        self.assertEqual(len(calls), 2)
+        for cmd in calls:
+            self.assertEqual(cmd[2:5], ["clone", "--repo", "acme/fleet"])
+            self.assertNotIn("--ref", cmd)
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
     def test_a_context_repository_is_cloned_with_its_ref_and_read(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         self.context("acme/terraform-live", ref="release-2026")
