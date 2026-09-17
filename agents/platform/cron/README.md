@@ -100,8 +100,8 @@ The one entry here whose product is a question to the operator rather than a
 report on the fleet. Every feedback channel kube-agents has is
 reporter-initiated: the tracker, the public form behind the short link, and the
 agent handing out both when asked. `feedback_prompt.py` is the one place the
-product asks, and it does so exactly once per install: a fixed message in the
-home chat channel carrying the form's short link, the form's disclosure that a
+product asks, and it does so once per install: a fixed message in the home
+chat channel carrying the form's short link, the form's disclosure that a
 submission becomes a public issue, and a line saying a reply in the thread
 reaches the agent. `deliver: "chat"` is what makes that last line true; the
 Chat Agent posts the message and owns the thread.
@@ -115,16 +115,35 @@ marker files in the profile home (`HERMES_HOME` under this roster is
 `profiles/platform`): `.feedback_prompt_armed`, created with `O_EXCL` on the
 first tick and holding the anchor time, and `.feedback_prompt_sent`, claimed
 with `O_EXCL` before anything reaches stdout, the same claim
-`bootstrap_delivery.py` makes and for the same reason. Both sit on the data
-volume, which survives restarts and image rolls and dies only with an
-uninstall, so an upgrade is not a new install. The clock starts at the first
+`bootstrap_delivery.py` makes and for the same reason, holding the time of the
+latest attempt and the count. Both sit on the data volume, which survives
+restarts and image rolls and dies only with an uninstall, so an upgrade is not
+a new install.
+
+Printing is not delivering: the relay runs after the script, and a claim taken
+on a day the relay, the Session KV server or the chat platform was down, or on
+an install that had bound no chat platform yet, would spend the one message on
+nothing. So the script reads the scheduler's own record of the run that
+carried the latest attempt, `last_delivery_error` on its entry in this
+profile's `cron/jobs.json`, the field `chat_delivery_watch.py` grades, and
+when that run graded as a hard failure (nothing reached any platform) it
+prints the message again on the next tick and rewrites the marker, under a
+lock on the marker so two racing runs cannot both retry. A record that says
+delivered, partial or degraded (it landed somewhere), a run the scheduler
+never recorded, or a store it cannot read ends the retries, in the direction
+of never posting twice. The retries stop after fourteen attempts in all, two
+weeks of daily ticks, because each attempt is a Chat Agent composition and an
+install that has bound no chat platform in that time is not one the message
+can reach. `chat-delivery-watch` counts the failed attempts like any other
+job's, so a relay outage that lasts past its threshold opens the ledger issue
+as usual. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets
 the message a week after the upgrade that brings it.
 
-Every other tick prints nothing and relays nothing, so once it has fired the
-job costs one silent subprocess a day, like `github-repo-watcher`'s idle
+Every other tick prints nothing and relays nothing, so once the message has
+landed the job costs one silent subprocess a day, like `github-repo-watcher`'s idle
 ticks. Two environment variables, set per install through the CR's
 `spec.deployment.env` and passed to the agent container by the operator's
 allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`

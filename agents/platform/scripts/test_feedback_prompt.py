@@ -2,18 +2,21 @@
 
 Run: python3 -m unittest agents/platform/scripts/test_feedback_prompt.py
 
-The property that matters is "exactly once": every tick but one prints nothing,
-and the one that prints claims a marker first. The clock is injected, so a
-week passes in a call.
+The property that matters is "once delivered": every tick but one prints nothing,
+the one that prints claims a marker first, and a print the scheduler recorded
+as undelivered is repeated until one lands or the attempts run out. The clock
+and the scheduler's store are injected, so a week passes in a call.
 """
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -212,6 +215,112 @@ class FailureTest(FeedbackPromptCase):
         with contextlib.redirect_stdout(io.StringIO()):
             fp.main(now=T0)
         self.assertTrue(self.armed().exists())
+
+
+RELAY_502 = (
+    "delivery error: chat relay answered HTTP 502: chat relay failed: "
+    "composed but not delivered to google_chat (target chat:cron-reports)"
+)
+
+
+def iso(t: float) -> str:
+    return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+
+
+class RetryTest(FeedbackPromptCase):
+    """Printing is not delivering: a recorded hard failure is retried, a landing is not."""
+
+    def setUp(self):
+        super().setUp()
+        self.tick(T0)
+        _, out, _ = self.tick(T0 + WEEK)
+        self.assertEqual(fp.MESSAGE, out)
+        self.assertEqual(fp.claim_record(T0 + WEEK, 1), self.sent().read_text())
+
+    def record(self, run_at: float, error: str | None, job_id: str = fp.JOB_ID):
+        """What the scheduler leaves in the profile store after the run at ``run_at``."""
+        store = self.home / fp.STORE_PATH
+        store.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"id": job_id, "last_run_at": iso(run_at), "last_status": "ok", "last_delivery_error": error}
+        store.write_text(json.dumps({"jobs": [{"id": "other-job", "last_delivery_error": RELAY_502}, entry]}))
+
+    def test_a_recorded_hard_failure_is_retried_on_the_next_tick(self):
+        # The scheduler stamps last_run_at after delivery, so the record of the
+        # run that carried the attempt sits after the attempt time.
+        self.record(T0 + WEEK + 77, RELAY_502)
+        code, out, err = self.tick(T0 + WEEK + 86400)
+        self.assertEqual((0, fp.MESSAGE, ""), (code, out, err))
+        self.assertEqual(fp.claim_record(T0 + WEEK + 86400, 2), self.sent().read_text())
+
+    def test_a_delivered_attempt_is_never_repeated(self):
+        self.record(T0 + WEEK + 77, None)
+        for day in (1, 2, 30):
+            _, out, _ = self.tick(T0 + WEEK + day * 86400)
+            self.assertEqual("", out, day)
+        self.assertEqual(fp.claim_record(T0 + WEEK, 1), self.sent().read_text())
+
+    def test_a_note_a_partial_or_a_degraded_delivery_landed_somewhere_and_is_not_retried(self):
+        for error in (
+            "delivered without thread_id",
+            "chat relay partial: the report did not reach slack.",
+            "chat relay degraded: the Chat Agent turn failed after posting",
+        ):
+            self.record(T0 + WEEK + 77, error)
+            _, out, _ = self.tick(T0 + WEEK + 86400)
+            self.assertEqual("", out, error)
+
+    def test_a_record_that_predates_the_attempt_is_not_evidence(self):
+        # The scheduler never recorded the run that printed (a crash between
+        # the run and the stamp): unknown, and unknown means no second post.
+        self.record(T0 + WEEK - 5, RELAY_502)
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual("", out)
+
+    def test_no_store_no_job_or_an_unreadable_store_ends_the_retries(self):
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual("", out)
+        self.record(T0 + WEEK + 77, RELAY_502, job_id="not-this-job")
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual("", out)
+        (self.home / fp.STORE_PATH).write_text("{not json")
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual("", out)
+
+    def test_retries_stop_after_the_attempt_cap(self):
+        attempted_at = T0 + WEEK
+        for attempt in range(2, fp.MAX_ATTEMPTS + 1):
+            self.record(attempted_at + 77, RELAY_502)
+            attempted_at += 86400
+            _, out, _ = self.tick(attempted_at)
+            self.assertEqual(fp.MESSAGE, out, attempt)
+            self.assertEqual(fp.claim_record(attempted_at, attempt), self.sent().read_text())
+        self.record(attempted_at + 77, RELAY_502)
+        _, out, _ = self.tick(attempted_at + 86400)
+        self.assertEqual("", out)
+        self.assertEqual(fp.claim_record(attempted_at, fp.MAX_ATTEMPTS), self.sent().read_text())
+
+    def test_a_racing_run_after_a_retry_sees_no_record_for_it_and_stays_silent(self):
+        self.record(T0 + WEEK + 77, RELAY_502)
+        retry_at = T0 + WEEK + 86400
+        _, out, _ = self.tick(retry_at)
+        self.assertEqual(fp.MESSAGE, out)
+        # Same store, same second: the retry's own run is not recorded yet.
+        _, out, _ = self.tick(retry_at)
+        self.assertEqual("", out)
+        self.assertEqual(fp.claim_record(retry_at, 2), self.sent().read_text())
+
+    def test_a_marker_written_before_retries_existed_counts_as_one_attempt(self):
+        self.sent().write_text(f"{T0 + WEEK:.0f}\n")
+        self.record(T0 + WEEK + 77, RELAY_502)
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual(fp.MESSAGE, out)
+        self.assertEqual(fp.claim_record(T0 + WEEK + 86400, 2), self.sent().read_text())
+
+    def test_the_claim_record_round_trips(self):
+        self.assertEqual((T0, 3), fp.parse_claim(fp.claim_record(T0, 3)))
+        self.assertEqual((T0, 1), fp.parse_claim(f"{T0:.0f}\n"))
+        self.assertIsNone(fp.parse_claim("claimed elsewhere\n"))
+        self.assertIsNone(fp.parse_claim(""))
 
 
 class MessageTest(unittest.TestCase):
