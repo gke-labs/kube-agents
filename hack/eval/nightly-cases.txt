@@ -143,9 +143,15 @@
 # unit_cost_hint, not the 200s default.
 ./tasks/incident-triage-oom-event-probe/task.yaml
 
-# Issue #953: unlocated cluster crashloop debugging (omits "Find the cluster it is
-# running on", requiring the Platform Agent to discover the target cluster via fleet
-# enumeration before delegating to the cluster agent).
+# Blocker: never run (`validated: false`). Issue #953: unlocated cluster
+# crashloop debugging (omits "Find the cluster it is running on", requiring the
+# Platform Agent to discover the target cluster via fleet enumeration before
+# delegating to the cluster agent). Requires role crashloop-workload on seeded
+# cluster A of the 3-cluster standing dirty fleet (bench/tf/fleet/README.md).
+# Authored in PR #1670; its eval loop was not run locally because the contributor
+# environment is single-cluster (kyber-test) without the multi-cluster OpenTofu
+# fleet stack applied. Lands in the nightly roster under ADDED_AFTER_THE_SPLIT
+# to build its empirical baseline in Boskos-leased pool projects.
 ./tasks/cluster-agent-unlocated-crashloop-debug/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
