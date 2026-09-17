@@ -1600,6 +1600,16 @@ class GitHardeningTest(unittest.TestCase):
             store_flag.push(h, "custom-cli-base")
         self.assertIn("custom-cli-base", str(ctx.exception))
 
+        # Checked alias expansion is returned by resolve_git_command and executed directly (Thread 8)
+        repo_alias = self.repository(executor, name="repo_alias")
+        self.append_repository_config(
+            repo_alias,
+            "\n[alias]\n\tstatus-alias = status --short\n",
+        )
+        violation, exec_argv = executor.resolve_git_command(["git", "status-alias"], cwd=str(repo_alias))
+        self.assertIsNone(violation)
+        self.assertEqual(["git", "status", "--short"], exec_argv)
+
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
         # `_execute` refuses a cwd outside the shared workspace and the lease
         # gate resolves cwd plus every `-C`, but neither looks at `--git-dir`.

@@ -3208,6 +3208,79 @@ class CommandExecutor:
                 break
         return None
 
+    def resolve_git_command(self, argv: list[str], cwd: str | None) -> tuple[str | None, list[str]]:
+        """Why this git command may not run here, or None if it may, along with the execution argv.
+
+        When an alias is present, returns the checked expansion as execution argv so execution
+        does not re-read .git/config at execution time (preventing TOCTOU races between check
+        and execute where an agent modifies .git/config after check passes).
+        """
+        if not argv or Path(argv[0]).name != "git":
+            return None, argv
+        subcommand, redirects = _git_plan(argv)
+        candidate = Path(cwd).resolve() if cwd else self.workspace_dir
+        # `-C` is applied the way git applies it: each one relative to the last.
+        for redirect in redirects:
+            candidate = (candidate / redirect).resolve()
+
+        alias_expansion = _read_repo_alias(candidate, subcommand)
+        if alias_expansion:
+            if alias_expansion[0].startswith("!"):
+                if alias_expansion[0] in ("!cycle", "!max_depth", "!config_error", "!error", "!shlex_error"):
+                    return (
+                        f"`git` alias recursion or configuration error ({alias_expansion[0][1:]}) is refused: "
+                        "aliases must expand cleanly without cycles, errors, or exceeding depth.",
+                        argv,
+                    )
+                return (
+                    "`git` alias executing a shell command (`!`) is refused: "
+                    "shell aliases cannot be executed through the credential proxy.",
+                    argv,
+                )
+            sub_idx = _find_subcommand_index(argv)
+            head = argv[:sub_idx] if sub_idx is not None else [argv[0]]
+            tail = argv[sub_idx + 1:] if sub_idx is not None else []
+            expanded_argv = head + alias_expansion + tail
+
+            arg_violation = git_argument_violation(expanded_argv)
+            if arg_violation is not None:
+                return arg_violation, argv
+
+            push_violation = git_push_violation(expanded_argv, cwd=candidate)
+            if push_violation is not None:
+                return push_violation, argv
+            subcommand, _ = _git_plan(expanded_argv)
+            execution_argv = expanded_argv
+        else:
+            push_violation = git_push_violation(argv, cwd=candidate)
+            if push_violation is not None:
+                return push_violation, argv
+            execution_argv = argv
+
+        if not self.require_git_lease:
+            return None, execution_argv
+
+        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
+            return None, execution_argv
+
+        if not self._within_workspace(candidate):
+            return (
+                f"`git {subcommand}` would run in {candidate}, outside the shared "
+                "workspace.",
+                argv,
+            )
+        if self._lease_holder(candidate) is None:
+            return (
+                f"`git {subcommand}` is only allowed inside a leased GitOps "
+                f"workspace, and {candidate} is not one (no {GIT_LEASE_MARKER} in "
+                "it or any directory above it). Other agents share this volume: "
+                "run the skill's workspace step — `audit_report.py start` for a "
+                "fleet audit, `submit_suggestion.py prepare` for a suggestion — "
+                "and work in the directory it prints.",
+                argv,
+            )
+        return None, execution_argv
+
     def git_lease_violation(self, argv: list[str], cwd: str | None) -> str | None:
         """Why this git command may not run here, or None if it may.
 
@@ -3224,65 +3297,8 @@ class CommandExecutor:
         checked by the skill (`gitops_workspace.assert_lease_owner`), which is
         the only layer that knows which lease it holds.
         """
-        if not argv or Path(argv[0]).name != "git":
-            return None
-        subcommand, redirects = _git_plan(argv)
-        candidate = Path(cwd).resolve() if cwd else self.workspace_dir
-        # `-C` is applied the way git applies it: each one relative to the last.
-        for redirect in redirects:
-            candidate = (candidate / redirect).resolve()
-
-        alias_expansion = _read_repo_alias(candidate, subcommand)
-        if alias_expansion:
-            if alias_expansion[0].startswith("!"):
-                if alias_expansion[0] in ("!cycle", "!max_depth", "!config_error", "!error", "!shlex_error"):
-                    return (
-                        f"`git` alias recursion or configuration error ({alias_expansion[0][1:]}) is refused: "
-                        "aliases must expand cleanly without cycles, errors, or exceeding depth."
-                    )
-                return (
-                    "`git` alias executing a shell command (`!`) is refused: "
-                    "shell aliases cannot be executed through the credential proxy."
-                )
-            sub_idx = _find_subcommand_index(argv)
-            head = argv[:sub_idx] if sub_idx is not None else [argv[0]]
-            tail = argv[sub_idx + 1:] if sub_idx is not None else []
-            expanded_argv = head + alias_expansion + tail
-
-            arg_violation = git_argument_violation(expanded_argv)
-            if arg_violation is not None:
-                return arg_violation
-
-            push_violation = git_push_violation(expanded_argv, cwd=candidate)
-            if push_violation is not None:
-                return push_violation
-            subcommand, _ = _git_plan(expanded_argv)
-        else:
-            push_violation = git_push_violation(argv, cwd=candidate)
-            if push_violation is not None:
-                return push_violation
-
-        if not self.require_git_lease:
-            return None
-
-        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
-            return None
-
-        if not self._within_workspace(candidate):
-            return (
-                f"`git {subcommand}` would run in {candidate}, outside the shared "
-                "workspace."
-            )
-        if self._lease_holder(candidate) is None:
-            return (
-                f"`git {subcommand}` is only allowed inside a leased GitOps "
-                f"workspace, and {candidate} is not one (no {GIT_LEASE_MARKER} in "
-                "it or any directory above it). Other agents share this volume: "
-                "run the skill's workspace step — `audit_report.py start` for a "
-                "fleet audit, `submit_suggestion.py prepare` for a suggestion — "
-                "and work in the directory it prints."
-            )
-        return None
+        violation, _ = self.resolve_git_command(argv, cwd)
+        return violation
 
     def _resolve_kubeconfig(self, context: str, *, scoped: bool = True) -> Path:
         """Turn the cluster name a caller sent into a kubeconfig the proxy wrote.
@@ -4172,7 +4188,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         # Not a policy rule: the policy matches on argv alone, and this refusal
         # turns on the working directory as well.
-        violation = self.executor.git_lease_violation(argv, cwd)
+        if hasattr(self.executor, "resolve_git_command"):
+            violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
+        else:
+            violation = self.executor.git_lease_violation(argv, cwd)
+            exec_argv = argv
         if violation is not None:
             LOGGER.warning(
                 "git lease refused request_id=%s cwd=%s",
@@ -4196,7 +4216,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # token sa` is on the denylist as `kubernetes.token-disclosure` and will
         # be refused by the denylist with that rule id. If the gate ran first, it
         # would refuse as `kubernetes.read-only`, losing the specific rule.
-        refusal_result = read_only_refusal(argv)
+        refusal_result = read_only_refusal(exec_argv)
         if refusal_result is not None:
             refusal, log_hint = refusal_result
             safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
@@ -4208,7 +4228,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         try:
             result = self.executor.execute(
-                argv,
+                exec_argv,
                 stdin=stdin,
                 cwd=cwd,
                 kubeconfig_context=kubeconfig_context,
