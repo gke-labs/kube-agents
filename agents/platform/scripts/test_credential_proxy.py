@@ -1128,6 +1128,10 @@ class GitHardeningTest(unittest.TestCase):
             ["git", "push", "--mirror", "origin"],
             ["git", "push", "origin", ":"],
             ["git", "push", "origin", "refs/heads/*:refs/heads/*"],
+            # End-of-options '--' delimiter before protected refspecs (#1498)
+            ["git", "push", "origin", "--", "HEAD:main", "platform-agent/y"],
+            ["git", "push", "origin", "--", "HEAD:main"],
+            ["git", "push", "origin", "--", "main"],
         ):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
@@ -1172,6 +1176,9 @@ class GitHardeningTest(unittest.TestCase):
         )
         self.assertIsNone(
             git_argument_violation(["git", "push", "--force-with-lease", "origin", "HEAD:platform-agent/my-fix"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "origin", "--", "HEAD:platform-agent/my-fix"])
         )
 
         # Positional pathspecs named 'push' after '--' are not treated as push subcommands

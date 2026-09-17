@@ -2218,14 +2218,17 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
         if arg.startswith("-o") and len(arg) > 2:
             idx += 1
             continue
+        if arg == "--":
+            positional.extend(push_args[idx + 1:])
+            break
         if arg.startswith("--"):
             opt_name, sep, _ = arg.partition("=")
             if (
-                any(
+                len(opt_name) > 2
+                and any(
                     opt.startswith(opt_name)
                     for opt in ("--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules")
                 )
-                or opt_name == "--rep"
             ):
                 if sep:
                     idx += 1
