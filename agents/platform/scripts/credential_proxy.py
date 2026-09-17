@@ -2092,12 +2092,24 @@ def git_push_violation(argv: list[str]) -> str | None:
     """Refuse direct pushes to protected rollout or base branches (#1498)."""
     if not argv or Path(argv[0]).name != "git":
         return None
-    if "push" not in argv[1:]:
-        return None
 
-    push_idx = argv[1:].index("push") + 1
-    # If '--' appears before 'push', 'push' is a pathspec or positional arg, not a command.
-    if "--" in argv[1:push_idx]:
+    # Locate 'push' subcommand by walking past value-taking global options
+    idx = 1
+    push_idx = -1
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == "--":
+            break
+        name, sep, _ = arg.partition("=")
+        if name in _GIT_GLOBAL_WITH_VALUE and not sep:
+            idx += 2
+            continue
+        if arg == "push":
+            push_idx = idx
+            break
+        idx += 1
+
+    if push_idx == -1:
         return None
 
     push_args = argv[push_idx + 1:]
@@ -2118,7 +2130,6 @@ def git_push_violation(argv: list[str]) -> str | None:
         protected.add(norm_override)
 
     has_tags = False
-    has_repo_flag = False
     positional: list[str] = []
     idx = 0
     while idx < len(push_args):
@@ -2133,10 +2144,12 @@ def git_push_violation(argv: list[str]) -> str | None:
             idx += 1
             continue
         if arg == "--repo":
-            has_repo_flag = True
             if idx + 1 < len(push_args):
                 idx += 2
                 continue
+            idx += 1
+            continue
+        if arg.startswith("--repo="):
             idx += 1
             continue
         if arg.startswith("-"):
@@ -2152,11 +2165,9 @@ def git_push_violation(argv: list[str]) -> str | None:
         idx += 1
 
     # In `git push [<repository> [<refspec>...]]`, the first positional argument
-    # is the repository unless `--repo <repo>` was already supplied.
-    if has_repo_flag:
-        refspecs = positional
-    else:
-        refspecs = positional[1:] if len(positional) > 1 else []
+    # is the repository unless no positional arguments are supplied. Even if
+    # `--repo` is specified, git's cmd_push treats the first positional arg as the repo.
+    refspecs = positional[1:] if len(positional) > 1 else []
 
     if not refspecs:
         if has_tags:
@@ -2249,6 +2260,58 @@ def git_argument_violation(argv: list[str]) -> str | None:
                 "ask an operator for anything that has to change the proxy's own "
                 "configuration."
             )
+    if "config" in rest:
+        for argument in rest:
+            clean = argument.split("=", 1)[0].strip().lower()
+            if clean.startswith("alias.") or clean == "alias":
+                return (
+                    "`git config` configuring an alias is refused: git aliases cannot be "
+                    "configured through the credential proxy."
+                )
+    return None
+
+
+def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str] | None:
+    """If `subcommand` is an alias defined in the repo-local `.git/config`, return its argv expansion."""
+    if not cwd or not subcommand:
+        return None
+    repo_path = Path(cwd).resolve()
+    cur = repo_path
+    config_file = None
+    while cur != cur.parent:
+        candidate_git = cur / ".git"
+        if candidate_git.is_dir() and (candidate_git / "config").is_file():
+            config_file = candidate_git / "config"
+            break
+        elif candidate_git.is_file():
+            try:
+                line = candidate_git.read_text(encoding="utf-8").strip()
+                if line.startswith("gitdir:"):
+                    gitdir = (cur / line.split(":", 1)[1].strip()).resolve()
+                    if (gitdir / "config").is_file():
+                        config_file = gitdir / "config"
+                        break
+            except Exception:
+                pass
+        elif cur.name == ".git" and (cur / "config").is_file():
+            config_file = cur / "config"
+            break
+        cur = cur.parent
+
+    if not config_file or not config_file.is_file():
+        return None
+
+    try:
+        import configparser
+        import shlex
+
+        parser = configparser.ConfigParser()
+        parser.read(config_file, encoding="utf-8")
+        if parser.has_section("alias") and parser.has_option("alias", subcommand):
+            val = parser.get("alias", subcommand)
+            return shlex.split(val)
+    except Exception:
+        pass
     return None
 
 
@@ -2942,13 +3005,27 @@ class CommandExecutor:
         if not argv or Path(argv[0]).name != "git":
             return None
         subcommand, redirects = _git_plan(argv)
-        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
-            return None
-
         candidate = Path(cwd).resolve() if cwd else self.workspace_dir
         # `-C` is applied the way git applies it: each one relative to the last.
         for redirect in redirects:
             candidate = (candidate / redirect).resolve()
+
+        alias_expansion = _read_repo_alias(candidate, subcommand)
+        if alias_expansion:
+            sub_idx = -1
+            for i, tok in enumerate(argv):
+                if tok == subcommand:
+                    sub_idx = i
+                    break
+            tail = argv[sub_idx + 1:] if sub_idx != -1 else []
+            expanded_argv = [argv[0]] + alias_expansion + tail
+            push_violation = git_push_violation(expanded_argv)
+            if push_violation is not None:
+                return push_violation
+            subcommand, _ = _git_plan(expanded_argv)
+
+        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
+            return None
 
         if not self._within_workspace(candidate):
             return (

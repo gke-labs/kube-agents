@@ -564,6 +564,7 @@ class Workspace:
     # the pull request's branch rather than on the base, and a caller that
     # assumed the base would silently rewrite the reviewed work.
     started_from: str = ""
+    default_branch: str = ""
     shallow: bool = False
     metadata: dict = field(default_factory=dict)
 
@@ -805,7 +806,8 @@ class ContentWorkspaceStore:
                     base_sha="",
                     shallow=depth is not None,
                 )
-                workspace.base = base or self._default_branch(workspace)
+                workspace.default_branch = self._default_branch(workspace)
+                workspace.base = base or workspace.default_branch
                 workspace.base_sha = self._sha(workspace, f"origin/{workspace.base}")
                 workspace.started_from = f"origin/{workspace.base}"
                 # Only when the caller named one, and only when it is really
@@ -1137,12 +1139,19 @@ class ContentWorkspaceStore:
             elif norm_base.startswith("heads/"):
                 norm_base = norm_base[len("heads/"):]
 
+            norm_default = (getattr(workspace, "default_branch", "") or "").strip()
+            if norm_default.startswith("refs/heads/"):
+                norm_default = norm_default[len("refs/heads/"):]
+            elif norm_default.startswith("heads/"):
+                norm_default = norm_default[len("heads/"):]
+
             if (
                 (norm_base and norm_branch.casefold() == norm_base.casefold())
+                or (norm_default and norm_branch.casefold() == norm_default.casefold())
                 or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
             ):
                 raise ContentWorkspaceError(
-                    f"'{branch}' is the workspace base or run branch; suggestions are proposed on their "
+                    f"'{branch}' is the workspace base, remote default, or run branch; suggestions are proposed on their "
                     "own branch and merged by a human"
                 )
             self._git(workspace, ["check-ref-format", "--branch", branch])
@@ -1318,12 +1327,19 @@ class ContentWorkspaceStore:
             elif norm_base.startswith("heads/"):
                 norm_base = norm_base[len("heads/"):]
 
+            norm_default = (getattr(workspace, "default_branch", "") or "").strip()
+            if norm_default.startswith("refs/heads/"):
+                norm_default = norm_default[len("refs/heads/"):]
+            elif norm_default.startswith("heads/"):
+                norm_default = norm_default[len("heads/"):]
+
             if (
                 (norm_base and norm_branch.casefold() == norm_base.casefold())
+                or (norm_default and norm_branch.casefold() == norm_default.casefold())
                 or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
             ):
                 raise ContentWorkspaceError(
-                    f"'{branch}' is the workspace base or run branch; suggestions are proposed on their "
+                    f"'{branch}' is the workspace base, remote default, or run branch; suggestions are proposed on their "
                     "own branch and merged by a human"
                 )
             if workspace.branch != branch:

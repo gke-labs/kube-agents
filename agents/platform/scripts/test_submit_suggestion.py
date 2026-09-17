@@ -1107,12 +1107,17 @@ class TestContentMode(SubmitSuggestionTestCase):
         self.assertNotIn("commit", self.verbs)
         self.assertNotIn("push", self.verbs)
 
-        # Test without --base flag, relying on GITOPS_BASE_BRANCH fallback in open_handle/check_branch
+        # Test without --base flag: open_handle resolves base via gitops_workspace.resolve_base_branch()
+        # with environment clear so check_branch passes and open_handle -> handle_submit_content refuses (#1498).
         self.verbs.clear()
-        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": release_base}):
+        resolved_base = "custom-resolved-trunk"
+        prepared["branch"] = resolved_base
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(gitops_workspace, "resolve_base_branch", return_value=resolved_base):
             with self.assertRaises(ValueError) as ctx:
                 self.submit_content(prepared, source)
             self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+            self.assertIn("is the same as base branch", str(ctx.exception))
             self.assertNotIn("commit", self.verbs)
             self.assertNotIn("push", self.verbs)
 
@@ -1258,10 +1263,13 @@ class TestContentMode(SubmitSuggestionTestCase):
         self.assertEqual(prepared_custom["base"], "release-trunk")
 
         # Preparing on branch equal to non-protected base (release-trunk) is refused by handle_prepare_content
+        # and cleanly closes the opened broker workspace without leaking handles (#1498).
+        self.verbs.clear()
         with self.assertRaises(ValueError) as ctx:
             self.prepare_content(branch="release-trunk")
         self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
         self.assertIn("is the same as base branch 'release-trunk'", str(ctx.exception))
+        self.assertIn("close", self.verbs)
 
     def test_a_body_file_reaches_gh_intact_in_content_mode(self):
         """The safe channel has to be the safe channel in both transports.

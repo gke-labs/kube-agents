@@ -1128,11 +1128,27 @@ class RealGitTest(unittest.TestCase):
                 "feat: direct to base",
                 [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
             )
-        self.assertIn("is the workspace base or run branch", str(ctx.exception))
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
 
         with self.assertRaises(ContentWorkspaceError) as ctx:
             self.store.push(handle, "release/2026-08")
-        self.assertIn("is the workspace base or run branch", str(ctx.exception))
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
+
+        # Even when client opened with a custom base, commit/push directly to remote default branch is refused (#1498)
+        ws.base = "feature/agent-custom-base"
+        ws.default_branch = "release-trunk"
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.commit(
+                handle,
+                "release-trunk",
+                "feat: direct to remote default",
+                [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+            )
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.push(handle, "release-trunk")
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
 
         # Commit and push directly to run branches are refused by check_branch
         with self.assertRaises(ContentWorkspaceError) as ctx:

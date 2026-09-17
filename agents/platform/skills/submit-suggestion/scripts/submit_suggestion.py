@@ -178,6 +178,10 @@ def handle_prepare_content(args) -> int:
         return s
 
     if _norm(branch) == _norm(workspace.base):
+        try:
+            workspace.close()
+        except Exception:
+            pass
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Cannot prepare on branch '{branch}': head branch "
             f"is the same as base branch '{workspace.base}'. Suggestions must be prepared on a "
