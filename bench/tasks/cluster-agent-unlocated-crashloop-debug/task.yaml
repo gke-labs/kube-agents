@@ -17,11 +17,14 @@
 # Isolation class: read-only. Eligible tier: nightly.
 #
 # Status: NIGHTLY-ACTIVE (registered in hack/eval/nightly-cases.txt).
-# Lands `validated: false` per docs/designs/bench-case-format.md: the eval loop
-# could not be executed on the single-cluster development install because it
-# requires role crashloop-workload on seeded cluster A of the 3-cluster
-# standing dirty fleet (bench/tf/fleet/README.md). Builds its empirical baseline
-# during nightly evaluation in Boskos-leased pool projects.
+# Lands `validated: false` per docs/designs/bench-case-format.md, subject to
+# maintainer waiver on the review (@scromp / maintainers on PR #1670) per the
+# precedent of #1412 (upgrades-api-deprecation-clean-repo): the eval loop was
+# not run because the contributor environment is single-cluster (kyber-test)
+# lacking role crashloop-workload on seeded cluster A of the 3-cluster standing
+# dirty fleet (bench/tf/fleet/README.md), and out-of-band cloud infrastructure
+# provisioning exceeds agent autonomy and IAM permissions. Builds its empirical
+# baseline during nightly evaluation in Boskos-leased pool projects.
 id: cluster-agent-unlocated-crashloop-debug
 name: Cluster Agent resolves unlocated crashloop without asking user
 prompt: >-

@@ -150,8 +150,11 @@
 # cluster A of the 3-cluster standing dirty fleet (bench/tf/fleet/README.md).
 # Authored in PR #1670; its eval loop was not run locally because the contributor
 # environment is single-cluster (kyber-test) without the multi-cluster OpenTofu
-# fleet stack applied. Lands in the nightly roster under ADDED_AFTER_THE_SPLIT
-# to build its empirical baseline in Boskos-leased pool projects.
+# fleet stack applied, and cloud infrastructure creation exceeds agent autonomy.
+# Held subject to maintainer waiver on the #1670 review (@scromp / maintainers)
+# per the precedent of #1412 (upgrades-api-deprecation-clean-repo). Lands in the
+# nightly roster under ADDED_AFTER_THE_SPLIT to build its empirical baseline in
+# Boskos-leased pool projects.
 ./tasks/cluster-agent-unlocated-crashloop-debug/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
