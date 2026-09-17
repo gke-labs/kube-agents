@@ -1777,6 +1777,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "kanban-board-health",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
+                "feedback-prompt",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "

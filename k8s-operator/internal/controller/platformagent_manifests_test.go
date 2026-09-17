@@ -1274,6 +1274,47 @@ func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
+	// The feedback prompt's whole per-install surface: `feedback_prompt.py`
+	// reads both from the environment on every tick and there is no config
+	// file behind them. Off the allowlist, the documented override renders on
+	// the CR, validates, and never reaches the script, and an install that
+	// wants the prompt off has no supported way to get it.
+	custom := []corev1.EnvVar{
+		{Name: "FEEDBACK_PROMPT_ENABLED", Value: "false"},
+		{Name: "FEEDBACK_PROMPT_DELAY", Value: "14d"},
+		{Name: "HERMES_HOME", Value: "/tmp/elsewhere"},
+		{
+			Name: "FEEDBACK_PROMPT_ENABLED",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	if values["FEEDBACK_PROMPT_ENABLED"] != "false" {
+		t.Errorf("expected the feedback prompt to be switchable off, got %q", values["FEEDBACK_PROMPT_ENABLED"])
+	}
+	if values["FEEDBACK_PROMPT_DELAY"] != "14d" {
+		t.Errorf("expected the feedback prompt's delay to be overridable, got %q", values["FEEDBACK_PROMPT_DELAY"])
+	}
+	// The script anchors its markers under HERMES_HOME; letting the CR move
+	// it would re-arm the prompt on a volume that has already sent it.
+	if _, ok := values["HERMES_HOME"]; ok {
+		t.Errorf("HERMES_HOME must stay operator-owned, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},

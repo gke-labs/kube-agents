@@ -191,6 +191,22 @@
       "deliver": "chat"
     },
     {
+      "id": "feedback-prompt",
+      "name": "Feedback Prompt",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 13 * * *",
+        "display": "0 13 * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "feedback_prompt.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "eod-event-watcher-daily-report",
       "name": "Event Watcher Daily Activity Recap",
       "schedule": {

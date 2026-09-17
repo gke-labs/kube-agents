@@ -3506,11 +3506,20 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// Any value parses: `excluded_namespaces` comma-splits the string and
 	// matches the parts literally, so an arbitrary one names namespaces that do
 	// not exist and excludes nothing. There is no validation to fail.
+	//
+	// FEEDBACK_PROMPT_ENABLED and FEEDBACK_PROMPT_DELAY are the feedback
+	// prompt's two per-install settings (`feedback_prompt.py`, a `no_agent`
+	// cron script). The first turns one fixed chat message off, the second
+	// moves when it is sent; neither names a path, a URL, a credential or an
+	// image, and a value that does not parse falls back to the default in the
+	// script, so an arbitrary value reaches nothing but that one message.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},
+		"FEEDBACK_PROMPT_DELAY":       {},
+		"FEEDBACK_PROMPT_ENABLED":     {},
 		envHermesOtelEnabled:          {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},

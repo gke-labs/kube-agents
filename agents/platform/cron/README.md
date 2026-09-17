@@ -94,6 +94,49 @@ It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
 under this roster `HERMES_HOME` is `profiles/platform`, which holds no board.
 
+## `feedback-prompt` asks once, a week after it first runs
+
+The one entry here whose product is a question to the operator rather than a
+report on the fleet. Every feedback channel kube-agents has is
+reporter-initiated: the tracker, the public form behind the short link, and the
+agent handing out both when asked. `feedback_prompt.py` is the one place the
+product asks, and it does so exactly once per install: a fixed message in the
+home chat channel carrying the form's short link, the form's disclosure that a
+submission becomes a public issue, and a line saying a reply in the thread
+reaches the agent. `deliver: "chat"` is what makes that last line true; the
+Chat Agent posts the message and owns the thread.
+
+It is a daily cron entry that fires once, not a Hermes one-shot, and the
+reason is this roster's merge. A shipped entry cannot carry an absolute
+`run_at`, and a completed one-shot is pruned from the store after seven days,
+at which point `merge_cron_store` sees an id the volume lacks and re-adds it,
+re-arming the prompt. So the once-only state lives outside the store, in two
+marker files in the profile home (`HERMES_HOME` under this roster is
+`profiles/platform`): `.feedback_prompt_armed`, created with `O_EXCL` on the
+first tick and holding the anchor time, and `.feedback_prompt_sent`, claimed
+with `O_EXCL` before anything reaches stdout, the same claim
+`bootstrap_delivery.py` makes and for the same reason. Both sit on the data
+volume, which survives restarts and image rolls and dies only with an
+uninstall, so an upgrade is not a new install. The clock starts at the first
+tick, not at any record of when the install finished: nothing in the operator
+status carries a ready-since time, and the Chat Agent's onboarding markers
+live in a different home. An install that predates the entry therefore gets
+the message a week after the upgrade that brings it.
+
+Every other tick prints nothing and relays nothing, so once it has fired the
+job costs one silent subprocess a day, like `github-repo-watcher`'s idle
+ticks. Two environment variables, set per install through the CR's
+`spec.deployment.env` and passed to the agent container by the operator's
+allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
+(default `true`; `false` neither arms nor claims, so an install that turns it
+on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
+`<n>d`, `<n>h` or `<n>m`, a malformed value falling back to the default with a
+stderr line). The form URL is a constant, never a knob: the short link is the
+only address the maintainers publish. `enabled: false` on the entry stays the
+fleet-wide switch, and retiring it follows the two-step path below like any
+other id; deleting the entry outright would leave the volume's copy firing
+against a script the next image no longer ships.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two
