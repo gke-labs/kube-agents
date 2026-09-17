@@ -31,7 +31,22 @@ if NAME == "cluster_agent_profile.py":
         # In the sandbox, the agent pod PVC is not mounted, but sandbox_mirror
         # pushes the profile skeleton and each cluster profile's identity file (USER.md)
         # into /opt/data/profiles. Enumerate valid, fully scaffolded cluster profiles from there.
-        profiles_dir = Path(os.environ.get("HERMES_HOME", "/opt/data")) / "profiles"
+        #
+        # In the sandbox, session-command.sh narrows HERMES_HOME to the profile home
+        # (e.g. /opt/data/profiles/platform) when cwd is inside a profile, but
+        # PLATFORM_AGENT_HOME remains the static sandbox data root (/opt/data).
+        # Resolve the profiles directory from PLATFORM_AGENT_HOME, falling back
+        # to parent traversal if HERMES_HOME points directly into a profile home.
+        data_root = Path(os.environ.get("PLATFORM_AGENT_HOME") or "/opt/data")
+        profiles_dir = data_root / "profiles"
+        if not profiles_dir.is_dir():
+            hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+            if (hermes_home / "profiles").is_dir():
+                profiles_dir = hermes_home / "profiles"
+            elif hermes_home.parent.name == "profiles" and hermes_home.parent.is_dir():
+                profiles_dir = hermes_home.parent
+            elif (hermes_home.parent / "profiles").is_dir():
+                profiles_dir = hermes_home.parent / "profiles"
         names = []
         if profiles_dir.is_dir():
             for p in profiles_dir.iterdir():

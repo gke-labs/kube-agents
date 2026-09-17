@@ -636,6 +636,49 @@ class SandboxStubTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertEqual(res.stdout.strip(), "cluster-ready")
 
+    def test_stub_list_resolves_when_hermes_home_is_profile_scoped(self):
+        # When session-command.sh exports HERMES_HOME=<root>/profiles/platform
+        # because cwd is inside a profile, list must still locate <root>/profiles.
+        p_ready = self.profiles / "cluster-ready"
+        p_ready.mkdir(exist_ok=True)
+        (p_ready / "USER.md").write_text("- project: p\n- cluster: ready\n- location: l\n")
+
+        p_platform = self.profiles / "platform"
+        p_platform.mkdir(exist_ok=True)
+
+        wrapper = self.tmp / "cluster_agent_profile.py"
+        if not wrapper.exists():
+            wrapper.symlink_to(self.stub_path)
+
+        # Case 1: PLATFORM_AGENT_HOME points to data root, HERMES_HOME points to profile
+        res1 = subprocess.run(
+            [sys.executable, str(wrapper), "list"],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PLATFORM_AGENT_HOME": str(self.tmp),
+                "HERMES_HOME": str(p_platform),
+            },
+            check=False,
+        )
+        self.assertEqual(res1.returncode, 0)
+        self.assertEqual(res1.stdout.strip(), "cluster-ready")
+
+        # Case 2: Only HERMES_HOME points to profile (PLATFORM_AGENT_HOME unset/nonexistent)
+        res2 = subprocess.run(
+            [sys.executable, str(wrapper), "list"],
+            capture_output=True,
+            text=True,
+            env={
+                **{k: v for k, v in os.environ.items() if k != "PLATFORM_AGENT_HOME"},
+                "HERMES_HOME": str(p_platform),
+            },
+            check=False,
+        )
+        self.assertEqual(res2.returncode, 0)
+        self.assertEqual(res2.stdout.strip(), "cluster-ready")
+
     def test_stub_name_derives_canonical_profile_name(self):
         wrapper = self.tmp / "cluster_agent_profile.py"
         wrapper.symlink_to(self.stub_path)
