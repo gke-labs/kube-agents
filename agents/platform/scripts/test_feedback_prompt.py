@@ -244,12 +244,25 @@ class FailureTest(FeedbackPromptCase):
             fp.main(now=T0)
         self.assertTrue(self.armed().exists())
 
-    def test_the_default_home_is_the_profile_home_the_ticker_uses(self):
+    def test_the_gateway_home_resolves_to_the_platform_profile_under_it(self):
         # `profile_cron_tick.py` runs this roster with HERMES_HOME set to the
-        # platform profile's home; a hand run in the container without that
-        # environment must find the same markers, not start a second pair
-        # under the gateway's `/opt/data`.
-        self.assertEqual("/opt/data/profiles/platform", fp.DEFAULT_HOME)
+        # platform profile's home, but the container sets HERMES_HOME to the
+        # gateway's home for every shell in it, so a hand run inherits that.
+        # It has to find the scheduled ticks' markers, not start a second pair
+        # under the gateway's home.
+        profile = self.home / fp.PROFILE_HOME
+        profile.mkdir(parents=True)
+        os.environ[fp.HOME_ENV] = str(self.home)
+        with contextlib.redirect_stdout(io.StringIO()):
+            fp.main(now=T0)
+        self.assertTrue((profile / fp.ARMED_MARKER).exists())
+        self.assertFalse(self.armed().exists())
+
+    def test_a_home_with_no_profile_beneath_it_is_the_profile_home(self):
+        # The ticker's case: HERMES_HOME is the profile home itself.
+        os.environ[fp.HOME_ENV] = str(self.home)
+        self.assertEqual(self.home, fp._home())
+        self.assertEqual("/opt/data", fp.GATEWAY_HOME)
 
 
 RELAY_502 = (
@@ -358,6 +371,47 @@ class RetryTest(FeedbackPromptCase):
         self.assertEqual("", out)
         self.assertEqual(fp.claim_record(retry_at, 2), self.sent().read_text())
 
+    def test_a_retry_whose_rewrite_fails_keeps_the_previous_record(self):
+        # The new record is written over the old one and the file cut to its
+        # length afterwards, never truncated first: a rewrite that fails (the
+        # volume full) or a run killed between the two steps would otherwise
+        # leave an empty marker, which every later tick reads as a claim it
+        # cannot retry. Here the write is refused; the failed run exits 1, the
+        # marker still holds attempt 1, and the next tick retries.
+        self.record(T0 + WEEK + 77, RELAY_502)
+        real_open = open
+
+        class RefusesWrites:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def write(self, _text):
+                raise OSError(28, "No space left on device")
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._handle.__exit__(*exc)
+
+        def open_refusing_marker_writes(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            if Path(path).name == fp.SENT_MARKER and "+" in mode:
+                return RefusesWrites(handle)
+            return handle
+
+        with unittest.mock.patch("builtins.open", open_refusing_marker_writes):
+            code, out, err = self.tick(T0 + WEEK + 86400)
+        self.assertEqual((1, ""), (code, out))
+        self.assertIn(fp.SENT_MARKER, err)
+        self.assertEqual(fp.claim_record(T0 + WEEK, 1), self.sent().read_text())
+        _, out, _ = self.tick(T0 + WEEK + 86400)
+        self.assertEqual(fp.MESSAGE, out)
+        self.assertEqual(fp.claim_record(T0 + WEEK + 86400, 2), self.sent().read_text())
+
     def test_a_marker_written_before_retries_existed_counts_as_one_attempt(self):
         self.sent().write_text(f"{T0 + WEEK:.0f}\n")
         self.record(T0 + WEEK + 77, RELAY_502)
@@ -380,9 +434,10 @@ class StampTest(FeedbackPromptCase):
         self.assertEqual("1789615518", fp.stamp(1789615518.0))
 
     def test_a_stamp_that_follows_the_attempt_within_the_second_is_its_record(self):
-        # Seen on the robot install: the script's clock read 18.63, the
-        # scheduler's stamp 18.78. With no adapter to run (no chat platform
-        # bound) the gap is that small every time, and a marker rounded to 19
+        # Seen on the robot install's arming run: the script's clock read
+        # 18.63, the scheduler's stamp 18.78. A delivery that fails as fast
+        # (the relay refusing the connection, a run outside the ticker with no
+        # delivery target) leaves the same gap, and a marker rounded to 19
         # would read that stamp as an earlier run and never retry.
         self.tick(T0)
         attempted_at = T0 + WEEK + 0.63

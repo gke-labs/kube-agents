@@ -140,11 +140,20 @@ them like any other job's failed runs, so an outage that lasts past its
 threshold opens the ledger issue as usual, and the post that finally lands
 clears the streak as any other job's delivery does; a capped job would go
 silent for good at the cap, and a silent run never clears a streak, so the
-ledger issue would name this job for the life of the install. On an install
-with no chat platform bound the scheduler records the failure before any
-adapter runs, so a retry there costs no Chat Agent turn; a relay or platform
-outage on an install with one bound costs one composition a day until it
-ends. The clock starts at the first
+ledger issue would name this job for the life of the install. Every attempt
+is a Chat Agent turn, whatever the install has bound: the ticker enables the
+relay for every cron child, and the relay composes the message before it
+learns which platforms are there, so an install with no working chat platform
+pays one composition a day from the day the prompt falls due until a platform
+is bound or `FEEDBACK_PROMPT_ENABLED=false` switches the job off, and an
+install with one bound pays it for the length of a relay or platform outage;
+that is what every scheduled report's delivery costs on the same install, and
+the ledger already names every one of them there. The store holds one record
+per job, so a run of this job that is not an attempt (a tick with the knob
+off, a failed run) overwrites the attempt's record and ends the retries the
+same way; and a partial delivery (one platform of several) ends them too,
+after which the silent runs leave whatever streak the ledger had counted
+where it stands. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets

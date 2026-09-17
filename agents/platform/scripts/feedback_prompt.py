@@ -25,8 +25,8 @@ state lives outside the store, in two marker files in the profile home:
 
 Printing is not delivering. The scheduler relays the output after the run and
 writes the outcome into this job's entry in the profile's ``cron/jobs.json``,
-as ``last_delivery_error`` (the relay answered 502, was unreachable, no
-platform bound, or ``None`` when the message landed), which is the record
+as ``last_delivery_error`` (the relay answered 502 because no platform took the
+post, was unreachable, or ``None`` when the message landed), which is the record
 ``chat_delivery_watch.py`` grades. A claim taken and never delivered would
 otherwise spend the one message on a relay outage, or on an install whose
 operator binds a chat platform after the day the prompt fell due. So each later
@@ -41,16 +41,24 @@ script prints only on that path and a failed run of this job (a malformed
 delay, a marker the volume refuses) has its failure summary relayed too, with
 the outcome in the same field: without that check a 502 on the summary would
 read as the post failing after it had landed, and the message would go twice.
+The store holds one record per job, so any run of this job that is not an
+attempt (a tick with the knob switched off, a failed run) overwrites the
+attempt's record and ends the retries the same way, in the same direction.
 
 There is no cap on the attempts. A capped job goes silent for good once the
 cap is reached, and a silent run never clears the streak
 ``chat_delivery_watch.py`` keeps for it, so the ledger issue would name this
 job for the life of the install; retried until one lands, the post that lands
-clears the streak as any other job's delivery does. On an install with no chat
-platform bound the scheduler records the failure before any adapter runs, so a
-retry there costs no Chat Agent turn; a relay or platform outage on an install
-with one bound costs one composition a day until it ends. The text is a
-constant, so a lost message is nothing to recover; only the posting is retried.
+clears the streak as any other job's delivery does. Every attempt is a Chat
+Agent turn: the ticker enables the relay for every cron child it spawns, and
+the relay composes the message before it learns which platforms are bound, so
+an install with no working chat platform pays one composition a day from the
+day the prompt falls due until a platform is bound or the knob below switches
+the job off, and an install with one bound pays it for the length of a relay
+or platform outage. That is what every scheduled report's delivery costs on
+the same install, and the ledger `chat-delivery-watch` keeps already names
+every one of them there. The text is a constant, so a lost message is nothing
+to recover; only the posting is retried.
 
 Both markers live on the data volume, which survives pod restarts and image
 rolls and is deleted only by an uninstall. That is what makes an upgrade not
@@ -101,12 +109,15 @@ from pathlib import Path
 from chat_delivery_watch import GRADE_HARD, STATUS_OK, grade_error, is_delivered_note, parse_iso
 
 HOME_ENV = "HERMES_HOME"
-# What the ticker sets HERMES_HOME to for this roster is the profile home,
-# `profiles/platform` under the data volume (`profile_cron_tick.py`). The
-# default is that same path rather than the gateway's `/opt/data`, so a hand
-# run in the container without the ticker's environment reads and writes the
-# markers the scheduled ticks use, not a second pair under the gateway's home.
-DEFAULT_HOME = "/opt/data/profiles/platform"
+# The markers live in the platform profile's home, which is what the ticker
+# sets HERMES_HOME to for this roster: `profiles/platform` under the data
+# volume (`profile_cron_tick.py`). The container itself sets HERMES_HOME to the
+# volume's root, the gateway's home (`docker-entrypoint.sh`), so a hand run in
+# the container inherits that and would otherwise arm and claim a second pair
+# of markers there and see none of the scheduled ticks' state; `_home` resolves
+# the profile home under whichever of the two it is handed.
+GATEWAY_HOME = "/opt/data"
+PROFILE_HOME = Path("profiles") / "platform"
 
 ENABLED_ENV = "FEEDBACK_PROMPT_ENABLED"
 DELAY_ENV = "FEEDBACK_PROMPT_DELAY"
@@ -157,7 +168,15 @@ A submission becomes a public issue on {REPOSITORY}, apart from the form's optio
 
 
 def _home() -> Path:
-    return Path(os.environ.get(HOME_ENV, DEFAULT_HOME))
+    """The profile home: HERMES_HOME itself, or the platform profile under it.
+
+    Under the ticker HERMES_HOME is the profile home and has no profile of its
+    own beneath it; in a shell in the container it is the gateway's home, and
+    the platform profile is a directory under it.
+    """
+    home = Path(os.environ.get(HOME_ENV, GATEWAY_HOME))
+    profile_home = home / PROFILE_HOME
+    return profile_home if profile_home.is_dir() else home
 
 
 def enabled(value: str | None) -> bool:
@@ -191,9 +210,10 @@ def stamp(at: float) -> str:
     """A time as the whole second it fell in, the form both markers hold it in.
 
     Floored, never rounded. The scheduler stamps ``last_run_at`` after the run,
-    and when no adapter ran (no chat platform bound) that stamp follows this
-    script's clock by a fraction of a second; a time rounded up to the next
-    second would then sit after its own record, which ``delivery_failed``
+    and when the delivery fails fast (the relay refused the connection, or a
+    run outside the ticker resolved no delivery target) that stamp follows
+    this script's clock by a fraction of a second; a time rounded up to the
+    next second would then sit after its own record, which ``delivery_failed``
     reads as the record of an earlier run, and the attempt would never be
     retried.
     """
@@ -310,8 +330,11 @@ def _claim_retry(marker: Path, store: Path, now: float) -> bool:
     so of two runs racing on the retry exactly one rewrites it; the other then
     reads an attempt time the store has no record at or after, and stays
     silent. The lock dies with the process, so a crash leaves nothing behind
-    that could wedge the next tick. Raises ``OSError`` when the marker cannot
-    be opened or locked.
+    that could wedge the next tick. The new record is written over the old one
+    before the file is cut to its length, never after a truncate: a write that
+    fails or a process killed between the two would otherwise leave an empty
+    marker, which every later tick reads as a claim it cannot retry. Raises
+    ``OSError`` when the marker cannot be opened, locked or rewritten.
     """
     with open(marker, "r+", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -322,8 +345,8 @@ def _claim_retry(marker: Path, store: Path, now: float) -> bool:
         if not delivery_failed(store, attempted_at):
             return False
         handle.seek(0)
-        handle.truncate()
         handle.write(claim_record(now, attempts + 1))
+        handle.truncate()
         handle.flush()
     return True
 
