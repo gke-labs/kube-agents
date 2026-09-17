@@ -96,6 +96,28 @@ def key_document(key: dict) -> dict:
     return {name: key.get(name) for name in KEY_COMPONENTS}
 
 
+def path_segment(text) -> str:
+    """One directory segment as the store's writer spells it
+    (``evidence_store._sanitize``, mirrored here rather than imported: the
+    dashboard is stdlib only): anything outside letters, digits, ``-_.``
+    becomes ``-``, so ``vendor/model:tag`` cannot add a path level."""
+    return "".join(c if c.isalnum() or c in "-_." else "-" for c in str(text))
+
+
+def key_path(key: dict | None) -> str:
+    """The version key as the directory path under the case, the way the
+    writer files it (``evidence_store._key_segments``): setup, judge, then
+    the versions segment, each sanitised; ``unkeyed`` for a record with no
+    key. store.json's ``older`` is keyed by this path, since the listing
+    sees paths and not records; ``key_id`` is the readable form the page
+    shows, and the two differ as soon as a component holds a character the
+    writer rewrites."""
+    if not key:
+        return "unkeyed"
+    versions = f"{key.get('scoring_version') or 'unknown'}-f{key.get('fleet')}-v{key.get('verifiers')}"
+    return "/".join(path_segment(part) for part in (key.get("setup_id") or "unknown-setup", key.get("judge_model") or "unknown-judge", versions))
+
+
 def key_changes(before: dict, after: dict) -> list[str]:
     return [name for name in KEY_COMPONENTS if before.get(name) != after.get(name)]
 
@@ -378,8 +400,9 @@ def read_span(store: dict | None) -> tuple[float | None, int | None, int]:
 
 
 def older_by_case(store: dict | None) -> dict[str, dict[str, int]]:
-    """store.json's ``older`` (``{case: {key: n}}``, what the listing left
-    behind), with only usable counts."""
+    """store.json's ``older`` (``{case directory: {key path: n}}``, what the
+    listing left behind, both as the writer spells them), with only usable
+    counts."""
     raw = store.get("older") if store else None
     if not isinstance(raw, dict):
         return {}
@@ -402,21 +425,27 @@ def trend_document(store: dict | None, data: dict) -> dict:
     key changes or in ``records``."""
     every = usable_records(store)
     drawn_since_ms, window_days, lead_days = read_span(store)
-    older = older_by_case(store)
+    older_paths = older_by_case(store)
     in_window = lambda at: drawn_since_ms is None or (at is not None and at >= drawn_since_ms)
     records = [r for r in every if in_window(at_ms({"at": r["recorded_at"]}))]
     domain_of = nightly.domains(data)
     keys: dict[str, dict] = {}
     by_case: dict[str, list[dict]] = {}
     metrics: set[str] = set()
+    paths: dict[str, str] = {}  # key id -> the directory path the writer files it under
     for record in every:
         keys.setdefault(key_id(record["key"]), key_document(record["key"]))
+        paths.setdefault(key_id(record["key"]), key_path(record["key"]))
         by_case.setdefault(record["case"], []).append(record)
     for record in records:
         metrics.update(judged_of(record))
     cases = {}
     for name in sorted(by_case):
-        points = case_points(by_case[name], older.get(name))
+        # What the listing left behind at each of this case's keys, joined
+        # through the paths the writer files them under.
+        left = older_paths.get(path_segment(name)) or {}
+        older = {kid: left[paths[kid]] for kid in {key_id(r["key"]) for r in by_case[name]} if paths[kid] in left}
+        points = case_points(by_case[name], older)
         drawn = [p for p in points if in_window(at_ms(p))]
         if not drawn:
             continue  # recorded in the lead-in only: outside the page's window

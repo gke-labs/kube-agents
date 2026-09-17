@@ -56,10 +56,12 @@ THE OUTPUT is what ``render.py --store`` reads (SCHEMA.md,
      error, records[]}
 
 ``older`` is what the listing showed and the read left behind, per case
-and version key: objects older than the span plus those the cap trimmed.
-The Trend page reads it to say, of a short trailing window, whether the
-store holds older records at that key that admission pools (``cut``)
-rather than calling it "collecting" on a guess.
+and version key: objects older than the span plus those the cap trimmed,
+keyed by the directories the writer filed them under (the listing sees
+paths, not records). The Trend page maps a record's own key to that path
+the way the writer does and reads it to say, of a short trailing window,
+whether the store holds older records at that key that admission pools
+(``cut``) rather than calling it "collecting" on a guess.
 
 ``records[]`` is every record read, each the JSON object as written plus
 ``object`` (its URL) and ``build`` (the Prow build id from the name; the
@@ -236,16 +238,19 @@ def select_objects(urls: list[str], location: str, *, now_ms: float, window_days
     name's stamp, then the newest ``max_objects`` per case per key
     directory. Returns them sorted, with ``{case: objects the cap left
     out}`` and ``{case: {key: objects left behind at that key}}`` (older
-    than the span, or trimmed by the cap; ``key`` in the record's key-id
-    form, the directory path under the case). A name that is not in the
-    layout is skipped: the store's own reader would refuse it, and the
-    page has nothing to say about it."""
+    than the span, or trimmed by the cap; ``case`` and ``key`` as the
+    directories the writer filed them under, so a component the writer
+    sanitised appears sanitised, ``unkeyed`` is a record without a key,
+    and ``""`` is an object filed directly under its case, the flat layout
+    the gate's reader also groups by directory). A name without a stamp is
+    skipped: the store's own reader would refuse it, and the page has
+    nothing to say about it."""
     since_ms = now_ms - (window_days + lead_days) * 24 * 3600 * 1000
     by_dir: dict[str, list[tuple[str, str]]] = {}
     older: dict[str, dict[str, int]] = {}
 
     def left_behind(key_dir: str, count: int) -> None:
-        case, key = key_dir.split("/", 1)
+        case, _, key = key_dir.partition("/")  # key is "" for the flat layout
         older.setdefault(case, {})[key] = older.get(case, {}).get(key, 0) + count
 
     for url in urls:

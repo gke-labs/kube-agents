@@ -9,6 +9,7 @@ draw. Every asserted time is America/Toronto.
 """
 
 import copy
+import datetime
 import itertools
 import json
 import pathlib
@@ -254,6 +255,35 @@ class LeadInTest(unittest.TestCase):
         young = self.doc["cases"]["young-case"]
         self.assertEqual(young["points"][0]["window"], {"runs": 6, "passes": 6, "lines": 2, "full": False, "cut": False})
         self.assertEqual(young["record"]["state"], "collecting")
+
+    def test_older_is_joined_through_the_writers_path_not_the_records_spelling(self):
+        # The listing sees the sanitised directories the writer filed
+        # (evidence_store._key_segments); the record carries the raw key.
+        # store.py's tally, end to end, then the page's lookup.
+        odd_key = {"setup_id": "s", "scoring_version": "v1", "judge_model": "vertex_ai/gemini-x:tag", "fleet": 1, "verifiers": 1}
+        urls = [f"{LOCATION}/odd-case/s/vertex_ai-gemini-x-tag/v1-f1-v1/2026-05-01T05-00-00Z-1.jsonl",  # the writer files case "odd case" here
+                f"{LOCATION}/odd-case/s/vertex_ai-gemini-x-tag/v1-f1-v1/2026-09-10T05-00-00Z-2.jsonl",
+                f"{LOCATION}/bare-case/unkeyed/2026-05-01T05-00-00Z-3.jsonl",
+                f"{LOCATION}/bare-case/unkeyed/2026-09-10T05-00-00Z-4.jsonl"]
+        now = datetime.datetime(2026, 9, 17, 14, 9, 2, tzinfo=datetime.timezone.utc)
+        chosen, _truncated, older = store.select_objects(urls, LOCATION, now_ms=now.timestamp() * 1000, window_days=10, lead_days=14, max_objects=200)
+        self.assertEqual(len(chosen), 2)
+        self.assertEqual(older, {"odd-case": {"s/vertex_ai-gemini-x-tag/v1-f1-v1": 1}, "bare-case": {"unkeyed": 1}})
+        base = night_one_records()
+
+        def one(case, key):
+            r = copy.deepcopy(base[0])
+            r.update(case=case, key=key, recorded_at="2026-09-10T05:00:00Z", build="21007100000000000000", object=f"{LOCATION}/{case}/x/1.jsonl")
+            return r
+
+        doc = trend.trend_document(store_doc([one("odd case", odd_key), one("bare-case", {})], window_days=10, lead_days=14, older=older), data_with_nightly(DOMAINS))
+        odd = doc["cases"]["odd case"]["points"][0]
+        self.assertEqual(odd["key"], "s/vertex_ai/gemini-x:tag/v1-f1-v1", "the page shows the record's own spelling")
+        self.assertTrue(odd["window"]["cut"], "and finds the older objects under the writer's path")
+        self.assertEqual(doc["cases"]["odd case"]["record"]["state"], "cut")
+        self.assertTrue(doc["cases"]["bare-case"]["points"][0]["window"]["cut"], "a record without a key is filed under unkeyed/")
+        self.assertEqual(trend.key_path({}), "unkeyed")
+        self.assertEqual(trend.key_path(odd_key), "s/vertex_ai-gemini-x-tag/v1-f1-v1")
 
     def test_a_store_without_a_read_time_or_lead_draws_everything(self):
         base = night_one_records()

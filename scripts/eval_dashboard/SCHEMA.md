@@ -716,10 +716,14 @@ judge_model, fleet, verifiers}, runs, passes, blocked?, infra?, judged?}` —
 plus `object` (its URL) and `build` (the Prow build id from the object
 name, `null` when the name carries none). `truncated` says per case how
 many older objects the cap left out, and `older` per case and version key
-(the key-id form, the directory path under the case) how many objects the
-listing showed and the read left behind, older than the span or trimmed
-by the cap, which is how the Trend page tells a short window it cannot
-see the bottom of (`cut`) from one that is genuinely short; `warnings[]` names each line that
+how many objects the listing showed and the read left behind, older than
+the span or trimmed by the cap, which is how the Trend page tells a short
+window it cannot see the bottom of (`cut`) from one that is genuinely
+short. `older`'s case and key are the directories the writer filed them
+under (`evidence_store._key_segments`: each component sanitised, `unkeyed`
+for a record without a key, `""` for an object filed directly under its
+case), not the record's own spelling; `trend.py` maps a record's key to
+that path the same way before the lookup; `warnings[]` names each line that
 would not parse (skipped, never fatal); `error` is set when the read did
 not happen — the listing failed, or the workflow called `--fail-with` for a
 read its `timeout` killed or its wall clock could not fit — and the

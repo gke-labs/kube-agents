@@ -208,6 +208,21 @@ class ReadStoreTest(unittest.TestCase):
         records = store.parse_records(objects[url_of("agent-kanban-smoke")] + objects[url_of("rca-remediation-pr")], [url_of("agent-kanban-smoke"), url_of("rca-remediation-pr")], LOCATION, warnings)
         self.assertEqual([r["object"] for r in records], [url_of("agent-kanban-smoke"), None, url_of("rca-remediation-pr")])
 
+    def test_what_is_left_behind_is_keyed_by_the_writers_directories_and_the_flat_layout_does_not_crash(self):
+        objects = {
+            # A judge spelled with a slash is filed under its sanitised segment.
+            url_of("case-a", "2026-05-01T05-00-00Z-1.jsonl", "s/vertex_ai-gemini-x/v1-f1-v1"): "{}\n",
+            # A record without a key is filed under unkeyed/.
+            url_of("case-a", "2026-05-02T05-00-00Z-2.jsonl", "unkeyed"): "{}\n",
+            # The flat layout: directly under the case (the gate's reader groups by directory, whatever the depth).
+            f"{LOCATION}/case-b/2026-05-03T05-00-00Z-3.jsonl": "{}\n",
+            # One inside the span, so the read has something to read.
+            url_of("case-b", "2026-09-16T05-00-00Z-4.jsonl"): json.dumps({"case": "case-b", "recorded_at": "2026-09-16T05:00:00Z", "key": {}}) + "\n",
+        }
+        doc = read(FakeGsutil(objects), lead_days=0)
+        self.assertEqual(doc["older"], {"case-a": {"s/vertex_ai-gemini-x/v1-f1-v1": 1, "unkeyed": 1}, "case-b": {"": 1}})
+        self.assertEqual([r["case"] for r in doc["records"]], ["case-b"])
+
     def test_an_empty_prefix_is_an_empty_store_and_a_failed_listing_raises(self):
         doc = read(FakeGsutil({}))
         self.assertEqual((doc["listed"], doc["records"], doc["error"]), (0, [], None))
