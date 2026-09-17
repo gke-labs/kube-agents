@@ -142,6 +142,16 @@ branch. It prints exactly one JSON line:
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"],
+  "carried": [
+    {
+      "id": "cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding",
+      "check": "cluster-admin-binding",
+      "cluster": "prod-us-east",
+      "namespace": "",
+      "object": "ClusterRoleBinding/debug-binding",
+      "title": "ClusterRoleBinding debug-binding grants cluster-admin to a non-system subject"
+    }
+  ],
   "context_repos": ["acme/terraform-live"],
   "declared_intent_repos": ["acme/fleet", "acme/terraform-live"],
   "sop": "governance/compliance_audit_sop.md",
@@ -168,6 +178,16 @@ workspace is empty rather than a checkout. Read it rather than guessing from wha
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
+
+`carried` lists every finding the open ledger carries — its id, the check that found it, where it
+is, and its title — read off the ledger body `finish` will compare your document against. **These
+are the findings you are answering for.** For each one, this run ends one of three ways: you report
+it again; you re-ran its check on that cluster, saw it gone, and say so under
+[`resolved_because`](#the-findings-document) with the same `check`, `cluster`, `namespace` and `object`;
+or you did not run that check there and your `checks_run` does not claim you did. A run whose
+`checks_run` says the check ran and whose document neither reports nor explains the finding is
+**held** — see [The clean run](#the-clean-run). Empty when there is no open ledger or its body could
+not be read (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
@@ -265,9 +285,9 @@ findings a clean run was refused its close over (empty on every other outcome; s
 - `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 - `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
-  — zero findings, but the ledger was **not** closed: it carried findings this run's own `checks_run`
-  commands name and the document neither reports nor explains. Not a clean result; report it as
-  [The clean run](#the-clean-run) says.
+  — zero findings, but the ledger was **not** closed: it carried findings whose checks this run's own
+  `checks_run` says ran again, and the document neither reports nor explains them. Not a clean
+  result; report it as [The clean run](#the-clean-run) says.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or gh side effects. It applies the same grouping and the same
@@ -459,8 +479,9 @@ field, and publishes nothing:
   knows the cluster can call an excuse for what it is.
 
 - `resolved_because` is **optional**, and is how a run that found nothing says why a finding the
-  ledger was carrying is gone. One entry per previous finding, carrying the same four identity
-  fields a finding has and a `reason` of at least sixteen characters saying what the command showed:
+  ledger was carrying is gone. One entry per previous finding — take the identity from `start`'s
+  `carried` list — carrying the same four identity fields a finding has and a `reason` of at least
+  sixteen characters saying what the command showed:
 
   ```json
   "resolved_because": [
@@ -913,20 +934,21 @@ see. Without this, a stream that inspected nothing produced no issue, no comment
 notice: four streams did exactly that on 2026-08-03, and the only reason it surfaced is that a fifth
 happened to have a ledger open from the day before.
 
-**Zero findings over a finding the run looked at again is not a clean run either.** Before it
-closes, `finish` reads the previous body. For every finding it carried, if a command in this run's
-`checks_run` on that cluster names the finding's object — `debug-binding` in
-`kubectl get clusterrolebinding debug-binding`, not in a fleet-wide `get clusterrolebindings -A` —
-and the document neither reports the finding again nor carries a `resolved_because` entry for it,
-the run either saw it gone or left it out, and from the document the two are the same absence. The
-ledger stays open and gets a comment naming each such finding and the command that named it, no
-remediation pull request is closed, and `finish` returns `status: "HELD"` with `resolved: 0`,
-`silent_ok: false` and the ids in `unaccounted`. Report it as you would a partial run — the ledger
-URL and the held ids — and on the next run either report the finding or, if you re-ran its check
-and saw the object gone, say so in `resolved_because`. On 2026-09-16 a compliance run closed its
-ledger as clean over a live cluster-admin binding its own `checks_run` claimed to have checked; this
-is the guard that turns that close into a held ledger. It cannot see a padded `checks_run` whose
-commands name nothing in particular — that stays a red line, below.
+**Zero findings over a finding the run checked again is not a clean run either.** Before it
+closes, `finish` reads the previous body — the same findings `start` handed you as `carried`. For
+every finding it carried, if this run's `checks_run` says the check that found it ran on that
+cluster — the SOP's fleet-wide `kubectl get clusterrolebindings -o json | jq …` counts; it lists
+every binding, `debug-binding` included — and the document neither reports the finding again nor
+carries a `resolved_because` entry for it, the run either saw it gone or left it out, and from the
+document the two are the same absence. The ledger stays open and gets a comment naming each such
+finding and the check that ran, no remediation pull request is closed, and `finish` returns
+`status: "HELD"` with `resolved: 0`, `silent_ok: false` and the ids in `unaccounted`. Report it as
+you would a partial run — the ledger URL and the held ids — and on the next run either report the
+finding or, if you re-ran its check and saw the object gone, say so in `resolved_because`. On
+2026-09-16 a compliance run closed its ledger as clean over a live cluster-admin binding its own
+`checks_run` claimed to have checked; this is the guard that turns that close into a held ledger. A
+check declared `checks_not_applicable` on that cluster did not run there and holds nothing — the
+excuse is published in the evidence table, where a reviewer can weigh it.
 
 A clean run is usually not news, and the closed issue is the record — but "clean" alone does not
 decide it. **`finish` decides it, and returns the answer as `silent_ok`.** Read the flag; do not

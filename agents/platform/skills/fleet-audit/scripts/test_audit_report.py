@@ -319,6 +319,26 @@ def ran(check, cluster="prod-us-east"):
     }
 
 
+def resolved_for(previous_body):
+    """A `resolved_because` entry for every finding a previous body carries.
+
+    A clean run over a ledger that carried findings has to account for each
+    one (#1683): the fixture's full-roster `checks_run` says every check ran
+    again, so without these the close is held. Tests about the close itself
+    use this; tests about the hold build the silence on purpose.
+    """
+    return [
+        {
+            "check": fid.split(".", 1)[0],
+            "cluster": where["cluster"],
+            "namespace": where["namespace"],
+            "object": where["object"],
+            "reason": "Re-ran the check on this cluster; the object is gone from the listing.",
+        }
+        for fid, where in audit_report.parse_finding_locations(previous_body).items()
+    ]
+
+
 def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
     if clusters is None:
         clusters = [
@@ -2887,7 +2907,9 @@ class TestPublishedBodies(HarnessTestCase):
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": previous_body}),
         }
-        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
 
         comments = self.harness.bodies_for("issue", "comment")
         self.assertEqual(len(comments), 1)
@@ -2997,7 +3019,9 @@ class TestFinishClean(HarnessTestCase):
             "--json body": json.dumps({"body": previous_body}),
         }
 
-        rc = self.run_finish(make_doc(findings=[]))
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc)
         self.assertEqual(rc, 0)
 
         self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
@@ -3186,6 +3210,26 @@ def naming_doc(findings=None, command=NAMING_COMMAND, **kwargs):
     return doc
 
 
+def without_held_check(**kwargs):
+    """A clean document whose prod-us-east did not run `cluster-admin-binding`.
+
+    Declared not applicable there rather than left out, so coverage stays
+    complete and the clean path is the one exercised, not the gap.
+    """
+    doc = make_doc(findings=[], **kwargs)
+    for cluster in doc["scope"]["clusters"]:
+        if cluster["name"] != "prod-us-east":
+            continue
+        cluster["checks_run"] = [e for e in cluster["checks_run"] if e["check"] != HELD_CHECK]
+        cluster["checks_not_applicable"] = [
+            {
+                "check": HELD_CHECK,
+                "reason": "GKE Autopilot: user ClusterRoleBindings to cluster-admin are rejected by admission.",
+            }
+        ]
+    return doc
+
+
 def resolved_entry(**overrides):
     entry = {
         "check": HELD_CHECK,
@@ -3201,7 +3245,7 @@ def resolved_entry(**overrides):
 
 
 class TestUnaccountedJoin(unittest.TestCase):
-    """The pure half of the held close: reading the body and matching a command."""
+    """The pure half of the held close: reading the body and joining on the check."""
 
     def test_locations_are_read_back_off_the_body(self):
         body = published_body(
@@ -3225,47 +3269,31 @@ class TestUnaccountedJoin(unittest.TestCase):
         self.assertEqual(audit_report.parse_finding_locations(""), {})
         self.assertEqual(audit_report.parse_finding_locations(None), {})
 
-    def test_a_name_is_matched_as_a_whole_token(self):
-        cases = [
-            ("kubectl get clusterrolebinding debug-binding -o yaml", True),
-            ("kubectl get clusterrolebinding/debug-binding -o yaml", True),
-            ("kubectl describe clusterrolebinding DEBUG-BINDING", True),
-            ("kubectl get clusterrolebindings -A -o json", False),
-            ("kubectl get clusterrolebinding debug-binding-v2", False),
-            ("kubectl get clusterrolebinding old.debug-binding", False),
-            ("kubectl get clusterrolebinding debug_binding", False),
-            ("", False),
-        ]
-        for command, expected in cases:
-            with self.subTest(command=command):
-                self.assertEqual(
-                    audit_report.command_names_object(command, HELD_OBJECT), expected
-                )
-        self.assertFalse(audit_report.command_names_object(NAMING_COMMAND, ""))
-        self.assertFalse(audit_report.command_names_object(NAMING_COMMAND, "Kind/"))
-
-    def test_a_namespace_is_a_name_too(self):
-        # `Namespace/payments` is named by `-n payments`, and not by a
-        # workload whose name merely starts with it.
-        self.assertTrue(
-            audit_report.command_names_object(
-                "kubectl get networkpolicy -n payments", "Namespace/payments"
-            )
-        )
-        self.assertFalse(
-            audit_report.command_names_object(
-                "kubectl get deploy payments-api -n shop", "Namespace/payments"
-            )
-        )
-
-    def test_the_join_holds_only_what_was_named_and_left_unexplained(self):
+    def test_the_join_holds_what_was_checked_again_and_left_unexplained(self):
         body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
 
-        held = audit_report.unaccounted_previous_findings(body, naming_doc())
+        # The SOP's own fleet-wide listing counts as having checked the
+        # binding: the join is on the check, not on the command naming the
+        # object (compliance_audit_sop.md's command for this check is
+        # `kubectl get clusterrolebindings -o json | jq …`, which names none).
+        listing = make_doc(findings=[])
+        held = audit_report.unaccounted_previous_findings(body, listing)
         self.assertEqual([entry["id"] for entry in held], [held_id()])
         self.assertEqual(held[0]["object"], HELD_OBJECT)
         self.assertEqual(held[0]["check"], HELD_CHECK)
-        self.assertEqual(held[0]["named_by"], [(HELD_CHECK, NAMING_COMMAND)])
+        self.assertEqual(
+            held[0]["commands"],
+            [
+                entry["command"]
+                for cluster in listing["scope"]["clusters"]
+                if cluster["name"] == "prod-us-east"
+                for entry in cluster["checks_run"]
+                if entry["check"] == HELD_CHECK
+            ],
+        )
+        # A targeted command holds the same way.
+        held = audit_report.unaccounted_previous_findings(body, naming_doc())
+        self.assertEqual(held[0]["commands"], [NAMING_COMMAND])
 
         # Reported again: not held.
         self.assertEqual(
@@ -3278,9 +3306,10 @@ class TestUnaccountedJoin(unittest.TestCase):
         explained = naming_doc()
         explained["resolved_because"] = [resolved_entry()]
         self.assertEqual(audit_report.unaccounted_previous_findings(body, explained), [])
-        # Not named by any command: not held — the harness cannot say it was seen.
+        # The check did not run on that cluster this run: not held — the
+        # harness cannot say the run looked.
         self.assertEqual(
-            audit_report.unaccounted_previous_findings(body, make_doc(findings=[])), []
+            audit_report.unaccounted_previous_findings(body, without_held_check()), []
         )
         # The cluster was not read this run: not held.
         elsewhere = naming_doc(
@@ -3290,18 +3319,19 @@ class TestUnaccountedJoin(unittest.TestCase):
         # No body to join against: nothing held.
         self.assertEqual(audit_report.unaccounted_previous_findings(None, naming_doc()), [])
 
-    def test_the_name_is_matched_on_the_previous_cluster_only(self):
-        # The command that names the binding runs on stage-eu; the finding was
-        # on prod-us-east. A different cluster's command says nothing about it.
+    def test_the_check_must_have_run_on_the_previous_cluster(self):
+        # The check ran on stage-eu only; the finding was on prod-us-east. A
+        # different cluster's check says nothing about it.
         body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
-        doc = make_doc(findings=[])
-        for cluster in doc["scope"]["clusters"]:
-            if cluster["name"] == "stage-eu":
-                for entry in cluster["checks_run"]:
-                    if entry["check"] == HELD_CHECK:
-                        entry["command"] = NAMING_COMMAND.replace(
-                            "prod-us-east", "stage-eu"
-                        )
+        doc = without_held_check()
+        self.assertTrue(
+            any(
+                entry["check"] == HELD_CHECK
+                for cluster in doc["scope"]["clusters"]
+                if cluster["name"] == "stage-eu"
+                for entry in cluster["checks_run"]
+            )
+        )
         self.assertEqual(audit_report.unaccounted_previous_findings(body, doc), [])
 
 
@@ -3378,8 +3408,8 @@ class TestHeldClose(HarnessTestCase):
     Rep 2 of the 2026-09-16 nightly closed evals-6 ledger #29 with "0 findings
     across 4 audited cluster(s)" while the planted binding was live. From the
     document alone the harness cannot tell a fixed finding from an omitted
-    one, so when the previous body named an object and this run's own command
-    names it too, the run is asked to say which (#1683).
+    one, so when the previous body carried a finding and this run says the
+    same check ran on that cluster again, the run is asked to say which (#1683).
     """
 
     def previous_ledger(self, *findings):
@@ -3391,9 +3421,11 @@ class TestHeldClose(HarnessTestCase):
             "--json body": json.dumps({"body": body}),
         }
 
-    def test_the_close_is_refused_when_a_command_names_the_object(self):
+    def test_the_close_is_refused_when_the_check_ran_on_that_cluster_again(self):
         self.previous_ledger()
-        self.assertEqual(self.run_finish(naming_doc()), 0)
+        # The fixture's default `checks_run` is the SOP's fleet-wide listing,
+        # which is exactly what rep 2 of 2026-09-16 would have written.
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
 
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         comments = self.harness.bodies_for("issue", "comment")
@@ -3405,8 +3437,9 @@ class TestHeldClose(HarnessTestCase):
         self.assertIn("debug-binding grants cluster-admin", comment)
         self.assertIn(f"`{HELD_OBJECT}`", comment)
         self.assertIn("_cluster-scoped_", comment)
-        self.assertIn(NAMING_COMMAND, comment)
+        self.assertIn(f"`{HELD_CHECK}` ran there as", comment)
         self.assertIn("resolved_because", comment)
+        self.assertIn("`carried`", comment)
         # The evidence table travels with the refusal too.
         self.assertIn("How this run checked the fleet", comment)
 
@@ -3452,11 +3485,12 @@ class TestHeldClose(HarnessTestCase):
         self.assertFalse(payload["silent_ok"])
         self.assertEqual(payload["unaccounted"], [])
 
-    def test_a_command_that_does_not_name_the_object_still_closes(self):
-        # The fixture's fleet-wide listing names the check, not the binding.
-        # The harness cannot say the run saw the object, so it does not hold.
+    def test_a_check_that_did_not_run_on_that_cluster_holds_nothing(self):
+        # Declared not applicable on prod-us-east: the run did not look, so
+        # the harness cannot say it saw the finding gone or left it out. The
+        # excuse is published in the evidence table for a reviewer to weigh.
         self.previous_ledger()
-        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.run_finish(without_held_check()), 0)
         self.assertTrue(self.harness.matching("issue", "close", "42"))
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
@@ -3495,6 +3529,9 @@ class TestHeldClose(HarnessTestCase):
         self.assertEqual(len(answers), 1)
         self.assertNotIn("closing as completed", answers[0])
         self.assertIn("stays open", answers[0])
+        # The held reason, not the coverage one: this run read the whole fleet.
+        self.assertIn("did not account for", answers[0])
+        self.assertNotIn("could not see the whole fleet", answers[0])
 
     def test_a_finding_that_stays_on_the_ledger_carries_the_field_empty(self):
         self.previous_ledger()
@@ -3544,6 +3581,7 @@ class TestStart(HarnessTestCase):
                 "workspace": str(self.workspace),
                 "findings_path": str(self.tmp_path / "findings_compliance-audit.json"),
                 "pending_remediation_requests": [],
+                "carried": [],
                 "context_repos": [],
                 "declared_intent_repos": ["acme/fleet"],
                 "sop": "governance/compliance_audit_sop.md",
@@ -3562,6 +3600,46 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+
+    def test_start_hands_over_the_findings_the_ledger_carries(self):
+        # The worker cannot write `resolved_because` for a finding it was
+        # never told about; `start` is the one place it is told.
+        body = published_body(
+            make_doc(findings=[held_finding(), make_finding(fid="a")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": body}),
+        }
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        carried = json.loads(self.out.strip())["carried"]
+        self.assertEqual([entry["id"] for entry in carried], sorted([held_id(), derived_id(fid="a")]))
+        held = next(entry for entry in carried if entry["id"] == held_id())
+        self.assertEqual(
+            held,
+            {
+                "id": held_id(),
+                "check": HELD_CHECK,
+                "title": "debug-binding grants cluster-admin to a default service account",
+                "cluster": "prod-us-east",
+                "namespace": "",
+                "object": HELD_OBJECT,
+            },
+        )
+        # And the entry is what `resolved_because` takes, minus the reason.
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = [
+            {k: v for k, v in held.items() if k in ("check", "cluster", "namespace", "object")}
+            | {"reason": "kubectl get clusterrolebinding debug-binding: NotFound."}
+        ]
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_an_unreadable_body_hands_over_nothing_and_says_so(self):
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json body": 1}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(self.out.strip())["carried"], [])
+        self.assertIn("could not read issue #42", self.err)
 
     def test_start_hands_over_the_roster(self):
         """Coverage must not depend on how far into the SOP the worker read.

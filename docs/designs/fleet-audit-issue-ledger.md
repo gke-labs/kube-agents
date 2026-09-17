@@ -55,12 +55,12 @@ One open GitHub issue per audit stream, rewritten in place on every run.
 - A clean run closes the issue **as completed** and closes any remediation PRs still open for that
   stream. Its closing comment carries the run's `checks_run` evidence table, since the body is not
   rewritten on a clean run, and the close is refused — `status: "HELD"`, ledger left open with a
-  comment — when the previous body carried a finding whose object this run's own `checks_run`
-  commands name and the document neither reports it nor explains it under `resolved_because`
-  (#1683).
+  comment — when the previous body carried a finding whose check this run's own `checks_run` says
+  ran again on that cluster and the document neither reports it nor explains it under
+  `resolved_because` (#1683). `start` hands the worker the carried findings so it can.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
-  `resolved == 0`, no coverage gap, and no remediation PR opened or closed. If any of those fails
+  `resolved == 0`, no coverage gap, no held close, and no remediation PR opened or closed. If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
   could not read the whole fleet is never silent even when both counters are zero, because "I found
@@ -440,10 +440,11 @@ branch.
 5. Clean run → answer every unanswered `/remediate` on the ledger, then close the ledger issue as
    completed, close every open remediation PR for the stream, print `CLEAN`. **Unless the run is
    partial**, in which case the status is still `CLEAN` but the issue stays open with a comment
-   naming the gaps and no PR is retired. **And unless the previous body carried a finding this
-   run's `checks_run` commands name by object** and the document neither reports nor lists under
-   `resolved_because` — then the status is `HELD`, the issue stays open with a comment naming each
-   such finding and the command that named it, no PR is retired, and `resolved` is `0` (#1683).
+   naming the gaps and no PR is retired. **And unless the previous body carried a finding whose
+   check this run's `checks_run` says ran again on that cluster** and the document neither reports
+   nor lists under `resolved_because` — then the status is `HELD`, the issue stays open with a
+   comment naming each such finding and the check that ran, no PR is retired, and `resolved` is `0`
+   (#1683).
 
    The answers come **before** the close, and that ordering is the whole of the rule. "Every
    `/remediate` gets exactly one answer" cannot have the clean run as its exception: this is the one
@@ -483,11 +484,12 @@ runs — otherwise the ledger reads its own replies back on the next run and ans
 
 Exit contract — eleven keys, always all eleven:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0,"postures_withheld":[]}`
-- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[]}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
+- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[],"unaccounted":[]}`
 
 `postures_withheld` is the ids of the posture findings `finish` took out of the document because it
 recorded no complete declared-intent search (§7.4); empty on every other run.
@@ -862,7 +864,8 @@ applies correctly most of the time is a rule the harness should be applying.
 
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
 moved nothing an operator needs to hear about — nothing new, nothing resolved, no coverage gap, no
-remediation PR opened or closed — and it is computed from the numbers `finish` is about to _report_,
+held close, no remediation PR opened or closed — and it is computed from the numbers `finish` is
+about to _report_,
 not the ones it privately knows. A partial run reports `resolved: 0`; an unreadable previous body
 makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
 and the report can never disagree. The PR counters are in the conjunction because opening a fix is
