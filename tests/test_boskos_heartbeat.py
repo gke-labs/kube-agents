@@ -4,8 +4,9 @@ Behavioural, not timing-based: every assertion waits for a condition with a
 generous deadline instead of demanding N beats in T seconds, so a loaded or
 slow machine cannot fail a healthy daemon. What is pinned: beats carry the
 right identity and keep coming; stdout stays quiet while the detail log
-records; a 401 is reported once per transition and does not stop the loop;
-beats resume after a hang; missing env disables the daemon with one line.
+records; a 401 is reported once per transition and does not stop the loop,
+and the stop summary then carries one WARNING naming the lost lease; beats
+resume after a hang; missing env disables the daemon with one line.
 """
 
 import os
@@ -138,6 +139,7 @@ class BoskosHeartbeatTest(unittest.TestCase):
         # Job-log channel: start line and stop summary only.
         lines = [ln for ln in stdout.splitlines() if ln.strip()]
         self.assertLessEqual(len(lines), 3, f"stdout flooded:\n{stdout}")
+        self.assertNotIn("WARNING", stdout, "a healthy lease must not warn")
         detail = wait_until(lambda: self.beat_log.read_text().splitlines())
         self.assertGreaterEqual(len(detail), 3)
         self.assertTrue(any(" ok http=200" in ln for ln in detail), detail)
@@ -150,6 +152,15 @@ class BoskosHeartbeatTest(unittest.TestCase):
         failed_lines = [ln for ln in stdout.splitlines() if "FAILED" in ln]
         self.assertEqual(len(failed_lines), 1, stdout)
         self.assertIn("http=401", failed_lines[0])
+        # The stop summary is the end-of-run signal that the project was not
+        # handed back (the wrapper's release swallows its own 401): exactly
+        # one WARNING line, naming the resource, on the job log.
+        warnings = [ln for ln in stdout.splitlines() if "WARNING" in ln]
+        self.assertEqual(len(warnings), 1, stdout)
+        self.assertIn(LEASE_NAME, warnings[0])
+        self.assertIn("401", warnings[0])
+        self.assertLess(stdout.index(warnings[0]), stdout.index("stopping for"),
+                        "the WARNING precedes the stop summary line")
 
     def test_beats_resume_after_a_hang(self):
         # The production question is only "does a beat land after the hang,

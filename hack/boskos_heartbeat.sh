@@ -46,11 +46,24 @@ UPDATE_URL="${BOSKOS_HOST}/update?name=${BOSKOS_RESOURCE_NAME}&owner=${BOSKOS_OW
 
 beats_sent=0
 beats_failed=0
+# Beats Boskos answered 401: ranch's OwnerNotMatch, i.e. the lease is no
+# longer this job's. Counted apart from other failures because it is the one
+# outcome the stop summary must shout about (see summary below).
+beats_401=0
 # "" until the first beat resolves, then ok|fail; transitions are the only
 # per-beat events worth a line on the job log.
 last_status=""
 
 summary() {
+  # One loud line when the lease was lost under this daemon. The Prow
+  # wrapper's release that follows will get the same 401 and its `|| true`
+  # swallows it, so this is the end-of-run signal that the project was not
+  # handed back: the first full nightly (build 2100374258805903360,
+  # 2026-09-17) lost kube-agents-evals-6 that way when the wrapper's
+  # boskosctl heartbeat hit its default 5h --timeout (#1491).
+  if [ "${beats_401}" -gt 0 ]; then
+    echo "${LOG_PREFIX} WARNING: lease on ${BOSKOS_RESOURCE_NAME} is lost (Boskos answered 401 owner-mismatch on ${beats_401} of ${beats_sent} beats); the release will fail the same way and ${BOSKOS_RESOURCE_NAME} stays leased until Boskos's reaper frees it"
+  fi
   echo "${LOG_PREFIX} stopping for ${BOSKOS_RESOURCE_NAME}: ${beats_sent} beats sent, ${beats_failed} failed (detail: ${BOSKOS_HEARTBEAT_LOG})"
   exit 0
 }
@@ -73,6 +86,7 @@ while true; do
   else
     status="fail"
     beats_failed=$((beats_failed + 1))
+    [ "${http_code}" = "401" ] && beats_401=$((beats_401 + 1))
   fi
   echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ${status} http=${http_code}" >>"${BOSKOS_HEARTBEAT_LOG}"
   if [ "${status}" != "${last_status}" ]; then

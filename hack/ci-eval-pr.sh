@@ -652,6 +652,11 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
+  # First, before anything slow: the eval-lifetime Boskos heartbeat started
+  # below the traps must be gone before the wrapper releases the lease, or
+  # it beats a freed resource and Boskos 401s every beat (the same orphan
+  # the wrapper's own cleanup() guards against). Unset outside Prow.
+  kill "${EVAL_HEARTBEAT_PID:-}" 2>/dev/null || true
   collect_bench_results
   profile_report "${exit_code}"
   (exit "${exit_code}")
@@ -666,6 +671,35 @@ trap profile_and_dump_on_exit EXIT
 # own; converting it to an exit is what lets the artifact collection above
 # fire on a deadline kill.
 trap 'exit 143' TERM INT
+
+# ─── Boskos lease heartbeat for the eval's own lifetime ──────────────────────
+# The Prow wrapper's `boskosctl heartbeat` covers this step, but boskosctl
+# stops beating after its default --timeout of 5h ("reached timeout,
+# stopping heartbeats", exit 0, so the wrapper's abort fallback never fires)
+# and the wrapper sets no --timeout. Boskos's ~5m reaper then clears the
+# lease's owner, and every later /update and the final release answer 401
+# OwnerNotMatch: the first full nightly (build 2100374258805903360,
+# 2026-09-17) lost kube-agents-evals-6 that way at 05:01Z of a run that ended
+# 05:57Z and could not hand the project back (#1491). A presubmit that
+# outlives 5h under a quota storm (#1214) is exposed the same way.
+#
+# The daemon ci-teardown.sh already runs beats here for exactly this script's
+# lifetime -- it has no timeout -- so the lease stays fresh however long the
+# fan-out takes; profile_and_dump_on_exit kills it first thing, so it is gone
+# before the wrapper's release. Same endpoint and owner convention as the
+# wrapper (BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}", oss-test-infra
+# prow/prowjobs/gke-labs/kube-agents/*.yaml); outside Prow nothing is derived
+# and the daemon disables itself with one line. `disown` is load-bearing: the
+# fan-out below sizes its lanes with `jobs -rp`, and a daemon left in the job
+# table would take one of them for the whole run (and be waited on).
+if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
+  export BOSKOS_HOST="${BOSKOS_HOST:-http://boskos.boskos.svc.cluster.local}"
+  export BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"
+  export BOSKOS_OWNER_NAME="${BOSKOS_OWNER_NAME:-${JOB_NAME}-${BUILD_ID}}"
+fi
+"${SCRIPT_DIR}/boskos_heartbeat.sh" &
+EVAL_HEARTBEAT_PID=$!
+disown "${EVAL_HEARTBEAT_PID}"
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
