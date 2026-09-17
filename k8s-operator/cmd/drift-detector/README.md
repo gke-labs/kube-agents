@@ -349,6 +349,17 @@ acked, while a delete or a foreign-cluster record is unaffected, since both are 
 context is consulted. Adding retries, a second `GET`, or a per-record backoff means re-checking
 that arithmetic.
 
+For the budget to be the bound, it has to be the only one, and client-go supplies a second by
+default: a `rest.Config` that leaves `QPS` unset gets 5 requests a second with a burst of 10, and
+every lookup waits on that token bucket before it touches the network. Against a batch of 100
+human writes that is eighteen seconds of the thirty spent queueing on the client, and the
+`--batch-join-budget 4s` above would stop enriching after about thirty records — while reporting
+them as lookup failures, because a budget that runs out mid-throttle surfaces as a plain context
+deadline, indistinguishable from a slow control plane. `cluster.go` therefore sets both to
+`--max-messages`' own ceiling, so a full batch is issued without the client ever waiting. Raising
+that ceiling raises the throttle with it; leaving them out of step puts part of the budget back out
+of reach.
+
 The flag's own validation cannot do that re-checking for you: it is bounded by a fixed ceiling of
 5m — half Pub/Sub's 600-second maximum deadline — not by whatever this subscription is set to, so
 `--batch-join-budget 120s` is accepted against a stock 60-second install. What closes the gap is one

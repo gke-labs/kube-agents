@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/rest"
 )
 
 // kubeconfigYAML is a minimal, well-formed kubeconfig. It points at an address
@@ -104,6 +106,52 @@ func TestNewObjectGetterInClusterOutsideACluster(t *testing.T) {
 	// the point: --in-cluster set outside a Pod must fail loudly at startup.
 	if _, err := newObjectGetter("", true); err == nil {
 		t.Skip("running inside a cluster, so there is no failure to assert on")
+	}
+}
+
+func TestJoinRESTConfigLiftsTheClientSideThrottle(t *testing.T) {
+	cfg, err := joinRESTConfig(writeKubeconfig(t, kubeconfigYAML), false)
+	if err != nil {
+		t.Fatalf("joinRESTConfig returned error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("cfg = nil, want a config built from the kubeconfig")
+	}
+
+	// Zero is the failure this pins, not a neutral starting point: client-go
+	// substitutes DefaultQPS and DefaultBurst for a config that leaves these
+	// unset, so a rate limiter no line of this package asked for starts making
+	// the eleventh lookup in a batch wait. Asserting against the defaults says
+	// which value is wrong and why.
+	if cfg.QPS == 0 || cfg.QPS == rest.DefaultQPS {
+		t.Errorf("cfg.QPS = %v, want the join's own limit rather than client-go's %v", cfg.QPS, rest.DefaultQPS)
+	}
+	if cfg.Burst == 0 || cfg.Burst == rest.DefaultBurst {
+		t.Errorf("cfg.Burst = %d, want the join's own limit rather than client-go's %d", cfg.Burst, rest.DefaultBurst)
+	}
+
+	// The batch is the unit the budget covers, so the throttle has to clear a
+	// whole maximum batch to leave --batch-join-budget as the only bound. A
+	// limit below the ceiling would make some part of the budget unspendable on
+	// the cluster, which is the defect this guards -- including the version of
+	// it where someone raises --max-messages' ceiling and leaves these behind.
+	if cfg.QPS < maxMessagesCeiling {
+		t.Errorf("cfg.QPS = %v, want at least maxMessagesCeiling (%d) so a full batch never waits on the client", cfg.QPS, maxMessagesCeiling)
+	}
+	if cfg.Burst < maxMessagesCeiling {
+		t.Errorf("cfg.Burst = %d, want at least maxMessagesCeiling (%d) so a full batch never waits on the client", cfg.Burst, maxMessagesCeiling)
+	}
+}
+
+func TestJoinRESTConfigWithNoCredentials(t *testing.T) {
+	// Nil and no error, which is what makes newObjectGetter's no-credentials
+	// mode reachable: it returns on this before it can dereference the config.
+	cfg, err := joinRESTConfig("", false)
+	if err != nil {
+		t.Fatalf("joinRESTConfig returned error: %v", err)
+	}
+	if cfg != nil {
+		t.Errorf("cfg = %v, want nil when neither credential source is configured", cfg)
 	}
 }
 

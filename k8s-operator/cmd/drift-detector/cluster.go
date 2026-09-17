@@ -49,6 +49,35 @@ const (
 	gkeContextPrefix    = "gke"
 	gkeContextSeparator = "_"
 	gkeContextFields    = 4
+
+	// joinClientQPS and joinClientBurst lift client-go's client-side throttle
+	// out of the way of --batch-join-budget, which is meant to be the only
+	// bound on a batch's lookups.
+	//
+	// A rest.Config with QPS left at zero does not mean "unlimited": client-go
+	// substitutes DefaultQPS=5 and DefaultBurst=10 (rest/config.go), and every
+	// request then waits on that token bucket in Request.tryThrottle before any
+	// network I/O. The join issues one GET per forwarded record, sequentially,
+	// inside one budget shared by the whole batch, so the eleventh human record
+	// in a batch waits 200ms, the hundredth waits eighteen seconds, and none of
+	// that is the cluster being slow. It is also invisible once it bites: a
+	// budget that expires while throttled surfaces as a bare "context deadline
+	// exceeded", because client-go deliberately does not wrap context errors,
+	// which is exactly what a slow control plane looks like.
+	//
+	// Sized to maxMessagesCeiling rather than to a number that seemed large
+	// enough, so the relationship is the point: a batch cannot hold more records
+	// than the pull API will return, so a whole maximum batch is issued without
+	// the throttle ever waiting, and it cannot become the binding constraint
+	// before the budget does. Raising the ceiling raises this with it. The cap
+	// stays finite rather than being disabled with QPS=-1, so a future change
+	// that makes these lookups concurrent still meets a client-side limit.
+	//
+	// Concurrency is not what this protects against today: the loop is
+	// sequential, one request in flight, each bounded by joinRequestTimeout and
+	// all of them by the budget.
+	joinClientQPS   float32 = maxMessagesCeiling
+	joinClientBurst         = maxMessagesCeiling
 )
 
 // newObjectGetter builds a live-object reader for one directly reachable
@@ -76,6 +105,26 @@ const (
 // without cluster credentials is a supported mode: it is how the binary has run
 // since T1, and the join degrades to a count rather than refusing to start.
 func newObjectGetter(kubeconfig string, inCluster bool) (objectGetter, error) {
+	cfg, err := joinRESTConfig(kubeconfig, inCluster)
+	if err != nil || cfg == nil {
+		return nil, err
+	}
+
+	client, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("dynamic client: %w", err)
+	}
+	return dynamicGetter{client: client}, nil
+}
+
+// joinRESTConfig builds the client configuration the join's lookups go out on,
+// or nil when neither credential source is configured.
+//
+// Split out of newObjectGetter so the throttle settings can be asserted without
+// a cluster: dynamic.NewForConfig copies the config into a client and gives no
+// way back to it, so a test that can only see the getter cannot tell a config
+// carrying joinClientQPS from one left at client-go's default.
+func joinRESTConfig(kubeconfig string, inCluster bool) (*rest.Config, error) {
 	var (
 		cfg *rest.Config
 		err error
@@ -96,11 +145,9 @@ func newObjectGetter(kubeconfig string, inCluster bool) (objectGetter, error) {
 		return nil, nil
 	}
 
-	client, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("dynamic client: %w", err)
-	}
-	return dynamicGetter{client: client}, nil
+	cfg.QPS = joinClientQPS
+	cfg.Burst = joinClientBurst
+	return cfg, nil
 }
 
 // verifyClusterIdentity checks the declared cluster identity against the one
