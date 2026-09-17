@@ -1649,6 +1649,54 @@ class GitHardeningTest(unittest.TestCase):
         self.assertIn("to protected branch 'release-trunk' is refused", v_sub or "")
         executor.require_git_lease = True
 
+        # Alias expansion whose head is a case-variant of a builtin canonicalizes to lowercase
+        # and undergoes push violation and lease checks (#1498, Thread 13)
+        self.append_repository_config(
+            repo_alias,
+            "\n[alias]\n\tp = Push origin HEAD:main\n\tpush = push\n",
+        )
+        violation, _ = executor.resolve_git_command(["git", "p"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("to protected branch 'main' is refused", violation or "")
+
+        # Direct uppercase variant is rejected as not a recognized git subcommand (#1498)
+        violation, _ = executor.resolve_git_command(["git", "Push", "origin", "HEAD:main"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("not a recognized git subcommand or alias", violation or "")
+
+        # lfs is not a git builtin and falls back to alias inspection (#1498, Thread 14)
+        self.append_repository_config(
+            repo_alias,
+            "\n[alias]\n\tlfs = push origin HEAD:main\n",
+        )
+        violation, _ = executor.resolve_git_command(["git", "lfs"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("to protected branch 'main' is refused", violation or "")
+
+        # Unaliased non-builtin lfs fails closed as unrecognized subcommand
+        repo_no_lfs = self.repository(executor, name="repo_no_lfs")
+        violation, _ = executor.resolve_git_command(["git", "lfs"], cwd=str(repo_no_lfs))
+        self.assertIsNotNone(violation)
+        self.assertIn("not a recognized git subcommand or alias", violation or "")
+
+        # Bounded file reads: oversized refs/remotes/<remote>/HEAD or .git files are skipped (#1498, Thread 15)
+        oversized_head = repo_alias / ".git" / "refs" / "remotes" / "origin" / "HEAD"
+        oversized_head.parent.mkdir(parents=True, exist_ok=True)
+        oversized_head.write_text("ref: refs/remotes/origin/main\n" + "x" * 8192, encoding="utf-8")
+        from credential_proxy import _detect_repo_default_branch, _find_repo_root
+        self.assertIsNone(_detect_repo_default_branch(repo_alias, "origin"))
+
+        # Valid small HEAD ref is detected
+        oversized_head.write_text("ref: refs/remotes/origin/release-trunk\n", encoding="utf-8")
+        self.assertEqual(_detect_repo_default_branch(repo_alias, "origin"), "release-trunk")
+
+        # Oversized .git file is skipped by _find_repo_root
+        fake_sub = repo_alias / "subproject"
+        fake_sub.mkdir()
+        fake_git = fake_sub / ".git"
+        fake_git.write_text("gitdir: ../.git\n" + "y" * 8192, encoding="utf-8")
+        self.assertEqual(_find_repo_root(fake_sub), repo_alias)
+
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
         # `_execute` refuses a cwd outside the shared workspace and the lease
         # gate resolves cwd plus every `-C`, but neither looks at `--git-dir`.

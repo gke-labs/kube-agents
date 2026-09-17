@@ -888,6 +888,27 @@ class RepositoryVerbTest(unittest.TestCase):
             self.assertEqual(caught.exception.status, 409)
             self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
 
+    def test_publish_refuses_hardcoded_protected_branches_and_ref_prefixes(self):
+        # VcsBroker.publish refuses main, master, production and refs/heads/ prefixes (#1498, Thread 12)
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "feature")
+        self.commit_in(work, "README.md", "direct to protected\n", "bypass")
+        bundle_b64 = self.bundle_of(work, "feature", answer["revision"])
+        for branch_name in ("master", "production", "refs/heads/main", "refs/heads/master"):
+            with self.subTest(branch=branch_name):
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.broker.publish(
+                        {
+                            "repository": "local.test/acme/infra",
+                            "branch": branch_name,
+                            "target": "main",
+                            "baseRevision": answer["revision"],
+                            "bundleBase64": bundle_b64,
+                        }
+                    )
+                self.assertEqual(caught.exception.status, 409)
+                self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
     def test_publish_refuses_the_branch_the_client_says_it_cloned(self):
         # A non-default branch cloned and published under another target is
         # what the default-branch check cannot see; the client names the

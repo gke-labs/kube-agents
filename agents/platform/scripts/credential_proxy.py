@@ -2123,8 +2123,9 @@ def _detect_repo_default_branch(repo_dir: Path | None, remote: str = "origin") -
             repo_root / "refs" / "remotes" / rem / "HEAD",
         ):
             try:
-                if head_candidate.is_file():
-                    text = head_candidate.read_text(encoding="utf-8").strip()
+                if head_candidate.is_file() and head_candidate.stat().st_size <= 4096:
+                    with open(head_candidate, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read(4096).strip()
                     prefix = f"ref: refs/remotes/{rem}/"
                     if text.startswith(prefix):
                         branch = text[len(prefix):].strip()
@@ -2162,7 +2163,7 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
         if arg.startswith("-"):
             idx += 1
             continue
-        if arg == "push":
+        if arg.lower() == "push":
             push_idx = idx
         break
 
@@ -2422,7 +2423,6 @@ GIT_BUILTIN_SUBCOMMANDS = (
             "hook",
             "init",
             "interpret-trailers",
-            "lfs",
             "log",
             "ls-files",
             "ls-remote",
@@ -2479,9 +2479,11 @@ def _find_repo_root(cwd: Path | str | None) -> Path | None:
             return cur
         elif candidate_git.is_file():
             try:
-                line = candidate_git.read_text(encoding="utf-8").strip()
-                if line.startswith("gitdir:"):
-                    return cur
+                if candidate_git.stat().st_size <= 4096:
+                    with open(candidate_git, "r", encoding="utf-8", errors="replace") as f:
+                        line = f.read(4096).strip()
+                    if line.startswith("gitdir:"):
+                        return cur
             except Exception:
                 pass
         elif cur.name == ".git" and (cur / "config").is_file():
@@ -2536,6 +2538,8 @@ def _read_repo_alias(
     MAX_ALIAS_DEPTH = 10
     for _ in range(MAX_ALIAS_DEPTH):
         if current_name in GIT_BUILTIN_SUBCOMMANDS:
+            if accumulated_tokens:
+                accumulated_tokens[0] = current_name
             break
         if current_name in visited:
             return ["!cycle"]
@@ -2558,6 +2562,8 @@ def _read_repo_alias(
             # subcommand name that is not a git builtin: fail closed (#1498).
             if accumulated_tokens and current_name not in GIT_BUILTIN_SUBCOMMANDS:
                 return ["!undefined_alias", current_name]
+            if accumulated_tokens and current_name in GIT_BUILTIN_SUBCOMMANDS:
+                accumulated_tokens[0] = current_name
             break
         elif proc.returncode != 0:
             # Fatal error, syntax error, excessive include depth: fail closed!
@@ -3315,6 +3321,11 @@ class CommandExecutor:
             if push_violation is not None:
                 return push_violation, argv
             subcommand, _ = _git_plan(expanded_argv)
+            if subcommand and subcommand not in GIT_BUILTIN_SUBCOMMANDS:
+                return (
+                    f"`git {subcommand}` is not a recognized git subcommand.",
+                    argv,
+                )
             execution_argv = expanded_argv
         else:
             if subcommand and subcommand not in GIT_BUILTIN_SUBCOMMANDS:
