@@ -2095,23 +2095,11 @@ def git_push_violation(argv: list[str]) -> str | None:
     if "push" not in argv[1:]:
         return None
 
-    subcommand, _ = _git_plan(argv)
-    if subcommand != "push":
-        # Check if an unrecognized global option consumed the slot before `push`.
-        # If the detected subcommand is a known non-push git verb, this is not a push.
-        non_push_verbs = {
-            "add", "am", "archive", "bisect", "branch", "bundle", "cat-file",
-            "check-ref-format", "checkout", "cherry-pick", "clean", "clone",
-            "commit", "describe", "diff", "fetch", "format-patch", "gc", "grep",
-            "init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "mv",
-            "notes", "pull", "range-diff", "rebase", "remote", "reset", "restore",
-            "revert", "rm", "shortlog", "show", "stash", "status", "submodule",
-            "switch", "tag", "worktree",
-        }
-        if subcommand in non_push_verbs:
-            return None
+    push_idx = argv[1:].index("push") + 1
+    # If '--' appears before 'push', 'push' is a pathspec or positional arg, not a command.
+    if "--" in argv[1:push_idx]:
+        return None
 
-    push_idx = argv.index("push")
     push_args = argv[push_idx + 1:]
 
     protected = {"main", "master", "production"}

@@ -1111,6 +1111,7 @@ class GitHardeningTest(unittest.TestCase):
             ["git", "push", "origin", "HEAD:heads/main"],
             ["git", "push", "--force-with-lease", "origin", "main"],
             ["git", "--attr-source", "HEAD", "push", "origin", "main"],
+            ["git", "--attr-source", "commit", "push", "origin", "main"],
             # Refspec-less pushes
             ["git", "push"],
             ["git", "push", "origin"],
@@ -1160,6 +1161,14 @@ class GitHardeningTest(unittest.TestCase):
         )
         self.assertIsNone(
             git_argument_violation(["git", "push", "--force-with-lease", "origin", "HEAD:platform-agent/my-fix"])
+        )
+
+        # Positional pathspecs named 'push' after '--' are not treated as push subcommands
+        self.assertIsNone(
+            git_argument_violation(["git", "checkout", "--", "push"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "blame", "--", "push"])
         )
 
     def test_a_subcommand_that_runs_a_command_is_refused(self):

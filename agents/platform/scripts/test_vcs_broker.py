@@ -850,12 +850,43 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
 
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
-            self.assertEqual(self.broker.base_branch, "")
-            broker_with_env = vcs_broker.VcsBroker(
-                self.scratch, git_runner=self.broker._git_runner, base_branch="custom-broker-base"
+        broker_with_env = vcs_broker.VcsBroker(
+            self.scratch, git_runner=self.broker._git_runner, base_branch="custom-broker-base"
+        )
+        broker_with_env.registry.hosts["local.test"] = self.forge
+        self.assertEqual(broker_with_env.base_branch, "custom-broker-base")
+        git(work, "checkout", "--quiet", "-b", "custom-broker-base")
+        self.commit_in(work, "README.md", "direct to custom base\n", "bypass-custom")
+        with self.assertRaises(WorkspaceError) as caught:
+            broker_with_env.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "custom-broker-base",
+                    "target": "main",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "custom-broker-base", answer["revision"]),
+                }
             )
-            self.assertEqual(broker_with_env.base_branch, "custom-broker-base")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
+        # Refusal via environment variable override (including refs/heads/ prefix normalization)
+        git(work, "checkout", "--quiet", "-b", "env-broker-base")
+        self.commit_in(work, "README.md", "direct to env base\n", "bypass-env")
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "refs/heads/env-broker-base"}):
+            self.assertEqual(self.broker.base_branch, "")
+            with self.assertRaises(WorkspaceError) as caught:
+                self.broker.publish(
+                    {
+                        "repository": "local.test/acme/infra",
+                        "branch": "env-broker-base",
+                        "target": "main",
+                        "baseRevision": answer["revision"],
+                        "bundleBase64": self.bundle_of(work, "env-broker-base", answer["revision"]),
+                    }
+                )
+            self.assertEqual(caught.exception.status, 409)
+            self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
 
     def test_publish_refuses_the_branch_the_client_says_it_cloned(self):
         # A non-default branch cloned and published under another target is

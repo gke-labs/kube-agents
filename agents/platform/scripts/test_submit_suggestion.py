@@ -1107,6 +1107,15 @@ class TestContentMode(SubmitSuggestionTestCase):
         self.assertNotIn("commit", self.verbs)
         self.assertNotIn("push", self.verbs)
 
+        # Test without --base flag, relying on GITOPS_BASE_BRANCH fallback in open_handle/check_branch
+        self.verbs.clear()
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": release_base}):
+            with self.assertRaises(ValueError) as ctx:
+                self.submit_content(prepared, source)
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+            self.assertNotIn("commit", self.verbs)
+            self.assertNotIn("push", self.verbs)
+
         # Submitting to a run branch is refused by check_branch before reaching the broker (#1498)
         run_base = "run/test-cluster/b-0011"
         prepared["branch"] = run_base
