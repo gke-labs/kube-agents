@@ -177,16 +177,17 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 // worker has no identity to present because session pods are spawned without
 // one; sys is a human; gateway could move today but its client program lands
 // separately from this render, so moving the identity first would refuse it at
-// connect on every install; and seed is applied rather than rendered, so
-// dropping its user would break an object already running on installs today. A
-// sixth name here means someone added a principal without asking whether it
-// could have an identity.
+// connect on every install; seed is applied rather than rendered, so dropping
+// its user would break an object already running on installs today; and eval
+// is the bench harness outside the cluster, over a port-forward, with no
+// ServiceAccount here to present. A seventh name here means someone added a
+// principal without asking whether it could have an identity.
 func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	var got []string
 	for _, id := range staticIdentities(identityTestAgent()) {
 		got = append(got, id.user)
 	}
-	want := []string{"gateway", "worker", "seed", "web", "sys"}
+	want := []string{"gateway", "worker", "seed", "web", "eval", "sys"}
 	if !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
 	}

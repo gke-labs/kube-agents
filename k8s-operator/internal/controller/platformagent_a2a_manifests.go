@@ -215,6 +215,7 @@ const (
 	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+	a2aEvalPasswordKey    = "eval-password"    // #nosec G101 -- Secret key name, not a credential
 
 	// a2aCredsSecretSuffix is appended to the NATS object name.
 	a2aCredsSecretSuffix = "-creds"
@@ -355,10 +356,12 @@ func randomA2APassword() (string, error) {
 // auth callout they hold no shared secret at all, which is the point. The
 // gateway and seed keys survive so an install that predates the callout keeps a
 // valid Secret shape through the upgrade, and so the hand-applied seed tooling
-// still has a credential.
+// still has a credential. The eval key is the bench harness's own principal
+// (evalIdentity): an existing Secret gains it on the first reconcile after an
+// upgrade, which is how the repair loop below is meant to be used.
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aWorkerPasswordKey, a2aSeedPasswordKey,
-	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+	a2aWebPasswordKey, a2aEvalPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 }
 
 // a2aProvisionedStreams is every JetStream stream the provision Job creates, and

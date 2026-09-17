@@ -62,6 +62,7 @@ func a2aTestCreds() *corev1.Secret {
 			"worker-password":  []byte("pw-worker"),
 			"seed-password":    []byte("pw-seed"),
 			"web-password":     []byte("pw-web"),
+			"eval-password":    []byte("pw-eval"),
 			"sys-password":     []byte("pw-sys"),
 			"callout-password": []byte("pw-callout"),
 		},
@@ -235,7 +236,10 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		"session": nil,
 		"seed":    nil,
 		"web":     nil,
-		"sys":     nil,
+		// eval takes a core subscription and never creates a consumer, so
+		// there is nothing for it to ack.
+		"eval": nil,
+		"sys":  nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -3368,6 +3372,12 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
 			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"},
 		},
+		// eval reaches no stream and no account-level discovery: the bench
+		// harness's diagnostic transport publishes on platform's in subject
+		// and takes a core subscription on its events, so a JetStream grant
+		// of any kind would be capability it does not use (and
+		// CONSUMER.CREATE on TASKS would read every addressee's task plane).
+		"eval": {},
 		"session": {
 			// sessionIdentity lists nothing: the callout derives each
 			// connection's grants from the attested pod, and a grant

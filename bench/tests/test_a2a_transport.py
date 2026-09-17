@@ -1,6 +1,6 @@
-"""The a2a transport: envelopes, the fold, and the harness's mapping of an
-exchange onto the run record -- with the bus itself replaced by a fake, since
-no nats-server runs in CI.
+"""The a2a transport: envelopes, the fold, the session against a stubbed NATS
+connection, and the harness's mapping of an exchange onto the run record with
+the bus client replaced by a fake, since no nats-server runs in CI.
 
 ``test_harness.py`` covers the api transport and stays untouched: selecting
 ``AGENT_TRANSPORT=a2a`` must leave every one of those paths as they were.
@@ -8,11 +8,12 @@ no nats-server runs in CI.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from typing import Any, ClassVar
 
 import pytest
-
 from kube_agents_bench import a2a_transport as a2a
 from kube_agents_bench import harness, scoring
 from kube_agents_bench.cases import load_case
@@ -32,9 +33,14 @@ _ANSWER = "payments-api in seeded-debug is OOMKilled at its 64Mi limit."
 def test_subjects_follow_the_0_4_layout() -> None:
     assert a2a.task_in_subject("platform", "task-1") == "a2a.tasks.platform.task-1.in"
     assert a2a.task_events_subject("platform", "task-1") == "a2a.tasks.platform.task-1.events"
-    assert (
-        a2a.task_supervisor_subject("platform", "task-1") == "a2a.tasks.platform.task-1.supervisor"
-    )
+
+
+def test_the_principal_is_eval_not_gateway() -> None:
+    """The one credential that may publish on every addressee's in subject
+    stays with the gateway; the harness has its own."""
+    assert a2a.NATS_USER == "eval"
+    assert a2a.INBOX_PREFIX == "_INBOX.eval"
+    assert harness._A2A_CREDS_KEY == "eval-password"
 
 
 def test_minted_ids_have_the_gateway_shape() -> None:
@@ -66,9 +72,10 @@ def test_the_submission_envelope_matches_the_spec() -> None:
     assert env["contextId"] == ids.context_id
     assert env["correlationId"] == ids.correlation_id
     assert env["to"] == {"session": _ADDRESSEE}
-    # Reserved: a client never populates identity; authority is the gateway's.
+    # Reserved: a client never populates identity. authority is the gateway's
+    # advisory block; this transport leaves it null rather than invent a shape.
     assert env["identity"] is None
-    assert env["authority"] is None
+    assert "authority" in env and env["authority"] is None
     # from must not name the addressee, or the in-subject agreement check
     # refuses the envelope as an executor writing its own in subject.
     assert env["from"]["session"] != _ADDRESSEE
@@ -87,6 +94,7 @@ def test_a_cancel_carries_the_empty_object() -> None:
     assert env["kind"] == "cancel"
     assert env["payload"] == {}
     assert env["taskId"] == ids.task_id
+    assert env["authority"] is None
 
 
 # --------------------------------------------------------------------------
@@ -244,17 +252,242 @@ def test_fold_keeps_progress_text_on_its_entry() -> None:
 
 
 # --------------------------------------------------------------------------
-# The harness on the a2a transport, with the bus faked
+# The session, against a stubbed NATS connection
 # --------------------------------------------------------------------------
 
 
-class _FakeBus:
-    """Stands in for ``a2a.BusTask``: scripted events, outcomes and failures.
+class _StubSub:
+    def __init__(self, stub: _StubConn, subject: str, cb: Any) -> None:
+        self.stub, self.subject, self.cb = stub, subject, cb
 
-    ``script`` is consumed one entry per exchange. An entry is either a list of
-    events (folded, outcome terminal unless ``outcome`` overrides it) or an
-    exception to raise. The harness constructs one instance per task, so the
-    class-level script is what a test programs.
+    async def unsubscribe(self) -> None:
+        self.stub.log.append(("unsubscribe", self.subject))
+
+
+class _StubMsg:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+
+class _StubConn:
+    """What ``_Session`` asks of ``nats.connect``'s return: subscribe, publish,
+    flush, close, and ``is_closed``. Records the order of everything, and
+    delivers scripted events to a subscription when it is flushed for the
+    first time after a publish -- the executor's answer to the submission."""
+
+    def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
+        self.log: list[tuple[Any, ...]] = []
+        self.subs: dict[str, _StubSub] = {}
+        self.events = events or []
+        self.is_closed = False
+        self.close_after_publish = False
+        self.refuse_publish = False
+
+    async def subscribe(self, subject: str, cb: Any) -> _StubSub:
+        self.log.append(("subscribe", subject))
+        sub = _StubSub(self, subject, cb)
+        self.subs[subject] = sub
+        return sub
+
+    async def publish(self, subject: str, data: bytes, headers: dict[str, str]) -> None:
+        env = json.loads(data)
+        self.log.append(("publish", subject, env["kind"], headers))
+        if env["kind"] == "message":
+            self._pending = env["taskId"]
+
+    async def flush(self, timeout: float) -> None:
+        self.log.append(("flush",))
+        task_id = getattr(self, "_pending", None)
+        if task_id is None:
+            return
+        self._pending = None
+        if self.close_after_publish:
+            self.is_closed = True
+            return
+        sub = self.subs.get(a2a.task_events_subject(_ADDRESSEE, task_id))
+        for raw in self.events:
+            env = {**raw, "taskId": task_id, "payload": {**raw["payload"], "taskId": task_id}}
+            await sub.cb(_StubMsg(json.dumps(env).encode()))
+
+    async def close(self) -> None:
+        self.log.append(("close",))
+        self.is_closed = True
+
+
+def _session_with(stub: _StubConn) -> a2a._Session:
+    session = a2a._Session(url="nats://stub", password="pw", addressee=_ADDRESSEE, user="eval")
+    session.nc = stub
+    return session
+
+
+def test_submit_subscribes_before_it_publishes_and_folds_the_terminal() -> None:
+    stub = _StubConn(_lifecycle("t"))
+    ids = a2a.mint_ids()
+
+    async def run() -> a2a.Exchange:
+        session = _session_with(stub)
+        await session.watch(ids.task_id)
+        await session.submit(ids, _PROMPT)
+        return await session.await_terminal(
+            ids.task_id, accept_timeout=5, deadline=time.monotonic() + 5
+        )
+
+    exchange = asyncio.run(run())
+    assert exchange.outcome == a2a.OUTCOME_TERMINAL
+    assert exchange.fold.artifact_text("result") == _ANSWER
+    kinds = [entry[0] for entry in stub.log]
+    assert kinds.index("subscribe") < kinds.index("publish")
+    (sub_entry,) = [e for e in stub.log if e[0] == "subscribe"]
+    assert sub_entry[1] == a2a.task_events_subject(_ADDRESSEE, ids.task_id)
+    (pub_entry,) = [e for e in stub.log if e[0] == "publish"]
+    assert pub_entry[1] == a2a.task_in_subject(_ADDRESSEE, ids.task_id)
+    assert pub_entry[2] == "message"
+    assert pub_entry[3]["Nats-Msg-Id"].startswith("env-")
+
+
+def test_awaiting_a_task_id_needs_no_submission() -> None:
+    """The await is a function of a task id: a task somebody else started, or
+    a child a parent's events name, is awaited by the same code."""
+    stub = _StubConn()
+    other = "task-someone-elses"
+
+    async def run() -> a2a.Exchange:
+        session = _session_with(stub)
+
+        async def executor() -> None:
+            await asyncio.sleep(0.05)
+            sub = stub.subs[a2a.task_events_subject(_ADDRESSEE, other)]
+            for env in _lifecycle(other, "done elsewhere"):
+                await sub.cb(_StubMsg(json.dumps(env).encode()))
+
+        asyncio.get_running_loop().create_task(executor())
+        return await session.await_terminal(other, accept_timeout=5, deadline=time.monotonic() + 5)
+
+    exchange = asyncio.run(run())
+    assert exchange.fold.task_id == other
+    assert exchange.fold.state == "completed"
+    assert exchange.fold.artifact_text("result") == "done elsewhere"
+    assert not any(e[0] == "publish" for e in stub.log)
+
+
+def test_a_wait_that_ends_on_a_bound_publishes_a_cancel() -> None:
+    stub = _StubConn(events=[])
+    client = a2a.BusClient(url="nats://stub", password="pw", addressee=_ADDRESSEE)
+    ids = a2a.mint_ids()
+
+    async def _open(self: a2a._Session) -> None:
+        self.nc = stub
+
+    original = a2a._Session.open
+    a2a._Session.open = _open  # type: ignore[method-assign]
+    try:
+        exchange = client.submit_and_await(
+            ids, _PROMPT, accept_timeout=0.05, deadline=time.monotonic() + 5
+        )
+    finally:
+        a2a._Session.open = original  # type: ignore[method-assign]
+
+    assert exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED
+    publishes = [(e[1], e[2]) for e in stub.log if e[0] == "publish"]
+    in_subject = a2a.task_in_subject(_ADDRESSEE, ids.task_id)
+    assert publishes == [(in_subject, "message"), (in_subject, "cancel")]
+    assert stub.log[-1] == ("close",)
+
+
+def test_abandoned_tasks_are_cancelled_before_the_new_submission() -> None:
+    stub = _StubConn(_lifecycle("t"))
+    client = a2a.BusClient(url="nats://stub", password="pw", addressee=_ADDRESSEE)
+    stale = a2a.mint_ids()
+    ids = a2a.mint_ids()
+
+    async def _open(self: a2a._Session) -> None:
+        self.nc = stub
+
+    original = a2a._Session.open
+    a2a._Session.open = _open  # type: ignore[method-assign]
+    try:
+        client.submit_and_await(
+            ids, _PROMPT, accept_timeout=5, deadline=time.monotonic() + 5, cancel_first=(stale,)
+        )
+    finally:
+        a2a._Session.open = original  # type: ignore[method-assign]
+
+    publishes = [(e[1], e[2]) for e in stub.log if e[0] == "publish"]
+    assert publishes[0] == (a2a.task_in_subject(_ADDRESSEE, stale.task_id), "cancel")
+    assert publishes[1] == (a2a.task_in_subject(_ADDRESSEE, ids.task_id), "message")
+
+
+def test_a_connection_that_closes_after_the_submission_says_so() -> None:
+    """No replay on a core subscription: the attempt is over, and the harness
+    owes the task a cancel on its next attempt."""
+    stub = _StubConn(_lifecycle("t"))
+    stub.close_after_publish = True
+    client = a2a.BusClient(url="nats://stub", password="pw", addressee=_ADDRESSEE)
+
+    async def _open(self: a2a._Session) -> None:
+        self.nc = stub
+
+    original = a2a._Session.open
+    a2a._Session.open = _open  # type: ignore[method-assign]
+    try:
+        with pytest.raises(a2a.BusUnavailable) as info:
+            client.submit_and_await(
+                a2a.mint_ids(), _PROMPT, accept_timeout=5, deadline=time.monotonic() + 5
+            )
+    finally:
+        a2a._Session.open = original  # type: ignore[method-assign]
+    assert info.value.retryable
+    assert info.value.submitted
+    assert "closed while awaiting" in str(info.value)
+
+
+def test_a_permissions_violation_is_not_retried() -> None:
+    """The principal's grants do not cover the subject: no tunnel fixes that."""
+    stub = _StubConn()
+
+    async def refusing_flush(timeout: float) -> None:
+        session.server_errors.append(
+            # The server's own casing, as nats-py relays it.
+            'nats: permissions violation for publish to "a2a.tasks.cluster-x.task-1.in"'
+        )
+
+    stub.flush = refusing_flush  # type: ignore[method-assign]
+    session = _session_with(stub)
+    ids = a2a.mint_ids()
+    with pytest.raises(a2a.BusUnavailable) as info:
+        asyncio.run(session.submit(ids, _PROMPT))
+    assert not info.value.retryable
+    assert "refused for 'eval'" in str(info.value)
+
+
+# --------------------------------------------------------------------------
+# The harness on the a2a transport, with the bus client faked
+# --------------------------------------------------------------------------
+
+
+class _Call:
+    def __init__(
+        self,
+        ids: a2a.TaskIds,
+        prompt: str,
+        accept_timeout: float,
+        deadline: float,
+        cancel_first: tuple[a2a.TaskIds, ...],
+    ) -> None:
+        self.ids = ids
+        self.prompt = prompt
+        self.accept_timeout = accept_timeout
+        self.deadline = deadline
+        self.cancel_first = cancel_first
+
+
+class _FakeBus:
+    """Stands in for ``a2a.BusClient``: scripted events, outcomes and failures.
+
+    ``script`` is consumed one entry per ``submit_and_await``. An entry is
+    either a list of events (folded, outcome terminal unless ``outcome``
+    overrides it) or an exception to raise. The harness constructs one client
+    per run, so the class-level script is what a test programs.
     """
 
     script: ClassVar[list[Any]] = []
@@ -262,35 +495,34 @@ class _FakeBus:
     instances: ClassVar[list[_FakeBus]] = []
 
     def __init__(
-        self,
-        *,
-        url: str,
-        password: str,
-        addressee: str,
-        ids: a2a.TaskIds,
-        prompt: str,
-        user: str = a2a.NATS_USER,
+        self, *, url: str, password: str, addressee: str, user: str = a2a.NATS_USER
     ) -> None:
         self.url = url
         self.password = password
         self.addressee = addressee
-        self.ids = ids
-        self.prompt = prompt
         self.user = user
-        self.attempts: list[tuple[float, float]] = []
+        self.calls: list[_Call] = []
         _FakeBus.instances.append(self)
 
-    def exchange(self, *, accept_timeout: float, deadline: float) -> a2a.Exchange:
-        self.attempts.append((accept_timeout, deadline))
-        step = _FakeBus.script.pop(0) if _FakeBus.script else _lifecycle(self.ids.task_id)
+    def submit_and_await(
+        self,
+        ids: a2a.TaskIds,
+        prompt: str,
+        *,
+        accept_timeout: float,
+        deadline: float,
+        cancel_first: tuple[a2a.TaskIds, ...] = (),
+    ) -> a2a.Exchange:
+        self.calls.append(_Call(ids, prompt, accept_timeout, deadline, tuple(cancel_first)))
+        step = _FakeBus.script.pop(0) if _FakeBus.script else _lifecycle(ids.task_id)
         if isinstance(step, BaseException):
             raise step
-        fold = a2a.Fold(self.ids.task_id)
+        fold = a2a.Fold(ids.task_id)
         events = []
         for raw in step:
             env = dict(raw)
-            env["taskId"] = self.ids.task_id
-            env["payload"] = {**env["payload"], "taskId": self.ids.task_id}
+            env["taskId"] = ids.task_id
+            env["payload"] = {**env["payload"], "taskId": ids.task_id}
             fold.apply(env)
             events.append(env)
         return a2a.Exchange(fold=fold, outcome=_FakeBus.outcome, events=events)
@@ -301,7 +533,7 @@ def fake_bus(monkeypatch: pytest.MonkeyPatch):
     _FakeBus.script = []
     _FakeBus.outcome = a2a.OUTCOME_TERMINAL
     _FakeBus.instances = []
-    monkeypatch.setattr(harness.a2a, "BusTask", _FakeBus)
+    monkeypatch.setattr(harness.a2a, "BusClient", _FakeBus)
     monkeypatch.setenv("AGENT_TRANSPORT", "a2a")
     # No cluster in the test: the URL and password overrides skip the
     # port-forward and the Secret read, which is also what a developer with a
@@ -324,16 +556,20 @@ def test_a_completed_task_is_the_answer(fake_bus) -> None:
     assert result.metadata["terminal_state"] == "completed"
     assert result.metadata["status_history"] == ["submitted", "working", "completed"]
     assert result.metadata["artifacts"] == ["result"]
+    assert result.metadata["abandoned_tasks"] == []
     # No usage on the bus: every bucket null, and the record says why.
     assert all(v is None for v in result.tokens.values())
     assert "no token usage" in result.metadata["tokens_note"]
-    # The bus half saw exactly the prompt, addressed to the default executor.
-    (task,) = fake_bus.instances
-    assert task.prompt == _PROMPT
-    assert task.addressee == "platform"
-    assert task.user == "gateway"
-    assert task.url == "nats://127.0.0.1:1"
-    assert result.metadata["task_id"] == task.ids.task_id
+    # The bus half saw exactly the prompt, addressed to the default executor,
+    # as the eval principal.
+    (client,) = fake_bus.instances
+    (call,) = client.calls
+    assert call.prompt == _PROMPT
+    assert client.addressee == "platform"
+    assert client.user == "eval"
+    assert client.password == "test-password"
+    assert client.url == "nats://127.0.0.1:1"
+    assert result.metadata["task_id"] == call.ids.task_id
 
 
 def test_the_transcript_is_stashed_for_the_verifiers(fake_bus) -> None:
@@ -418,28 +654,40 @@ def test_an_unreachable_bus_is_retried_through_a_fresh_tunnel_then_infrastructur
     monkeypatch.setattr(harness, "_reset_port_forward", lambda *a, **k: resets.append(k))
     fake_bus.script = [
         a2a.BusUnavailable("connect refused"),
-        a2a.BusUnavailable("connect refused"),
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
         a2a.BusUnavailable("connect refused"),
     ]
     result = KubeAgentsHarness().run(_PROMPT)
 
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "connect refused" in result.errors[0]
-    (task,) = fake_bus.instances
-    assert len(task.attempts) == harness._MAX_TRANSPORT_FAILURES
+    (client,) = fake_bus.instances
+    assert len(client.calls) == harness._MAX_TRANSPORT_FAILURES
+    # Every attempt is a new task: no replay for the eval principal.
+    assert len({c.ids.task_id for c in client.calls}) == harness._MAX_TRANSPORT_FAILURES
+    # Only the attempt whose submission was taken owes a cancel, and the next
+    # attempt publishes it before its own submission.
+    assert client.calls[1].cancel_first == ()
+    assert client.calls[2].cancel_first == (client.calls[1].ids,)
     # The respawn targets the NATS Service on its client port, not the agent.
     assert len(resets) == harness._MAX_TRANSPORT_FAILURES - 1
     assert all(r == {"service": "platform-agent-a2a-nats", "remote_port": 4222} for r in resets)
-    assert task.url == "nats://127.0.0.1:24999"
+    assert client.url == "nats://127.0.0.1:24999"
 
 
 def test_a_bus_that_comes_back_on_retry_reaches_the_answer(fake_bus) -> None:
-    fake_bus.script = [a2a.BusUnavailable("connection stayed down"), _lifecycle("t")]
+    fake_bus.script = [
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+        _lifecycle("t"),
+    ]
     result = KubeAgentsHarness().run(_PROMPT)
 
     assert not result.has_errors()
     assert result.output == _ANSWER
-    assert len(fake_bus.instances[0].attempts) == 2
+    first, second = fake_bus.instances[0].calls
+    assert second.ids.task_id != first.ids.task_id
+    assert result.metadata["task_id"] == second.ids.task_id
+    assert result.metadata["abandoned_tasks"] == [first.ids.task_id]
 
 
 def test_a_refused_credential_is_not_retried(fake_bus) -> None:
@@ -447,7 +695,7 @@ def test_a_refused_credential_is_not_retried(fake_bus) -> None:
     result = KubeAgentsHarness().run(_PROMPT)
 
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert len(fake_bus.instances[0].attempts) == 1
+    assert len(fake_bus.instances[0].calls) == 1
 
 
 def test_a_missing_credential_is_infrastructure(fake_bus, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -472,9 +720,9 @@ def test_the_deadline_is_the_http_timeout(fake_bus, monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("AGENT_A2A_ACCEPT_TIMEOUT", "7")
     before = time.monotonic()
     KubeAgentsHarness().run(_PROMPT)
-    ((accept_timeout, deadline),) = fake_bus.instances[0].attempts
-    assert accept_timeout == 7
-    assert before + 41 < deadline <= before + 43
+    (call,) = fake_bus.instances[0].calls
+    assert call.accept_timeout == 7
+    assert before + 41 < call.deadline <= before + 43
 
 
 def test_an_unknown_transport_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -484,14 +732,14 @@ def test_an_unknown_transport_is_refused(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "AGENT_TRANSPORT" in result.errors[0]
 
 
-def test_the_delegation_seam_settles_at_once_without_card_ids(
+def test_the_delegation_wait_settles_at_once_without_card_ids(
     fake_bus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No activity artifact, no card ids: the wait finds nothing outstanding.
 
-    The seam is wired (a status turn would be a follow-up task on the same
-    context) but has nothing to do until an executor publishes its tool
-    trace; the run must not sleep a poll interval or exec into the pod.
+    The poll is the harness's (a status turn would be a follow-up task on
+    the same context) and has nothing to do until an executor publishes its
+    tool trace; the run must not sleep a poll interval or exec into the pod.
     """
     monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "30")
@@ -505,7 +753,7 @@ def test_the_delegation_seam_settles_at_once_without_card_ids(
     assert not result.has_errors()
     assert result.output == _ANSWER
     assert time.monotonic() - started < 5
-    assert len(fake_bus.instances) == 1
+    assert len(fake_bus.instances[0].calls) == 1
     assert shells == []
     assert result.metadata["worker_commands"] is None
 
@@ -513,7 +761,7 @@ def test_the_delegation_seam_settles_at_once_without_card_ids(
 def test_a_status_turn_is_a_follow_up_task_on_the_same_context(
     fake_bus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With a card id in the activity trace, the wait polls over the bus."""
+    """With a card id in the activity trace, the harness polls over the bus."""
     monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
@@ -562,7 +810,7 @@ def test_a_status_turn_is_a_follow_up_task_on_the_same_context(
     result = KubeAgentsHarness().run(_PROMPT)
 
     assert not result.has_errors(), result.errors
-    first, follow = fake_bus.instances
+    first, follow = fake_bus.instances[0].calls
     assert follow.ids.context_id == first.ids.context_id
     assert follow.ids.correlation_id == first.ids.correlation_id
     assert follow.ids.task_id != first.ids.task_id
@@ -608,7 +856,7 @@ def test_the_nats_forward_names_the_service_and_client_port(
     ]
 
 
-def test_the_credential_comes_from_the_creds_secret(
+def test_the_credential_is_the_eval_key_of_the_creds_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import base64
@@ -631,7 +879,8 @@ def test_the_credential_comes_from_the_creds_secret(
     (cmd,) = calls
     assert cmd[:4] == ["kubectl", "get", "secret", "platform-agent-a2a-nats-creds"]
     assert "-n" in cmd and "kubeagents-system" in cmd and "--context" in cmd and "ctx" in cmd
-    assert cmd[-1] == "jsonpath={.data.gateway-password}"
+    assert cmd[-1] == "jsonpath={.data.eval-password}"
+    assert "gateway" not in " ".join(cmd)
 
 
 def test_a_missing_creds_secret_names_itself(monkeypatch: pytest.MonkeyPatch) -> None:

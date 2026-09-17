@@ -48,25 +48,33 @@ Environment:
     AGENT_DELEGATION_POLL_INTERVAL: Seconds between status turns (default ``30``).
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
-    AGENT_TRANSPORT: ``api`` (default; everything above) or ``a2a``, which
-        hands the prompt to the agent over the A2A bus instead -- one
-        ``message`` envelope on ``a2a.tasks.{addressee}.{taskId}.in`` and the
-        task's events folded until the terminal one, the way the gateway
-        drives a customer conversation under ``spec.mode: next``
-        (:mod:`kube_agents_bench.a2a_transport`). Same harness, same
-        ``AgentResult``, same transcript stash for the verifiers. The a2a path
-        reads ``AGENT_NAMESPACE``, ``AGENT_CLUSTER_CONTEXT``,
+    AGENT_TRANSPORT: ``api`` (default; everything above) or ``a2a``, the
+        diagnostic transport: the prompt goes onto the A2A bus directly as
+        one ``message`` envelope on ``a2a.tasks.{addressee}.{taskId}.in`` and
+        the task's events are folded until the terminal one
+        (:mod:`kube_agents_bench.a2a_transport`). It proves the bus and the
+        executor and skips the gateway, which is why it is a diagnostic: the
+        next-mode transport the evals run on is the gateway's inject adapter,
+        which keeps the only credential that may publish on every addressee's
+        ``in`` subject. This one connects as the operator's ``eval``
+        principal -- publish on ``platform``'s ``in``, subscribe on
+        ``platform``'s ``events``, nothing else -- and never the gateway's,
+        and every envelope it publishes carries ``authority: null``: that
+        block is the gateway's to populate and its shape is advisory, so the
+        harness asserts nothing there rather than invent one. Same harness,
+        same ``AgentResult``, same transcript stash for the verifiers. The
+        a2a path reads ``AGENT_NAMESPACE``, ``AGENT_CLUSTER_CONTEXT``,
         ``AGENT_HTTP_TIMEOUT`` (as the whole task's deadline), the delegation
         variables, and:
     AGENT_A2A_ADDRESSEE: The executor the task is addressed to (default
-        ``platform``).
+        ``platform``, the only addressee the ``eval`` grants reach).
     AGENT_A2A_LOCAL_PORT: Local side of the port-forward to the NATS Service
         (default ``24222``). The remote side is always the client port 4222.
     AGENT_A2A_NATS_SERVICE: The NATS Service to port-forward to (default
         ``<AGENT_SERVICE_NAME>-a2a-nats``); the credentials Secret is
-        ``<service>-creds`` in ``AGENT_NAMESPACE``, key ``gateway-password``.
+        ``<service>-creds`` in ``AGENT_NAMESPACE``, key ``eval-password``.
     AGENT_A2A_NATS_URL: A bus URL to use instead of spawning a port-forward.
-    AGENT_A2A_NATS_PASSWORD: The ``gateway`` user's password, instead of
+    AGENT_A2A_NATS_PASSWORD: The ``eval`` principal's password, instead of
         reading the Secret.
     AGENT_A2A_ACCEPT_TIMEOUT: Seconds a submitted task may wait for its first
         event before the run is classified as infrastructure -- no executor
@@ -134,11 +142,13 @@ _TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_A2A})
 
 # The a2a transport's port-forward target: the operator's NATS Service, named
 # ``<cr>-a2a-nats`` and listening for clients on 4222; its credentials Secret
-# is ``<service>-creds``. The local side defaults away from 4222 so a bus a
-# developer already runs on the loopback is not mistaken for the tunnel.
+# is ``<service>-creds``, and the one key read from it is the ``eval``
+# principal's -- the harness's own identity on the bus, never the gateway's.
+# The local side defaults away from 4222 so a bus a developer already runs on
+# the loopback is not mistaken for the tunnel.
 _A2A_NATS_SERVICE_SUFFIX = "-a2a-nats"
 _A2A_CREDS_SECRET_SUFFIX = "-creds"
-_A2A_CREDS_KEY = "gateway-password"
+_A2A_CREDS_KEY = "eval-password"
 _A2A_NATS_CLIENT_PORT = 4222
 _A2A_DEFAULT_LOCAL_PORT = 24222
 # How long a submitted task may sit with no event at all before the run is
@@ -872,7 +882,12 @@ def _infra_failure(detail: str) -> AgentResult:
 
 
 def _a2a_password(nats_service: str) -> str:
-    """The bus password for the ``gateway`` user, from the env or the Secret.
+    """The ``eval`` principal's bus password, from the env or the Secret.
+
+    Only that key is ever read. The same Secret holds the gateway's password,
+    and the gateway's grants are the ones that reach every addressee; a
+    harness holding them would be a second requester the bus could not tell
+    from the first.
 
     Raises:
         RuntimeError: The Secret could not be read or carries no such key --
@@ -1161,17 +1176,25 @@ class KubeAgentsHarness(AgentHarness):
     def _execute_a2a(self, prompt: str) -> AgentResult:
         """The a2a transport: submit the prompt on the bus and fold the reply.
 
-        Mirrors ``_execute``'s retry classes. The tunnel to the NATS Service
-        gets the same bounded establishment retry; an exchange that never
-        reaches the bus (connect refused, credential refused, no ``TASKS``
-        stream, an unacknowledged publish, a connection that stays down) is
-        retried through a fresh tunnel up to :data:`_MAX_TRANSPORT_FAILURES`
-        times and then classified as infrastructure; a task no executor
-        accepted inside ``AGENT_A2A_ACCEPT_TIMEOUT`` is infrastructure at once
-        (a cancel is published first). A task an executor took and ended
-        ``failed``, ``rejected`` or ``canceled`` is the agent's own outcome and
-        stays in front of the judge with the terminal on ``errors``; so does a
-        task still running at ``AGENT_HTTP_TIMEOUT``, after a cancel.
+        A diagnostic (see :mod:`kube_agents_bench.a2a_transport`), with
+        ``_execute``'s retry classes. The tunnel to the NATS Service gets the
+        same bounded establishment retry. An attempt that never reaches the
+        bus or loses it (connect refused, the connection dropped before the
+        terminal) is retried through a fresh tunnel as a NEW task, up to
+        :data:`_MAX_TRANSPORT_FAILURES` attempts in all, with a cancel
+        published first for any task an earlier attempt had submitted; the
+        ``eval`` principal has no replay, so the same task cannot be picked
+        back up. Exhaustion, a refused credential or a refused subject, a
+        missing creds Secret, and a task no executor accepted inside
+        ``AGENT_A2A_ACCEPT_TIMEOUT`` (a cancel is published) are infrastructure.
+        A task an executor took and ended ``failed``, ``rejected`` or
+        ``canceled`` is the agent's own outcome and stays in front of the judge
+        with the terminal on ``errors``; so does a task still running at
+        ``AGENT_HTTP_TIMEOUT``, after a cancel.
+
+        This method submits and awaits and nothing more. The kanban poll for
+        delegated cases behind the bridge is :meth:`_a2a_delegation_wait`,
+        called after it, where it can be deleted.
         """
         try:
             timeout = _numeric_env("AGENT_HTTP_TIMEOUT", "600", float)
@@ -1229,25 +1252,48 @@ class KubeAgentsHarness(AgentHarness):
             # stack never rendered): infrastructure, and not worth a retry.
             return _infra_failure(str(exc))
 
-        ids = a2a.mint_ids()
+        client = a2a.BusClient(url=url, password=password, addressee=addressee)
         deadline = time.monotonic() + timeout
 
-        def _exchange(task: a2a.BusTask) -> a2a.Exchange:
-            """One task to its terminal, through the transport retry."""
-            failures = 0
+        def _submit(
+            text: str,
+            *,
+            until: float,
+            context_id: str | None = None,
+            correlation_id: str | None = None,
+        ) -> tuple[a2a.TaskIds, a2a.Exchange, list[str]]:
+            """One prompt to a terminal, through the transport retry.
+
+            Every attempt is a new task id: the principal has no replay, so
+            an attempt whose connection dropped cannot resume the task it
+            submitted. Those tasks are cancelled by the next attempt and
+            their ids returned, so the record says what was abandoned.
+            """
+            attempts = 0
+            abandoned: list[a2a.TaskIds] = []
             while True:
+                ids = a2a.mint_ids(context_id=context_id, correlation_id=correlation_id)
+                attempts += 1
                 try:
-                    return task.exchange(accept_timeout=accept_timeout, deadline=deadline)
+                    exchange = client.submit_and_await(
+                        ids,
+                        text,
+                        accept_timeout=accept_timeout,
+                        deadline=until,
+                        cancel_first=tuple(abandoned),
+                    )
+                    return ids, exchange, [a.task_id for a in abandoned]
                 except a2a.BusUnavailable as exc:
-                    failures += 1
+                    if exc.submitted:
+                        abandoned.append(ids)
                     _log.warning(
-                        "a2a: exchange for %s failed in transport (%d/%d): %s",
-                        task.ids.task_id,
-                        failures,
+                        "a2a: attempt %d/%d for task %s failed in transport: %s",
+                        attempts,
                         _MAX_TRANSPORT_FAILURES,
+                        ids.task_id,
                         exc,
                     )
-                    if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
+                    if not exc.retryable or attempts >= _MAX_TRANSPORT_FAILURES:
                         raise
                     try:
                         _tunnel(reset=True)
@@ -1255,11 +1301,10 @@ class KubeAgentsHarness(AgentHarness):
                         # Counted, not raised: the ceiling above ends it.
                         _log.warning("a2a: port-forward respawn failed before retry: %s", pf_exc)
 
-        task = a2a.BusTask(url=url, password=password, addressee=addressee, ids=ids, prompt=prompt)
         try:
-            exchange = _exchange(task)
+            ids, exchange, abandoned = _submit(prompt, until=deadline)
         except a2a.BusUnavailable as exc:
-            return _infra_failure(f"the bus exchange for task {ids.task_id} failed: {exc}")
+            return _infra_failure(f"the bus exchange failed: {exc}")
 
         if exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED:
             # Nothing consumed the submission: no executor for the addressee
@@ -1272,6 +1317,7 @@ class KubeAgentsHarness(AgentHarness):
             )
 
         result = _a2a_result(exchange, ids, addressee)
+        result.metadata["abandoned_tasks"] = abandoned
         if exchange.outcome == a2a.OUTCOME_DEADLINE:
             result.errors.append(
                 f"task {ids.task_id} did not reach a terminal state within {timeout:.0f}s "
@@ -1282,40 +1328,34 @@ class KubeAgentsHarness(AgentHarness):
             result.errors.append(f"task {ids.task_id} ended {exchange.fold.state}{detail}")
 
         if delegation_timeout > 0:
-            # The seam for delegated work. Card ids are read from the
-            # trajectory, which on this path carries tool calls only once the
-            # executor publishes ``activity`` artifacts; until then the wait
-            # finds nothing outstanding and settles at once. A status turn is
-            # a follow-up task on the same context and correlation, the way a
-            # second message in the same chat thread would be.
-            def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
-                follow = a2a.BusTask(
-                    url=url,
-                    password=password,
-                    addressee=addressee,
-                    ids=a2a.mint_ids(context_id=ids.context_id, correlation_id=ids.correlation_id),
-                    prompt=poll,
-                )
-                nonlocal deadline
-                deadline = time.monotonic() + turn_timeout
+
+            def _follow_up(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
+                """A status turn: a follow-up task on the same context and
+                correlation, the way a second message in the same chat
+                thread would be."""
                 try:
-                    turn_exchange = _exchange(follow)
+                    turn_ids, turn_exchange, _ = _submit(
+                        poll,
+                        until=time.monotonic() + turn_timeout,
+                        context_id=ids.context_id,
+                        correlation_id=ids.correlation_id,
+                    )
                 except a2a.BusUnavailable as exc:
                     raise _TransportError(str(exc), retryable=exc.retryable) from exc
                 if turn_exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED:
                     raise _TransportError(
-                        f"no executor accepted status turn {follow.ids.task_id}",
+                        f"no executor accepted status turn {turn_ids.task_id}",
                         retryable=True,
                     )
-                return _a2a_result(turn_exchange, follow.ids, addressee), ""
+                return _a2a_result(turn_exchange, turn_ids, addressee), ""
 
             def _respawn_tunnel() -> None:
                 _tunnel(reset=True)
 
             try:
-                self._await_delegated_work(
+                self._a2a_delegation_wait(
                     result,
-                    turn=_status_turn,
+                    follow_up=_follow_up,
                     reset=_respawn_tunnel,
                     timeout=timeout,
                     delegation_timeout=delegation_timeout,
@@ -1324,6 +1364,41 @@ class KubeAgentsHarness(AgentHarness):
             except _DelegationTransportExhausted as exc:
                 return _infra_failure(str(exc))
         return result
+
+    def _a2a_delegation_wait(
+        self,
+        result: AgentResult,
+        *,
+        follow_up: Callable[[str, float], tuple[AgentResult, str]],
+        reset: Callable[[], None],
+        timeout: float,
+        delegation_timeout: float,
+        poll_interval: float,
+    ) -> None:
+        """The case runner's kanban poll for delegated cases behind the bridge.
+
+        Under ``spec.mode: next`` the platform persona still delegates by
+        filing a kanban card, and the bridge's terminal means the turn ended,
+        not the work. So the same wait the api path runs
+        (:meth:`_await_delegated_work`) runs here, asking over the bus. It is
+        the harness's, not the transport's: the transport submits and awaits
+        a task id and never polls the model. When agent-initiated delegation
+        becomes a child task on the bus, the parent's events will name the
+        child's task id, ``BusClient.await_terminal`` awaits it, and this
+        method is deleted.
+
+        Card ids are read from the trajectory, which on this path carries
+        tool calls only once the executor publishes ``activity`` artifacts;
+        until then the wait finds nothing outstanding and settles at once.
+        """
+        self._await_delegated_work(
+            result,
+            turn=follow_up,
+            reset=reset,
+            timeout=timeout,
+            delegation_timeout=delegation_timeout,
+            poll_interval=poll_interval,
+        )
 
     def _await_delegated_work(
         self,

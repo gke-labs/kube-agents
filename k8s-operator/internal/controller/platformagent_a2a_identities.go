@@ -132,6 +132,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		workerIdentity(),
 		seedIdentity(),
 		webIdentity(),
+		evalIdentity(),
 		sysIdentity(),
 	}
 }
@@ -519,6 +520,56 @@ func webIdentity() a2aIdentity {
 		subscribe: []string{
 			"a2a.>",
 			"_INBOX.web.>",
+		},
+	}
+}
+
+// eval: the bench harness's diagnostic bus transport
+// (bench/kube_agents_bench/a2a_transport.py, AGENT_TRANSPORT=a2a), which
+// submits one task to the platform executor and awaits its terminal.
+//
+// STATIC, permanently, for the web user's reason: the holder is a process
+// outside the cluster - devops-bench on a workstation or in a Prow pod, over a
+// kubectl port-forward - and it has no ServiceAccount in THIS cluster to
+// present, so the callout could never resolve it. It exists so the harness
+// never touches the gateway's credential: the gateway's grant list is the one
+// that may publish on every addressee's `in` subject, and a second process
+// holding it would be a second requester indistinguishable from the first on
+// replay.
+//
+// The grants are the two subjects a requester of the platform executor needs
+// and nothing else: publish on `platform`'s `in` (the submission, and a
+// cancel), subscribe on `platform`'s `events` (the executor's status and
+// artifact updates, including the terminal). No supervisor subject in either
+// direction - the harness is not the task's supervisor and reads the
+// executor's terminal on `events`, where the bridge writes it. No JetStream
+// API at all: the harness subscribes with a core subscription taken before it
+// publishes, so it needs no consumer, and a CONSUMER.CREATE on TASKS would let
+// it deliver any addressee's task plane into its own inbox
+// (a2aJetStreamSurfaceRationale). Without JetStream the publish has no ack and
+// the subscription has no replay; the harness treats a dropped connection as a
+// failed attempt and resubmits, which is the trade a diagnostic can make. The
+// inbox pair is the file's invariant (every principal may answer its own
+// requests), not a grant the harness uses.
+func evalIdentity() a2aIdentity {
+	return a2aIdentity{
+		user:    "eval",
+		account: a2aAccountApp,
+		comment: "the bench harness's diagnostic bus transport: one task to the platform\n" +
+			"executor, its terminal awaited. STATIC permanently: the holder runs outside\n" +
+			"the cluster over a port-forward and has no ServiceAccount here to present.\n" +
+			"Publish on platform's in subject and subscribe on its events, nothing else:\n" +
+			"no supervisor, no JetStream API (a core subscription needs no consumer, and\n" +
+			"CONSUMER.CREATE on TASKS would read every addressee's task plane).",
+		auth:     a2aAuthStatic,
+		credsKey: a2aEvalPasswordKey,
+		publish: []string{
+			"a2a.tasks.platform.*.in",
+			"_INBOX.eval.>",
+		},
+		subscribe: []string{
+			"a2a.tasks.platform.*.events",
+			"_INBOX.eval.>",
 		},
 	}
 }
