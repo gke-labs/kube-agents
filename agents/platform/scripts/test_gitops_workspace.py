@@ -1064,12 +1064,28 @@ class TestContextRepos(WorkspaceTestCase):
                 ["acme/terraform-live", "acme/notes"],
             )
 
+    def test_a_ref_with_an_at_sign_after_the_first_character_is_kept(self):
+        # `release@2026` is a branch name git accepts: only the sequence `@{`
+        # and the lone name `@` are refused, and both stay refused below.
+        for good in ("release@2026", "deploy@eu", "team/x@y"):
+            with self.subTest(ref=good):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": good}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    self.assertTrue(gitops_workspace.is_valid_ref(good))
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repo_entries(),
+                        [{"repo": "acme/terraform-live", "ref": good}],
+                    )
+
     def test_a_ref_that_is_not_a_branch_name_is_dropped_with_a_warning(self):
         # A leading dash is an option to `git`; the rest are shapes a ref
         # cannot take — `foo.lock/bar` among them, a `.lock` component git
         # refuses in the middle of a name as it does at the end. The
         # repository is still read, at HEAD.
-        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "foo.lock/bar", "a/.b", "with space", "a@{1}"):
+        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "foo.lock/bar", "a/.b", "with space", "a@{1}", "@", "@release"):
             with self.subTest(ref=bad):
                 context = json.dumps(
                     [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": bad}]

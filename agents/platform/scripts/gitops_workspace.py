@@ -160,7 +160,9 @@ GITHUB_REPO_TYPE = "github"
 #: a leading dash is an option. An entry whose `ref` fails the shape keeps its
 #: URL and drops the ref, with a warning; the repository is still read, at HEAD.
 CONTEXT_REF_KEY = "ref"
-_REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}\Z")
+_REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]{0,254}\Z")
+# `@` is admitted after the first character: `release@2026` is a branch name
+# git accepts, and a lone `@`, which it does not, fails the first class.
 # `git check-ref-format`'s rules, the ones the shape regex above leaves open:
 # no `..`, no component starting with `.`, no empty component, no `@{`, and
 # no component ending in `.lock` — `.lock/` catches one in the middle, the
