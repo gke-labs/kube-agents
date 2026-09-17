@@ -300,12 +300,18 @@ class StoreStatesTest(unittest.TestCase):
         self.assertEqual((empty["source"], empty["read_at"], empty["records"], empty["cases"], empty["domains"], empty["metrics"], empty["default_metric"]), (None, None, 0, {}, {}, [], None))
         failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gsutil ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"]), data_with_nightly(DOMAINS))
         self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"]), ("2026-09-17T14:30:00Z: gsutil ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4))
-        odd = store_doc(night_one_records() + [None, {"case": 3}, {"case": "x", "key": {}, "recorded_at": "junk"}, {"case": "y", "key": {}, "recorded_at": "2026-09-17T06:00:00Z", "runs": "three", "judged": {"OutcomeValidity": {"mean": "high", "n": 3}, "Other": {"mean": 0.5, "n": 0}}}])
+        # A non-finite mean is what json.loads makes of a `NaN` or `Infinity`
+        # literal in a record; json.dumps would write it back and the page's
+        # JSON.parse would refuse the whole document.
+        nan = json.loads('{"case": "y", "key": {}, "recorded_at": "2026-09-17T06:00:00Z", "runs": 3, "passes": 3, "judged": {"OutcomeValidity": {"mean": NaN, "n": 3}, "OutcomeScore": {"mean": Infinity, "n": 3}, "ToolInvocation": {"mean": 1, "n": 3}}}')
+        odd = store_doc(night_one_records() + [None, {"case": 3}, {"case": "x", "key": {}, "recorded_at": "junk"}, {"case": "y", "key": {}, "recorded_at": "2026-09-17T05:00:00Z", "runs": "three", "judged": {"OutcomeValidity": {"mean": "high", "n": 3}, "Other": {"mean": 0.5, "n": 0}}}, nan])
         doc = trend.trend_document(odd, data_with_nightly(DOMAINS))
-        self.assertEqual(doc["records"], 5)
-        (y,) = doc["cases"]["y"]["points"]
+        self.assertEqual(doc["records"], 6)
+        y, later = doc["cases"]["y"]["points"]
         self.assertEqual((y["runs"], y["passes"], y["judged"]), (0, 0, {}), "unusable numbers are zero and an unusable metric is absent")
-        self.assertEqual(y["night"], "at:2026-09-17T06:00:00Z")
+        self.assertEqual(y["night"], "at:2026-09-17T05:00:00Z")
+        self.assertEqual(sorted(later["judged"]), ["ToolInvocation"], "a non-finite mean is no score")
+        json.dumps(doc, allow_nan=False)  # the whole document is JSON a browser will parse
 
     def test_trend_json_carries_the_trend_block_and_store_json_is_copied_only_when_given(self):
         data = load_fixture()

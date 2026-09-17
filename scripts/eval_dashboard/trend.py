@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import datetime
 import itertools
+import math
 
 try:
     from eval_dashboard import nightly, tiers
@@ -127,7 +128,13 @@ def _count(value) -> int:
 
 
 def _mean(value) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    """A finite number, or None. ``json.loads`` accepts ``NaN`` and
+    ``Infinity`` and ``json.dumps`` would write them back into the inlined
+    page, where ``JSON.parse`` refuses them and the page cannot render; a
+    judge's non-finite score is no score."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
 
 
 def judged_of(record: dict) -> dict[str, dict]:
