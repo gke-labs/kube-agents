@@ -9,6 +9,12 @@
 # all, and the chart's published GHCR images at that commit instead. Section 2a
 # is the whole of the difference, and with the variable unset nothing below
 # behaves differently from the day this line was added.
+#
+# Setting EVAL_MODE_NEXT=1 flips the installed agent to `spec.mode: next` after
+# the today-mode install has proven itself (sections 2a and 2b refuse the flag
+# where it cannot work, step 4 builds the A2A images, step 5 hands the operator
+# their references, step 6b flips and gates; the constants block below says
+# what each does). Unset, nothing behaves differently either.
 # ==============================================================================
 
 set -euo pipefail
@@ -46,6 +52,65 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 readonly SANDBOX_SSH_KEY_TYPE="ed25519"
 readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 
+# EVAL_MODE_NEXT=1 flips the eval install to `spec.mode: next` once the
+# today-mode install has passed step 6, so the presubmit matrix can be run
+# against the next stack on demand (#1686, measuring #1661). Unset, or set to
+# anything but "1", is today: every line the flag guards is skipped and the
+# script behaves exactly as it did before the flag existed.
+#
+# What the flag has to do, and where:
+#   - section 2a refuses it on the release-candidate path (no A2A images are
+#     published to point the operator at) and section 2b refuses it on a Prow
+#     run that is not a pull request's (a periodic under it would append
+#     next-mode samples to main's baseline record);
+#   - step 4 also builds the A2A gateway, auth callout and worker images from
+#     a2a/Dockerfile.* (the operator's defaults for them name a private dev
+#     registry, #1557, which a leased project cannot pull from);
+#   - step 5 passes those references to the operator through the chart's
+#     operator.extraEnv, which the operator reads as its image overrides;
+#   - step 6b patches the CR, waits for the agent Deployment to roll, and
+#     gates on the NATS StatefulSet, the callout Deployment, the provisioning
+#     Job and the agent Deployment, in that order.
+# The chart deliberately renders no spec.mode (docs/designs/spec-mode-switch.md),
+# so the flip is a merge patch on the CR the chart created. The names below
+# are what the operator renders for a CR of this name (a2aNATSName,
+# a2aCalloutName, a2aGatewayName and the provision Job's component label in
+# k8s-operator/internal/controller/platformagent_a2a_manifests.go; the managed
+# .env rides the <cr>-config ConfigMap). The CR name is the chart's
+# platformAgent.name default, which this deploy does not override.
+readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
+readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
+readonly MODE_NEXT_PATCH='{"spec":{"mode":"next"}}'
+readonly MODE_NEXT_GENERATION_ATTEMPTS=60
+readonly MODE_NEXT_POLL_SECONDS=5
+readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
+# The provisioning Job depends on NATS and on the callout, and its retries
+# back off exponentially: 19.5 minutes to complete was measured under adverse
+# conditions (#1661), a few minutes on a healthy cluster.
+readonly MODE_NEXT_PROVISION_JOB_TIMEOUT="1500s"
+readonly A2A_PART_OF_SELECTOR="app.kubernetes.io/part-of=a2a-next"
+readonly A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"
+readonly A2A_NATS_POD_SELECTOR="app=${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+# How much of each log the step keeps for the artifact: the tail of a pod or
+# operator log on failure, the recent events, the gateway's last lines in the
+# report, and how far back the agent's entrypoint log is scanned for its
+# account of the mode and the skill overlay.
+readonly MODE_NEXT_DIAG_LOG_LINES=100
+readonly MODE_NEXT_DIAG_EVENT_LINES=40
+readonly MODE_NEXT_REPORT_LOG_LINES=30
+readonly MODE_NEXT_ENTRYPOINT_SCAN_LINES=400
+readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
+# The operator's override variables (a2aGatewayImage and a2aWorkerImage in
+# platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go)
+# and the repository names step 4 pushes the builds under.
+readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
+readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
+readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
+readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
+readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
+readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
+
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 # Still required with the agent path on vertex_ai below: the judge reads it
 # (JUDGE_API_KEY in ci-eval-pr.sh) and the chart's credentials secret carries it.
@@ -81,6 +146,12 @@ export AGENT_IMAGE="${AR_REPO}/platform-agent"
 export AGENT_TAG="${TAG}"
 export IMAGE_TAG="${TAG}"
 
+# The operator's A2A image overrides, as chart values. Empty unless
+# EVAL_MODE_NEXT=1, in which case step 4 fills it once the image references
+# exist; step 5 expands it into the Helm install, where an empty array
+# contributes nothing and the release is byte-for-byte the today one.
+A2A_OPERATOR_ENV_ARGS=()
+
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
 # RC_COMMIT_SHA unset is the presubmit and everything this script did before the
 # variable existed: build the pull request's images into the leased project's
@@ -103,6 +174,16 @@ export IMAGE_TAG="${TAG}"
 # without being named here. Both plugin images default to enabled=false and are
 # not rendered on either path.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  # The release pipeline publishes no A2A images, so there is nothing for
+  # step 5c to point the operator at on this path; refuse the pair here
+  # rather than at the first ImagePullBackOff forty minutes in.
+  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+    echo "ERROR: EVAL_MODE_NEXT=1 is set together with RC_COMMIT_SHA. The mode-next flip needs" >&2
+    echo "       the pull-request build path, which builds the A2A images the operator has to" >&2
+    echo "       be pointed at; a published release candidate carries none." >&2
+    exit 1
+  fi
+
   # Sourced inside the branch, deliberately. The presubmit path must not acquire
   # a second file's exports and functions just because this one exists.
   # shellcheck source=scripts/release/common.sh
@@ -278,6 +359,18 @@ else
   IS_PROW_RUN="false"
 fi
 
+# The mode flip exists for a pull request's run. bench-gate keeps main's
+# baseline honest by refusing to append a sample when PULL_NUMBER or
+# RC_COMMIT_SHA is set (bench/baselines/README.md); a periodic or postsubmit
+# carrying EVAL_MODE_NEXT=1 would set neither and append next-mode samples to
+# the window every pull request is judged against. Refuse that here.
+if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
+  echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
+  echo "       The flag is for a pull request's presubmit; a periodic or postsubmit under it" >&2
+  echo "       would record next-mode samples into main's baseline." >&2
+  exit 1
+fi
+
 # The override exists for developers, and only for them. Under Boskos the
 # project is leased per run, so a value pinned in the job environment would
 # eventually point one project's run at another project's GitOps repo — the
@@ -434,8 +527,32 @@ else
   # The postsubmit's mode=max cache manifests; CACHE_IMAGE stays the fallback.
   export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
   export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
+  # Under EVAL_MODE_NEXT=1 the same build also produces the three first-party
+  # A2A images, in its `a2a` step; with the substitutions absent that step is
+  # a no-op and the build is the four-image one above. Empty otherwise, so
+  # the command below is byte-for-byte what it was. The same references go
+  # to the operator through operator.extraEnv in step 5: the operator reads
+  # its A2A image overrides from its own environment and otherwise renders
+  # defaults from a private dev registry (#1557), which is what a leased
+  # project's nodes fail to pull.
+  A2A_BUILD_SUBSTITUTIONS=""
+  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+    A2A_GATEWAY_URI="${AR_REPO}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
+    A2A_CALLOUT_URI="${AR_REPO}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
+    A2A_WORKER_URI="${AR_REPO}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI}"
+    A2A_OPERATOR_ENV_ARGS=(
+      --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
+      --set-string "operator.extraEnv[1].name=${A2A_CALLOUT_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
+      --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
+    )
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout and worker images"
+  fi
   gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
   echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 fi
@@ -545,6 +662,7 @@ helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
   --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
   --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
+  ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
   --wait --timeout 15m
 # Deleted here rather than from the EXIT trap, which two later steps replace.
 # A failed install leaves the directory behind in a pod prow destroys with the
@@ -587,6 +705,119 @@ if ! kubectl rollout status statefulset/platform-agent-shell -n "${NAMESPACE}" -
   exit 1
 fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
+
+# ─── 6b. EVAL_MODE_NEXT: switch to spec.mode: next and gate the bus ──────────
+# Everything above proved the today-mode install. From here the CR is patched
+# and the gates run over what `mode: next` adds, in dependency order: the NATS
+# StatefulSet (the bus), the callout Deployment (the Job below cannot
+# authenticate to NATS without it), the provisioning Job (the streams; until
+# it completes there is nothing on the bus), and then the agent Deployment,
+# which the operator rolls when it pins the mode into the managed .env and
+# the config hash moves. The Deployment's generation is recorded before the
+# patch: `rollout status` right after it would answer for the today
+# ReplicaSet, before the operator has reconciled anything.
+#
+# Reported, never gated: the A2A gateway Deployment. It exits on start without
+# a chat backend (a2a/gateway/config.go: neither DISCORD_TOKEN nor
+# A2A_GCHAT_RELAY_URL), and a leased eval project renders neither (#1660);
+# the bench drives the agent over /v1/responses regardless. Not gated either:
+# the shell StatefulSet, which does not change under next.
+#
+# A namespace ResourceQuota on limits.cpu refuses every A2A pod: none of them
+# declares a CPU limit (the callout declares a memory limit only, #1661).
+# Nothing this deploy or the chart renders carries such a quota, so no
+# LimitRange is added here. An install that has one needs the operator fix,
+# or a LimitRange of its own, before the flag.
+dump_mode_next_state() {
+  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
+  kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true
+  kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp | tail -"${MODE_NEXT_DIAG_EVENT_LINES}" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${OPERATOR_DEPLOYMENT_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+}
+
+# Waits for the operator to create the workload, then for its rollout; on
+# failure describes it, dumps the stack and stops the deploy.
+gate_mode_next_rollout() {
+  local workload="$1"
+  local gate_start=$SECONDS
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    kubectl get "${workload}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if ! kubectl rollout status "${workload}" -n "${NAMESPACE}" --timeout="${MODE_NEXT_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: ${workload} rollout failed under mode: next"
+    kubectl describe "${workload}" -n "${NAMESPACE}" || true
+    dump_mode_next_state
+    exit 1
+  fi
+  echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+}
+
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  STEP_START=$SECONDS
+  MODE_NEXT_START=$SECONDS
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next (EVAL_MODE_NEXT=1) ==="
+  GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
+  kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"
+
+  GEN_AFTER="${GEN_BEFORE}"
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    GEN_AFTER="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
+    [ "${GEN_AFTER}" != "${GEN_BEFORE}" ] && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if [ "${GEN_AFTER}" = "${GEN_BEFORE}" ]; then
+    echo "ERROR: the agent Deployment never rolled after the mode patch (generation ${GEN_BEFORE} throughout)"
+    dump_mode_next_state
+    exit 1
+  fi
+  echo "Agent Deployment generation ${GEN_BEFORE} -> ${GEN_AFTER} at $((SECONDS - MODE_NEXT_START))s; managed .env now reads:"
+  # Whole, not grepped for the mode key: the key is named in exactly two
+  # places by design (tests/test_mode_grep.py), and this script is not one.
+  kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true
+  echo
+
+  gate_mode_next_rollout "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+  gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"
+
+  # The Job's name carries a digest of its rendered spec, so it is found by
+  # its component label. `kubectl wait` errors on a selector that matches
+  # nothing, hence the existence poll first.
+  JOB_GATE_START=$SECONDS
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    [ -n "$(kubectl get jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" -o name 2>/dev/null)" ] && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if ! kubectl wait --for=condition=complete jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --timeout="${MODE_NEXT_PROVISION_JOB_TIMEOUT}"; then
+    echo "ERROR: the A2A provisioning Job did not complete within ${MODE_NEXT_PROVISION_JOB_TIMEOUT}"
+    kubectl describe jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" || true
+    echo "--- provisioning Job pod logs ---"
+    kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+    echo "--- NATS pod log ---"
+    kubectl logs -n "${NAMESPACE}" -l "${A2A_NATS_POD_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+    dump_mode_next_state
+    exit 1
+  fi
+  echo "✓ A2A provisioning Job complete $((JOB_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+
+  gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
+
+  # What the run has to show for itself, for the artifact log: the CR status,
+  # the stack the mode rendered, the ungated gateway, and the entrypoint's
+  # account of the A2A skill overlay landing (or not) in the agent pod.
+  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
+  kubectl get statefulsets,deployments,jobs,pods,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true
+  echo "--- A2A gateway (reported, not gated; see the comment above this step) ---"
+  kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" -n "${NAMESPACE}" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" --all-containers --tail="${MODE_NEXT_REPORT_LOG_LINES}" 2>/dev/null || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" --all-containers --previous --tail="${MODE_NEXT_REPORT_LOG_LINES}" 2>/dev/null || true
+  # kubectl's "unable to retrieve container logs" for a crashed container
+  # arrives on stdout without a newline; keep the next header on its own line.
+  echo
+  echo "--- agent entrypoint lines about the mode and the A2A overlay ---"
+  kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" --all-containers --tail="${MODE_NEXT_ENTRYPOINT_SCAN_LINES}" 2>/dev/null | grep -i "a2a\|overlay\|mode" | head -"${MODE_NEXT_ENTRYPOINT_MATCH_LINES}" || true
+  echo "✓ mode: next rollout finished in $((SECONDS - STEP_START))s"
+fi
 
 # ─── 7. Agent API Connectivity Verification ──────────────────────────────────
 STEP_START=$SECONDS
