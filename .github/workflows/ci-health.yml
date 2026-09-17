@@ -302,19 +302,28 @@ jobs:
 
       # The Trend page's input, still as the reader (step A). Best-effort by
       # construction: a failed listing writes the prior read back with its
-      # error, a failed step leaves no work/store.json and the render below
-      # skips --store, so the other pages publish either way and the page
-      # says the store was not read. The prior is the copy render.py
-      # published beside data.json last tick, so a tick fetches only last
-      # night's objects.
+      # error; a timeout or a crash falls back to the prior itself, so the
+      # page stays on its last good read either way (docs/ci-health.md
+      # promises that); with no prior at all the step leaves no
+      # work/store.json, the render below skips --store, and the page says
+      # the store was not read. The other pages publish in every case. The
+      # prior is the copy render.py published beside data.json last tick,
+      # so a tick fetches only last night's objects. Skipped after a failed
+      # collect: nothing renders then, and the read would only spend the
+      # job's budget on a document no step consumes.
       - name: Read the evidence store for the Trend page (best-effort)
+        if: steps.collect.outcome == 'success'
         continue-on-error: true
         run: |
           gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json || echo "no published store.json yet; reading the whole window"
           timeout "$STORE_TIMEOUT_S" python3 scripts/eval_dashboard/store.py \
             --location "$EVIDENCE_STORE" \
             --prior work/prior-store.json \
-            --out work/store.json
+            --out work/store.json \
+            || {
+              echo "::warning::store.py failed or timed out (exit $?); the Trend page renders from the last published store.json"
+              [ -f work/prior-store.json ] && cp work/prior-store.json work/store.json
+            }
 
       # ---- B. everything that writes or posts, as the dedicated publisher --
       - name: Authenticate to Google Cloud (dashboard publisher and Chat app)

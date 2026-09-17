@@ -1395,13 +1395,15 @@ const pointAt = (p) => parseIso(p.at);
 const fmtRate = (passes, runs) => (runs ? `${pct(passes / runs)} (${passes}/${runs})` : "no graded run");
 const fmtMean = (value) => (isNumber(value) ? value.toFixed(2) : "—");
 
-// A night's label and link: dated by the collector's start when the build is
-// a nightly run on record (the Nightly report names nights that way), else
-// by the record's own stamp. The report link only when the report carries
-// the night; otherwise the build log, when the collector recorded one.
+// A night's label and link: dated by the record's own stamp (`at`, when the
+// nightly wrote it), the one time source the whole page uses, so a night's
+// bar, tick, marker, tooltip and table row agree; the collector's start
+// (`started`) is not used for a date, or the same night would carry two.
+// The report link only when the report carries the night; otherwise the
+// build log, when the collector recorded one.
 function trendNight(t, id) {
   const night = trendNights(t).find((n) => n.id === id);
-  const ms = night ? (parseIso(night.started) ?? parseIso(night.at)) : null;
+  const ms = night ? parseIso(night.at) : null;
   const onReport = night && night.build != null && nights().some((n) => String(n.build) === String(night.build));
   return { night, ms, label: ms != null ? et(ms) : "an unknown night", href: onReport ? nightHref({ build: night.build }) : (night && night.log_url ? night.log_url : null) };
 }
@@ -1532,8 +1534,9 @@ function trendLegendHtml(kind, metric, t) {
 function trendMarkers(t, keyChanges, link) {
   const out = [];
   for (const k of keyChanges || []) {
-    const night = trendNight(t, k.night);
-    const ms = night.ms ?? parseIso(k.at);
+    // Dated like the bar it sits on: by the record (`k.at` is that night's
+    // recorded_at), so the marker lands on the night, not beside it.
+    const ms = parseIso(k.at) ?? trendNight(t, k.night).ms;
     out.push({ ms, cls: "keym", label: `key: ${(k.changed || []).join(", ") || "changed"}` });
   }
   if (link.sinceMs != null) out.push({ ms: link.sinceMs, cls: "incm", label: "incident start" });
@@ -1592,7 +1595,7 @@ function trendStatusHtml(t) {
 
 function trendHtml(link) {
   const t = trendDoc();
-  const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
+  const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back, each night dated by when its record was written. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
   const head = (title) => `<div class="sec head"><h1>${title}</h1><div class="lede">${lede}</div></div>`;
   if (!t || (!t.source && !t.read_at) || !t.records) {
     const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no record inside its ${esc(t.window_days || "")}-day window yet. The first night that records fills this page.</p>` : "";

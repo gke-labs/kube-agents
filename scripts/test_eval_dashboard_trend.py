@@ -23,6 +23,7 @@ from test_eval_dashboard_pages import (
     dom_text,
     health_doc,
     history_lines,
+    inline_blob,
     load_fixture,
     render_to,
 )
@@ -283,7 +284,8 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("key: judge_model", app, "the version-key marker is labelled with what changed")
         self.assertIn("Table view · 8 nights", app)
         self.assertIn('<th>Night</th><th>Cases</th><th>Pass rate</th><th>Trailing window</th><th>OutcomeValidity</th><th>Spread</th><th>Version key</th>', app)
-        self.assertIn(f'<a href="nightly.html#build={NIGHT_1_BUILD}">Wed 8:00 PM ET</a>', app, "night one is dated by its run and links the report")
+        self.assertIn(f'<a href="nightly.html#build={NIGHT_1_BUILD}">Thu 1:54 AM ET</a>', app, "night one is dated by its record (recorded_at, the stamp its bar is placed by), not by the run's start, and links the report")
+        self.assertNotIn("Wed 8:00 PM ET", app, "the run's start is not a second date for the same night")
         self.assertIn(" ET", app)
         self.assertNotIn(" UTC", app)
         self.assertNotIn(".html?", app)
@@ -297,6 +299,11 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn('<path class="band"', app, "the spread band spans the nights at one key")
         self.assertIn('class="dot lone"', app, "the night after the key change is a lone point")
         self.assertIn("one night, no spread yet", app)
+        # The marker is dated like the bars: its x is a night's x, not a
+        # point between two nights.
+        marker = re.search(r'<line class="keym" x1="([0-9.]+)"', app)
+        self.assertIsNotNone(marker, "the key change is marked")
+        self.assertIn(f'cx="{marker.group(1)}"', app, "the key-change marker sits on the night it marks")
         self.assertIn("<b>Record today: collecting.</b> 2/3 across 1 night at the current key, 17 more runs before the window is full", app)
         self.assertIn("<b>Version key changed</b>", app)
         self.assertIn("<b>judge_model</b> changed", app)
@@ -360,6 +367,14 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn('<a href="trend.html" class="on">Trend</a>', page)
         self.assertIn('<a href="trend.html" >Trend</a>', (self.out / "index.html").read_text())
         self.assertNotIn("<", re.search(r'id="inline-brief">(.*?)</script>', page, re.DOTALL).group(1))
+        # The trend block rides inside trend.html only; the five other pages
+        # never read it and stay the size they were.
+        brief = json.loads((self.out / "brief.json").read_text())
+        self.assertEqual(inline_blob(page, render.INLINE_BRIEF_ID), brief, "trend.html carries the whole document, trend block included")
+        for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
+            inlined = inline_blob((self.out / name).read_text(), render.INLINE_BRIEF_ID)
+            self.assertIsNone(inlined["trend"], f"{name}: no trend block inlined")
+            self.assertEqual({**inlined, "trend": brief["trend"]}, brief, f"{name}: everything else is brief.json")
 
 
 if __name__ == "__main__":

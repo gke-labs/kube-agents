@@ -1063,8 +1063,12 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
 def render_page(page: str, brief: dict, data: dict, public_url: str | None = None) -> str:
     """One of the six pages from the shared template, with brief.json (and
     the health verdict, when there is one) inlined as JSON data elements and
-    pages.js after them. ``page`` is a PAGES key."""
+    pages.js after them. ``page`` is a PAGES key. The trend block is the
+    Trend page's alone: it grows a night's records every night (a quarter
+    of it is megabytes), and no other page reads it, so they carry
+    ``trend: null`` and stay the size they were."""
     template = PAGE_TEMPLATE.read_text()
+    inlined = brief if page == "trend" else {**brief, "trend": None}
     values = {
         "__TITLE__": PAGES[page]["title"],
         "__PAGE__": page,
@@ -1076,7 +1080,7 @@ def render_page(page: str, brief: dict, data: dict, public_url: str | None = Non
         # The PR view is a tab only while it is the page being read.
         "__NAV_RUN__": f'<a href="{RUN_PAGE}" class="on">PR view</a>' if page == "run" else "",
         "__BASE__": base_html(public_url),
-        "__INLINE_BRIEF__": inline_json_html(INLINE_BRIEF_ID, brief),
+        "__INLINE_BRIEF__": inline_json_html(INLINE_BRIEF_ID, inlined),
         "__INLINE_HEALTH__": inline_json_html(INLINE_HEALTH_ID, brief["health"]) if brief.get("health") else "",
         "__META__": meta_html(data),
         "__FRESHNESS__": freshness_html(data),

@@ -155,8 +155,9 @@ def nightly_runs_by_build(data: dict) -> dict[str, dict]:
 def night_documents(records: list[dict], data: dict) -> list[dict]:
     """``nights[]``, oldest first: each night the store holds a record for,
     with the collector's start time and Spyglass link when its build is a
-    nightly run on record (``started`` is what the page dates the night by;
-    a night the collector has not seen is dated by ``recorded_at``)."""
+    nightly run on record. The page dates every night by ``at`` (the newest
+    ``recorded_at`` of the night), the same stamp its points are placed by;
+    ``started`` and ``log_url`` only serve the link to the report."""
     runs = nightly_runs_by_build(data)
     nights: dict[str, dict] = {}
     for record in records:
@@ -177,7 +178,7 @@ def night_documents(records: list[dict], data: dict) -> list[dict]:
             }
         night["cases"] += 1
         night["at"] = max(night["at"], record["recorded_at"])
-    return sorted(nights.values(), key=lambda n: (n["started"] or n["at"], n["at"]))
+    return sorted(nights.values(), key=lambda n: n["at"])
 
 
 # --------------------------------------------------------------------------

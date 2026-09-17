@@ -394,7 +394,9 @@ class RenderedFilesTest(unittest.TestCase):
             for name in ("index.html", "run.html"):
                 page = (out / name).read_text()
                 head = page.split("<body", 1)[0]
-                self.assertEqual(inline_blob(head, render.INLINE_BRIEF_ID), brief, f"{name}: the inline brief is brief.json")
+                # Less the trend block, which only trend.html reads (it grows
+                # every night; test_eval_dashboard_trend covers that page).
+                self.assertEqual(inline_blob(head, render.INLINE_BRIEF_ID), {**brief, "trend": None}, f"{name}: the inline brief is brief.json")
                 self.assertEqual(inline_blob(head, render.INLINE_HEALTH_ID), brief["health"], f"{name}: the inline verdict")
                 self.assertEqual(page.count('id="inline-brief">'), 1, f"{name}: one copy of the document, not two")
                 raw = re.search(r'id="inline-brief">(.*?)</script>', head, re.DOTALL).group(1)

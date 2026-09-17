@@ -498,7 +498,8 @@ The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
 `<script type="application/json" id="inline-brief">` (the verdict it read,
 the same document as `brief.health`, again as `inline-health`), so a page
-needs no request beyond itself;
+needs no request beyond itself (the `trend` block, which grows every night,
+is inlined into `trend.html` only; the other pages carry `trend: null`);
 the poll of the published `brief.json` and `health.json` every 60 seconds
 is a best-effort refresh on top. That matters on `storage.cloud.google.com`, which answers an XHR
 with a login redirect: the pages still render whole there. The header
@@ -666,8 +667,9 @@ five components. `nights[]` is every night the store holds a record for,
 oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
 `build:<prow build id>` from the object name (or `at:<recorded_at>` for a
 record without one), `started` and `log_url` the collector's when that
-build is a nightly run in `data.json` (`null` otherwise; the page then
-dates the night by `at`). `cases{}` is per case `{domain, points[],
+build is a nightly run in `data.json` (`null` otherwise); the page dates
+every night by `at`, the stamp its points and markers are placed by, and
+uses `build` only for the link to the report. `cases{}` is per case `{domain, points[],
 key_changes[], record}`: `points[]` oldest first, one per record, `{night,
 at, build, commit, key, runs, passes, blocked, infra, judged{metric:
 {mean, n, spread{low, high, nights}}}, window{runs, passes, lines, full}}`
