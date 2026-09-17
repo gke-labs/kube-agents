@@ -2201,10 +2201,10 @@ def git_push_violation(argv: list[str]) -> str | None:
         elif norm_target.lower().startswith("heads/"):
             norm_target = norm_target[len("heads/"):]
 
-        if norm_target.casefold() in protected:
+        if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
             return (
-                f"`git push` to protected branch '{norm_target}' is refused: changes to the "
-                "base branch must be proposed via pull request and merged through "
+                f"`git push` to protected branch '{norm_target}' is refused: changes to "
+                "base or run branches must be proposed via pull request and merged through "
                 "the approved workflow."
             )
     return None

@@ -2476,24 +2476,23 @@ class TestProtectedBranches(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
                     audit_report.assert_pushable(branch)
 
-        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "run/test-cluster/fix-task"}):
-            for branch in (
-                "run/test-cluster/fix-task",
-                "refs/heads/run/test-cluster/fix-task",
-                "heads/run/test-cluster/fix-task",
-            ):
-                with self.subTest(branch=branch):
-                    with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
-                        audit_report.assert_pushable(branch)
+        # Run branches are refused unconditionally without env overrides (#1498)
+        for branch in (
+            "run/test-cluster/fix-task",
+            "refs/heads/run/test-cluster/fix-task",
+            "heads/run/test-cluster/fix-task",
+        ):
+            with self.subTest(branch=branch):
+                with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                    audit_report.assert_pushable(branch)
 
-        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/broker-task"}):
-            for branch in (
-                "run/test-cluster/broker-task",
-                "refs/heads/run/test-cluster/broker-task",
-            ):
-                with self.subTest(branch=branch):
-                    with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
-                        audit_report.assert_pushable(branch)
+        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
+            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                audit_report.assert_pushable("custom-gitops-base")
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
+            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                audit_report.assert_pushable("custom-broker-base")
 
     def test_remediation_branch_is_pushable(self):
         # The audit report branch is gone; the only branch the harness ever

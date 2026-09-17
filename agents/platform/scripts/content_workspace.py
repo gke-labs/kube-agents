@@ -100,6 +100,7 @@ DEFAULT_MAX_MATCH_CHARS = 400
 # imported: this is the enforcement point, and a control that depends on a skill
 # module being importable is a control that disappears when the skill moves.
 PROTECTED_BRANCHES = frozenset({"main", "master", "production"})
+PROTECTED_BRANCH_PREFIXES = ("run/",)
 
 # The complete set of git subcommands this module ever issues. Not a policy
 # knob and not derived from any request — a literal, so that "what git can the
@@ -510,9 +511,12 @@ def check_branch(name: object) -> str:
     elif norm_branch.startswith("heads/"):
         norm_branch = norm_branch[len("heads/"):]
 
-    if norm_branch.casefold() in protected:
+    if (
+        norm_branch.casefold() in protected
+        or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
+    ):
         raise ContentWorkspaceError(
-            f"'{branch}' is a rollout or base branch; suggestions are proposed on their "
+            f"'{branch}' is a rollout, base, or run branch; suggestions are proposed on their "
             "own branch and merged by a human"
         )
     return branch
@@ -1133,9 +1137,12 @@ class ContentWorkspaceStore:
             elif norm_base.startswith("heads/"):
                 norm_base = norm_base[len("heads/"):]
 
-            if norm_base and norm_branch.casefold() == norm_base.casefold():
+            if (
+                (norm_base and norm_branch.casefold() == norm_base.casefold())
+                or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
+            ):
                 raise ContentWorkspaceError(
-                    f"'{branch}' is the workspace base branch; suggestions are proposed on their "
+                    f"'{branch}' is the workspace base or run branch; suggestions are proposed on their "
                     "own branch and merged by a human"
                 )
             self._git(workspace, ["check-ref-format", "--branch", branch])
@@ -1311,9 +1318,12 @@ class ContentWorkspaceStore:
             elif norm_base.startswith("heads/"):
                 norm_base = norm_base[len("heads/"):]
 
-            if norm_base and norm_branch.casefold() == norm_base.casefold():
+            if (
+                (norm_base and norm_branch.casefold() == norm_base.casefold())
+                or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
+            ):
                 raise ContentWorkspaceError(
-                    f"'{branch}' is the workspace base branch; suggestions are proposed on their "
+                    f"'{branch}' is the workspace base or run branch; suggestions are proposed on their "
                     "own branch and merged by a human"
                 )
             if workspace.branch != branch:

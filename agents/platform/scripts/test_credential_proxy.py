@@ -1123,20 +1123,28 @@ class GitHardeningTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
 
-        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "run/test-cluster/fix-task"}):
+        # Run branch pushes are refused unconditionally without needing env overrides (#1498)
+        self.assertIsNotNone(
+            git_argument_violation(["git", "push", "origin", "run/test-cluster/fix-task"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "push", "origin", "HEAD:run/test-cluster/fix-task"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "HEAD", "push", "origin", "run/test-cluster/fix-task"])
+        )
+
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release-branch-override"}):
             self.assertIsNotNone(
-                git_argument_violation(["git", "push", "origin", "run/test-cluster/fix-task"])
+                git_argument_violation(["git", "push", "origin", "release-branch-override"])
             )
             self.assertIsNotNone(
-                git_argument_violation(["git", "push", "origin", "HEAD:run/test-cluster/fix-task"])
-            )
-            self.assertIsNotNone(
-                git_argument_violation(["git", "--attr-source", "HEAD", "push", "origin", "run/test-cluster/fix-task"])
+                git_argument_violation(["git", "push", "origin", "HEAD:release-branch-override"])
             )
 
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/broker-task"}):
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
             self.assertIsNotNone(
-                git_argument_violation(["git", "push", "origin", "run/test-cluster/broker-task"])
+                git_argument_violation(["git", "push", "origin", "custom-broker-base"])
             )
 
         # Bare HEAD pushes without destination branch are refused

@@ -1096,16 +1096,163 @@ class TestContentMode(SubmitSuggestionTestCase):
     def test_submit_content_when_branch_equals_base_branch_is_refused_before_commit_or_push(self):
         prepared = self.prepare_content(branch="platform-agent/fix-netpol")
         # Test with a non-default base branch name that is not in hardcoded PROTECTED_BRANCHES
-        run_base = "run/test-cluster/b-0011"
-        prepared["branch"] = run_base
+        release_base = "release/2026-08"
+        prepared["branch"] = release_base
         source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
         self.verbs.clear()
         with self.assertRaises(ValueError) as ctx:
-            self.submit_content(prepared, source, base=run_base)
+            self.submit_content(prepared, source, base=release_base)
         self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
         self.assertIn("is the same as base branch", str(ctx.exception))
         self.assertNotIn("commit", self.verbs)
         self.assertNotIn("push", self.verbs)
+
+        # Submitting to a run branch is refused by check_branch before reaching the broker (#1498)
+        run_base = "run/test-cluster/b-0011"
+        prepared["branch"] = run_base
+        with self.assertRaises(ValueError) as ctx:
+            self.submit_content(prepared, source, base=run_base)
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+        self.assertIn("is a protected base or run branch", str(ctx.exception))
+
+    def test_prepare_content_preserves_remote_default_branch_when_master(self):
+        # A repository whose default trunk is `master` rather than `main` must not have
+        # `main` forced onto it by the client during prepare (#1498).
+        origin_master = self.tmp_path / "origin_master.git"
+        seed_master = self.tmp_path / "seed_master"
+        seed_master.mkdir()
+        for cmd in (
+            ["git", "init", "--quiet", "--bare", "--initial-branch=master", str(origin_master)],
+            ["git", "init", "--quiet", "--initial-branch=master", str(seed_master)],
+        ):
+            subprocess.run(cmd, check=True, capture_output=True)
+        (seed_master / "README.md").write_text("master seed\n", encoding="utf-8")
+        for argv in (
+            ["config", "user.email", "t@example.com"],
+            ["config", "user.name", "T"],
+            ["add", "README.md"],
+            ["commit", "--quiet", "-m", "seed master"],
+            ["remote", "add", "origin", str(origin_master)],
+            ["push", "--quiet", "origin", "master"],
+        ):
+            git(argv, seed_master)
+
+        def master_runner(argv, cwd):
+            argv = [str(origin_master) if token == "https://github.com/acme/fleet.git" else token for token in argv]
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+                    "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+                    "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+                    "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+                },
+            )
+            return GitResult(completed.returncode, completed.stdout, completed.stderr)
+
+        master_store = content_workspace.ContentWorkspaceStore(
+            self.tmp_path / "broker" / "master_trees",
+            self.tmp_path / "agent-master-workspace",
+            master_runner,
+        )
+
+        class MasterRouter:
+            workspaces = master_store
+
+        route = credential_proxy.CredentialProxyHandler._workspace_route
+
+        def master_call(endpoint, verb, payload):
+            self.verbs.append(verb)
+            try:
+                return route(MasterRouter(), verb, payload)
+            except content_workspace.ContentWorkspaceError as exc:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    exc.status,
+                    {"status": "blocked", "code": exc.code, "message": str(exc)},
+                ) from exc
+
+        self.patch_attr(credential_proxy_client, "_workspace_call", master_call)
+
+        # Prepare should discover master as base and succeed
+        prepared = self.prepare_content(branch="platform-agent/fix-for-master")
+        self.assertEqual(prepared["base"], "master")
+        self.assertEqual(prepared["branch"], "platform-agent/fix-for-master")
+
+        # Preparing on branch equal to base (master) is refused
+        with self.assertRaises(ValueError) as ctx:
+            self.prepare_content(branch="master")
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+
+        # Test with a non-protected default branch (release-trunk)
+        origin_custom = self.tmp_path / "origin_custom.git"
+        seed_custom = self.tmp_path / "seed_custom"
+        seed_custom.mkdir()
+        for cmd in (
+            ["git", "init", "--quiet", "--bare", "--initial-branch=release-trunk", str(origin_custom)],
+            ["git", "init", "--quiet", "--initial-branch=release-trunk", str(seed_custom)],
+        ):
+            subprocess.run(cmd, check=True, capture_output=True)
+        (seed_custom / "README.md").write_text("custom seed\n", encoding="utf-8")
+        for argv in (
+            ["config", "user.email", "t@example.com"],
+            ["config", "user.name", "T"],
+            ["add", "README.md"],
+            ["commit", "--quiet", "-m", "seed custom"],
+            ["remote", "add", "origin", str(origin_custom)],
+            ["push", "--quiet", "origin", "release-trunk"],
+        ):
+            git(argv, seed_custom)
+
+        def custom_runner(argv, cwd):
+            argv = [str(origin_custom) if token == "https://github.com/acme/fleet.git" else token for token in argv]
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+                    "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+                    "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+                    "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+                },
+            )
+            return GitResult(completed.returncode, completed.stdout, completed.stderr)
+
+        custom_store = content_workspace.ContentWorkspaceStore(
+            self.tmp_path / "broker" / "custom_trees",
+            self.tmp_path / "agent-custom-workspace",
+            custom_runner,
+        )
+
+        class CustomRouter:
+            workspaces = custom_store
+
+        def custom_call(endpoint, verb, payload):
+            self.verbs.append(verb)
+            try:
+                return route(CustomRouter(), verb, payload)
+            except content_workspace.ContentWorkspaceError as exc:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    exc.status,
+                    {"status": "blocked", "code": exc.code, "message": str(exc)},
+                ) from exc
+
+        self.patch_attr(credential_proxy_client, "_workspace_call", custom_call)
+
+        prepared_custom = self.prepare_content(branch="platform-agent/fix-custom")
+        self.assertEqual(prepared_custom["base"], "release-trunk")
+
+        # Preparing on branch equal to non-protected base (release-trunk) is refused by handle_prepare_content
+        with self.assertRaises(ValueError) as ctx:
+            self.prepare_content(branch="release-trunk")
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+        self.assertIn("is the same as base branch 'release-trunk'", str(ctx.exception))
 
     def test_a_body_file_reaches_gh_intact_in_content_mode(self):
         """The safe channel has to be the safe channel in both transports.

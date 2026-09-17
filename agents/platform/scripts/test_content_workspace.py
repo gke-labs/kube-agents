@@ -355,13 +355,17 @@ class CheckBranchTest(unittest.TestCase):
                 with self.assertRaises(ContentWorkspaceError):
                     check_branch(protected)
 
-        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "run/test-cluster/fix-task"}):
-            with self.assertRaises(ContentWorkspaceError):
-                check_branch("run/test-cluster/fix-task")
+        # Run branches are refused without needing env overrides (#1498)
+        with self.assertRaises(ContentWorkspaceError):
+            check_branch("run/test-cluster/fix-task")
 
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/broker-task"}):
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
             with self.assertRaises(ContentWorkspaceError):
-                check_branch("run/test-cluster/broker-task")
+                check_branch("custom-gitops-base")
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
+            with self.assertRaises(ContentWorkspaceError):
+                check_branch("custom-broker-base")
 
         # Paired ordinary use: the branch names the product actually authors.
         self.assertEqual(
@@ -1124,11 +1128,25 @@ class RealGitTest(unittest.TestCase):
                 "feat: direct to base",
                 [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
             )
-        self.assertIn("is the workspace base branch", str(ctx.exception))
+        self.assertIn("is the workspace base or run branch", str(ctx.exception))
 
         with self.assertRaises(ContentWorkspaceError) as ctx:
             self.store.push(handle, "release/2026-08")
-        self.assertIn("is the workspace base branch", str(ctx.exception))
+        self.assertIn("is the workspace base or run branch", str(ctx.exception))
+
+        # Commit and push directly to run branches are refused by check_branch
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.commit(
+                handle,
+                "run/test-cluster/b-0011",
+                "feat: direct to run branch",
+                [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+            )
+        self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.push(handle, "run/test-cluster/b-0011")
+        self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
 
     def test_a_commit_lands_the_bytes_and_nothing_else(self):
         result = self.commit(

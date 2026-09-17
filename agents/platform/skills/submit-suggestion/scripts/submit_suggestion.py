@@ -57,6 +57,7 @@ from github_token_refresh import refresh_git_credentials, log
 # Branches a suggestion may never target. `main` and `master` are the GitOps
 # rollout branches; `production` is the convention some fleets use instead.
 PROTECTED_BRANCHES = {"main", "master", "production"}
+PROTECTED_BRANCH_PREFIXES = ("run/",)
 
 OWNER = "submit-suggestion"
 
@@ -100,10 +101,10 @@ def check_branch(branch_name: str, base_branch: str | None = None) -> str:
         protected.add(_norm(override))
     if base_branch:
         protected.add(_norm(base_branch))
-    if short in protected:
+    if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Target branch '{branch_name}' is a protected "
-            "base branch; changes must be submitted on a separate feature branch."
+            "base or run branch; changes must be submitted on a separate feature branch."
         )
     return branch
 
@@ -160,7 +161,11 @@ def handle_prepare_content(args) -> int:
     # managed-repos list depend on which transport the run happened to pick.
     validate_repo(repo)
     refresh_git_credentials(repo)
-    base = getattr(args, "base", None) or gitops_workspace.resolve_base_branch()
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    base = getattr(args, "base", None) or override or None
     workspace = credential_proxy_client.Workspace.open(
         proxy_endpoint(), repo, base=base, branch=branch
     )
@@ -268,7 +273,11 @@ def open_handle(args) -> "credential_proxy_client.Workspace":
     caller can pass `--base-sha` to the conflict check; nothing here holds a
     directory, which is what makes a second process able to pick the session up.
     """
-    resolved_base = getattr(args, "base", None) or gitops_workspace.resolve_base_branch()
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    resolved_base = getattr(args, "base", None) or override or ""
     return credential_proxy_client.Workspace(
         proxy_endpoint(),
         {
@@ -425,7 +434,7 @@ def handle_submit_content(args, body: str) -> int:
                 return s[len("heads/"):]
             return s
 
-        if _norm(branch) == _norm(workspace.base):
+        if workspace.base and _norm(branch) == _norm(workspace.base):
             raise ValueError(
                 f"CRITICAL SECURITY REFUSAL: Cannot submit on branch '{branch}': head branch "
                 f"is the same as base branch '{workspace.base}'. Suggestions must be committed and pushed on a "

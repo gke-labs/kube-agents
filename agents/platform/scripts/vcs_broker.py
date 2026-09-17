@@ -533,9 +533,12 @@ class VcsBroker:
             elif normalized_branch.startswith("heads/"):
                 normalized_branch = normalized_branch[len("heads/"):]
 
-            if normalized_branch.casefold() in protected_branches:
+            if (
+                normalized_branch.casefold() in protected_branches
+                or normalized_branch.casefold().startswith("run/")
+            ):
                 raise WorkspaceError(
-                    f"{branch} is a protected or default branch. Publish a branch "
+                    f"{branch} is a protected, default, or run branch. Publish a branch "
                     "of your own and open a proposal onto it.",
                     status=409,
                     code="PROTECTED_BRANCH",

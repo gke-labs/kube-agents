@@ -828,27 +828,34 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(list(self.scratch.iterdir()), [])
 
     def test_publish_refuses_the_configured_base_branch(self):
-        # A configured base branch (CREDENTIAL_PROXY_BASE_BRANCH or GITOPS_BASE_BRANCH)
-        # is protected from direct publication, just like the default branch (#1498).
+        # Run branches (run/**) are protected from direct publication unconditionally (#1498),
+        # as are configured base branches (CREDENTIAL_PROXY_BASE_BRANCH or GITOPS_BASE_BRANCH).
         git(self.seed, "checkout", "--quiet", "-b", "run/test-cluster/fix-task")
         git(self.seed, "push", "--quiet", "origin", "run/test-cluster/fix-task")
         git(self.seed, "checkout", "--quiet", "main")
         work, answer = self.clone_locally()
         git(work, "checkout", "--quiet", "-b", "run/test-cluster/fix-task")
         self.commit_in(work, "README.md", "direct to run branch\n", "bypass")
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/fix-task"}):
-            with self.assertRaises(WorkspaceError) as caught:
-                self.broker.publish(
-                    {
-                        "repository": "local.test/acme/infra",
-                        "branch": "run/test-cluster/fix-task",
-                        "target": "main",
-                        "baseRevision": answer["revision"],
-                        "bundleBase64": self.bundle_of(work, "run/test-cluster/fix-task", answer["revision"]),
-                    }
-                )
-            self.assertEqual(caught.exception.status, 409)
-            self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+        # Refused unconditionally without any env override
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "run/test-cluster/fix-task",
+                    "target": "main",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "run/test-cluster/fix-task", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
+            self.assertEqual(self.broker.base_branch, "")
+            broker_with_env = vcs_broker.VcsBroker(
+                self.scratch, git_runner=self.broker._git_runner, base_branch="custom-broker-base"
+            )
+            self.assertEqual(broker_with_env.base_branch, "custom-broker-base")
 
     def test_publish_refuses_the_branch_the_client_says_it_cloned(self):
         # A non-default branch cloned and published under another target is

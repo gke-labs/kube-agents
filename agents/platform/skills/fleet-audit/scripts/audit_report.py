@@ -303,6 +303,7 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
 )
 
 PROTECTED_BRANCHES = {"main", "master", "production"}
+PROTECTED_BRANCH_PREFIXES = ("run/",)
 
 # Both directories must live on the PVC. `gh` and `git` are not binaries in the
 # agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
@@ -1143,7 +1144,7 @@ def assert_pushable(branch: str) -> str:
         elif override.startswith("heads/"):
             override = override[len("heads/"):]
         protected.add(override)
-    if short in protected:
+    if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
             f"'{branch}' is strictly blocked by GKE SRE guardrails!"
