@@ -157,6 +157,7 @@ class ReadStoreTest(unittest.TestCase):
         # Window: 09-03 12:00 onwards keeps days 4 and 5 (day 3 05:00 is outside). Cap: two per key, so nothing more is cut here...
         self.assertEqual(doc["listed"], 12)
         self.assertEqual((doc["window_days"], doc["lead_days"]), (3, 0))
+        self.assertEqual(doc["older"], {"case-a": {KEY_DIR: 3}, "case-b": {KEY_DIR: 3}}, "days 1-3 at the current key were listed and left behind; the old key's one object is inside the span")
         self.assertEqual(sorted((r["case"], r["recorded_at"]) for r in doc["records"]), [
             ("case-a", "2026-09-04T05:00:00Z"), ("case-a", "2026-09-05T04:00:00Z"), ("case-a", "2026-09-05T05:00:00Z"),
             ("case-b", "2026-09-04T05:00:00Z"), ("case-b", "2026-09-05T05:00:00Z")])
@@ -164,6 +165,7 @@ class ReadStoreTest(unittest.TestCase):
         # ...and with a wider window the cap binds per key and is reported per case.
         doc = read(FakeGsutil(objects), now=now, window_days=30, lead_days=0, max_objects=2)
         self.assertEqual(doc["truncated"], {"case-a": 3, "case-b": 3})
+        self.assertEqual(doc["older"], {"case-a": {KEY_DIR: 3}, "case-b": {KEY_DIR: 3}}, "what the cap trimmed is left behind too, per key")
         self.assertEqual(len([r for r in doc["records"] if r["case"] == "case-a"]), 3, "two at the current key, one at the old one")
         # The lead-in reaches past the window: one more day brings day 3 in (the page pools it, does not draw it).
         doc = read(FakeGsutil(objects), now=now, window_days=3, lead_days=1, max_objects=5)
@@ -183,16 +185,28 @@ class ReadStoreTest(unittest.TestCase):
         for record in doc["records"]:
             self.assertEqual(record["object"], url_of(record["case"]))
 
-    def test_a_multi_line_object_is_attributed_by_case_and_stamp(self):
+    def test_a_multi_line_object_is_read_alone_so_every_record_carries_its_object(self):
+        # Not the writer's rule (one record per object), but nothing forbids
+        # it: the chunk's line count disagrees with its object count, so the
+        # chunk is read again one object at a time.
         objects = fixture_objects()
         extra = json.dumps({"case": "agent-kanban-smoke", "recorded_at": "2026-09-16T05:00:00Z", "key": {"setup_id": "s", "scoring_version": "v1", "judge_model": "j", "fleet": 1, "verifiers": 1}, "runs": 3, "passes": 3}) + "\n"
         objects[url_of("agent-kanban-smoke")] = objects[url_of("agent-kanban-smoke")] + extra
-        doc = read(FakeGsutil(objects))
+        gsutil = FakeGsutil(objects)
+        doc = read(gsutil)
         self.assertEqual(len(doc["records"]), 5)
+        self.assertEqual([len(c) - 2 for c in gsutil.cats], [4, 1, 1, 1, 1])
         by = {(r["case"], r["recorded_at"]): r for r in doc["records"]}
         self.assertEqual(by[("agent-kanban-smoke", "2026-09-17T05:54:31Z")]["build"], BUILD)
-        self.assertIsNone(by[("agent-kanban-smoke", "2026-09-16T05:00:00Z")]["object"], "a line no name accounts for is not guessed")
+        self.assertEqual(by[("agent-kanban-smoke", "2026-09-16T05:00:00Z")]["object"], url_of("agent-kanban-smoke"), "the second line is the object's too")
         self.assertEqual(by[("rca-remediation-pr", "2026-09-17T05:54:31Z")]["build"], BUILD)
+        # The incremental read keeps both records of the object without a fetch.
+        again = read(FakeGsutil(objects), prior=doc)
+        self.assertEqual((len(again["records"]), again["fetched"]), (5, 0))
+        # parse_records alone, handed a chunk it cannot re-read, still does not guess.
+        warnings = []
+        records = store.parse_records(objects[url_of("agent-kanban-smoke")] + objects[url_of("rca-remediation-pr")], [url_of("agent-kanban-smoke"), url_of("rca-remediation-pr")], LOCATION, warnings)
+        self.assertEqual([r["object"] for r in records], [url_of("agent-kanban-smoke"), None, url_of("rca-remediation-pr")])
 
     def test_an_empty_prefix_is_an_empty_store_and_a_failed_listing_raises(self):
         doc = read(FakeGsutil({}))

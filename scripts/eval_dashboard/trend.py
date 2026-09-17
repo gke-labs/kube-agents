@@ -19,9 +19,11 @@ WHAT "SCORE" MEANS is written once, in ``docs/designs/eval-scorer.md``
   (``BaselineStore.evidence_for``). Admission pools with no date limit and
   this page reads a bounded span, so the read reaches ``lead_days`` past
   the drawn window (store.py) and the nights in that lead-in are pooled
-  but not drawn; a window that still ran out of records at the read's
-  edge is marked ``cut`` and the page says so instead of "not full", so
-  the line here and the record's verdict never disagree silently.
+  but not drawn; a window that is still short while the listing shows
+  older objects at that key beyond the read (``older`` in store.json:
+  older than the span, or trimmed by the cap) is marked ``cut`` and the
+  page says so instead of "not full", so the line here and the record's
+  verdict never disagree silently.
 * **Judged quality is advisory and never a single point.** A record carries
   a mean and its ``n`` per metric and not the repetitions' own values, so
   the spread across repetitions is not in the store yet (an addition to the
@@ -71,9 +73,6 @@ ADMISSION_MIN_RUNS = 20
 SPREAD_NIGHTS = 7
 # The judged metric the page opens on: rung 6's default (EVAL_JUDGED_METRICS).
 DEFAULT_METRIC = "OutcomeValidity"
-# A pool whose oldest record sits this close to the read's start may go on
-# past it in the store (two nightly cadences: a night is missed now and then).
-CUT_EDGE_MS = 2 * 24 * 3600 * 1000
 DAY_MS = 24 * 3600 * 1000
 KEY_COMPONENTS = ("setup_id", "scoring_version", "judge_model", "fleet", "verifiers")
 DOMAIN_UNKNOWN = nightly.DOMAIN_UNKNOWN
@@ -198,32 +197,30 @@ def at_ms(point: dict) -> float | None:
     return parsed.timestamp() * 1000 if parsed else None
 
 
-def trailing_window(points: list[dict], index: int, read_since_ms: float | None = None) -> dict:
+def trailing_window(points: list[dict], index: int, older: dict[str, int] | None = None) -> dict:
     """What admission would read at ``points[index]``: the newest whole
     records at its key pooled back until ``ADMISSION_MIN_RUNS`` runs
     (``BaselineStore.evidence_for``: whole lines, so a pool of threes
     overshoots to 21 rather than pretending to 20). ``full`` says whether
     the bar's run count was reached. ``cut`` says the pool ran out of
-    records at the edge of what was read (``read_since_ms``, the start of
-    the store read): the oldest record it pooled sits within
-    ``CUT_EDGE_MS`` of that edge, so the store may hold older records at
-    this key that admission pools and this page did not read. A pool that
-    ran out well inside the read is genuinely short (``collecting``)."""
+    records inside the read while the listing showed older objects at
+    this key that the read left behind (``older``, ``{key: count}`` from
+    store.json: older than the span, or trimmed by the cap), so the store
+    holds records that admission pools and this page did not read. A
+    short pool with nothing older at its key is genuinely short
+    (``collecting``)."""
     key = points[index]["key"]
     runs = passes = lines = 0
-    oldest = None
     for point in reversed(points[: index + 1]):
         if point["key"] != key:
             continue
         runs += point["runs"]
         passes += point["passes"]
         lines += 1
-        oldest = point
         if runs >= ADMISSION_MIN_RUNS:
             break
     full = runs >= ADMISSION_MIN_RUNS
-    oldest_ms = at_ms(oldest) if oldest else None
-    cut = not full and read_since_ms is not None and oldest_ms is not None and oldest_ms <= read_since_ms + CUT_EDGE_MS
+    cut = not full and bool(older) and _count(older.get(key)) > 0
     return {"runs": runs, "passes": passes, "lines": lines, "full": full, "cut": cut}
 
 
@@ -247,10 +244,10 @@ def trailing_spread(points: list[dict], index: int, metric: str) -> dict | None:
     return {"low": min(means), "high": max(means), "nights": len(means)}
 
 
-def case_points(records: list[dict], read_since_ms: float | None = None) -> list[dict]:
+def case_points(records: list[dict], older: dict[str, int] | None = None) -> list[dict]:
     """One case's records as points, oldest first, each with its trailing
-    window and, per metric, its trailing spread. ``read_since_ms`` is where
-    the store read began (``trailing_window``)."""
+    window and, per metric, its trailing spread. ``older`` is what the
+    listing left behind at each of the case's keys (``trailing_window``)."""
     points = []
     for record in records:
         points.append({
@@ -266,7 +263,7 @@ def case_points(records: list[dict], read_since_ms: float | None = None) -> list
             "judged": judged_of(record),
         })
     for index, point in enumerate(points):
-        point["window"] = trailing_window(points, index, read_since_ms)
+        point["window"] = trailing_window(points, index, older)
         for metric, blob in point["judged"].items():
             blob["spread"] = trailing_spread(points, index, metric)
     return points
@@ -364,20 +361,36 @@ def domain_key_changes(cases: dict[str, dict]) -> list[dict]:
 # the document
 
 
-def read_span(store: dict | None) -> tuple[float | None, float | None, int | None, int]:
-    """``(drawn_since_ms, read_since_ms, window_days, lead_days)`` from the
-    store document: the page draws nights from ``read_at - window_days``
-    and the read began ``lead_days`` earlier (store.py). A store without a
-    usable ``read_at`` or window bounds nothing: everything is drawn."""
+def read_span(store: dict | None) -> tuple[float | None, int | None, int]:
+    """``(drawn_since_ms, window_days, lead_days)`` from the store document:
+    the page draws nights from ``read_at - window_days``; the read began
+    ``lead_days`` earlier (store.py) and those records are pooled only. A
+    store without a usable ``read_at`` or window bounds nothing:
+    everything is drawn."""
     if not store:
-        return None, None, None, 0
+        return None, None, 0
     read_at = nightly.parse_iso(store.get("read_at"))
     window_days = store.get("window_days") if isinstance(store.get("window_days"), int) and not isinstance(store.get("window_days"), bool) else None
     lead_days = store.get("lead_days") if isinstance(store.get("lead_days"), int) and not isinstance(store.get("lead_days"), bool) and store.get("lead_days") >= 0 else 0
     if read_at is None or window_days is None:
-        return None, None, window_days, lead_days
-    read_ms = read_at.timestamp() * 1000
-    return read_ms - window_days * DAY_MS, read_ms - (window_days + lead_days) * DAY_MS, window_days, lead_days
+        return None, window_days, lead_days
+    return read_at.timestamp() * 1000 - window_days * DAY_MS, window_days, lead_days
+
+
+def older_by_case(store: dict | None) -> dict[str, dict[str, int]]:
+    """store.json's ``older`` (``{case: {key: n}}``, what the listing left
+    behind), with only usable counts."""
+    raw = store.get("older") if store else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    for case, keys in raw.items():
+        if not isinstance(keys, dict):
+            continue
+        counts = {str(k): v for k, v in keys.items() if _count(v) > 0}
+        if counts:
+            out[str(case)] = counts
+    return out
 
 
 def trend_document(store: dict | None, data: dict) -> dict:
@@ -388,7 +401,8 @@ def trend_document(store: dict | None, data: dict) -> dict:
     the first drawn nights and appear nowhere else: not as points, nights,
     key changes or in ``records``."""
     every = usable_records(store)
-    drawn_since_ms, read_since_ms, window_days, lead_days = read_span(store)
+    drawn_since_ms, window_days, lead_days = read_span(store)
+    older = older_by_case(store)
     in_window = lambda at: drawn_since_ms is None or (at is not None and at >= drawn_since_ms)
     records = [r for r in every if in_window(at_ms({"at": r["recorded_at"]}))]
     domain_of = nightly.domains(data)
@@ -402,7 +416,7 @@ def trend_document(store: dict | None, data: dict) -> dict:
         metrics.update(judged_of(record))
     cases = {}
     for name in sorted(by_case):
-        points = case_points(by_case[name], read_since_ms)
+        points = case_points(by_case[name], older.get(name))
         drawn = [p for p in points if in_window(at_ms(p))]
         if not drawn:
             continue  # recorded in the lead-in only: outside the page's window

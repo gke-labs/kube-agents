@@ -204,10 +204,10 @@ class ManyNightsTest(unittest.TestCase):
 class LeadInTest(unittest.TestCase):
     """The read reaches ``lead_days`` past the drawn window (store.py): those
     nights pool into the first drawn nights' windows and spreads and are
-    drawn nowhere; a window that still ran out at the read's edge is
-    ``cut``, not ``collecting``. Read at Thu 2026-09-17 14:09 UTC with a
-    10-day window and a 14-day lead-in: drawn from 09-07 14:09, read from
-    08-24 14:09."""
+    drawn nowhere; a window that is still short while the listing left
+    older objects behind at its key (``older``) is ``cut``, not
+    ``collecting``. Read at Thu 2026-09-17 14:09 UTC with a 10-day window
+    and a 14-day lead-in: drawn from 09-07 14:09, read from 08-24 14:09."""
 
     @classmethod
     def setUpClass(cls):
@@ -225,12 +225,13 @@ class LeadInTest(unittest.TestCase):
 
         extra = [
             one("gone-case", "2026-09-03T05:50:00Z", "2100903000000000001"),  # lead-in only
-            one("sparse-case", "2026-08-25T05:50:00Z", "2100825000000000002"),  # at the read's edge...
-            one("sparse-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...so this pool may go on past it
-            one("young-case", "2026-09-05T05:50:00Z", "2100905000000000003"),  # started well inside the read...
-            one("young-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...so this pool is genuinely short
+            one("sparse-case", "2026-08-25T05:50:00Z", "2100825000000000002"),  # two records inside the read...
+            one("sparse-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...and, per the listing, four older ones at this key
+            one("young-case", "2026-09-05T05:50:00Z", "2100905000000000003"),  # two records inside the read...
+            one("young-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...and nothing older: genuinely short
         ]
-        cls.doc = trend.trend_document(store_doc(records + extra, window_days=10, lead_days=14), data_with_nightly(DOMAINS))
+        older = {"sparse-case": {KEY_1: 4}, "young-case": {KEY_2: 2}}  # young's older objects are at another key
+        cls.doc = trend.trend_document(store_doc(records + extra, window_days=10, lead_days=14, older=older), data_with_nightly(DOMAINS))
 
     def test_the_lead_in_is_pooled_and_not_drawn(self):
         doc = self.doc
@@ -245,7 +246,7 @@ class LeadInTest(unittest.TestCase):
         self.assertEqual([n["at"][:10] for n in doc["nights"]], ["2026-09-08", "2026-09-09", "2026-09-10"])
         self.assertEqual(doc["domains"]["chat-and-routing"]["points"][0]["at"][:10], "2026-09-08")
 
-    def test_a_pool_that_ran_out_at_the_reads_edge_is_cut_and_one_that_ran_out_inside_it_is_collecting(self):
+    def test_a_short_pool_with_older_objects_at_its_key_is_cut_and_one_without_is_collecting(self):
         sparse = self.doc["cases"]["sparse-case"]
         self.assertEqual([p["at"][:10] for p in sparse["points"]], ["2026-09-09"])
         self.assertEqual(sparse["points"][0]["window"], {"runs": 6, "passes": 6, "lines": 2, "full": False, "cut": True})
@@ -258,7 +259,9 @@ class LeadInTest(unittest.TestCase):
         base = night_one_records()
         doc = trend.trend_document(store_doc(base, read_at="junk"), data_with_nightly(DOMAINS))
         self.assertEqual((doc["read_at"], doc["window_days"], doc["lead_days"], doc["records"]), (None, 90, 0, 4))
-        self.assertFalse(doc["cases"]["agent-kanban-smoke"]["points"][0]["window"]["cut"], "with no read edge nothing is cut")
+        self.assertFalse(doc["cases"]["agent-kanban-smoke"]["points"][0]["window"]["cut"], "with nothing left behind nothing is cut")
+        odd = trend.trend_document(store_doc(base, older={"agent-kanban-smoke": {KEY_1: "many"}, "x": None}), data_with_nightly(DOMAINS))
+        self.assertFalse(odd["cases"]["agent-kanban-smoke"]["points"][0]["window"]["cut"], "an unusable count is no count")
 
 
 class StoreStatesTest(unittest.TestCase):
@@ -339,7 +342,8 @@ class TrendPageTest(unittest.TestCase):
             # A month of nights at one key (the density a quarter's chart works
             # at; rca fails two of three every night), read with a lead-in,
             # plus a sparse case whose pool runs out at the read's edge.
-            # A key change on night 11; night 20 recorded no OutcomeValidity.
+            # A key change on night 11; night 20 recorded no OutcomeValidity;
+            # the listing left three older objects behind at sparse-case's key.
             dense = []
             for day in range(1, 31):
                 night = later_night(base, day, f"21007{day:02d}0000000000000", passes={"rca-remediation-pr": 1}, key={"judge_model": "gemini-3.5-pro"} if day >= 11 else None)
@@ -356,7 +360,7 @@ class TrendPageTest(unittest.TestCase):
             hostile = copy.deepcopy(base[0])
             hostile.update(case=HOSTILE_CASE, recorded_at="2026-09-30T05:50:00Z", build="21007300000000000000", object=f"{LOCATION}/hostile/x/30.jsonl")
             dense.append(hostile)
-            (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z", lead_days=14)))
+            (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z", lead_days=14, older={"sparse-case": {KEY_1: 3}})))
             cls.dense = render_to(root / "dense", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "dense.json")])
         cls.page = cls.out / "trend.html"
 
@@ -451,7 +455,7 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("100% of 21</text>", admit, "the window label of a full window carries no caveat")
         demote = dom_text(self.dense / "trend.html", fragment="#cases=rca-remediation-pr")
         self.assertIn("<b>Record today: the record would demote it.</b> 7/21 across 7 nights at the current key against a bar of 95% over 20", demote)
-        # The sparse case: one record at the read's edge (06-20, the read began 06-19), one drawn.
+        # The sparse case: two records inside the read and three older ones the listing showed.
         cut = dom_text(self.dense / "trend.html", fragment="#cases=sparse-case")
         self.assertIn("<b>Record today: not knowable from this read.</b> 6/6 across 2 nights at the current key inside this read; the store may hold older records at this key that admission pools and this page did not read", cut)
         self.assertIn("100% of 6 · window reaches past this read</text>", cut, "the chart label")

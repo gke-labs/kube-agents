@@ -52,7 +52,14 @@ THE OUTPUT is what ``render.py --store`` reads (SCHEMA.md,
 "store.json")::
 
     {schema_version: 1, source, read_at, window_days, lead_days, max_objects,
-     listed, fetched, truncated{case: n}, warnings[], error, records[]}
+     listed, fetched, truncated{case: n}, older{case: {key: n}}, warnings[],
+     error, records[]}
+
+``older`` is what the listing showed and the read left behind, per case
+and version key: objects older than the span plus those the cap trimmed.
+The Trend page reads it to say, of a short trailing window, whether the
+store holds older records at that key that admission pools (``cut``)
+rather than calling it "collecting" on a guess.
 
 ``records[]`` is every record read, each the JSON object as written plus
 ``object`` (its URL) and ``build`` (the Prow build id from the name; the
@@ -224,20 +231,32 @@ def stamp_ms(stamp: str) -> float | None:
     return parsed.timestamp() * 1000
 
 
-def select_objects(urls: list[str], location: str, *, now_ms: float, window_days: int, max_objects: int, lead_days: int = 0) -> tuple[list[str], dict[str, int]]:
+def select_objects(urls: list[str], location: str, *, now_ms: float, window_days: int, max_objects: int, lead_days: int = 0) -> tuple[list[str], dict[str, int], dict[str, dict[str, int]]]:
     """The URLs worth reading: inside the window plus the lead-in by their
     name's stamp, then the newest ``max_objects`` per case per key
     directory. Returns them sorted, with ``{case: objects the cap left
-    out}``. A name that is not in the layout is skipped: the store's own
-    reader would refuse it, and the page has nothing to say about it."""
+    out}`` and ``{case: {key: objects left behind at that key}}`` (older
+    than the span, or trimmed by the cap; ``key`` in the record's key-id
+    form, the directory path under the case). A name that is not in the
+    layout is skipped: the store's own reader would refuse it, and the
+    page has nothing to say about it."""
     since_ms = now_ms - (window_days + lead_days) * 24 * 3600 * 1000
     by_dir: dict[str, list[tuple[str, str]]] = {}
+    older: dict[str, dict[str, int]] = {}
+
+    def left_behind(key_dir: str, count: int) -> None:
+        case, key = key_dir.split("/", 1)
+        older.setdefault(case, {})[key] = older.get(case, {}).get(key, 0) + count
+
     for url in urls:
         parsed = parse_url(url, location)
         if parsed is None:
             continue
         at = stamp_ms(parsed["stamp"])
-        if at is None or at < since_ms:
+        if at is None:
+            continue
+        if at < since_ms:
+            left_behind(parsed["key_dir"], 1)
             continue
         by_dir.setdefault(parsed["key_dir"], []).append((parsed["name"], url))
     chosen: list[str] = []
@@ -247,9 +266,10 @@ def select_objects(urls: list[str], location: str, *, now_ms: float, window_days
         if len(group) > max_objects:
             case = key_dir.split("/", 1)[0]
             truncated[case] = truncated.get(case, 0) + len(group) - max_objects
+            left_behind(key_dir, len(group) - max_objects)
             group = group[-max_objects:]
         chosen.extend(url for _, url in group)
-    return sorted(chosen), truncated
+    return sorted(chosen), truncated, older
 
 
 # --------------------------------------------------------------------------
@@ -258,13 +278,15 @@ def select_objects(urls: list[str], location: str, *, now_ms: float, window_days
 
 def parse_records(text: str, urls: list[str], location: str, warnings: list[str]) -> list[dict]:
     """The records in one ``gsutil cat`` output, each with its ``object`` and
-    ``build``. Lines are matched to objects by order when the counts agree
-    (one record per object, the writer's rule); otherwise by the case and
-    stamp the name carries, and an unmatched record keeps ``object`` and
-    ``build`` null rather than a guess. A line that is not a JSON object is
-    a warning and is skipped; the record's own ``case``, ``recorded_at``
-    and ``key`` are what the page reads, so a record without them is
-    skipped too."""
+    ``build``. Every line of a single object is that object's; across a
+    chunk, lines are matched to objects by order when the counts agree
+    (one record per object, the writer's rule), otherwise by the case and
+    stamp the name carries (``read_store`` re-reads such a chunk one
+    object at a time, so this is a fallback for a caller that does not),
+    and an unmatched record keeps ``object`` and ``build`` null rather
+    than a guess. A line that is not a JSON object is a warning and is
+    skipped; the record's own ``case``, ``recorded_at`` and ``key`` are
+    what the page reads, so a record without them is skipped too."""
     lines = [line for line in text.splitlines() if line.strip()]
     parsed_urls = [parse_url(u, location) for u in urls]
     by_case_stamp = {
@@ -287,7 +309,9 @@ def parse_records(text: str, urls: list[str], location: str, warnings: list[str]
             warnings.append(f"{_where(urls, index, len(lines))}: record without case, recorded_at or key")
             continue
         url, name = None, None
-        if len(lines) == len(urls):
+        if len(urls) == 1:
+            url, name = urls[0], parsed_urls[0]
+        elif len(lines) == len(urls):
             url, name = urls[index], parsed_urls[index]
         else:
             hit = by_case_stamp.get((case, recorded_at.replace(":", "-")))
@@ -330,19 +354,30 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
     now = now or datetime.datetime.now(UTC)
     cap = max_objects if max_objects is not None else max_objects_from_env()
     urls = list_objects(location, gsutil, runner)
-    wanted, truncated = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, lead_days=lead_days, max_objects=cap)
-    known: dict[str, dict] = {}
+    wanted, truncated, older = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, lead_days=lead_days, max_objects=cap)
+    known: dict[str, list[dict]] = {}  # an object's records: one by the writer's rule, every line of it either way
     if prior and prior.get("source") == location.rstrip("/"):
         for record in prior.get("records") or []:
             if isinstance(record, dict) and isinstance(record.get("object"), str):
-                known[record["object"]] = record
-    kept = [known[url] for url in wanted if url in known]
+                known.setdefault(record["object"], []).append(record)
+    kept = [record for url in wanted if url in known for record in known[url]]
     to_read = [url for url in wanted if url not in known]
     warnings: list[str] = []
     fetched: list[dict] = []
     for part, text, err in cat_objects(to_read, gsutil, runner):
         if text is None:
             warnings.append(f"{part[0]}: gsutil cat failed: {err[:200] or 'failed'}")
+            continue
+        if len(part) > 1 and sum(1 for line in text.splitlines() if line.strip()) != len(part):
+            # An object with more than one line among them (not the
+            # writer's rule, but possible): read them one at a time, so
+            # every record carries its object and the incremental read
+            # keeps all of them next tick.
+            for url, single, single_err in cat_objects(part, gsutil, runner, chunk=1):
+                if single is None:
+                    warnings.append(f"{url[0]}: gsutil cat failed: {single_err[:200] or 'failed'}")
+                    continue
+                fetched.extend(parse_records(single, url, location, warnings))
             continue
         fetched.extend(parse_records(text, part, location, warnings))
     records = kept + fetched
@@ -357,6 +392,7 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
         "listed": len(urls),
         "fetched": len(to_read),
         "truncated": truncated,
+        "older": older,
         "warnings": warnings,
         "error": None,
         "records": records,

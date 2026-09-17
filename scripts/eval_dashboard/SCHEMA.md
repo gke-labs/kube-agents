@@ -686,9 +686,10 @@ at, build, commit, key, runs, passes, blocked, infra, judged{metric:
 {mean, n, spread{low, high, nights}}}, window{runs, passes, lines, full,
 cut}}` — `window` is what computed admission reads at that night (the
 newest whole records at the same key pooled to `bar.min_runs`; `full` when
-reached; `cut` when the pool ran out within two days of the read's start,
-so the store may hold older records at that key that admission pools and
-this read did not reach) and `spread` the range of the case's nightly means
+reached; `cut` when the pool is short while `store.json`'s `older` shows
+objects at that key the read left behind, older than the span or trimmed
+by the cap, so the store holds records that admission pools and this read
+did not reach) and `spread` the range of the case's nightly means
 over the last `spread_nights` at the same key (`nights` 1 is no spread);
 `key_changes[]` is `{night, at, from, to, changed[]}` for every record
 inside the drawn window whose key differs from the one before; `record` is
@@ -705,8 +706,8 @@ run never writes it), so nothing here is a presubmit's.
 
 The evidence store (`docs/designs/eval-scorer.md`, "What is stored")
 as one document: `{schema_version, source, read_at, window_days,
-lead_days, max_objects, listed, fetched, truncated{case: n}, warnings[],
-error, records[]}`. `records[]` is every object read inside the last
+lead_days, max_objects, listed, fetched, truncated{case: n}, older{case:
+{key: n}}, warnings[], error, records[]}`. `records[]` is every object read inside the last
 `window_days` plus `lead_days` (90 and 14: the page draws the window and
 pools the lead-in into its first nights) and under `max_objects` per case per key
 (`EVAL_BASELINE_MAX_OBJECTS`, 200, the gate's own cap), each the JSON line
@@ -714,7 +715,11 @@ as written — `{case, recorded_at, commit, key{setup_id, scoring_version,
 judge_model, fleet, verifiers}, runs, passes, blocked?, infra?, judged?}` —
 plus `object` (its URL) and `build` (the Prow build id from the object
 name, `null` when the name carries none). `truncated` says per case how
-many older objects the cap left out; `warnings[]` names each line that
+many older objects the cap left out, and `older` per case and version key
+(the key-id form, the directory path under the case) how many objects the
+listing showed and the read left behind, older than the span or trimmed
+by the cap, which is how the Trend page tells a short window it cannot
+see the bottom of (`cut`) from one that is genuinely short; `warnings[]` names each line that
 would not parse (skipped, never fatal); `error` is set when the read did
 not happen — the listing failed, or the workflow called `--fail-with` for a
 read its `timeout` killed or its wall clock could not fit — and the
