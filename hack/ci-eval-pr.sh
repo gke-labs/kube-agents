@@ -1632,29 +1632,37 @@ unit_cost_hint() {
 # it grades whatever the parent has said so far. Every unit inherits the
 # global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the six
 # full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
-# a ledger write, one closing line -- get 3600s.
+# a ledger write, one closing line -- get 3000s.
 #
-# Why 3600 (#1683). The nightly of 2026-09-16 (build 2100374258805903360)
-# cut three audits at the 2700s ceiling after their work was done:
-# compliance-rbac-overgrant rep 1's worker rewrote its ledger 2520s after
-# launch and the harness gave up 192s later, while the same case's passing
-# rep needed 160s between its ledger write and its delivered answer;
+# Why more than 2700 (#1683). The nightly of 2026-09-16 (build
+# 2100374258805903360) cut three audits at the ceiling after their work was
+# done: compliance-rbac-overgrant rep 1's worker rewrote its ledger 2520s
+# after launch and the harness gave up 192s later, while the same case's
+# passing rep needed 160s between its ledger write and its delivered answer;
 # upgrade-readiness-lagging-cluster rep 1 timed out 30s after its ledger was
 # created; fleet-cost-idle-pool rep 1 ran 2739s. The audit's own wall clock
 # at p90 is ~35 minutes (2074s over 903 presubmit repetitions, 2026-09-04 to
-# 09-15) and the relay after the ledger write ~3 minutes, so a run at p90
-# fits under 2700s -- the reps that hit the ceiling are the tail beyond it,
-# whose true length the graded durations cannot show because they are cut
-# at the ceiling. The worst that completed under it needed the whole 2700s;
-# an hour clears that by a third and costs at most 900s more on a unit that
-# would otherwise have been graded as a stub. The task lock a later
-# repetition waits behind is sized from this ceiling (run_one_unit), so a
-# unit that uses the whole hour cannot make its successor give up. The
-# variance is still #985's problem.
+# 09-15), so a run at p90 fits under 2700s -- the reps that hit the ceiling
+# are the tail beyond it, whose true length the graded durations cannot show
+# because they are cut there. The variance is still #985's problem.
+#
+# Why not more than 3000. The ledger read token is minted just before
+# devops-bench starts (mint_ledger_token, below) and lives one hour, and
+# ledger_issue_contains reads GitHub with it only after the agent turn, the
+# delegation wait and the settle. The delegation clock starts after the
+# opening turn, so everything outside it -- startup, port-forward, the
+# opening turn, settle, the verifier's own GET -- has to fit in the hour
+# minus this ceiling. 3000 leaves 600s for that; 3600 left nothing, and a
+# worker that delivered its URL in the last minutes would have handed the
+# verifier an expired token and a rung-2 "checks errored" red on a run that
+# had done its work. 300s over 2700 covers all three cut reps above with
+# margin. The task lock a later repetition waits behind is sized from this
+# ceiling (run_one_unit), so a unit that uses all of it cannot make its
+# successor give up.
 unit_delegation_timeout() {
   case "$1" in
-    compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3600 ;;
-    upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3600 ;;
+    compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
+    upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
@@ -1733,7 +1741,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The task lock is held for the holder's whole unit, so the wait must
   # outlast one: the unit's delegation ceiling plus grading and teardown
   # (about 300s on the record; 600s here). A fixed 1800s deadline under a
-  # 3600s ceiling would make a same-task successor give up while its
+  # 3000s ceiling would make a same-task successor give up while its
   # predecessor was still legitimately running -- 24% of presubmit runs
   # launch compliance rep 2 within 2090s of rep 1 (385 logs, 09-04 to
   # 09-15). The infra lock keeps its default: audit units carry no stack.
