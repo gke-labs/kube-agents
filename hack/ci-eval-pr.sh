@@ -591,20 +591,26 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     # The adjudicator verdict and its history, when the target has them, so the
     # rendered Brief bakes the current state instead of waiting for the first
     # page poll (and on storage.cloud.google.com that XHR redirects and fails).
-    # Missing is the normal case until the adjudicator has run.
+    # Missing is the normal case until the adjudicator has run. The published
+    # store.json rides along the same way for the Trend page: this hook never
+    # reads the evidence store itself (the ci-health workflow does), it only
+    # keeps the page on the last read instead of blanking it.
     case "$3" in
       gs://*)
         gsutil cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
         gsutil cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
+        gsutil cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
         ;;
       *)
         [ -f "${3%/}/health.json" ] && cp "${3%/}/health.json" "$2/health.json" || true
         [ -f "${3%/}/health-history.jsonl" ] && cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" || true
+        [ -f "${3%/}/store.json" ] && cp "${3%/}/store.json" "$2/store.json" || true
         ;;
     esac
     render_args=()
     [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
     [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+    [ -f "$2/store.json" ] && render_args+=(--store "$2/store.json")
     # Same --public-url rule as hack/ci-dashboard-refresh.sh: a bucket target
     # is the published site, so pass the target to derive <base href> without
     # hardcoding production when targeting a staging bucket. A local directory

@@ -164,14 +164,23 @@ esac
 # first poll. Missing is the normal case until the adjudicator has run.
 HEALTH_PRIOR="${WORK}/health.json"
 HISTORY_PRIOR="${WORK}/health-history.jsonl"
+# The evidence-store read the last tick published beside data.json, for the
+# Trend page (render.py --store). This script does not read the store
+# itself -- the ci-health workflow does, best-effort, as the archive reader;
+# carrying the published copy keeps the page on its last read rather than
+# blanking it on a publish from here. Missing is the state before any tick
+# has read the store.
+STORE_PRIOR="${WORK}/store.json"
 case "${EVAL_DASHBOARD_TARGET}" in
   gs://*)
     gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HEALTH_PRIOR}"
     gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HISTORY_PRIOR}"
+    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/store.json" "${STORE_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${STORE_PRIOR}"
     ;;
   *)
     [ -f "${EVAL_DASHBOARD_TARGET%/}/health.json" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}"
     [ -f "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}"
+    [ -f "${EVAL_DASHBOARD_TARGET%/}/store.json" ] && cp "${EVAL_DASHBOARD_TARGET%/}/store.json" "${STORE_PRIOR}"
     ;;
 esac
 
@@ -223,6 +232,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   render_args=()
   [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
   [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+  [ -f "$2/store.json" ] && render_args+=(--store "$2/store.json")
   # A bucket target is the published site: pass the target to derive <base href>
   # so every relative link resolves there without hardcoding production
   # when targeting a staging bucket. A local directory keeps relative links.

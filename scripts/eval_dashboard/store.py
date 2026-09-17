@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Read the eval evidence store into ``store.json`` for the Trend page.
+
+Usage::
+
+    python3 scripts/eval_dashboard/store.py --location gs://bucket/evidence \\
+        [--prior store.json] [--window-days 90] [--out store.json]
+
+The evidence store is where the nightly appends one record per case per
+night (``docs/designs/eval-scorer.md``, "What is stored"): one immutable
+object per record, filed under the case and the version key it was measured
+at, named by its ``recorded_at`` stamp and the Prow build that wrote it::
+
+    <location>/<case>/<setup-id>/<judge-model>/<sv>-f<n>-v<n>/<stamp>-<build>.jsonl
+
+This reader is the dashboard's, not the gate's: ``bench/kube_agents_bench/
+baselines.py`` reads the same layout to decide admission and must stop on a
+malformed line; this one feeds a page, skips the line with a warning and
+carries on. It imports nothing from ``bench`` on purpose -- the dashboard is
+stdlib plus gsutil (``collect.py``), and the record format is small enough to
+re-parse here. What it keeps identical is the one thing that must match: the
+per-case-per-key object cap (``EVAL_BASELINE_MAX_OBJECTS``, default 200)
+and the rule that a record's own ``key`` is the truth and the path only an
+index.
+
+ONE LISTING PER REFRESH, THEN ONLY THE NEW OBJECTS. Objects are immutable
+and the store is append-only, so a record once read is final. ``--prior``
+is the ``store.json`` the last refresh published; every object it already
+holds is kept without a fetch, and only the names the listing shows that it
+does not hold are read (``gsutil cat``, in chunks). A tick therefore costs
+one ``ls`` of the prefix plus last night's objects, whatever the store's
+age. Without a prior, everything inside the window is read once.
+
+THE WINDOW AND THE CAP. The Trend page shows ``--window-days`` (90, a
+quarter) of nights; objects whose name stamps them older are not fetched.
+Inside the window the newest ``--max-objects`` per case *per key* are
+read, the gate's own cap, and ``truncated`` says per case how many older
+objects that left out -- a cap that is silent reads as "I considered
+everything" when it did not. One object per case per night keeps a
+quarter (about 91 objects) well under the 200; the cap binds only if the
+nightly records more than twice a night.
+
+THE OUTPUT is what ``render.py --store`` reads (SCHEMA.md,
+"store.json")::
+
+    {schema_version: 1, source, read_at, window_days, max_objects,
+     listed, truncated{case: n}, warnings[], records[]}
+
+``records[]`` is every record read, each the JSON object as written plus
+``object`` (its URL) and ``build`` (the Prow build id from the name; the
+record itself does not carry it). ``recorded_at`` and ``key`` come from the
+record, never from the path.
+
+FAILURE POSTURE: a page, not a gate. A listing that fails writes the prior
+document back with ``error`` set and ``read_at`` unchanged, so the Trend
+page shows the last good read and says the store could not be read this
+tick; with no prior either, nothing is written and the exit is non-zero.
+The workflow runs this step best-effort and renders without ``--store``
+when it produced nothing, so the other pages publish regardless.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+SCHEMA_VERSION = 1
+#: How many nights the Trend page carries. A quarter, per #1493's question.
+DEFAULT_WINDOW_DAYS = 90
+#: Newest objects read per case per key: the gate's cap, the same default
+#: and the same environment variable (bench/kube_agents_bench/evidence_store.py).
+DEFAULT_MAX_OBJECTS = 200
+MAX_OBJECTS_ENV = "EVAL_BASELINE_MAX_OBJECTS"
+#: Objects per ``gsutil cat``: well under any argv limit, few enough calls
+#: for a cold read of a quarter (about 3,500 objects at 38 cases a night).
+CAT_CHUNK = 100
+#: Concurrent ``gsutil cat`` calls. gsutil fetches the objects of one call
+#: serially at close to a second each (38 objects took 30 s on 2026-09-17),
+#: so a cold read of a quarter is three quarters of an hour single-file and
+#: a few minutes at this width; the incremental tick reads one chunk.
+CAT_WORKERS = 8
+#: Seconds before one gsutil call is treated as failed.
+GSUTIL_TIMEOUT_S = 300
+#: What gsutil says about a prefix that holds nothing yet (collect.py reads
+#: the same phrase): an empty store, not an unreachable one.
+NO_OBJECTS = "matched no objects"
+#: An object name: ``<recorded_at with ':' as '-'>-<build>.jsonl``, as
+#: evidence_store.GcsBackend.append writes it. The build is Prow's numeric
+#: id; ``local`` (a laptop run) or anything else reads as no build.
+NAME_RE = re.compile(r"^(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)-(?P<build>[^/]+)\.jsonl$")
+UTC = datetime.timezone.utc
+
+
+def utc_now() -> str:
+    return datetime.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def max_objects_from_env(env: dict | None = None) -> int:
+    """``EVAL_BASELINE_MAX_OBJECTS`` or the default; junk falls back, as the
+    gate's reader does -- this bounds a read, it is not a correctness knob."""
+    raw = (env if env is not None else os.environ).get(MAX_OBJECTS_ENV, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_OBJECTS
+    return value if value > 0 else DEFAULT_MAX_OBJECTS
+
+
+# --------------------------------------------------------------------------
+# gsutil
+
+
+def gsutil_call(args: list[str], gsutil: str = "gsutil", runner=None) -> tuple[str | None, str]:
+    """(stdout, stderr) of one gsutil call; stdout None when it failed.
+    ``runner`` defaults to ``subprocess.run`` at call time, so a test that
+    patches it sees every call."""
+    run = runner or subprocess.run
+    try:
+        proc = run([gsutil, *args], capture_output=True, text=True, timeout=GSUTIL_TIMEOUT_S, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, (proc.stderr or "").strip()
+    return proc.stdout, (proc.stderr or "")
+
+
+def list_objects(location: str, gsutil: str = "gsutil", runner=None) -> list[str]:
+    """Every ``.jsonl`` object URL under ``location``, sorted. An empty prefix
+    is ``[]``; a listing that failed raises ``RuntimeError`` with gsutil's
+    words, so the caller can tell the two apart (module docstring)."""
+    out, err = gsutil_call(["ls", f"{location.rstrip('/')}/**"], gsutil, runner)
+    if out is None:
+        if NO_OBJECTS in err.lower():
+            return []
+        raise RuntimeError(f"gsutil ls {location}: {err[:400] or 'failed'}")
+    return sorted(
+        line.strip() for line in out.splitlines()
+        if line.strip().startswith("gs://") and line.strip().endswith(".jsonl")
+    )
+
+
+def cat_objects(urls: list[str], gsutil: str = "gsutil", runner=None, chunk: int = CAT_CHUNK, workers: int = CAT_WORKERS):
+    """``(chunk of URLs, text or None, error)`` per ``gsutil cat`` call, in
+    chunk order; the calls run ``workers`` at a time. gsutil prints the
+    objects in argument order, each ending in the newline the writer put
+    there, so a chunk's text is its lines in order."""
+    parts = [urls[start:start + chunk] for start in range(0, len(urls), chunk)]
+    if not parts:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(parts)))) as pool:
+        results = list(pool.map(lambda part: gsutil_call(["cat", *part], gsutil, runner), parts))
+    return [(part, out, err) for part, (out, err) in zip(parts, results, strict=True)]
+
+
+# --------------------------------------------------------------------------
+# names
+
+
+def parse_url(url: str, location: str) -> dict | None:
+    """``{case, key_dir, name, stamp, build}`` for an object URL under
+    ``location``, or None for one that is not in the store's layout (a stray
+    object directly under the prefix, a name without a stamp)."""
+    root = location.rstrip("/") + "/"
+    if not url.startswith(root):
+        return None
+    relative = url[len(root):]
+    parts = relative.split("/")
+    if len(parts) < 2:
+        return None
+    match = NAME_RE.match(parts[-1])
+    if not match:
+        return None
+    build = match.group("build")
+    return {
+        "case": parts[0],
+        "key_dir": "/".join(parts[:-1]),
+        "name": parts[-1],
+        "stamp": match.group("stamp"),
+        "build": build if build.isdigit() else None,
+    }
+
+
+def stamp_ms(stamp: str) -> float | None:
+    """Epoch milliseconds of a name's stamp (``2026-09-17T05-54-31Z``)."""
+    try:
+        parsed = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H-%M-%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    return parsed.timestamp() * 1000
+
+
+def select_objects(urls: list[str], location: str, *, now_ms: float, window_days: int, max_objects: int) -> tuple[list[str], dict[str, int]]:
+    """The URLs worth reading: inside the window by their name's stamp, then
+    the newest ``max_objects`` per case per key directory. Returns them
+    sorted, with ``{case: objects the cap left out}``. A name that is not
+    in the layout is skipped: the store's own reader would refuse it, and
+    the page has nothing to say about it."""
+    since_ms = now_ms - window_days * 24 * 3600 * 1000
+    by_dir: dict[str, list[tuple[str, str]]] = {}
+    for url in urls:
+        parsed = parse_url(url, location)
+        if parsed is None:
+            continue
+        at = stamp_ms(parsed["stamp"])
+        if at is None or at < since_ms:
+            continue
+        by_dir.setdefault(parsed["key_dir"], []).append((parsed["name"], url))
+    chosen: list[str] = []
+    truncated: dict[str, int] = {}
+    for key_dir, group in by_dir.items():
+        group.sort()  # names start with the stamp: chronological
+        if len(group) > max_objects:
+            case = key_dir.split("/", 1)[0]
+            truncated[case] = truncated.get(case, 0) + len(group) - max_objects
+            group = group[-max_objects:]
+        chosen.extend(url for _, url in group)
+    return sorted(chosen), truncated
+
+
+# --------------------------------------------------------------------------
+# records
+
+
+def parse_records(text: str, urls: list[str], location: str, warnings: list[str]) -> list[dict]:
+    """The records in one ``gsutil cat`` output, each with its ``object`` and
+    ``build``. Lines are matched to objects by order when the counts agree
+    (one record per object, the writer's rule); otherwise by the case and
+    stamp the name carries, and an unmatched record keeps ``object`` and
+    ``build`` null rather than a guess. A line that is not a JSON object is
+    a warning and is skipped; the record's own ``case``, ``recorded_at``
+    and ``key`` are what the page reads, so a record without them is
+    skipped too."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    parsed_urls = [parse_url(u, location) for u in urls]
+    by_case_stamp = {
+        (p["case"], p["stamp"]): (u, p) for u, p in zip(urls, parsed_urls) if p is not None
+    }
+    records = []
+    for index, line in enumerate(lines):
+        try:
+            doc = json.loads(line)
+        except ValueError as exc:
+            warnings.append(f"{_where(urls, index, len(lines))}: not valid JSON: {exc}")
+            continue
+        if not isinstance(doc, dict):
+            warnings.append(f"{_where(urls, index, len(lines))}: not a JSON object")
+            continue
+        case = doc.get("case")
+        recorded_at = doc.get("recorded_at")
+        key = doc.get("key")
+        if not isinstance(case, str) or not isinstance(recorded_at, str) or not isinstance(key, dict):
+            warnings.append(f"{_where(urls, index, len(lines))}: record without case, recorded_at or key")
+            continue
+        url, name = None, None
+        if len(lines) == len(urls):
+            url, name = urls[index], parsed_urls[index]
+        else:
+            hit = by_case_stamp.get((case, recorded_at.replace(":", "-")))
+            if hit:
+                url, name = hit
+        record = dict(doc)
+        record["object"] = url
+        record["build"] = name["build"] if name else None
+        records.append(record)
+    return records
+
+
+def _where(urls: list[str], index: int, count: int) -> str:
+    return urls[index] if count == len(urls) else f"{urls[0]} .. {urls[-1]} line {index + 1}"
+
+
+# --------------------------------------------------------------------------
+# the document
+
+
+def load_prior(path: pathlib.Path | None) -> dict | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("records"), list):
+        return None
+    return doc
+
+
+def read_store(location: str, *, prior: dict | None = None, window_days: int = DEFAULT_WINDOW_DAYS,
+               max_objects: int | None = None, now: datetime.datetime | None = None,
+               gsutil: str = "gsutil", runner=None) -> dict:
+    """The store.json document for ``location``: one listing, the prior's
+    records kept where the listing still names them, the rest fetched.
+    Raises ``RuntimeError`` when the listing fails; the CLI decides what
+    that means with or without a prior."""
+    now = now or datetime.datetime.now(UTC)
+    cap = max_objects if max_objects is not None else max_objects_from_env()
+    urls = list_objects(location, gsutil, runner)
+    wanted, truncated = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, max_objects=cap)
+    known: dict[str, dict] = {}
+    if prior and prior.get("source") == location.rstrip("/"):
+        for record in prior.get("records") or []:
+            if isinstance(record, dict) and isinstance(record.get("object"), str):
+                known[record["object"]] = record
+    kept = [known[url] for url in wanted if url in known]
+    to_read = [url for url in wanted if url not in known]
+    warnings: list[str] = []
+    fetched: list[dict] = []
+    for part, text, err in cat_objects(to_read, gsutil, runner):
+        if text is None:
+            warnings.append(f"gsutil cat failed for {len(part)} object(s) starting {part[0]}: {err[:200] or 'failed'}")
+            continue
+        fetched.extend(parse_records(text, part, location, warnings))
+    records = kept + fetched
+    records.sort(key=lambda r: (str(r.get("recorded_at") or ""), str(r.get("case") or ""), str(r.get("object") or "")))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": location.rstrip("/"),
+        "read_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "window_days": window_days,
+        "max_objects": cap,
+        "listed": len(urls),
+        "fetched": len(to_read),
+        "truncated": truncated,
+        "warnings": warnings,
+        "error": None,
+        "records": records,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--location", required=True, metavar="GS_PREFIX", help="the store, e.g. gs://kube-agents-evals-bench/evidence")
+    parser.add_argument("--prior", type=pathlib.Path, default=None, help="the store.json the last refresh published; its records are kept without a fetch (missing or unreadable: read everything in the window)")
+    parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS, metavar="N", help=f"read objects stamped inside the last N days (default {DEFAULT_WINDOW_DAYS})")
+    parser.add_argument("--max-objects", type=int, default=None, metavar="N", help=f"newest objects per case per key (default {MAX_OBJECTS_ENV} or {DEFAULT_MAX_OBJECTS}, the gate's cap)")
+    parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("store.json"))
+    parser.add_argument("--gsutil", default="gsutil", help="gsutil binary to invoke")
+    args = parser.parse_args(argv)
+    if args.window_days < 1:
+        parser.error("--window-days must be at least 1")
+    if args.max_objects is not None and args.max_objects < 1:
+        parser.error("--max-objects must be at least 1")
+
+    prior = load_prior(args.prior)
+    try:
+        doc = read_store(args.location, prior=prior, window_days=args.window_days, max_objects=args.max_objects, gsutil=args.gsutil)
+    except RuntimeError as exc:
+        if prior is None:
+            print(f"error: {exc}; no prior store.json to fall back on", file=sys.stderr)
+            return 1
+        prior = dict(prior)
+        prior["error"] = f"{utc_now()}: {exc}"
+        args.out.write_text(json.dumps(prior, separators=(",", ":")) + "\n", encoding="utf-8")
+        print(f"warning: {exc}; wrote the prior read of {prior.get('read_at')} to {args.out}", file=sys.stderr)
+        return 0
+    for warning in doc["warnings"]:
+        print(f"warning: {warning}", file=sys.stderr)
+    args.out.write_text(json.dumps(doc, separators=(",", ":")) + "\n", encoding="utf-8")
+    print(
+        f"wrote {args.out}: {len(doc['records'])} records ({doc['fetched']} objects fetched,"
+        f" {doc['listed']} listed, {len(doc['warnings'])} warnings)",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

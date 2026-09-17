@@ -1,5 +1,6 @@
-/* The Brief (index.html), the PR view (run.html), the Grid (grid.html) and
- * the Cases page (cases.html) share this script.
+/* The Brief (index.html), the PR view (run.html), the Grid (grid.html),
+ * the Cases page (cases.html), the Nightly report (nightly.html) and the
+ * Trend page (trend.html) share this script.
  *
  * render.py inlines it into every page after two JSON data elements
  * (PAGE.inlineBrief and PAGE.inlineHealth): brief.json -- the per-run
@@ -27,6 +28,7 @@
  *   run.html#build=<prow build id>
  *   grid.html#since=<ISO>&until=<ISO>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
  *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held
+ *   trend.html#cases=a,b | trend.html#domain=<domain> [&metric=<judged metric>][&since=<ISO>[&until=<ISO>]]
  * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
  * `#gate` or `#agent`; `?build=<id>` on run.html; the same on the Grid and
  * the Cases page) is still read, so a link already posted opens the same
@@ -81,8 +83,8 @@ const PAGE = {
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
   briefFile: "brief.json",
   healthFile: "health.json",
-  pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html", nightly: "nightly.html" },
-  titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test", nightly: "kube-agents · last night's run" },
+  pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html", nightly: "nightly.html", trend: "trend.html" },
+  titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test", nightly: "kube-agents · last night's run", trend: "kube-agents · scores over time on main" },
   // The Grid's window chips, and the one it opens with when the URL names none.
   gridWindows: [["6h", 6 * 3600 * 1000], ["24h", 24 * 3600 * 1000], ["36h", 36 * 3600 * 1000], ["7d", 7 * 24 * 3600 * 1000]],
   gridDefaultWindow: "36h",
@@ -104,6 +106,15 @@ const PAGE = {
   nightStateClass: { pass: "p-pass", partial: "p-partial", fail: "p-fail", infra: "p-infra" },
   nightStateWords: { pass: "passed all reps", partial: "failed some reps", fail: "failed all reps", infra: "quota / infra, not graded" },
   nightsListed: 14,
+  // The Trend page (trend.py): a judged metric's name as a URL parameter,
+  // the chart geometry (SVG user units; the chart scales to its card), and
+  // where "score" is defined once.
+  metricRe: /^[A-Za-z][A-Za-z0-9_]{0,39}$/,
+  trendChart: { width: 520, height: 170, left: 38, right: 14, top: 22, bottom: 26, barMax: 24, gap: 2, dot: 4 },
+  // Days of padding around the nights on the time axis, so a single night
+  // and an incident marker both land inside the plot.
+  trendPadDays: 1,
+  scoreDocUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/designs/eval-scorer.md#what-a-score-is",
 };
 
 function inlineJson(id) {
@@ -123,7 +134,7 @@ let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 let live = false;
 // What the reader has clicked on the Grid and the Cases page. URL parameters
 // seed it; a chip or a cell changes it and re-renders.
-const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false };
+const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false, scope: null, metric: null };
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -247,7 +258,7 @@ function linkCaseIds(values) {
 // `#agent`, the old anchors, still selects that view; a bare case id on
 // the Cases page names its row.
 function linkState() {
-  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null };
+  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null, domain: null, metric: null };
   let query, fragment;
   try {
     query = new URLSearchParams(location.search);
@@ -271,6 +282,14 @@ function linkState() {
   out.show = pick("show", ["all", "blocking", "held"]);
   out.window = pick("window", PAGE.gridWindows.map((w) => w[0]));
   out.rows = pick("rows", ["all", "admitted", "failing"]);
+  // The Trend page's scope and metric: a domain slug (the case-id grammar
+  // covers it) and a judged metric's name; a value outside its grammar is
+  // no parameter, and the metric is checked against the metrics on record
+  // when the page renders.
+  const domain = param("domain").trim();
+  if (PAGE.caseIdRe.test(domain)) out.domain = domain;
+  const metric = param("metric").trim();
+  if (PAGE.metricRe.test(metric)) out.metric = metric;
   const view = param("view") || location.hash.slice(1);
   out.view = Object.values(PAGE.views).includes(view) ? view : "";
   // A bare fragment that is a case id (`cases.html#<case>`) names the row to
@@ -300,6 +319,10 @@ const numbersHref = () => briefHref(PAGE.views.agent);
 // The Grid on the incident's own window: the same scope, no view.
 const gridHref = (inc) => { const params = scopeParams(inc); return PAGE.pages.grid + (params.length ? `#${params.join("&")}` : ""); };
 const caseHref = (name) => `${PAGE.pages.cases}#${enc(name)}`;
+// The Trend page on a set of cases (the Cases page's link, the Brief's last
+// incident with its start and end), or on a domain.
+const trendHref = (cases, sinceMs = null, untilMs = null) => `${PAGE.pages.trend}#${scopeParams({ cases, sinceMs, untilMs }).join("&")}`;
+const trendDomainHref = (domain) => `${PAGE.pages.trend}#domain=${enc(domain)}`;
 const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 /* ---- links out ---- */
@@ -684,7 +707,7 @@ function lastIncidentHtml() {
   if (!past.length) return brief.history ? `<p class="mut">No incident on record yet.</p>` : `<p class="mut">No incident history is published yet, so only the current state is shown.</p>`;
   const inc = past[0];
   const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : "a degraded gate";
-  return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a></p>`;
+  return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a> <a href="${esc(trendHref(inc.cases, inc.sinceMs, inc.untilMs))}">The record on main around the night it started →</a></p>`;
 }
 
 /* ---- the Brief's release table (SCHEMA.md: releases[]) ---- */
@@ -789,7 +812,7 @@ function briefHtml(link) {
 
 function footHtml() {
   const generated = parseIso(brief.generated_at);
-  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
+  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span>Scores over time on main: <a href="${PAGE.pages.trend}">trend</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
 }
 
 /* ---- the PR view ---- */
@@ -979,7 +1002,7 @@ function caseRow(c, link) {
   const pre = rates.presubmit || [], night = rates.nightly || [];
   const classes = [link.caseHash === c.name ? "hl" : "", c.status === "retired" ? "dim" : ""].filter(Boolean).join(" ");
   const issues = (c.issues || []).map(issueLink).join(" · ") || `<span class="mut">—</span>`;
-  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}</td>` +
+  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
     `<td>${stripHtml(c)}</td><td>${rateCell(pre[0])}</td><td>${rateCell(pre[1])}</td><td>${rateCell(night[0])}</td><td>${rateCell(night[1])}</td>` +
     `<td>${statusPill(c)}</td><td class="iss">${issues}</td></tr>` +
     `<tr class="why ${classes}"><td colspan="${CASE_COLUMNS}">${lastFailureHtml(c)}</td></tr>`;
@@ -1362,10 +1385,279 @@ function nightlyHtml(link) {
     nightsListHtml(night) + footHtml();
 }
 
+/* ---- the Trend page (SCHEMA.md: brief.json's trend block; trend.py) ---- */
+
+const trendDoc = () => (brief.trend && typeof brief.trend === "object" && !Array.isArray(brief.trend) ? brief.trend : null);
+const trendCases = (t) => (t && t.cases && typeof t.cases === "object" && !Array.isArray(t.cases) ? t.cases : {});
+const trendDomains = (t) => (t && t.domains && typeof t.domains === "object" && !Array.isArray(t.domains) ? t.domains : {});
+const trendNights = (t) => (t && Array.isArray(t.nights) ? t.nights.filter((n) => n && typeof n === "object" && typeof n.id === "string") : []);
+const pointAt = (p) => parseIso(p.at);
+const fmtRate = (passes, runs) => (runs ? `${pct(passes / runs)} (${passes}/${runs})` : "no graded run");
+const fmtMean = (value) => (isNumber(value) ? value.toFixed(2) : "—");
+
+// A night's label and link: dated by the collector's start when the build is
+// a nightly run on record (the Nightly report names nights that way), else
+// by the record's own stamp. The report link only when the report carries
+// the night; otherwise the build log, when the collector recorded one.
+function trendNight(t, id) {
+  const night = trendNights(t).find((n) => n.id === id);
+  const ms = night ? (parseIso(night.started) ?? parseIso(night.at)) : null;
+  const onReport = night && night.build != null && nights().some((n) => String(n.build) === String(night.build));
+  return { night, ms, label: ms != null ? et(ms) : "an unknown night", href: onReport ? nightHref({ build: night.build }) : (night && night.log_url ? night.log_url : null) };
+}
+
+// The judged metric the page draws: the chip or the link, when it is one the
+// store carries; else the default (rung 6's metric when present).
+function trendMetric(t, link) {
+  const metrics = Array.isArray(t.metrics) ? t.metrics.filter((m) => typeof m === "string") : [];
+  const wanted = ui.metric || link.metric;
+  if (wanted && metrics.includes(wanted)) return wanted;
+  return typeof t.default_metric === "string" && metrics.includes(t.default_metric) ? t.default_metric : (metrics[0] || null);
+}
+
+// What the page is scoped to: a chip wins, then the link's cases, then its
+// domain, else the overview of every domain.
+function trendScope(t, link) {
+  const domains = trendDomains(t);
+  if (ui.scope != null) return ui.scope && domains[ui.scope] ? { domain: ui.scope } : { all: true };
+  if (link.cases.size) return { cases: [...link.cases] };
+  if (link.domain && domains[link.domain]) return { domain: link.domain };
+  return { all: true };
+}
+
+// The time axis: the nights in the points, the incident when linked, padded
+// a day each side so one night and a marker both sit inside the plot.
+function trendRange(pointSets, link) {
+  const stamps = [];
+  for (const points of pointSets) for (const p of points) { const ms = pointAt(p); if (ms != null) stamps.push(ms); }
+  if (link.sinceMs != null) stamps.push(link.sinceMs);
+  if (link.untilMs != null) stamps.push(link.untilMs);
+  if (!stamps.length) return null;
+  const pad = PAGE.trendPadDays * PAGE.dayMs;
+  return { fromMs: Math.min(...stamps) - pad, toMs: Math.max(...stamps) + pad };
+}
+
+// One chart: `kind` is "rate" (bars for each night's pass rate, a line for
+// the trailing admission window, the bar) or "judged" (a line of means with
+// the spread band; a lone night is a hollow point). One series colour, the
+// page accent; text in text tokens; the tooltip carries every value.
+function trendChartHtml(t, points, kind, metric, range, markers, title) {
+  const g = PAGE.trendChart;
+  const plotW = g.width - g.left - g.right, plotH = g.height - g.top - g.bottom;
+  const x = (ms) => g.left + (range.toMs === range.fromMs ? plotW / 2 : (ms - range.fromMs) / (range.toMs - range.fromMs) * plotW);
+  const y = (v) => g.top + (1 - Math.max(0, Math.min(1, v))) * plotH;
+  const spanDays = Math.max(1, (range.toMs - range.fromMs) / PAGE.dayMs);
+  const slot = plotW / spanDays;
+  const barW = Math.max(3, Math.min(g.barMax, slot * 0.6 - g.gap));
+  const parts = [];
+  // Grid: solid hairlines at 0, 25, 50, 75, 100 %, ticks in the muted ink.
+  for (const v of [0, 0.25, 0.5, 0.75, 1]) parts.push(`<line class="grid" x1="${g.left}" x2="${g.left + plotW}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"></line><text class="axis" x="${g.left - 6}" y="${(y(v) + 3.5).toFixed(1)}" text-anchor="end">${Math.round(v * 100)}%</text>`);
+  // X ticks: one per night up to fourteen, thinned beyond; each a date.
+  const nightsOnAxis = points.map((p) => pointAt(p)).filter((ms) => ms != null);
+  const every = Math.max(1, Math.ceil(nightsOnAxis.length / 14));
+  nightsOnAxis.forEach((ms, i) => { if (i % every === 0 || i === nightsOnAxis.length - 1) parts.push(`<text class="axis" x="${x(ms).toFixed(1)}" y="${g.height - 8}" text-anchor="middle">${esc(fmtParts(ms, { month: "short", day: "numeric" }))}</text>`); });
+  const drawn = points.filter((p) => pointAt(p) != null);
+  const label = (px, py, text) => (px > g.left + plotW * 0.66
+    ? `<text class="lab" x="${(px - 8).toFixed(1)}" y="${(py + 4).toFixed(1)}" text-anchor="end">${esc(text)}</text>`
+    : `<text class="lab" x="${(px + 8).toFixed(1)}" y="${(py + 4).toFixed(1)}">${esc(text)}</text>`);
+  if (kind === "rate") {
+    const bar = isNumber(t.bar && t.bar.rate) ? t.bar.rate : null;
+    if (bar != null) parts.push(`<line class="thr" x1="${g.left}" x2="${g.left + plotW}" y1="${y(bar).toFixed(1)}" y2="${y(bar).toFixed(1)}"></line><text class="thr-l" x="${g.left + 4}" y="${(y(bar) - 4).toFixed(1)}">${Math.round(bar * 100)}% bar</text>`);
+    for (const p of drawn) {
+      if (!p.runs) continue;
+      const rate = p.passes / p.runs, top = y(rate), h = Math.max(0, y(0) - top);
+      const left = x(pointAt(p)) - barW / 2;
+      // 4px rounded data end, square at the baseline: a path, not a rect.
+      const r = Math.min(4, barW / 2, h);
+      parts.push(`<path class="bar" d="M${left.toFixed(1)},${y(0).toFixed(1)} v${(-(h - r)).toFixed(1)} a${r},${r} 0 0 1 ${r},${-r} h${(barW - 2 * r).toFixed(1)} a${r},${r} 0 0 1 ${r},${r} v${(h - r).toFixed(1)} z"></path>`);
+    }
+    const line = drawn.filter((p) => p.window && p.window.runs > 0);
+    if (line.length > 1) parts.push(`<path class="line" d="${line.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p.window.passes / p.window.runs).toFixed(1)}`).join(" ")}"></path>`);
+    for (const p of line) parts.push(`<circle class="dot${p.window.full ? "" : " lone"}" cx="${x(pointAt(p)).toFixed(1)}" cy="${y(p.window.passes / p.window.runs).toFixed(1)}" r="${g.dot}"></circle>`);
+    const last = line[line.length - 1];
+    if (last) parts.push(label(x(pointAt(last)), y(last.window.passes / last.window.runs), `${pct(last.window.passes / last.window.runs)} of ${last.window.runs}${last.window.full ? "" : " · window not full"}`));
+  } else if (metric) {
+    const withMetric = drawn.filter((p) => p.judged && p.judged[metric]);
+    const band = withMetric.filter((p) => { const j = p.judged[metric]; const s = j.spread || j; return isNumber(s.low) && isNumber(s.high) && (s.nights == null ? (s.cases || 0) > 1 : s.nights > 1); });
+    if (band.length > 1) parts.push(`<path class="band" d="${band.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y((p.judged[metric].spread || p.judged[metric]).high).toFixed(1)}`).join(" ")} ${[...band].reverse().map((p) => `L${x(pointAt(p)).toFixed(1)},${y((p.judged[metric].spread || p.judged[metric]).low).toFixed(1)}`).join(" ")} z"></path>`);
+    if (withMetric.length > 1) parts.push(`<path class="line" d="${withMetric.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p.judged[metric].mean).toFixed(1)}`).join(" ")}"></path>`);
+    for (const p of withMetric) {
+      const j = p.judged[metric], s = j.spread || j;
+      const lone = s.nights != null ? s.nights < 2 : (s.cases || 0) < 2;
+      parts.push(`<circle class="dot${lone ? " lone" : ""}" cx="${x(pointAt(p)).toFixed(1)}" cy="${y(j.mean).toFixed(1)}" r="${g.dot}"></circle>`);
+    }
+    const last = withMetric[withMetric.length - 1];
+    if (last) {
+      const j = last.judged[metric], s = j.spread || j;
+      const lone = s.nights != null ? s.nights < 2 : (s.cases || 0) < 2;
+      const range = !lone && s.nights == null ? ` · ${fmtMean(s.low)}–${fmtMean(s.high)} across ${plural(s.cases, "case")}` : "";
+      parts.push(label(x(pointAt(last)), y(j.mean), `${fmtMean(j.mean)} · n=${j.n}${lone ? (s.nights != null ? " · one night, no spread yet" : " · one case") : range}`));
+    }
+  }
+  // Markers: the version key changed (label: the components), the incident.
+  markers.forEach((m, i) => {
+    if (m.ms == null || m.ms < range.fromMs || m.ms > range.toMs) return;
+    const px = x(m.ms).toFixed(1);
+    parts.push(`<line class="${m.cls}" x1="${px}" x2="${px}" y1="${g.top - 4}" y2="${y(0).toFixed(1)}"></line><text class="${m.cls}-l" x="${(Number(px) + 4).toFixed(1)}" y="${g.top - 8 + (i % 2) * 10}">${esc(m.label)}</text>`);
+  });
+  // Hit targets: one per night, the slot wide and the plot tall, carrying
+  // the readout for the tooltip and a native <title>; focusable.
+  for (const p of drawn) {
+    const cx = x(pointAt(p)), w = Math.max(24, slot);
+    const night = trendNight(t, p.night);
+    const lines = [`${night.label}${p.commit ? ` · ${String(p.commit).slice(0, 7)}` : ""}`];
+    if (kind === "rate") {
+      lines.push(`nightly pass rate: ${fmtRate(p.passes, p.runs)}${p.cases ? ` over ${plural(p.cases, "case")}` : ""}`);
+      if (p.window) lines.push(`trailing window: ${fmtRate(p.window.passes, p.window.runs)} across ${plural(p.window.lines, "night")}${p.window.full ? "" : " · not full yet"}`);
+      if (p.blocked || p.infra) lines.push(`${p.blocked || 0} blocked · ${p.infra || 0} infra, not in the rate`);
+    } else if (metric && p.judged && p.judged[metric]) {
+      const j = p.judged[metric], s = j.spread || j;
+      lines.push(`${metric}: ${fmtMean(j.mean)} mean · n=${j.n}`);
+      if (s.nights != null) lines.push(s.nights > 1 ? `range of the last ${plural(s.nights, "nightly mean")}: ${fmtMean(s.low)} – ${fmtMean(s.high)}` : "one night at this key: no spread to show yet");
+      else if (s.cases != null) lines.push(s.cases > 1 ? `range across ${plural(s.cases, "case")}: ${fmtMean(s.low)} – ${fmtMean(s.high)}` : "one case that night");
+    } else if (metric) lines.push(`${metric}: not recorded that night`);
+    if (p.key) lines.push(`key ${p.key}`);
+    const tip = lines.join("\n");
+    parts.push(`<rect class="hit" tabindex="0" x="${(cx - w / 2).toFixed(1)}" y="${g.top}" width="${w.toFixed(1)}" height="${plotH}" data-tip="${esc(tip)}" aria-label="${esc(tip)}"><title>${esc(tip)}</title></rect>`);
+  }
+  return `<svg class="tchart" viewBox="0 0 ${g.width} ${g.height}" role="img" aria-label="${esc(title)}">${parts.join("")}</svg>`;
+}
+
+function trendLegendHtml(kind, metric, t) {
+  const spread = isNumber(t.spread_nights) ? t.spread_nights : 7;
+  if (kind === "rate") return `<div class="tlegend"><span><i></i>pass rate that night (passes / scored runs)</span><span><i class="line"></i>trailing window: newest nights at the same key pooled to ${esc(t.bar && t.bar.min_runs || 20)} runs (hollow: not full yet)</span><span><i class="thr"></i>the admission bar</span><span><i class="keym"></i>version key changed</span></div>`;
+  return `<div class="tlegend"><span><i class="line"></i>${esc(metric || "judged")} mean per night (n in the tooltip)</span><span><i class="band"></i>range of the nightly means over the last ${spread} nights at the same key, or across a domain's cases</span><span><i class="keym"></i>version key changed</span></div>`;
+}
+
+function trendMarkers(t, keyChanges, link) {
+  const out = [];
+  for (const k of keyChanges || []) {
+    const night = trendNight(t, k.night);
+    const ms = night.ms ?? parseIso(k.at);
+    out.push({ ms, cls: "keym", label: `key: ${(k.changed || []).join(", ") || "changed"}` });
+  }
+  if (link.sinceMs != null) out.push({ ms: link.sinceMs, cls: "incm", label: "incident start" });
+  if (link.untilMs != null) out.push({ ms: link.untilMs, cls: "incm", label: "healthy again" });
+  return out;
+}
+
+// The table twin of a scope's charts: every value the charts draw.
+function trendTableHtml(t, points, metric, perDomain) {
+  const rows = points.map((p) => {
+    const night = trendNight(t, p.night);
+    const when = night.href ? `<a href="${esc(night.href)}">${esc(night.label)}</a>` : esc(night.label);
+    const j = metric && p.judged ? p.judged[metric] : null;
+    const s = j ? (j.spread || j) : null;
+    const spread = s && isNumber(s.low) && isNumber(s.high) && (s.nights != null ? s.nights > 1 : (s.cases || 0) > 1) ? `${fmtMean(s.low)} – ${fmtMean(s.high)}` : "—";
+    return `<tr><td>${when}</td>${perDomain ? `<td>${p.cases}</td>` : ""}<td>${esc(fmtRate(p.passes, p.runs))}</td><td>${p.window ? esc(`${fmtRate(p.window.passes, p.window.runs)}${p.window.full ? "" : " · not full"}`) : "—"}</td><td>${j ? `${fmtMean(j.mean)} <span class="mut">n=${j.n}</span>` : "—"}</td><td>${spread}</td><td class="mut">${esc(perDomain ? (p.keys || []).join(", ") : p.key || "")}</td></tr>`;
+  }).reverse();
+  return `<details class="tv"><summary>Table view · ${plural(points.length, "night")}</summary><table class="tt"><thead><tr><th>Night</th>${perDomain ? "<th>Cases</th>" : ""}<th>Pass rate</th><th>Trailing window</th><th>${esc(metric || "judged")}</th><th>Spread</th><th>Version key</th></tr></thead><tbody>${rows.join("")}</tbody></table></details>`;
+}
+
+function trendRecordHtml(rec) {
+  if (!rec) return "";
+  const words = { "would-admit": "the record would admit it", "would-demote": "the record would demote it", collecting: "collecting" };
+  const bar = rec.bar || {};
+  const detail = rec.state === "collecting"
+    ? `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key, ${Math.max(0, (bar.min_runs || 20) - rec.runs)} more runs before the window is full`
+    : `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key against a bar of ${pct(bar.rate || 0.95)} over ${bar.min_runs || 20}`;
+  return `<p class="rec"><b>Record today: ${esc(words[rec.state] || rec.state)}.</b> ${esc(detail)} <span class="mut">(as of ${esc(et(parseIso(rec.as_of)))}; the roster decides, the record informs)</span></p>`;
+}
+
+function trendKeyChangesHtml(t, changes) {
+  if (!changes || !changes.length) return "";
+  const items = changes.map((k) => { const night = trendNight(t, k.night); return `<li>${esc(night.label)}: <b>${esc((k.changed || []).join(", "))}</b> changed · <code>${esc(k.from)}</code> → <code>${esc(k.to)}</code></li>`; });
+  return `<p class="rec"><b>Version key changed</b> (pooling never crosses one):</p><ul class="merges">${items.join("")}</ul>`;
+}
+
+function trendCardHtml(t, title, sub, points, keyChanges, metric, range, link, perDomain, footer) {
+  const markers = trendMarkers(t, keyChanges, link);
+  if (!points.length) return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><p class="mut">No record in the store for this scope.</p></div>`;
+  return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><div class="tgrid">` +
+    `<div><div class="small mut">Pass rate by night</div>${trendChartHtml(t, points, "rate", null, range, markers, `${title}: pass rate by night`)}${trendLegendHtml("rate", null, t)}</div>` +
+    `<div><div class="small mut">Judged ${esc(metric || "quality")} by night · advisory</div>${metric ? trendChartHtml(t, points, "judged", metric, range, markers, `${title}: ${metric} by night`) : `<p class="mut">No judged metric in the store yet.</p>`}${metric ? trendLegendHtml("judged", metric, t) : ""}</div>` +
+    `</div>${footer || ""}${trendTableHtml(t, points, metric, perDomain)}</div>`;
+}
+
+function trendStatusHtml(t) {
+  if (!t || (!t.source && !t.read_at)) return `<div class="banner hs-amber">${pillHtml("DEGRADED", "STORE NOT READ")}<span>The evidence store was not read for this render (no <code>store.json</code> beside the data), so there is nothing to draw. The next scheduled refresh reads it; the other pages are unaffected.</span></div>`;
+  const read = parseIso(t.read_at);
+  const parts = [];
+  if (t.error) parts.push(`<div class="banner hs-amber">${pillHtml("DEGRADED", "STALE READ")}<span>The store could not be read on the last refresh (${esc(String(t.error).slice(0, 200))}); this page shows the last good read, ${esc(read != null ? et(read) : "at an unknown time")}.</span></div>`);
+  const truncated = t.truncated && typeof t.truncated === "object" ? Object.keys(t.truncated) : [];
+  if (truncated.length) parts.push(`<p class="stale">The read was capped at ${esc(t.max_objects)} objects per case per version key for ${plural(truncated.length, "case")} (${truncated.slice(0, 6).map(esc).join(", ")}${truncated.length > 6 ? ", …" : ""}); their oldest nights inside the window are not drawn.</p>`);
+  if (Array.isArray(t.warnings) && t.warnings.length) parts.push(`<p class="stale">${plural(t.warnings.length, "record")} in the store could not be read and ${t.warnings.length === 1 ? "is" : "are"} left out: <code>${esc(String(t.warnings[0]).slice(0, 160))}</code>${t.warnings.length > 1 ? " …" : ""}</p>`);
+  return parts.join("");
+}
+
+function trendHtml(link) {
+  const t = trendDoc();
+  const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
+  const head = (title) => `<div class="sec head"><h1>${title}</h1><div class="lede">${lede}</div></div>`;
+  if (!t || (!t.source && !t.read_at) || !t.records) {
+    const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no record inside its ${esc(t.window_days || "")}-day window yet. The first night that records fills this page.</p>` : "";
+    return head("Scores over time on main") + trendStatusHtml(t) + why + footHtml();
+  }
+  const metric = trendMetric(t, link);
+  const scope = trendScope(t, link);
+  const cases = trendCases(t), domains = trendDomains(t);
+  const metrics = Array.isArray(t.metrics) ? t.metrics.filter((m) => typeof m === "string") : [];
+  const domainNames = Object.keys(domains).sort();
+  const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d)).join("")}` +
+    (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") + `</div>`;
+  const read = parseIso(t.read_at);
+  const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, "record")} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
+  let body = "";
+  if (scope.cases) {
+    const found = scope.cases.filter((name) => cases[name]);
+    const missing = scope.cases.filter((name) => !cases[name]);
+    const range = trendRange(found.map((name) => cases[name].points || []), link);
+    body = found.map((name) => {
+      const c = cases[name];
+      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">its domain, ${esc(domainWords(c.domain))} →</a></p>`;
+      return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer);
+    }).join("");
+    if (missing.length) body += `<div class="tcard"><h3><code>${missing.map(esc).join("</code>, <code>")}</code></h3><p class="mut">No record in the store for ${missing.length === 1 ? "this case" : "these cases"} inside the window: ${missing.length === 1 ? "it has" : "they have"} not run on a recording night yet, or the name is not a case.</p></div>`;
+    const title = scope.cases.length === 1 ? `<code>${esc(scope.cases[0])}</code> on main` : `${plural(scope.cases.length, "case")} on main`;
+    const inc = link.sinceMs != null ? `<div class="lede">Marked: the incident that started ${esc(et(link.sinceMs))}${link.untilMs != null ? ` and ended ${esc(et(link.untilMs))}` : ""}. The record either side of the marker is what main did around it.</div>` : "";
+    return head(title) + inc + trendStatusHtml(t) + ctl + readLine + body + footHtml();
+  }
+  if (scope.domain) {
+    const d = domains[scope.domain];
+    const members = (d.cases || []).filter((name) => cases[name]);
+    const range = trendRange([d.points || [], ...members.map((name) => cases[name].points || [])], link);
+    body = trendCardHtml(t, esc(domainWords(scope.domain)), `${plural(members.length, "case")} pooled per night`, d.points || [], d.key_changes, metric, range, link, true, "") +
+      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendHref([name]))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record))).join("")}</div>`;
+    return head(`${esc(domainWords(scope.domain))} on main`) + trendStatusHtml(t) + ctl + readLine + body + footHtml();
+  }
+  const range = trendRange(domainNames.map((name) => domains[name].points || []), link);
+  body = domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendDomainHref(name))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "")).join("");
+  return head("Scores over time on main") + trendStatusHtml(t) + ctl + readLine + body + footHtml();
+}
+
+// The Trend page's tooltip: one element, fed by textContent from the hit
+// target under the pointer (or the focused one), never markup.
+function onTrendPointer(event) {
+  const tip = document.getElementById("ttip");
+  if (!tip) return;
+  const hit = event.target instanceof Element ? event.target.closest("[data-tip]") : null;
+  if (!hit || event.type === "pointerout" || event.type === "focusout") {
+    if (!hit || event.type === "pointerout" || event.type === "focusout") tip.style.display = "none";
+    return;
+  }
+  tip.textContent = hit.dataset.tip;
+  tip.style.display = "block";
+  const box = hit.getBoundingClientRect();
+  const px = event.clientX || box.left + box.width / 2, py = event.clientY || box.top;
+  const left = Math.min(px + 14, window.innerWidth - tip.offsetWidth - 8);
+  tip.style.left = `${Math.max(8, left)}px`;
+  tip.style.top = `${Math.max(8, py - tip.offsetHeight - 12)}px`;
+}
+
 /* ---- clicks on the Grid and the Cases page ---- */
 
 function onClick(event) {
-  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-marker],button[data-toggle],button[data-build]");
+  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-marker],button[data-toggle],button[data-build],button[data-scope],button[data-metric]");
   if (!target) return;
   const d = target.dataset;
   if (d.sort) ui.sort = d.sort;
@@ -1377,6 +1669,8 @@ function onClick(event) {
   else if (d.toggle === "retired") ui.showRetired = true;
   else if (d.toggle === "close") ui.selected = null;
   else if (d.build && d.case) ui.selected = { build: d.build, case: d.case };
+  else if (d.scope != null) ui.scope = d.scope;
+  else if (d.metric) ui.metric = d.metric;
   renderAll();
   if (d.build && d.case) {
     const panel = document.getElementById("detail");
@@ -1400,7 +1694,7 @@ function renderFreshness() {
   el.className = stale ? "fresh stale" : "fresh";
 }
 
-const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml, nightly: nightlyHtml };
+const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml, nightly: nightlyHtml, trend: trendHtml };
 
 // `scroll` is true for a navigation (boot, a hash change): the page then
 // scrolls to the `view=` section or the `#<case>` row it just rendered. The
@@ -1415,7 +1709,7 @@ function renderAll(scroll = false) {
   const keepLeft = scrolled ? scrolled.scrollLeft : null;
   try {
     if (!briefLoaded) throw new Error(`the page's data element (#${PAGE.inlineBrief}) is missing or unreadable`);
-    app.innerHTML = renderers[page](link);
+    app.innerHTML = renderers[page](link) + (page === "trend" ? '<div class="ttip" id="ttip" role="tooltip"></div>' : "");
   } catch (err) {
     app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. The data behind it is <a href="${PAGE.briefFile}">${PAGE.briefFile}</a>.</div></div>`;
   }
@@ -1469,6 +1763,7 @@ async function refresh() {
 }
 
 document.getElementById("app").addEventListener("click", onClick);
+for (const type of ["pointermove", "pointerout", "focusin", "focusout"]) document.getElementById("app").addEventListener(type, onTrendPointer);
 renderAll(true);
 // Polling is attempted everywhere, a file:// preview included: a failed
 // poll costs nothing but the "regenerated every N min" suffix.

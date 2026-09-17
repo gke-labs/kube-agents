@@ -481,7 +481,7 @@ what the renderer does with them.
 
 ## The rendered pages
 
-`render.py` writes five pages beside `data.json`. Every time shown is
+`render.py` writes six pages beside `data.json`. Every time shown is
 America/Toronto ("ET"), formatted in the browser with
 `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
@@ -492,6 +492,7 @@ America/Toronto ("ET"), formatted in the browser with
 | `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
 | `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
 | `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it.                                          |
+| `trend.html`   | **The Trend page** ("Scores over time on main"): the store's nightly records per case and domain — pass rate by night with the trailing admission window and the bar, judged quality by night with the spread the store supports (a case: the range of its nightly means over seven nights at one key; a domain: the range across its cases), a marker on each night the version key changed, a table under each chart, a banner when the store was not read. `#cases=`, `#domain=`, `#since=` (incident). `trend.py`, from `store.json`.   |
 
 The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
@@ -520,6 +521,7 @@ the question imports it.
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
 `cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
 `nightly.html[#build=<prow build id>]`
+`trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
 
 Every parameter travels in the URL fragment as `key=value` pairs joined
 by `&`. `storage.cloud.google.com` answers an unauthenticated request with
@@ -562,12 +564,17 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
   last night's.
 - `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
   chips as parameters; a value outside the vocabulary is the default.
+- On the Trend page `cases` scopes to those cases (the case-id grammar
+  above), `domain` to a domain slug (same grammar), `metric` to a judged
+  metric (`[A-Za-z][A-Za-z0-9_]{0,39}`, and one the store carries, else the
+  default); `since` and `until` draw the incident's start and end as
+  markers. No parameter is the overview of every domain.
 
 ### `brief.json` (written by `render.py`)
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
-pending[], releases[], nightly{}}`. `runs[]` is the **presubmit's** last `run_days` of
+pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
@@ -646,6 +653,57 @@ first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
 and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
+
+`trend` is `trend.py`'s block from `store.json` (below), the evidence
+store's read: `{source, read_at, error, window_days, max_objects,
+truncated{case: n}, warnings[], records, metrics[], default_metric,
+spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{}}`.
+Without a `--store` every field is empty or `null` and the page says the
+store was not read; `error` set means the last read failed and the rest is
+the read before it. `keys{}` maps a key id
+(`<setup_id>/<judge_model>/<scoring_version>-f<fleet>-v<verifiers>`) to its
+five components. `nights[]` is every night the store holds a record for,
+oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
+`build:<prow build id>` from the object name (or `at:<recorded_at>` for a
+record without one), `started` and `log_url` the collector's when that
+build is a nightly run in `data.json` (`null` otherwise; the page then
+dates the night by `at`). `cases{}` is per case `{domain, points[],
+key_changes[], record}`: `points[]` oldest first, one per record, `{night,
+at, build, commit, key, runs, passes, blocked, infra, judged{metric:
+{mean, n, spread{low, high, nights}}}, window{runs, passes, lines, full}}`
+— `window` is what computed admission reads at that night (the newest
+whole records at the same key pooled to `bar.min_runs`; `full` when
+reached) and `spread` the range of the case's nightly means over the last
+`spread_nights` at the same key (`nights` 1 is no spread); `key_changes[]`
+is `{night, at, from, to, changed[]}` for every record whose key differs
+from the one before; `record` is `{state, key, runs, passes, lines, rate,
+bar, as_of}` with `state` in `would-admit|would-demote|collecting`, the
+newest window against the bar. `domains{}` is per domain `{cases[],
+points[], key_changes[]}` with `points[]` the cases pooled per night
+`{night, at, runs, passes, cases, keys[], judged{metric: {mean, n, low,
+high, cases}}}` (`mean` weighted by `n`, `low`/`high` the range of the
+cases' means). Only nightly records exist in the store (a pull request's
+run never writes it), so nothing here is a presubmit's.
+
+### `store.json` (written by `store.py`, read by `render.py --store`)
+
+The evidence store (`docs/designs/eval-scorer.md`, "What is stored")
+as one document: `{schema_version, source, read_at, window_days,
+max_objects, listed, fetched, truncated{case: n}, warnings[], error,
+records[]}`. `records[]` is every object read inside the last
+`window_days` (90) and under `max_objects` per case per key
+(`EVAL_BASELINE_MAX_OBJECTS`, 200, the gate's own cap), each the JSON line
+as written — `{case, recorded_at, commit, key{setup_id, scoring_version,
+judge_model, fleet, verifiers}, runs, passes, blocked?, infra?, judged?}` —
+plus `object` (its URL) and `build` (the Prow build id from the object
+name, `null` when the name carries none). `truncated` says per case how
+many older objects the cap left out; `warnings[]` names each line that
+would not parse (skipped, never fatal); `error` is set when the listing
+failed and the document is the prior read written back. The reader lists
+the prefix once and fetches only the objects the prior `store.json`
+(`--prior`, the copy `render.py` published beside `data.json`) does not
+hold: objects are immutable and the store append-only, so a record once
+read is final.
 
 ### `health.json` and `health-history.jsonl` (optional inputs)
 
@@ -769,6 +827,24 @@ asserts it reads as `lost_pods` and not as setup deaths.
 baseline needs, ending on the afternoon every run was green and three hours
 long (#1586); the test asserts the `slow` note from 18:00Z that day and none
 over the 09-12/13 weekend.
+
+`testdata_store/` holds four **real** objects from the evidence store's
+first recording night (2026-09-17, build 2100374258805903360, commit
+`b458323d`), in the store's own layout under an `evidence/` root — the case,
+the setup, the judge, the `<scoring>-f<fleet>-v<verifiers>` directory and the
+`<stamp>-<build>.jsonl` name — one record per object, verbatim:
+
+| case                            | why it is here                                         |
+| ------------------------------- | ------------------------------------------------------ |
+| `agent-kanban-smoke`            | 3/3, `ToolInvocation` 0.67: a clean night              |
+| `rca-remediation-pr`            | 2/3: a partial night with judged means below 1         |
+| `cluster-agent-crashloop-debug` | 3/3 with `OutcomeValidity` 0.9: a pass that is not 1.0 |
+| `upgrades-fleet-version-table`  | 3/3, `OutcomeValidity` 0.8                             |
+
+`scripts/test_eval_dashboard_store.py` serves them through a fake `gsutil`
+(`ls` of the tree, `cat` of the files) and pins the parse, the window, the
+per-key cap and the incremental read; `scripts/test_eval_dashboard_trend.py`
+derives the trend from them and renders the page.
 
 `testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;

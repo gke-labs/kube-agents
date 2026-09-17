@@ -25,9 +25,11 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #      project's bucket; the grant cannot be copied from here). It reads the
 #      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
 #      (kube-agents-owned; it holds objectViewer there too, and whichever
-#      account replaces it needs the same) and the prior data.json, and
-#      writes the merged data.json to the runner's disk. It writes nothing
-#      to any bucket. A read grant for the dedicated publisher has been
+#      account replaces it needs the same), the eval evidence store
+#      gs://kube-agents-evals-bench (objectViewer, for the Trend page;
+#      best-effort, and incremental against the store.json the last tick
+#      published) and the prior data.json, and writes the merged data.json
+#      to the runner's disk. It writes nothing to any bucket. A read grant for the dedicated publisher has been
 #      requested from the OSS Prow owners; once it lands, this step
 #      switches account and the job is single-identity.
 #   B. Everything else runs as eval-dashboard-publisher@kube-agents-prow --
@@ -165,6 +167,12 @@ env:
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
   SINCE_DAYS: "14"
   STALE_AFTER_S: "2400"
+  # The eval evidence store the nightly appends to (docs/designs/
+  # eval-scorer.md); scripts/eval_dashboard/store.py reads it for the Trend
+  # page. One listing plus the objects the last published store.json does
+  # not hold, so the budget is for a cold read of the 90-day window.
+  EVIDENCE_STORE: gs://kube-agents-evals-bench/evidence
+  STORE_TIMEOUT_S: "600"
   COLLECT_TIMEOUT_S: "1500"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
@@ -292,6 +300,22 @@ jobs:
               sys.exit("collected zero runs: refusing to publish an empty dashboard over a good one")
           '
 
+      # The Trend page's input, still as the reader (step A). Best-effort by
+      # construction: a failed listing writes the prior read back with its
+      # error, a failed step leaves no work/store.json and the render below
+      # skips --store, so the other pages publish either way and the page
+      # says the store was not read. The prior is the copy render.py
+      # published beside data.json last tick, so a tick fetches only last
+      # night's objects.
+      - name: Read the evidence store for the Trend page (best-effort)
+        continue-on-error: true
+        run: |
+          gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json || echo "no published store.json yet; reading the whole window"
+          timeout "$STORE_TIMEOUT_S" python3 scripts/eval_dashboard/store.py \
+            --location "$EVIDENCE_STORE" \
+            --prior work/prior-store.json \
+            --out work/store.json
+
       # ---- B. everything that writes or posts, as the dedicated publisher --
       - name: Authenticate to Google Cloud (dashboard publisher and Chat app)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -385,6 +409,10 @@ jobs:
           [ -f work/health.json ] && render_args+=(--health work/health.json)
           [ -f work/health-history.jsonl ] && render_args+=(--health-history work/health-history.jsonl)
           [ -f work/health-history.jsonl ] || echo "::warning::no health-history.jsonl this tick; the Brief renders the current verdict only"
+          # The evidence-store read above, when it produced one; without it
+          # the Trend page says the store was not read this tick.
+          [ -f work/store.json ] && render_args+=(--store work/store.json)
+          [ -f work/store.json ] || echo "::warning::no store.json this tick; the Trend page renders as 'store not read'"
           # --public-url (bare) emits <base href> for the published site,
           # post_health.DASHBOARD_URL's directory, so the pages' links
           # resolve there whatever URL the console login lands on.
