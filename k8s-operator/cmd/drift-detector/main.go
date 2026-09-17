@@ -149,7 +149,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.clusterLocation, "cluster-location", "",
 		"GKE location (region or zone) of --cluster-name. Required with it: a cluster name is unique only within a project and location, so without this a same-named cluster elsewhere would be read as this one.")
 	fs.StringVar(&f.gitopsManagers, "gitops-managers", "",
-		"Comma-separated managedFields managers that are the GitOps controller (for example argocd-controller). Matched exactly. Empty means ownership is reported without any reconciliation claim.")
+		"Comma-separated managedFields managers that are the GitOps controller (for example argocd-controller). Matched exactly, and only on writes to the object: a claim these managers made through a subresource such as status is not counted as a reconcile. Empty means ownership is reported without any reconciliation claim.")
 	fs.DurationVar(&f.batchJoinBudget, "batch-join-budget", defaultBatchJoinBudget,
 		"Longest one batch may spend on live-object lookups before the rest fail open. Keep it to half the subscription's ack deadline or less, leaving the rest for the batch's Ack; startup reads the real deadline and warns when it does not. Exceeding the whole deadline means Pub/Sub redelivers the batch this process is still working on.")
 
@@ -251,11 +251,13 @@ func realMain(argv []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	source, err := newPubsubSource(ctx, f.project, f.subscription)
-	if err != nil {
-		return err
-	}
-
+	// The cluster side is built and checked before the Pub/Sub client, and the
+	// order is load-bearing in two ways. It fails on a local misconfiguration
+	// without first opening a connection to a remote service -- and it is what
+	// makes the refusal below reachable from a test, since newPubsubSource wants
+	// credentials and nothing past it can be exercised without them. Building a
+	// client from a kubeconfig connects to nothing, so a test can drive this far
+	// on a temporary file.
 	getter, err := newObjectGetter(f.kubeconfig, f.inCluster)
 	if err != nil {
 		return err
@@ -298,6 +300,11 @@ func realMain(argv []string) error {
 		if line != "" {
 			log.Printf("%s: %s", commandName, line)
 		}
+	}
+
+	source, err := newPubsubSource(ctx, f.project, f.subscription)
+	if err != nil {
+		return err
 	}
 
 	// Log the path actually pulled, not the flag: --subscription accepts a bare

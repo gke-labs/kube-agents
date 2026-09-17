@@ -291,6 +291,52 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 	}
 }
 
+func TestRealMainRefusesAClusterTheCredentialsDoNotReach(t *testing.T) {
+	// The one case in this file that runs past the flag validation, and the
+	// reason realMain builds the cluster side before the Pub/Sub client: every
+	// other case returns before newPubsubSource, which wants credentials, so
+	// nothing downstream of it was reachable from a test at all. What is pinned
+	// here is the wiring rather than the comparison -- TestVerifyClusterIdentity
+	// covers the comparison, and it stays green if this call site logs the
+	// mismatch instead of returning it, which would leave a detector that
+	// announces it is reading the wrong cluster and then reads it.
+	//
+	// No credentials are needed: building a client from a kubeconfig connects to
+	// nothing, and the identity comes out of the file's own context name.
+	const reachesUSEast4 = `apiVersion: v1
+kind: Config
+clusters:
+  - name: prod-a
+    cluster:
+      server: https://127.0.0.1:1
+contexts:
+  - name: gke_example-project_us-east4_prod-a
+    context:
+      cluster: prod-a
+      user: prod-a
+current-context: gke_example-project_us-east4_prod-a
+users:
+  - name: prod-a
+    user:
+      token: not-a-real-token
+`
+
+	argv := []string{
+		"--project", "example-project",
+		"--kubeconfig", writeKubeconfig(t, reachesUSEast4),
+		"--cluster-name", "prod-a",
+		"--cluster-location", "us-central1",
+	}
+
+	err := realMain(argv)
+	if err == nil {
+		t.Fatalf("realMain(%v) succeeded, want it to refuse a cluster the credentials do not reach", argv)
+	}
+	if want := "refusing to enrich"; !strings.Contains(err.Error(), want) {
+		t.Errorf("realMain error = %q, want it to contain %q", err, want)
+	}
+}
+
 func TestLooksLikeProjectNumber(t *testing.T) {
 	// The whole test is "nothing but digits", and it is exact rather than
 	// heuristic because a GCP project ID must begin with a lowercase letter.

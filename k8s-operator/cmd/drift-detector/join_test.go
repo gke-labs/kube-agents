@@ -385,6 +385,29 @@ func TestReconciledBy(t *testing.T) {
 			wantClaim:   true,
 			wantManager: "flux",
 		},
+		{
+			name:     "a configured manager's status write is not the reconcile",
+			managers: map[string]bool{"kustomize-controller": true},
+			owners:   []fieldOwner{{Manager: "kustomize-controller", Subresource: "status", UpdatedAt: after}},
+			// The systematic case, not an edge one: a GitOps controller writes
+			// .status on its own custom resources every loop, under the same
+			// manager name, so without the subresource skip a change to spec is
+			// marked reconciled within seconds of being made.
+			wantClaim: false,
+		},
+		{
+			name:     "a status entry does not hide the same manager's write to the object",
+			managers: map[string]bool{"kustomize-controller": true},
+			owners: []fieldOwner{
+				{Manager: "kustomize-controller", Subresource: "status", UpdatedAt: after},
+				{Manager: "kustomize-controller", UpdatedAt: after},
+			},
+			// Skipping the status entry costs no real claim, because an apply to
+			// the object is its own fieldOwner. Pinned so the skip cannot be
+			// widened into "this manager is ignored".
+			wantClaim:   true,
+			wantManager: "kustomize-controller",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			j := newJoiner(nil, joinCluster(), tc.managers, func(context.Context, DriftEvent) {})
@@ -400,6 +423,33 @@ func TestReconciledBy(t *testing.T) {
 				t.Errorf("ReconciledBy = %q with no claim, want empty", manager)
 			}
 		})
+	}
+}
+
+func TestReconciledByIgnoresAStatusWriteAnsweringASpecChange(t *testing.T) {
+	// The whole scenario end to end, because the table above states the rule and
+	// this states why it matters. A person runs `flux suspend kustomization
+	// apps`, which patches spec.suspend -- exactly the out-of-band change worth
+	// paging on. The controller's next loop writes .status on the same object,
+	// seconds later, under the manager name --gitops-managers configures.
+	//
+	// Reported as reconciled, that change is one T4 would suppress the inject
+	// for: DriftEvent.Reconciled means the person's edit has since been written
+	// over and there may be nothing left to revert, and here the edit stands
+	// untouched.
+	const manager = "kustomize-controller"
+	suspendedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	statusWrittenAt := suspendedAt.Add(4 * time.Second)
+
+	j := newJoiner(nil, joinCluster(), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
+
+	claim, claimed := j.reconciledBy([]fieldOwner{
+		{Manager: "flux-cli", UpdatedAt: suspendedAt, Paths: []string{"spec.suspend"}},
+		{Manager: manager, Subresource: "status", UpdatedAt: statusWrittenAt, Paths: []string{"status.conditions"}},
+	}, suspendedAt)
+
+	if claim {
+		t.Errorf("Reconciled = true by %q, want no claim: the controller wrote status, and spec.suspend still stands", claimed)
 	}
 }
 

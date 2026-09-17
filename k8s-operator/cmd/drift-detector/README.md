@@ -59,7 +59,7 @@ line, not silently unenriched.
 | `--kubeconfig`            | empty                            | Read live objects through this kubeconfig. Mutually exclusive with `--in-cluster`; setting neither of the two disables the join.                                                                                                                                      |
 | `--cluster-name`          | empty                            | The GKE cluster those credentials reach. Required with either of the two above, and an error without them. Checked at startup against the cluster they actually reach; a disagreement stops the process.                                                              |
 | `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                                                                                                                                   |
-| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly. Empty means no reconciliation claim is made.                                                                                                                                |
+| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource. Empty means no reconciliation claim is made.                                                            |
 | `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                             |
 
 ## Classification
@@ -267,6 +267,22 @@ configured manager that had ever touched the object, and report that manager's l
 reconcile for a change the detector cannot place in time. With the flag unset the detector cannot tell a
 GitOps controller from any other client, so `Reconciled` is false everywhere and means "not shown to
 be reconciled", never "shown not to be".
+
+**A claim made through a subresource does not count.** `managedFields` records a write to `status`
+as its own entry, and every GitOps controller writes `.status` on its own custom resources — a
+`Kustomization`, a `HelmRelease`, an `Application` — under the same manager name, on every
+reconcile loop. Counting those would make the wrong answer the systematic one rather than the rare
+one: `flux suspend kustomization apps` patches `spec.suspend`, the controller writes its conditions
+four seconds later, and the change goes out `Reconciled` while the suspension still stands. Entries
+with a subresource are therefore skipped, and the manager's own write to the object — a separate
+entry — is what can still make the claim.
+
+The reverse case is the price: a person patching `/status` directly, answered by the controller's
+own status write, is a reconcile this declines. Matching the entry's subresource against the
+audited change's own would catch it, and is wrong for `kubectl scale` — the audit record carries
+subresource `scale`, while the controller answers it by re-applying the object under no subresource
+at all, so the two would never line up. Declining reports the drift, which is the direction every
+other judgment here fails in.
 
 It is also the weakest claim the data supports. `managedFields` keeps no previous value, so it
 cannot say the person's change was reverted — the controller may have written an unrelated field.

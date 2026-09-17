@@ -368,6 +368,11 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 // unrelated field, and managedFields keeps no history of the value that was
 // there before. Deciding what actually happened is the agent's job; this flag
 // exists so the agent is told when there is reason to look.
+//
+// Weak is not the same as cheap, though, and the loop below declines three
+// things outright: a change with no time, a manager with no time, and a claim
+// made through a subresource. The last is the one that would otherwise fire
+// constantly rather than rarely -- see the comment on it.
 func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, string) {
 	// Redundant with the loop below -- a nil map returns false for every
 	// lookup, so every owner would be skipped anyway -- and kept because it is
@@ -398,6 +403,29 @@ func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, s
 	}
 	for _, owner := range owners {
 		if !j.gitopsManagers[owner.Manager] {
+			continue
+		}
+		// A claim made through a subresource is not the reconcile. ownership()
+		// keeps a subresource write as its own fieldOwner, and every GitOps
+		// controller writes .status on its own custom resources -- a
+		// Kustomization, a HelmRelease, an Application -- under the same manager
+		// name, on every loop, seconds apart. Without this the systematic case
+		// is the wrong one: `flux suspend kustomization apps` patches
+		// spec.suspend, the controller's next status write lands at or after the
+		// audited change, and the event goes out Reconciled while the person's
+		// change stands untouched. That is the reading T4 would act on to
+		// suppress the inject.
+		//
+		// Skipping the entry rather than requiring it to match the audited
+		// change's own subresource, which looks sharper and is wrong for
+		// `kubectl scale`: the audit record carries subresource "scale", but the
+		// controller reconciles it by re-applying the object, whose entry has no
+		// subresource at all, so matching the two would decline a real
+		// reconcile. The cost is the reverse case -- a person patching /status
+		// directly, answered by the controller's own status write -- where this
+		// declines a claim that was true. Declining reports the drift, which is
+		// the direction every other judgment in this function fails in.
+		if owner.Subresource != "" {
 			continue
 		}
 		// A manager with no recorded time cannot be placed relative to the
