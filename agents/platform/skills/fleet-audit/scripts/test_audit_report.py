@@ -6318,6 +6318,24 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
             self.assertNotIn("no longer reproduces", body)
 
+    def test_the_refusal_names_the_declaring_file_through_the_cell_sanitiser(self):
+        # A note's filename comes from the tree walk or the broker listing,
+        # neither of which refuses a backtick, and the refusal wraps
+        # `repo:path` in a code span: one backtick in the name would close it
+        # and leave the rest of the comment, marker included, as live
+        # Markdown. The pointer goes through `_cell`, as the ledger table's
+        # does, so the two never name one declaration two different ways.
+        self.record()
+        self.file(self.entry(path="knowledge/check`out.md"))
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/check'out.md`", refusals[0])
+        self.assertNotIn("check`out", refusals[0])
+
     def test_a_declared_posture_with_a_shortened_id_is_refused_and_not_a_typo(self):
         # The id a finding carries, the ledger prints and a requester copies
         # is `_shorten_id` of the derived string once the four fields overrun

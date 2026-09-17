@@ -3585,10 +3585,15 @@ def declared_reason(target: str, entry: dict) -> str:
     it. The reason names the file, because removing the item there is what
     brings the finding back, and a fresh request then opens it.
     """
-    declaration = entry.get("declaration") or {}
+    # The pointer goes through the same cell sanitiser the ledger table uses:
+    # `path` is a filename from the tree walk or the broker listing, neither
+    # of which refuses a backtick or a newline, and one backtick would close
+    # the code span and leave the rest of the comment, marker included, as
+    # live Markdown. `target` is an id the run already matched, not free text.
+    _, where = _declared_pointer(entry)
     return (
         f"`{target}` is a posture a repository declaration covers — "
-        f"`{declaration.get('repo', '')}:{declaration.get('path', '')}` — so this "
+        f"`{where}` — so this "
         "run lists it under _Declared intent_ rather than as a finding, and a "
         "pull request for it would contradict the ledger. Remove the "
         "declaration; the finding returns on the next run, and a new request "
