@@ -2800,19 +2800,21 @@ def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
     """The tuple a declaration and a finding are joined on, case-folded.
 
     Folded because the finding's own identity is: `derive_finding_id` lowers
-    every segment, so the ledger prints `deployment-api` for `Deployment/api`
-    and treats the two spellings as one finding. An owner who writes the Kind
-    the way kubectl prints it, or copies it off the finding id, passes the
-    item shape check; an exact comparison here then matched nothing and the
-    posture published under a note that covers it.
+    and trims every segment, so the ledger prints `deployment-api` for
+    `Deployment/api` and treats the two spellings as one finding. An owner who
+    writes the Kind the way kubectl prints it, or copies it off the finding
+    id, passes the item shape check; an exact comparison here then matched
+    nothing and the posture published under a note that covers it. Trimmed
+    for the finding's side: the validator keeps a field's surrounding
+    whitespace, the id does not, and the key follows the id.
     """
     key = (
-        str(entry.get("check", "")).lower(),
-        str(entry.get("namespace") or "").lower(),
-        str(entry.get("object", "")).lower(),
+        str(entry.get("check", "")).strip().lower(),
+        str(entry.get("namespace") or "").strip().lower(),
+        str(entry.get("object", "")).strip().lower(),
     )
     if with_cluster:
-        return (str(entry.get(DECLARATION_CLUSTER_FIELD, "")).lower(),) + key
+        return (str(entry.get(DECLARATION_CLUSTER_FIELD, "")).strip().lower(),) + key
     return key
 
 

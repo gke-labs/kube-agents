@@ -6076,6 +6076,21 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         # The moved entry carries the finding's own spelling, not the note's.
         self.assertIn("| `payments/Deployment/checkout-gateway` |", self.ledger_body())
 
+    def test_the_join_trims_whitespace_as_the_finding_id_does(self):
+        # The validator keeps a finding field's surrounding whitespace and
+        # `derive_finding_id` strips it, so `"payments "` is the same finding
+        # as `"payments"` on the ledger; the key has to read it the same way.
+        findings = posture_and_fault_findings()
+        pdb = next(f for f in findings if f["check"] == "no-pdb")
+        pdb["namespace"] = "payments "
+        pdb["object"] = " Deployment/checkout-gateway"
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc(findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+
     def test_a_cluster_scoped_entry_matches_only_its_cluster(self):
         self.record()
         self.file(self.entry(cluster="stage-eu"))
