@@ -355,6 +355,14 @@ class CheckBranchTest(unittest.TestCase):
                 with self.assertRaises(ContentWorkspaceError):
                     check_branch(protected)
 
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "run/test-cluster/fix-task"}):
+            with self.assertRaises(ContentWorkspaceError):
+                check_branch("run/test-cluster/fix-task")
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/broker-task"}):
+            with self.assertRaises(ContentWorkspaceError):
+                check_branch("run/test-cluster/broker-task")
+
         # Paired ordinary use: the branch names the product actually authors.
         self.assertEqual(
             "platform-agent/provision-mercury-09",
@@ -1092,6 +1100,35 @@ class RealGitTest(unittest.TestCase):
         return self.store.commit(
             self.workspace.handle, "platform-agent/change", "feat: a change", changes, **kwargs
         )
+
+    def test_commit_and_push_to_workspace_base_branch_are_refused(self):
+        # When a workspace is opened with a non-default base branch (e.g. release/2026-08),
+        # both commit and push directly onto that base branch must be refused by the store.
+        handle = "b" * 32
+        tree = self.base / "trees" / "release_work" / "repo"
+        tree.parent.mkdir(parents=True)
+        real_git_runner(["git", "clone", str(self.remote), str(tree)], self.base)
+        ws = Workspace(
+            handle=handle,
+            repo="acme/fleet",
+            tree=tree,
+            base="release/2026-08",
+            base_sha=self.workspace.base_sha,
+        )
+        self.store._workspaces[handle] = ws
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.commit(
+                handle,
+                "release/2026-08",
+                "feat: direct to base",
+                [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+            )
+        self.assertIn("is the workspace base branch", str(ctx.exception))
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.push(handle, "release/2026-08")
+        self.assertIn("is the workspace base branch", str(ctx.exception))
 
     def test_a_commit_lands_the_bytes_and_nothing_else(self):
         result = self.commit(

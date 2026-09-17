@@ -2088,6 +2088,128 @@ def _git_refused_name(argument: str) -> str:
     )
 
 
+def git_push_violation(argv: list[str]) -> str | None:
+    """Refuse direct pushes to protected rollout or base branches (#1498)."""
+    if not argv or Path(argv[0]).name != "git":
+        return None
+    if "push" not in argv[1:]:
+        return None
+
+    subcommand, _ = _git_plan(argv)
+    if subcommand != "push":
+        # Check if an unrecognized global option consumed the slot before `push`.
+        # If the detected subcommand is a known non-push git verb, this is not a push.
+        non_push_verbs = {
+            "add", "am", "archive", "bisect", "branch", "bundle", "cat-file",
+            "check-ref-format", "checkout", "cherry-pick", "clean", "clone",
+            "commit", "describe", "diff", "fetch", "format-patch", "gc", "grep",
+            "init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "mv",
+            "notes", "pull", "range-diff", "rebase", "remote", "reset", "restore",
+            "revert", "rm", "shortlog", "show", "stash", "status", "submodule",
+            "switch", "tag", "worktree",
+        }
+        if subcommand in non_push_verbs:
+            return None
+
+    push_idx = argv.index("push")
+    push_args = argv[push_idx + 1:]
+
+    protected = {"main", "master", "production"}
+    handler_base = getattr(CredentialProxyHandler, "base_branch", "")
+    base_override = (
+        handler_base
+        or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    if base_override:
+        norm_override = base_override.strip().lower()
+        if norm_override.startswith("refs/heads/"):
+            norm_override = norm_override[len("refs/heads/"):]
+        elif norm_override.startswith("heads/"):
+            norm_override = norm_override[len("heads/"):]
+        protected.add(norm_override)
+
+    has_tags = False
+    has_repo_flag = False
+    positional: list[str] = []
+    idx = 0
+    while idx < len(push_args):
+        arg = push_args[idx]
+        if arg in ("--all", "--mirror"):
+            return (
+                f"`git push {arg}` is refused: pushing all branches directly "
+                "is not permitted."
+            )
+        if arg == "--tags":
+            has_tags = True
+            idx += 1
+            continue
+        if arg == "--repo":
+            has_repo_flag = True
+            if idx + 1 < len(push_args):
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if arg.startswith("-"):
+            if (
+                arg in ("-o", "--push-option", "--receive-pack", "--exec")
+                and idx + 1 < len(push_args)
+            ):
+                idx += 2
+                continue
+            idx += 1
+            continue
+        positional.append(arg)
+        idx += 1
+
+    # In `git push [<repository> [<refspec>...]]`, the first positional argument
+    # is the repository unless `--repo <repo>` was already supplied.
+    if has_repo_flag:
+        refspecs = positional
+    else:
+        refspecs = positional[1:] if len(positional) > 1 else []
+
+    if not refspecs:
+        if has_tags:
+            return None
+        return (
+            "`git push` without an explicit destination refspec is refused: specify an explicit "
+            "destination branch (e.g. 'HEAD:platform-agent/<name>')."
+        )
+
+    for ref in refspecs:
+        if ref == ":" or ref.endswith(":") or (":" in ref and not ref.split(":")[-1].lstrip("+")):
+            return (
+                "`git push` with matching refspec ':' is refused: specify an explicit "
+                "destination branch."
+            )
+        target = ref.split(":")[-1].lstrip("+")
+        if "*" in target or "*" in ref:
+            return (
+                f"`git push` with wildcard refspec '{ref}' is refused: specify an explicit "
+                "destination branch."
+            )
+        if target.casefold() in {"head", "@"}:
+            return (
+                "`git push` with bare 'HEAD' refspec is refused: specify an explicit "
+                "destination branch (e.g. 'HEAD:platform-agent/<name>')."
+            )
+        norm_target = target.strip()
+        if norm_target.lower().startswith("refs/heads/"):
+            norm_target = norm_target[len("refs/heads/"):]
+        elif norm_target.lower().startswith("heads/"):
+            norm_target = norm_target[len("heads/"):]
+
+        if norm_target.casefold() in protected:
+            return (
+                f"`git push` to protected branch '{norm_target}' is refused: changes to the "
+                "base branch must be proposed via pull request and merged through "
+                "the approved workflow."
+            )
+    return None
+
+
 def git_argument_violation(argv: list[str]) -> str | None:
     """Why this git argv may not run, or None if it may.
 
@@ -2104,6 +2226,9 @@ def git_argument_violation(argv: list[str]) -> str | None:
     """
     if not argv or Path(argv[0]).name != "git":
         return None
+    push_violation = git_push_violation(argv)
+    if push_violation is not None:
+        return push_violation
     rest = argv[1:]
     scoped: dict[str, str] = {}
     for subcommand, (letters, why) in _GIT_REFUSED_SHORT_FOR_SUBCOMMAND.items():
@@ -3248,7 +3373,7 @@ def build_workspace_store(executor: CommandExecutor):
     return store
 
 
-def build_vcs_broker(executor: CommandExecutor):
+def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
     """The version-control broker. Always built; there is no switch.
 
     Unlike the content workspace this has no off state. It is the forge-neutral
@@ -3271,6 +3396,7 @@ def build_vcs_broker(executor: CommandExecutor):
         git_runner=executor.execute_vcs_git,
         cli_runner=executor.execute_forge_cli,
         refresh=executor.refresh_forge_credential,
+        base_branch=base_branch,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -3414,6 +3540,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    base_branch: str = ""
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
     # which is what lets a migrating client detect support by asking rather than
@@ -4457,7 +4584,14 @@ def serve(args: argparse.Namespace) -> None:
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.workspaces = build_workspace_store(executor)
-    CredentialProxyHandler.vcs = build_vcs_broker(executor)
+    CredentialProxyHandler.base_branch = (
+        getattr(args, "base_branch", "")
+        or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
+        or os.getenv("GITOPS_BASE_BRANCH", "")
+    ).strip()
+    CredentialProxyHandler.vcs = build_vcs_broker(
+        executor, base_branch=CredentialProxyHandler.base_branch
+    )
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
@@ -4568,6 +4702,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--state-dir",
         default=os.getenv("CREDENTIAL_PROXY_STATE_DIR", "/var/lib/credential-proxy"),
+    )
+    parser.add_argument(
+        "--base-branch",
+        default=os.getenv(
+            "CREDENTIAL_PROXY_BASE_BRANCH", os.getenv("GITOPS_BASE_BRANCH", "")
+        ),
+        help="Protected GitOps base branch that agents may not push to directly",
     )
     return parser.parse_args()
 

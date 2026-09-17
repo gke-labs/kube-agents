@@ -185,7 +185,10 @@ def resolve_base_branch(
        repository, and it costs one `symbolic-ref`.
     3. `main`, when there is no clone to ask yet.
     """
-    override = os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
     if override:
         return override
     if workspace is None:

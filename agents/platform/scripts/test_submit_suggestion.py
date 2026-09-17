@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -281,6 +282,22 @@ class TestCheckBranch(unittest.TestCase):
             "platform-agent/fix",
         )
 
+    def test_configured_gitops_base_branch_is_refused(self):
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "run/test-cluster/fix-task"}):
+            with self.assertRaises(ValueError) as caught:
+                submit_suggestion.check_branch("run/test-cluster/fix-task")
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/broker-task"}):
+            with self.assertRaises(ValueError) as caught:
+                submit_suggestion.check_branch("run/test-cluster/broker-task")
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_explicit_base_branch_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.check_branch("custom-base", base_branch="custom-base")
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
 
 class TestValidateRepo(unittest.TestCase):
     def test_invalid_format_raises(self):
@@ -363,6 +380,17 @@ class TestPrepare(SubmitSuggestionTestCase):
         with self.assertRaises(ValueError):
             self.prepare(branch="main")
         self.assertFalse((self.root / "t_card").exists())
+
+    def test_prepare_when_branch_equals_base_branch_is_refused(self):
+        subprocess.run(
+            ["git", "branch", "staging", "HEAD"],
+            cwd=str(self.origin), check=True, capture_output=True,
+        )
+        with patch.object(gitops_workspace, "resolve_base_branch", return_value="staging"):
+            with self.assertRaises(ValueError) as caught:
+                self.prepare(branch="staging")
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+            self.assertIn("head branch is the same as base branch", str(caught.exception))
 
     def test_a_retried_card_reuses_its_branch_rather_than_failing(self):
         # `-B`, not `-b`. A card that comes back from review runs prepare again.
@@ -466,6 +494,17 @@ class TestSubmit(SubmitSuggestionTestCase):
             self.submit("main", payload["workspace"])
         self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
         self.assertEqual(self.gh_calls, [])
+
+    def test_submit_when_branch_equals_base_branch_is_refused_before_push(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with patch.object(gitops_workspace, "resolve_base_branch", return_value="platform-agent/fix-netpol"):
+            with self.assertRaises(ValueError) as caught:
+                self.submit("platform-agent/fix-netpol", payload["workspace"])
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+            self.assertIn("head branch is the same as base branch", str(caught.exception))
+        self.assertEqual(self.gh_calls, [])
+        self.assertNotIn("platform-agent/fix-netpol", self.origin_branches())
 
     def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
         """Step 5, and the data loss it used to cause.
@@ -948,6 +987,7 @@ class TestContentMode(SubmitSuggestionTestCase):
         keep_description=False,
         deletes=(),
         repo="acme/fleet",
+        base=None,
     ):
         argv = [
             "submit",
@@ -957,6 +997,8 @@ class TestContentMode(SubmitSuggestionTestCase):
             "--base-sha", prepared["baseSha"],
             "--repo", repo,
         ]
+        if base is not None:
+            argv += ["--base", base]
         if title is not None:
             argv += ["--title", title]
         if body_file is not None:
@@ -1050,6 +1092,20 @@ class TestContentMode(SubmitSuggestionTestCase):
         # No cwd either: in content mode there is no directory in this container
         # for `gh` to run in, and it does not need one — every call names --repo.
         self.assertIsNone(cwd)
+
+    def test_submit_content_when_branch_equals_base_branch_is_refused_before_commit_or_push(self):
+        prepared = self.prepare_content(branch="platform-agent/fix-netpol")
+        # Test with a non-default base branch name that is not in hardcoded PROTECTED_BRANCHES
+        run_base = "run/test-cluster/b-0011"
+        prepared["branch"] = run_base
+        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
+        self.verbs.clear()
+        with self.assertRaises(ValueError) as ctx:
+            self.submit_content(prepared, source, base=run_base)
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+        self.assertIn("is the same as base branch", str(ctx.exception))
+        self.assertNotIn("commit", self.verbs)
+        self.assertNotIn("push", self.verbs)
 
     def test_a_body_file_reaches_gh_intact_in_content_mode(self):
         """The safe channel has to be the safe channel in both transports.

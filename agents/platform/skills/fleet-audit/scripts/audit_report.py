@@ -1127,7 +1127,23 @@ def base_branch() -> str:
 
 def assert_pushable(branch: str) -> str:
     """Refuse to force-push a protected branch (same guardrail as submit_suggestion.py)."""
-    if branch.strip().lower() in PROTECTED_BRANCHES:
+    short = branch.strip().lower()
+    if short.startswith("refs/heads/"):
+        short = short[len("refs/heads/"):]
+    elif short.startswith("heads/"):
+        short = short[len("heads/"):]
+    protected = set(PROTECTED_BRANCHES)
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip().lower()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip().lower()
+    )
+    if override:
+        if override.startswith("refs/heads/"):
+            override = override[len("refs/heads/"):]
+        elif override.startswith("heads/"):
+            override = override[len("heads/"):]
+        protected.add(override)
+    if short in protected:
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
             f"'{branch}' is strictly blocked by GKE SRE guardrails!"

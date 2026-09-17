@@ -77,19 +77,33 @@ PR_STATE_OPEN = "OPEN"
 NO_PULL_REQUEST_MARKER = "no pull requests found"
 
 
-def check_branch(branch_name: str) -> str:
+def check_branch(branch_name: str, base_branch: str | None = None) -> str:
     branch = (branch_name or "").strip()
     if not branch:
         raise ValueError("--branch is required and must not be empty")
-    # Compare the short name: "refs/heads/main" is not in PROTECTED_BRANCHES,
-    # but pushing it moves main all the same.
-    short = branch.lower()
-    if short.startswith("refs/heads/"):
-        short = short[len("refs/heads/"):]
-    if short in PROTECTED_BRANCHES:
+
+    def _norm(b: str) -> str:
+        s = b.strip().lower()
+        if s.startswith("refs/heads/"):
+            return s[len("refs/heads/"):]
+        if s.startswith("heads/"):
+            return s[len("heads/"):]
+        return s
+
+    short = _norm(branch)
+    protected = set(PROTECTED_BRANCHES)
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    if override:
+        protected.add(_norm(override))
+    if base_branch:
+        protected.add(_norm(base_branch))
+    if short in protected:
         raise ValueError(
-            f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
-            f"'{branch_name}' is strictly blocked by GKE SRE guardrails!"
+            f"CRITICAL SECURITY REFUSAL: Target branch '{branch_name}' is a protected "
+            "base branch; changes must be submitted on a separate feature branch."
         )
     return branch
 
@@ -146,9 +160,24 @@ def handle_prepare_content(args) -> int:
     # managed-repos list depend on which transport the run happened to pick.
     validate_repo(repo)
     refresh_git_credentials(repo)
+    base = getattr(args, "base", None) or gitops_workspace.resolve_base_branch()
     workspace = credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=branch
+        proxy_endpoint(), repo, base=base, branch=branch
     )
+    def _norm(b: str) -> str:
+        s = (b or "").strip().lower()
+        if s.startswith("refs/heads/"):
+            return s[len("refs/heads/"):]
+        if s.startswith("heads/"):
+            return s[len("heads/"):]
+        return s
+
+    if _norm(branch) == _norm(workspace.base):
+        raise ValueError(
+            f"CRITICAL SECURITY REFUSAL: Cannot prepare on branch '{branch}': head branch "
+            f"is the same as base branch '{workspace.base}'. Suggestions must be prepared on a "
+            "separate feature branch."
+        )
     # No lease and no workspace path. The handle is what `submit` presents, and
     # unlike the `.lease` file it replaces the agent cannot fabricate one -- it
     # is 128 bits the broker minted and never wrote to a shared volume. It is
@@ -188,6 +217,20 @@ def handle_prepare(args) -> int:
     )
     gitops_workspace.configure_identity(workspace, _runner)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
+    def _norm(b: str) -> str:
+        s = (b or "").strip().lower()
+        if s.startswith("refs/heads/"):
+            return s[len("refs/heads/"):]
+        if s.startswith("heads/"):
+            return s[len("heads/"):]
+        return s
+
+    if _norm(branch) == _norm(base):
+        raise ValueError(
+            f"CRITICAL SECURITY REFUSAL: Cannot prepare on branch '{branch}': head branch "
+            f"is the same as base branch '{base}'. Suggestions must be prepared on a "
+            "separate feature branch."
+        )
 
     # Continue the branch when the remote already has it; only cut a new one
     # from the base when it does not.
@@ -225,12 +268,13 @@ def open_handle(args) -> "credential_proxy_client.Workspace":
     caller can pass `--base-sha` to the conflict check; nothing here holds a
     directory, which is what makes a second process able to pick the session up.
     """
+    resolved_base = getattr(args, "base", None) or gitops_workspace.resolve_base_branch()
     return credential_proxy_client.Workspace(
         proxy_endpoint(),
         {
             "handle": args.handle,
             "repo": args.repo or gitops_workspace.resolve_repo(),
-            "base": getattr(args, "base", None) or "",
+            "base": resolved_base,
             "baseSha": getattr(args, "base_sha", None) or "",
         },
     )
@@ -373,6 +417,20 @@ def handle_submit_content(args, body: str) -> int:
     # with nothing left that could name them, and the sidecar's disk is not
     # something a retry loop should be able to fill.
     with open_handle(args) as workspace:
+        def _norm(b: str) -> str:
+            s = (b or "").strip().lower()
+            if s.startswith("refs/heads/"):
+                return s[len("refs/heads/"):]
+            if s.startswith("heads/"):
+                return s[len("heads/"):]
+            return s
+
+        if _norm(branch) == _norm(workspace.base):
+            raise ValueError(
+                f"CRITICAL SECURITY REFUSAL: Cannot submit on branch '{branch}': head branch "
+                f"is the same as base branch '{workspace.base}'. Suggestions must be committed and pushed on a "
+                "separate feature branch."
+            )
         log(f"Sending {len(changes)} file(s) to the broker for branch '{branch}'...")
         result = workspace.commit(
             branch=branch,
@@ -493,8 +551,23 @@ def handle_submit(args) -> int:
                 "of the description being kept."
             )
 
-    push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
+    def _norm(b: str) -> str:
+        s = (b or "").strip().lower()
+        if s.startswith("refs/heads/"):
+            return s[len("refs/heads/"):]
+        if s.startswith("heads/"):
+            return s[len("heads/"):]
+        return s
+
+    if _norm(branch) == _norm(base):
+        raise ValueError(
+            f"CRITICAL SECURITY REFUSAL: Cannot submit on branch '{branch}': head branch "
+            f"is the same as base branch '{base}'. Suggestions must be committed and pushed on a "
+            "separate feature branch."
+        )
+
+    push_branch(branch, workspace)
     pr_url = create_pull_request(
         branch,
         args.title,

@@ -1099,6 +1099,61 @@ class GitHardeningTest(unittest.TestCase):
             git_argument_violation(["git", "push", "-f", "origin", "audit"])
         )
 
+    def test_git_push_to_protected_or_base_branch_is_refused(self):
+        for argv in (
+            ["git", "push", "origin", "main"],
+            ["git", "push", "origin", "master"],
+            ["git", "push", "origin", "production"],
+            ["git", "push", "origin", "refs/heads/main"],
+            ["git", "push", "origin", "heads/main"],
+            ["git", "push", "origin", "HEAD:main"],
+            ["git", "push", "origin", "HEAD:refs/heads/master"],
+            ["git", "push", "origin", "HEAD:heads/main"],
+            ["git", "push", "--force-with-lease", "origin", "main"],
+            ["git", "--attr-source", "HEAD", "push", "origin", "main"],
+            # Refspec-less pushes
+            ["git", "push"],
+            ["git", "push", "origin"],
+            # Bulk and pattern pushes
+            ["git", "push", "--all", "origin"],
+            ["git", "push", "--mirror", "origin"],
+            ["git", "push", "origin", ":"],
+            ["git", "push", "origin", "refs/heads/*:refs/heads/*"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "run/test-cluster/fix-task"}):
+            self.assertIsNotNone(
+                git_argument_violation(["git", "push", "origin", "run/test-cluster/fix-task"])
+            )
+            self.assertIsNotNone(
+                git_argument_violation(["git", "push", "origin", "HEAD:run/test-cluster/fix-task"])
+            )
+            self.assertIsNotNone(
+                git_argument_violation(["git", "--attr-source", "HEAD", "push", "origin", "run/test-cluster/fix-task"])
+            )
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/broker-task"}):
+            self.assertIsNotNone(
+                git_argument_violation(["git", "push", "origin", "run/test-cluster/broker-task"])
+            )
+
+        # Bare HEAD pushes without destination branch are refused
+        self.assertIsNotNone(git_argument_violation(["git", "push", "origin", "HEAD"]))
+        self.assertIsNotNone(git_argument_violation(["git", "push", "origin", "@"]))
+
+        # Legitimate feature branch pushes are allowed
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "origin", "platform-agent/my-fix"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "origin", "HEAD:platform-agent/my-fix"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "--force-with-lease", "origin", "HEAD:platform-agent/my-fix"])
+        )
+
     def test_a_subcommand_that_runs_a_command_is_refused(self):
         # `git bisect run <cmd>` executes <cmd> in the credential container.
         # Demonstrated through the proxy from inside a valid lease, in two

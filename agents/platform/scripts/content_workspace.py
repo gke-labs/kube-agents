@@ -491,9 +491,28 @@ def check_branch(name: object) -> str:
     from would make the feature useless, and reading is not authoring.
     """
     branch = check_branch_name(name)
-    if branch.casefold() in PROTECTED_BRANCHES:
+    protected = set(PROTECTED_BRANCHES)
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    if override:
+        norm_override = override.strip()
+        if norm_override.startswith("refs/heads/"):
+            norm_override = norm_override[len("refs/heads/"):]
+        elif norm_override.startswith("heads/"):
+            norm_override = norm_override[len("heads/"):]
+        protected.add(norm_override.casefold())
+
+    norm_branch = branch.strip()
+    if norm_branch.startswith("refs/heads/"):
+        norm_branch = norm_branch[len("refs/heads/"):]
+    elif norm_branch.startswith("heads/"):
+        norm_branch = norm_branch[len("heads/"):]
+
+    if norm_branch.casefold() in protected:
         raise ContentWorkspaceError(
-            f"'{branch}' is a rollout branch; suggestions are proposed on their "
+            f"'{branch}' is a rollout or base branch; suggestions are proposed on their "
             "own branch and merged by a human"
         )
     return branch
@@ -1102,6 +1121,23 @@ class ContentWorkspaceStore:
                     "read-only; reopen it without a depth to author a change"
                 )
             branch = check_branch(branch)
+            norm_branch = branch.strip()
+            if norm_branch.startswith("refs/heads/"):
+                norm_branch = norm_branch[len("refs/heads/"):]
+            elif norm_branch.startswith("heads/"):
+                norm_branch = norm_branch[len("heads/"):]
+
+            norm_base = (workspace.base or "").strip()
+            if norm_base.startswith("refs/heads/"):
+                norm_base = norm_base[len("refs/heads/"):]
+            elif norm_base.startswith("heads/"):
+                norm_base = norm_base[len("heads/"):]
+
+            if norm_base and norm_branch.casefold() == norm_base.casefold():
+                raise ContentWorkspaceError(
+                    f"'{branch}' is the workspace base branch; suggestions are proposed on their "
+                    "own branch and merged by a human"
+                )
             self._git(workspace, ["check-ref-format", "--branch", branch])
             if not isinstance(message, str) or not message.strip():
                 raise ContentWorkspaceError("message must be a non-empty string")
@@ -1263,6 +1299,23 @@ class ContentWorkspaceStore:
         with self._lock:
             workspace = self.get(handle)
             branch = check_branch(branch)
+            norm_branch = branch.strip()
+            if norm_branch.startswith("refs/heads/"):
+                norm_branch = norm_branch[len("refs/heads/"):]
+            elif norm_branch.startswith("heads/"):
+                norm_branch = norm_branch[len("heads/"):]
+
+            norm_base = (workspace.base or "").strip()
+            if norm_base.startswith("refs/heads/"):
+                norm_base = norm_base[len("refs/heads/"):]
+            elif norm_base.startswith("heads/"):
+                norm_base = norm_base[len("heads/"):]
+
+            if norm_base and norm_branch.casefold() == norm_base.casefold():
+                raise ContentWorkspaceError(
+                    f"'{branch}' is the workspace base branch; suggestions are proposed on their "
+                    "own branch and merged by a human"
+                )
             if workspace.branch != branch:
                 raise ContentWorkspaceError(
                     f"nothing has been committed on '{branch}' in this workspace"
