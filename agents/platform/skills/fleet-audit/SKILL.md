@@ -181,10 +181,11 @@ still reproducing at `finish`, its pull request opens immediately instead of a w
 
 `carried` lists every finding the open ledger carries — its id, the check that found it, where it
 is, and its title — read off the ledger body `finish` will compare your document against. **These
-are the findings you are answering for.** For each one, this run ends one of three ways: you report
+are the findings you are answering for.** For each one, this run ends one of four ways: you report
 it again; you re-ran its check on that cluster, saw it gone, and say so under
 [`resolved_because`](#the-findings-document) with the same `check`, `cluster`, `namespace` and `object`;
-or you did not run that check there and your `checks_run` does not claim you did. A run whose
+it is a posture now covered by a declaration and sits under `declared`; or you did not run that
+check there and your `checks_run` does not claim you did. A run whose
 `checks_run` says the check ran and whose document neither reports nor explains the finding is
 **held** — see [The clean run](#the-clean-run). Empty when there is no open ledger or its body could
 not be read (`start` says so on stderr).
@@ -496,10 +497,13 @@ field, and publishes nothing:
 
   `check` must be a slug in the SOP's roster, `cluster` must be in `scope.clusters`, `namespace` is
   omitted for a cluster-scoped object, and the entry's identity may not also be a finding in the
-  same document. Nothing here renders on the ledger; the entry exists so `finish` can tell "fixed"
-  from "not written down" before it closes one (see [The clean run](#the-clean-run)). Write it only
-  for a finding you re-ran the check for and saw gone — it is a statement in a public issue, the
-  same as a `checks_run` command.
+  same document. Each entry's id and `reason` are published in the run's closing (or held-open)
+  comment, next to the evidence table, so a retired finding carries the sentence that retired it;
+  nothing renders in the ledger body. The entry exists so `finish` can tell "fixed" from "not
+  written down" before it closes one (see [The clean run](#the-clean-run)). Write it only for a
+  finding you re-ran the check for and saw gone — it is a statement in a public issue, the same as
+  a `checks_run` command. A posture that is now covered by a declaration needs no entry: list it
+  under `declared` and it is accounted for.
 
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
@@ -938,10 +942,11 @@ happened to have a ledger open from the day before.
 closes, `finish` reads the previous body — the same findings `start` handed you as `carried`. For
 every finding it carried, if this run's `checks_run` says the check that found it ran on that
 cluster — the SOP's fleet-wide `kubectl get clusterrolebindings -o json | jq …` counts; it lists
-every binding, `debug-binding` included — and the document neither reports the finding again nor
-carries a `resolved_because` entry for it, the run either saw it gone or left it out, and from the
-document the two are the same absence. The ledger stays open and gets a comment naming each such
-finding and the check that ran, no remediation pull request is closed, and `finish` returns
+every binding, `debug-binding` included — and the document neither reports the finding again,
+carries a `resolved_because` entry for it, nor lists it under `declared`, the run either saw it gone
+or left it out, and from the document the two are the same absence. The ledger stays open and gets
+a comment naming each such finding and the check that ran (plus any `resolved_because` reasons and
+declared postures the document does carry), no remediation pull request is closed, and `finish` returns
 `status: "HELD"` with `resolved: 0`, `silent_ok: false` and the ids in `unaccounted`. Report it as
 you would a partial run — the ledger URL and the held ids — and on the next run either report the
 finding or, if you re-ran its check and saw the object gone, say so in `resolved_because`. On

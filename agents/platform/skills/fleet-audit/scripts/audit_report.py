@@ -2599,15 +2599,21 @@ def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list
     `check`, `cluster`, `namespace` and `object` from the body, and `commands`,
     what this run says it ran for that check on that cluster. Empty when the
     previous body is unreadable, carries no findings, or every previous
-    finding is reported again, explained, or on a cluster this run did not
-    read or did not run that check against. Sorted by id.
+    finding is reported again, explained under `resolved_because`, moved
+    under `declared`, or on a cluster this run did not read or did not run
+    that check against. Sorted by id.
     """
     previous = parse_finding_locations(previous_body)
     if not previous:
         return []
+    # Explained under `resolved_because`, or moved under `declared`: a
+    # posture now covered by a declaration is present and accounted for, and
+    # SKILL.md says that move is its designed retirement path. Neither is
+    # "not written down".
     explained = {
         derive_finding_id(entry)
-        for entry in data.get("resolved_because") or []
+        for key in ("resolved_because", "declared")
+        for entry in data.get(key) or []
         if isinstance(entry, dict)
     }
     current = {
@@ -4672,32 +4678,70 @@ def render_clean_comment(
         if len(withheld) > MAX_DECLARED_ROWS:
             out.append(f"- _…and {len(withheld) - MAX_DECLARED_ROWS} more_")
 
-    # A clean run closes the ledger without rewriting it, so this comment is
-    # the last place a declared posture is published on the issue tracker:
-    # once the ledger is closed, a clean run with declarations opens nothing
-    # (see the CLEAN branch of `handle_finish`), and the record is the
-    # declaration itself in the repository plus the `declared` count on the
-    # `finish` line. Say what was seen and where it is declared; "0 findings"
-    # over a fleet with pinned replicas the operator never hears about is a
-    # quieter claim than the run can back.
-    declared = list(data.get("declared") or [])
-    if declared:
-        out += [
-            "",
-            f"{len(declared)} posture(s) a check would have flagged are declared "
-            "on purpose in a linked repository and were not reported as findings:",
-            "",
-        ]
-        for entry in declared[:MAX_DECLARED_ROWS]:
-            obj, where = _declared_pointer(entry)
-            out.append(
-                f"- `{_cell(str(entry.get('check', '')))}` on `{obj}` in "
-                f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`"
-            )
-        if len(declared) > MAX_DECLARED_ROWS:
-            out.append(f"- _…and {len(declared) - MAX_DECLARED_ROWS} more_")
+    out += _comment_resolved(data)
+    out += _comment_declared(data)
     out += _comment_evidence(audit_id, clusters, out)
     return _clip_comment("\n".join(out))
+
+
+def _comment_resolved(data: dict) -> list[str]:
+    """The `resolved_because` entries, id and reason, for a comment.
+
+    The reason is the one sentence that retired a carried finding, and the
+    ledger body is not rewritten on a clean run, so the comment is the only
+    place it can be published. Validated and then dropped, it would be a
+    claim made to the harness and to nobody else.
+    """
+    resolved = [e for e in data.get("resolved_because") or [] if isinstance(e, dict)]
+    if not resolved:
+        return []
+    noun = "finding" if len(resolved) == 1 else "findings"
+    out = [
+        "",
+        f"{len(resolved)} previously reported {noun} the run confirmed gone, in its "
+        "own words:",
+        "",
+    ]
+    for entry in resolved[:MAX_DELTA_ROWS]:
+        out.append(
+            f"- `{_cell(derive_finding_id(entry))}` — "
+            f"{_cell(str(entry.get('reason', '')))}"
+        )
+    if len(resolved) > MAX_DELTA_ROWS:
+        out.append(f"- _…and {len(resolved) - MAX_DELTA_ROWS} more_")
+    return out
+
+
+def _comment_declared(data: dict) -> list[str]:
+    """The declared postures, with their `repo:path` pointers, for a comment.
+
+    A clean run closes the ledger without rewriting it, so this comment is
+    the last place a declared posture is published on the issue tracker:
+    once the ledger is closed, a clean run with declarations opens nothing
+    (see the CLEAN branch of `handle_finish`), and the record is the
+    declaration itself in the repository plus the `declared` count on the
+    `finish` line. Say what was seen and where it is declared; "0 findings"
+    over a fleet with pinned replicas the operator never hears about is a
+    quieter claim than the run can back. A held run is not rewritten either.
+    """
+    declared = list(data.get("declared") or [])
+    if not declared:
+        return []
+    out = [
+        "",
+        f"{len(declared)} posture(s) a check would have flagged are declared "
+        "on purpose in a linked repository and were not reported as findings:",
+        "",
+    ]
+    for entry in declared[:MAX_DECLARED_ROWS]:
+        obj, where = _declared_pointer(entry)
+        out.append(
+            f"- `{_cell(str(entry.get('check', '')))}` on `{obj}` in "
+            f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`"
+        )
+    if len(declared) > MAX_DECLARED_ROWS:
+        out.append(f"- _…and {len(declared) - MAX_DECLARED_ROWS} more_")
+    return out
 
 
 def _comment_evidence(audit_id: str, clusters: list[dict], out: list[str]) -> list[str]:
@@ -4761,6 +4805,8 @@ def render_held_comment(
         out.append(line)
     if len(held) > MAX_DELTA_ROWS:
         out.append(f"- _…and {len(held) - MAX_DELTA_ROWS} more_")
+    out += _comment_resolved(data)
+    out += _comment_declared(data)
     out += _comment_evidence(audit_id, clusters, out)
     return _clip_comment("\n".join(out))
 
@@ -5012,25 +5058,43 @@ def render_clean_remediate_answer(
 ) -> str:
     """Said once per `/remediate` standing on a ledger that came back clean.
 
-    Not a refusal — nothing was wrong with the request. The finding it named has
-    simply stopped reproducing, which is the outcome the requester wanted, and
-    saying so is what stops them from re-asking on an issue that is about to
-    close.
+    Not a refusal — nothing was wrong with the request. On a closing or a
+    partial run the finding it named has simply stopped reproducing, which is
+    the outcome the requester wanted, and saying so is what stops them from
+    re-asking on an issue that is about to close.
+
+    On a held run (`held=True`) it must say something else: the run did not
+    account for the findings the ledger carries, and the requester's target
+    is, by construction, one of them. "No longer reproduces" would contradict
+    the held-open comment posted right after it.
     """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     targets = request.get("targets") or []
     named = ", ".join(f"`{_ident(t)}`" for t in targets)
+    if held:
+        middle = (
+            f"The {audit_name(audit_id)} audit found **0 findings** on this run, but "
+            "it did not account for the findings this ledger was carrying"
+            + (f" — {named} among them" if targets else "")
+            + ", so nothing has been reported as resolved. A pull request here "
+            "would propose a fix for a finding whose state this run did not "
+            "establish."
+        )
+    else:
+        middle = (
+            f"The {audit_name(audit_id)} audit found **0 findings** on this run"
+            + (
+                f", so {named} no longer reproduces."
+                if targets
+                else ", so there is nothing left to remediate."
+            )
+            + " A pull request here would propose a change nobody needs."
+        )
     out = [
         f"@{request.get('author', 'someone')} — that `/remediate` was read on "
         f"{stamp}, and no pull request was opened.",
         "",
-        f"The {audit_name(audit_id)} audit found **0 findings** on this run"
-        + (
-            f", so {named} no longer reproduces."
-            if targets
-            else ", so there is nothing left to remediate."
-        )
-        + " A pull request here would propose a change nobody needs.",
+        middle,
         "",
         (
             "This ledger is closing as completed. If the finding comes back, the "

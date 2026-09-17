@@ -3319,6 +3319,38 @@ class TestUnaccountedJoin(unittest.TestCase):
         # No body to join against: nothing held.
         self.assertEqual(audit_report.unaccounted_previous_findings(None, naming_doc()), [])
 
+    def test_a_carried_posture_that_moved_under_declared_is_accounted_for(self):
+        # The designed retirement path for a posture finding: a declaration
+        # appears in a linked repository and the next run moves the object
+        # under `declared`. Present and accounted for, not "not written down".
+        body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
+        doc = make_doc(findings=[])
+        doc["declared"] = [make_declared(check=HELD_CHECK, namespace="", obj=HELD_OBJECT)]
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, doc), [])
+
+    def test_the_held_comment_carries_the_declared_and_resolved_entries(self):
+        # A held run is not rewritten either, so the comment is where a
+        # declaration's pointer and a resolved reason get published.
+        doc = make_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        doc["resolved_because"] = [resolved_entry(object="ClusterRoleBinding/other")]
+        held = [
+            {
+                "id": held_id(),
+                "title": "t",
+                "check": HELD_CHECK,
+                "cluster": "prod-us-east",
+                "namespace": "",
+                "object": HELD_OBJECT,
+                "commands": ["kubectl get clusterrolebindings -o json"],
+            }
+        ]
+        comment = audit_report.render_held_comment(AUDIT, doc, held, NOW)
+        self.assertIn("declared at `acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
+        self.assertIn("confirmed gone, in its own words", comment)
+        self.assertIn(resolved_entry()["reason"], comment)
+        self.assertLess(comment.index("stays open"), comment.index("confirmed gone"))
+
     def test_the_check_must_have_run_on_the_previous_cluster(self):
         # The check ran on stage-eu only; the finding was on prod-us-east. A
         # different cluster's check says nothing about it.
@@ -3479,6 +3511,11 @@ class TestHeldClose(HarnessTestCase):
         comments = self.harness.bodies_for("issue", "comment")
         self.assertEqual(len(comments), 1)
         self.assertIn("closed as completed", comments[0])
+        # The reason that retired the finding is published with the close,
+        # next to the evidence table; validated-and-dropped would be a claim
+        # made to the harness and nobody else.
+        self.assertIn("confirmed gone, in its own words", comments[0])
+        self.assertIn(f"`{held_id()}` — {resolved_entry()['reason']}", comments[0])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["resolved"], 1)
@@ -3532,6 +3569,11 @@ class TestHeldClose(HarnessTestCase):
         # The held reason, not the coverage one: this run read the whole fleet.
         self.assertIn("did not account for", answers[0])
         self.assertNotIn("could not see the whole fleet", answers[0])
+        # And not the clean one either: the target is one of the findings the
+        # run did not account for, so it has not "stopped reproducing".
+        self.assertNotIn("no longer reproduces", answers[0])
+        self.assertNotIn("nobody needs", answers[0])
+        self.assertIn(f"`{held_id()}`", answers[0])
 
     def test_a_finding_that_stays_on_the_ledger_carries_the_field_empty(self):
         self.previous_ledger()

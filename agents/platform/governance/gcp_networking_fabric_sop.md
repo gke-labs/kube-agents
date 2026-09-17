@@ -190,7 +190,7 @@ Every finding must conform to the full findings schema:
 ./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
   [--repo "<owner>/<repo>"]
-# -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```
