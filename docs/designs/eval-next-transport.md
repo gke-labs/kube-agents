@@ -93,12 +93,12 @@ the presubmit exports nothing new until it chooses to. The exchange:
    the conversation key, and the harness returns when the terminal lands or its deadline passes.
    The deadline on this path is the gateway's first-event grace plus a margin (below), never
    `AGENT_HTTP_TIMEOUT` alone, and it bounds the whole task, not one request as that variable
-   does on the api transport. A timeout asks the conversation for status first and cancels only
-   once the answer shows an executor took the task (below); the cancel goes through an explicit
-   cancel route on the conversation, which lands on the bus as `kind: cancel` exactly as the
-   text route's `stop` does, and the harness never sends the stop text. The status question is
-   one of the gateway's exact status phrases, answered by replay from the stream, so no model
-   turn is spent on status.
+   does on the api transport. A timeout reads the conversation's state first, through the
+   adapter's read route (below), and cancels only once that state shows an executor took the
+   task; the cancel goes through an explicit cancel route on the conversation, which lands on the
+   bus as `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the
+   stop text. The harness sends no message at the deadline, so nothing it does there can mint a
+   task or spend a model turn.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
    executor publishes them. Token counts are not on the bus; the record says so rather than
@@ -130,7 +130,11 @@ conversation; its `Kind` is `dm`; its roster is the requester alone with `comple
 `openDirect` returns the same conversation. Those are the five adapter operations the
 test-backend section names, inbound message with verified sender, conversation and thread
 identity, roster read, post-to-conversation, and `openDirect`, and the inject adapter implements
-all five rather than a subset the session record has to special-case.
+all five rather than a subset the session record has to special-case. One more route sits on
+the adapter's side of the door and is not a sixth backend operation: a read of the conversation's
+state, which returns what the session record holds for the key and runs the never-started heal
+check itself without routing anything; the infrastructure paragraph below says what the harness
+does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
@@ -138,9 +142,10 @@ Chat; a localhost door has no silent-stop failure mode, so it is a side door tha
 exactly one real backend, and the guard keeps refusing two real ones. The door beside a real
 backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
 against one install and compare them, and the Slack adapter in flight agrees on the same reading.
-One thing the decision did not address and this document assumes: the door alone is enough for
-the gateway to start, because the eval install has no real backend until stage 2 gives it one.
-The adapter's change settles that in the guard itself.
+The door alone is also enough for the gateway to start (decided 2026-09-17 by the A2A owner,
+whose reason is that this is what makes the adapter the answer for an eval install with no real
+backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
+the guard say so in code and in the gateway spec's test-backend section.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
 for a dead tunnel: the adapter unreachable, the gateway refusing the injection, or no executor
@@ -154,16 +159,21 @@ default of that variable and the grace default are both ten minutes, and the hea
 strictly against a clock `startTask` stamps after the harness's own started, so a deadline at the
 grace sends a cancel to a task nobody consumes, gets "cancel sent" back, and no terminal ever
 follows. The heal is not a clock either: it runs at the top of `handleInbound`, before routing,
-on the next inbound message, and a passive read of the conversation never triggers it. So when
-the deadline fires the harness sends one message, an exact status phrase the gateway answers by
-replay, and classifies from what that message draws: the never-started notice, infrastructure; a
-status card showing executor events, a graded timeout, and only now does the cancel go out; a
-status card with no events and no notice, the gateway's clock has not reached the grace yet, so
-wait the margin and ask once more. The cancel is never sent before that answer: `cancelTask`
-detaches the task and the heal is guarded on the task not being detached, so a cancel sent first
-puts the never-started notice out of reach for that task on every later message. That is how
-the harness and the gateway agree on what "nobody took it" means. A task an executor took and
-finished with a `failed` terminal is a graded failure.
+on the next inbound message, and once it has released the conversation that same message is
+routed as a new turn, so a status phrase sent to trigger it would start a task that reads
+"status". The harness therefore sends no message at the deadline. It reads the conversation's
+state through the adapter's read route, which returns what the session record holds and runs the
+heal check itself without routing anything, and classifies from one of four outcomes: no active
+task and a terminal posted, the run finished as the deadline fired, so it is graded like any
+other; an active task with no executor event and an age inside the grace, the gateway's clock has
+not reached the grace yet, so wait the margin and read once more; an active task with executor
+events, a graded timeout, and only now does the cancel go out; the heal fired on this read and
+released the conversation, infrastructure, with nothing started. The cancel is never sent before
+that read: `cancelTask` detaches the task and the heal is guarded on the task not being detached,
+so a cancel sent first puts the never-started notice out of reach for that task. That is how the
+harness and the gateway agree on what "nobody took it" means, and nothing the harness does at the
+deadline can mint a task. A task an executor took and finished with a `failed` terminal is a
+graded failure.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
