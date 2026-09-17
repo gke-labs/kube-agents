@@ -541,10 +541,14 @@ from, refuses to publish that branch under any target, and tells the broker
 which branch that was (`clonedFrom`) so the broker refuses it too,
 `CLONED_BRANCH` — defence in depth for a confused caller, since a client that
 lied would gain nothing it could not get by omitting the field. In addition to
-the remote's default branch, the broker enforces protected branch policy across
-all write doors: `main`, `master`, `production`, any operator-configured base
+the remote's default branch, the broker enforces protected branch policy on
+`/v1/vcs/publish`: `main`, `master`, `production`, any operator-configured base
 override (`CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH`), and any `run/**`
-branch are strictly refused without a pull request (`PROTECTED_BRANCH`).
+branch are strictly refused without a pull request (`PROTECTED_BRANCH`, status 409).
+Across the broker's other write doors, protected branch policy is enforced under
+their respective protocols: the content workspace door (`/v1/workspace/*`) refuses
+with `ContentWorkspaceError` (HTTP 400 `workspace.invalid`), and the command
+execution door (`/v1/exec`) refuses with HTTP 403 `SECURITY_POLICY_BLOCKED`.
 
 The scratch repository is never checked out. It is fetched into and pushed from,
 and nothing materialises a working tree, so a `.gitattributes`, a hook, or a

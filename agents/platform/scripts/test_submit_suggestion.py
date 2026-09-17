@@ -1222,6 +1222,8 @@ class TestContentMode(SubmitSuggestionTestCase):
             with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as ctx:
                 self.submit_content(prepared2, source2, base=None)
             self.assertIn("remote default", str(ctx.exception))
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertEqual(ctx.exception.payload.get("code"), "workspace.invalid")
             self.assertIn("commit", self.verbs)
             self.assertNotIn("push", self.verbs)
 
