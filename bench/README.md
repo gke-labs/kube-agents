@@ -4,7 +4,8 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 
 ## Layout
 
-- `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. That transport needs either a standard-runtime install or a relay pre-opened on its local port — see [Sandboxed installs](#sandboxed-installs). Environment variables are documented in the module docstring.
+- `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. That transport needs either a standard-runtime install or a relay pre-opened on its local port — see [Sandboxed installs](#sandboxed-installs). `AGENT_TRANSPORT=a2a` swaps the HTTP door for the A2A bus (see [Transports](#transports)). Environment variables are documented in the module docstring.
+- `kube_agents_bench/a2a_transport.py` — the bus half of that second transport: envelopes, subjects, the event fold, and one submit-and-await exchange over `nats-py`.
 - `kube_agents_bench/parsing.py` — pure payload and trajectory reading: maps a response onto devops-bench's canonical `AgentResult`, and reads back which kanban cards a turn filed, what statuses it reported, and what a finished card delivered.
 - `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
   `/api/v1` interaction contract. It waits for aggregate terminal state before
@@ -69,6 +70,25 @@ PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> 
 ```
 
 This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional, and `./tasks` runs every case. The exports are what `hack/ci-eval-pr.sh` sets, so a local run grades the way the presubmit does; a case with `fixtures:` also needs `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh`. `--no-infra` smokes the agent path only: it skips the deterministic checks, so such a run can neither pass nor fail the gate. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses this. See `--help` for the rest.
+
+## Transports
+
+The harness reaches the agent through one of two doors, selected by `AGENT_TRANSPORT`. Everything else about a run is the same: the same `KubeAgentsHarness`, the same `AgentResult`, the same transcript stash the verifiers read.
+
+- `api` (the default): `kubectl port-forward` to `svc/platform-agent` and `POST /v1/responses`, followed by status turns on the same conversation while delegated cards settle. This door is identical under `spec.mode: today` and `spec.mode: next`, so a run through it says nothing about the next stack.
+- `a2a`: the prompt is published as one `message` envelope on `a2a.tasks.<addressee>.<taskId>.in`, the way the gateway submits a chat message under `spec.mode: next`, and the task's `…events` and `…supervisor` subjects are folded until the terminal status lands. The harness port-forwards the operator's NATS Service (`<cr>-a2a-nats`, client port 4222) and connects as the `gateway` user with the password from `<cr>-a2a-nats-creds`. The addressee defaults to `platform`, which today only the Hermes bridge sidecar answers; a run against an install with no executor ends as infrastructure (nothing accepted the task within `AGENT_A2A_ACCEPT_TIMEOUT`), never as a graded answer. A task an executor took and ended `failed` is graded. The variables are in the harness module docstring.
+
+What each transport gives the verifiers:
+
+| Verifier                                          | `api`                       | `a2a`                                                                                                                                                             |
+| ------------------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `report_contains`, `fleet_resource_property`      | yes                         | yes: the `result` artifact's text is the report                                                                                                                   |
+| `tool_called`                                     | the delegating turn's calls | only once the executor publishes an `activity` artifact; the bridge does not, so the trajectory holds the task's lifecycle events and the check counts zero calls |
+| `worker_commands`                                 | the delegated cards' logs   | same read, but the card ids come from the trajectory, so none are found until `activity` artifacts carry them                                                     |
+| `ledger_issue_contains`                           | yes                         | yes                                                                                                                                                               |
+| token accounting (`tokens.*`, reported not gated) | the session row             | none: the bus reports no usage, every bucket is null, and `bench-gate` takes the terminal event as the liveness signal instead                                    |
+
+Delegation on the a2a path is a seam, not a feature: the kanban poll behind the wait is wired to issue follow-up tasks on the same context, but with no card ids in the trajectory it settles at once. Whether delegation becomes a child task on the bus is an open design question.
 
 ## The gate
 

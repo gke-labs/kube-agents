@@ -148,6 +148,14 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
+#: The trajectory entry name the harness's a2a transport gives a task's
+#: ``status-update`` events (``a2a_transport.EVENT_ENTRY_STATUS``). The bus
+#: carries no token usage, so an a2a record's ``tokens`` are all null and its
+#: liveness signal is the executor's terminal event instead: an entry of this
+#: name whose ``args.final`` is true. Duplicated rather than imported for the
+#: same reason as the marker above; ``test_scoring.py`` asserts they agree.
+A2A_STATUS_EVENT = "a2a.status-update"
+
 #: Field values from devops-bench's ``_build_failed_record``: ``status`` is
 #: ``"failed"`` on every failed record, and ``verification_status`` is
 #: ``"not_evaluated"`` when verification did not run -- which has TWO
@@ -395,6 +403,22 @@ class RepResult:
         return self.outcome in ("pass", "fail")
 
 
+def _a2a_terminal_event(trajectory: list[Any]) -> bool:
+    """Whether the trajectory carries an a2a executor's terminal status event.
+
+    The a2a transport records the task's lifecycle events as trajectory
+    entries; a final one means an executor took the task and ended it, which
+    is the run evidence a token count gives on the api transport.
+    """
+    for entry in trajectory:
+        if not isinstance(entry, dict) or entry.get("name") != A2A_STATUS_EVENT:
+            continue
+        args = entry.get("args")
+        if isinstance(args, dict) and args.get("final") is True:
+            return True
+    return False
+
+
 def _liveness_failures(record: RunRecord) -> list[str]:
     """Rung 3's signals. Every one must hold for the record to be a real run.
 
@@ -421,10 +445,14 @@ def _liveness_failures(record: RunRecord) -> list[str]:
 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
-    # so the log says which one happened.
+    # so the log says which one happened. The one record that legitimately
+    # carries null buckets is an a2a-transport run: the bus reports no usage,
+    # and its liveness is the executor's terminal event in the trajectory
+    # instead (see _a2a_terminal_event).
     total = record.tokens.get("total")
     if total is None:
-        failures.append("no token accounting on the record (tokens.total is null)")
+        if not _a2a_terminal_event(record.trajectory):
+            failures.append("no token accounting on the record (tokens.total is null)")
     elif not isinstance(total, bool) and _as_float(total) == 0:
         failures.append("tokens.total is 0: no model call was billed")
 

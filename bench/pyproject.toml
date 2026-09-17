@@ -22,6 +22,7 @@ dependencies = [
     # The HARNESS still never parses one -- devops-bench has already done that
     # by the time it is called -- so the `dev` group's note below still holds
     # for the reason it was written.
+    "nats-py==2.16.0",
     "pyyaml>=6.0",
 ]
 
