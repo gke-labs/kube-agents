@@ -338,6 +338,13 @@ def required_roles(path: str) -> tuple[str, ...]:
 # imposes anyway.
 MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 
+# What `repository_role` answers. `managed` is a repository in `managed_repos`,
+# whatever else it is in; `context` is one in `context_repos` alone; the third
+# is neither. Only the content workspace's clone reads the answer.
+ROLE_MANAGED = "managed"
+ROLE_CONTEXT = "context"
+ROLE_UNREGISTERED = "unregistered"
+
 _managed_repository_cache: tuple[float, frozenset[str]] | None = None
 _managed_repository_lock = threading.Lock()
 
@@ -379,6 +386,80 @@ def repository_is_managed(repository: str) -> bool:
     one in the ConfigMap from whoever registered it.
     """
     return repository.lower() in managed_repositories()
+
+
+_context_repository_cache: tuple[float, frozenset[str]] | None = None
+
+
+def context_repositories() -> frozenset[str]:
+    """The `owner/name` slugs registered under `context_repos`, lowercased.
+
+    The list the agent may only *read*: the second key of the same ConfigMap,
+    through the same module and with the same cache window as the managed list,
+    and never merged with it -- see `gitops_workspace.CONTEXT_REPOS_KEY` for why
+    that separation is the safety property. Raises when unreadable, for the
+    reason `managed_repositories` gives.
+    """
+    global _context_repository_cache
+    now = time.monotonic()
+    with _managed_repository_lock:
+        cached = _context_repository_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    from gitops_workspace import get_context_github_repos
+
+    slugs = frozenset(slug.lower() for slug in get_context_github_repos())
+    with _managed_repository_lock:
+        _context_repository_cache = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
+    return slugs
+
+
+def repository_role(repository: str) -> str:
+    """Which list ``repository`` is registered in: managed, context, or neither.
+
+    Managed wins. A repository in both lists is one the install writes to, and
+    the write path must see it exactly as it would without the second entry.
+    Consulted by the content workspace to decide what credential a clone gets,
+    and by nothing that gates a write: `repository_is_managed` stays the only
+    question `commit`, `push`, the API routes and the refresh route ask, and
+    `ROLE_CONTEXT` is not an answer any of them accepts.
+    """
+    if repository_is_managed(repository):
+        return ROLE_MANAGED
+    if repository.lower() in context_repositories():
+        return ROLE_CONTEXT
+    return ROLE_UNREGISTERED
+
+
+def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
+    """The credential the broker's own clone of ``repository`` presents.
+
+    A context repository gets the forge's read-only credential; anything else
+    gets none, and that "none" is not the same thing for the two remaining
+    roles. A managed repository rides the ambient write credential the CLI
+    installed, as it always has, so the broker adds nothing. An unregistered
+    one is a public upstream read with no credential at all, as it always was.
+
+    An unreadable list is logged and answered with no credential rather than
+    raised: this is not an authorization check -- `open` has none by design --
+    and refusing the clone would take `inspect-repository` away from every
+    public repository for the sake of a private one that would have failed
+    anyway.
+    """
+    try:
+        role = repository_role(repository)
+    except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
+        LOGGER.warning(
+            "content workspace open repo=%s role=unknown: the repository lists "
+            "could not be read type=%s; cloning without a credential",
+            repository,
+            type(exc).__name__,
+        )
+        return providers.NoCredential()
+    LOGGER.info("content workspace open repo=%s role=%s", repository, role)
+    if role != ROLE_CONTEXT or registry.default is None:
+        return providers.NoCredential()
+    return registry.default.read_credential(repository)
 
 
 def require_managed_workspace(store, handle: object) -> None:
@@ -1731,6 +1812,13 @@ VCS_GIT_SUBCOMMANDS = frozenset(
 # provider-specific operation without this file listing providers.
 FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
 
+# The flag that turns a forge's refresh helper into a read-only mint: the helper
+# then prints a token for the one repository named and installs nothing.
+# `github_token_refresh.READ_ONLY_FLAG` is the same string; the two are kept in
+# step by test rather than by import, because importing the helper here would
+# import its CLI side into the broker.
+FORGE_READ_ONLY_FLAG = "--read-only"
+
 # What may be spliced into that filename. Closed, anchored and lowercase: a
 # provider name reaching a path is the one place a forge's own string could
 # become a directory traversal.
@@ -3079,7 +3167,12 @@ class CommandExecutor:
         """Run a trusted, operator-defined helper that is not agent selectable."""
         return self._execute(argv, cwd=cwd)
 
-    def execute_workspace_git(self, argv: list[str], cwd: Path) -> ExecutionResult:
+    def execute_workspace_git(
+        self,
+        argv: list[str],
+        cwd: Path,
+        config: tuple[tuple[str, str], ...] = (),
+    ) -> ExecutionResult:
         """git the broker issues on its own behalf, in a tree the agent cannot name.
 
         A separate door from `/v1/exec`, and separate on purpose. The point of
@@ -3101,6 +3194,12 @@ class CommandExecutor:
         * the working directory is inside the *content workspace* root, which
           `assert_disjoint_roots` has already proven is not inside the volume
           the agent writes to.
+
+        `config` is what the credential for this clone asked git to carry --
+        the read-only token's `extraheader`, for a context repository -- and it
+        travels the same way `execute_vcs_git`'s does: into the
+        `GIT_CONFIG_COUNT` layer ahead of the forced pins, so a credential can
+        add a header and cannot turn a pin off.
         """
         from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
 
@@ -3123,6 +3222,7 @@ class CommandExecutor:
             [executable_path, *argv[1:]],
             cwd=str(cwd),
             containment_root=self.content_workspace_root,
+            extra_config=tuple(config),
         )
 
     def execute_vcs_git(
@@ -3261,6 +3361,50 @@ class CommandExecutor:
                 f": {detail[:1000]}" if detail else "",
             )
             raise RuntimeError("credential refresh failed")
+
+    def mint_read_credential(self, provider: str, repository: str) -> str:
+        """A read-only token for one clone of a context repository, or raise.
+
+        The privileged operation a `MintedReadCredential` names and does not
+        perform. The same helper `refresh_forge_credential` runs, with the flag
+        that makes it print a `contents: read` token for this one repository
+        instead of installing a write token for every managed one.
+
+        The role check is the admission: only a repository registered under
+        `context_repos` and not under `managed_repos` is minted for. A managed
+        repository already has the write credential and must keep riding it,
+        an unregistered one gets no credential of either kind, and neither
+        refusal is a failure the caller can act on, so it is a `PermissionError`
+        the credential swallows into a credential-less clone. Checked here and
+        not only in the caller because this is the call that spends the token.
+
+        The token comes back on stdout and is returned, never logged: what the
+        helper wrote to stderr is logged redacted on failure, as the refresh
+        path does, and stdout is not.
+        """
+        if not _PROVIDER_RE.fullmatch(provider or ""):
+            raise ValueError("provider is not a forge name")
+        if repository_role(repository) != ROLE_CONTEXT:
+            raise PermissionError(
+                f"{repository} is not a context repository of this install"
+            )
+        helper = Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
+        if not helper.is_file():
+            raise RuntimeError(f"no credential refresh helper for {provider}")
+        result = self.execute_internal([str(helper), FORGE_READ_ONLY_FLAG, repository])
+        if result.exit_code != 0:
+            detail = redact_credentials(result.stderr.strip())
+            LOGGER.warning(
+                "%s read-only credential mint exited %d%s",
+                provider,
+                result.exit_code,
+                f": {detail[:1000]}" if detail else "",
+            )
+            raise RuntimeError("read-only credential mint failed")
+        token = result.stdout.strip()
+        if not token:
+            raise RuntimeError("read-only credential mint returned no token")
+        return token
 
     def _within_workspace(self, candidate: Path) -> bool:
         return _within(self.workspace_dir, candidate)
@@ -3767,11 +3911,17 @@ def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
         return None
     from content_workspace import ContentWorkspaceStore
 
+    # Its own registry, carrying the read-only mint and nothing else: the store
+    # clones one host, and the credential it may add to a clone is the one that
+    # can only read. The write token is not this registry's to hand out -- the
+    # broker's has it, and the content workspace never asks.
+    registry = providers.Registry({"mint": executor.mint_read_credential})
     store = ContentWorkspaceStore(
         executor.content_workspace_root,
         executor.workspace_dir,
         executor.execute_workspace_git,
         base_branch=base_branch,
+        credential_for=lambda repository: read_credential_for(registry, repository),
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store

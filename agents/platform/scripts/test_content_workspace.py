@@ -1819,5 +1819,135 @@ class GrepTest(unittest.TestCase):
         self.assertEqual("replicas: 2", answer["matches"][0]["text"])
 
 
+class FakeCredential:
+    """A credential whose `git_config` is whatever the test says it is."""
+
+    def __init__(self, config=()):
+        self.config = tuple(config)
+        self.ensured = []
+
+    def ensure(self, repo):
+        self.ensured.append(repo)
+
+    def headers(self, repo):
+        return {}
+
+    def git_config(self, repo):
+        return self.config
+
+
+class ConfigRecordingRunner(RecordingRunner):
+    """A runner that also records the config layer each invocation carried."""
+
+    def __init__(self, responses=None):
+        super().__init__(responses)
+        self.configs = []
+
+    def __call__(self, argv, cwd, config=()):
+        self.configs.append(tuple(config))
+        return super().__call__(argv, cwd)
+
+
+class CloneCredentialTest(unittest.TestCase):
+    """What a clone presents is decided per repository, applied to the remote verbs only."""
+
+    HEADER = (
+        ("http.https://github.com/.extraheader", "AUTHORIZATION: basic eDp5"),
+        ("credential.helper", ""),
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, runner, credential_for):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner, credential_for=credential_for
+        )
+
+    def test_a_context_repository_s_clone_carries_its_credential_and_nothing_else_does(self):
+        credential = FakeCredential(self.HEADER)
+        asked = []
+
+        def credential_for(repo):
+            asked.append(repo)
+            return credential if repo == "acme/tf-live" else None
+
+        runner = ConfigRecordingRunner({"diff --cached": FakeResult(1)})
+        store = self.store(runner, credential_for)
+
+        workspace = store.open("acme/tf-live")
+        self.assertEqual(["acme/tf-live"], asked)
+        self.assertEqual(["acme/tf-live"], credential.ensured, "made current before the clone")
+        clone = runner.subcommands.index("clone")
+        self.assertEqual(self.HEADER, runner.configs[clone])
+        self.assertEqual(
+            {()},
+            {config for index, config in enumerate(runner.configs) if index != clone},
+            "every local git in the open ran with no credential layer",
+        )
+        self.assertIs(credential, workspace.credential)
+
+        # The fetch in `commit` presents what the clone did.
+        runner.calls.clear()
+        runner.configs.clear()
+        store.commit(
+            workspace.handle,
+            "platform-agent/change",
+            "feat: a change",
+            [Change(repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+        )
+        fetch = runner.subcommands.index("fetch")
+        self.assertEqual(self.HEADER, runner.configs[fetch])
+        self.assertEqual(
+            {()},
+            {config for index, config in enumerate(runner.configs) if index != fetch},
+        )
+
+        # Paired: a repository the selector answers nothing for -- a managed
+        # one on the ambient credential, a public one on none -- clones with
+        # no layer at all, and the workspace records that.
+        runner.calls.clear()
+        runner.configs.clear()
+        other = store.open("acme/gitops")
+        self.assertEqual({()}, set(runner.configs))
+        self.assertIsNone(other.credential)
+
+    def test_a_credential_that_could_not_be_minted_leaves_the_clone_credential_less(self):
+        # `MintedReadCredential.ensure` swallows a failed mint and answers an
+        # empty `git_config`; the store then clones exactly as it did before
+        # the credential existed.
+        credential = FakeCredential(())
+        runner = ConfigRecordingRunner()
+        store = self.store(runner, lambda repo: credential)
+        workspace = store.open("acme/tf-live")
+        self.assertEqual(["acme/tf-live"], credential.ensured)
+        self.assertEqual({()}, set(runner.configs))
+        self.assertEqual(["git", "clone", "--quiet"], runner.calls[0][0][:3])
+        self.assertIs(credential, workspace.credential)
+
+    def test_a_store_without_a_selector_hands_its_runner_no_config_at_all(self):
+        # The executor before it learned `config`, and every recorded runner in
+        # this file: `(argv, cwd)` keeps working because the keyword is only
+        # passed when there is something in it.
+        class StrictRunner(RecordingRunner):
+            def __call__(self, argv, cwd):
+                return super().__call__(argv, cwd)
+
+        runner = StrictRunner()
+        ContentWorkspaceStore(self.base / "trees", self.agent, runner).open("acme/fleet")
+        self.assertIn("clone", runner.subcommands)
+
+    def test_a_clone_that_fails_with_a_credential_still_leaves_no_tree_behind(self):
+        credential = FakeCredential(self.HEADER)
+        runner = ConfigRecordingRunner({"clone": FakeResult(128, stderr="fatal: Authentication failed")})
+        store = self.store(runner, lambda repo: credential)
+        with self.assertRaises(ContentWorkspaceError):
+            store.open("acme/tf-live")
+        self.assertEqual([], list(store.tree_root.iterdir()))
+
 if __name__ == "__main__":
     unittest.main()

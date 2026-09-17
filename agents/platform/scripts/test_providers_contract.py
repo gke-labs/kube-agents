@@ -20,6 +20,7 @@ be checking.
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import unittest
@@ -28,7 +29,7 @@ from typing import Any
 from unittest import mock
 
 from providers import AVAILABLE, COLLABORATION_VERBS, ForgeUnsupported
-from providers.credentials import BrokeredCredential
+from providers.credentials import BrokeredCredential, MintedReadCredential, NoCredential
 from workspace_paths import WorkspaceError
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -380,6 +381,93 @@ class BrokeredCredentialTest(unittest.TestCase):
         with self.assertRaises(PermissionError):
             BrokeredCredential("acme", refuse).ensure("acme/not-ours")
 
+
+class ReadCredentialTest(unittest.TestCase):
+    """The read-only credential: per clone, presented to git, never installed."""
+
+    def test_every_forge_defaults_to_no_read_credential(self):
+        # Without a mint operation there is nothing to present, on every forge
+        # and on every stub: a context repository is then cloned with no
+        # credential, which is what every forge did before this existed.
+        from providers import Registry
+
+        registry = Registry({})
+        for forge in (*registry.forges, *registry.stubs):
+            with self.subTest(forge=forge.name):
+                self.assertIsInstance(forge.read_credential("acme/infra"), NoCredential)
+
+    def test_a_forge_built_with_a_mint_answers_a_fresh_credential_per_call(self):
+        from providers import Registry
+
+        registry = Registry({"mint": lambda provider, repo: "token"})
+        forge = registry.default
+        first = forge.read_credential("acme/infra")
+        second = forge.read_credential("acme/infra")
+        self.assertIsInstance(first, MintedReadCredential)
+        self.assertIsNot(first, second, "scoped to one clone, so one object per clone")
+        # The write credential is untouched by the read one existing.
+        self.assertIsInstance(forge.credential, BrokeredCredential)
+
+    def test_the_credential_reaches_git_as_a_header_and_nothing_else(self):
+        minted = []
+
+        def mint(provider, repo):
+            minted.append((provider, repo))
+            return "s3cret\n"
+
+        credential = MintedReadCredential("acme", mint, "acme.example")
+        # Nothing to present before it is made current.
+        self.assertEqual((), credential.git_config("acme/infra"))
+        credential.ensure("acme/infra")
+        self.assertEqual([("acme", "acme/infra")], minted)
+
+        config = credential.git_config("acme/infra")
+        self.assertEqual(
+            ("http.https://acme.example/.extraheader", "credential.helper"),
+            tuple(key for key, _ in config),
+        )
+        header = dict(config)["http.https://acme.example/.extraheader"]
+        self.assertTrue(header.startswith("AUTHORIZATION: basic "), header)
+        self.assertEqual(
+            "x-access-token:s3cret",
+            base64.b64decode(header.split()[-1]).decode("utf-8"),
+        )
+        self.assertNotIn("s3cret", header)
+        # The empty helper is what keeps a 401 on this token from falling back
+        # to whatever helper the ambient write credential installed.
+        self.assertEqual("", dict(config)["credential.helper"])
+        # The API side is not part of the read path.
+        self.assertEqual({}, credential.headers("acme/infra"))
+
+    def test_a_failed_mint_including_a_refusal_is_swallowed_into_no_credential(self):
+        # The asymmetry with `BrokeredCredential`: there is no token when the
+        # mint is refused, so proceeding is a credential-less clone, not a
+        # verb running on a token that was just refused.
+        for failure in (RuntimeError("the minter is down"), PermissionError("not a context repository")):
+            with self.subTest(failure=type(failure).__name__):
+
+                def mint(provider, repo, failure=failure):
+                    raise failure
+
+                credential = MintedReadCredential("acme", mint, "acme.example")
+                with self.assertLogs("credential-proxy.vcs", level="WARNING") as logs:
+                    credential.ensure("acme/infra")
+                self.assertEqual((), credential.git_config("acme/infra"))
+                self.assertNotIn("not a context", "\n".join(logs.output), "no detail crosses")
+
+    def test_no_mint_operation_means_nothing_to_present(self):
+        credential = MintedReadCredential("acme", None, "acme.example")
+        credential.ensure("acme/infra")
+        self.assertEqual((), credential.git_config("acme/infra"))
+
+    def test_a_second_ensure_replaces_the_token_rather_than_keeping_a_stale_one(self):
+        tokens = iter(["first", "second"])
+        credential = MintedReadCredential("acme", lambda p, r: next(tokens), "acme.example")
+        credential.ensure("acme/infra")
+        before = dict(credential.git_config("acme/infra"))
+        credential.ensure("acme/infra")
+        after = dict(credential.git_config("acme/infra"))
+        self.assertNotEqual(before, after)
 
 if __name__ == "__main__":
     unittest.main()

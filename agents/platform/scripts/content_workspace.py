@@ -568,9 +568,20 @@ class Workspace:
     default_branch: str = ""
     shallow: bool = False
     metadata: dict = field(default_factory=dict)
+    # What this workspace's clone presented to the remote, kept so the fetch in
+    # `commit` presents the same thing. None when the clone carried nothing of
+    # its own -- a managed repository on the ambient credential, or a public
+    # one on none -- and never anything a response reports.
+    credential: object | None = None
 
 
 GitRunner = Callable[..., object]
+# Answers "what credential does the broker's own clone of this repository
+# present": the forge's read-only one for a context repository, none otherwise.
+# Injected rather than imported so this module keeps knowing nothing about
+# repository registration, which is the property `require_managed_workspace`
+# in the broker relies on.
+CredentialFor = Callable[[str], object]
 
 
 class ContentWorkspaceStore:
@@ -594,6 +605,7 @@ class ContentWorkspaceStore:
         agent_workspace_root: str | Path,
         runner: GitRunner,
         base_branch: str = "",
+        credential_for: CredentialFor | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -621,6 +633,7 @@ class ContentWorkspaceStore:
             or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
             or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
         )
+        self._credential_for = credential_for
         self._workspaces: dict[str, Workspace] = {}
         # One lock, held across the whole of every public verb.
         #
@@ -703,13 +716,28 @@ class ContentWorkspaceStore:
         rendered = _ABSOLUTE_PATH_RE.sub("<path>", rendered)
         return rendered[:500]
 
-    def _git(self, workspace_or_dir, argv: list[str], *, check: bool = True):
+    def _git(
+        self,
+        workspace_or_dir,
+        argv: list[str],
+        *,
+        check: bool = True,
+        config: tuple[tuple[str, str], ...] = (),
+    ):
         cwd = (
             workspace_or_dir.tree
             if isinstance(workspace_or_dir, Workspace)
             else Path(workspace_or_dir)
         )
-        result = self._runner(["git", *argv], cwd=cwd)
+        # `config` is handed on only when there is something in it. The two
+        # verbs that talk to the remote are the only ones that ever have any,
+        # and a runner that takes `(argv, cwd)` -- every recorded one in the
+        # tests, and the executor before it learned the argument -- keeps
+        # working for the rest.
+        if config:
+            result = self._runner(["git", *argv], cwd=cwd, config=config)
+        else:
+            result = self._runner(["git", *argv], cwd=cwd)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
             raise GitFailed(
@@ -721,6 +749,28 @@ class ContentWorkspaceStore:
     @staticmethod
     def _out(result) -> str:
         return (getattr(result, "stdout", "") or "").strip()
+
+    def _credential(self, repo: str) -> object | None:
+        """The credential this repository's clone presents, or None.
+
+        Asked once per `open`, before the clone. Whatever it answers is made
+        current here too, so the caller holds an object whose `git_config` is
+        ready to hand to git.
+        """
+        if self._credential_for is None:
+            return None
+        credential = self._credential_for(repo)
+        if credential is None:
+            return None
+        credential.ensure(repo)
+        return credential
+
+    @staticmethod
+    def _remote_config(workspace: Workspace) -> tuple[tuple[str, str], ...]:
+        """The git config a fetch of this workspace carries: what its clone did."""
+        if workspace.credential is None:
+            return ()
+        return tuple(workspace.credential.git_config(workspace.repo))
 
     # -- lifecycle -------------------------------------------------------
 
@@ -778,6 +828,13 @@ class ContentWorkspaceStore:
             tree = self.tree_root / handle
             tree.mkdir(parents=True, exist_ok=False)
             url = f"https://github.com/{repo}.git"
+            # Which credential, if any, this clone presents is decided by the
+            # broker from the repository's registered role: a read-only token
+            # for a context repository, nothing added for anything else. It is
+            # applied to this clone and to the fetch in `commit`, and to no
+            # other git this store runs -- everything else is local.
+            credential = self._credential(repo)
+            remote_config = tuple(credential.git_config(repo)) if credential else ()
             # The URL is composed here from a validated `owner/name`, never taken
             # from the caller: a caller-supplied URL is `url.<host>.insteadOf` by
             # another route, and the whole point of this module is that the agent
@@ -795,7 +852,7 @@ class ContentWorkspaceStore:
                     if base is not None:
                         argv += ["--branch", base]
                 argv += [url, str(tree / "repo")]
-                self._git(tree, argv)
+                self._git(tree, argv, config=remote_config)
                 # Measured after the clone, and the tree goes if it is over.
                 # A repository the broker cannot afford to hold is not one it
                 # should hold *badly*, half-cloned and still on the disk.
@@ -812,6 +869,7 @@ class ContentWorkspaceStore:
                     base="",
                     base_sha="",
                     shallow=depth is not None,
+                    credential=credential,
                 )
                 workspace.default_branch = self._default_branch(workspace)
                 workspace.base = base or workspace.default_branch
@@ -1181,7 +1239,11 @@ class ContentWorkspaceStore:
                 )
             changes = list(changes)
 
-            self._git(workspace, ["fetch", "--quiet", "--prune", "origin"])
+            self._git(
+                workspace,
+                ["fetch", "--quiet", "--prune", "origin"],
+                config=self._remote_config(workspace),
+            )
             current_base_sha = self._sha(workspace, f"origin/{workspace.base}")
             if expected_base_sha and expected_base_sha != current_base_sha:
                 self._raise_if_moved_under_us(

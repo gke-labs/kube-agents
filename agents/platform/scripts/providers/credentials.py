@@ -27,6 +27,7 @@ performs it.
 
 from __future__ import annotations
 
+import base64
 import logging
 from typing import Callable, Protocol
 
@@ -38,6 +39,27 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 # for it. Carrying the provider as an argument rather than in a route path is
 # what lets an agent image and a broker image differ by a release.
 RefreshOperation = Callable[[str, str], None]
+
+# The privileged operation a MintedReadCredential names: (provider, repository)
+# -> a read-only token for that one repository. Nothing out of process reaches
+# it: the broker asks for it inside its own clone, and the executor that
+# performs it decides from the repository's registered role whether to.
+MintOperation = Callable[[str, str], str]
+
+# How an installation token is presented to git over HTTPS: basic auth with
+# this fixed username and the token as the password, on the
+# `http.<url>.extraheader` key so the token never becomes part of a URL git
+# might print. The key is per host, composed below from the forge's own; the
+# username is the convention the first forge's installation tokens use, and
+# a forge with another convention picks a different strategy.
+HTTP_EXTRAHEADER_KEY = "http.https://{host}/.extraheader"
+EXTRAHEADER_USERNAME = "x-access-token"
+# `credential.helper` set to the empty string clears every helper configured
+# below it in git's precedence, which in the broker means the one the CLI
+# installed for the write token. Without this, a 401 from a bad read token
+# would fall back to the write credential -- the fallback this credential
+# exists to make impossible.
+CREDENTIAL_HELPER_KEY = "credential.helper"
 
 
 class Credential(Protocol):
@@ -105,6 +127,71 @@ class BrokeredCredential:
 
     def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
         return ()
+
+
+class MintedReadCredential:
+    """A read-only token minted for one clone of one repository, shown to git only.
+
+    What the broker presents when it clones a *context* repository -- one
+    registered to be read for declared intent and never written. It is the
+    counterpart of `BrokeredCredential` on the other side of a line that
+    strategy cannot cross: the brokered token is installed once, ambiently, in
+    a helper every git in the sidecar consults, and it is a write token. A
+    context repository must never be reached on that token, so this one is
+    never installed anywhere. `ensure` asks the executor to mint it, `git_config`
+    hands it to the one git invocation the caller is about to run as an
+    `extraheader`, and the process it was handed to is the only place it ever
+    lives.
+
+    Two things are asymmetric with `BrokeredCredential`, on purpose:
+
+    * A failed mint is swallowed, `PermissionError` included, and the caller
+      proceeds with no credential. The refusal there stops a verb from running
+      on a *valid* token against a repository just refused; here there is no
+      token when the mint is refused, so proceeding means a credential-less
+      clone -- what every context repository got before this existed, which
+      is correct for a public one and fails for a private one the way it
+      always did.
+    * `headers` is empty. The API side is not part of the read path: a context
+      repository is cloned and read, and the collaboration verbs on it are the
+      write gate's business.
+    """
+
+    def __init__(self, provider: str, mint: MintOperation | None, host: str) -> None:
+        self.provider = provider
+        self._mint = mint
+        self._host = host
+        self._token: str | None = None
+
+    def ensure(self, repo: str) -> None:
+        self._token = None
+        if self._mint is None:
+            return
+        try:
+            token = self._mint(self.provider, repo)
+        except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
+            LOGGER.warning(
+                "%s: read-only credential for %s was not minted: %s",
+                self.provider,
+                repo,
+                type(exc).__name__,
+            )
+            return
+        self._token = token.strip() or None
+
+    def headers(self, repo: str) -> dict[str, str]:
+        return {}
+
+    def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
+        if not self._token:
+            return ()
+        basic = base64.b64encode(
+            f"{EXTRAHEADER_USERNAME}:{self._token}".encode("utf-8")
+        ).decode("ascii")
+        return (
+            (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
+            (CREDENTIAL_HELPER_KEY, ""),
+        )
 
 
 class NoCredential:

@@ -7,6 +7,7 @@ the sidecar queries the token broker (Minty) directly. Standalone/legacy
 deployments continue to use the direct path.
 """
 
+import argparse
 import email.message
 import io
 import json
@@ -61,6 +62,25 @@ SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
 #: the work inside it; this is the 60s the in-pod HTTP branch allows plus room
 #: for the connection.
 SANDBOX_REFRESH_TIMEOUT_SECONDS = 90
+
+#: The two Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
+#: github-minter.yaml). The write scope is what every managed repository rides;
+#: the read scope grants `contents: read` alone and is minted per clone of a
+#: context repository, by the broker, for its own git and nothing else.
+MINTY_WRITE_SCOPE = "platform-agent-scope"
+MINTY_READ_SCOPE = "platform-agent-read-scope"
+
+#: The flag that selects the read-only mint. `credential_proxy.CommandExecutor`
+#: spells the same flag when it runs this script; it cannot import this module
+#: for the constant without also importing the CLI side, so the two copies are
+#: kept in step by `test_credential_proxy.py`.
+READ_ONLY_FLAG = "--read-only"
+
+#: How long one Minty request may take, how long the CLI may take to install
+#: what Minty returned, and how long gcloud may take to print an identity token.
+MINTY_REQUEST_TIMEOUT_SECONDS = 5
+CLI_SETUP_TIMEOUT_SECONDS = 15
+GCLOUD_TIMEOUT_SECONDS = 5
 
 # What `gh` prints when the credential is the problem, as opposed to the
 # repository, the network, or the rate limit. Matched case-insensitively
@@ -224,6 +244,185 @@ def get_current_git_repo(cwd: str | None = None) -> str | None:
     return None
 
 
+def broker_oidc_token() -> str:
+    """The Google OIDC identity token Minty authenticates the caller by.
+
+    Federation first, and only when the container is actually running on a
+    federated credential -- fetch_identity_token returns None otherwise and
+    this falls through to the metadata server via gcloud, which is what every
+    placement other than the co-located sandbox proxy uses. The federated
+    branch exists because gcloud refuses to mint an ID token from an
+    external_account credential at all, so without it the co-located proxy can
+    reach GCP but not GitHub.
+    """
+    oidc_token = wif_credentials.fetch_identity_token(TOKEN_BROKER_URL)
+    if oidc_token:
+        log("Minted the broker OIDC token through Workload Identity Federation.")
+        return oidc_token
+    try:
+        res = subprocess.run(
+            [
+                "gcloud",
+                "auth",
+                "print-identity-token",
+                f"--audiences={TOKEN_BROKER_URL}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=GCLOUD_TIMEOUT_SECONDS,
+        )
+        oidc_token = res.stdout.strip()
+    except Exception:
+        try:
+            res = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=GCLOUD_TIMEOUT_SECONDS,
+            )
+            oidc_token = res.stdout.strip()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to retrieve Google OIDC token via gcloud: {e}"
+            ) from e
+
+    if not oidc_token:
+        raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
+    return oidc_token
+
+
+def request_minty_token(
+    oidc_token: str,
+    org_name: str,
+    repositories: Sequence[str],
+    scope: str,
+    *,
+    max_attempts: int = 3,
+    initial_delay: float = 0.5,
+    backoff_factor: float = 2.0,
+) -> str:
+    """One installation token from Minty for `repositories` under `scope`, with bounded retries."""
+    headers = {"Content-Type": "application/json", "X-OIDC-Token": oidc_token}
+    body = {
+        "org_name": org_name,
+        "repositories": list(repositories),
+        "scope": scope,
+    }
+    req_data = json.dumps(body).encode("utf-8")
+
+    log(
+        f"Requesting scoped installation token from Minty for organization {org_name} "
+        f"(repositories: {list(repositories)}, scope: {scope})..."
+    )
+
+    token = None
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = urllib.request.Request(
+                TOKEN_BROKER_URL, data=req_data, headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(
+                req, timeout=MINTY_REQUEST_TIMEOUT_SECONDS
+            ) as response:
+                if response.status == 200:
+                    token = response.read().decode("utf-8").strip()
+                    break
+                if response.status >= 500:
+                    raise urllib.error.HTTPError(
+                        TOKEN_BROKER_URL,
+                        response.status,
+                        f"HTTP {response.status}",
+                        email.message.Message(),
+                        None,
+                    )
+                error_body = response.read().decode("utf-8").strip()
+                raise RuntimeError(
+                    f"Minty returned error (HTTP {response.status}): {error_body}"
+                )
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8")
+            except Exception:
+                pass
+            if e.code >= 500:
+                if attempt < max_attempts:
+                    delay = initial_delay * (backoff_factor ** (attempt - 1))
+                    log(
+                        f"Minty returned HTTP {e.code} on attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+            raise RuntimeError(
+                f"Minty returned error (HTTP {e.code}): {error_body}"
+            ) from e
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as e:
+            last_exc = e
+            if attempt < max_attempts:
+                delay = initial_delay * (backoff_factor ** (attempt - 1))
+                log(
+                    f"Minty connection error ({e}) on attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"Failed to connect to Minty at {TOKEN_BROKER_URL}: {e}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to connect to Minty at {TOKEN_BROKER_URL}: {e}"
+            ) from e
+
+    if not token:
+        if last_exc:
+            raise RuntimeError(
+                f"Failed to obtain token from Minty: {last_exc}"
+            ) from last_exc
+        raise RuntimeError("Token received from Minty is empty")
+    return token
+
+
+def mint_read_only_token(target_repo: str | None) -> str:
+    """A `contents: read` installation token for one repository, and nothing else.
+
+    The credential the broker presents to its own `git clone` of a context
+    repository (`content_workspace.py`, through `MintedReadCredential`). Three
+    things distinguish it from `refresh_git_credentials`, each deliberate:
+
+    * The scope is `MINTY_READ_SCOPE` and the repository list is this one
+      repository. The write scope's list is widened to every managed repository
+      so one token slot serves them all; a read token is per clone, so there is
+      no slot to serve and no reason to widen.
+    * It goes straight to Minty. There is no sidecar to delegate to, because
+      this runs *in* the sidecar, and no sandbox to forward through, because the
+      sandbox must never hold it.
+    * It touches nothing: no CLI login, no credential helper, no file. The token
+      is returned to the caller, which puts it in one git process's environment
+      and lets it die with that process. The ambient write credential the CLI
+      installed stays exactly as it was.
+    """
+    repository = target_repo.strip().strip("/") if target_repo else ""
+    if not repo_ref.is_github_slug(repository):
+        raise RuntimeError(
+            f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
+        )
+    org_name, repo_name = repository.split("/", 1)
+    token = request_minty_token(
+        broker_oidc_token(), org_name, [repo_name], MINTY_READ_SCOPE
+    )
+    log(f"Minted a read-only installation token for repository: {repository}")
+    return token
+
+
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
@@ -316,56 +515,11 @@ def refresh_git_credentials(
         log(f"GitHub credentials refreshed through the shell sandbox for {repository}.")
         return ""
 
-    # 1. Retrieve Google OIDC identity token.
-    #
-    # Federation first, and only when the container is actually running on a
-    # federated credential -- fetch_identity_token returns None otherwise and
-    # this falls through to the metadata server via gcloud, which is what every
-    # placement other than the co-located sandbox proxy uses. The federated
-    # branch exists because gcloud refuses to mint an ID token from an
-    # external_account credential at all, so without it the co-located proxy can
-    # reach GCP but not GitHub.
-    oidc_token = wif_credentials.fetch_identity_token(TOKEN_BROKER_URL)
-    if oidc_token:
-        log("Minted the broker OIDC token through Workload Identity Federation.")
-    else:
-        try:
-            res = subprocess.run(
-                [
-                    "gcloud",
-                    "auth",
-                    "print-identity-token",
-                    f"--audiences={TOKEN_BROKER_URL}",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=5,
-            )
-            oidc_token = res.stdout.strip()
-        except Exception:
-            try:
-                res = subprocess.run(
-                    ["gcloud", "auth", "print-identity-token"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=5,
-                )
-                oidc_token = res.stdout.strip()
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to retrieve Google OIDC token via gcloud: {e}"
-                ) from e
-
-        if not oidc_token:
-            raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
-
-    # 2. Query Minty Token Broker with bounded retries
-    org_name, repo_name = repository.split("/", 1)
+    oidc_token = broker_oidc_token()
 
     # In a multi-repo deployment, scope the installation token to all managed
     # repositories within this organization to avoid pod-wide token slot churn.
+    org_name, repo_name = repository.split("/", 1)
     repositories_to_scope = [repo_name]
     try:
         from gitops_workspace import get_managed_github_repos
@@ -381,87 +535,15 @@ def refresh_git_credentials(
     except Exception as e:
         log(f"WARNING: Could not expand managed repositories for token scoping: {e}")
 
-    headers = {"Content-Type": "application/json", "X-OIDC-Token": oidc_token}
-    body = {
-        "org_name": org_name,
-        "repositories": repositories_to_scope,
-        "scope": "platform-agent-scope",
-    }
-    req_data = json.dumps(body).encode("utf-8")
-
-    log(
-        f"Requesting scoped installation token from Minty for organization {org_name} (repositories: {repositories_to_scope})..."
+    token = request_minty_token(
+        oidc_token,
+        org_name,
+        repositories_to_scope,
+        MINTY_WRITE_SCOPE,
+        max_attempts=max_attempts,
+        initial_delay=initial_delay,
+        backoff_factor=backoff_factor,
     )
-
-    token = None
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            req = urllib.request.Request(
-                TOKEN_BROKER_URL, data=req_data, headers=headers, method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                if response.status == 200:
-                    token = response.read().decode("utf-8").strip()
-                    break
-                if response.status >= 500:
-                    raise urllib.error.HTTPError(
-                        TOKEN_BROKER_URL,
-                        response.status,
-                        f"HTTP {response.status}",
-                        email.message.Message(),
-                        None,
-                    )
-                error_body = response.read().decode("utf-8").strip()
-                raise RuntimeError(
-                    f"Minty returned error (HTTP {response.status}): {error_body}"
-                )
-        except urllib.error.HTTPError as e:
-            last_exc = e
-            error_body = ""
-            try:
-                error_body = e.read().decode("utf-8")
-            except Exception:
-                pass
-            if e.code >= 500:
-                if attempt < max_attempts:
-                    delay = initial_delay * (backoff_factor ** (attempt - 1))
-                    log(
-                        f"Minty returned HTTP {e.code} on attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s..."
-                    )
-                    time.sleep(delay)
-                    continue
-            raise RuntimeError(
-                f"Minty returned error (HTTP {e.code}): {error_body}"
-            ) from e
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            ConnectionError,
-            OSError,
-        ) as e:
-            last_exc = e
-            if attempt < max_attempts:
-                delay = initial_delay * (backoff_factor ** (attempt - 1))
-                log(
-                    f"Minty connection error ({e}) on attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s..."
-                )
-                time.sleep(delay)
-                continue
-            raise RuntimeError(
-                f"Failed to connect to Minty at {TOKEN_BROKER_URL}: {e}"
-            ) from e
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to connect to Minty at {TOKEN_BROKER_URL}: {e}"
-            ) from e
-
-    if not token:
-        if last_exc:
-            raise RuntimeError(
-                f"Failed to obtain token from Minty: {last_exc}"
-            ) from last_exc
-        raise RuntimeError("Token received from Minty is empty")
 
     # 3. Configure gh CLI authentication and Git credentials
     try:
@@ -474,14 +556,14 @@ def refresh_git_credentials(
             text=True,
             check=True,
             capture_output=True,
-            timeout=15,
+            timeout=CLI_SETUP_TIMEOUT_SECONDS,
             env=env,
         )
         subprocess.run(
             ["gh", "auth", "setup-git"],
             check=True,
             capture_output=True,
-            timeout=15,
+            timeout=CLI_SETUP_TIMEOUT_SECONDS,
             env=env,
         )
         log(
@@ -494,9 +576,23 @@ def refresh_git_credentials(
 
 
 def main():
-    target_repo = sys.argv[1] if len(sys.argv) > 1 else None
+    parser = argparse.ArgumentParser(
+        description="Refresh the GitHub credential the CLI and git ride, or "
+        "mint a read-only token for one repository."
+    )
+    parser.add_argument("repository", nargs="?", help="owner/repo to mint for")
+    parser.add_argument(
+        READ_ONLY_FLAG,
+        action="store_true",
+        help="print a contents:read installation token for the repository on "
+        "stdout, installing nothing; the broker's clone of a context repository",
+    )
+    args = parser.parse_args()
     try:
-        refresh_git_credentials(target_repo)
+        if args.read_only:
+            print(mint_read_only_token(args.repository), end="")
+            return
+        refresh_git_credentials(args.repository)
     except Exception as e:
         log(f"FATAL: Failed to refresh git credentials: {e}")
         sys.exit(1)
