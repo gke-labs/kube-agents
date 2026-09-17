@@ -91,7 +91,12 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         teardown = self.jobs["step-5-teardown-env"]
         self.assertEqual(
             set(teardown["needs"]),
-            {"step-1-resolve-candidate", "step-2-deploy-env", "step-3-run-e2e-matrix"},
+            {
+                "step-1-resolve-candidate",
+                "step-2-deploy-env",
+                "step-3-run-e2e-matrix",
+                "step-3b-rollback-leg",
+            },
         )
 
     def test_teardown_keeps_the_success_gate_on_the_jobs_it_does_depend_on(self):
@@ -104,6 +109,58 @@ class NightlyPipelineWiringTest(unittest.TestCase):
             "a failed run leaves standing for diagnosis",
         )
         self.assertIn("step-3-run-e2e-matrix", teardown["needs"])
+
+    def test_the_rollback_leg_runs_on_the_nightly_cluster_after_the_matrix(self):
+        """It moves the install twice, so it has to come after what the matrix graded.
+
+        Bound to `nightly` and holding the `nightly-environment` lock for the
+        same reason as the called workflows: pointed anywhere else it rolls
+        back a cluster this pipeline did not build.
+        """
+        job = self.jobs["step-3b-rollback-leg"]
+        self.assertEqual(job.get("environment"), "nightly")
+        self.assertEqual(job["concurrency"]["group"], "nightly-environment")
+        self.assertIn("step-3-run-e2e-matrix", job["needs"])
+        self.assertIn("step-1-resolve-candidate", job["needs"])
+
+    def test_the_rollback_leg_does_not_gate_the_promotion_yet(self):
+        """A leg with no green record cannot decide whether staging moves.
+
+        `continue-on-error` is what keeps a red leg from failing the run, and
+        keeping it out of step 4's `needs` is what keeps it from holding the
+        promotion. Admission is a decision taken on its record, by moving it
+        into that list and dropping the flag together.
+        """
+        leg = self.jobs["step-3b-rollback-leg"]
+        self.assertIs(leg.get("continue-on-error"), True)
+        self.assertNotIn("step-3b-rollback-leg", self.jobs["step-4-create-staging-tag"]["needs"])
+
+    def test_the_rollback_leg_checks_out_the_workflow_ref_with_tags(self):
+        """The script resolves the GA to roll back to from the tags in its checkout.
+
+        A checkout at the candidate commit would run whatever copy of the script
+        that commit has, or none, and a shallow one has no tags to resolve from.
+        """
+        steps = self.jobs["step-3b-rollback-leg"]["steps"]
+        checkout = next(
+            step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")
+        )
+        self.assertEqual(checkout["with"].get("fetch-depth"), 0)
+        self.assertNotIn("ref", checkout["with"])
+        run_step = next(step for step in steps if "rollback_environment.sh" in str(step.get("run", "")))
+        self.assertIn("commit_sha", run_step["env"]["CANDIDATE_SHA"])
+
+    def test_a_red_rollback_leg_still_tears_the_cluster_down(self):
+        """The leg gates nothing, so a cluster kept for it is only a bill.
+
+        The teardown's condition names the deploy and matrix results and not
+        the leg's, with `!cancelled()` in place of the implicit success().
+        """
+        cond = self.jobs["step-5-teardown-env"].get("if", "")
+        self.assertIn("!cancelled()", cond)
+        self.assertIn("needs.step-2-deploy-env.result == 'success'", cond)
+        self.assertIn("needs.step-3-run-e2e-matrix.result == 'success'", cond)
+        self.assertNotIn("step-3b-rollback-leg.result", cond)
 
     def test_the_promotion_tag_is_pushed_with_the_release_bot_token(self):
         """A tag pushed with GITHUB_TOKEN triggers no workflow, so staging never deploys."""
