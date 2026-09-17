@@ -992,7 +992,8 @@ class _DelegationTransportExhausted(Exception):
 
 
 class KubeAgentsHarness(AgentHarness):
-    """Drives the in-cluster platform agent over its HTTP endpoint.
+    """Drives the in-cluster platform agent over its HTTP endpoint, or, under
+    ``AGENT_TRANSPORT=a2a``, over the A2A bus.
 
     Known failure modes (HTTP errors, unreachable endpoint, malformed JSON)
     return an ``AgentResult`` with ``errors`` populated; the base class's safety
@@ -1195,12 +1196,15 @@ class KubeAgentsHarness(AgentHarness):
         same bounded establishment retry. An attempt that never reaches the
         bus or loses it (connect refused, the connection dropped before the
         terminal) is retried through a fresh tunnel as a NEW task, up to
-        :data:`_MAX_TRANSPORT_FAILURES` attempts in all, with a cancel
-        published first for any task an earlier attempt had submitted; the
-        ``eval`` principal has no replay, so the same task cannot be picked
-        back up. Exhaustion, a refused credential or a refused subject, a
-        missing creds Secret, and a task no executor accepted inside
-        ``AGENT_A2A_ACCEPT_TIMEOUT`` (a cancel is published) are infrastructure.
+        :data:`_MAX_TRANSPORT_FAILURES` attempts in all; the ``eval``
+        principal has no replay, so the same task cannot be picked back up.
+        A task an attempt had submitted before it dropped gets a cancel from
+        the next attempt, or on the way out when there is none, and its id
+        lands in ``metadata["abandoned_tasks"]`` on every record this method
+        returns, the infrastructure one included. Exhaustion, a refused
+        credential or a refused subject, a missing creds Secret, and a task no
+        executor accepted inside ``AGENT_A2A_ACCEPT_TIMEOUT`` (a cancel is
+        published) are infrastructure.
         A task an executor took and ended ``failed``, ``rejected`` or
         ``canceled`` is the agent's own outcome and stays in front of the judge
         with the terminal on ``errors``; so does a task still running at
@@ -1272,6 +1276,10 @@ class KubeAgentsHarness(AgentHarness):
 
         client = a2a.BusClient(url=url, password=password, addressee=addressee)
         deadline = time.monotonic() + timeout
+        # Every task an attempt submitted and then lost, the status turns'
+        # included. One list for the whole run, so it reaches the record
+        # whether the run ends in an answer or in infrastructure.
+        abandoned: list[str] = []
 
         def _submit(
             text: str,
@@ -1279,16 +1287,18 @@ class KubeAgentsHarness(AgentHarness):
             until: float,
             context_id: str | None = None,
             correlation_id: str | None = None,
-        ) -> tuple[a2a.TaskIds, a2a.Exchange, list[str]]:
+            max_attempts: int = _MAX_TRANSPORT_FAILURES,
+        ) -> tuple[a2a.TaskIds, a2a.Exchange]:
             """One prompt to a terminal, through the transport retry.
 
             Every attempt is a new task id: the principal has no replay, so
             an attempt whose connection dropped cannot resume the task it
-            submitted. Those tasks are cancelled by the next attempt and
-            their ids returned, so the record says what was abandoned.
+            submitted. Such a task is cancelled by the next attempt, or on
+            the way out when there is none, and its id is added to
+            ``abandoned`` either way.
             """
             attempts = 0
-            abandoned: list[a2a.TaskIds] = []
+            uncancelled: list[a2a.TaskIds] = []
             while True:
                 ids = a2a.mint_ids(context_id=context_id, correlation_id=correlation_id)
                 attempts += 1
@@ -1298,43 +1308,69 @@ class KubeAgentsHarness(AgentHarness):
                         text,
                         accept_timeout=accept_timeout,
                         deadline=until,
-                        cancel_first=tuple(abandoned),
+                        cancel_first=tuple(uncancelled),
                     )
-                    return ids, exchange, [a.task_id for a in abandoned]
                 except a2a.BusUnavailable as exc:
+                    uncancelled = [t for t in uncancelled if t.task_id not in exc.cancelled]
                     if exc.submitted:
-                        abandoned.append(ids)
+                        abandoned.append(ids.task_id)
+                        uncancelled.append(ids)
                     _log.warning(
                         "a2a: attempt %d/%d for task %s failed in transport: %s",
                         attempts,
-                        _MAX_TRANSPORT_FAILURES,
+                        max_attempts,
                         ids.task_id,
                         exc,
                     )
-                    if not exc.retryable or attempts >= _MAX_TRANSPORT_FAILURES:
+                    if not exc.retryable or attempts >= max_attempts:
+                        # No next attempt will carry these cancels: publish
+                        # them now, so an executor is not left working on a
+                        # task nobody awaits after the run has moved on.
+                        _cancel_outstanding(uncancelled)
                         raise
                     try:
                         _tunnel(reset=True)
                     except RuntimeError as pf_exc:
                         # Counted, not raised: the ceiling above ends it.
                         _log.warning("a2a: port-forward respawn failed before retry: %s", pf_exc)
+                else:
+                    _cancel_outstanding(
+                        [t for t in uncancelled if t.task_id not in exchange.cancelled]
+                    )
+                    return ids, exchange
+
+        def _cancel_outstanding(tasks: list[a2a.TaskIds]) -> None:
+            if not tasks:
+                return
+            taken = client.cancel(tasks, "abandoned by an exhausted retry")
+            left = [t.task_id for t in tasks if t.task_id not in taken]
+            if left:
+                _log.warning(
+                    "a2a: no cancel reached task(s) %s; an executor may still be working on them",
+                    ", ".join(left),
+                )
 
         try:
-            ids, exchange, abandoned = _submit(prompt, until=deadline)
+            ids, exchange = _submit(prompt, until=deadline)
         except a2a.BusUnavailable as exc:
-            return _infra_failure(f"the bus exchange failed: {exc}")
+            failure = _infra_failure(f"the bus exchange failed: {exc}")
+            failure.metadata["abandoned_tasks"] = abandoned
+            return failure
 
         if exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED:
             # Nothing consumed the submission: no executor for the addressee
             # is running. Not an answer, and no judge should see the empty
             # record as one.
-            return _infra_failure(
+            failure = _infra_failure(
                 f"no executor accepted task {ids.task_id} on "
                 f"{a2a.task_in_subject(addressee, ids.task_id)} within "
                 f"{accept_timeout:.0f}s; cancel published"
             )
+            failure.metadata["abandoned_tasks"] = abandoned
+            return failure
 
         result = _a2a_result(exchange, ids, addressee)
+        # The same list the status turns append to: the record sees theirs too.
         result.metadata["abandoned_tasks"] = abandoned
         if exchange.outcome == a2a.OUTCOME_DEADLINE:
             result.errors.append(
@@ -1350,13 +1386,16 @@ class KubeAgentsHarness(AgentHarness):
             def _follow_up(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
                 """A status turn: a follow-up task on the same context and
                 correlation, the way a second message in the same chat
-                thread would be."""
+                thread would be. One attempt: the wait retries a failed turn
+                itself, through the same reset, so the ceiling is the wait's
+                rather than the wait's times this one's."""
                 try:
-                    turn_ids, turn_exchange, _ = _submit(
+                    turn_ids, turn_exchange = _submit(
                         poll,
                         until=time.monotonic() + turn_timeout,
                         context_id=ids.context_id,
                         correlation_id=ids.correlation_id,
+                        max_attempts=1,
                     )
                 except a2a.BusUnavailable as exc:
                     raise _TransportError(str(exc), retryable=exc.retryable) from exc

@@ -50,6 +50,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench.a2a_transport import EVENT_ENTRY_STATUS
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
@@ -149,13 +150,12 @@ DEFAULT_JUDGED_MARGIN = 0.5
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
 #: The trajectory entry name the harness's a2a transport gives a task's
-#: ``status-update`` events (``a2a_transport.EVENT_ENTRY_STATUS``). The bus
-#: carries no token usage, so an a2a record's ``tokens`` are all null and its
-#: liveness signal is the executor's terminal event instead: an entry of this
-#: name whose ``args.final`` is true. Duplicated rather than imported for the
-#: same reason as the marker above; ``test_a2a_transport.py`` asserts they
-#: agree.
-A2A_STATUS_EVENT = "a2a.status-update"
+#: ``status-update`` events. The bus carries no token usage, so an a2a
+#: record's ``tokens`` are all null and its liveness signal is the executor's
+#: terminal event instead: an entry of this name whose ``args.final`` is true.
+#: Imported, where the marker above is duplicated: the transport module
+#: brings in neither ``devops_bench`` nor ``nats`` at import time.
+A2A_STATUS_EVENT = EVENT_ENTRY_STATUS
 
 #: Field values from devops-bench's ``_build_failed_record``: ``status`` is
 #: ``"failed"`` on every failed record, and ``verification_status`` is

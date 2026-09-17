@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 import pytest
@@ -535,6 +536,7 @@ class _FakeBus:
         self.addressee = addressee
         self.user = user
         self.calls: list[_Call] = []
+        self.cancels: list[tuple[tuple[a2a.TaskIds, ...], str]] = []
         _FakeBus.instances.append(self)
 
     def submit_and_await(
@@ -549,6 +551,10 @@ class _FakeBus:
         self.calls.append(_Call(ids, prompt, accept_timeout, deadline, tuple(cancel_first)))
         step = _FakeBus.script.pop(0) if _FakeBus.script else _lifecycle(ids.task_id)
         if isinstance(step, BaseException):
+            if isinstance(step, a2a.BusUnavailable) and step.submitted:
+                # The connection was open long enough to submit, so the stale
+                # cancels ahead of the submission went out too.
+                step.cancelled = tuple(t.task_id for t in cancel_first)
             raise step
         fold = a2a.Fold(ids.task_id)
         events = []
@@ -558,7 +564,16 @@ class _FakeBus:
             env["payload"] = {**env["payload"], "taskId": ids.task_id}
             fold.apply(env)
             events.append(env)
-        return a2a.Exchange(fold=fold, outcome=_FakeBus.outcome, events=events)
+        return a2a.Exchange(
+            fold=fold,
+            outcome=_FakeBus.outcome,
+            events=events,
+            cancelled=tuple(t.task_id for t in cancel_first),
+        )
+
+    def cancel(self, tasks: Sequence[a2a.TaskIds], why: str) -> tuple[str, ...]:
+        self.cancels.append((tuple(tasks), why))
+        return tuple(t.task_id for t in tasks)
 
 
 @pytest.fixture
@@ -699,13 +714,45 @@ def test_an_unreachable_bus_is_retried_through_a_fresh_tunnel_then_infrastructur
     # Every attempt is a new task: no replay for the eval principal.
     assert len({c.ids.task_id for c in client.calls}) == harness._MAX_TRANSPORT_FAILURES
     # Only the attempt whose submission was taken owes a cancel, and the next
-    # attempt publishes it before its own submission.
+    # attempt publishes it before its own submission. That attempt never
+    # connected, so the cancel is still owed when the retry runs out, and it
+    # goes out on the way out instead; the record names the task either way.
     assert client.calls[1].cancel_first == ()
     assert client.calls[2].cancel_first == (client.calls[1].ids,)
+    assert client.cancels == [((client.calls[1].ids,), "abandoned by an exhausted retry")]
+    assert result.metadata["abandoned_tasks"] == [client.calls[1].ids.task_id]
     # The respawn targets the NATS Service on its client port, not the agent.
     assert len(resets) == harness._MAX_TRANSPORT_FAILURES - 1
     assert all(r == {"service": "platform-agent-a2a-nats", "remote_port": 4222} for r in resets)
     assert client.url == "nats://127.0.0.1:24999"
+
+
+def test_an_exhausted_retry_cancels_the_task_it_submitted_last(fake_bus) -> None:
+    """The attempt that hits the ceiling had submitted before it dropped.
+
+    No next attempt exists to carry its cancel, so the harness publishes it
+    before returning infrastructure, and no task is cancelled twice: each
+    abandoned id gets exactly one cancel, from the next attempt or on the
+    way out.
+    """
+    fake_bus.script = [
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+    ]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    (client,) = fake_bus.instances
+    first, second, third = client.calls
+    assert second.cancel_first == (first.ids,)
+    assert third.cancel_first == (second.ids,)
+    assert client.cancels == [((third.ids,), "abandoned by an exhausted retry")]
+    cancelled_once = [t.task_id for c in client.calls for t in c.cancel_first] + [
+        t.task_id for tasks, _ in client.cancels for t in tasks
+    ]
+    assert sorted(cancelled_once) == sorted(c.ids.task_id for c in client.calls)
+    assert result.metadata["abandoned_tasks"] == [c.ids.task_id for c in client.calls]
 
 
 def test_a_bus_that_comes_back_on_retry_reaches_the_answer(fake_bus) -> None:
@@ -721,6 +768,9 @@ def test_a_bus_that_comes_back_on_retry_reaches_the_answer(fake_bus) -> None:
     assert second.ids.task_id != first.ids.task_id
     assert result.metadata["task_id"] == second.ids.task_id
     assert result.metadata["abandoned_tasks"] == [first.ids.task_id]
+    # The second attempt carried the cancel, so nothing was left to cancel.
+    assert second.cancel_first == (first.ids,)
+    assert fake_bus.instances[0].cancels == []
 
 
 def test_a_refused_credential_is_not_retried(fake_bus) -> None:
@@ -791,13 +841,8 @@ def test_the_delegation_wait_settles_at_once_without_card_ids(
     assert result.metadata["worker_commands"] is None
 
 
-def test_a_status_turn_is_a_follow_up_task_on_the_same_context(
-    fake_bus, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With a card id in the activity trace, the harness polls over the bus."""
-    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
-    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
-    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+def _card_filed() -> list[dict[str, Any]]:
+    """An opening turn whose activity trace files kanban card-7."""
     filed = _artifact(
         "t",
         "activity",
@@ -812,6 +857,16 @@ def test_a_status_turn_is_a_follow_up_task_on_the_same_context(
             }
         ],
     )
+    return [
+        _status("t", "submitted"),
+        filed,
+        _artifact("t", "result", [{"kind": "text", "text": "Filed card-7."}]),
+        _status("t", "completed", final=True),
+    ]
+
+
+def _card_settled() -> list[dict[str, Any]]:
+    """A status turn whose activity trace shows card-7 done."""
     settled = _artifact(
         "t",
         "activity",
@@ -826,20 +881,22 @@ def test_a_status_turn_is_a_follow_up_task_on_the_same_context(
             }
         ],
     )
-    fake_bus.script = [
-        [
-            _status("t", "submitted"),
-            filed,
-            _artifact("t", "result", [{"kind": "text", "text": "Filed card-7."}]),
-            _status("t", "completed", final=True),
-        ],
-        [
-            _status("t", "submitted"),
-            settled,
-            _artifact("t", "result", [{"kind": "text", "text": "card-7 is done."}]),
-            _status("t", "completed", final=True),
-        ],
+    return [
+        _status("t", "submitted"),
+        settled,
+        _artifact("t", "result", [{"kind": "text", "text": "card-7 is done."}]),
+        _status("t", "completed", final=True),
     ]
+
+
+def test_a_status_turn_is_a_follow_up_task_on_the_same_context(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a card id in the activity trace, the harness polls over the bus."""
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    fake_bus.script = [_card_filed(), _card_settled()]
     result = KubeAgentsHarness().run(_PROMPT)
 
     assert not result.has_errors(), result.errors
@@ -853,6 +910,35 @@ def test_a_status_turn_is_a_follow_up_task_on_the_same_context(
     # overwrite it (see _fold_status_turn), but the delivered result joins it.
     assert result.metadata["final_message"].startswith("Filed card-7.")
     assert "RCA: OOMKilled" in result.metadata["final_message"]
+
+
+def test_a_status_turn_that_drops_is_one_attempt_and_its_task_is_recorded(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A status turn makes one attempt; the wait's own retry asks again.
+
+    The dropped turn's task gets its cancel on the way out of that one
+    attempt, not from a retry inside the turn, and its id joins the record's
+    abandoned list beside the opening turn's.
+    """
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    fake_bus.script = [
+        _card_filed(),
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+        _card_settled(),
+    ]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert not result.has_errors(), result.errors
+    (client,) = fake_bus.instances
+    opening, dropped, again = client.calls
+    assert again.cancel_first == ()
+    assert client.cancels == [((dropped.ids,), "abandoned by an exhausted retry")]
+    assert result.metadata["abandoned_tasks"] == [dropped.ids.task_id]
+    assert result.metadata["task_id"] == opening.ids.task_id
+    assert "RCA: OOMKilled" in result.output
 
 
 # --------------------------------------------------------------------------

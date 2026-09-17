@@ -137,14 +137,15 @@ it is; the chatops gateway, purely as sequencing, since it has a ServiceAccount 
 client program lands separately from this render; `web`, because a browser never can;
 `seed`, because the hand-applied seed tooling is applied rather than rendered and
 dropping its user would refuse an object already running; `sys`, a human at a
-port-forward; and the shared `worker`, which is now a shrinking residue rather than the
+port-forward; `eval`, the bench harness's diagnostic bus transport, a process outside the
+cluster with no ServiceAccount to present; and the shared `worker`, which is now a shrinking residue rather than the
 session story — no session pod authenticates as it, and what keeps it alive is the seed
 tooling's twin and the agent-side workloads that have not moved, the platform agent pod
 and the Hermes bridge sidecar beside it among them.
 
-Three of those are permanent - the callout, which cannot authenticate through itself;
-`web`, because a browser never can; and `sys`, which is a human rather than a workload -
-and the rest are waiting on something nameable. The single
+Four of those are permanent - the callout, which cannot authenticate through itself;
+`web`, because a browser never can; `sys`, which is a human rather than a workload; and
+`eval`, which runs outside the cluster - and the rest are waiting on something nameable. The single
 source for all of it - the config's APP and `$SYS` static user blocks, the callout's map,
 and the `NATS_USER` a client is handed so it can set its inbox prefix - is
 `platformagent_a2a_identities.go`; before the callout those three lived in a config

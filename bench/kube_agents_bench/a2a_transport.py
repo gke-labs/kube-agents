@@ -3,8 +3,10 @@
 The harness hands a case's prompt to the executor the way a task reaches it on
 the bus under ``spec.mode: next``: one ``message`` envelope on
 ``a2a.tasks.{addressee}.{taskId}.in``, then the task's ``events`` folded until
-a terminal ``status-update`` lands. It proves the bus, the callout, the stream
-and the executor, and it skips the gateway -- its routing, its session
+a terminal ``status-update`` lands. It proves the bus, the stream and the
+executor, not the auth callout: the ``eval`` principal and the bridge's
+``worker`` are both static users listed in ``auth_users``, so a green run says
+nothing about the callout. It skips the gateway -- its routing, its session
 registry, the relay back -- which is why it is a diagnostic rather than the
 next-mode transport the evals will run on. That one is the gateway's inject
 adapter, planned and not yet built, which goes through the gateway's inbound
@@ -398,13 +400,24 @@ class BusUnavailable(RuntimeError):
     plausibly succeed; a refused credential or a refused subject cannot.
     ``submitted`` says whether the submission had already been taken by the
     server when the attempt failed, in which case an executor may be working
-    on a task nobody is awaiting and the next attempt owes it a cancel.
+    on a task nobody is awaiting and someone owes it a cancel: the next
+    attempt, or the caller on its way out when there is none. ``cancelled``
+    names the tasks this attempt did publish a cancel for before it failed,
+    so the caller does not cancel them again.
     """
 
-    def __init__(self, message: str, *, retryable: bool = True, submitted: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        submitted: bool = False,
+        cancelled: Sequence[str] = (),
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.submitted = submitted
+        self.cancelled: tuple[str, ...] = tuple(cancelled)
 
 
 @dataclass
@@ -414,6 +427,8 @@ class Exchange:
     fold: Fold
     outcome: str
     events: list[dict[str, Any]]
+    #: The ``cancel_first`` task ids whose cancel the server took on the way in.
+    cancelled: tuple[str, ...] = ()
 
 
 class _Session:
@@ -541,15 +556,18 @@ class _Session:
             ids.correlation_id,
         )
 
-    async def cancel(self, ids: TaskIds, why: str) -> None:
-        """Tell the executor the task is abandoned from this side. Best effort."""
+    async def cancel(self, ids: TaskIds, why: str) -> bool:
+        """Tell the executor the task is abandoned from this side. Best effort:
+        True when the server took the cancel."""
         try:
             await self.publish(
                 build_envelope(KIND_CANCEL, ids, cancel_payload(), to=self.addressee)
             )
-            _log.info("a2a: published cancel for task %s (%s)", ids.task_id, why)
         except BusUnavailable as exc:
             _log.warning("a2a: cancel for task %s was not taken: %s", ids.task_id, exc)
+            return False
+        _log.info("a2a: published cancel for task %s (%s)", ids.task_id, why)
+        return True
 
     async def await_terminal(
         self, task_id: str, *, accept_timeout: float, deadline: float
@@ -651,9 +669,10 @@ class BusClient:
         Subscribes before it publishes, so an executor's first event cannot
         race the subscription. ``cancel_first`` names tasks an earlier attempt
         abandoned when its connection dropped; each gets a cancel before the
-        new submission, so an executor is not left working for nobody. A wait
-        that ends on a bound rather than a terminal publishes a cancel for
-        ``ids`` too.
+        new submission, so an executor is not left working for nobody, and the
+        ones the server took are named on the exchange, or on the exception
+        when this attempt fails too. A wait that ends on a bound rather than a
+        terminal publishes a cancel for ``ids`` too.
 
         Raises:
             BusUnavailable: The bus could not be reached, refused the
@@ -664,9 +683,11 @@ class BusClient:
             session = self._session()
             await session.open()
             submitted = False
+            cancelled: list[str] = []
             try:
                 for stale in cancel_first:
-                    await session.cancel(stale, "abandoned by an earlier attempt")
+                    if await session.cancel(stale, "abandoned by an earlier attempt"):
+                        cancelled.append(stale.task_id)
                 await session.watch(ids.task_id)
                 await session.submit(ids, prompt)
                 submitted = True
@@ -675,12 +696,43 @@ class BusClient:
                 )
                 if exchange.outcome != OUTCOME_TERMINAL:
                     await session.cancel(ids, exchange.outcome)
+                exchange.cancelled = tuple(cancelled)
                 return exchange
             except BusUnavailable as exc:
                 exc.submitted = submitted
+                exc.cancelled = tuple(cancelled)
                 raise
             finally:
                 await session.close()
+
+        return asyncio.run(_run())
+
+    def cancel(self, tasks: Sequence[TaskIds], why: str) -> tuple[str, ...]:
+        """Publish a cancel for each of ``tasks`` on a connection of its own.
+
+        For the tasks a retry abandoned when no further attempt will carry
+        their cancel: the last attempt was the one that dropped, or the
+        failure is not worth retrying. Best effort: returns the ids the server
+        took a cancel for, and an unreachable bus returns none.
+        """
+
+        async def _run() -> tuple[str, ...]:
+            session = self._session()
+            try:
+                await session.open()
+            except BusUnavailable as exc:
+                _log.warning(
+                    "a2a: no connection to cancel %d abandoned task(s): %s", len(tasks), exc
+                )
+                return ()
+            taken: list[str] = []
+            try:
+                for ids in tasks:
+                    if await session.cancel(ids, why):
+                        taken.append(ids.task_id)
+            finally:
+                await session.close()
+            return tuple(taken)
 
         return asyncio.run(_run())
 
