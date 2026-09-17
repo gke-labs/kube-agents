@@ -4,8 +4,8 @@
 > `hack/ci-deploy.sh` has no mode flag, the gateway has no inject adapter, and the presubmit
 > install runs `today`. The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
-> owner answered the first draft's questions on 2026-09-17; the answers are folded in below as
-> decisions, dated where each lands.
+> owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;
+> the answers and the review's points are folded in below as decisions, dated where each lands.
 
 **Scope:** how a bench case reaches the agent when the install runs the next stack, in two
 stages, which transport each stage uses, and what each stage proves.
@@ -81,16 +81,20 @@ the presubmit exports nothing new until it chooses to. The exchange:
 1. Port-forward the adapter's Service on `AGENT_CLUSTER_CONTEXT`, through the harness's existing
    forward machinery and its retry classes.
 2. `POST /inject` with a synthetic conversation key, a principal the gateway resolves through
-   its principal map, and the prompt as the text. The gateway takes the message through
+   the inject section of its principal map (below), the prompt as the text, and the case id
+   plus repetition as the backend message id. The gateway takes the message through
    `handleInbound` like a message from any backend: routing, the session record, `startTask`,
    and the relay back, with `taskId`, `contextId`, `correlationId` and the `authority` block
-   minted by the gateway. The response names the task id.
+   minted by the gateway. The response names the task id. The gateway's `ingress` log joins
+   the backend message id to the `correlationId`, so with the case and repetition as that id
+   the audit chain reaches the eval record with nothing added.
 3. Await the terminal of that task id, as [Completion signals](#completion-signals) says.
    Replies arrive the way the relay would post them to a conversation, over SSE or a `GET` on
    the conversation key, and the harness returns when the terminal lands or `AGENT_HTTP_TIMEOUT`
    elapses. On this path that variable bounds the whole task, not one request as it does on the
-   api transport; a timeout cancels the task through the gateway. No model turn is spent on
-   status.
+   api transport. A timeout cancels through an explicit cancel route on the conversation, which
+   lands on the bus as `kind: cancel` exactly as the text route's `stop` does; the harness never
+   sends the stop text. No model turn is spent on status.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
    executor publishes them. Token counts are not on the bus; the record says so rather than
@@ -104,16 +108,46 @@ only, which the harness reads the way the presubmit reads `API_SERVER_KEY` today
 replaces admits key holders, and this one admits the same population rather than everyone
 holding `pods/portforward` in the namespace; that matters because the task it starts runs on the
 platform persona with the install's cluster and GitHub credentials, under an `authority` block
-the gateway mints for a synthetic principal, past the allowed-users gate. Being a backend, the
-adapter also satisfies the gateway's one-backend guard
-(`a2a/gateway/config.go` refuses to start with no backend and with two), so an eval install with
-the adapter enabled has a gateway that starts. The guard keeps refusing two, and the Slack adapter
-in flight has to agree on that with the inject adapter.
+the gateway mints for a synthetic principal, past the allowed-users gate.
+
+**The adapter cannot assert a real principal (decided 2026-09-17).** The gateway spec's test-backend
+section keeps Discord structurally incapable of asserting a real principal through its mapping
+table, and the inject door takes its principal from a request body, so it needs the same
+property or it becomes an identity-minting door the day publisher identity arms. Three things
+give it that property. The adapter resolves the principal through its own prefixed section of
+the principal map, whose entries map to eval-only identities and never to a cloud principal. It
+stamps its own `verifiedBy`, `inject-bearer`, so nothing downstream can mistake the block for one
+`chat-event-topic-iam` verified. And an unmapped principal is dropped at ingress with the same
+notice the Discord path gives (drop, log, no task); nothing is defaulted.
+
+**The synthetic conversation is a session like any other.** Its key is `inject:<key>`,
+backend-qualified like `discord:` and `gchat:` keys so it cannot collide with a real
+conversation; its `Kind` is `dm`; its roster is the requester alone with `complete: true`; and
+`openDirect` returns the same conversation. Those are the five adapter operations the
+test-backend section names, inbound message with verified sender, conversation and thread
+identity, roster read, post-to-conversation, and `openDirect`, and the inject adapter implements
+all five rather than a subset the session record has to special-case.
+
+**The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
+`a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
+Chat; a localhost door has no silent-stop failure mode, so it is a side door that may sit beside
+exactly one real backend, and the guard keeps refusing two real ones. The door alone is enough
+for the gateway to start, which is what the eval install needs until stage 2 gives it a real
+backend; the door beside that backend is not a refusal, which is what lets stage 2 run the inject
+and Chat transports against one install and compare them. The Slack adapter in flight agrees on
+the same reading.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
 for a dead tunnel: the adapter unreachable, the gateway refusing the injection, or no executor
-taking the task within a bounded window. A task an executor took and finished with a `failed`
-terminal is a graded failure.
+taking the task. The window for that last one is the gateway's, not the harness's:
+`A2A_FIRST_EVENT_GRACE` bounds how long an active task with nothing on its events subject may
+hold a conversation, and the never-started heal in `handleInbound` releases the conversation on
+its next message with a notice naming the task. The harness runs no second clock. When its
+deadline passes with no terminal, its cancel is that next message, and what comes back on the
+conversation says which case this was: the never-started notice is infrastructure, and a cancel
+of a task that had events is the deadline outcome. So the harness and the gateway agree on what
+"nobody took it" means, and `AGENT_HTTP_TIMEOUT` on this path is never set below the grace. A
+task an executor took and finished with a `failed` terminal is a graded failure.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
@@ -130,7 +164,8 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 `resource_property`, `fleet_resource_property` and `ledger_issue_contains` read the cluster and
 GitHub and never touched the transport. `tool_called` reads the trajectory, which on this path
 has data only when the executor publishes `activity` artifacts; the Hermes bridge publishes
-`result` alone and the worker adapter publishes `activity` and `progress` beside it, so a case
+status updates and a `result` artifact and no `activity` or `progress` artifacts, while the
+worker adapter publishes `activity` and `progress` beside the result, so a case
 that gates on `tool_called` has no data on stage 1 until the bridge publishes activity or the
 persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
@@ -153,8 +188,9 @@ why a task nobody took is infrastructure rather than a failed case.
 
 `AGENT_TRANSPORT=a2a` has the harness stand in for the gateway: port-forward the NATS Service
 the operator renders for the CR (`<cr>-a2a-nats`, client port 4222), mint `taskId`, `contextId`
-and `correlationId`, subscribe to `a2a.tasks.{addressee}.{taskId}.events` and the supervisor
-subject, publish one `message` envelope on `a2a.tasks.{addressee}.{taskId}.in`
+and `correlationId`, subscribe to `a2a.tasks.{addressee}.{taskId}.events` and, once the
+supervisor split lands, its subject (on `main` the gateway's terminals land on `.events`),
+publish one `message` envelope on `a2a.tasks.{addressee}.{taskId}.in`
 (`AGENT_A2A_ADDRESSEE` selects the addressee, default `platform`), fold the events as `tasks/get`
 folds them, and publish `cancel` on the way out of a timeout. The forward enters from the node,
 which the NATS ingress NetworkPolicy does not govern, so the fence that admits only enumerated bus
@@ -165,7 +201,8 @@ that the gateway itself is the thing that is down. It is not the presubmit's tra
 Two conditions on it (decided 2026-09-17). It authenticates as its own `eval` principal in the
 identity map the callout reads ([`spec-nats-deployment.md`](spec-nats-deployment.md), "Accounts
 and connection-time authorization"): publish on `a2a.tasks.platform.*.in`, subscribe on the
-matching `.events`, nothing else. It never holds the gateway's credential, in any case, and until
+matching `.events` and, once the supervisor split lands, its `.supervisor`, nothing else. It
+never holds the gateway's credential, in any case, and until
 that row is rendered the transport has no credential it may use. And it leaves `authority` null
 and says so: the block is populate-by-gateway-only and advisory until publisher identity arms
 ([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "Requester identity on the bus"), so a
@@ -176,7 +213,10 @@ harness-invented shape would be a second writer of a field consumers may not dec
 The entry hop moves up to the front door. A case publishes a Chat MESSAGE event on the Pub/Sub
 topic, under the runner's Workload Identity, in the layout `tests/e2e/gchat_agent_test.py`
 already forges for the release gate; the sender is an identity on the install's allowed-users
-list. The reply is read from the bus events of the task the gateway opened for that
+list. That forged sender is the impersonation surface `verifiedBy: chat-event-topic-iam` names,
+anyone with `pubsub.publisher` on the topic is the sender, and stage 2 depends on that boundary
+staying project IAM: the day it is replaced by a per-request proof, stage 2 needs a real sender.
+The reply is read from the bus events of the task the gateway opened for that
 conversation, or from the Chat thread. The principle prefers the thread, because it is what the
 customer sees; the bus events grade one hop short and need no Chat read credential. Which the
 harness reads is the eval crew's to decide when the stage is built. The presubmit's cases move
@@ -205,7 +245,8 @@ lands in the same change that gives the gateway rendered under `next` the creden
 relay URL as its backend, so an install with Google Chat configured has a gateway that starts
 without a Discord Secret; the relay URL is the backend the gateway refuses to start without. And
 it settles the one-backend guard with the Slack adapter in flight, so the relay URL beside a
-Slack credential is still a refusal and never a collision.
+Slack credential is still a refusal and never a collision, while the inject door beside the relay
+URL is not one (stage 1, above), so the install this stage wires runs both transports.
 
 Two decisions sit beside that list. The legacy Chat consumer still runs under `next`, and a topic
 fans out to every subscription, so an install that arms the A2A subscription beside it answers
@@ -251,8 +292,10 @@ on this path the bridge publishes no trajectory. Stage 1 writes the wait again f
 path: card ids and statuses read from the `result` text, the status question sent as a new turn
 on the same conversation key, and the worker logs read by those ids for `worker_commands`. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
-transport. When child tasks exist, the parent's events name the child's task id, the same await
-code awaits it, and the wait goes.
+transport. Reading card ids out of `result` text is interim: a structured artifact for them is
+a bridge change outside this document, and the text read is the first thing child tasks delete.
+When child tasks exist, the parent's events name the child's task id, the same await code awaits
+it, and the wait goes.
 
 ## The CI flag
 
@@ -266,7 +309,12 @@ the provisioning Job reaching `complete` (the Job depends on the callout and has
 reports the A2A gateway's state and last log lines and never gates on it: the gateway refuses to
 start without a backend, and the eval install has none until the inject adapter is rendered. The
 same flag is what the operator renders the inject adapter's env, Service and NetworkPolicy
-under; once it does, the gateway has a backend and the flag can gate on it too. The A2A images
+under; once it does, the gateway starts and the flag can gate on it too. The flag reaches the
+operator as an operator environment variable, the pattern the A2A image overrides use, and not
+as a CRD field (decided 2026-09-17 by the A2A owner on the adapter's issue): the door maps a
+body-supplied principal, and nothing a customer can set on a `PlatformAgent` may render it. The
+rendered object set with the flag unset carries no inject Service, env or NetworkPolicy, and that
+is a property for the conformance suite to check rather than a comment to trust. The A2A images
 the flip needs are built in the same Cloud Build step as the other images and set on the
 operator, because the defaults point at a registry the pool projects cannot pull from. The eval
 matrix in `hack/ci-eval-pr.sh` is unchanged.
@@ -284,12 +332,9 @@ stage 1 lands.
 
 Marked open on purpose; this document does not pick. The first draft's two questions for the A2A
 owner, which executor answers `platform` and whether delegation becomes a child task on the bus,
-were answered on 2026-09-17 and are recorded above as decisions. What remains is the eval crew's:
+were answered on 2026-09-17 and are recorded above as decisions, as was how the eval flag
+reaches the operator (The CI flag). What remains is the eval crew's:
 
-- **How the eval flag reaches the operator,** which renders the inject adapter only under it. A
-  CRD field is the mode switch's pattern; an operator environment variable is how the A2A image
-  overrides reach it. The eval crew decides it with the flag change, and the answer lands in
-  [`spec-mode-switch.md`](spec-mode-switch.md) or the gateway spec, not here.
 - **Which reply stage 2 grades,** the bus events of the task the gateway opened or the Chat
   thread. The principle prefers the thread; the bus events grade one hop short and need no Chat
   read credential. The eval crew decides when the stage is built.
