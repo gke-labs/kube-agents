@@ -33,6 +33,9 @@ _ANSWER = "payments-api in seeded-debug is OOMKilled at its 64Mi limit."
 def test_subjects_follow_the_0_4_layout() -> None:
     assert a2a.task_in_subject("platform", "task-1") == "a2a.tasks.platform.task-1.in"
     assert a2a.task_events_subject("platform", "task-1") == "a2a.tasks.platform.task-1.events"
+    assert (
+        a2a.task_supervisor_subject("platform", "task-1") == "a2a.tasks.platform.task-1.supervisor"
+    )
 
 
 def test_the_principal_is_eval_not_gateway() -> None:
@@ -336,9 +339,12 @@ def test_submit_subscribes_before_it_publishes_and_folds_the_terminal() -> None:
     assert exchange.outcome == a2a.OUTCOME_TERMINAL
     assert exchange.fold.artifact_text("result") == _ANSWER
     kinds = [entry[0] for entry in stub.log]
-    assert kinds.index("subscribe") < kinds.index("publish")
-    (sub_entry,) = [e for e in stub.log if e[0] == "subscribe"]
-    assert sub_entry[1] == a2a.task_events_subject(_ADDRESSEE, ids.task_id)
+    assert max(i for i, k in enumerate(kinds) if k == "subscribe") < kinds.index("publish")
+    # The pair ``lib.TaskReplaySubjects`` folds, and nothing else.
+    assert [e[1] for e in stub.log if e[0] == "subscribe"] == [
+        a2a.task_events_subject(_ADDRESSEE, ids.task_id),
+        a2a.task_supervisor_subject(_ADDRESSEE, ids.task_id),
+    ]
     (pub_entry,) = [e for e in stub.log if e[0] == "publish"]
     assert pub_entry[1] == a2a.task_in_subject(_ADDRESSEE, ids.task_id)
     assert pub_entry[2] == "message"
@@ -368,6 +374,33 @@ def test_awaiting_a_task_id_needs_no_submission() -> None:
     assert exchange.fold.state == "completed"
     assert exchange.fold.artifact_text("result") == "done elsewhere"
     assert not any(e[0] == "publish" for e in stub.log)
+
+
+def test_a_supervisor_terminal_ends_the_wait() -> None:
+    """An executor that dies after ``working`` leaves the terminal to the
+    task's supervisor, on the supervisor subject; the wait ends on it rather
+    than running out the deadline."""
+    stub = _StubConn()
+    task = "task-orphaned"
+
+    async def run() -> a2a.Exchange:
+        session = _session_with(stub)
+
+        async def supervisor() -> None:
+            await asyncio.sleep(0.05)
+            events = stub.subs[a2a.task_events_subject(_ADDRESSEE, task)]
+            await events.cb(_StubMsg(json.dumps(_status(task, "working")).encode()))
+            sup = stub.subs[a2a.task_supervisor_subject(_ADDRESSEE, task)]
+            terminal = _status(task, "failed", final=True, text="executor gone")
+            await sup.cb(_StubMsg(json.dumps(terminal).encode()))
+
+        asyncio.get_running_loop().create_task(supervisor())
+        return await session.await_terminal(task, accept_timeout=5, deadline=time.monotonic() + 5)
+
+    exchange = asyncio.run(run())
+    assert exchange.outcome == a2a.OUTCOME_TERMINAL
+    assert exchange.fold.history == ["working", "failed"]
+    assert exchange.fold.status_message == "executor gone"
 
 
 def test_a_wait_that_ends_on_a_bound_publishes_a_cancel() -> None:

@@ -153,7 +153,8 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 #: carries no token usage, so an a2a record's ``tokens`` are all null and its
 #: liveness signal is the executor's terminal event instead: an entry of this
 #: name whose ``args.final`` is true. Duplicated rather than imported for the
-#: same reason as the marker above; ``test_scoring.py`` asserts they agree.
+#: same reason as the marker above; ``test_a2a_transport.py`` asserts they
+#: agree.
 A2A_STATUS_EVENT = "a2a.status-update"
 
 #: Field values from devops-bench's ``_build_failed_record``: ``status`` is

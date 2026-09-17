@@ -54,11 +54,12 @@ Environment:
         the task's events are folded until the terminal one
         (:mod:`kube_agents_bench.a2a_transport`). It proves the bus and the
         executor and skips the gateway, which is why it is a diagnostic: the
-        next-mode transport the evals run on is the gateway's inject adapter,
-        which keeps the only credential that may publish on every addressee's
-        ``in`` subject. This one connects as the operator's ``eval``
-        principal -- publish on ``platform``'s ``in``, subscribe on
-        ``platform``'s ``events``, nothing else -- and never the gateway's,
+        next-mode transport the evals will run on is the gateway's inject
+        adapter, planned and not yet built, which keeps the only credential
+        that may publish on every addressee's ``in`` subject. This one
+        connects as the operator's ``eval`` principal -- publish on
+        ``platform``'s ``in``, subscribe on ``platform``'s ``events`` and
+        ``supervisor``, nothing else -- and never the gateway's,
         and every envelope it publishes carries ``authority: null``: that
         block is the gateway's to populate and its shape is advisory, so the
         harness asserts nothing there rather than invent one. Same harness,
@@ -140,6 +141,13 @@ TRANSPORT_API = "api"
 TRANSPORT_A2A = "a2a"
 _TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_A2A})
 
+# Defaults for the bounds both transports read from the environment, as the
+# strings ``_numeric_env`` parses: one request (on a2a, the whole task), the
+# delegation wait's total, and the interval between status turns, in seconds.
+_DEFAULT_HTTP_TIMEOUT = "600"
+_DEFAULT_DELEGATION_TIMEOUT = "1800"
+_DEFAULT_POLL_INTERVAL = "30"
+
 # The a2a transport's port-forward target: the operator's NATS Service, named
 # ``<cr>-a2a-nats`` and listening for clients on 4222; its credentials Secret
 # is ``<service>-creds``, and the one key read from it is the ``eval``
@@ -151,6 +159,8 @@ _A2A_CREDS_SECRET_SUFFIX = "-creds"
 _A2A_CREDS_KEY = "eval-password"
 _A2A_NATS_CLIENT_PORT = 4222
 _A2A_DEFAULT_LOCAL_PORT = 24222
+# The tunnel's near end: where a port-forward the harness spawned listens.
+_A2A_LOOPBACK_URL = "nats://127.0.0.1"
 # How long a submitted task may sit with no event at all before the run is
 # classified as infrastructure: nothing consumed it. The bridge publishes
 # ``submitted`` on accept before queueing, so a busy executor still answers
@@ -1032,9 +1042,13 @@ class KubeAgentsHarness(AgentHarness):
         api_path = os.environ.get("AGENT_API_PATH", "/v1/responses")
         try:
             local_port = _numeric_env("AGENT_LOCAL_PORT", str(SERVICE_API_PORT), int)
-            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", "600", float)
-            delegation_timeout = _numeric_env("AGENT_DELEGATION_TIMEOUT", "1800", float)
-            poll_interval = _numeric_env("AGENT_DELEGATION_POLL_INTERVAL", "30", float)
+            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", _DEFAULT_HTTP_TIMEOUT, float)
+            delegation_timeout = _numeric_env(
+                "AGENT_DELEGATION_TIMEOUT", _DEFAULT_DELEGATION_TIMEOUT, float
+            )
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_POLL_INTERVAL, float
+            )
         except ValueError as exc:
             return AgentResult.errored(str(exc))
 
@@ -1197,13 +1211,17 @@ class KubeAgentsHarness(AgentHarness):
         called after it, where it can be deleted.
         """
         try:
-            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", "600", float)
+            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", _DEFAULT_HTTP_TIMEOUT, float)
             accept_timeout = _numeric_env(
                 "AGENT_A2A_ACCEPT_TIMEOUT", _A2A_DEFAULT_ACCEPT_TIMEOUT, float
             )
             local_port = _numeric_env("AGENT_A2A_LOCAL_PORT", str(_A2A_DEFAULT_LOCAL_PORT), int)
-            delegation_timeout = _numeric_env("AGENT_DELEGATION_TIMEOUT", "1800", float)
-            poll_interval = _numeric_env("AGENT_DELEGATION_POLL_INTERVAL", "30", float)
+            delegation_timeout = _numeric_env(
+                "AGENT_DELEGATION_TIMEOUT", _DEFAULT_DELEGATION_TIMEOUT, float
+            )
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_POLL_INTERVAL, float
+            )
         except ValueError as exc:
             return AgentResult.errored(str(exc))
         addressee = os.environ.get("AGENT_A2A_ADDRESSEE", a2a.DEFAULT_ADDRESSEE)
@@ -1243,7 +1261,7 @@ class KubeAgentsHarness(AgentHarness):
                         f"{transport_failures} times running; last failure: {exc}"
                     )
         if not url:
-            url = f"nats://127.0.0.1:{local_port}"
+            url = f"{_A2A_LOOPBACK_URL}:{local_port}"
 
         try:
             password = _a2a_password(nats_service)

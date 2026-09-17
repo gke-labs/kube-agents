@@ -537,20 +537,24 @@ func webIdentity() a2aIdentity {
 // holding it would be a second requester indistinguishable from the first on
 // replay.
 //
-// The grants are the two subjects a requester of the platform executor needs
-// and nothing else: publish on `platform`'s `in` (the submission, and a
-// cancel), subscribe on `platform`'s `events` (the executor's status and
-// artifact updates, including the terminal). No supervisor subject in either
-// direction - the harness is not the task's supervisor and reads the
-// executor's terminal on `events`, where the bridge writes it. No JetStream
-// API at all: the harness subscribes with a core subscription taken before it
-// publishes, so it needs no consumer, and a CONSUMER.CREATE on TASKS would let
-// it deliver any addressee's task plane into its own inbox
-// (a2aJetStreamSurfaceRationale). Without JetStream the publish has no ack and
-// the subscription has no replay; the harness treats a dropped connection as a
-// failed attempt and resubmits, which is the trade a diagnostic can make. The
-// inbox pair is the file's invariant (every principal may answer its own
-// requests), not a grant the harness uses.
+// The grants are the subjects a requester of the platform executor needs and
+// nothing else: publish on `platform`'s `in` (the submission, and a cancel),
+// subscribe on `platform`'s `events` (the executor's status and artifact
+// updates, including the terminal) and on its `supervisor`, where a task's
+// supervisor writes the synthesized terminal when the executor dies without
+// one - the pair lib.TaskReplaySubjects folds. The harness reads both and
+// never publishes on `supervisor`: it is not the task's supervisor. No
+// JetStream API at all: the harness subscribes with a core subscription taken
+// before it publishes, so it needs no consumer, and a CONSUMER.CREATE on TASKS
+// would let it deliver any addressee's task plane into its own inbox
+// (a2aJetStreamSurfaceRationale). A core subscription has no replay, so the
+// harness treats a dropped connection as a failed attempt and resubmits, which
+// is the trade a diagnostic can make. The inbox pair is what makes a reply to
+// this principal deliverable: a publish that carries a reply subject gets the
+// stream's PubAck there with no JetStream grant, and it is also the file's
+// invariant (every principal may answer its own requests). The harness
+// publishes without a reply subject today and learns the server took the frame
+// from its flush.
 func evalIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    "eval",
@@ -558,9 +562,10 @@ func evalIdentity() a2aIdentity {
 		comment: "the bench harness's diagnostic bus transport: one task to the platform\n" +
 			"executor, its terminal awaited. STATIC permanently: the holder runs outside\n" +
 			"the cluster over a port-forward and has no ServiceAccount here to present.\n" +
-			"Publish on platform's in subject and subscribe on its events, nothing else:\n" +
-			"no supervisor, no JetStream API (a core subscription needs no consumer, and\n" +
-			"CONSUMER.CREATE on TASKS would read every addressee's task plane).",
+			"Publish on platform's in subject and subscribe on its events and supervisor\n" +
+			"(the pair a task's terminal may land on), nothing else: no JetStream API (a\n" +
+			"core subscription needs no consumer, and CONSUMER.CREATE on TASKS would read\n" +
+			"every addressee's task plane).",
 		auth:     a2aAuthStatic,
 		credsKey: a2aEvalPasswordKey,
 		publish: []string{
@@ -569,6 +574,7 @@ func evalIdentity() a2aIdentity {
 		},
 		subscribe: []string{
 			"a2a.tasks.platform.*.events",
+			"a2a.tasks.platform.*.supervisor",
 			"_INBOX.eval.>",
 		},
 	}

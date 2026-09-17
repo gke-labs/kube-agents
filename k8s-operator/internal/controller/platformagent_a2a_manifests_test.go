@@ -3374,8 +3374,8 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		},
 		// eval reaches no stream and no account-level discovery: the bench
 		// harness's diagnostic transport publishes on platform's in subject
-		// and takes a core subscription on its events, so a JetStream grant
-		// of any kind would be capability it does not use (and
+		// and takes core subscriptions on its events and supervisor, so a
+		// JetStream grant of any kind would be capability it does not use (and
 		// CONSUMER.CREATE on TASKS would read every addressee's task plane).
 		"eval": {},
 		"session": {

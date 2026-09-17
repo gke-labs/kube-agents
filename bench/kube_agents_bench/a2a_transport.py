@@ -6,11 +6,12 @@ the bus under ``spec.mode: next``: one ``message`` envelope on
 a terminal ``status-update`` lands. It proves the bus, the callout, the stream
 and the executor, and it skips the gateway -- its routing, its session
 registry, the relay back -- which is why it is a diagnostic rather than the
-next-mode transport the evals run on. That one is the gateway's inject
-adapter, and it carries the only credential that may publish on every
-addressee's ``in`` subject; this transport authenticates as its own ``eval``
-principal, whose grants are publish on ``platform``'s ``in`` and subscribe on
-``platform``'s ``events`` and nothing else.
+next-mode transport the evals will run on. That one is the gateway's inject
+adapter, planned and not yet built, which goes through the gateway's inbound
+path and carries the only credential that may publish on every addressee's
+``in`` subject; this transport authenticates as its own ``eval`` principal,
+whose grants are publish on ``platform``'s ``in`` and subscribe on
+``platform``'s ``events`` and ``supervisor`` and nothing else.
 
 Envelope, subject and payload shapes are ``docs/designs/spec-a2a-payloads.md``;
 the fold mirrors ``a2a/lib/fold.go``; the ids are minted the way
@@ -26,11 +27,15 @@ a parent's events name one. Nothing here polls the model; the kanban poll for
 delegated cases is the harness's, in :mod:`kube_agents_bench.harness`, where
 it can be deleted.
 
-The ``eval`` principal holds no JetStream API grant, so the subscription is a
-core NATS subscription taken before the publish and the publish carries no
-acknowledgement. That is the trade a diagnostic makes: a connection that drops
-mid-task cannot replay what it missed, so it ends the attempt as
-:class:`BusUnavailable` and the harness resubmits as a new task.
+The ``eval`` principal holds no JetStream API grant, so the subscriptions are
+core NATS subscriptions taken before the publish, and they have no replay.
+That is the trade a diagnostic makes: a connection that drops mid-task cannot
+recover what it missed, so it ends the attempt as :class:`BusUnavailable` and
+the harness resubmits as a new task. The publish asks for no acknowledgement
+-- one carrying a reply subject would get the stream's PubAck on the
+principal's inbox, which its grants allow -- and learns that the server took
+the frame from the flush that follows it; a stream that is missing surfaces as
+a task nobody accepted.
 
 ``nats`` is imported lazily inside the client so the default ``api`` transport
 never loads it.
@@ -73,6 +78,7 @@ __all__ = [
     "mint_ids",
     "task_events_subject",
     "task_in_subject",
+    "task_supervisor_subject",
 ]
 
 _log = logging.getLogger("kube_agents_bench.a2a_transport")
@@ -133,6 +139,9 @@ ARTIFACT_PROGRESS = "progress"
 # would drag ``nats`` into the scorer). Change it in both files or in neither.
 EVENT_ENTRY_STATUS = "a2a.status-update"
 EVENT_ENTRY_ARTIFACT = "a2a.artifact-update"
+# The ``status`` a trajectory entry carries once its call is over; every entry
+# this transport records is written after the fact, so it is the only value.
+ENTRY_STATUS_DONE = "completed"
 
 # Outcomes of one await.
 OUTCOME_TERMINAL = "terminal"
@@ -170,6 +179,11 @@ def task_in_subject(addressee: str, task_id: str) -> str:
 
 def task_events_subject(addressee: str, task_id: str) -> str:
     return f"a2a.tasks.{addressee}.{task_id}.events"
+
+
+def task_supervisor_subject(addressee: str, task_id: str) -> str:
+    """Where the task's supervisor writes the terminal an executor died without."""
+    return f"a2a.tasks.{addressee}.{task_id}.supervisor"
 
 
 @dataclass(frozen=True)
@@ -314,7 +328,7 @@ class Fold:
                     "name": EVENT_ENTRY_STATUS,
                     "args": {"state": state, "final": self.final},
                     "result": text or None,
-                    "status": "completed",
+                    "status": ENTRY_STATUS_DONE,
                 }
             )
         elif kind == KIND_ARTIFACT_UPDATE:
@@ -356,7 +370,7 @@ class Fold:
                             "name": data["name"],
                             "args": args,
                             "result": data.get("result"),
-                            "status": str(data.get("status") or "completed"),
+                            "status": str(data.get("status") or ENTRY_STATUS_DONE),
                         }
                     )
             return
@@ -370,7 +384,7 @@ class Fold:
                 "result": (
                     _text_of(parts) if name in (ARTIFACT_PROGRESS, ARTIFACT_THINKING) else None
                 ),
-                "status": "completed",
+                "status": ENTRY_STATUS_DONE,
             }
         )
 
@@ -474,21 +488,32 @@ class _Session:
             )
 
     async def watch(self, task_id: str) -> None:
-        """Subscribe to ``task_id``'s events, before anything is published."""
+        """Subscribe to ``task_id``'s events and supervisor subjects, before
+        anything is published.
+
+        The pair is what ``lib.TaskReplaySubjects`` folds: the executor's own
+        events, and the terminal its supervisor writes if the executor dies
+        without one. One connection delivers both in publish order into one
+        queue, and the fold drops whatever follows the first terminal.
+        """
         import nats.errors
 
-        subject = task_events_subject(self.addressee, task_id)
+        subjects = (
+            task_events_subject(self.addressee, task_id),
+            task_supervisor_subject(self.addressee, task_id),
+        )
         queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._queues[task_id] = queue
 
         async def _on_message(msg: Any) -> None:
             await queue.put(msg.data)
 
-        try:
-            self._subs.append(await self.nc.subscribe(subject, cb=_on_message))
-        except (TimeoutError, nats.errors.Error) as exc:
-            raise BusUnavailable(f"subscribe to {subject} failed: {exc}") from exc
-        await self._flush(f"subscription to {subject}")
+        for subject in subjects:
+            try:
+                self._subs.append(await self.nc.subscribe(subject, cb=_on_message))
+            except (TimeoutError, nats.errors.Error) as exc:
+                raise BusUnavailable(f"subscribe to {subject} failed: {exc}") from exc
+        await self._flush(f"subscriptions to {' and '.join(subjects)}")
 
     async def publish(self, envelope: dict[str, Any]) -> None:
         """Publish one envelope on the addressee's ``in`` subject and flush."""
