@@ -1161,14 +1161,15 @@ class PoolNote(unittest.TestCase):
                     "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": "22"}]},
                 },
             ),
-            # Rows dated to T0 so the digest figure is really read: a row two
-            # days back leaves before _as_seconds on POOL_DIGEST_DAYS.
+            # Rows dated to T0 and judged so the digest figure is really read:
+            # a row two days back leaves before _as_seconds on
+            # POOL_DIGEST_DAYS, and an unjudged one before the sample floor.
             *(
                 (
                     f"a day's minutes {name}",
                     {
                         "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
-                        "trend": {"days": [{"day": "2026-09-08", "breached": True, "p50_minutes": value}]},
+                        "trend": {"days": [{"day": "2026-09-08", "breached": True, "judged": True, "p50_minutes": value}]},
                     },
                 )
                 for name, value in (
