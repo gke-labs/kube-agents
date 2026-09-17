@@ -188,9 +188,11 @@ why a task nobody took is infrastructure rather than a failed case.
 
 `AGENT_TRANSPORT=a2a` has the harness stand in for the gateway: port-forward the NATS Service
 the operator renders for the CR (`<cr>-a2a-nats`, client port 4222), mint `taskId`, `contextId`
-and `correlationId`, subscribe to `a2a.tasks.{addressee}.{taskId}.events` and, once the
-supervisor split lands, its subject (on `main` the gateway's terminals land on `.events`),
-publish one `message` envelope on `a2a.tasks.{addressee}.{taskId}.in`
+and `correlationId`, subscribe to `a2a.tasks.{addressee}.{taskId}.events` and
+`a2a.tasks.{addressee}.{taskId}.supervisor` (the pair `tasks/get` folds: the executor's events,
+and the terminal the gateway writes as supervisor when an executor dies without one; an install
+that took the supervisor split inside the last retention window still holds older supervisor
+terminals on `.events`), publish one `message` envelope on `a2a.tasks.{addressee}.{taskId}.in`
 (`AGENT_A2A_ADDRESSEE` selects the addressee, default `platform`), fold the events as `tasks/get`
 folds them, and publish `cancel` on the way out of a timeout. The forward enters from the node,
 which the NATS ingress NetworkPolicy does not govern, so the fence that admits only enumerated bus
@@ -201,8 +203,8 @@ that the gateway itself is the thing that is down. It is not the presubmit's tra
 Two conditions on it (decided 2026-09-17). It authenticates as its own `eval` principal in the
 identity map the callout reads ([`spec-nats-deployment.md`](spec-nats-deployment.md), "Accounts
 and connection-time authorization"): publish on `a2a.tasks.platform.*.in`, subscribe on the
-matching `.events` and, once the supervisor split lands, its `.supervisor`, nothing else. It
-never holds the gateway's credential, in any case, and until
+matching `.events` and `.supervisor`, nothing else. It never holds the gateway's credential, in
+any case, and until
 that row is rendered the transport has no credential it may use. And it leaves `authority` null
 and says so: the block is populate-by-gateway-only and advisory until publisher identity arms
 ([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "Requester identity on the bus"), so a
