@@ -21,12 +21,20 @@ import sys
 
 NAME = os.path.basename(sys.argv[0])
 
-extra = ""
 if NAME == "cluster_agent_profile.py":
-    extra = (
-        "\nFor read-only cluster profile discovery, use the platform MCP tools:\n"
+    instruction = (
+        "For read-only cluster profile discovery, use the platform MCP tools:\n"
         "  - `list_cluster_profiles()`: lists active, fully scaffolded Cluster Agent profiles.\n"
         "  - `get_cluster_profile_name(project, cluster, location)`: derives the canonical profile name.\n"
+        "Do not report the request as blocked when discovering profiles — use the MCP tools above.\n"
+        "For profile mutation operations (create, delete, reconcile), report the request as\n"
+        "blocked on work that has to happen in the agent pod, and say which script it was."
+    )
+else:
+    instruction = (
+        "There is no way to run it from here, and no argument to this command that\n"
+        "changes that. Report the request as blocked on work that has to happen in\n"
+        "the agent pod, and say which script it was."
     )
 
 print(
@@ -36,10 +44,8 @@ print(
     "code-execution tools run in, reached over SSH from the agent pod. It has\n"
     "no `hermes` binary, no profiles tree, and no access to the agent pod's\n"
     "data volume. The script this file stands in for needs all three.\n"
-    f"{extra}\n"
-    "There is no way to run it from here, and no argument to this command that\n"
-    "changes that. Report the request as blocked on work that has to happen in\n"
-    "the agent pod, and say which script it was.\n"
+    "\n"
+    f"{instruction}\n"
     "\n"
     "/opt/data/.sandbox describes which side of the boundary this is.",
     file=sys.stderr,

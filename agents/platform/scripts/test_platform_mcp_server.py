@@ -841,6 +841,16 @@ class TestSessionKvHeaders(unittest.TestCase):
         env = config["mcp_servers"]["platform_control"]["env"]
         self.assertEqual(env.get("SESSION_KV_API_KEY"), "${SESSION_KV_API_KEY}")
 
+    def test_config_yaml_passes_platform_agent_home_into_this_subprocess(self):
+        """Hermes hands a stdio MCP server only the keys named in `env`, so
+        PLATFORM_AGENT_HOME is empty in profile-scoped homes unless config.yaml lists it."""
+        import yaml
+
+        config_path = Path(__file__).resolve().parents[1] / "config.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        env = config["mcp_servers"]["platform_control"]["env"]
+        self.assertEqual(env.get("PLATFORM_AGENT_HOME"), "${PLATFORM_AGENT_HOME}")
+
 
 class TestReportToChat(unittest.TestCase):
     """The specialist's hand-off to the Chat Agent relay."""

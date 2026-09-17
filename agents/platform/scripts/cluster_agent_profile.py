@@ -87,6 +87,7 @@ PROFILES_BASE = _resolve_profiles_base()
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
 CLUSTER_PROFILE_PREFIX = "cluster-"
+IDENTITY_FILE = "USER.md"
 
 # Non-cluster profiles that live under $HERMES_HOME/profiles but are never
 # managed as Cluster Agents: the front-door router (`default`) and the Platform
@@ -455,7 +456,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # It stays informational even so: the pin the runtime honours is KUBECONFIG
     # in the profile's .env (step 3b), not this line. Repointing an agent means
     # re-running this scaffold, not editing USER.md.
-    (home / "USER.md").write_text(
+    (home / IDENTITY_FILE).write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
@@ -536,7 +537,7 @@ def list_profiles(include_incomplete: bool = False) -> list[str]:
     for p in PROFILES_BASE.iterdir():
         if not p.is_dir() or p.name in RESERVED_PROFILES or not p.name.startswith(CLUSTER_PROFILE_PREFIX):
             continue
-        if not (p / "USER.md").is_file():
+        if not (p / IDENTITY_FILE).is_file():
             continue
         if read_cluster_identity(p) is None:
             continue
