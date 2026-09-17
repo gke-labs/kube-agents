@@ -2797,24 +2797,26 @@ def search_tree(
 
 
 def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
-    """The tuple a declaration and a finding are joined on, case-folded.
+    """The tuple a declaration and a finding are joined on: the finding id's segments.
 
-    Folded because the finding's own identity is: `derive_finding_id` lowers
-    and trims every segment, so the ledger prints `deployment-api` for
-    `Deployment/api` and treats the two spellings as one finding. An owner who
-    writes the Kind the way kubectl prints it, or copies it off the finding
-    id, passes the item shape check; an exact comparison here then matched
-    nothing and the posture published under a note that covers it. Trimmed
-    for the finding's side: the validator keeps a field's surrounding
-    whitespace, the id does not, and the key follows the id.
+    Each field goes through `_id_segment`, the reduction `derive_finding_id`
+    applies, because the ledger's identity is the standard the join has to
+    meet: it lowers, trims and squeezes every run outside `[a-z0-9]` to one
+    `-`, so `Deployment/api`, `deployment/api` and `Deployment / api` are all
+    `deployment-api` there and one finding. An owner who writes the Kind the
+    way kubectl prints it, or copies it off the finding id, passes the item
+    shape check, and a finding the model wrote with a space around the slash
+    or around a field still carries the id the note's author read; a key that
+    folded less than the id did matched nothing in those cases and the posture
+    published under a note that covers it.
     """
     key = (
-        str(entry.get("check", "")).strip().lower(),
-        str(entry.get("namespace") or "").strip().lower(),
-        str(entry.get("object", "")).strip().lower(),
+        _id_segment(str(entry.get("check", "") or "")),
+        _id_segment(str(entry.get("namespace") or "")),
+        _id_segment(str(entry.get("object", "") or "")),
     )
     if with_cluster:
-        return (str(entry.get(DECLARATION_CLUSTER_FIELD, "")).strip().lower(),) + key
+        return (_id_segment(str(entry.get(DECLARATION_CLUSTER_FIELD, "") or "")),) + key
     return key
 
 
@@ -4877,7 +4879,9 @@ def _declared_pointer(entry: dict) -> tuple[str, str]:
     declaration = entry.get("declaration") or {}
     where = f"{declaration.get('repo', '')}:{declaration.get('path', '')}"
     namespace = str(entry.get("namespace") or "").strip()
-    obj = str(entry.get("object", ""))
+    # The moved entry keeps the finding's own spelling, whitespace included;
+    # the cell drops the whitespace so the table column does not carry it.
+    obj = str(entry.get("object", "")).strip()
     if namespace:
         obj = f"{namespace}/{obj}"
     # The pointer is the one cell a reader follows rather than reads, so it

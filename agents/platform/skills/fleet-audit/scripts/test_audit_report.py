@@ -6090,6 +6090,26 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertEqual(payload["declared"], 1)
         self.assertEqual(payload["new"], 4)
         self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The pointer cell drops the whitespace the moved entry keeps.
+        self.assertIn("| `payments/Deployment/checkout-gateway` |", self.ledger_body())
+
+    def test_the_join_folds_whitespace_around_the_slash_as_the_finding_id_does(self):
+        # `Deployment / checkout-gateway` reduces to `deployment-checkout-gateway`
+        # in the finding id, the same segment `Deployment/checkout-gateway`
+        # gives, so the ledger already treats the two as one finding; a key
+        # that only trimmed the ends matched nothing for the spaced spelling.
+        findings = posture_and_fault_findings()
+        pdb = next(f for f in findings if f["check"] == "no-pdb")
+        pdb["object"] = "Deployment / checkout-gateway"
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc(findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The moved entry keeps the finding's spelling; the rendered cell
+        # drops the whitespace around it.
+        self.assertIn("| `payments/Deployment / checkout-gateway` |", self.ledger_body())
 
     def test_a_cluster_scoped_entry_matches_only_its_cluster(self):
         self.record()
