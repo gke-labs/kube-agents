@@ -1646,9 +1646,10 @@ unit_cost_hint() {
 # fits under 2700s -- the reps that hit the ceiling are the tail beyond it,
 # whose true length the graded durations cannot show because they are cut
 # at the ceiling. The worst that completed under it needed the whole 2700s;
-# an hour clears that by a third, keeps a unit under the lock deadline a
-# later repetition waits behind (1800s, lock_acquire), and costs at most
-# 900s more on a unit that would otherwise have been graded as a stub. The
+# an hour clears that by a third and costs at most 900s more on a unit that
+# would otherwise have been graded as a stub. The task lock a later
+# repetition waits behind is sized from this ceiling (run_one_unit), so a
+# unit that uses the whole hour cannot make its successor give up. The
 # variance is still #985's problem.
 unit_delegation_timeout() {
   case "$1" in
@@ -1729,7 +1730,15 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
-  if ! lock_acquire "${STATE_DIR}/lock-task-${name}"; then
+  # The task lock is held for the holder's whole unit, so the wait must
+  # outlast one: the unit's delegation ceiling plus grading and teardown
+  # (about 300s on the record; 600s here). A fixed 1800s deadline under a
+  # 3600s ceiling would make a same-task successor give up while its
+  # predecessor was still legitimately running -- 24% of presubmit runs
+  # launch compliance rep 2 within 2090s of rep 1 (385 logs, 09-04 to
+  # 09-15). The infra lock keeps its default: audit units carry no stack.
+  if ! lock_acquire "${STATE_DIR}/lock-task-${name}" \
+    "$(($(unit_delegation_timeout "${name}") + 600))"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi

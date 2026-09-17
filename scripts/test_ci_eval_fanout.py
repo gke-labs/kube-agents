@@ -163,6 +163,26 @@ class DelegationCeilingTest(unittest.TestCase):
         # whole point of the line.
         self.assertLess(unit.index(export), unit.index("uv run devops-bench"))
 
+    def test_the_task_lock_wait_outlasts_the_units_ceiling(self):
+        # A same-task repetition waits on the task lock for the holder's whole
+        # unit. With a 3600s ceiling, a fixed 1800s wait would make it give
+        # up while the holder was still legitimately running.
+        unit = lifted("run_one_unit")
+        wait = (
+            'lock_acquire "${STATE_DIR}/lock-task-${name}" \\\n'
+            '    "$(($(unit_delegation_timeout "${name}") + 600))"'
+        )
+        self.assertIn(wait, unit)
+        body = "\n".join(
+            [
+                lifted("unit_delegation_timeout"),
+                'export AGENT_DELEGATION_TIMEOUT="2700"',
+                'name=compliance-rbac-overgrant; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
+                'name=capacity-pinned-pool-probe; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
+            ]
+        )
+        self.assertEqual(run_bash(body).stdout.split(), ["4200", "3300"])
+
 
 class RunDirRecoveryTest(unittest.TestCase):
     def test_the_results_line_regex_recovers_the_run_directory(self):
