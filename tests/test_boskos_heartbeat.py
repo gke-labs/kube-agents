@@ -51,6 +51,23 @@ def wait_until(condition, deadline=WAIT_DEADLINE_SECONDS):
     return condition()
 
 
+def _has_exited(pid):
+    """True once pid is gone, or is a zombie waiting for init to reap it.
+
+    The kernel reparents an orphan to init (or a subreaper), which reaps it
+    asynchronously; on the CI runner the daemon stays a zombie for a moment
+    after it exits, and a zombie still answers kill(pid, 0).
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+    ).stdout.strip()
+    return state == "" or state.startswith("Z")
+
+
 class _FakeBoskos(BaseHTTPRequestHandler):
     updates = []  # (name, owner, state)
     owner = LEASE_OWNER
@@ -216,8 +233,8 @@ class BoskosHeartbeatTest(unittest.TestCase):
         self.assertIn("started for", stdout)
         self.assertIn("stopping for", stdout)
         daemon_pid = int(pid_file.read_text().strip())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(daemon_pid, 0)
+        self.assertTrue(wait_until(lambda: _has_exited(daemon_pid)),
+                        "the daemon is still running after its caller died")
 
     def test_disabled_without_boskos_env(self):
         proc = self._spawn(BOSKOS_HOST="")
