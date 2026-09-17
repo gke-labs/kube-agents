@@ -90,11 +90,12 @@ the presubmit exports nothing new until it chooses to. The exchange:
    the audit chain reaches the eval record with nothing added.
 3. Await the terminal of that task id, as [Completion signals](#completion-signals) says.
    Replies arrive the way the relay would post them to a conversation, over SSE or a `GET` on
-   the conversation key, and the harness returns when the terminal lands or `AGENT_HTTP_TIMEOUT`
-   elapses. On this path that variable bounds the whole task, not one request as it does on the
-   api transport. A timeout cancels through an explicit cancel route on the conversation, which
-   lands on the bus as `kind: cancel` exactly as the text route's `stop` does; the harness never
-   sends the stop text. No model turn is spent on status.
+   the conversation key, and the harness returns when the terminal lands or its deadline passes.
+   The deadline on this path is the gateway's first-event grace plus a margin (below), never
+   `AGENT_HTTP_TIMEOUT` alone, and it bounds the whole task, not one request as that variable
+   does on the api transport. A timeout cancels through an explicit cancel route on the
+   conversation, which lands on the bus as `kind: cancel` exactly as the text route's `stop`
+   does; the harness never sends the stop text. No model turn is spent on status.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
    executor publishes them. Token counts are not on the bus; the record says so rather than
@@ -143,20 +144,17 @@ for a dead tunnel: the adapter unreachable, the gateway refusing the injection, 
 taking the task. The window for that last one is the gateway's, not the harness's:
 `A2A_FIRST_EVENT_GRACE` bounds how long an active task with nothing on its events subject may
 hold a conversation, and the never-started heal in `handleInbound` releases the conversation on
-its next message with a notice naming the task. The harness runs no second clock. When its
-deadline passes with no terminal, its cancel is that next message, and what comes back on the
-conversation says which case this was: the never-started notice is infrastructure, and a cancel
-of a task that had events is the deadline outcome. So the harness and the gateway agree on what
-"nobody took it" means, on two conditions. The harness's deadline on this path runs strictly
-above the grace by more than the submit latency, not at it: the api default of `AGENT_HTTP_TIMEOUT`
-and the grace default are both ten minutes, the heal compares strictly against a clock the
-gateway starts in `startTask` after the harness's own clock started, and a cancel that arrives
-inside the grace is sent to a task nobody consumes, acknowledged as "cancel sent", and never
-followed by a terminal. And that last outcome has a reading of its own when it happens anyway:
-a cancel acknowledged and followed by no terminal within a short bound is infrastructure, the
-cancel reached nobody, and the harness confirms it by sending one more message once the grace
-has passed and reading the never-started notice. A task an executor took and finished with a
-`failed` terminal is a graded failure.
+its next message with a notice naming the task. The harness runs no second clock, and it does
+not read the answer off its own. Its deadline on this path is the grace plus a margin, a constant
+the adapter's change owns (60 s is the proposal), and never `AGENT_HTTP_TIMEOUT` alone: the api
+default of that variable and the grace default are both ten minutes, and the heal compares
+strictly against a clock `startTask` stamps after the harness's own started, so a deadline at the
+grace sends a cancel to a task nobody consumes, gets "cancel sent" back, and no terminal ever
+follows. When the deadline fires, the harness classifies from the conversation's state: the heal
+has fired and no executor event exists, infrastructure; an executor event exists, a graded
+timeout, and the cancel goes out; neither yet, wait for the heal, bounded by that same margin.
+So the harness and the gateway agree on what "nobody took it" means. A task an executor took
+and finished with a `failed` terminal is a graded failure.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
@@ -179,10 +177,12 @@ that gates on `tool_called` has no data on stage 1 until the bridge publishes ac
 persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either.
-`ledger_issue_contains` is in the same class: it finds the ledger by scanning the final message
-for a GitHub issue URL, and that URL has one channel, the delegated worker's card result, which
-today's wait folds into the final message. Until the rebuilt wait does the same, every case that
-gates on it fails on stage 1 with no issue URL in the report, a graded failure and not an error.
+`ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
+it works on any transport that maps a result into the final message, which both new transports
+do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
+worker's card result, which today's wait folds into the final message, so on this path it has
+the URL only once the rebuilt wait appends the delivered card results the same way, and until
+then it fails as a graded failure with no issue URL in the report, not as an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
 session worker carries only the tool-less `chat` profile; running the platform persona as a
