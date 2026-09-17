@@ -7349,7 +7349,12 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
     only a repository with no usable intent file is copied whole, under those
     caps. Every step is a clone of its own, so each must report the commit the
     first did; a branch that moved between them would give a tree from two
-    commits and a sha for neither, and the repository is not searched. In
+    commits and a sha for neither, and the repository is not searched that
+    run, its postures published as a coverage gap until the next one. One
+    broker handle per repository, pinning one base sha for the intent file
+    and every note the way the in-process `fetch`, `list` and `grep`
+    subcommands do, would remove both the repeated clone and the moved-sha
+    case; that is a follow-up, and the per-step clone stands until it lands. In
     directory mode the script ignores `--prefix` and `--into`, makes one full
     leased checkout and names it, so the first step is the whole copy and the
     tree to read and the scratch to remove are two different paths.
