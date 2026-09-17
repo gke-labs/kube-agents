@@ -744,58 +744,9 @@ source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
 write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
-# ─── 2c. Heal seeded-a's default pool: two nodes, not one ───────────────────
-# The seeded fleet's slot-a cluster hosts the namespace-level defect workloads
-# (payments-api, checkout-gateway) alongside GKE's system pods, and one
-# e2-medium's 940m allocatable CPU is fully claimed by the system set alone.
-# The fixtures only ever ran because they scheduled before the system pods
-# filled the node; the 2026-09-08 auto-upgrade rebuilt the node on all 30
-# pool projects, system-critical pods scheduled first, and every fixture went
-# Pending -- the crashloop trio redded every pull request (#1278).
-# bench/tf/fleet/main.tf now says node_count = 2, but a fleet re-apply is a
-# per-project human action on 30 projects, and this job -- running as the
-# Prow identity that holds container.admin in the leased project -- is the
-# first thing to touch each project after the break. So it heals at lease
-# time, the same posture as the poisoned-Helm-record guard in ci-deploy.sh:
-# discover slot a by the fleet's labels and the "-a" name suffix (the rule
-# hack/fleet-kubeconfigs.sh uses; fixtures.json sanctions exactly this), and
-# resize the default pool to SEEDED_A_DEFAULT_POOL_NODES when it is short.
-# Idempotent (a two-node pool is left alone), non-fatal (a failure warns and
-# the fixture checks report what they see, as they do today), and mutates
-# only the pool's node count -- never the fixtures, never the state file,
-# which the tofu change keeps in agreement. FLEET_HEAL_SEEDED_A=0 disables it.
-readonly SEEDED_A_DEFAULT_POOL_NODES=2
-readonly SEEDED_A_DEFAULT_POOL_NAME="default-pool"
-if [ "${FLEET_HEAL_SEEDED_A:-1}" != "0" ]; then
-  STEP_START=$SECONDS
-  # `|| true` as at the section-3b listing: under `set -euo pipefail` a
-  # failed `clusters list` (revoked credential, disabled API, a 5xx) would
-  # otherwise trip errexit on this assignment and kill the run at 2c.
-  SEEDED_A_LINE="$(gcloud container clusters list --project "${PROJECT_ID}" \
-    --filter='resourceLabels.environment=seeded AND resourceLabels.managed-by=kube-agents-seeded-fleet' \
-    --format='value(name,location)' 2>/dev/null | awk '$1 ~ /-a$/ {print; exit}' || true)"
-  if [ -z "${SEEDED_A_LINE}" ]; then
-    echo "seeded-a heal: no slot-a seeded cluster found in ${PROJECT_ID}; nothing to heal"
-  else
-    SEEDED_A_NAME="${SEEDED_A_LINE%%[[:space:]]*}"
-    SEEDED_A_LOCATION="${SEEDED_A_LINE##*[[:space:]]}"
-    SEEDED_A_NODES="$(gcloud container node-pools describe "${SEEDED_A_DEFAULT_POOL_NAME}" \
-      --cluster "${SEEDED_A_NAME}" --location "${SEEDED_A_LOCATION}" --project "${PROJECT_ID}" \
-      --format='value(initialNodeCount)' 2>/dev/null || true)"
-    if [ -z "${SEEDED_A_NODES}" ]; then
-      echo "WARNING: seeded-a heal: could not read ${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} node count; leaving it alone" >&2
-    elif [ "${SEEDED_A_NODES}" -ge "${SEEDED_A_DEFAULT_POOL_NODES}" ]; then
-      echo "seeded-a heal: ${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} already has ${SEEDED_A_NODES} node(s)"
-    elif gcloud container clusters resize "${SEEDED_A_NAME}" --node-pool "${SEEDED_A_DEFAULT_POOL_NAME}" \
-        --num-nodes "${SEEDED_A_DEFAULT_POOL_NODES}" --location "${SEEDED_A_LOCATION}" \
-        --project "${PROJECT_ID}" --quiet; then
-      echo "✓ seeded-a heal: HEALED ${PROJECT_ID}/${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} ${SEEDED_A_NODES} -> ${SEEDED_A_DEFAULT_POOL_NODES} nodes (#1278); fixtures reschedule on their own"
-    else
-      echo "WARNING: seeded-a heal: resize of ${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} failed; the pod-state fixture checks will report what they see (#1278)" >&2
-    fi
-  fi
-  echo "✓ seeded-a heal finished in $((SECONDS - STEP_START))s"
-fi
+# Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
+# own manual sweep had already raised all 30 projects and main.tf declares the same
+# count, so the heal never fired: this job's last deliberate fleet write (#1693).
 
 
 # 3. Agent & Harness Configuration
@@ -1070,10 +1021,11 @@ EVAL_DEFAULT_LOCATION="${GCP_LOCATION}"
 # the run pays neither the ~6-minute provision nor the ~8-minute teardown.
 # The discovery filter is the fleet's documented address (both labels from
 # `local.cluster_labels` in bench/tf/fleet/main.tf), the same one
-# hack/fleet-kubeconfigs.sh uses. This block and section 2c's seeded-a heal
-# are the two sanctioned addressers of a seeded cluster outside that catalog
-# chain, and the catalog's own description (bench/tf/fleet/fixtures.json)
-# names both as the exceptions; 2c is the only one that mutates anything.
+# hack/fleet-kubeconfigs.sh uses. This block is the only sanctioned addresser
+# of a seeded cluster outside that catalog chain, and the catalog's own
+# description (bench/tf/fleet/fixtures.json) names it as the exception. It
+# mutates nothing in-cluster; since #1693 no part of this job writes to the
+# fleet's clusters at all.
 #
 # ONLY slot c, never another slot. Slot a carries the planted namespace
 # defects -- including a real, live HPA at max replicas (fixture
