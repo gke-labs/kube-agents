@@ -625,8 +625,13 @@ DECLARATIONS_PATH_KEY = "declarations_path"
 DECLARED_INTENT_SOURCES_KEY = "declared_intent_sources"
 # What `start` hands the worker for each repository it owes and could not
 # read: the slug and the `ref` the entry pins, so the worker's own copy reads
-# the branch the administrator configured rather than the remote's HEAD.
+# the branch the administrator configured rather than the remote's HEAD. An
+# entry whose pin was refused as not a git branch name carries it under
+# `refused_ref` instead: the harness read nothing there, and the worker copies
+# nothing either, so the repository stays a named coverage gap until the
+# entry is corrected rather than being read at its default branch.
 DECLARED_INTENT_UNSEARCHED_KEY = "declared_intent_unsearched"
+REFUSED_REF_KEY = "refused_ref"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
 FRONTMATTER_DELIMITER = "---"
@@ -7203,7 +7208,11 @@ def context_repo_entries() -> list[dict]:
 
     try:
         return [
-            {"repo": str(entry["repo"]), "ref": entry.get("ref") or None}
+            {
+                "repo": str(entry["repo"]),
+                "ref": entry.get("ref") or None,
+                REFUSED_REF_KEY: entry.get(REFUSED_REF_KEY),
+            }
             for entry in gitops_workspace.get_context_github_repo_entries()
         ]
     except Exception as exc:
@@ -7414,6 +7423,7 @@ def discover_declarations(
         )
         return [], [], []
     refs = {entry["repo"].lower(): entry.get("ref") for entry in context}
+    refused = {entry["repo"].lower(): entry.get(REFUSED_REF_KEY) for entry in context}
     declarations: list[dict] = []
     searched: list[str] = []
     sources: list[dict] = []
@@ -7423,6 +7433,18 @@ def discover_declarations(
         # a context entry naming it is not honoured, because the run reads the
         # branch it will publish against.
         ref = None if is_gitops else refs.get(slug.lower())
+        # A pin that is not a git branch name is not replaced by the default
+        # branch: the pin exists so a curated branch is what silences a
+        # posture, and the default branch is where anyone with write access
+        # lands a note. The repository is skipped, stays out of `searched`,
+        # and the ledger names it as not searched until the entry is fixed.
+        if not is_gitops and refused.get(slug.lower()) is not None:
+            log(
+                f"WARNING: {slug}: ref {refused[slug.lower()]!r} is not a git branch "
+                "name; not searched, and not read at its default branch instead. "
+                "Correct the ref on the context_repos entry."
+            )
+            continue
         into: Path | None = None
         skipped: tuple[str, ...] = ()
         bound: list[str] | None = None
@@ -7501,19 +7523,25 @@ def unsearched_intent_entries(
     never honoured, and for an entry without one): the only other place the
     pin is printed lists repositories that were searched, and a worker that
     cannot see it clones HEAD and records a branch the administrator did
-    not ask to be read. Empty on a stream with no declared-intent step,
-    which owes no search.
+    not ask to be read. An entry whose pin was refused carries it under
+    `refused_ref` beside a null `ref`: that repository is not the worker's to
+    copy at HEAD either, and the SOP says so. Empty on a stream with no
+    declared-intent step, which owes no search.
     """
     if not audit_declarable_checks(audit_id):
         return []
     refs = {entry["repo"].lower(): entry.get("ref") for entry in context}
+    refused = {entry["repo"].lower(): entry.get(REFUSED_REF_KEY) for entry in context}
     have = {entry.partition("@")[0].strip().lower() for entry in searched}
     out: list[dict] = []
     for slug in declared_intent_repos(repo, [entry["repo"] for entry in context]):
         if slug.lower() in have:
             continue
         is_gitops = slug.lower() == repo.strip().lower()
-        out.append({"repo": slug, "ref": None if is_gitops else refs.get(slug.lower())})
+        item = {"repo": slug, "ref": None if is_gitops else refs.get(slug.lower())}
+        if not is_gitops and refused.get(slug.lower()) is not None:
+            item[REFUSED_REF_KEY] = refused[slug.lower()]
+        out.append(item)
     return out
 
 
@@ -7651,6 +7679,8 @@ def handle_start(args: argparse.Namespace) -> None:
                 # above is slugs, `declared_intent_sources` lists only what was
                 # searched — and a worker that cannot see it clones HEAD and
                 # records a branch the administrator did not ask to be read.
+                # One whose pin was refused carries `refused_ref` instead, and
+                # is not copied at all.
                 DECLARED_INTENT_UNSEARCHED_KEY: unsearched_intent_entries(
                     audit_id, repo, context_entries, searched
                 ),

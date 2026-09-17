@@ -230,8 +230,11 @@ the repository its entry — as `owner/name@sha`. `finish` unions that list into
 moves every finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
 from `declared_intent_searched` is one the harness could not read; `declared_intent_unsearched`
 lists each as `{repo, ref}`, stderr says why, and the SOP says what the worker does about it — its
-own copy at that `ref`. On every other stream the three lists are empty and the file at
-`declarations_path` holds none.
+own copy at that `ref`. An entry whose `ref` failed the branch-name check carries the value under
+`refused_ref` instead of a `ref`: the harness skipped that repository rather than reading its
+default branch in the pin's place, the worker copies nothing either, and the ledger names it as
+not searched until the entry is corrected. On every other stream the three lists are empty and the
+file at `declarations_path` holds none.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 

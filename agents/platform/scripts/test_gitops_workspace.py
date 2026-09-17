@@ -1080,12 +1080,15 @@ class TestContextRepos(WorkspaceTestCase):
                         [{"repo": "acme/terraform-live", "ref": good}],
                     )
 
-    def test_a_ref_that_is_not_a_branch_name_is_dropped_with_a_warning(self):
+    def test_a_ref_that_is_not_a_branch_name_is_refused_and_marks_the_entry(self):
         # A leading dash is an option to `git`; the rest are shapes a ref
         # cannot take — `foo.lock/bar` among them, a `.lock` component git
-        # refuses in the middle of a name as it does at the end. The
-        # repository is still read, at HEAD.
-        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "foo.lock/bar", "a/.b", "with space", "a@{1}", "@", "@release"):
+        # refuses in the middle of a name as it does at the end, and `+`,
+        # which git accepts and the shape check does not. The entry keeps
+        # its slug and carries the refused value under `refused_ref` in place
+        # of a `ref`, so the declared-intent search skips the repository
+        # rather than reading its default branch in the pin's place.
+        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "foo.lock/bar", "a/.b", "with space", "a@{1}", "@", "@release", "release/2026+hotfix"):
             with self.subTest(ref=bad):
                 context = json.dumps(
                     [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": bad}]
@@ -1095,16 +1098,24 @@ class TestContextRepos(WorkspaceTestCase):
                     with self.assertLogs("gitops_workspace", level="WARNING") as logs:
                         self.assertEqual(
                             gitops_workspace.get_context_github_repo_entries(),
-                            [{"repo": "acme/terraform-live", "ref": None}],
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": bad}],
                         )
-                    # The raw entry carries no `ref` key at all once dropped.
+                    # The raw entry carries the refused value, never as `ref`.
                     self.assertEqual(
                         gitops_workspace.get_context_repo_entries(),
-                        [{"type": "github", "url": "https://github.com/acme/terraform-live"}],
+                        [{"type": "github", "url": "https://github.com/acme/terraform-live", "refused_ref": bad}],
+                    )
+                    # The slug list every other caller reads still names the
+                    # repository: it is owed, and the ledger names it as not
+                    # searched.
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
                     )
                 joined = "\n".join(logs.output)
-                self.assertIn("Dropping ref", joined)
-                self.assertIn("reading HEAD", joined)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(bad), joined)
+                self.assertIn("skips this repository", joined)
+                self.assertNotIn("reading HEAD", joined)
 
     def test_a_non_github_entry_is_skipped_from_the_entries_too(self):
         context = (

@@ -4048,9 +4048,17 @@ def searched(*slugs, sha=SEARCH_SHA):
     return [f"{slug}@{sha}" for slug in slugs]
 
 
-def context_entries(*slugs, ref=None):
-    """What `get_context_github_repo_entries` returns for `slugs`, each at `ref`."""
-    return [{"repo": slug, "ref": ref} for slug in slugs]
+def context_entries(*slugs, ref=None, refused_ref=None):
+    """What `get_context_github_repo_entries` returns for `slugs`, each at `ref`.
+
+    `refused_ref` is what the entry carries instead when its pin failed the
+    branch-name check: `ref` is then None and the value rides beside it.
+    """
+    entries = [{"repo": slug, "ref": ref} for slug in slugs]
+    if refused_ref is not None:
+        for entry in entries:
+            entry["refused_ref"] = refused_ref
+    return entries
 
 
 def searched_doc(findings=None, repos=("acme/fleet",), **kwargs):
@@ -5458,11 +5466,11 @@ class DiscoveryTestCase(HarnessTestCase):
         target.write_text(text, encoding="utf-8")
         return target
 
-    def context(self, *slugs, ref=None):
+    def context(self, *slugs, ref=None, refused_ref=None):
         patcher = patch.object(
             gitops_workspace,
             "get_context_github_repo_entries",
-            lambda: context_entries(*slugs, ref=ref),
+            lambda: context_entries(*slugs, ref=ref, refused_ref=refused_ref),
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -5910,6 +5918,34 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertEqual(
             payload["declared_intent_unsearched"],
             [{"repo": "acme/terraform-live", "ref": "release-2026"}],
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_refused_ref_skips_the_repository_rather_than_reading_its_default_branch(self):
+        # `release/2026+hotfix` is a branch name git accepts and the shape
+        # check does not. The pin exists so a curated branch is what silences
+        # a posture, so the repository is not read at HEAD in its place: no
+        # clone is attempted, it stays out of `searched`, the warning names
+        # the refused value, and the worker's entry carries it under
+        # `refused_ref` so the worker does not copy at HEAD either.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        copy = self.tmp_path / "copy"
+        self.write(copy, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        self.context("acme/terraform-live", refused_ref="release/2026+hotfix")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
+        self.assertEqual(
+            payload["declared_intent_unsearched"],
+            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": "release/2026+hotfix"}],
+        )
+        self.assertEqual([c for c in self.clone_calls() if "acme/terraform-live" in c], [])
+        self.assertEqual(self.filed(), [])
+        self.assertIn(
+            "WARNING: acme/terraform-live: ref 'release/2026+hotfix' is not a git branch "
+            "name; not searched, and not read at its default branch instead.",
+            self.err,
         )
         self.assertEqual(self.temp_dirs(), [])
 

@@ -158,8 +158,14 @@ GITHUB_REPO_TYPE = "github"
 #: name and, above all, never allowed to begin with `-`, because the value is
 #: handed to `inspect_repository.py clone --ref` and from there to `git`, where
 #: a leading dash is an option. An entry whose `ref` fails the shape keeps its
-#: URL and drops the ref, with a warning; the repository is still read, at HEAD.
+#: URL and carries the refused value under `refused_ref` instead, with a
+#: warning; the declared-intent search then skips the repository rather than
+#: reading its default branch, because the pin exists so that a curated branch
+#: is what silences a posture, and the default branch is where anyone with
+#: ordinary write access lands a note. The slug stays in every list, so the
+#: ledger names the repository as one not searched until the entry is fixed.
 CONTEXT_REF_KEY = "ref"
+CONTEXT_REF_REFUSED_KEY = "refused_ref"
 _REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]{0,254}\Z")
 # `@` is admitted after the first character: `release@2026` is a branch name
 # git accepts, and a lone `@`, which it does not, fails the first class.
@@ -167,7 +173,7 @@ _REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]{0,254}\Z")
 # no `..`, no component starting with `.`, no empty component, no `@{`, and
 # no component ending in `.lock` — `.lock/` catches one in the middle, the
 # suffix below one at the end; `git clone --branch foo.lock/bar` exits 128,
-# which would leave the repository unsearched rather than read at HEAD.
+# so refusing it here names the reason on the entry instead of at the clone.
 _REF_FORBIDDEN_SUBSTRINGS = ("..", "/.", "//", "@{", ".lock/")
 _REF_FORBIDDEN_SUFFIXES = ("/", ".", ".lock")
 
@@ -785,9 +791,11 @@ def _parse_repos_json(repos_str: str, key: str = MANAGED_REPOS_KEY) -> list[dict
                         repo_type = str(item.get("type", "")).strip()
                         if url and repo_type:
                             entry = {"type": repo_type, "url": url}
-                            ref = _context_ref(item, url, key)
+                            ref, refused = _context_ref(item, url, key)
                             if ref:
                                 entry[CONTEXT_REF_KEY] = ref
+                            elif refused is not None:
+                                entry[CONTEXT_REF_REFUSED_KEY] = refused
                             entries.append(entry)
         except json.JSONDecodeError as err:
             LOGGER.warning("Failed to decode %s JSON: %s", key, err)
@@ -807,26 +815,31 @@ def is_valid_ref(ref: object) -> bool:
     return not ref.endswith(_REF_FORBIDDEN_SUFFIXES)
 
 
-def _context_ref(item: dict, url: str, key: str) -> str | None:
-    """The entry's `ref`, or None — with a warning when one was given and dropped.
+def _context_ref(item: dict, url: str, key: str) -> tuple[str | None, str | None]:
+    """`(ref, refused)`: the entry's `ref` when it is a branch name, else the value refused.
 
     Only a `context_repos` entry may carry one: the managed list is what the
     push gate and the resolver read, and a branch pin there would be a claim
-    about where fixes land that nothing downstream honours.
+    about where fixes land that nothing downstream honours. A refused value
+    is returned rather than dropped, with a warning naming it, so the caller
+    can mark the entry and the declared-intent search can skip the repository
+    instead of reading its default branch in the pin's place.
     """
     raw = item.get(CONTEXT_REF_KEY)
     if raw is None or key != CONTEXT_REPOS_KEY:
-        return None
+        return None, None
     ref = str(raw).strip()
     if is_valid_ref(ref):
-        return ref
+        return ref, None
     LOGGER.warning(
-        "Dropping ref %r on %s repository %r: not a git branch name; reading HEAD.",
+        "Refusing ref %r on %s repository %r: not a git branch name; the "
+        "declared-intent search skips this repository rather than reading "
+        "its default branch.",
         raw,
         key,
         url,
     )
-    return None
+    return None, str(raw)
 
 
 def _state_key_path(key: str) -> Path:
@@ -961,7 +974,10 @@ def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
             continue
         if slug not in seen:
             seen.add(slug)
-            res.append({"repo": slug, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)})
+            out = {"repo": slug, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)}
+            if entry.get(CONTEXT_REF_REFUSED_KEY) is not None:
+                out[CONTEXT_REF_REFUSED_KEY] = entry[CONTEXT_REF_REFUSED_KEY]
+            res.append(out)
     return res
 
 
@@ -991,8 +1007,9 @@ def get_context_github_repo_entries() -> list[dict]:
 
     The same list as `get_context_github_repos` with each slug's branch pin
     beside it (None when the entry has none), for the one caller that passes
-    the pin on to a clone. Same skip rule, same warning, same one-way
-    relationship to the managed list.
+    the pin on to a clone. An entry whose pin was refused carries it under
+    `refused_ref` instead, and that caller skips the repository. Same skip
+    rule, same warning, same one-way relationship to the managed list.
     """
     return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY)
 
