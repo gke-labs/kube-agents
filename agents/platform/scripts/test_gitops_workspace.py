@@ -1159,6 +1159,26 @@ class TestContextRepos(WorkspaceTestCase):
                 [{"repo": "acme/live", "ref": "a"}],
             )
 
+    def test_a_case_variant_duplicate_is_the_same_slug_and_keeps_the_first_ref(self):
+        # The readers key on the lowercased slug, so a second entry that
+        # differed only in case would overwrite the first's ref with its own:
+        # a pinned entry followed by an unpinned spelling read the repository
+        # at its default branch, and a refused pin followed by one was read
+        # rather than skipped.
+        context = (
+            '[{"type": "github", "url": "https://github.com/Acme/Live", "ref": "release-2026"}, '
+            '{"type": "github", "url": "https://github.com/acme/live"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "Acme/Live", "ref": "release-2026"}],
+            )
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["Acme/Live"])
+
     def test_validate_repo_org_matching_primary_org(self):
         with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
             self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")

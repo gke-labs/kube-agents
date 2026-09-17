@@ -952,7 +952,11 @@ def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
 
     `ref` is the entry's branch pin or None. The first entry for a slug wins,
     ref included: two entries for one repository on two branches is one
-    repository read once, at the branch the first names.
+    repository read once, at the branch the first names. Slugs are compared
+    case-folded, as GitHub compares them, so `Acme/Live` and `acme/live` are
+    one entry too; the readers downstream key on the lowercased slug, and a
+    second entry that survived here would hand them the last ref, not the
+    first.
     """
     res: list[dict] = []
     seen: set[str] = set()
@@ -972,8 +976,8 @@ def _github_entries(entries: list[dict[str, str]], key: str) -> list[dict]:
                 "Skipping %s repository %r: not a GitHub repository URL.", key, url
             )
             continue
-        if slug not in seen:
-            seen.add(slug)
+        if slug.lower() not in seen:
+            seen.add(slug.lower())
             out = {"repo": slug, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)}
             if entry.get(CONTEXT_REF_REFUSED_KEY) is not None:
                 out[CONTEXT_REF_REFUSED_KEY] = entry[CONTEXT_REF_REFUSED_KEY]
