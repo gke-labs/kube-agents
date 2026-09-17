@@ -9,6 +9,7 @@ draw. Every asserted time is America/Toronto.
 """
 
 import copy
+import itertools
 import json
 import pathlib
 import re
@@ -330,6 +331,12 @@ class TrendPageTest(unittest.TestCase):
             empty = store_doc([])
             (root / "empty.json").write_text(json.dumps(empty))
             cls.empty = render_to(root / "empty", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "empty.json")])
+            # A month of nights: the density a quarter's chart works at.
+            dense = []
+            for day in range(1, 31):
+                dense += later_night(base, day, f"21007{day:02d}0000000000000")
+            (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z")))
+            cls.dense = render_to(root / "dense", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "dense.json")])
         cls.page = cls.out / "trend.html"
 
     @classmethod
@@ -416,6 +423,20 @@ class TrendPageTest(unittest.TestCase):
         # A metric the store does not carry falls back to the default; an unknown case says so.
         self.assertIn("Judged OutcomeValidity by night", dom_text(self.page, fragment="#metric=Nope"))
         self.assertIn("No record in the store for this case inside the window", dom_text(self.page, fragment="#cases=no-such-case"))
+
+    def test_hit_targets_are_disjoint_and_cover_the_plot_at_a_months_density(self):
+        # SVG hit-testing returns the topmost element: overlapping rects
+        # would name a later night than the one under the pointer.
+        app = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
+        svg = re.search(r'<svg class="tchart"[^>]*pass rate by night.*?</svg>', app, re.DOTALL).group(0)
+        rects = [(float(x), float(w)) for x, w in re.findall(r'<rect class="hit" tabindex="0" x="([0-9.]+)" y="\d+" width="([0-9.]+)"', svg)]
+        self.assertEqual(len(rects), 30)
+        for (x0, w0), (x1, _) in itertools.pairwise(rects):
+            self.assertLessEqual(x0 + w0, x1 + 0.11, "adjacent hit targets overlap")
+            self.assertGreaterEqual(x0 + w0, x1 - 0.11, "a gap between adjacent hit targets")
+        self.assertEqual(rects[0][0], 38.0, "the first target starts at the plot's left edge")
+        self.assertAlmostEqual(rects[-1][0] + rects[-1][1], 506.0, places=0)
+        self.assertTrue(all(w > 0 for _, w in rects))
 
     def test_a_chip_writes_the_link_so_the_pages_own_links_still_navigate(self):
         # A scope chip, then the domain view's case title: the title wins,

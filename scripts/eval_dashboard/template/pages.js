@@ -1515,10 +1515,16 @@ function trendChartHtml(t, points, kind, metric, range, markers, title) {
     const px = x(m.ms).toFixed(1);
     parts.push(`<line class="${m.cls}" x1="${px}" x2="${px}" y1="${g.top - 4}" y2="${y(0).toFixed(1)}"></line><text class="${m.cls}-l" x="${(Number(px) + 4).toFixed(1)}" y="${g.top - 8 + (i % 2) * 10}">${esc(m.label)}</text>`);
   });
-  // Hit targets: one per night, the slot wide and the plot tall, carrying
-  // the readout for the tooltip and a native <title>; focusable.
-  for (const p of drawn) {
-    const cx = x(pointAt(p)), w = Math.max(24, slot);
+  // Hit targets: one per night, disjoint (each reaches halfway to its
+  // neighbours, to the plot's edge at the ends) and the plot tall, carrying
+  // the readout for the tooltip and a native <title>; focusable. Disjoint
+  // matters: SVG hit-testing returns the topmost element, so rects that
+  // overlapped at a quarter's density named a later night than the one
+  // under the pointer.
+  const xs = drawn.map((p) => x(pointAt(p)));
+  drawn.forEach((p, i) => {
+    const cx = xs[i];
+    const x0 = i ? (xs[i - 1] + cx) / 2 : g.left, x1 = i < xs.length - 1 ? (cx + xs[i + 1]) / 2 : g.left + plotW;
     const night = trendNight(t, p.night);
     const lines = [`${night.label}${p.commit ? ` · ${String(p.commit).slice(0, 7)}` : ""}`];
     if (kind === "rate") {
@@ -1533,8 +1539,8 @@ function trendChartHtml(t, points, kind, metric, range, markers, title) {
     } else if (metric) lines.push(`${metric}: not recorded that night`);
     if (p.key) lines.push(`key ${p.key}`);
     const tip = lines.join("\n");
-    parts.push(`<rect class="hit" tabindex="0" x="${(cx - w / 2).toFixed(1)}" y="${g.top}" width="${w.toFixed(1)}" height="${plotH}" data-tip="${esc(tip)}" aria-label="${esc(tip)}"><title>${esc(tip)}</title></rect>`);
-  }
+    parts.push(`<rect class="hit" tabindex="0" x="${x0.toFixed(1)}" y="${g.top}" width="${Math.max(0, x1 - x0).toFixed(1)}" height="${plotH}" data-tip="${esc(tip)}" aria-label="${esc(tip)}"><title>${esc(tip)}</title></rect>`);
+  });
   return `<svg class="tchart" viewBox="0 0 ${g.width} ${g.height}" role="img" aria-label="${esc(title)}">${parts.join("")}</svg>`;
 }
 

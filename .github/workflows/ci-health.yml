@@ -319,8 +319,12 @@ jobs:
       # step leaves no work/store.json, the render below skips --store, and
       # the page says the store was not read. The other pages publish in
       # every case. The prior is the copy render.py published beside
-      # data.json last tick, so a tick fetches only last night's objects.
-      # Skipped after a failed collect: nothing renders then.
+      # data.json last tick, so a tick fetches only last night's objects;
+      # only a NotFound on it means the first tick (a cold read of the whole
+      # span), any other download failure is retried and then ends the
+      # step, because a cold read against a bucket that just failed would
+      # spend the budget and could not fall back to a prior it does not
+      # have. Skipped after a failed collect: nothing renders then.
       #
       # The job has one wall clock (timeout-minutes) and two budgeted reads
       # before the publisher half, the collect and this one, whose budgets
@@ -332,7 +336,24 @@ jobs:
         if: steps.collect.outcome == 'success'
         continue-on-error: true
         run: |
-          gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json || echo "no published store.json yet; reading the whole window"
+          # `gsutil stat` exits 1 for a missing object and for a failed
+          # call alike, so the error text is read (as the health-history
+          # step below does).
+          prior=unreachable
+          for attempt in 1 2 3; do
+            if gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json 2>gsutil.err; then prior=present; break; fi
+            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then prior=absent; break; fi
+            echo "::warning::attempt $attempt: could not download the prior store.json (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
+            if [ "$attempt" -lt 3 ]; then sleep 15; fi
+          done
+          rm -f gsutil.err
+          case "$prior" in
+            absent) echo "no published store.json yet; reading the whole span" ;;
+            unreachable)
+              echo "::warning::the prior store.json could not be downloaded; the store is not read this tick and the page says so (the bucket's copy waits for the next tick)"
+              exit 1
+              ;;
+          esac
           keep_prior() {
             echo "::warning::$1; the Trend page shows the last published store.json as a stale read"
             python3 scripts/eval_dashboard/store.py --location "$EVIDENCE_STORE" --prior work/prior-store.json --out work/store.json --fail-with "$1"
