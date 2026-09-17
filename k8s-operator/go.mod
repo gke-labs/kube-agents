@@ -9,7 +9,7 @@ require (
 	github.com/nats-io/nats.go v1.53.1
 	github.com/nats-io/nkeys v0.4.16
 	github.com/prometheus/client_golang v1.24.1
-	github.com/prometheus/client_model v0.6.2
+	github.com/prometheus/client_model v0.6.3
 	github.com/securego/gosec/v2 v2.29.0
 	golang.org/x/oauth2 v0.37.0
 	google.golang.org/api v0.297.0
