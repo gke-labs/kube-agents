@@ -78,7 +78,8 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
     05:57Z run. The script runs hack/boskos_heartbeat.sh itself, after the
     traps are installed (so the trap can always kill it), disowned (so the
     fan-out's `jobs -rp` lane count and the final `wait` never see it), and
-    the trap kills it before anything slow, ahead of the wrapper's release.
+    the trap kills it last, so the lease is beaten through the trap's own
+    tail and the daemon is still gone minutes before the wrapper's release.
     """
 
     src = SCRIPT.read_text(encoding="utf-8")
@@ -107,10 +108,14 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
         self.assertIn('BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"', block)
         self.assertIn('http://boskos.boskos.svc.cluster.local', block)
 
-    def test_the_trap_kills_the_daemon_before_anything_slow(self):
+    def test_the_trap_kills_the_daemon_after_everything_slow(self):
+        # The trap's tail (result collection, the artifact dump on a red run,
+        # the dashboard publish) is not bounded by the reaper window, and on
+        # a run past boskosctl's 5h --timeout this daemon is the only thing
+        # beating; killing it first would reopen the gap it closes.
         body = trap_body()
         kill = body.index('kill "${EVAL_HEARTBEAT_PID:-}"')
-        self.assertLess(kill, body.index("collect_bench_results"))
+        self.assertGreater(kill, body.index("publish_eval_dashboard"))
         # An unset PID (every run outside Prow, and the lifted-trap tests
         # above) must not turn into a failure of the trap.
         self.assertEqual(run_trap(0).returncode, 0)

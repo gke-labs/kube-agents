@@ -652,11 +652,6 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
-  # First, before anything slow: the eval-lifetime Boskos heartbeat started
-  # below the traps must be gone before the wrapper releases the lease, or
-  # it beats a freed resource and Boskos 401s every beat (the same orphan
-  # the wrapper's own cleanup() guards against). Unset outside Prow.
-  kill "${EVAL_HEARTBEAT_PID:-}" 2>/dev/null || true
   collect_bench_results
   profile_report "${exit_code}"
   (exit "${exit_code}")
@@ -665,6 +660,16 @@ profile_and_dump_on_exit() {
   # was captured above and publish_eval_dashboard never returns non-zero, so
   # this cannot change what Prow reports (errexit is already cleared above).
   publish_eval_dashboard
+  # Last, after everything slow: the eval-lifetime Boskos heartbeat started
+  # below the traps keeps the lease alive through this tail too. On a run
+  # past boskosctl's 5h --timeout nothing else beats, and the tail is not
+  # bounded by the ~5m reaper window (the artifact dump's kubectl calls
+  # carry no --request-timeout; the dashboard publish has a 900s budget), so
+  # killing it first would reopen the gap this daemon closes. The wrapper's
+  # release comes after ci-teardown.sh, minutes from now, so the daemon is
+  # gone long before it; caller_alive stops it even if this kill is never
+  # reached. Unset outside Prow.
+  kill "${EVAL_HEARTBEAT_PID:-}" 2>/dev/null || true
 }
 trap profile_and_dump_on_exit EXIT
 # A Prow deadline delivers SIGTERM, which does not run the EXIT trap on its
@@ -685,8 +690,9 @@ trap 'exit 143' TERM INT
 #
 # The daemon ci-teardown.sh already runs beats here for exactly this script's
 # lifetime -- it has no timeout -- so the lease stays fresh however long the
-# fan-out takes; profile_and_dump_on_exit kills it first thing, so it is gone
-# before the wrapper's release. Same endpoint and owner convention as the
+# fan-out and the EXIT trap's artifact tail take; profile_and_dump_on_exit
+# kills it as its last act, minutes before the wrapper's release, and the
+# daemon stops itself once this script is gone. Same endpoint and owner convention as the
 # wrapper (BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}", oss-test-infra
 # prow/prowjobs/gke-labs/kube-agents/*.yaml); outside Prow nothing is derived
 # and the daemon disables itself with one line. `disown` is load-bearing: the
