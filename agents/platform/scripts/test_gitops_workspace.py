@@ -1172,6 +1172,31 @@ class TestContextRepos(WorkspaceTestCase):
         self.assertIn("'null'", joined)
         self.assertIn("skips this repository", joined)
 
+    def test_a_ref_that_is_not_a_string_is_refused_rather_than_spelt_as_a_branch(self):
+        # `"ref": 123` or `"ref": false` is a template that emitted the wrong
+        # type, not a branch named `123` or `False`; `str()` on the value
+        # would have passed both through the shape check as pins. Only a
+        # string is a candidate, and the refused value keeps its JSON
+        # spelling in the warning and on the entry, as `null` does.
+        for raw, spelling in ((123, "123"), (False, "false"), (["main"], '["main"]')):
+            with self.subTest(ref=spelling):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": raw}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": spelling}],
+                        )
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(spelling), joined)
+
     def test_a_non_github_entry_is_skipped_from_the_entries_too(self):
         context = (
             '[{"type": "gitlab", "url": "https://gitlab.com/acme/live", "ref": "main"}, '

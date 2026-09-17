@@ -166,8 +166,6 @@ GITHUB_REPO_TYPE = "github"
 #: ledger names the repository as one not searched until the entry is fixed.
 CONTEXT_REF_KEY = "ref"
 CONTEXT_REF_REFUSED_KEY = "refused_ref"
-# How a `"ref": null` is named when it is refused: the JSON spelling, not Python's.
-CONTEXT_REF_NULL_SPELLING = "null"
 _REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]{0,254}\Z")
 # `@` is admitted after the first character: `release@2026` is a branch name
 # git accepts, and a lone `@`, which it does not, fails the first class.
@@ -832,12 +830,15 @@ def _context_ref(item: dict, url: str, key: str) -> tuple[str | None, str | None
     # Only an absent key means "no pin". A `null`, empty or blank value is
     # refused with the rest: each is what a template with an unset variable
     # emits, and the pin it lost is the one the default branch must not
-    # stand in for.
+    # stand in for. Only a string is a candidate at all: `123` or `false` is
+    # a template that emitted the wrong type, not a branch named `123` or
+    # `False`, which `str()` would have made of it. A refused value that is
+    # not a string is named by its JSON spelling, `null` and `false` rather
+    # than `None` and `False`, because JSON is what the administrator wrote.
     raw = item[CONTEXT_REF_KEY]
-    ref = "" if raw is None else str(raw).strip()
-    if is_valid_ref(ref):
-        return ref, None
-    refused = CONTEXT_REF_NULL_SPELLING if raw is None else str(raw)
+    if isinstance(raw, str) and is_valid_ref(raw.strip()):
+        return raw.strip(), None
+    refused = raw if isinstance(raw, str) else json.dumps(raw)
     LOGGER.warning(
         "Refusing ref %r on %s repository %r: not a git branch name; the "
         "declared-intent search skips this repository rather than reading "
