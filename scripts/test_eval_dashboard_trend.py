@@ -266,7 +266,8 @@ class LeadInTest(unittest.TestCase):
                 f"{LOCATION}/bare-case/unkeyed/2026-05-01T05-00-00Z-3.jsonl",
                 f"{LOCATION}/bare-case/unkeyed/2026-09-10T05-00-00Z-4.jsonl"]
         now = datetime.datetime(2026, 9, 17, 14, 9, 2, tzinfo=datetime.timezone.utc)
-        chosen, _truncated, older = store.select_objects(urls, LOCATION, now_ms=now.timestamp() * 1000, window_days=10, lead_days=14, max_objects=200)
+        chosen, _truncated, older, skipped = store.select_objects(urls, LOCATION, now_ms=now.timestamp() * 1000, window_days=10, lead_days=14, max_objects=200)
+        self.assertEqual(skipped, [])
         self.assertEqual(len(chosen), 2)
         self.assertEqual(older, {"odd-case": {"s/vertex_ai-gemini-x-tag/v1-f1-v1": 1}, "bare-case": {"unkeyed": 1}})
         base = night_one_records()
@@ -298,8 +299,10 @@ class StoreStatesTest(unittest.TestCase):
     def test_no_store_an_error_and_odd_records_all_yield_a_document(self):
         empty = trend.trend_document(None, data_with_nightly(DOMAINS))
         self.assertEqual((empty["source"], empty["read_at"], empty["records"], empty["cases"], empty["domains"], empty["metrics"], empty["default_metric"]), (None, None, 0, {}, {}, [], None))
-        failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gsutil ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"]), data_with_nightly(DOMAINS))
-        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"]), ("2026-09-17T14:30:00Z: gsutil ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4))
+        failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gsutil ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"], partial={"fetched": 3, "remaining": 1}), data_with_nightly(DOMAINS))
+        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"], failed["partial"]), ("2026-09-17T14:30:00Z: gsutil ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4, {"fetched": 3, "remaining": 1}))
+        self.assertIsNone(empty["partial"])
+        self.assertIsNone(trend.trend_document(store_doc(night_one_records(), partial={"fetched": 4, "remaining": 0}), data_with_nightly(DOMAINS))["partial"], "nothing left is not partial")
         # A non-finite mean is what json.loads makes of a `NaN` or `Infinity`
         # literal in a record; json.dumps would write it back and the page's
         # JSON.parse would refuse the whole document.
@@ -369,7 +372,8 @@ class TrendPageTest(unittest.TestCase):
             # A read that failed this tick: the prior document with error set,
             # a cap that trimmed one case and a line that would not parse.
             stale = store_doc(records, error="2026-09-17T14:30:00Z: gsutil ls gs://kube-agents-evals-bench/evidence: AccessDeniedException: 403",
-                              truncated={"rca-remediation-pr": 2}, warnings=["gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value"])
+                              truncated={"rca-remediation-pr": 2}, warnings=["gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value"],
+                              partial={"fetched": 800, "remaining": 2600})
             (root / "stale.json").write_text(json.dumps(stale))
             cls.stale = render_to(root / "stale", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "stale.json")])
             empty = store_doc([])
@@ -510,6 +514,7 @@ class TrendPageTest(unittest.TestCase):
         stale = dom_text(self.stale / "trend.html")
         self.assertIn('<p class="stale">The read was capped at 200 objects per case per version key for 1 case (rca-remediation-pr); their oldest nights inside the window are not drawn.</p>', stale)
         self.assertIn('<p class="stale">1 record in the store could not be read and is left out: <code>gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value</code></p>', stale)
+        self.assertIn('<p class="stale">The last read stopped at its time budget after 800 of 3400 objects; the cases the rest belong to are drawn without them until the next refresh finishes the read.</p>', stale)
         self.assertNotIn('class="stale"', dom_text(self.page), "a clean read carries neither note")
 
     def test_the_polls_re_render_keeps_an_open_table_view_and_the_focused_night(self):

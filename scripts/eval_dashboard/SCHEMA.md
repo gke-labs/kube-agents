@@ -663,7 +663,7 @@ night's records every night); the block is inlined into `trend.html` and
 published beside `brief.json` as **`trend.json`**, which the Trend page
 polls. It is `trend.py`'s block from `store.json` (below), the evidence
 store's read: `{source, read_at, error, window_days, lead_days, max_objects,
-truncated{case: n}, warnings[], records, metrics[], default_metric,
+truncated{case: n}, partial, warnings[], records, metrics[], default_metric,
 spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{}}`.
 Without a `--store` every field is empty or `null` and the page says the
 store was not read; `error` set means the last read failed or was not
@@ -707,7 +707,7 @@ run never writes it), so nothing here is a presubmit's.
 The evidence store (`docs/designs/eval-scorer.md`, "What is stored")
 as one document: `{schema_version, source, read_at, window_days,
 lead_days, max_objects, listed, fetched, truncated{case: n}, older{case:
-{key: n}}, warnings[], error, records[]}`. `records[]` is every object read inside the last
+{key: n}}, partial, warnings[], error, records[]}`. `records[]` is every object read inside the last
 `window_days` plus `lead_days` (90 and 14: the page draws the window and
 pools the lead-in into its first nights) and under `max_objects` per case per key
 (`EVAL_BASELINE_MAX_OBJECTS`, 200, the gate's own cap), each the JSON line
@@ -723,7 +723,11 @@ short. `older`'s case and key are the directories the writer filed them
 under (`evidence_store._key_segments`: each component sanitised, `unkeyed`
 for a record without a key, `""` for an object filed directly under its
 case), not the record's own spelling; `trend.py` maps a record's key to
-that path the same way before the lookup; `warnings[]` names each line that
+that path the same way before the lookup. `partial` is `null`, or
+`{fetched, remaining}` when the read stopped at its deadline
+(`--deadline-s`) between waves of fetches with objects left for the next
+tick, which finds them absent from its `--prior` and reads them first;
+`warnings[]` names each line that
 would not parse (skipped, never fatal); `error` is set when the read did
 not happen — the listing failed, or the workflow called `--fail-with` for a
 read its `timeout` killed or its wall clock could not fit — and the

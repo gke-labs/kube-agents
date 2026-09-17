@@ -334,7 +334,11 @@ jobs:
       # sum past it. This read gets what the collect left less JOB_TAIL_S,
       # and is not started when that is under a minute: a job-level timeout
       # is not continue-on-error and would cancel the health verdict, the
-      # render and the post, not just this page.
+      # render and the post, not just this page. Inside its budget the read
+      # stops itself between waves (--deadline-s, 30 s under the budget) and
+      # keeps what it fetched, so a cold read that does not fit one tick
+      # finishes over the next ones instead of starting over each time;
+      # `timeout` is the hard stop behind it.
       - name: Read the evidence store for the Trend page (best-effort)
         if: steps.collect.outcome == 'success'
         continue-on-error: true
@@ -358,7 +362,7 @@ jobs:
               ;;
           esac
           keep_prior() {
-            echo "::warning::$1; the Trend page shows the last published store.json as a stale read"
+            echo "::warning::$1; the Trend page shows the last published store.json as a stale read, or says the store was not read when there is none"
             python3 scripts/eval_dashboard/store.py --location "$EVIDENCE_STORE" --prior work/prior-store.json --out work/store.json --fail-with "$1"
           }
           left=$(( JOB_TIMEOUT_S - JOB_TAIL_S - ($(date +%s) - JOB_STARTED) ))
@@ -369,6 +373,7 @@ jobs:
             timeout "$budget" python3 scripts/eval_dashboard/store.py \
               --location "$EVIDENCE_STORE" \
               --prior work/prior-store.json \
+              --deadline-s $(( budget - 30 )) \
               --out work/store.json \
               || keep_prior "store.py failed or timed out (exit $?, budget ${budget}s)"
           fi

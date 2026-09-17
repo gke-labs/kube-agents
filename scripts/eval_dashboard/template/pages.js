@@ -1640,6 +1640,7 @@ function trendStatusHtml(t) {
   const read = parseIso(t.read_at);
   const parts = [];
   if (t.error) parts.push(`<div class="banner hs-amber">${pillHtml("DEGRADED", "STALE READ")}<span>The store could not be read on the last refresh (${esc(String(t.error).slice(0, 200))}); this page shows the last good read, ${esc(read != null ? et(read) : "at an unknown time")}.</span></div>`);
+  if (t.partial && isNumber(t.partial.remaining) && t.partial.remaining > 0) parts.push(`<p class="stale">The last read stopped at its time budget after ${esc(t.partial.fetched)} of ${esc(t.partial.fetched + t.partial.remaining)} objects; the cases the rest belong to are drawn without them until the next refresh finishes the read.</p>`);
   const truncated = t.truncated && typeof t.truncated === "object" ? Object.keys(t.truncated) : [];
   if (truncated.length) parts.push(`<p class="stale">The read was capped at ${esc(t.max_objects)} objects per case per version key for ${plural(truncated.length, "case")} (${truncated.slice(0, 6).map(esc).join(", ")}${truncated.length > 6 ? ", …" : ""}); their oldest nights inside the window are not drawn.</p>`);
   if (Array.isArray(t.warnings) && t.warnings.length) parts.push(`<p class="stale">${plural(t.warnings.length, "record")} in the store could not be read and ${t.warnings.length === 1 ? "is" : "are"} left out: <code>${esc(String(t.warnings[0]).slice(0, 160))}</code>${t.warnings.length > 1 ? " …" : ""}</p>`);

@@ -406,6 +406,15 @@ def read_span(store: dict | None) -> tuple[float | None, int | None, int]:
     return read_at.timestamp() * 1000 - window_days * DAY_MS, window_days, lead_days
 
 
+def partial_read(store: dict | None) -> dict | None:
+    """store.json's ``partial`` (``{fetched, remaining}``: the read stopped
+    at its deadline with objects left for the next tick), or None."""
+    raw = store.get("partial") if store else None
+    if not isinstance(raw, dict) or _count(raw.get("remaining")) <= 0:
+        return None
+    return {"fetched": _count(raw.get("fetched")), "remaining": _count(raw.get("remaining"))}
+
+
 def older_by_case(store: dict | None) -> dict[str, dict[str, int]]:
     """store.json's ``older`` (``{case directory: {key path: n}}``, what the
     listing left behind, both as the writer spells them), with only usable
@@ -475,6 +484,7 @@ def trend_document(store: dict | None, data: dict) -> dict:
         "lead_days": lead_days,
         "max_objects": store.get("max_objects") if store and isinstance(store.get("max_objects"), int) else None,
         "truncated": {str(k): v for k, v in (store.get("truncated") or {}).items() if isinstance(v, int)} if store and isinstance(store.get("truncated"), dict) else {},
+        "partial": partial_read(store),
         "warnings": [w for w in (store.get("warnings") or []) if isinstance(w, str)] if store else [],
         "records": len(records),
         "metrics": metric_list,

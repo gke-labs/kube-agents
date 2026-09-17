@@ -52,8 +52,8 @@ THE OUTPUT is what ``render.py --store`` reads (SCHEMA.md,
 "store.json")::
 
     {schema_version: 1, source, read_at, window_days, lead_days, max_objects,
-     listed, fetched, truncated{case: n}, older{case: {key: n}}, warnings[],
-     error, records[]}
+     listed, fetched, truncated{case: n}, older{case: {key: n}}, partial,
+     warnings[], error, records[]}
 
 ``older`` is what the listing showed and the read left behind, per case
 and version key: objects older than the span plus those the cap trimmed,
@@ -67,6 +67,16 @@ whether the store holds older records at that key that admission pools
 ``object`` (its URL) and ``build`` (the Prow build id from the name; the
 record itself does not carry it). ``recorded_at`` and ``key`` come from the
 record, never from the path.
+
+A READ THAT OUTRUNS ITS TIME finishes over the next ticks rather than
+never. Objects are fetched in waves (``CAT_WORKERS`` chunks at a time);
+with ``--deadline-s`` the reader stops between waves once the next one
+would not fit, writes what it has with ``partial`` set (``{fetched,
+remaining}``), and the next tick's ``--prior`` already holds those
+records, so a cold read of months converges in a few ticks even when a
+single tick cannot hold it. The workflow's ``timeout`` stays as the hard
+stop behind the deadline. A read that was killed instead persists
+nothing, which is why the deadline exists.
 
 FAILURE POSTURE: a page, not a gate. A listing that fails writes the prior
 document back with ``error`` set and ``read_at`` unchanged, so the Trend
@@ -92,6 +102,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 
 SCHEMA_VERSION = 1
 #: How many nights the Trend page draws. A quarter, per #1493's question.
@@ -233,7 +244,7 @@ def stamp_ms(stamp: str) -> float | None:
     return parsed.timestamp() * 1000
 
 
-def select_objects(urls: list[str], location: str, *, now_ms: float, window_days: int, max_objects: int, lead_days: int = 0) -> tuple[list[str], dict[str, int], dict[str, dict[str, int]]]:
+def select_objects(urls: list[str], location: str, *, now_ms: float, window_days: int, max_objects: int, lead_days: int = 0) -> tuple[list[str], dict[str, int], dict[str, dict[str, int]], list[str]]:
     """The URLs worth reading: inside the window plus the lead-in by their
     name's stamp, then the newest ``max_objects`` per case per key
     directory. Returns them sorted, with ``{case: objects the cap left
@@ -242,12 +253,16 @@ def select_objects(urls: list[str], location: str, *, now_ms: float, window_days
     directories the writer filed them under, so a component the writer
     sanitised appears sanitised, ``unkeyed`` is a record without a key,
     and ``""`` is an object filed directly under its case, the flat layout
-    the gate's reader also groups by directory). A name without a stamp is
-    skipped: the store's own reader would refuse it, and the page has
-    nothing to say about it."""
+    the gate's reader also groups by directory), and the URLs this reader
+    cannot place: a name without a stamp (``bench-gate record
+    --recorded-at`` with a non-``Z`` stamp writes one) or an object
+    directly under the prefix. The gate's reader pools such an object
+    without reading its name, so the caller names each one in a warning
+    rather than dropping it in silence."""
     since_ms = now_ms - (window_days + lead_days) * 24 * 3600 * 1000
     by_dir: dict[str, list[tuple[str, str]]] = {}
     older: dict[str, dict[str, int]] = {}
+    skipped: list[str] = []
 
     def left_behind(key_dir: str, count: int) -> None:
         case, _, key = key_dir.partition("/")  # key is "" for the flat layout
@@ -255,10 +270,9 @@ def select_objects(urls: list[str], location: str, *, now_ms: float, window_days
 
     for url in urls:
         parsed = parse_url(url, location)
-        if parsed is None:
-            continue
-        at = stamp_ms(parsed["stamp"])
-        if at is None:
+        at = stamp_ms(parsed["stamp"]) if parsed else None
+        if parsed is None or at is None:
+            skipped.append(url)
             continue
         if at < since_ms:
             left_behind(parsed["key_dir"], 1)
@@ -274,7 +288,7 @@ def select_objects(urls: list[str], location: str, *, now_ms: float, window_days
             left_behind(key_dir, len(group) - max_objects)
             group = group[-max_objects:]
         chosen.extend(url for _, url in group)
-    return sorted(chosen), truncated, older
+    return sorted(chosen), truncated, older, sorted(skipped)
 
 
 # --------------------------------------------------------------------------
@@ -349,17 +363,28 @@ def load_prior(path: pathlib.Path | None) -> dict | None:
     return doc
 
 
+def now_utc() -> datetime.datetime:
+    """The wall clock; a test seam (``read_store``'s ``now`` is the other)."""
+    return datetime.datetime.now(UTC)
+
+
 def read_store(location: str, *, prior: dict | None = None, window_days: int = DEFAULT_WINDOW_DAYS,
                lead_days: int = DEFAULT_LEAD_DAYS, max_objects: int | None = None,
-               now: datetime.datetime | None = None, gsutil: str = "gsutil", runner=None) -> dict:
+               now: datetime.datetime | None = None, gsutil: str = "gsutil", runner=None,
+               deadline_s: float | None = None, chunk: int = CAT_CHUNK, workers: int = CAT_WORKERS,
+               clock=time.monotonic) -> dict:
     """The store.json document for ``location``: one listing, the prior's
-    records kept where the listing still names them, the rest fetched.
+    records kept where the listing still names them, the rest fetched in
+    waves of ``workers`` chunks. With ``deadline_s`` the read stops between
+    waves once the next wave (sized by the last one) would end past the
+    deadline, and the document says so in ``partial`` (module docstring).
     Raises ``RuntimeError`` when the listing fails; the CLI decides what
     that means with or without a prior."""
-    now = now or datetime.datetime.now(UTC)
+    started = clock()
+    now = now or now_utc()
     cap = max_objects if max_objects is not None else max_objects_from_env()
     urls = list_objects(location, gsutil, runner)
-    wanted, truncated, older = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, lead_days=lead_days, max_objects=cap)
+    wanted, truncated, older, skipped = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, lead_days=lead_days, max_objects=cap)
     known: dict[str, list[dict]] = {}  # an object's records: one by the writer's rule, every line of it either way
     if prior and prior.get("source") == location.rstrip("/"):
         for record in prior.get("records") or []:
@@ -367,24 +392,36 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
                 known.setdefault(record["object"], []).append(record)
     kept = [record for url in wanted if url in known for record in known[url]]
     to_read = [url for url in wanted if url not in known]
-    warnings: list[str] = []
+    warnings: list[str] = [f"{url}: not in the store's layout (no stamp in the name); not read" for url in skipped]
     fetched: list[dict] = []
-    for part, text, err in cat_objects(to_read, gsutil, runner):
-        if text is None:
-            warnings.append(f"{part[0]}: gsutil cat failed: {err[:200] or 'failed'}")
-            continue
-        if len(part) > 1 and sum(1 for line in text.splitlines() if line.strip()) != len(part):
-            # An object with more than one line among them (not the
-            # writer's rule, but possible): read them one at a time, so
-            # every record carries its object and the incremental read
-            # keeps all of them next tick.
-            for url, single, single_err in cat_objects(part, gsutil, runner, chunk=1):
-                if single is None:
-                    warnings.append(f"{url[0]}: gsutil cat failed: {single_err[:200] or 'failed'}")
-                    continue
-                fetched.extend(parse_records(single, url, location, warnings))
-            continue
-        fetched.extend(parse_records(text, part, location, warnings))
+    parts = [to_read[start:start + chunk] for start in range(0, len(to_read), chunk)]
+    waves = [parts[start:start + workers] for start in range(0, len(parts), max(1, workers))]
+    done = 0
+    wave_s = 0.0
+    stopped = False
+    for index, wave in enumerate(waves):
+        if deadline_s is not None and index and clock() - started + wave_s > deadline_s:
+            stopped = True
+            break
+        wave_started = clock()
+        for part, text, err in cat_objects([url for piece in wave for url in piece], gsutil, runner, chunk=chunk, workers=workers):
+            if text is None:
+                warnings.append(f"{part[0]}: gsutil cat failed: {err[:200] or 'failed'}")
+                continue
+            if len(part) > 1 and sum(1 for line in text.splitlines() if line.strip()) != len(part):
+                # An object with more than one line among them (not the
+                # writer's rule, but possible): read them one at a time,
+                # so every record carries its object and the incremental
+                # read keeps all of them next tick.
+                for url, single, single_err in cat_objects(part, gsutil, runner, chunk=1):
+                    if single is None:
+                        warnings.append(f"{url[0]}: gsutil cat failed: {single_err[:200] or 'failed'}")
+                        continue
+                    fetched.extend(parse_records(single, url, location, warnings))
+                continue
+            fetched.extend(parse_records(text, part, location, warnings))
+        done += sum(len(part) for part in wave)
+        wave_s = clock() - wave_started
     records = kept + fetched
     records.sort(key=lambda r: (str(r.get("recorded_at") or ""), str(r.get("case") or ""), str(r.get("object") or "")))
     return {
@@ -395,9 +432,10 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
         "lead_days": lead_days,
         "max_objects": cap,
         "listed": len(urls),
-        "fetched": len(to_read),
+        "fetched": done,
         "truncated": truncated,
         "older": older,
+        "partial": {"fetched": done, "remaining": len(to_read) - done} if stopped else None,
         "warnings": warnings,
         "error": None,
         "records": records,
@@ -413,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-objects", type=int, default=None, metavar="N", help=f"newest objects per case per key (default {MAX_OBJECTS_ENV} or {DEFAULT_MAX_OBJECTS}, the gate's cap)")
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("store.json"))
     parser.add_argument("--gsutil", default="gsutil", help="gsutil binary to invoke")
+    parser.add_argument("--deadline-s", type=float, default=None, metavar="S", help="stop fetching between waves once the next wave would end past S seconds from the start, and write what was read with `partial` set; the rest is read next tick (default: no deadline)")
     parser.add_argument("--fail-with", metavar="REASON", default=None, help="read nothing: write --prior back with `error` set to REASON (the workflow's path when this script was killed or had no time to run); exit 1 without a prior")
     args = parser.parse_args(argv)
     if args.window_days < 1:
@@ -421,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--lead-days must be at least 0")
     if args.max_objects is not None and args.max_objects < 1:
         parser.error("--max-objects must be at least 1")
+    if args.deadline_s is not None and args.deadline_s < 0:
+        parser.error("--deadline-s must be at least 0")
 
     prior = load_prior(args.prior)
 
@@ -437,15 +478,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.fail_with is not None:
         return keep_prior(args.fail_with.strip() or "the store was not read this tick")
     try:
-        doc = read_store(args.location, prior=prior, window_days=args.window_days, lead_days=args.lead_days, max_objects=args.max_objects, gsutil=args.gsutil)
+        doc = read_store(args.location, prior=prior, window_days=args.window_days, lead_days=args.lead_days, max_objects=args.max_objects, gsutil=args.gsutil, deadline_s=args.deadline_s)
     except RuntimeError as exc:
         return keep_prior(str(exc))
     for warning in doc["warnings"]:
         print(f"warning: {warning}", file=sys.stderr)
     args.out.write_text(json.dumps(doc, separators=(",", ":")) + "\n", encoding="utf-8")
+    partial = doc["partial"]
     print(
         f"wrote {args.out}: {len(doc['records'])} records ({doc['fetched']} objects fetched,"
-        f" {doc['listed']} listed, {len(doc['warnings'])} warnings)",
+        f" {doc['listed']} listed, {len(doc['warnings'])} warnings"
+        + (f"; stopped at the deadline with {partial['remaining']} objects left for the next tick" if partial else "")
+        + ")",
         file=sys.stderr,
     )
     return 0

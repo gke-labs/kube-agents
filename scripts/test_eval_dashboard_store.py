@@ -150,12 +150,13 @@ class ReadStoreTest(unittest.TestCase):
                 objects[url_of(case, name)] = json.dumps({"case": case, "recorded_at": f"2026-09-{day:02d}T05:00:00Z", "key": {"setup_id": "s", "scoring_version": "v1", "judge_model": "j", "fleet": 1, "verifiers": 1}, "runs": 3, "passes": 3}) + "\n"
         # An older key directory for case-a: capped on its own, never against the current one.
         objects[url_of("case-a", "2026-09-05T04-00-00Z-9.jsonl", "old-setup/j/v1-f1-v1")] = json.dumps({"case": "case-a", "recorded_at": "2026-09-05T04:00:00Z", "key": {"setup_id": "old-setup", "scoring_version": "v1", "judge_model": "j", "fleet": 1, "verifiers": 1}, "runs": 3, "passes": 0}) + "\n"
-        # A stray object outside the layout is not read.
+        # A stray object outside the layout is not read, and is named in a warning.
         objects[f"{LOCATION}/notes.jsonl"] = "{}\n"
         now = datetime.datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
         doc = read(FakeGsutil(objects), now=now, window_days=3, lead_days=0, max_objects=2)
         # Window: 09-03 12:00 onwards keeps days 4 and 5 (day 3 05:00 is outside). Cap: two per key, so nothing more is cut here...
         self.assertEqual(doc["listed"], 12)
+        self.assertEqual(doc["warnings"], [f"{LOCATION}/notes.jsonl: not in the store's layout (no stamp in the name); not read"], "the object this reader cannot place is named, since the gate's reader would pool it")
         self.assertEqual((doc["window_days"], doc["lead_days"]), (3, 0))
         self.assertEqual(doc["older"], {"case-a": {KEY_DIR: 3}, "case-b": {KEY_DIR: 3}}, "days 1-3 at the current key were listed and left behind; the old key's one object is inside the span")
         self.assertEqual(sorted((r["case"], r["recorded_at"]) for r in doc["records"]), [
@@ -250,6 +251,27 @@ class ReadStoreTest(unittest.TestCase):
         self.assertEqual(len(again["records"]), 4)
         self.assertEqual(again["fetched"], 1)
 
+    def test_a_read_that_outruns_its_deadline_stops_between_waves_and_finishes_next_tick(self):
+        ticks = iter(range(0, 10_000, 10))  # every look at the clock is 10 s later
+        clock = lambda: float(next(ticks))
+        # Waves of one object: started 0, wave 1 runs 10..20 (10 s); before
+        # wave 2 the clock reads 30, plus a 10 s wave is past a 25 s deadline.
+        gsutil = FakeGsutil()
+        doc = read(gsutil, chunk=1, workers=1, deadline_s=25, clock=clock)
+        self.assertEqual((len(doc["records"]), doc["fetched"], doc["partial"]), (1, 1, {"fetched": 1, "remaining": 3}))
+        self.assertEqual(len(gsutil.cats), 1)
+        self.assertIsNone(doc["error"], "a read that stopped is a read, not a failure")
+        # The next tick keeps that record from the prior and reads on; with no deadline it finishes.
+        again = read(FakeGsutil(), prior=doc, chunk=1, workers=1)
+        self.assertEqual((len(again["records"]), again["fetched"], again["partial"]), (4, 3, None))
+        # The first wave always runs, whatever the deadline, so every tick makes progress.
+        ticks = iter(range(0, 10_000, 10))
+        doc = read(FakeGsutil(), chunk=1, workers=1, deadline_s=0, clock=clock)
+        self.assertEqual((len(doc["records"]), doc["partial"]), (1, {"fetched": 1, "remaining": 3}))
+        # Without a deadline the waves run to the end.
+        doc = read(FakeGsutil(), chunk=1, workers=1)
+        self.assertEqual((len(doc["records"]), doc["partial"]), (4, None))
+
     def test_cats_are_chunked(self):
         objects = {}
         for i in range(250):
@@ -282,8 +304,10 @@ class NamesTest(unittest.TestCase):
 
 class CliTest(unittest.TestCase):
     def run_cli(self, argv, gsutil):
+        # The wall clock is pinned: the fixture is stamped 2026-09-17 and
+        # would age out of the read's span on 2026-12-30 otherwise.
         err = io.StringIO()
-        with unittest.mock.patch.object(store.subprocess, "run", gsutil), redirect_stderr(err):
+        with unittest.mock.patch.object(store.subprocess, "run", gsutil), unittest.mock.patch.object(store, "now_utc", return_value=NOW), redirect_stderr(err):
             code = store.main(argv)
         return code, err.getvalue()
 
@@ -293,6 +317,7 @@ class CliTest(unittest.TestCase):
             code, err = self.run_cli(["--location", LOCATION, "--out", str(out)], FakeGsutil())
             self.assertEqual(code, 0, err)
             self.assertIn("4 records (4 objects fetched, 4 listed, 0 warnings)", err)
+            self.assertIsNone(json.loads(out.read_text())["partial"])
             doc = json.loads(out.read_text())
             self.assertEqual(len(doc["records"]), 4)
             self.assertEqual((doc["window_days"], doc["lead_days"]), (store.DEFAULT_WINDOW_DAYS, store.DEFAULT_LEAD_DAYS))
@@ -345,6 +370,8 @@ class CliTest(unittest.TestCase):
                 store.main(["--location", LOCATION, "--window-days", "0"])
             with self.assertRaises(SystemExit):
                 store.main(["--location", LOCATION, "--lead-days", "-1"])
+            with self.assertRaises(SystemExit):
+                store.main(["--location", LOCATION, "--deadline-s", "-1"])
             with self.assertRaises(SystemExit):
                 store.main(["--location", LOCATION, "--max-objects", "0"])
 

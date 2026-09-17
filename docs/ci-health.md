@@ -33,7 +33,9 @@ incident links to the record around the night it started. What "score" means
 there — the deterministic pass rate is the gate's number, judged quality is
 advisory and never a single point — is defined once, in
 [`docs/designs/eval-scorer.md`, "What a score is"](designs/eval-scorer.md#what-a-score-is).
-A store read that fails, times out or finds no wall clock left after the collect
+A store read that would not fit its time budget stops early, keeps what it
+fetched with a note on the page, and finishes over the next ticks. A store read
+that fails, times out or finds no wall clock left after the collect
 leaves the Trend page on its last good read, marked stale with the reason, and
 every other page unaffected; a tick that cannot download that last read at all
 (anything but a NotFound, retried three times) reads nothing, the page says the
