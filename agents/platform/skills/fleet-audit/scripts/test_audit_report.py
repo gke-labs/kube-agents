@@ -6001,7 +6001,7 @@ class TestOpenRemediationPr(HarnessTestCase):
         order = [
             c
             for c in self.harness.calls
-            if c[0] in ("git", "gh") and c[1] not in ("symbolic-ref", "remote", "ls-remote")
+            if c[0] in ("git", "gh") and c[1] not in ("symbolic-ref", "remote")
         ]
         self.assertEqual(order[0], ["git", "fetch", "origin", "main"])
         self.assertEqual(

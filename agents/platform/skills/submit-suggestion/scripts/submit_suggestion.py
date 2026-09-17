@@ -274,7 +274,13 @@ def open_handle(args) -> "credential_proxy_client.Workspace":
     caller can pass `--base-sha` to the conflict check; nothing here holds a
     directory, which is what makes a second process able to pick the session up.
     """
-    resolved_base = getattr(args, "base", None) or ""
+    resolved_base = (
+        getattr(args, "base", None)
+        or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH")
+        or os.environ.get("GITOPS_BASE_BRANCH")
+        or gitops_workspace.resolve_base_branch()
+        or ""
+    )
     return credential_proxy_client.Workspace(
         proxy_endpoint(),
         {

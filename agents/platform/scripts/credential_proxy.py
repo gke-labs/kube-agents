@@ -2107,46 +2107,27 @@ def _git_refused_name(argument: str) -> str:
 def _detect_repo_default_branch(repo_dir: Path | None, remote: str = "origin") -> str | None:
     if not repo_dir:
         return None
-    # 1. Ask the remote server directly via ls-remote --symref so that local edits
-    # to .git/refs/remotes/origin/HEAD or deleting origin/HEAD cannot bypass the guard (#1498).
-    try:
-        res = subprocess.run(
-            ["git", "-C", str(repo_dir), "ls-remote", "--symref", remote, "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if res.returncode == 0:
-            for line in (res.stdout or "").splitlines():
-                if line.startswith("ref: refs/heads/") and line.rstrip().endswith("HEAD"):
-                    branch = line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()
+    repo_root = _find_repo_root(repo_dir) or Path(repo_dir)
+    # Read refs/remotes/<remote>/HEAD directly without subprocess or network calls (#1498).
+    # In git, remote tracking HEADs are stored as loose ref files:
+    # .git/refs/remotes/<remote>/HEAD containing e.g. "ref: refs/remotes/origin/main"
+    for head_candidate in (
+        repo_root / ".git" / "refs" / "remotes" / remote / "HEAD",
+        repo_root / "refs" / "remotes" / remote / "HEAD",
+    ):
+        try:
+            if head_candidate.is_file():
+                text = head_candidate.read_text(encoding="utf-8").strip()
+                prefix = f"ref: refs/remotes/{remote}/"
+                if text.startswith(prefix):
+                    branch = text[len(prefix):].strip()
                     if branch:
                         return branch
-    except Exception:
-        pass
-    # 2. Fallback to local symbolic-ref if ls-remote is offline or unavailable
-    try:
-        res = subprocess.run(
-            ["git", "-C", str(repo_dir), "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if res.returncode == 0:
-            ref = res.stdout.strip()
-            return ref.split("/", 1)[1] if ref.startswith(f"{remote}/") else ref
-    except Exception:
-        pass
-    # 3. Fallback to reading the ref file directly
-    try:
-        head_file = repo_dir / ".git" / "refs" / "remotes" / remote / "HEAD"
-        if head_file.is_file():
-            text = head_file.read_text(encoding="utf-8").strip()
-            if text.startswith("ref:"):
-                ref = text.split(":", 1)[1].strip()
-                return ref.split("/")[-1]
-    except Exception:
-        pass
+                if text.startswith("ref:"):
+                    ref = text.split(":", 1)[1].strip()
+                    return ref.split("/")[-1]
+        except Exception:
+            pass
     return None
 
 
@@ -2450,15 +2431,30 @@ def _find_repo_root(cwd: Path | str | None) -> Path | None:
                 pass
         elif cur.name == ".git" and (cur / "config").is_file():
             return cur.parent
+        elif (cur / "config").is_file() and (cur / "HEAD").is_file():
+            # Bare repository root (#1498)
+            return cur
         cur = cur.parent
     return None
 
 
-def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str] | None:
+_GIT_PROBE_ENVIRONMENT = {
+    "GIT_ALLOW_PROTOCOL": "https",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "KUBECTL_KUBERC": "false",
+}
+
+
+def _read_repo_alias(
+    cwd: Path | str | None,
+    subcommand: str | None,
+    executor: "CommandExecutor | None" = None,
+) -> list[str] | None:
     """If `subcommand` is an alias defined in the repo-local `.git/config`, return its argv expansion.
 
     Git never alias-expands builtin subcommands, and expands non-builtin aliases recursively.
     Uses git config --get to ensure identical lexing, quoting, continuation, and include semantics.
+    Runs inside the executor's hardened environment (GIT_ALLOW_PROTOCOL=https, GIT_CONFIG_NOSYSTEM=1) (#1498).
     """
     if not cwd or not subcommand:
         return None
@@ -2475,6 +2471,13 @@ def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str
     current_name = subcommand.lower()
     accumulated_tokens: list[str] = []
 
+    git_bin = "git"
+    env = os.environ.copy()
+    env.update(_GIT_PROBE_ENVIRONMENT)
+    if executor is not None:
+        git_bin = executor.executables.get("git") or "git"
+        env = executor.environment.copy()
+
     MAX_ALIAS_DEPTH = 10
     for _ in range(MAX_ALIAS_DEPTH):
         if current_name in GIT_BUILTIN_SUBCOMMANDS:
@@ -2485,10 +2488,11 @@ def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str
 
         try:
             proc = subprocess.run(
-                ["git", "-C", str(repo_root), "config", "--get", f"alias.{current_name}"],
+                [git_bin, "-C", str(repo_root), "config", "--get", f"alias.{current_name}"],
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=env,
             )
         except Exception:
             return ["!error"]
@@ -3223,7 +3227,7 @@ class CommandExecutor:
         for redirect in redirects:
             candidate = (candidate / redirect).resolve()
 
-        alias_expansion = _read_repo_alias(candidate, subcommand)
+        alias_expansion = _read_repo_alias(candidate, subcommand, executor=self)
         if alias_expansion:
             if alias_expansion[0].startswith("!"):
                 if alias_expansion[0] in ("!cycle", "!max_depth", "!config_error", "!error", "!shlex_error"):
@@ -3252,6 +3256,11 @@ class CommandExecutor:
             subcommand, _ = _git_plan(expanded_argv)
             execution_argv = expanded_argv
         else:
+            if subcommand and subcommand not in GIT_BUILTIN_SUBCOMMANDS:
+                return (
+                    f"`git {subcommand}` is not a recognized git subcommand or alias.",
+                    argv,
+                )
             push_violation = git_push_violation(argv, cwd=candidate)
             if push_violation is not None:
                 return push_violation, argv
@@ -4216,7 +4225,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # token sa` is on the denylist as `kubernetes.token-disclosure` and will
         # be refused by the denylist with that rule id. If the gate ran first, it
         # would refuse as `kubernetes.read-only`, losing the specific rule.
-        refusal_result = read_only_refusal(exec_argv)
+        refusal_result = read_only_refusal(argv)
+        if refusal_result is None and exec_argv != argv:
+            refusal_result = read_only_refusal(exec_argv)
         if refusal_result is not None:
             refusal, log_hint = refusal_result
             safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"

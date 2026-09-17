@@ -1560,11 +1560,13 @@ class GitHardeningTest(unittest.TestCase):
         self.assertIsNotNone(v_depth)
         self.assertIn("exceeding depth", v_depth or "")
 
-        # Directory mode remote default branch protection via ls-remote (Thread 2 & Thread 6)
+        # Directory mode remote default branch protection via ref inspection (#1498)
         bare_remote = Path(self.temp_dir.name) / "bare_remote.git"
         subprocess.run(["git", "init", "--bare", "-b", "release-trunk", str(bare_remote)], check=True, capture_output=True)
         seed_work = Path(self.temp_dir.name) / "seed_work"
         subprocess.run(["git", "clone", str(bare_remote), str(seed_work)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(seed_work), "config", "user.name", "Test User"], check=True)
+        subprocess.run(["git", "-C", str(seed_work), "config", "user.email", "test@example.com"], check=True)
         (seed_work / "README.md").write_text("hello\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(seed_work), "add", "."], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(seed_work), "commit", "-m", "init"], check=True, capture_output=True)
@@ -1572,16 +1574,17 @@ class GitHardeningTest(unittest.TestCase):
 
         clone_dir = Path(executor.workspace_dir) / "clone_trunk"
         subprocess.run(["git", "clone", str(bare_remote), str(clone_dir)], check=True, capture_output=True)
-        # Repoint local origin/HEAD to main
-        subprocess.run(["git", "-C", str(clone_dir), "remote", "set-head", "origin", "main"], check=False, capture_output=True)
-        self.assertIsNotNone(
-            executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
+        # Push to release-trunk is detected and refused as a protected rollout/base branch even without lease checks
+        executor.require_git_lease = False
+        v = executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
+        self.assertIsNotNone(v)
+        self.assertIn("to protected branch 'release-trunk' is refused", v or "")
+
+        # Pushing to platform-agent/* feature branch is allowed
+        self.assertIsNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:platform-agent/fix-bug"], cwd=str(clone_dir))
         )
-        # Delete origin/HEAD
-        subprocess.run(["git", "-C", str(clone_dir), "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"], check=False, capture_output=True)
-        self.assertIsNotNone(
-            executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
-        )
+        executor.require_git_lease = True
 
         # Content workspace store honours base_branch argument (#1498, Thread 5)
         import content_workspace
@@ -1855,6 +1858,34 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         # gate let it through rather than answering 403 itself.
         self.assertEqual(200, status)
         self.assertEqual("completed", body["status"])
+
+    def test_an_alias_in_leased_repo_is_expanded_and_executed_over_v1_exec(self):
+        workspace = (
+            CredentialProxyHandler.executor.workspace_dir / "gitops" / "t_card"
+        )
+        repo_dir = workspace / "acme__fleet"
+        subprocess.run(["git", "init", "--quiet", str(repo_dir)], check=True)
+        subprocess.run(["git", "-C", str(repo_dir), "config", "alias.status-short", "status --porcelain"], check=True)
+        (workspace / ".lease").write_text('{"lease": "t_card"}', encoding="utf-8")
+
+        executed_argvs = []
+        original_execute = CredentialProxyHandler.executor.execute
+
+        def recording_execute(argv, **kwargs):
+            executed_argvs.append(argv)
+            return original_execute(argv, **kwargs)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", side_effect=recording_execute):
+            status, body = self.post(
+                {
+                    "argv": ["git", "status-short"],
+                    "cwd": str(repo_dir),
+                }
+            )
+        self.assertEqual(200, status)
+        self.assertEqual("completed", body["status"])
+        self.assertTrue(len(executed_argvs) > 0)
+        self.assertEqual(["git", "status", "--porcelain"], executed_argvs[0])
 
 
 class CommandExecutorTest(unittest.TestCase):

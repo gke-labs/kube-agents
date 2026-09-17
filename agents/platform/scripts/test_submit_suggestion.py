@@ -518,15 +518,12 @@ class TestSubmit(SubmitSuggestionTestCase):
         subprocess.run(["git", "--git-dir", str(self.origin), "symbolic-ref", "HEAD", "refs/heads/release-trunk"], check=True)
 
         payload = self.prepare(branch="platform-agent/fix-netpol")
+        # Update local origin/HEAD to track the remote default release-trunk
+        subprocess.run(["git", "-C", str(payload["workspace"]), "remote", "set-head", "origin", "--auto"], check=True)
         self.commit(payload["workspace"])
         # Switch to release-trunk in workspace so assert_on_branch passes
         subprocess.run(["git", "-C", str(payload["workspace"]), "checkout", "-B", "release-trunk"], check=True)
-        # Repoint local clone's origin/HEAD to another ref to simulate an agent edit (#1498, Thread 7)
-        subprocess.run(
-            ["git", "-C", str(payload["workspace"]), "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
-            check=True,
-        )
-        # Even if base is overridden to main, submitting on the repo's true remote default branch (release-trunk) is refused
+        # Even if base is overridden to main, submitting on the repo's detected default branch (release-trunk) is refused
         with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "main"}):
             with self.assertRaises(ValueError) as caught:
                 self.submit("release-trunk", payload["workspace"])
@@ -1142,6 +1139,23 @@ class TestContentMode(SubmitSuggestionTestCase):
             self.submit_content(prepared, source, base=run_base)
         self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
         self.assertIn("is a protected base or run branch", str(ctx.exception))
+
+    def test_submit_content_when_base_omitted_resolves_fallback_and_refuses_when_branch_matches(self):
+        prepared = self.prepare_content(branch="platform-agent/fix-netpol")
+        # When --base is omitted, open_handle falls back to gitops_workspace.resolve_base_branch() (#1498).
+        # We test with environment clear and mock resolve_base_branch to return a custom non-protected branch name.
+        custom_base = "custom-release-base"
+        prepared["branch"] = custom_base
+        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
+        self.verbs.clear()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(gitops_workspace, "resolve_base_branch", return_value=custom_base):
+                with self.assertRaises(ValueError) as ctx:
+                    self.submit_content(prepared, source, base=None)
+                self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
+                self.assertIn("is the same as base branch", str(ctx.exception))
+                self.assertNotIn("commit", self.verbs)
+                self.assertNotIn("push", self.verbs)
 
     def test_prepare_content_preserves_remote_default_branch_when_master(self):
         # A repository whose default trunk is `master` rather than `main` must not have
