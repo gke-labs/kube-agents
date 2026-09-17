@@ -60,7 +60,7 @@ class OnceOnlyTest(FeedbackPromptCase):
 
     def test_a_tick_before_the_delay_is_silent(self):
         self.tick(T0)
-        code, out, _ = self.tick(T0 + WEEK - 1)
+        code, out, _ = self.tick(T0 + WEEK - fp.DUE_SLACK_SECONDS - 1)
         self.assertEqual((0, ""), (code, out))
         self.assertFalse(self.sent().exists())
 
@@ -131,15 +131,14 @@ class KnobsTest(FeedbackPromptCase):
         self.assertEqual(2 * 60, fp.parse_delay("2m"))
         self.assertEqual(2 * 60, fp.parse_delay(" 2M "))
 
-    def test_unset_and_malformed_delays_fall_back_to_a_week(self):
+    def test_an_unset_delay_is_a_week_and_a_malformed_one_is_refused(self):
         self.assertEqual(WEEK, fp.parse_delay(None))
         self.assertEqual(WEEK, fp.parse_delay(""))
         for value in ("7", "7 days", "1w", "-1d", "1.5d", "abc"):
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                self.assertEqual(WEEK, fp.parse_delay(value), value)
-            self.assertIn(fp.DELAY_ENV, err.getvalue())
-            self.assertIn(value, err.getvalue())
+            with self.assertRaises(ValueError, msg=value) as raised:
+                fp.parse_delay(value)
+            self.assertIn(fp.DELAY_ENV, str(raised.exception))
+            self.assertIn(value, str(raised.exception))
 
     def test_the_delay_knob_moves_the_due_time(self):
         os.environ[fp.DELAY_ENV] = "2m"
@@ -149,14 +148,38 @@ class KnobsTest(FeedbackPromptCase):
         _, out, _ = self.tick(T0 + 120)
         self.assertEqual(fp.MESSAGE, out)
 
-    def test_a_malformed_delay_is_logged_and_the_default_applies(self):
+    def test_a_malformed_delay_is_a_failed_run_that_arms_nothing(self):
+        # The scheduler keeps a zero-exit script's stderr nowhere, so a silent
+        # fallback would leave no trace of the rejected value. A failed run is
+        # reported in chat like any other script failure, and the clock does
+        # not start until the value parses.
         os.environ[fp.DELAY_ENV] = "soon"
+        code, out, err = self.tick(T0)
+        self.assertEqual((1, ""), (code, out))
+        self.assertIn("'soon'", err)
+        self.assertFalse(self.armed().exists())
+        os.environ[fp.DELAY_ENV] = "2m"
+        code, out, _ = self.tick(T0)
+        self.assertEqual((0, ""), (code, out))
+        self.assertTrue(self.armed().exists())
+
+    def test_a_week_is_due_a_few_minutes_early_but_not_a_day_early(self):
+        # The daily tick drifts by seconds from one day to the next, so a
+        # strict comparison could read seven days as seven days less a few
+        # seconds and land on day eight.
         self.tick(T0)
-        _, out, err = self.tick(T0 + WEEK - 1)
+        _, out, _ = self.tick(T0 + WEEK - fp.DUE_SLACK_SECONDS - 1)
         self.assertEqual("", out)
-        self.assertIn("using 7d", err)
-        _, out, _ = self.tick(T0 + WEEK)
+        _, out, _ = self.tick(T0 + WEEK - fp.DUE_SLACK_SECONDS)
         self.assertEqual(fp.MESSAGE, out)
+
+    def test_a_delay_under_a_day_gets_no_slack(self):
+        # A hand-marked run with a two-minute delay is how the mechanism is
+        # observed; two minutes has to mean two minutes there.
+        self.assertFalse(fp.due(T0, T0 + 119, 120))
+        self.assertTrue(fp.due(T0, T0 + 120, 120))
+        self.assertFalse(fp.due(T0, T0 + 86400 - fp.DUE_SLACK_SECONDS - 1, 86400))
+        self.assertTrue(fp.due(T0, T0 + 86400 - fp.DUE_SLACK_SECONDS, 86400))
 
 
 class FailureTest(FeedbackPromptCase):

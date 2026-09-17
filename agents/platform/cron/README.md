@@ -130,12 +130,20 @@ ticks. Two environment variables, set per install through the CR's
 allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
 (default `true`; `false` neither arms nor claims, so an install that turns it
 on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
-`<n>d`, `<n>h` or `<n>m`, a malformed value falling back to the default with a
-stderr line). The form URL is a constant, never a knob: the short link is the
-only address the maintainers publish. `enabled: false` on the entry stays the
-fleet-wide switch, and retiring it follows the two-step path below like any
-other id; deleting the entry outright would leave the volume's copy firing
-against a script the next image no longer ships.
+`<n>d`, `<n>h` or `<n>m`). A delay that does not parse is a failed run, exit 1
+with the reason on stderr, which the scheduler reports in chat like any other
+script failure until the value is fixed; it does not fall back, because the
+scheduler keeps a zero-exit script's stderr nowhere and a silent fallback
+would leave no trace but the message arriving a week early. The schedule is
+daily, so whatever the delay, the message lands on the first 13:00 UTC tick
+at or after it; a delay of a day or more is compared with ten minutes of
+slack, because the tick's own time drifts by seconds from one day to the next
+and a strict week would otherwise land on day eight. The form URL is a
+constant, never a knob: the short link is the only address the maintainers
+publish. `enabled: false` on the entry stays the fleet-wide switch, and
+retiring it follows the two-step path below like any other id; deleting the
+entry outright would leave the volume's copy firing against a script the next
+image no longer ships.
 
 ## Never put an id on both rosters
 

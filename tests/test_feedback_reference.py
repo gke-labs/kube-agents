@@ -34,6 +34,9 @@ SPECIALIST_SOULS = (
     REPO_ROOT / "agents/cluster/SOUL.md",
 )
 CHAT_SOUL = REPO_ROOT / "agents/chat/SOUL.md"
+# The one place the product hands the link out unasked: the once-per-install
+# feedback prompt, a cron script rather than a persona.
+FEEDBACK_SCRIPT = REPO_ROOT / "agents/platform/scripts/feedback_prompt.py"
 
 # The two links every agent-facing file must carry. The short link is assembled
 # independently from the site config in test_short_link_matches_the_site_redirect;
@@ -142,8 +145,16 @@ class FeedbackReferenceTest(unittest.TestCase):
             "the site no longer serves the link the agents hand out",
         )
 
+    def test_the_feedback_prompt_carries_the_short_link_and_the_public_warning(self) -> None:
+        # The prompt reaches every install once, unasked, so it owes the reader
+        # the same two facts the persona bullet does before they open the form.
+        text = FEEDBACK_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(SHORT_LINK, text, "the prompt hands out a link the site no longer serves")
+        self.assertRegex(text, PUBLIC_WARNING, "a submission is published; the prompt has to say so")
+        self.assertRegex(text, REDACTION_RULE, "the prompt has to say what to keep out of a report")
+
     def test_no_agent_material_names_the_form_url(self) -> None:
-        for path in sorted((REPO_ROOT / "agents").rglob("*.md")):
+        for path in sorted((REPO_ROOT / "agents").rglob("*.md")) + [FEEDBACK_SCRIPT]:
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertIsNone(
                     FORMS_URL.search(path.read_text(encoding="utf-8")),

@@ -34,8 +34,21 @@ take their per-install settings (the operator copies them from the CR's
   nothing at all: it neither arms nor claims, so an install that turns the
   prompt on later still gets exactly one request, a delay after it did so.
 - ``FEEDBACK_PROMPT_DELAY`` (default ``7d``; ``<n>d``, ``<n>h`` or ``<n>m``). A
-  value that does not parse falls back to the default with a line on stderr,
-  which the scheduler logs and does not deliver.
+  value that does not parse is a failed run, exit 1 with the reason on stderr,
+  which the scheduler reports in chat like any other script failure until the
+  value is fixed. Falling back silently was the alternative, and it is not
+  observable: the scheduler keeps a zero-exit script's stderr nowhere, so the
+  only trace of a rejected value would be the message arriving a week early.
+
+The schedule is daily, so the delay is quantised to the 13:00 UTC tick: the
+message lands on the first tick at or after the anchor plus the delay. A delay
+of a day or more is compared with a few minutes of slack, because the tick's
+own time drifts by seconds from day to day (the ticker's phase within its
+minute changes on every pod restart, and start-up takes a variable few
+seconds) and without the slack a week could read as seven days less a few
+seconds and land on day eight. A delay under a day is compared exactly: the
+daily schedule fires it at the next tick regardless, and exactness is what a
+two-minute delay is for when a run is marked due by hand.
 
 The form URL is a constant, not a knob: the published short link is the only
 address the maintainers hand out, and it redirects wherever the form lives.
@@ -63,6 +76,11 @@ DELAY_RE = re.compile(r"^(\d+)([dhm])$")
 UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60}
 DEFAULT_DELAY = "7d"
 DEFAULT_DELAY_SECONDS = 7 * UNIT_SECONDS["d"]
+# Slack for a delay of at least a day, and none below that; see the module
+# docstring. Ten minutes is well above the sub-minute ticker phase plus Hermes
+# start-up that separate one day's tick from the next, and far below the day
+# between ticks, so it cannot bring the message forward by a tick.
+DUE_SLACK_SECONDS = 10 * 60
 
 ARMED_MARKER = ".feedback_prompt_armed"
 SENT_MARKER = ".feedback_prompt_sent"
@@ -98,16 +116,23 @@ def enabled(value: str | None) -> bool:
 
 
 def parse_delay(value: str | None) -> int:
-    """The delay in seconds, from ``<n>d|h|m``; the default when unset or malformed."""
+    """The delay in seconds, from ``<n>d|h|m``; the default when unset.
+
+    Raises ``ValueError`` for a value that does not parse. The caller turns that
+    into a failed run rather than a fallback, so the misconfiguration is seen.
+    """
     if value is None or not value.strip():
         return DEFAULT_DELAY_SECONDS
     match = DELAY_RE.match(value.strip().lower())
     if match is None:
-        sys.stderr.write(
-            f"{LOG_PREFIX}: {DELAY_ENV}={value!r} is not <n>d, <n>h or <n>m; using {DEFAULT_DELAY}\n"
-        )
-        return DEFAULT_DELAY_SECONDS
+        raise ValueError(f"{DELAY_ENV}={value!r} is not <n>d, <n>h or <n>m (the default is {DEFAULT_DELAY})")
     return int(match.group(1)) * UNIT_SECONDS[match.group(2)]
+
+
+def due(anchored_at: float, now: float, delay: int) -> bool:
+    """Whether the delay has elapsed, with slack for a delay the daily tick quantises."""
+    slack = DUE_SLACK_SECONDS if delay >= UNIT_SECONDS["d"] else 0
+    return now - anchored_at >= delay - slack
 
 
 def _create_exclusive(path: Path, content: str) -> bool:
@@ -148,6 +173,13 @@ def anchor(home: Path, now: float) -> float | None:
 def main(home: Path | None = None, now: float | None = None) -> int:
     if not enabled(os.environ.get(ENABLED_ENV)):
         return 0  # silent, and nothing on disk changes
+    # Before arming: a run that cannot read its own configuration should not
+    # start the clock, and should fail where the failure is reported.
+    try:
+        delay = parse_delay(os.environ.get(DELAY_ENV))
+    except ValueError as exc:
+        sys.stderr.write(f"{LOG_PREFIX}: {exc}\n")
+        return 1
     if home is None:
         home = _home()
     if now is None:
@@ -161,7 +193,7 @@ def main(home: Path | None = None, now: float | None = None) -> int:
     if anchored_at is None:
         return 0  # armed this tick
 
-    if now - anchored_at < parse_delay(os.environ.get(DELAY_ENV)):
+    if not due(anchored_at, now, delay):
         return 0  # not due yet
 
     # The claim decides; nothing reaches stdout before it succeeds.
