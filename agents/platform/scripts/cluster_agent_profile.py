@@ -33,6 +33,14 @@ TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-templat
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
 
 
+ENV_PLATFORM_AGENT_HOME = "PLATFORM_AGENT_HOME"
+ENV_HERMES_HOME = "HERMES_HOME"
+DEFAULT_DATA_ROOT = Path("/opt/data")
+PROFILES_DIR_NAME = "profiles"
+SANDBOX_PROFILES_BASE = Path(sandbox_exec.DEFAULT_SANDBOX_CWD) / PROFILES_DIR_NAME
+SANDBOX_CLEANUP_TIMEOUT_SECONDS = 15
+
+
 def _resolve_data_root() -> Path:
     """Resolve the data PVC root containing the profiles/ directory.
 
@@ -41,22 +49,17 @@ def _resolve_data_root() -> Path:
     the data PVC root (/opt/data). If PLATFORM_AGENT_HOME is unset and HERMES_HOME points
     directly to a profile home, derive the root from HERMES_HOME.parent.parent.
     """
-    if os.environ.get("PLATFORM_AGENT_HOME"):
-        return Path(os.environ["PLATFORM_AGENT_HOME"])
-    raw_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
-    if raw_home.parent.name == "profiles":
+    if os.environ.get(ENV_PLATFORM_AGENT_HOME):
+        return Path(os.environ[ENV_PLATFORM_AGENT_HOME])
+    raw_home = Path(os.environ.get(ENV_HERMES_HOME, str(DEFAULT_DATA_ROOT)))
+    if raw_home.parent.name == PROFILES_DIR_NAME:
         return raw_home.parent.parent
     return raw_home
 
 
 def _resolve_profiles_base() -> Path:
     """Resolve the directory containing all profile subdirectories."""
-    if os.environ.get("PLATFORM_AGENT_HOME"):
-        return Path(os.environ["PLATFORM_AGENT_HOME"]) / "profiles"
-    raw_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
-    if raw_home.parent.name == "profiles":
-        return raw_home.parent
-    return raw_home / "profiles"
+    return _resolve_data_root() / PROFILES_DIR_NAME
 
 
 HERMES_HOME = _resolve_data_root()
@@ -502,9 +505,9 @@ def delete_profile(name: str) -> None:
     if sandbox_exec.sandbox_enabled():
         try:
             sandbox_exec.run(
-                ["rm", "-rf", f"/opt/data/profiles/{name}"],
+                ["rm", "-rf", str(SANDBOX_PROFILES_BASE / name)],
                 check=True,
-                timeout=15,
+                timeout=SANDBOX_CLEANUP_TIMEOUT_SECONDS,
                 principal=sandbox_exec.TERMINAL_PRINCIPAL,
             )
         except Exception as e:  # noqa: BLE001

@@ -1331,7 +1331,19 @@ class TestClusterProfileTools(unittest.TestCase):
 
             import cluster_agent_profile as cap
 
-            with patch.dict(os.environ, {"HERMES_HOME": str(platform_home)}), \
+            # 1. HERMES_HOME points to profile home while PLATFORM_AGENT_HOME is unset
+            env_without_platform = {k: v for k, v in os.environ.items() if k != "PLATFORM_AGENT_HOME"}
+            env_without_platform["HERMES_HOME"] = str(platform_home)
+            with patch.dict(os.environ, env_without_platform, clear=True), \
+                 patch.object(cap, "PROFILES_BASE", cap._resolve_profiles_base()):
+                result = platform_mcp_server.list_cluster_profiles()
+                self.assertEqual(result, "cluster-prod")
+
+            # 2. PLATFORM_AGENT_HOME is explicitly set to the data root
+            env_with_platform = {k: v for k, v in os.environ.items()}
+            env_with_platform["HERMES_HOME"] = "/arbitrary/unused"
+            env_with_platform["PLATFORM_AGENT_HOME"] = str(tmp)
+            with patch.dict(os.environ, env_with_platform, clear=True), \
                  patch.object(cap, "PROFILES_BASE", cap._resolve_profiles_base()):
                 result = platform_mcp_server.list_cluster_profiles()
                 self.assertEqual(result, "cluster-prod")
