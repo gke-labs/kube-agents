@@ -80,7 +80,7 @@ Cluster Agent is named, stored, or driven:
   for a cluster in another project is verified against the right project today.
 - `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:235-243`).
 - The credential broker passes `--project` through as a value-taking flag
-  (`agents/platform/scripts/command_policy.py:392`), takes the project from the kubeconfig context
+  (`_GCLOUD_FLAGS_WITH_VALUE` in `agents/platform/scripts/command_policy.py`), takes the project from the kubeconfig context
   name (`credential_proxy.py:1168-1190`), and re-issues `get-credentials` with the target's project
   (`:2496`). It does not pin a project. Only IAM stops a cross-project call.
 - The scoped service account pool is already keyed on a per-row project. `scoped_clusters`
@@ -200,8 +200,8 @@ matches the immediate parent only, so a walk that stops early misses every proje
 silently. An organisation policy that forbids the Asset API is an open question (§11), not a code
 path.
 
-The discovery verb is absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS`
-(`command_policy.py:277-377`) admits `container clusters list` and `projects list` but no `asset`
+The discovery verb is absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS` in
+`command_policy.py` admits `container clusters list` and `projects list` but no `asset`
 command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
 refused fail-closed with no signal. Adding `("asset", "search-all-resources")` is part of phase 2, with the resolver that needs it,
 and so is adding `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a

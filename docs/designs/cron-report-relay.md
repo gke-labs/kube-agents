@@ -390,6 +390,10 @@ booleans and therefore settles it outright on a deployed pod), then `CONFIG_PATH
 profile's — then per-platform environment signals for an install neither file
 describes.
 
+The one narrowing is `also_delivered_to`: a platform the cron child already
+posted the raw report to is skipped, and where that would empty the set the
+relay fans out to every platform anyway (see "What this costs" below).
+
 A dual-platform install gets the report on both. Picking one is what #1094 was:
 the resolver returned on its first match, Slack led the order, and an install
 with Slack enabled but no home channel lost every scheduled governance report for
@@ -469,7 +473,13 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either.
+either. One case the scheduler's check misses: it matches the bare marker only,
+and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
+marker as the whole response) reached both senders. The adapter therefore
+carries its own `is_silent_report`, which undresses the marker before testing,
+and the Slack sender imports the same predicate so the two ends agree. The
+scheduler's direct Google Chat leg, which the two roster jobs on `"all"` still
+use, is upstream's sender and carries no such guard.
 
 ## How the switch is wired: `chat` is a platform
 
@@ -508,7 +518,9 @@ cannot state in code it owns, so it is asserted at image build time:
 [`verify_chat_relay.py`](../../deploy/docker/plugins/verify_chat_relay.py) drives
 the real `_deliver_result` against a loopback stand-in for the Session KV server
 and asserts on what crossed the wire. Upstream changing the wrapper fails the
-build.
+build, and the same check pins the adapter's `SILENT_MARKER` to the scheduler's
+spelling, so the marker the silence predicate undresses is the one the
+scheduler emits.
 
 ### What this costs
 
@@ -519,12 +531,25 @@ every one of them is visible to a job author:
   Slack. A job that wants one voice names one target.
 - **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
   expands to every platform with a configured home channel and the relay now has
-  one. A job left on `all` therefore reports twice — once flat into the channel
-  and once through the Chat Agent — on either platform, now that
-  `home_target_env` restores the Google Chat channel too. So the whole Platform
-  Agent roster names `"chat"` rather than relying on the expansion, which is
-  also the only way to say "relay, and do not also post flat" at all: the token
-  is additive, so there is no value that subtracts a target from `all`.
+  one. A job left on `all` therefore reports twice on a platform the scheduler
+  can address — once flat into the channel and once through the Chat Agent. The
+  relay leg subtracts what it can: `adapter.sibling_delivery_targets` resolves
+  the job's `deliver` in the cron child, where alone `all` is known to have
+  expanded, and sends the set as `also_delivered_to`; `relay_cron_report` skips
+  those platforms. An explicit `platform:chat_id` part counts only when its id
+  is that platform's home channel, the one place the relay's leg goes; a DM the
+  relay never addresses cannot get a duplicate from it, and claiming it would
+  cost the home channel its only composed copy. The subtraction is one-sided by design — where it would empty
+  the list it fans out to every platform anyway, because `also_delivered_to`
+  says what the scheduler _intended_ to send and a channel that resolved can
+  still fail on the send. Two copies is a nuisance; none is a missed audit. So
+  on an install where the child can address every enabled platform, a job on
+  `all` still posts twice; the subtraction bites only where the child could
+  address a strict subset. That is why every report-producing job on the
+  Platform Agent roster names `"chat"` except the two the roster README names:
+  the `deliver` token itself remains additive, and `"chat"` is the only way to
+  ask for one composed copy without depending on a subtraction that is designed
+  to give up rather than risk silence.
   No migration was needed to get there: `deliver` is
   an image-owned key on a named profile, so the entrypoint's existing cron merge
   rewrites it on every live volume at the next pod start (`agents/platform/cron/README.md`
@@ -541,9 +566,17 @@ every one of them is visible to a job author:
   saying so only in a log is how the seven consecutive failures above went
   unnoticed. So the degradation is stated twice: the posted message is prefixed
   `[unrelayed]`, naming the profile and job, and the response body carries
-  `"relay": "degraded"` next to `"status": "delivered"`. A fan-out leg that
-  failed while another landed is reported the same way and for the same reason,
-  through `undelivered` — see [Which platforms a report is posted
+  `"relay": "degraded"` next to `"status": "delivered"`.
+  `relay` has one cause today, and both callers had hard-coded the sentence for
+  it, so the body also carries `relay_detail`: the route's own wording, which
+  names the cause and never a platform, and which lets a second cause land in
+  the route without a client change.
+  A send that lands on one platform and not another is a different case, and not
+  a degradation — the report reached a channel, so `relay` stays `ok` — but one
+  audience has nothing, so the body carries `undelivered`: the platforms that
+  missed it, comma-joined. Holding the two fields apart is what stops a
+  consumer reporting the same miss twice, once as prose and once as a list — see
+  [Which platforms a report is posted
   to](#which-platforms-a-report-is-posted-to).
   That is the whole reason the route blocks rather than accepting into a
   background task: answering `accepted` first would make each of those failures

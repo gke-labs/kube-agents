@@ -3,7 +3,12 @@ import shlex
 import unittest
 from pathlib import Path
 
-from command_policy import evaluate, GCLOUD_READ_COMMANDS, _gcloud_words_and_flag
+from command_policy import (
+    evaluate,
+    GCLOUD_READ_COMMANDS,
+    _gcloud_asks_for_help,
+    _gcloud_words_and_flag,
+)
 
 # The gcp-config-connector skill is prompt material that spells out the
 # commands the model runs verbatim, and it promises to stay read-only. Both
@@ -636,7 +641,13 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertTrue(evaluate(argv).allowed)
 
     def test_an_unlisted_group_alone_is_refused(self):
-        decision = evaluate(["gcloud", "compute", "instances", "list"])
+        # A pure read is still refused until someone lists it -- this is an
+        # allowlist, not a "reads are fine" rule. `compute images list` stands
+        # in for that: a real, harmless gcloud read that nothing here needs.
+        # It used to be `compute instances list`, which stopped making the
+        # point when the gce-compute-fleet-audit collector turned out to need
+        # that read and it was listed.
+        decision = evaluate(["gcloud", "compute", "images", "list"])
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.read-only", decision.rule_id)
 
@@ -664,6 +675,27 @@ class GcloudReadOnlyTest(unittest.TestCase):
         decision = evaluate(["gcloud", "--unknown-flag", "container", "clusters", "list"])
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_the_unreadable_refusal_does_not_call_the_flag_global(self):
+        """The flag that reaches this branch is usually command-specific.
+
+        This walker, unlike the kubectl one, stays strict past the command
+        path, so ordinary flags on a write verb land here. Calling them global
+        sent readers after a gcloud release note that does not exist, and an
+        agent quoting the advice into a report tells a customer something
+        untrue.
+        """
+        for argv in (
+            ["gcloud", "container", "clusters", "update", "c", "--enable-autoupgrade"],
+            ["gcloud", "container", "clusters", "update", "c", "--maintenance-window", "09:00"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual("gcp.unreadable-command", decision.rule_id)
+                self.assertNotIn("global", decision.message)
+                # The advice has to be something the reader can act on alone.
+                self.assertIn("without the flag", decision.message)
 
     def test_multiple_flags_before_command(self):
         # Multiple flags should be correctly skipped.
@@ -707,6 +739,190 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.read-only", decision.rule_id)
         self.assertEqual(("projects", "delete", "my-project"), decision.verb_tuple)
+
+    def test_help_on_a_write_verb_is_allowed(self):
+        """`--help` prints a synopsis; the verb after it is a topic, not an act.
+
+        The security-patch SOP tells the agent to confirm a remediation flag's
+        syntax with `--help` before writing it into a finding, and every live
+        run of that stream had the request refused as though it were the
+        update itself.
+        """
+        for argv in (
+            ["gcloud", "container", "clusters", "update", "--help"],
+            ["gcloud", "container", "clusters", "update", "my-cluster", "-h"],
+            ["gcloud", "--project", "p", "compute", "instances", "create", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_help_standing_as_a_flag_value_grants_nothing(self):
+        """`--format --help` makes `--help` a value, not the help flag."""
+        decision = evaluate(
+            ["gcloud", "container", "clusters", "delete", "--format", "--help", "c"]
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_help_after_an_unknown_flag_is_still_unreadable(self):
+        """An unknown flag's arity is unknown, so nothing after it is trusted.
+
+        `_gcloud_words_and_flag` refuses first, so this grades the earlier gate
+        and never enters the help walker -- which is the right answer for
+        `evaluate` and no evidence at all about the walker. The next test grades
+        that separately.
+        """
+        decision = evaluate(["gcloud", "--unknown-flag", "container", "clusters",
+                             "delete", "--help"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_the_help_walker_stops_at_an_unknown_flag_on_its_own(self):
+        """The walker's own fail-closed branch, reached directly.
+
+        Unreachable through `evaluate` today because the words parse runs first,
+        so nothing pins it there. It is the guarantee the walker's docstring
+        makes to any future second caller -- an unknown flag could take a value
+        and hide the `--help` that follows it, or hide one that is not there --
+        and an unpinned guarantee is one a refactor deletes without a failure.
+        """
+        self.assertFalse(_gcloud_asks_for_help(
+            ["gcloud", "--unknown-flag", "container", "clusters", "delete", "--help"]))
+        # The same argv without the unknown flag, to show the False above is the
+        # flag's doing and not a walk that finds no help anywhere.
+        self.assertTrue(_gcloud_asks_for_help(
+            ["gcloud", "container", "clusters", "delete", "--help"]))
+
+    def test_help_buys_nothing_on_a_surface_that_mutates_local_state(self):
+        """`auth`, `config` and `components` are outside the escape.
+
+        The escape is sound only because gcloud short-circuits to a synopsis
+        before acting, which is gcloud's behaviour rather than this module's.
+        For an API verb that assumption failing is survivable -- the request
+        arrives at GCP as an identity with no write permission. For these three
+        it is not: they rewrite the active project, the active credentials and
+        the installed toolchain from inside the pod, with no IAM check to fail
+        back to, and every command afterwards inherits the result.
+
+        The one marked below is the case this exclusion carries alone.
+        `credentialProxyPolicyJSON` in the operator names `auth
+        (login|activate-service-account)` and `components
+        (install|update|remove)` by pattern and no `config` verb at all. So the
+        two `auth login`/`activate-service-account` cases and the two
+        `components` ones are refused a layer earlier whatever this module says,
+        while `auth revoke` and every `config` case here reach `evaluate` and
+        were allowed by the escape -- measured against the deployed proxy on
+        2026-09-01.
+        """
+        for argv in (
+            ["gcloud", "auth", "activate-service-account", "--help"],
+            ["gcloud", "auth", "login", "--help"],
+            # Not in the proxy document's pattern; this module is the only gate.
+            ["gcloud", "auth", "revoke", "--help"],
+            ["gcloud", "config", "set", "project", "elsewhere", "--help"],
+            # Help ahead of the operands, not just trailing them.
+            ["gcloud", "config", "set", "--help", "project", "elsewhere"],
+            ["gcloud", "config", "unset", "project", "-h"],
+            ["gcloud", "components", "update", "--help"],
+            ["gcloud", "components", "install", "beta", "-h"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_the_exclusion_does_not_reach_reads_on_those_surfaces(self):
+        """Excluding a surface removes the escape, not the allowlist.
+
+        `gcloud config list` is a listed read and stays one; the exclusion only
+        stops `--help` from standing in for allowlist membership. Without this
+        the narrowing would be a regression for anything introspecting its own
+        configuration.
+        """
+        for argv in (
+            ["gcloud", "config", "list"],
+            ["gcloud", "config", "list", "--help"],
+            ["gcloud", "auth", "list"],
+            ["gcloud", "auth", "list", "--help"],
+            # No surface word at all -- the one unambiguous documentation request.
+            ["gcloud", "--help"],
+            ["gcloud", "-h"],
+            # A track word and nothing after it is the same thing: a topic
+            # listing, naming no surface to exclude.
+            ["gcloud", "beta", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_a_release_track_does_not_walk_past_the_exclusion(self):
+        """`gcloud beta auth revoke` is `auth`, not `beta`.
+
+        The exclusion read the first word, and a track word stands where the
+        surface should be, so one prefix defeated it. Measured against the
+        deployed proxy on 2026-09-01: `gcloud auth revoke --help` was refused
+        and `gcloud beta auth revoke --help` was allowed. Two of the spellings
+        below -- `beta auth revoke` and every `config` verb -- are the cases the
+        exclusion's own comment says `credentialProxyPolicyJSON` does not name,
+        so the prefix walked around this module exactly where it was the only
+        gate.
+        """
+        for argv in (
+            ["gcloud", "beta", "auth", "revoke", "--help"],
+            ["gcloud", "alpha", "auth", "revoke", "--help"],
+            ["gcloud", "beta", "auth", "login", "--help"],
+            ["gcloud", "beta", "config", "set", "project", "elsewhere", "--help"],
+            ["gcloud", "alpha", "config", "unset", "project", "-h"],
+            ["gcloud", "beta", "components", "update", "--help"],
+            # A global flag ahead of the track, so the walk has to skip both.
+            ["gcloud", "--project", "p", "beta", "config", "set", "project", "x", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_a_release_track_still_gets_the_escape_on_every_other_surface(self):
+        """Looking past the track must not cost the escape its purpose.
+
+        The SOP that motivated the escape reads remediation flag syntax off
+        `container clusters update`, and it is `gcloud beta container clusters
+        update --help` as often as the GA spelling.
+        """
+        for argv in (
+            ["gcloud", "beta", "container", "clusters", "update", "my-cluster", "--help"],
+            ["gcloud", "alpha", "container", "clusters", "delete", "c", "-h"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_init_buys_nothing_from_help_either(self):
+        """`gcloud init` is `auth` and `config` in one word.
+
+        It runs an auth flow and rewrites the active configuration, which is the
+        criterion the other four are on the list for. Unlike them it was never
+        measured escaping -- gcloud short-circuited every `--help` tested -- so
+        this pins the exclusion rather than a fix to an observed hole.
+        """
+        for argv in (["gcloud", "init", "--help"], ["gcloud", "beta", "init", "-h"]):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_help_does_not_smuggle_a_file_write_or_an_identity_change(self):
+        for argv, rule in (
+            (["gcloud", "container", "clusters", "update", "--help",
+              "--output-path", "/etc/x"], "gcp.file-write-forbidden"),
+            (["gcloud", "--impersonate-service-account", "x@y.iam.gserviceaccount.com",
+              "container", "clusters", "update", "--help"],
+             "identity.caller-supplied-impersonation"),
+            (["gcloud", "--flags-file", "/tmp/ff.yaml", "container", "clusters",
+              "update", "--help"], "gcp.flags-file-forbidden"),
+        ):
+            with self.subTest(rule=rule):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule, decision.rule_id)
 
     def test_flags_file_is_refused_outright(self):
         # --flags-file reads from a file under the agent's control. We cannot
@@ -947,6 +1163,36 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_a_global_compute_resource_can_be_described(self):
+        # §3.5 and §3.6 of governance/fleet_wide_cost_analysis_sop.md both make
+        # a describe the confirm step before an irreversible release, and a
+        # global address or forwarding rule cannot be named without --global.
+        # gcloud will not resolve those objects without
+        # it -- "Underspecified resource ... Specify one of the [--global,
+        # --region] flags" -- so the allowlist entries for these two describes
+        # covered regional resources and nothing else.
+        for argv, desc in (
+            (["gcloud", "compute", "addresses", "describe", "argocd-webhook-ip",
+              "--global", "--project", "p"], "SOP 3.5 confirm before release"),
+            (["gcloud", "compute", "forwarding-rules", "describe", "a1b2c3",
+              "--global", "--project", "p"], "SOP 3.6 confirm the target"),
+            (["gcloud", "compute", "addresses", "list", "--global",
+              "--project", "p"], "the listing the scope flag comes from"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_global_does_not_reach_a_verb_that_is_not_a_read(self):
+        # --global is now readable, so the command path behind it is read and
+        # judged rather than the whole command being refused as unparseable.
+        # `addresses delete` is the second half of the same SOP remediation and
+        # it must still be refused -- on gcp.read-only, the rule that means the
+        # allowlist was consulted.
+        decision = evaluate(["gcloud", "compute", "addresses", "delete", "n",
+                             "--global", "--project", "p"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+
     def test_the_daily_networking_fabric_audit_can_run_its_reads(self):
         # agents/platform/cron/jobs.json schedules `gcp-networking-fabric-audit`
         # daily, enabled, deliver: all, executing
@@ -1095,11 +1341,183 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
                 decision = evaluate(argv)
                 self.assertFalse(decision.allowed, desc)
                 self.assertEqual(decision.rule_id, "kubernetes.read-only", desc)
+    def test_the_reads_two_live_fleet_audits_were_refused_now_pass(self):
+        # Two reads that scheduled runs once recorded as "did not run", each
+        # for one missing table entry rather than a wrong idea about GCP.
+        #
+        # capacity-history: the stockout SOP documented the sibling `advice
+        # capacity`'s flags against capacity-history's name, and the real
+        # required flags (--machine-type singular, --provisioning-model,
+        # --types) were not all in the arity table, so the *correct* spelling
+        # was refused as gcp.unreadable-command. #1229 fixed the arities; these
+        # cases stay as the regression pin.
+        #
+        # routers: `routers list` binds the router names the networking SOP's
+        # 2.2 needs, and `routers get-status` is the one read that carries
+        # natStatus[].autoAllocatedNatIps; only the latter was refused before
+        # this change.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "capacity-history",
+              "--machine-type=n2-standard-32", "--provisioning-model=SPOT",
+              "--types=PREEMPTION,PRICE", "--zone=us-central1-a",
+              "--format=json"],
+             "capacity-history, zonal, gcloud's own --help example"),
+            (["gcloud", "beta", "compute", "advice", "capacity-history",
+              "--provisioning-model=SPOT", "--machine-type=g2-standard-4",
+              "--types=PRICE", "--region=us-east4"],
+             "capacity-history, regional, flags reordered"),
+            (["gcloud", "compute", "routers", "list", "--project=p",
+              "--format=json"],
+             "networking SOP:59 router inventory"),
+            (["gcloud", "compute", "routers", "list", "--regions=us-east4",
+              "--format=json"],
+             "routers list with --regions (plural)"),
+            (["gcloud", "compute", "routers", "get-status", "rtr",
+              "--region=us-east4", "--project=p", "--format=json"],
+             "networking SOP:59 NAT autoAllocatedNatIps"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
+    def test_the_gce_fleet_sop_reads_are_allowed(self):
+        # governance/gce_compute_fleet_sop.md spells these. 2.2's own read is
+        # the MIG `describe`, 2.4's is the node-group `list`, and 2.1's
+        # serial-port read needs --port=1 to reach the console the startup
+        # script writes to -- unlisted, that flag refused the whole command as
+        # gcp.unreadable-command before the allowlist was consulted.
+        for argv, desc in (
+            (["gcloud", "compute", "instance-groups", "managed", "describe",
+              "mig-1", "--region=us-east4", "--format=json"],
+             "SOP 2.2 describe"),
+            (["gcloud", "compute", "instance-groups", "managed", "list",
+              "--project=p", "--format=json"],
+             "MIG discovery"),
+            (["gcloud", "compute", "sole-tenancy", "node-groups", "list",
+              "--format=json"],
+             "SOP 2.4 list"),
+            (["gcloud", "compute", "sole-tenancy", "node-groups", "list-nodes",
+              "ng-1", "--zone=us-east4-a", "--format=json"],
+             "node-group utilisation"),
+            (["gcloud", "compute", "instances", "get-serial-port-output", "vm-1",
+              "--zone=us-east4-a", "--port=1"],
+             "SOP 2.1 with --port=1"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
+    def test_the_mig_and_node_group_writes_stay_refused(self):
+        for argv, desc in (
+            (["gcloud", "compute", "instance-groups", "managed", "resize",
+              "mig-1", "--size=3", "--region=us-east4"],
+             "managed resize"),
+            (["gcloud", "compute", "instance-groups", "managed", "delete",
+              "mig-1", "--region=us-east4"],
+             "managed delete"),
+            (["gcloud", "compute", "instance-groups", "managed",
+              "rolling-action", "restart", "mig-1", "--region=us-east4"],
+             "rolling-action restart"),
+            (["gcloud", "compute", "sole-tenancy", "node-groups", "add-nodes",
+              "ng-1", "--zone=us-east4-a"],
+             "add-nodes"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
+    def test_an_unknown_flag_is_still_unreadable_after_the_additions(self):
+        # The additions are individual arity entries, not a relaxation of the
+        # fail-closed rule -- that rule is the reason the refusals above were
+        # correct behaviour from a table that was merely incomplete. A flag
+        # nobody has enumerated must still take the whole command down.
+        decision = evaluate([
+            "gcloud", "compute", "routers", "list", "--not-a-real-flag", "v",
+        ])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_routers_mutations_are_not_swept_in_with_get_status(self):
+        # `routers get-status` reads; `routers add-interface`/`set-nat` and
+        # friends do not, and they sit one word away in the same noun.
+        for verb in ("add-interface", "add-bgp-peer", "set-nat",
+                     "update-interface", "remove-interface", "nats"):
+            with self.subTest(verb=verb):
+                self.assertFalse(
+                    evaluate(["gcloud", "compute", "routers", verb, "r"]).allowed,
+                    verb,
+                )
+
+    def test_the_gce_compute_fleet_audit_reads_are_allowed(self):
+        # The GCE fleet SOP opens every project target with `instances list`,
+        # and the collector that runs it fails the whole target when that first
+        # read fails. Unlisted, the gate answered before the fleet did: the
+        # collector recorded a skipped target reading "permission denied or
+        # API unavailable" against a project whose disks and snapshots were
+        # readable all along, and both of the stream's checks reported
+        # nothing gathered. Probed against a live install, `instances list`
+        # was refused under gcp.read-only while `disks list` beside it
+        # returned JSON -- the command tuple was the whole difference.
+        # get-serial-port-output is the GCE SOP's 2.1 read
+        # (gce-startup-script-status): the check looks for "startup-script exit
+        # status 1" in the console output and has no other source for it.
+        for argv, desc in (
+            (["gcloud", "compute", "instances", "list", "--project", "p",
+              "--format=json"],
+             "collector's project inventory, space-separated --project"),
+            (["gcloud", "compute", "instances", "list", "--project=p",
+              "--format=json"],
+             "same read, --project=p"),
+            (["gcloud", "compute", "instances", "get-serial-port-output",
+              "vm-1", "--zone=us-east4-a", "--project=p"],
+             "gce-startup-script-status evidence read"),
+            (["gcloud", "compute", "instances", "describe", "vm-1",
+              "--zone=us-east4-a", "--project=p", "--format=json"],
+             "the SOP's 2.3 ops-agent-guest-health read"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
+    def test_instances_mutations_are_not_swept_in_with_the_fleet_audit_reads(self):
+        # `instances reset` matters most here: the stream emits it as the
+        # proposed remediation text for a failed startup script, so the one
+        # verb the collector names in its own output must stay refused.
+        for verb in ("create", "delete", "reset", "stop", "start",
+                     "add-metadata", "set-machine-type"):
+            with self.subTest(verb=verb):
+                self.assertFalse(
+                    evaluate(["gcloud", "compute", "instances", verb,
+                              "vm-1", "--zone=us-east4-a"]).allowed,
+                    verb,
+                )
+
+    def test_the_world_open_ingress_firewall_read_is_allowed(self):
+        # A rule's `sourceRanges`, `allowed` and `direction` have no other
+        # surface, so a world-open-ingress read has no data without `list`.
+        # Both --project spellings, because collectors use the space-separated
+        # one and the SOPs print the `=` one.
+        for argv, desc in (
+            (["gcloud", "compute", "firewall-rules", "list", "--project", "p",
+              "--format", "json"],
+             "collector's read, space-separated --project"),
+            (["gcloud", "compute", "firewall-rules", "list", "--project=p",
+              "--format=json"],
+             "the SOP's printed spelling"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
 
     def test_the_writes_one_word_from_the_new_reads_stay_refused(self):
         # Each new entry has a mutating sibling that shares all but the last
         # word. The entries are full paths, so the siblings must still refuse.
         for argv, desc in (
+            (["gcloud", "compute", "firewall-rules", "create", "f"],
+             "firewall-rules create"),
+            (["gcloud", "compute", "firewall-rules", "update", "f"],
+             "firewall-rules update"),
+            (["gcloud", "compute", "firewall-rules", "delete", "f"],
+             "firewall-rules delete"),
             (["gcloud", "compute", "networks", "create", "n"], "networks create"),
             (["gcloud", "compute", "networks", "delete", "n"], "networks delete"),
             (["gcloud", "compute", "networks", "subnets", "create", "s"],
@@ -1112,12 +1530,6 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             (["gcloud", "compute", "routers", "create", "r"], "routers create"),
             (["gcloud", "compute", "routers", "update", "r"], "routers update"),
             (["gcloud", "compute", "routers", "delete", "r"], "routers delete"),
-            (["gcloud", "compute", "firewall-rules", "create", "f"],
-             "firewall-rules create"),
-            (["gcloud", "compute", "firewall-rules", "update", "f"],
-             "firewall-rules update"),
-            (["gcloud", "compute", "firewall-rules", "delete", "f"],
-             "firewall-rules delete"),
             (["gcloud", "compute", "security-policies", "create", "p"],
              "security-policies create"),
             (["gcloud", "billing", "budgets", "create", "--billing-account=A"],
@@ -1125,6 +1537,46 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             (["gcloud", "billing", "budgets", "delete", "b"], "budgets delete"),
             (["gcloud", "artifacts", "docker", "images", "delete", "img"],
              "images delete"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
+    def test_the_registry_cleanup_policy_read_is_allowed(self):
+        # A repository's `cleanupPolicies` and `sizeBytes` have no other
+        # surface; unlisted, a registry-hygiene read degrades to a coverage
+        # gap rather than an error. Both --project spellings, for the same
+        # reason as the firewall read above.
+        for argv, desc in (
+            (["gcloud", "artifacts", "repositories", "list", "--project", "p",
+              "--format", "json"],
+             "collector's read, space-separated --project"),
+            (["gcloud", "artifacts", "repositories", "list", "--project=p",
+              "--format=json"],
+             "the SOP's printed spelling"),
+            (["gcloud", "artifacts", "repositories", "describe", "images",
+              "--location=us-east4", "--project=p"],
+             "the remediation's confirming read"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
+    def test_writing_a_cleanup_policy_stays_refused(self):
+        # A cleanup policy is a write for a human to make, because a cleanup
+        # policy deletes container images, and a `keep` rule that misses a tag
+        # some cluster still deploys breaks the next pod schedule in the fleet.
+        # The agent prints those commands for a human; it must not run them.
+        for argv, desc in (
+            (["gcloud", "artifacts", "repositories", "set-cleanup-policies",
+              "images", "--location=us-east4", "--policy=policy.json"],
+             "set-cleanup-policies"),
+            (["gcloud", "artifacts", "repositories", "delete", "images",
+              "--location=us-east4"], "repositories delete"),
+            (["gcloud", "artifacts", "repositories", "create", "images",
+              "--repository-format=docker", "--location=us-east4"],
+             "repositories create"),
+            (["gcloud", "artifacts", "repositories", "update", "images",
+              "--location=us-east4"], "repositories update"),
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)

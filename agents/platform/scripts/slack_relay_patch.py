@@ -78,6 +78,52 @@ def relay_without_token() -> bool:
     return not os.getenv("SLACK_BOT_TOKEN", "").strip()
 
 
+def is_silent_text(message: Any) -> bool:
+    """Is this delivery a silent cron tick rather than something to post?
+
+    The sibling sender's predicate, imported rather than restated. Both senders
+    are handed the same cron output by the same ``_deliver_result``, and until
+    this they disagreed about it. ``is_silent_report`` undresses the marker
+    before testing; this end only tested for blank. So a scheduled audit that
+    emphasised the marker — every audit SOP tells a quiet run to make the bare
+    marker its entire final response, and a markdown-writing model sometimes
+    dresses it — was suppressed by the relay and posted to Slack as
+    ``*[SILENT]*``. Upstream's matcher takes the marker bare and stops delivery
+    before either sender runs, so only the dressed form ever reaches here, and
+    only this end was still delivering it.
+
+    Falling back to the blank test leaves a deployment with no chat platform
+    installed behaving exactly as it did.
+
+    The test reads the *unwrapped* message, which is the form the sibling
+    tests. ``is_silent_report`` undresses by stripping markdown off the two
+    ends of what it is given, so handed the whole delivery it strips the ends
+    of the wrapper — and ``**[SILENT]**`` under a ``Cronjob Response:`` header
+    came back False, which is every cron delivery there is. The undressing was
+    only ever reachable here on a message that had lost its wrapper.
+    """
+    text = "" if message is None else str(message)
+    try:
+        from plugins.platforms.chat.adapter import (
+            is_silent_report,
+            parse_cron_wrapper,
+        )
+    except Exception as exc:
+        # Loud, because in the gateway process the plugin is always installed:
+        # an import failure here is a packaging fault, not the no-chat-platform
+        # deployment the fallback below is for, and silently reverting to the
+        # blank test would post dressed markers to Slack with nothing logged.
+        LOGGER.warning(
+            "the chat adapter's silence predicate could not be imported (%s: %s); "
+            "testing for blank only",
+            type(exc).__name__,
+            exc,
+        )
+        return not text.strip()
+    _job_id, _title, report = parse_cron_wrapper(text)
+    return bool(is_silent_report(report))
+
+
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
     """Read an upload without allowing it to grow past the relay limit."""
     if path.stat().st_size > max_file_bytes:
@@ -609,12 +655,23 @@ def install() -> None:
             # before formatting as well as after: a formatter that decorates
             # its input turns whitespace into a message worth sending, and
             # upstream's own guard — which only sees the formatted text —
-            # would let that through.
+            # would let that through. ``is_silent_text`` is the sibling
+            # sender's predicate, so a dressed ``[SILENT]`` is dropped on both
+            # legs rather than on one.
             blank = {"success": True, "platform": "slack", "skipped": "empty_text"}
-            if not message or not str(message).strip():
-                return blank
-            formatted = format_mrkdwn(module, message)
-            if not formatted or not str(formatted).strip():
+            formatted = message if is_silent_text(message) else format_mrkdwn(module, message)
+            if is_silent_text(formatted):
+                # A drop that leaves no trace is the failure nobody can find
+                # afterwards: `skipped` reports success and the scheduler
+                # records no `last_delivery_error`, so a suppressed report
+                # reads exactly like one that was never scheduled. The sibling
+                # chat sender logs its own suppression; this leg logged none,
+                # which was defensible only while the branch required literally
+                # blank text.
+                LOGGER.info(
+                    "slack relay: dropped a %d-character message as a silent tick",
+                    len(str(message or "")),
+                )
                 return blank
 
             target = str(chat_id or "")

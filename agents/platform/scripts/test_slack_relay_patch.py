@@ -1,8 +1,10 @@
 import asyncio
 import dataclasses
+import importlib.util
 import io
 import json
 import os
+import pathlib
 import sys
 import types
 import unittest
@@ -204,6 +206,33 @@ ADAPTER_MODULE_NAME = "fake_slack_adapter_module"
 # whichever class won registration above — the fake, or the real one if the SDK
 # is installed in this environment.
 SlackApiError = sys.modules["slack_sdk.errors"].SlackApiError
+
+
+def _chat_adapter_modules() -> dict:
+    """The real Google Chat adapter, under the name the patch imports it by.
+
+    ``is_silent_text`` reaches for ``plugins.platforms.chat.adapter``, which is
+    a path inside the Hermes tree and does not exist in this checkout. Load the
+    shipped source under that name so the silence tests exercise the predicate
+    the deployment actually shares, not a local restatement of it — a stub
+    would pass whether or not the two ends still agree, which is the only thing
+    those tests are for. Parent packages are stubbed alongside it because
+    ``from a.b.c import d`` walks them.
+    """
+    source = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "deploy/docker/plugins/chat/adapter.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "plugins.platforms.chat.adapter", source
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    parents = {
+        name: types.ModuleType(name)
+        for name in ("plugins", "plugins.platforms", "plugins.platforms.chat")
+    }
+    return {**parents, "plugins.platforms.chat.adapter": module}
 
 
 def relay_error(body: object) -> urllib.error.HTTPError:
@@ -837,6 +866,72 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
                     result,
                 )
         self.assertEqual([], captured)
+
+    def test_a_dressed_silence_marker_is_dropped_here_too(self):
+        """The two senders must not disagree about what silence looks like.
+
+        Upstream's matcher takes ``[SILENT]`` bare and stops delivery before
+        either sender runs, so the only form that reaches a sender is the one
+        it does not take — the marker wearing markdown, which is what an agent
+        told to copy ``chat_summary`` verbatim emits when it emphasises the
+        field. Google Chat's sender has undressed it before testing since the
+        marker started arriving that way; this one tested for blank, so a
+        scheduled audit that meant to say nothing said ``*[SILENT]*`` in Slack
+        and nothing in Chat.
+
+        Loaded under the name the patch imports rather than stubbed, so the
+        assertion is that the two ends share one predicate rather than that
+        they share an idea of one.
+
+        Wrapped as well as bare, because wrapped is the only form a scheduled
+        run produces and the bare cases alone passed against a predicate that
+        dropped every one of them. ``is_silent_report`` undresses by stripping
+        markdown off the two ends of what it is handed, so handed the whole
+        delivery it strips the ends of the ``Cronjob Response:`` header instead
+        of the marker.
+        """
+        entry = self._register_slack()
+        captured, patched = self._relay([])
+        wrap = "Cronjob Response: Compliance Audit\n(job_id: compliance-audit)\n-----\n\n{}"
+        with mock.patch.dict(sys.modules, _chat_adapter_modules()):
+            for dressed in ("`[SILENT]`", "**[SILENT]**", "  **`[silent]`**  "):
+                for label, message in (
+                    ("bare", dressed),
+                    ("wrapped", wrap.format(dressed)),
+                ):
+                    with self.subTest(dressed=dressed, form=label):
+                        with patched:
+                            result = self._send(entry, message=message)
+                        self.assertEqual(
+                            {
+                                "success": True,
+                                "platform": "slack",
+                                "skipped": "empty_text",
+                            },
+                            result,
+                        )
+        self.assertEqual([], captured)
+
+    def test_a_real_brief_still_goes_out_when_the_sibling_predicate_is_loaded(self):
+        """The guard above must not swallow a report that merely mentions it."""
+        entry = self._register_slack()
+        captured, patched = self._relay([{"ok": True, "ts": "1"}])
+        with mock.patch.dict(sys.modules, _chat_adapter_modules()):
+            with patched:
+                self._send(
+                    entry,
+                    message="Compliance Audit: 2 critical [SILENT] was not the answer",
+                )
+        self.assertEqual(1, len(captured))
+
+    def test_the_silence_predicate_falls_back_when_no_chat_platform_is_installed(self):
+        """A Slack-only deployment has no sibling to import; keep the old test."""
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            sys.modules.pop("plugins.platforms.chat.adapter", None)
+            self.assertTrue(slack_relay_patch.is_silent_text(""))
+            self.assertTrue(slack_relay_patch.is_silent_text(None))
+            self.assertTrue(slack_relay_patch.is_silent_text("  \n "))
+            self.assertFalse(slack_relay_patch.is_silent_text("**[SILENT]**"))
 
     def test_a_user_id_target_opens_a_dm_first(self):
         entry = self._register_slack()
