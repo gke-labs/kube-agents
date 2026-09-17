@@ -2581,9 +2581,10 @@ def parse_declarations(
             continue
         raw_object = item["object"].strip()
         # Each side of the slash on its own: `Deployment / api` is a hand-typed
-        # spelling of `Deployment/api`, and the join is an exact lookup against
-        # the finding's `Kind/name`, so the whitespace would not fail the item
-        # here but silently match nothing there.
+        # spelling of `Deployment/api`, and the join is a case-blind lookup
+        # against the finding's `Kind/name` that does not fold whitespace, so
+        # the whitespace would not fail the item here but silently match
+        # nothing there.
         kind, _, name = (part.strip() for part in raw_object.partition("/"))
         if not kind or not name or "/" in name:
             log(f"WARNING: {item_where}: object must be Kind/name, got {raw_object!r}; skipped.")
