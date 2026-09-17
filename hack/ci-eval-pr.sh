@@ -1172,7 +1172,10 @@ export JUDGE_PROVIDER="google"
 # touching the agent line.
 export JUDGE_MODEL="${JUDGE_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 export AGENT_PROVIDER="google"
-export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
+# Paired with MODEL_DEFAULT_NAME in ci-deploy.sh -- flipping one without the
+# other files records under a model the install is not serving. The reason for
+# the model is on that line.
+export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.5-flash}"
 
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
 unset NAMESPACE

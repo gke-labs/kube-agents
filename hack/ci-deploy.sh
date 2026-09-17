@@ -176,7 +176,16 @@ fi
 # own AGENT_MODEL_OVERRIDE, so flip both or the eval version key names a
 # model the install is not serving.
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
-export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
+# Flash, not the 3.1 pro preview, since 2026-09-17. Dynamic shared quota has no
+# per-project wall to raise, so the only lever left is which pool we draw from.
+# Two neighbours of this line are already ruled out: EVAL_TASK_PARALLELISM=6 ran
+# slower than 4 (143.3 min of fan-out against 135.4, with nine times the
+# refusals), and no region can be tried with the pro preview because it is
+# served on the global endpoint alone -- us-central1 404s every call.
+# This model is the chart's own vertex_ai default (_helpers.tpl), so it is the
+# one Gemini here that is certain to resolve.
+# Flip this and AGENT_MODEL in ci-eval-pr.sh together, per the note above.
+export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.5-flash}"
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
 export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-false}"
