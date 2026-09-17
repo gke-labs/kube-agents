@@ -88,7 +88,8 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
         start = re.search(
             r'^"\$\{SCRIPT_DIR\}/boskos_heartbeat\.sh" &\n'
             r'EVAL_HEARTBEAT_PID=\$!\n'
-            r'disown "\$\{EVAL_HEARTBEAT_PID\}"$',
+            r'(?:#[^\n]*\n)*'
+            r'disown "\$\{EVAL_HEARTBEAT_PID\}" 2>/dev/null \|\| true$',
             self.src,
             re.M,
         )

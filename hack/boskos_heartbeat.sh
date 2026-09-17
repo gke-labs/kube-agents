@@ -18,6 +18,8 @@
 # Usage (backgrounded, killed by the caller's EXIT trap):
 #   ./hack/boskos_heartbeat.sh & HEARTBEAT_PID=$!
 #   trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true' EXIT
+# If the caller dies without running that trap, the daemon notices at its
+# next beat and stops itself (see the loop), so it cannot outlive the job.
 #
 # Disabled (single notice, exit 0) unless BOSKOS_HOST, BOSKOS_RESOURCE_NAME,
 # and BOSKOS_OWNER_NAME are all set. Pool resource names are DNS-safe, so
@@ -69,10 +71,34 @@ summary() {
 }
 trap summary TERM INT
 
+# True while the process that started this daemon still exists. Compares the
+# kernel's current parent pid with $PPID (fixed at startup): the kernel
+# reparents a child the moment its parent dies, before anyone reaps it, so
+# this also catches a caller that sits as a zombie -- where `kill -0 $PPID`
+# would still say alive. Reads /proc where it exists (the Prow image) and
+# falls back to ps elsewhere; if neither answers, the caller is assumed
+# alive, so a missing tool can only keep the lease beating, never drop it.
+caller_alive() {
+  local parent_now=""
+  if [ -r "/proc/$$/status" ]; then
+    parent_now="$(awk '/^PPid:/ { print $2 }' "/proc/$$/status" 2>/dev/null)"
+  else
+    parent_now="$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')"
+  fi
+  [ -z "${parent_now}" ] || [ "${parent_now}" = "${PPID}" ]
+}
+
 mkdir -p "$(dirname "${BOSKOS_HEARTBEAT_LOG}")" 2>/dev/null || true
 echo "${LOG_PREFIX} started for ${BOSKOS_RESOURCE_NAME} (owner ${BOSKOS_OWNER_NAME}, every ${BOSKOS_HEARTBEAT_INTERVAL_SECONDS}s, detail: ${BOSKOS_HEARTBEAT_LOG})"
 
 while true; do
+  # The caller's EXIT trap is the normal stop. If the caller died without
+  # running it (SIGKILL), stop anyway: this process inherits the job's log
+  # pipe, and Prow's entrypoint waits in command.Wait() for every holder of
+  # that pipe to exit, so an orphan that never exits holds the job open
+  # until the decoration timeout and turns a finished run into a "timed
+  # out" one.
+  caller_alive || summary
   # curl -w emits a code even on failure ("000", or "200000" when the
   # connection dies after headers), so normalise to the LAST three digits
   # rather than appending a fallback that doubles it up.

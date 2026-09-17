@@ -699,7 +699,9 @@ if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
 fi
 "${SCRIPT_DIR}/boskos_heartbeat.sh" &
 EVAL_HEARTBEAT_PID=$!
-disown "${EVAL_HEARTBEAT_PID}"
+# Outside Prow the daemon exits within milliseconds; if bash has already
+# reaped it, disown answers "no such job", which must not be a set -e death.
+disown "${EVAL_HEARTBEAT_PID}" 2>/dev/null || true
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="

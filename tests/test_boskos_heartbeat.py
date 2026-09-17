@@ -6,7 +6,9 @@ slow machine cannot fail a healthy daemon. What is pinned: beats carry the
 right identity and keep coming; stdout stays quiet while the detail log
 records; a 401 is reported once per transition and does not stop the loop,
 and the stop summary then carries one WARNING naming the lost lease; beats
-resume after a hang; missing env disables the daemon with one line.
+resume after a hang; missing env disables the daemon with one line; a
+caller that dies without its EXIT trap (SIGKILL) takes the daemon with it
+at the next beat, so it never holds the job's log pipe open.
 """
 
 import os
@@ -91,6 +93,13 @@ class BoskosHeartbeatTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _spawn(self, **env_overrides):
+        return self._popen(["bash", str(HEARTBEAT_SCRIPT)], env_overrides)
+
+    def _spawn_caller(self, script, **env_overrides):
+        """Run a bash caller that starts the daemon itself, same env as _spawn."""
+        return self._popen(["bash", "-c", script], env_overrides)
+
+    def _popen(self, argv, env_overrides):
         env = {
             **os.environ,
             "BOSKOS_HOST": self.host,
@@ -102,7 +111,7 @@ class BoskosHeartbeatTest(unittest.TestCase):
             **env_overrides,
         }
         return subprocess.Popen(
-            ["bash", str(HEARTBEAT_SCRIPT)],
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -179,6 +188,36 @@ class BoskosHeartbeatTest(unittest.TestCase):
         self._stop(proc)
         self.assertGreater(len(_FakeBoskos.updates), frozen_count,
                            "no beat resumed after SIGCONT")
+
+    def test_stops_by_itself_when_the_caller_is_killed(self):
+        # ci-eval-pr.sh and ci-teardown.sh kill the daemon from their EXIT
+        # trap. A SIGKILLed caller never runs it; the daemon must then stop
+        # on its own, because it holds the job's stdout pipe and Prow's
+        # entrypoint waits on that pipe until the decoration timeout.
+        pid_file = Path(self.tmp.name) / "daemon.pid"
+        caller = (
+            f'bash "{HEARTBEAT_SCRIPT}" & echo $! >"{pid_file}"; disown; '
+            "sleep 1; kill -9 $$"
+        )
+        proc = self._spawn_caller(caller)
+        self._await_beats(2)
+        # communicate() returns only when the last holder of the pipe (the
+        # daemon) has closed it; a daemon that outlives its caller hangs
+        # here, exactly as it would hang the Prow job.
+        try:
+            stdout = proc.communicate(timeout=WAIT_DEADLINE_SECONDS)[0]
+        except subprocess.TimeoutExpired:
+            daemon_pid = int(pid_file.read_text().strip() or 0)
+            if daemon_pid:
+                os.kill(daemon_pid, signal.SIGKILL)
+            proc.kill()
+            self.fail("the daemon outlived its SIGKILLed caller")
+        self.assertEqual(proc.returncode, -signal.SIGKILL, "the caller must die by SIGKILL")
+        self.assertIn("started for", stdout)
+        self.assertIn("stopping for", stdout)
+        daemon_pid = int(pid_file.read_text().strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(daemon_pid, 0)
 
     def test_disabled_without_boskos_env(self):
         proc = self._spawn(BOSKOS_HOST="")
