@@ -77,12 +77,33 @@ class McpStdioSeamTest(unittest.TestCase):
         fake_executable(bin_dir, "kubectl", "import sys; print('{}'); sys.exit(0)")
 
         env = dict(os.environ)
+        # Every signal `chat_platforms.enabled_chat_platforms` reads, dropped
+        # before the pins below put back only what this seam wants. The same
+        # scrub `_seams.py` does, for the same reason and in the same order:
+        # with both config files absent the environment is what decides, and a
+        # maintainer's own shell is exactly where those variables live. This
+        # seam does not go through that helper, so it repeats the list; keep
+        # the two in step with `chat_platforms._ENV_SIGNALS`, since a signal
+        # that module gains and these lose reintroduces the hazard silently.
+        for leaked in (
+            "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_RELAY_URL", "SLACK_HOME_CHANNEL",
+            "GOOGLE_CHAT_WEBHOOK", "GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID",
+            "GOOGLE_CHAT_HOME_CHANNEL",
+        ):
+            env.pop(leaked, None)
         env.update(
             {
                 "PATH": str(bin_dir) + os.pathsep + env.get("PATH", ""),
                 "PYTHONPATH": str(SCRIPTS_DIR),
-                # The config the server's platform detection reads; absent →
-                # deterministic google_chat fallback.
+                # The three sources the server's platform detection reads, in
+                # precedence order. The managed scope outranks both others and
+                # defaults to /etc/hermes, so a workstation carrying one would
+                # otherwise answer for this test; the profile config is second.
+                # Both pinned absent, which leaves the scrubbed environment
+                # above to decide — and there the single home channel below is
+                # the only signal, so the broadcast is a deterministic one
+                # target.
+                "HERMES_MANAGED_DIR": str(self.tmp_path / "absent-managed-scope"),
                 "PLATFORM_AGENT_CONFIG_PATH": str(self.tmp_path / "absent.yaml"),
                 "PLATFORM_AGENT_DOTENV_PATH": str(self.tmp_path / "absent.env"),
                 "SESSION_KV_API_KEY": "irrelevant-here",
