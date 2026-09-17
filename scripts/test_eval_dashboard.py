@@ -516,7 +516,7 @@ class RenderedPagesTest(unittest.TestCase):
     def test_six_pages_are_written_and_none_names_the_legacy_page(self):
         out_dir, _, tmp = render_fixture(fixture_data())
         self.addCleanup(tmp.cleanup)
-        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "trend.html"])
+        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "trend.html", "trend.json"])
         for page in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html", "trend.html"):
             text = (out_dir / page).read_text()
             self.assertNotIn("legacy", text.lower(), page)

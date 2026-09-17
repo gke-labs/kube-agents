@@ -40,11 +40,13 @@ writes six pages and two data files into ``out/``:
   (``trend.py``). Without ``--store`` the page says the store was not read.
 * ``brief.json`` -- what the six pages render from: the per-run
   classification, the per-case record, the current health verdict, the
-  incident history, the recent merges, the release-candidate runs, the
-  nights on record and the trend.
-  ``data.json`` is copied verbatim beside it, and ``store.json`` when one
-  was given (the next refresh reads it back as ``store.py --prior``, so a
-  tick fetches only the objects it has not seen).
+  incident history, the recent merges, the release-candidate runs and the
+  nights on record. The trend block is ``trend.json`` beside it, polled by
+  the Trend page alone (every page polls brief.json, and the block grows
+  every night). ``data.json`` is copied verbatim beside them, and
+  ``store.json`` when one was given (the next refresh reads it back as
+  ``store.py --prior``, so a tick fetches only the objects it has not
+  seen).
 
 Every page is rendered in the browser (``template/page.html.tmpl`` +
 ``template/pages.js``) from the brief.json document inlined into it as
@@ -132,6 +134,10 @@ CASES_PAGE = "cases.html"
 NIGHTLY_PAGE = nightly.NIGHTLY_PAGE
 TREND_PAGE = trend.TREND_PAGE
 BRIEF_JSON = "brief.json"
+#: The Trend page's block, published on its own: every page polls
+#: brief.json every minute and only trend.html reads the block, which grows
+#: a night's records every night (about 2 MB at a quarter).
+TREND_JSON = "trend.json"
 # The evidence-store read this render was given (store.py's output), copied
 # beside data.json so the next refresh can read it as --prior.
 STORE_JSON = "store.json"
@@ -1218,7 +1224,10 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     for page, spec in PAGES.items():
         (out_dir / spec["file"]).write_text(render_page(page, brief, data, args.public_url))
-    (out_dir / BRIEF_JSON).write_text(json.dumps(brief, separators=(",", ":")))
+    # brief.json is what every page polls; the trend block rides in
+    # trend.json, which the Trend page alone polls (and has inlined).
+    (out_dir / BRIEF_JSON).write_text(json.dumps({**brief, "trend": None}, separators=(",", ":")))
+    (out_dir / TREND_JSON).write_text(json.dumps(brief["trend"], separators=(",", ":")))
     # health.json and health-history.jsonl are deliberately not copied into
     # the out-dir: the adjudicator owns those objects, and republishing a
     # copy would overwrite a fresher verdict with the one this render read.
@@ -1229,7 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
     # so a broken read never replaces the good prior in the bucket.
     if store is not None:
         shutil.copyfile(args.store, out_dir / STORE_JSON)
-    print(f"wrote {', '.join(str(out_dir / spec['file']) for spec in PAGES.values())}, {BRIEF_JSON}")
+    print(f"wrote {', '.join(str(out_dir / spec['file']) for spec in PAGES.values())}, {BRIEF_JSON}, {TREND_JSON}")
     return 0
 
 

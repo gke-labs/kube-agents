@@ -163,16 +163,28 @@ def list_objects(location: str, gsutil: str = "gsutil", runner=None) -> list[str
 
 
 def cat_objects(urls: list[str], gsutil: str = "gsutil", runner=None, chunk: int = CAT_CHUNK, workers: int = CAT_WORKERS):
-    """``(chunk of URLs, text or None, error)`` per ``gsutil cat`` call, in
-    chunk order; the calls run ``workers`` at a time. gsutil prints the
-    objects in argument order, each ending in the newline the writer put
-    there, so a chunk's text is its lines in order."""
+    """``(URLs, text or None, error)`` per ``gsutil cat`` call, in URL order;
+    the calls run ``workers`` at a time. gsutil prints the objects in
+    argument order, each ending in the newline the writer put there, so a
+    chunk's text is its lines in order. A chunk whose call failed is read
+    again one object at a time, so one bad object (a 5xx, a 403) costs that
+    object and not its chunk-mates; each object that still fails is its own
+    ``(url, None, error)`` entry, so the caller can name it."""
     parts = [urls[start:start + chunk] for start in range(0, len(urls), chunk)]
     if not parts:
         return []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(parts)))) as pool:
+    pool_size = max(1, min(workers, len(parts)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as pool:
         results = list(pool.map(lambda part: gsutil_call(["cat", *part], gsutil, runner), parts))
-    return [(part, out, err) for part, (out, err) in zip(parts, results, strict=True)]
+    out = []
+    for part, (text, err) in zip(parts, results, strict=True):
+        if text is not None or len(part) == 1:
+            out.append((part, text, err))
+            continue
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(part)))) as pool:
+            singles = list(pool.map(lambda url: gsutil_call(["cat", url], gsutil, runner), part))
+        out.extend(([url], text, err) for url, (text, err) in zip(part, singles, strict=True))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -330,7 +342,7 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
     fetched: list[dict] = []
     for part, text, err in cat_objects(to_read, gsutil, runner):
         if text is None:
-            warnings.append(f"gsutil cat failed for {len(part)} object(s) starting {part[0]}: {err[:200] or 'failed'}")
+            warnings.append(f"{part[0]}: gsutil cat failed: {err[:200] or 'failed'}")
             continue
         fetched.extend(parse_records(text, part, location, warnings))
     records = kept + fetched

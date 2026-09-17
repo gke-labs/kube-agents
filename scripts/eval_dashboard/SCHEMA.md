@@ -499,9 +499,11 @@ which `render.py` inlines into each page as
 `<script type="application/json" id="inline-brief">` (the verdict it read,
 the same document as `brief.health`, again as `inline-health`), so a page
 needs no request beyond itself (the `trend` block, which grows every night,
-is inlined into `trend.html` only; the other pages carry `trend: null`);
+is inlined into `trend.html` only; the other pages and `brief.json` itself
+carry `trend: null`, and the block is published as `trend.json` beside it);
 the poll of the published `brief.json` and `health.json` every 60 seconds
-is a best-effort refresh on top. That matters on `storage.cloud.google.com`, which answers an XHR
+(and of `trend.json`, on the Trend page alone) is a best-effort refresh on
+top. That matters on `storage.cloud.google.com`, which answers an XHR
 with a login redirect: the pages still render whole there. The header
 badge says `updated <time> · Nm ago`, plus `· regenerated every 15 min`
 while no poll has succeeded (the workflow republishes every page on that
@@ -655,7 +657,11 @@ and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
-`trend` is `trend.py`'s block from `store.json` (below), the evidence
+`trend` is `null` in the published `brief.json` (every page polls that
+file every minute and only the Trend page reads the block, which grows a
+night's records every night); the block is inlined into `trend.html` and
+published beside `brief.json` as **`trend.json`**, which the Trend page
+polls. It is `trend.py`'s block from `store.json` (below), the evidence
 store's read: `{source, read_at, error, window_days, lead_days, max_objects,
 truncated{case: n}, warnings[], records, metrics[], default_metric,
 spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{}}`.

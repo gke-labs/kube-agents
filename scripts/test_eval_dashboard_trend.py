@@ -273,7 +273,7 @@ class StoreStatesTest(unittest.TestCase):
         self.assertEqual((y["runs"], y["passes"], y["judged"]), (0, 0, {}), "unusable numbers are zero and an unusable metric is absent")
         self.assertEqual(y["night"], "at:2026-09-17T06:00:00Z")
 
-    def test_brief_json_carries_the_trend_block_and_store_json_is_copied_only_when_given(self):
+    def test_trend_json_carries_the_trend_block_and_store_json_is_copied_only_when_given(self):
         data = load_fixture()
         data["generated_at"] = NOW
         with tempfile.TemporaryDirectory() as tmp:
@@ -288,13 +288,14 @@ class StoreStatesTest(unittest.TestCase):
                 broken.write_text("{not json")
                 unreadable = render_to(root / "unreadable", data, extra_args=["--store", str(broken)])
             brief = json.loads((out / "brief.json").read_text())
-            self.assertEqual(brief["trend"]["records"], 4)
-            self.assertEqual(sorted(p.name for p in out.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "store.json", "trend.html"])
+            self.assertIsNone(brief["trend"], "every page polls brief.json; the block rides in trend.json")
+            self.assertEqual(json.loads((out / "trend.json").read_text())["records"], 4)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "store.json", "trend.html", "trend.json"])
             self.assertEqual(json.loads((out / "store.json").read_text())["records"][0]["case"], "agent-kanban-smoke")
-            self.assertIsNone(json.loads((without / "brief.json").read_text())["trend"]["source"])
+            self.assertIsNone(json.loads((without / "trend.json").read_text())["source"])
             self.assertFalse((without / "store.json").exists())
             self.assertFalse((unreadable / "store.json").exists(), "a store that did not parse is not republished over the good prior")
-            self.assertIsNone(json.loads((unreadable / "brief.json").read_text())["trend"]["source"])
+            self.assertIsNone(json.loads((unreadable / "trend.json").read_text())["source"])
 
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
@@ -337,9 +338,14 @@ class TrendPageTest(unittest.TestCase):
             # A month of nights at one key (the density a quarter's chart works
             # at; rca fails two of three every night), read with a lead-in,
             # plus a sparse case whose pool runs out at the read's edge.
+            # A key change on night 11; night 20 recorded no OutcomeValidity.
             dense = []
             for day in range(1, 31):
-                dense += later_night(base, day, f"21007{day:02d}0000000000000", passes={"rca-remediation-pr": 1})
+                night = later_night(base, day, f"21007{day:02d}0000000000000", passes={"rca-remediation-pr": 1}, key={"judge_model": "gemini-3.5-pro"} if day >= 11 else None)
+                if day == 20:
+                    for r in night:
+                        r["judged"].pop("OutcomeValidity")
+                dense += night
             for at, build in (("2026-06-20T05:50:00Z", "2100620000000000009"), ("2026-09-15T05:50:00Z", "21007150000000000000")):
                 r = copy.deepcopy(base[0])
                 r.update(case="sparse-case", recorded_at=at, build=build, object=f"{LOCATION}/sparse-case/x/{build}.jsonl")
@@ -473,6 +479,21 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn('data-focused="case:rca-remediation-pr:rate:2"', html)
         self.assertIn('data-tip="block"', html, "the focused night's tooltip is showing again")
 
+    def test_the_band_and_the_window_line_break_at_a_key_change_and_the_band_at_an_unrecorded_night(self):
+        app = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
+        rate, judged = re.findall(r'<svg class="tchart".*?</svg>', app, re.DOTALL)[:2]
+        self.assertIn("key: judge_model", app)
+        self.assertEqual(rate.count('<path class="line"'), 2, "the trailing-window line restarts at the new key")
+        self.assertEqual(judged.count('<path class="band"'), 3, "nights 2-10 at key 1, 12-19 and 21-30 at key 2: the lone night 11 and the unrecorded night 20 break it")
+        self.assertEqual(judged.count('<path class="line"'), 2, "the line of means breaks at the unrecorded night only")
+        self.assertEqual(judged.count('class="dot lone"'), 2, "night 1 and night 11, each the first at its key")
+        # No band crosses the key marker: every band's x range is on one side of it.
+        marker = float(re.search(r'<line class="keym" x1="([0-9.]+)"', judged).group(1))
+        for d in re.findall(r'<path class="band" d="([^"]+)"', judged):
+            xs = [float(v) for v in re.findall(r'[ML]([0-9.]+),', d)]
+            self.assertTrue(max(xs) < marker or min(xs) > marker, (min(xs), max(xs), marker))
+        self.assertIn("OutcomeValidity: not recorded that night", judged)
+
     def test_hit_targets_are_disjoint_and_cover_the_plot_at_a_months_density(self):
         # SVG hit-testing returns the topmost element: overlapping rects
         # would name a later night than the one under the pointer.
@@ -525,10 +546,14 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn('<a href="trend.html" class="on">Trend</a>', page)
         self.assertIn('<a href="trend.html" >Trend</a>', (self.out / "index.html").read_text())
         self.assertNotIn("<", re.search(r'id="inline-brief">(.*?)</script>', page, re.DOTALL).group(1))
-        # The trend block rides inside trend.html only; the five other pages
-        # never read it and stay the size they were.
+        # The trend block rides inside trend.html and trend.json only; the
+        # five other pages never read it, and brief.json, which every page
+        # polls every minute, does not carry it either.
         brief = json.loads((self.out / "brief.json").read_text())
-        self.assertEqual(inline_blob(page, render.INLINE_BRIEF_ID), brief, "trend.html carries the whole document, trend block included")
+        trend_json = json.loads((self.out / "trend.json").read_text())
+        self.assertIsNone(brief["trend"])
+        self.assertEqual(trend_json["records"], 32)
+        self.assertEqual(inline_blob(page, render.INLINE_BRIEF_ID), {**brief, "trend": trend_json}, "trend.html carries the whole document, trend block included")
         for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
             inlined = inline_blob((self.out / name).read_text(), render.INLINE_BRIEF_ID)
             self.assertIsNone(inlined["trend"], f"{name}: no trend block inlined")

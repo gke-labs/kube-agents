@@ -83,6 +83,9 @@ const PAGE = {
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
   briefFile: "brief.json",
   healthFile: "health.json",
+  // The trend block, published beside brief.json and polled by the Trend
+  // page alone: nothing else reads it and it grows every night.
+  trendFile: "trend.json",
   pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html", nightly: "nightly.html", trend: "trend.html" },
   titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test", nightly: "kube-agents · last night's run", trend: "kube-agents · scores over time on main" },
   // The Grid's window chips, and the one it opens with when the URL names none.
@@ -1452,6 +1455,23 @@ function trendRange(pointSets, link) {
   return { fromMs: Math.min(...stamps) - pad, toMs: Math.max(...stamps) + pad };
 }
 
+// A point's version key: a case point carries one, a domain point the keys
+// of its cases that night.
+const keyOf = (p) => (typeof p.key === "string" ? p.key : Array.isArray(p.keys) ? p.keys.join(",") : "");
+// The runs of consecutive points that `keep` and that `joins` to the point
+// before, each at least two long: what one <path> may connect. A point that
+// is not kept ends the run (a gap is drawn as a gap, never bridged).
+function segments(points, keep, joins) {
+  const out = [];
+  let run = [];
+  for (const p of points) {
+    if (keep(p) && (!run.length || joins(run[run.length - 1], p))) run.push(p);
+    else { if (run.length > 1) out.push(run); run = keep(p) ? [p] : []; }
+  }
+  if (run.length > 1) out.push(run);
+  return out;
+}
+
 // One chart: `kind` is "rate" (bars for each night's pass rate, a line for
 // the trailing admission window, the bar) or "judged" (a line of means with
 // the spread band; a lone night is a hollow point). One series colour, the
@@ -1487,15 +1507,21 @@ function trendChartHtml(t, points, kind, metric, range, markers, title, key) {
       parts.push(`<path class="bar" d="M${left.toFixed(1)},${y(0).toFixed(1)} v${(-(h - r)).toFixed(1)} a${r},${r} 0 0 1 ${r},${-r} h${(barW - 2 * r).toFixed(1)} a${r},${r} 0 0 1 ${r},${r} v${(h - r).toFixed(1)} z"></path>`);
     }
     const line = drawn.filter((p) => p.window && p.window.runs > 0);
-    if (line.length > 1) parts.push(`<path class="line" d="${line.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p.window.passes / p.window.runs).toFixed(1)}`).join(" ")}"></path>`);
+    // The window pools at one key, so its line breaks where the key changes.
+    for (const seg of segments(line, (p) => true, (a, b) => keyOf(a) === keyOf(b))) parts.push(`<path class="line" d="${seg.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p.window.passes / p.window.runs).toFixed(1)}`).join(" ")}"></path>`);
     for (const p of line) parts.push(`<circle class="dot${p.window.full ? "" : " lone"}" cx="${x(pointAt(p)).toFixed(1)}" cy="${y(p.window.passes / p.window.runs).toFixed(1)}" r="${g.dot}"></circle>`);
     const last = line[line.length - 1];
     if (last) parts.push(label(x(pointAt(last)), y(last.window.passes / last.window.runs), `${pct(last.window.passes / last.window.runs)} of ${last.window.runs}${last.window.full ? "" : last.window.cut ? " · window reaches past this read" : " · window not full"}`));
   } else if (metric) {
-    const withMetric = drawn.filter((p) => p.judged && p.judged[metric]);
-    const band = withMetric.filter((p) => { const j = p.judged[metric]; const s = j.spread || j; return isNumber(s.low) && isNumber(s.high) && (s.nights == null ? (s.cases || 0) > 1 : s.nights > 1); });
-    if (band.length > 1) parts.push(`<path class="band" d="${band.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y((p.judged[metric].spread || p.judged[metric]).high).toFixed(1)}`).join(" ")} ${[...band].reverse().map((p) => `L${x(pointAt(p)).toFixed(1)},${y((p.judged[metric].spread || p.judged[metric]).low).toFixed(1)}`).join(" ")} z"></path>`);
-    if (withMetric.length > 1) parts.push(`<path class="line" d="${withMetric.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p.judged[metric].mean).toFixed(1)}`).join(" ")}"></path>`);
+    const hasMetric = (p) => !!(p.judged && p.judged[metric]);
+    const inBand = (p) => { if (!hasMetric(p)) return false; const j = p.judged[metric], s = j.spread || j; return isNumber(s.low) && isNumber(s.high) && (s.nights == null ? (s.cases || 0) > 1 : s.nights > 1); };
+    // The band is a pooled spread at one key: it breaks where the key
+    // changes, at a night the metric was not recorded, and at a lone night.
+    // The line of means breaks at an unrecorded night only; a step at a key
+    // change is the thing the marker beside it explains.
+    for (const seg of segments(drawn, inBand, (a, b) => keyOf(a) === keyOf(b))) parts.push(`<path class="band" d="${seg.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y((p.judged[metric].spread || p.judged[metric]).high).toFixed(1)}`).join(" ")} ${[...seg].reverse().map((p) => `L${x(pointAt(p)).toFixed(1)},${y((p.judged[metric].spread || p.judged[metric]).low).toFixed(1)}`).join(" ")} z"></path>`);
+    for (const seg of segments(drawn, hasMetric, () => true)) parts.push(`<path class="line" d="${seg.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p.judged[metric].mean).toFixed(1)}`).join(" ")}"></path>`);
+    const withMetric = drawn.filter(hasMetric);
     for (const p of withMetric) {
       const j = p.judged[metric], s = j.spread || j;
       const lone = s.nights != null ? s.nights < 2 : (s.cases || 0) < 2;
@@ -1766,7 +1792,7 @@ function renderAll(scroll = false) {
   renderFreshness();
   if (focusedHit != null) {
     const again = app.querySelector(`[data-hit="${CSS.escape(focusedHit)}"]`);
-    if (again) again.focus();
+    if (again) again.focus({ preventScroll: true });
   }
   // The section is rendered just above, after the browser looked for the
   // anchor, and a `view=` fragment names no element anyway: scroll by hand.
@@ -1795,6 +1821,9 @@ async function refresh() {
   try {
     const next = await fetchJson(PAGE.briefFile);
     if (next && typeof next === "object" && Array.isArray(next.runs)) {
+      // brief.json carries no trend block (trend.json does, below); the
+      // one inlined or last polled stays.
+      next.trend = brief.trend;
       brief = next;
       briefLoaded = true;
       health = normalizeHealth(next.health) ?? health;
@@ -1811,6 +1840,14 @@ async function refresh() {
     if (fresh) health = fresh;
   } catch (err) {
     // health.json is optional; the inlined verdict (or none) stays.
+  }
+  if (document.body.dataset.page === "trend") {
+    try {
+      const next = await fetchJson(PAGE.trendFile);
+      if (next && typeof next === "object" && !Array.isArray(next)) brief.trend = next;
+    } catch (err) {
+      // The inlined block stays, as brief.json's data does above.
+    }
   }
   renderAll();
 }

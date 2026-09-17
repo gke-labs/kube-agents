@@ -355,7 +355,7 @@ class RenderedFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = render_to(tmp, data, health=health_doc())
             names = sorted(p.name for p in out.iterdir())
-            self.assertEqual(names, ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "trend.html"])
+            self.assertEqual(names, ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "trend.html", "trend.json"])
             brief = json.loads((out / "brief.json").read_text())
             self.assertEqual(brief["health"]["state"], "OUTAGE")
             index = (out / "index.html").read_text()

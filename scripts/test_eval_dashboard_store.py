@@ -41,10 +41,11 @@ class FakeGsutil:
     urls under the prefix, `cat` concatenates the objects in argument order.
     Records every call so a test can count listings and fetches."""
 
-    def __init__(self, objects=None, fail_ls=None, fail_cat=None):
+    def __init__(self, objects=None, fail_ls=None, fail_cat=None, fail_urls=()):
         self.objects = dict(objects if objects is not None else fixture_objects())
         self.fail_ls = fail_ls
         self.fail_cat = fail_cat
+        self.fail_urls = set(fail_urls)  # a cat naming any of these fails whole, as gsutil's does
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -59,8 +60,8 @@ class FakeGsutil:
                 return subprocess.CompletedProcess(argv, 1, "", "CommandException: One or more URLs matched no objects.")
             return subprocess.CompletedProcess(argv, 0, "\n".join(hits) + "\n", "")
         if args[0] == "cat":
-            if self.fail_cat:
-                return subprocess.CompletedProcess(argv, 1, "", self.fail_cat)
+            if self.fail_cat or self.fail_urls.intersection(args[1:]):
+                return subprocess.CompletedProcess(argv, 1, "".join(self.objects.get(u, "") for u in args[1:] if u not in self.fail_urls), self.fail_cat or "ServiceException: 503 Service Unavailable")
             return subprocess.CompletedProcess(argv, 0, "".join(self.objects[u] for u in args[1:]), "")
         raise AssertionError(f"unexpected gsutil call {argv}")
 
@@ -199,11 +200,26 @@ class ReadStoreTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             read(FakeGsutil(fail_ls="AccessDeniedException: 403"))
 
-    def test_a_failed_cat_is_a_warning_and_the_next_chunk_is_still_read(self):
+    def test_a_failed_cat_is_a_warning_per_object_and_the_next_chunk_is_still_read(self):
         doc = read(FakeGsutil(fail_cat="ServiceException: 503"))
         self.assertEqual(doc["records"], [])
-        self.assertEqual(len(doc["warnings"]), 1)
-        self.assertIn("gsutil cat failed for 4 object(s)", doc["warnings"][0])
+        self.assertEqual(len(doc["warnings"]), 4, "one warning per object the read lost, not per chunk")
+        self.assertTrue(all(w.endswith(": gsutil cat failed: ServiceException: 503") for w in doc["warnings"]), doc["warnings"])
+        self.assertTrue(doc["warnings"][0].startswith(url_of("agent-kanban-smoke")))
+
+    def test_one_bad_object_costs_that_object_and_not_its_chunk_mates(self):
+        bad = url_of("rca-remediation-pr")
+        gsutil = FakeGsutil(fail_urls=[bad])
+        doc = read(gsutil)
+        self.assertEqual(sorted(r["case"] for r in doc["records"]), ["agent-kanban-smoke", "cluster-agent-crashloop-debug", "upgrades-fleet-version-table"])
+        self.assertEqual(doc["warnings"], [f"{bad}: gsutil cat failed: ServiceException: 503 Service Unavailable"])
+        self.assertEqual(doc["error"], None, "a lost object is a warning the page shows, not a failed read")
+        # One chunked cat, then one cat per object of the failed chunk.
+        self.assertEqual([len(c) - 2 for c in gsutil.cats], [4, 1, 1, 1, 1])
+        # The lost object is not in the prior, so the next tick fetches it alone.
+        again = read(FakeGsutil(), prior=doc)
+        self.assertEqual(len(again["records"]), 4)
+        self.assertEqual(again["fetched"], 1)
 
     def test_cats_are_chunked(self):
         objects = {}
