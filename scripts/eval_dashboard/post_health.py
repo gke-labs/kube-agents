@@ -643,7 +643,7 @@ def pool_numbers(pool: dict) -> list[str]:
     waiting = pool.get("over_threshold") or 0
     if waiting:
         lines.append(
-            f"{waiting} run{'' if waiting == 1 else 's'} waiting right now,"
+            f"{waiting} {plural(waiting, 'run')} waiting right now,"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
     return lines
@@ -830,7 +830,7 @@ def pool_digest_line(pool: dict) -> str:
     if pool.get("over_threshold") and not pool.get("day"):
         waiting = pool["over_threshold"]
         return (
-            f"⏳ Queue backed up — {waiting} run{'' if waiting == 1 else 's'} waiting"
+            f"⏳ Queue backed up — {waiting} {plural(waiting, 'run')} waiting"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
     # Both figures, as pool_numbers does: the day breaches on p50 or p95, so
