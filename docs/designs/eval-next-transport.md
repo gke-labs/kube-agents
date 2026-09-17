@@ -131,11 +131,12 @@ all five rather than a subset the session record has to special-case.
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
 Chat; a localhost door has no silent-stop failure mode, so it is a side door that may sit beside
-exactly one real backend, and the guard keeps refusing two real ones. The door alone is enough
-for the gateway to start, which is what the eval install needs until stage 2 gives it a real
-backend; the door beside that backend is not a refusal, which is what lets stage 2 run the inject
-and Chat transports against one install and compare them. The Slack adapter in flight agrees on
-the same reading.
+exactly one real backend, and the guard keeps refusing two real ones. The door beside a real
+backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
+against one install and compare them, and the Slack adapter in flight agrees on the same reading.
+One thing the decision did not address and this document assumes: the door alone is enough for
+the gateway to start, because the eval install has no real backend until stage 2 gives it one.
+The adapter's change settles that in the guard itself.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
 for a dead tunnel: the adapter unreachable, the gateway refusing the injection, or no executor
@@ -146,8 +147,16 @@ its next message with a notice naming the task. The harness runs no second clock
 deadline passes with no terminal, its cancel is that next message, and what comes back on the
 conversation says which case this was: the never-started notice is infrastructure, and a cancel
 of a task that had events is the deadline outcome. So the harness and the gateway agree on what
-"nobody took it" means, and `AGENT_HTTP_TIMEOUT` on this path is never set below the grace. A
-task an executor took and finished with a `failed` terminal is a graded failure.
+"nobody took it" means, on two conditions. The harness's deadline on this path runs strictly
+above the grace by more than the submit latency, not at it: the api default of `AGENT_HTTP_TIMEOUT`
+and the grace default are both ten minutes, the heal compares strictly against a clock the
+gateway starts in `startTask` after the harness's own clock started, and a cancel that arrives
+inside the grace is sent to a task nobody consumes, acknowledged as "cancel sent", and never
+followed by a terminal. And that last outcome has a reading of its own when it happens anyway:
+a cancel acknowledged and followed by no terminal within a short bound is infrastructure, the
+cancel reached nobody, and the harness confirms it by sending one more message once the grace
+has passed and reading the never-started notice. A task an executor took and finished with a
+`failed` terminal is a graded failure.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
@@ -161,8 +170,8 @@ while the job stayed green, the gateway among them.
 gate, an `authority` block that names a real principal, and the reply rendered into the thread.
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
-`resource_property`, `fleet_resource_property` and `ledger_issue_contains` read the cluster and
-GitHub and never touched the transport. `tool_called` reads the trajectory, which on this path
+`resource_property` and `fleet_resource_property` read the cluster and never touched the
+transport. `tool_called` reads the trajectory, which on this path
 has data only when the executor publishes `activity` artifacts; the Hermes bridge publishes
 status updates and a `result` artifact and no `activity` or `progress` artifacts, while the
 worker adapter publishes `activity` and `progress` beside the result, so a case
@@ -170,6 +179,10 @@ that gates on `tool_called` has no data on stage 1 until the bridge publishes ac
 persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either.
+`ledger_issue_contains` is in the same class: it finds the ledger by scanning the final message
+for a GitHub issue URL, and that URL has one channel, the delegated worker's card result, which
+today's wait folds into the final message. Until the rebuilt wait does the same, every case that
+gates on it fails on stage 1 with no issue URL in the report, a graded failure and not an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
 session worker carries only the tool-less `chat` profile; running the platform persona as a
@@ -193,7 +206,9 @@ and `correlationId`, subscribe to `a2a.tasks.{addressee}.{taskId}.events` and
 and the terminal the gateway writes as supervisor when an executor dies without one; an install
 that took the supervisor split inside the last retention window still holds older supervisor
 terminals on `.events`), publish one `message` envelope on `a2a.tasks.{addressee}.{taskId}.in`
-(`AGENT_A2A_ADDRESSEE` selects the addressee, default `platform`), fold the events as `tasks/get`
+(`AGENT_A2A_ADDRESSEE` selects the addressee, default `platform`; the `eval` grant below reaches
+`platform` alone, so any other value is refused at the callout until the grant widens), fold the
+events as `tasks/get`
 folds them, and publish `cancel` on the way out of a timeout. The forward enters from the node,
 which the NATS ingress NetworkPolicy does not govern, so the fence that admits only enumerated bus
 clients in-cluster does not have to name the harness. It proves the bus, the callout, the streams
@@ -292,7 +307,9 @@ that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results 
 `kanban_show` payloads in the trajectory, and gives up after three turns that report nothing, and
 on this path the bridge publishes no trajectory. Stage 1 writes the wait again for the inject
 path: card ids and statuses read from the `result` text, the status question sent as a new turn
-on the same conversation key, and the worker logs read by those ids for `worker_commands`. It
+on the same conversation key, the delivered card results appended to the graded answer as
+today's wait appends them, so `ledger_issue_contains` and `report_contains` see what the worker
+returned, and the worker logs read by those ids for `worker_commands`. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
 transport. Reading card ids out of `result` text is interim: a structured artifact for them is
 a bridge change outside this document, and the text read is the first thing child tasks delete.
