@@ -64,15 +64,16 @@ of the finding: the mode does not change what the cases see, because the cases n
 
 ## Stage 1: the gateway's inject adapter
 
-The gateway is in the path, and the harness holds no bus credential (decided 2026-09-17). The
+The gateway is in the path, and the presubmit's transport holds no bus credential (decided
+2026-09-17). The
 direct-bus transport the first draft of this document proposed proves the bus, the callout, the
 streams and the executor, but it leaves out the gateway's routing, its session registry and the
 relay back, and it hands a second process the one credential that may publish on `.in`. Stage 1
 is therefore the next-stack analogue of the door the harness uses today: an **inject adapter in
 the gateway**, a third backend beside Discord and Google Chat, HTTP on localhost or a ClusterIP
-Service, off by default, rendered by the operator only under the eval flag. The gateway spec's
-"The test backend" section is the home of its design; this document records what the harness
-does with it. The direct-bus transport survives as a diagnostic, below.
+Service, off by default, rendered by the operator only under the eval flag. Its design text goes
+in the gateway spec's "The test backend" section, which does not carry it yet; this document
+records what the harness does with it. The direct-bus transport survives as a diagnostic, below.
 
 Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is today's transport byte for byte, and
 the presubmit exports nothing new until it chooses to. The exchange:
@@ -95,10 +96,16 @@ the presubmit exports nothing new until it chooses to. The exchange:
    executor publishes them. Token counts are not on the bus; the record says so rather than
    failing.
 
-The adapter binds to localhost or a ClusterIP Service with a NetworkPolicy edge from the eval
-runner's path only, and carries no authentication of its own: it is rendered only under the eval
-flag, and the principal it maps is a synthetic one. That is stated here so nobody reads it as a
-customer surface. Being a backend, the adapter also satisfies the gateway's one-backend guard
+The adapter binds to localhost or a ClusterIP Service. A NetworkPolicy edge fences it from every
+in-cluster pod but the eval runner's path; it does not govern the port-forward the harness uses,
+which enters from the node, so the fence is not what keeps the door shut. What keeps it shut is a
+bearer token the operator renders into a Secret beside the adapter's env, under the eval flag
+only, which the harness reads the way the presubmit reads `API_SERVER_KEY` today. The door it
+replaces admits key holders, and this one admits the same population rather than everyone
+holding `pods/portforward` in the namespace; that matters because the task it starts runs on the
+platform persona with the install's cluster and GitHub credentials, under an `authority` block
+the gateway mints for a synthetic principal, past the allowed-users gate. Being a backend, the
+adapter also satisfies the gateway's one-backend guard
 (`a2a/gateway/config.go` refuses to start with no backend and with two), so an eval install with
 the adapter enabled has a gateway that starts. The guard keeps refusing two, and the Slack adapter
 in flight has to agree on that with the inject adapter.
@@ -125,8 +132,9 @@ GitHub and never touched the transport. `tool_called` reads the trajectory, whic
 has data only when the executor publishes `activity` artifacts; the Hermes bridge publishes
 `result` alone and the worker adapter publishes `activity` and `progress` beside it, so a case
 that gates on `tool_called` has no data on stage 1 until the bridge publishes activity or the
-persona moves to the worker path. `worker_commands` reads the kanban worker logs, which the case
-runner's delegation poll still collects for the cases that delegate (Completion signals).
+persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
+this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
+signals), and until then a case that gates on it has no data on stage 1 either.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
 session worker carries only the tool-less `chat` profile; running the platform persona as a
@@ -235,10 +243,16 @@ ended and the card was filed, not that the work is done.
 Stage 1 handles that in three parts. The transport awaits the terminal of a named task id,
 "await the terminal of task X" rather than "await the task I submitted", for everything the
 executor does itself, which is most cases and removes the poll turns. For a terminal whose result
-names card ids, the case runner re-enters today's kanban poll one hop further in, with the time
-cost above moved with it; the poll lives in the case runner and not in the transport, so it can
-be deleted without touching the transport. When child tasks exist, the parent's events name the
-child's task id, the same await code awaits it, and the poll goes.
+names card ids, the case runner waits for the cards one hop further in, with the time cost above
+moved with it. Today's wait cannot be re-entered as it is: it is a method of the api transport
+that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
+`kanban_show` payloads in the trajectory, and gives up after three turns that report nothing, and
+on this path the bridge publishes no trajectory. Stage 1 writes the wait again for the inject
+path: card ids and statuses read from the `result` text, the status question sent as a new turn
+on the same conversation key, and the worker logs read by those ids for `worker_commands`. It
+lives in the case runner and not in the transport, so it can be deleted without touching the
+transport. When child tasks exist, the parent's events name the child's task id, the same await
+code awaits it, and the wait goes.
 
 ## The CI flag
 
@@ -262,9 +276,9 @@ what every pull request measures, and that is the eval crew's decision, not a sc
 The next stack still has holes independent of any case (no resource requests on the NATS,
 gateway or provisioning pods, a gateway with no backend until the adapter lands, images in a
 private registry), and a default-on flip would red every pull request for reasons none of them
-caused. And until a case sends through
-the gateway, a run under `next` measures nothing a run under `today` does not; the flag exists so
-the matrix can be run against `next` on demand while stage 1 lands.
+caused. And until a case sends through the gateway, a run under `next` measures nothing a run
+under `today` does not; the flag exists so the matrix can be run against `next` on demand while
+stage 1 lands.
 
 ## Open questions
 
