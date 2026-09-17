@@ -2581,10 +2581,10 @@ def parse_declarations(
             continue
         raw_object = item["object"].strip()
         # Each side of the slash on its own: `Deployment / api` is a hand-typed
-        # spelling of `Deployment/api`, and the join is a case-blind lookup
-        # against the finding's `Kind/name` that does not fold whitespace, so
-        # the whitespace would not fail the item here but silently match
-        # nothing there.
+        # spelling of `Deployment/api`. The join would fold the spacing anyway,
+        # since it reduces each field as the finding id does; stripping here
+        # keeps the filed entry, and the `Kind/name` the ledger prints from it,
+        # in the canonical spelling.
         kind, _, name = (part.strip() for part in raw_object.partition("/"))
         if not kind or not name or "/" in name:
             log(f"WARNING: {item_where}: object must be Kind/name, got {raw_object!r}; skipped.")

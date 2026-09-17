@@ -6133,8 +6133,9 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertEqual(payload["declared"], 1)
         self.assertEqual(payload["new"], 4)
         self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
-        # The moved entry keeps the finding's spelling; the rendered cell
-        # drops the whitespace around it.
+        # The moved entry keeps the finding's spelling, the spaces around the
+        # slash included; the rendered cell strips only its two ends, so the
+        # column carries no margin and the spelling stays the finding's.
         self.assertIn("| `payments/Deployment / checkout-gateway` |", self.ledger_body())
 
     def test_a_cluster_scoped_entry_matches_only_its_cluster(self):
