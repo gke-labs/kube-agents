@@ -117,6 +117,36 @@ class RepAndOutcomeTest(unittest.TestCase):
         with_excerpt = dict(task("a", "fff"), excerpt="  payments-api is Pending  ")
         self.assertEqual(classify.excerpt_of(with_excerpt), "payments-api is Pending")
 
+    def test_the_excerpt_is_the_reason_reps_own_words(self):
+        """The quote beside the grader's reason comes from the repetition that
+        reason belongs to, never from a different one."""
+        t = task("a", "ff")
+        t["reps"][1]["excerpt"] = "rep two's report"
+        self.assertEqual(classify.first_reason(t), classify.clean_reason(GRADED_FAIL))
+        self.assertIsNone(classify.excerpt_of(t), "rep 1 said nothing; rep 2's words are not rep 1's")
+        t["reps"][0]["excerpt"] = "  rep one's report  "
+        self.assertEqual(classify.excerpt_of(t), "rep one's report")
+        # A never-ran skeleton leads (rung 3: stale output, a storm reason the
+        # pages skip); its text is not quoted under rep 2's reason.
+        s = task("b", "ef")
+        s["reps"][0]["excerpt"] = "stale skeleton text"
+        s["reps"][1]["excerpt"] = "the real report"
+        self.assertEqual(classify.first_reason(s), classify.clean_reason(GRADED_FAIL))
+        self.assertEqual(classify.excerpt_of(s), "the real report")
+        # The pages link the transcript of that same repetition.
+        self.assertEqual(classify.shown_rep_n(t), 1)
+        self.assertEqual(classify.shown_rep_n(s), 2)
+        self.assertIsNone(classify.shown_rep_n({"name": "d", "result": "fail"}), "a synthetic rep has no number")
+        # No rep carries a reason: nothing to pair with, so the first rep's
+        # words stand (the gate comment's fallback for a reason-less rep).
+        p = {"name": "c", "result": "fail", "reps": [
+            {"n": 1, "result": "fail", "reason": None},
+            {"n": 2, "result": "fail", "reason": None, "excerpt": "the only words on record"},
+        ]}
+        self.assertEqual(classify.first_reason(p), "")
+        self.assertEqual(classify.excerpt_of(p), "the only words on record")
+        self.assertEqual(classify.shown_rep_n(p), 2, "and the transcript link follows the quote")
+
     def test_the_roster_is_read_from_the_roster_file(self):
         roster = classify.admitted_cases()
         self.assertIsNotNone(roster)

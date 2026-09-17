@@ -289,6 +289,32 @@ def main() -> None:
         "a real report is not mistaken for silence",
     )
 
+    # 10. `adapter.SILENT_MARKER` restates this string because `cron.scheduler`
+    #     is absent from the checkout the unit tests run in. A restated constant
+    #     is only safe while something notices divergence, and this is the one
+    #     place both are importable. If upstream ever renames the token, the
+    #     adapter's silence predicate would stop matching it and every quiet
+    #     cron run would post the new marker to the home channel — so fail the
+    #     image build here instead.
+    from plugins.platforms.chat.adapter import SILENT_MARKER as ADAPTER_SILENT_MARKER
+    from plugins.platforms.chat.adapter import is_silent_report
+
+    check(
+        ADAPTER_SILENT_MARKER == SILENT_MARKER,
+        f"the adapter's restated silence marker still matches upstream's ({SILENT_MARKER!r})",
+    )
+    # The predicate the relay actually calls, against the real marker and
+    # against the shape upstream's matcher swallows: an alert that quotes the
+    # marker while explaining a quiet run. `_is_cron_silence_response` accepts
+    # the second one, which is why the adapter does not ask it.
+    check(is_silent_report(f"**{SILENT_MARKER}**"), "a dressed marker is still silence")
+    check(
+        not is_silent_report(
+            f"Incident: the 06:00 audit posted nothing.\n{SILENT_MARKER}\nwas the last thing recorded."
+        ),
+        "an alert that quotes the marker in prose is not silence",
+    )
+
     print("\nverify_chat_relay: all checks passed")
 
 

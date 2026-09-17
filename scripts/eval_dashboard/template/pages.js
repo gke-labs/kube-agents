@@ -307,10 +307,13 @@ const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 const prText = (pr) => (pr == null ? "no PR" : `PR #${pr}`);
 const prLink = (pr) => (pr == null ? prText(pr) : `<a href="${PAGE.prUrl}/${esc(pr)}">${esc(prText(pr))}</a>`);
 const buildUrl = (run) => (run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
-const transcriptUrl = (run, kase) => {
+const transcriptUrl = (run, kase, n = 1) => {
   const base = buildUrl(run);
-  return base ? `${base}/artifacts/eval_${enc(kase)}_rep1.log` : null;
+  return base ? `${base}/artifacts/eval_${enc(kase)}_rep${enc(n)}.log` : null;
 };
+// The repetition whose reason and quote a case row shows (classify.py's
+// rep_n); rep 1, as the pages always linked, when the row names none.
+const repOf = (c) => (Number.isInteger(c.rep_n) && c.rep_n > 0 ? c.rep_n : 1);
 const issueLink = (issue) => {
   const match = /^#(\d+)$/.exec(String(issue).trim());
   return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
@@ -588,11 +591,12 @@ function agentSawHtml(inc, inWindow) {
     return `<p>No agent ran. The build log is the evidence${url ? `: <a href="${esc(url)}">${esc(prText(death.pr))} at ${esc(et(runFinish(death)))}</a>` : ""}.</p>`;
   }
   if (!pick) return `<p class="mut">No failed repetition with a recorded reason in this window.</p>`;
-  const url = transcriptUrl(pick.run, pick.c.case);
+  const n = repOf(pick.c);
+  const url = transcriptUrl(pick.run, pick.c.case, n);
   const quote = pick.c.excerpt
     ? `<div class="q">“${esc(pick.c.excerpt)}”<small>From the agent's report on ${prLink(pick.run.pr)} · <code>${esc(pick.c.case)}</code>${url ? ` · <a href="${esc(url)}">full transcript</a>` : ""}</small></div>`
     : "";
-  return `${quote}<div class="reason">${esc(pick.c.reason)}</div><small class="mut">The check that failed, as the grader wrote it, on ${prLink(pick.run.pr)} · <code>${esc(pick.c.case)}</code>${url ? ` · <a href="${esc(url)}">transcript (rep 1)</a>` : ""}. data.json carries no agent report text, so nothing here is quoted from the agent.</small>`;
+  return `${quote}<div class="reason">${esc(pick.c.reason)}</div><small class="mut">The check that failed, as the grader wrote it, on ${prLink(pick.run.pr)} · <code>${esc(pick.c.case)}</code>${url ? ` · <a href="${esc(url)}">transcript (rep ${n})</a>` : ""}.${pick.c.excerpt ? "" : " The build log carried no report excerpt for this repetition, so nothing here is quoted from the agent."}</small>`;
 }
 
 function changedBeforeHtml(inc, inWindow) {
@@ -835,14 +839,15 @@ function caseCard(run, c) {
   // a tag -- the tags above answer "is this mine?" from the presubmit alone.
   const nightly = c.nightly_failed_recent === true ? " · it also failed every repetition on the latest nightly run"
     : c.nightly_failed_recent === false ? " · the latest nightly run passed it" : "";
-  const url = transcriptUrl(run, c.case);
+  const n = repOf(c);
+  const url = transcriptUrl(run, c.case, n);
   const log = buildUrl(run);
   return `<div class="case"><div class="hd"><h3>${esc(c.case)}</h3>${tagFor(c)}</div>` +
     `<div class="sub">${esc(how)}${esc(rate)}${esc(nightly)}</div>` +
     (c.reason ? `<div class="reason">${esc(c.reason)}</div>` : "") +
     (c.excerpt ? `<div class="quote">“${esc(c.excerpt)}”</div>` : "") +
     (c.do ? `<div class="do"><b>Do:</b> ${esc(c.do)}</div>` : "") +
-    `<div class="links">${url ? `<a href="${esc(url)}">transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(caseHref(c.case))}">this case's history</a></div></div>`;
+    `<div class="links">${url ? `<a href="${esc(url)}">transcript (rep ${n})</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(caseHref(c.case))}">this case's history</a></div></div>`;
 }
 
 // classify.py's run-level `do` for a run with no cases, as "<imperative>.
@@ -1215,13 +1220,13 @@ function detailHtml() {
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
   const length = startMs != null && finishMs != null ? ` · ${minutesText(finishMs - startMs)} run` : "";
   const tag = c.outcome === "failed" || c.outcome === "infra" ? ` · ${tagFor(c)}` : "";
-  const url = transcriptUrl(run, c.case), log = buildUrl(run);
+  const n = repOf(c), url = transcriptUrl(run, c.case, n), log = buildUrl(run);
   return `<div class="detail" id="detail"><h3><code>${esc(c.case)}</code> · ${prLink(run.pr)} · ${esc(et(runFinish(run)))} · project ${esc(projectShort(run.project))}<button type="button" class="close" data-toggle="close">close ×</button></h3>` +
     `<div class="sub">${esc(how)}${esc(length)} · ${plural(others, "other case")} passed in this run${tag}</div>` +
     (c.reason ? `<div class="reason">${esc(c.reason)}</div>` : "") +
     (c.excerpt ? `<div class="quote">“${esc(c.excerpt)}”</div>` : "") +
     (c.do ? `<div class="do"><b>Do:</b> ${esc(c.do)}</div>` : "") +
-    `<div class="links">${url ? `<a href="${esc(url)}">full transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(runHref(run))}">this run's page</a><a href="${esc(caseHref(c.case))}">this case's history →</a></div></div>`;
+    `<div class="links">${url ? `<a href="${esc(url)}">full transcript (rep ${n})</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(runHref(run))}">this run's page</a><a href="${esc(caseHref(c.case))}">this case's history →</a></div></div>`;
 }
 
 /* ---- the Nightly report (SCHEMA.md: brief.json's nightly block) ---- */

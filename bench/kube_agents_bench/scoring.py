@@ -232,6 +232,10 @@ class RunRecord:
     setup_id: str | None
     scoring_version: str | None
     agent_model: str | None
+    #: The agent's final report as devops-bench recorded it (``output``, the
+    #: "Actual Output" the judge grades). Read for reporting only: the gate
+    #: quotes its first lines into the build log; no rung reads it.
+    output: str = ""
 
     @property
     def catastrophic(self) -> float | None:
@@ -335,6 +339,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
             setup_id=_as_str(manifest.get("setupId")),
             scoring_version=_as_str(row.get("scoringVersion")),
             agent_model=_as_str(manifest.get("model")),
+            output=str(rec.get("output") or ""),
         )
 
     # The documented empty-list record: the file exists, zero tasks were
@@ -380,6 +385,9 @@ class RepResult:
     failed_checks: list[str] = field(default_factory=list)
     latency: float | None = None
     total_tokens: int | None = None
+    #: The agent's final report, verbatim, for the build log's excerpt line.
+    #: Not in the hand-off: the dashboard reads it from the log.
+    report: str = ""
 
     @property
     def scored(self) -> bool:
@@ -514,6 +522,7 @@ def classify_rep(
             total_tokens=(
                 record.tokens.get("total") if record and record.tokens else None
             ),
+            report=record.output if record else "",
         )
 
     has_infra = spec.deployer != NOOP_DEPLOYER

@@ -10,6 +10,11 @@ decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
 the dashboard's Brief bakes that verdict and its history (`render.py --health`,
 `--health-history`; the checkout is fetched with full history for the Brief's
 "what changed right before" block).
+The Brief's "What the agent saw" also quotes the agent's own words:
+`bench-gate case` prints the first 300 characters of each failing
+repetition's final report under its grading line (`rep N report:`), the
+collector keeps it as `reps[].excerpt`, and the Brief and the run page show
+it beside the grader's reason (builds graded before 2026-09-15 carry none).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken

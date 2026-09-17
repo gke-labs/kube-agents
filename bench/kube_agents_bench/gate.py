@@ -43,6 +43,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -105,6 +106,19 @@ ADMISSION_CELL_UNKNOWN = "--"
 RECORD_COLUMN = "Record says"
 #: A hand-off that predates `record_verdict`.
 RECORD_CELL_UNKNOWN = "--"
+
+# How much of the agent's final report the build log quotes per failing
+# repetition. The dashboard's Brief shows it as "what the agent saw" beside
+# the grader's reason; the collector (scripts/eval_dashboard/collect.py)
+# caps at the same figure, so the two never disagree about the cut.
+REPORT_EXCERPT_MAX_CHARS = 300
+
+# What must not reach the log line: C0 and C1 controls and DEL (a captured
+# kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
+# which a JSON `\ud8xx` escape in results.json turns into a str that print()
+# cannot encode -- and an exception there would end `bench-gate case` before
+# its hand-off is written.
+_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -238,6 +252,22 @@ def _label(case: dict[str, Any]) -> str:
     return "UNSTABLE"
 
 
+def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
+    """The agent's final report as one build-log line, or "" when it said nothing.
+
+    Control characters and lone surrogates become spaces and whitespace is
+    collapsed to single spaces, so the line is one printable line whatever
+    the report held; ``<`` is dropped, so a report can neither forge the
+    log's ``<<< finished`` marker nor open a tag in anything that renders
+    the log as HTML; anything past ``limit`` is cut, with an ellipsis in the
+    last position to say so.
+    """
+    flat = " ".join(_UNPRINTABLE.sub(" ", str(text or "")).replace("<", "").split())
+    if len(flat) > limit:
+        return flat[: limit - 1].rstrip() + "…"
+    return flat
+
+
 def _cmd_case(args: argparse.Namespace) -> int:
     try:
         spec = load_case(args.task)
@@ -352,6 +382,15 @@ def _cmd_case(args: argparse.Namespace) -> int:
     for rep in verdict.reps:
         judged = " ".join(f"{k}={v}" for k, v in sorted(rep.judged.items()))
         print(f"  rep {rep.index}: {rep.outcome} -- {rep.reason}" + (f" [{judged}]" if judged else ""))
+        # The agent's own words, one line under the grading line of every
+        # repetition that did not pass, so the dashboard can quote the report
+        # beside the check that failed. A pass needs no quote; an empty
+        # report (a transport failure's, typically) prints nothing rather
+        # than an empty line. Its own shape -- `rep N report:` -- so nothing
+        # that greps for `rep N:` matches it.
+        excerpt = _report_excerpt(rep.report) if rep.outcome != "pass" else ""
+        if excerpt:
+            print(f"  rep {rep.index} report: {excerpt}")
     print(f"  admission: {admission_reason}")
     # stderr, not stdout: this is the one line that says the judged rung is
     # quieter than the configuration claims, and it must survive a reader who

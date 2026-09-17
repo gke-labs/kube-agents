@@ -2,6 +2,9 @@ exit 0
 Task agent-kanban-smoke Result: [UNSTABLE] passed 0 of 3 repetitions (not admitted, so it cannot collapse)
   deployer: noop
   rep 1: fail -- VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe'] [OutcomeScore=0.5 OutcomeValidity=0.9 ToolInvocation=0.6]
+  rep 1 report: Delegated to the platform agent — the task was created with id t_bbbebbd5. [Redacted: the captured report embedded a live fleet inventory. No rung reads this field; the gate quotes its first 300 characters into the build log — see fixtures/runs/README.md.]
   rep 2: fail -- VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe'] [OutcomeScore=0.5 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 2 report: 🔀 Delegated to the **platform** agent Created as task `t_169f6f10`. 🔀 Delegated to the **platform** agent Task `t_169f6f10` ("devops-bench smoke probe") is done — completed by the platform agent in about 28 seconds, with zero mutations. Its full result: Dispatch path works end to end — card `t_169f…
   rep 3: fail -- VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe'] [OutcomeScore=0.5 OutcomeValidity=0.2 ToolInvocation=0.6]
+  rep 3 report: Delegated to the platform agent — the task was created with id t_fe1fc689. Delegated to the platform agent — task t_fe1fc689 ("devops-bench smoke probe") is done, completed at 19:13 by run 425. Its complete result: Card received and executed — the board and dispatch path are working end to end, wit…
   admission: no screening evidence for this case yet

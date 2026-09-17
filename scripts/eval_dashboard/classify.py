@@ -12,7 +12,7 @@ interface::
         "build": str, "pr": int|None, "headline": str, "lede": str,
         "verdict": "red" | "green" | "infra",
         "cases": [{"case", "outcome", "cls", "also_failing_prs",
-                   "pass_rate_30d", "reason", "excerpt", "do",
+                   "pass_rate_30d", "reason", "excerpt", "rep_n", "do",
                    "admitted", "reps"}],
         "matches_incident": bool,
         # run-level detail: "setup_death", "storm_reps", "cls", "do"
@@ -363,24 +363,61 @@ def clean_reason(reason: str | None) -> str:
     return REASON_SCORE_PREFIX_RE.sub("", reason or "").strip()
 
 
-def first_reason(task: dict) -> str:
-    """The first graded failure's reason, else the first storm rep's."""
+def reason_rep(task: dict) -> dict | None:
+    """The repetition whose reason the pages show: the first graded failure
+    with a reason, else the first rep of any kind with one; None when no
+    rep carries a reason."""
     graded = [r for r in task_reps(task) if rep_kind(r) == "fail" and r.get("reason")]
     other = [r for r in task_reps(task) if r.get("reason")]
     for rep in graded + other:
-        return clean_reason(rep.get("reason"))
-    return ""
+        return rep
+    return None
+
+
+def first_reason(task: dict) -> str:
+    """The first graded failure's reason, else the first storm rep's."""
+    rep = reason_rep(task)
+    return clean_reason(rep.get("reason")) if rep else ""
+
+
+def _has_excerpt(rep: dict) -> bool:
+    return isinstance(rep.get("excerpt"), str) and bool(rep["excerpt"].strip())
+
+
+def shown_rep(task: dict) -> dict | None:
+    """The one repetition a case row is about: the rep whose reason
+    ``first_reason`` shows, else -- when no rep carries a reason -- the
+    first with an excerpt. Its reason, its words and its transcript link
+    then all belong to the same run of the agent."""
+    rep = reason_rep(task)
+    if rep:
+        return rep
+    for candidate in task_reps(task):
+        if _has_excerpt(candidate):
+            return candidate
+    return None
+
+
+def shown_rep_n(task: dict) -> int | None:
+    """The 1-based number of :func:`shown_rep`, so a page links that
+    repetition's transcript and not rep 1's. None when there is no shown
+    rep or it has no number (a synthetic rep from a single result); the
+    pages then link rep 1 as they always did."""
+    rep = shown_rep(task)
+    n = rep.get("n") if rep else None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
 
 
 def excerpt_of(task: dict) -> str | None:
-    """A report excerpt, when a collector ever records one (additive,
-    optional: ``tasks[].excerpt`` or ``reps[].excerpt``). Never invented."""
+    """A report excerpt, when the collector recorded one (additive, optional):
+    ``tasks[].excerpt``, else the ``excerpt`` of :func:`shown_rep`, so the
+    quote and the check beside it come from the same run of the agent: a rep
+    that said nothing quotes nothing, and another rep's words never stand
+    in. Never invented."""
     if isinstance(task.get("excerpt"), str) and task["excerpt"].strip():
         return task["excerpt"].strip()
-    for rep in task_reps(task):
-        if isinstance(rep.get("excerpt"), str) and rep["excerpt"].strip():
-            return rep["excerpt"].strip()
-    return None
+    rep = shown_rep(task)
+    return rep["excerpt"].strip() if rep and _has_excerpt(rep) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -580,6 +617,7 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         "pass_rate_30d": rates.get(name),
         "reason": first_reason(task) if outcome in (OUTCOME_FAILED, OUTCOME_PARTIAL, OUTCOME_INFRA) else "",
         "excerpt": excerpt_of(task),
+        "rep_n": shown_rep_n(task),
         "do": do,
         # Additive detail the pages show; the keys above are the contract.
         "admitted": is_admitted,

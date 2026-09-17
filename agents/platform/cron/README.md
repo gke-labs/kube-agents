@@ -202,7 +202,10 @@ the exemption by name, pinned to a `no_agent` entry whose script exists.
 process that produced them has exited, and the Chat Agent — which is who the
 user replies to — never saw the finding. `"all"` now expands to include the
 relay as well as the channel, so a job left on it is heard twice rather than
-not at all.
+not at all. The relay skips a platform the scheduler already posted to only
+where that leaves it another platform to post to; on an install where the cron
+child can address every enabled channel itself, both copies land
+([design](../../../docs/designs/cron-report-relay.md)).
 
 `deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
 it and thereby owns the thread the user replies in. It is a delivery mode, not a
@@ -211,8 +214,8 @@ scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
-dual-platform install a job left on `"all"` is now heard twice on _each_ of them
-rather than twice in one place. Two entries here name `"all"`
+dual-platform install whose cron child can address both, a job left on `"all"`
+is heard twice on _each_ of them rather than twice in one place. Two entries here name `"all"`
 (`gcp-networking-fabric-audit` and `gce-compute-fleet-audit`) and accept that;
 the rest name `"chat"`.
 

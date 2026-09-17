@@ -42,7 +42,7 @@ from pathlib import Path
 import pytest
 
 from kube_agents_bench import evidence_store
-from kube_agents_bench.gate import main
+from kube_agents_bench.gate import REPORT_EXCERPT_MAX_CHARS, _report_excerpt, main
 from kube_agents_bench.scoring import MISSING
 
 from conftest import FIXTURE_RUNS, GREEN_RUNS, RED_RUNS, read_fixture, write_run
@@ -214,6 +214,105 @@ def test_the_per_repetition_detail_is_printed(kanban_task, tmp_path, capsys):
     # identical runs disagree by 0.8 while the verdict is the same on all three.
     assert "OutcomeValidity=0.2" in printed and "OutcomeValidity=0.9" in printed
     assert "admission:" in printed
+
+
+REPORT_PREFIX = "  rep 1 report: "
+
+
+def test_a_failing_repetition_quotes_the_agents_report_under_its_grading_line(
+    kanban_task, tmp_path, capsys
+):
+    """The dashboard quotes the agent's own words beside the grader's reason,
+    and reads them from the build log: one `rep N report:` line right under
+    the repetition's grading line, which itself does not change."""
+    out = tmp_path / "case.json"
+    run_case(kanban_task, [FIXTURE_RUNS / RED_RUNS[0]], out)
+    lines = capsys.readouterr().out.splitlines()
+    graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: fail -- "))
+    assert lines[graded + 1].startswith(
+        REPORT_PREFIX + "Delegated to the platform agent — the task was created with id "
+        "t_bbbebbd5. [Redacted:"
+    ), lines[graded + 1]
+    # The report never rides in the hand-off; the log is its one channel.
+    assert "report" not in payload(out)["reps"][0]
+
+
+def test_a_passing_repetition_prints_no_report_line(kanban_task, tmp_path, capsys):
+    out = tmp_path / "case.json"
+    run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], out)
+    printed = capsys.readouterr().out
+    assert "rep 1: pass" in printed and REPORT_PREFIX not in printed
+
+
+def test_an_empty_report_prints_no_line_at_all(kanban_task, make_run, tmp_path, capsys):
+    def silent(rec):
+        rec["output"] = " \n\t "
+
+    out = tmp_path / "case.json"
+    run_case(kanban_task, [make_run("kanban_red_1", silent)], out)
+    printed = capsys.readouterr().out
+    assert "  rep 1: fail -- " in printed and REPORT_PREFIX not in printed
+
+
+def test_the_report_line_is_one_flat_line_with_no_angle_brackets_and_a_cap(
+    kanban_task, make_run, tmp_path, capsys
+):
+    def noisy(rec):
+        rec["output"] = "Line one.\n\n  <b>Line\ttwo</b>  " + "x" * 400
+
+    out = tmp_path / "case.json"
+    run_case(kanban_task, [make_run("kanban_red_1", noisy)], out)
+    line = next(
+        l for l in capsys.readouterr().out.splitlines() if l.startswith(REPORT_PREFIX)
+    )
+    text = line[len(REPORT_PREFIX):]
+    assert text.startswith("Line one. b>Line two/b> xxx")
+    assert "<" not in text
+    assert len(text) == REPORT_EXCERPT_MAX_CHARS and text.endswith("…")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", ""),
+        (None, ""),
+        ("   \n\n\t", ""),
+        ("one\ntwo\r\n\tthree   four", "one two three four"),
+        ("a <b> c << d", "a b> c  d".replace("  ", " ")),
+        ("x" * 300, "x" * 300),
+        ("x" * 301, "x" * 299 + "…"),
+        ("word " * 100, ("word " * 100).strip()[:299].rstrip() + "…"),
+        # A lone surrogate (a JSON `\ud83d` escape) and C0 controls (an ANSI
+        # colour code, a NUL, a BEL) become spaces: print() must not raise.
+        ("a\ud83db", "a b"),
+        ("\x1b[31mred\x1b[0m\x00 done\x07", "[31mred [0m done"),
+        ("c1\x85controls\x9bhere", "c1 controls here"),
+        ("café — naïve 🔀", "café — naïve 🔀"),
+    ],
+)
+def test_report_excerpt_collapses_strips_and_truncates(raw, expected):
+    got = _report_excerpt(raw)
+    assert got == expected
+    assert len(got) <= REPORT_EXCERPT_MAX_CHARS
+    assert "\n" not in got and "<" not in got
+    got.encode("utf-8")  # strict: what a UTF-8 stdout does
+
+
+def test_a_report_with_a_lone_surrogate_still_grades_and_writes_the_hand_off(
+    kanban_task, make_run, tmp_path, capsys
+):
+    """results.json can carry `\ud83d` as a JSON escape; json.loads keeps it
+    as a lone surrogate, and printing that raises under a UTF-8 stdout. The
+    gate must still print its lines and write the case JSON."""
+    def broken(rec):
+        rec["output"] = "half an emoji \ud83d then the report"
+
+    out = tmp_path / "case.json"
+    assert run_case(kanban_task, [make_run("kanban_red_1", broken)], out) == 0
+    printed = capsys.readouterr().out
+    assert REPORT_PREFIX + "half an emoji then the report" in printed
+    printed.encode("utf-8")
+    assert out.is_file() and payload(out)["reps"][0]["outcome"] == "fail"
 
 
 def test_missing_is_accepted_as_a_repetition_placeholder(kanban_task, tmp_path):

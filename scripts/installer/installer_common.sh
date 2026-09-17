@@ -478,7 +478,10 @@ save_secret_env_var() {
 expand_tilde_path() {
   local path="$1"
   case "$path" in
-    "~" | "~/"*)
+    # The slash sits outside the quotes so shellcheck's SC2088 stays enforced in
+    # this block rather than being suppressed across it. The tilde stays quoted
+    # because the pattern has to match one the shell did not expand.
+    "~" | "~"/*)
       if [ -z "${HOME:-}" ]; then
         print_error "Cannot expand '~' in '${path}': HOME is unset. Pass an absolute path instead." >&2
         return 1

@@ -130,7 +130,8 @@ the same layout and is collected from the moment it starts running.
   - `reps` — **optional, additive**: per-repetition grading detail, one
     entry per indented `rep N: <verdict> -- <text>` grading line under the
     task's verdict line, in log order:
-    `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`.
+    `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
+    plus `"excerpt": <string>` when the log carried one (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -140,6 +141,28 @@ the same layout and is collected from the moment it starts running.
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
       dump stripped, truncated to 300 chars. `null` for passing reps and
       when nothing remains.
+    - `excerpt` — **optional, additive**: the agent's own words — the text
+      of the `rep N report: <text>` line `bench-gate case` prints right
+      under the grading line of a repetition that did not pass (since
+      2026-09-15): the first 300 characters of the agent's final report
+      (`results.json`'s `output`, the "Actual Output" the judge grades),
+      whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
+      last position where it was cut; capped at 300 again here. The
+      collector consumes the line whole before any other pattern reads it,
+      so text the agent wrote cannot pose as the lease line, a grading line
+      or the final verdict. The key is
+      **absent** — never `null` or `""` — when the log carries no such line:
+      a passing rep, an empty report (a transport failure's), a report line
+      for a rep the log never graded (dropped, never an entry of its own),
+      and every build graded before the line existed. `classify.py`'s
+      `excerpt_of` reads it into the Brief's "What the agent saw" quote, the
+      run page's case card and a case's `last_failure`, always from the
+      repetition whose `reason` is shown, so the quote and the check beside
+      it come from the same run of the agent; nothing is quoted when that
+      rep has none (when no rep carries a reason, the first rep with an
+      excerpt is the one the row is about, link included). The PR gate comment's Reason line stays the grader's
+      `reason` and falls back to the excerpt only for a rep that has no
+      reason at all.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
@@ -573,9 +596,12 @@ not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
 `setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
-also_failing_prs, pass_rate_30d, reason, excerpt, do, admitted, reps,
+also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
 nightly_failed_recent}`) and `health_at` (the verdict in force when it
-finished, from history; `null` without history). `also_failing_prs` and
+finished, from history; `null` without history). `rep_n` is the 1-based
+repetition the row is about — the one whose `reason` is shown, else the
+one whose `excerpt` is (`null` when there is neither); the pages link that
+repetition's transcript, rep 1's when it is `null`. `also_failing_prs` and
 `pass_rate_30d` count presubmit runs only; `nightly_failed_recent` is
 `true` / `false` when the newest nightly run within two days of this one
 graded the case and failed / did not fail it on every repetition, `null`
