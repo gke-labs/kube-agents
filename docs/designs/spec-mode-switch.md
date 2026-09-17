@@ -131,6 +131,16 @@ default posture). Until then, flipping it is a `kubectl patch` on the PlatformAg
 Helm 3's three-way merge leaves fields the chart never sets alone, so a patched mode
 should survive chart upgrades.
 
+## One thing inside `next` has its own switch
+
+The A2A gateway's inject backend (`spec-chatops-gateway.md`, "The test backend") renders only
+when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
+second mode mechanism and does not belong in the field this document defines: the backend has no
+authentication, so a CRD field would put "disable every check on the chat door" in the API a
+cluster's owner edits, and the operator would be obliged to honour it. Whether an install is an
+eval install is a property of who deployed the operator, which is where the A2A image overrides
+are already decided.
+
 ## Per-feature overrides - sketched, not built
 
 If a component later needs to graduate separately, the shape is a sibling map consulted by

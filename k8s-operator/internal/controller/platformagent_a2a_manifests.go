@@ -155,6 +155,66 @@ const (
 	// operator input can redirect.
 	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
 
+	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
+	// read from the CONTROLLER's environment rather than from the CR.
+	//
+	// Why an operator env var and not a CRD field, which is how `spec.mode`
+	// reaches the operator: this is not a posture a cluster's owner chooses,
+	// it is a property of the install being an eval install. The backend has
+	// no authentication (a2a/gateway/inject.go), so a CRD field would put
+	// "disable every check on the chat door" in the API a user edits, and
+	// the operator would be obliged to honour it. The image overrides above
+	// are the right precedent: operator-scoped, set by whoever deploys the
+	// operator, invisible to the CR.
+	//
+	// Nothing in this repository sets it. A developer sets it by hand on the
+	// operator Deployment; a CI eval would set it through the chart's
+	// operator.extraEnv, where the A2A image overrides already go, and that
+	// wiring does not exist yet -- so `AGENT_TRANSPORT=inject` in a presubmit
+	// today would find no Service to reach.
+	//
+	// It is read the same way a2aStrictEventsWriter is: anything but an
+	// explicit "true" is off, so a typo leaves the door shut.
+	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
+
+	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
+	// select the backend, and a2aInjectPort is the port it listens on. The
+	// listen address is every interface rather than loopback: a Service has
+	// to reach it, and a pod-local loopback bind would be reachable only
+	// from inside the gateway container. What withholds it from the pod
+	// network is buildA2AGatewayNetworkPolicy, not the bind address.
+	//
+	// Untyped on purpose, like a2aNATSClientPort: the container port wants
+	// an int32, the fence wants an intstr, and the listen address wants a
+	// string.
+	a2aInjectListenEnvVar = "A2A_INJECT_LISTEN"
+	a2aInjectPort         = 8099
+
+	// The one identity the inject backend admits, and the principal it
+	// stands for. The gateway resolves an injected author through the
+	// principal map like any other non-gchat backend, so the eval runner
+	// needs an entry in one -- and the map the gateway mounts by default is
+	// a hand-made ConfigMap for a Discord install, which an eval project
+	// does not have. The operator renders its own one-entry map instead and
+	// points the gateway at it.
+	//
+	// The principal is deliberately not a real cloud identity: a synthetic
+	// backend must be structurally incapable of asserting one, the same
+	// property the Discord test backend's mapping table has
+	// (spec-chatops-gateway.md, "The test backend").
+	a2aInjectAuthor    = "devops-bench"
+	a2aInjectPrincipal = "eval:devops-bench"
+
+	// a2aInjectPrincipalMapPath is where that map is mounted. It is NOT the
+	// gateway's default path: the default is where the hand-made
+	// `principal-map` ConfigMap goes, that volume is rendered on every
+	// gateway, and mounting one ConfigMap over another at the same path is
+	// not a thing a pod spec can express. So the operator mounts its own map
+	// beside it and repoints A2A_PRINCIPAL_MAP. An install with the inject
+	// backend armed has no Discord backend by construction (the gateway
+	// refuses two), so nothing is lost by ignoring the other map there.
+	a2aInjectPrincipalMapPath = "/etc/a2a/inject-principal-map"
+
 	// a2aStrictEventsWriterEnvVar is read from the CONTROLLER's environment
 	// and rendered onto the gateway, the same override shape as the worker
 	// image above. It exists so that tightening the `…events` writer-class
@@ -289,9 +349,22 @@ func a2aStrictEventsWriter() string {
 	return "false"
 }
 
+// a2aInjectBackendEnabled reports whether the operator was deployed with the
+// eval flag. Anything but an explicit "true" is off, for the reason
+// a2aStrictEventsWriter gives: a typo must relax rather than tighten, and
+// here "relaxed" is the shut door.
+func a2aInjectBackendEnabled() bool {
+	return os.Getenv(a2aInjectBackendEnvVar) == "true"
+}
+
 func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string    { return agent.Name + "-a2a-nats" }
 func a2aGatewayName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-gateway" }
 func a2aCalloutName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-callout" }
+
+// a2aInjectName is the Service, ConfigMap and NetworkPolicy the inject
+// backend renders. One name for all three: they exist together, go together,
+// and naming them apart would only make the teardown list harder to read.
+func a2aInjectName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-inject" }
 
 // a2aCredsSecretName is the Secret holding the static users' passwords.
 func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
@@ -1627,6 +1700,98 @@ func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 // It is expected to crash-loop until the gateway image is reachable and the
 // discord-bot Secret is created — both are optional references so the render
 // never blocks the rest of the stack.
+// buildA2AInjectService is how the eval runner reaches the inject backend:
+// a ClusterIP, which is what `kubectl port-forward svc/...` resolves.
+//
+// ClusterIP and not a LoadBalancer or a NodePort, and the distinction is the
+// whole access control. The backend has no authentication of its own, so the
+// only thing standing between it and a task submitted as a mapped principal
+// is that nothing can route to it: the fence below denies every pod, and a
+// ClusterIP is unreachable from outside the cluster. The eval runner's
+// port-forward enters through the kubelet on the node path, which is neither
+// pod-network traffic (so the fence does not govern it) nor routable from
+// off-cluster (so it needs an authenticated Kubernetes API session first).
+// That API session is the authentication, borrowed from the cluster.
+func buildA2AInjectService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aInjectName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "inject"),
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{"app": a2aGatewayName(agent)},
+			Ports: []corev1.ServicePort{{
+				Name:       "inject",
+				Port:       a2aInjectPort,
+				TargetPort: intstr.FromInt32(a2aInjectPort),
+			}},
+		},
+	}
+}
+
+// buildA2AInjectPrincipalMap is the one-entry map that admits the eval
+// runner. See a2aInjectAuthor for why the operator renders its own rather
+// than reusing the hand-made `principal-map` ConfigMap.
+//
+// A directory-shaped map: LoadPrincipalMap reads a mounted ConfigMap as one
+// file per backend user id whose content is the principal, which is what a
+// ConfigMap volume renders.
+func buildA2AInjectPrincipalMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aInjectName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "inject"),
+		},
+		Data: map[string]string{a2aInjectAuthor: a2aInjectPrincipal},
+	}
+}
+
+// buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
+// inject backend is armed.
+//
+// PolicyTypes carries Ingress with NO rules, which denies every pod. That is
+// the intent rather than an omission: the two chat backends dial out and
+// listen for nothing, so until this backend existed no pod had any business
+// reaching the gateway at all, and the inject port must not become the one
+// that does. The eval runner is not a pod -- it reaches the Service through
+// `kubectl port-forward`, which enters from the node and is exempt from
+// NetworkPolicy under Dataplane V2, the same path the NATS monitor and
+// websocket ports rely on (buildA2ANATSNetworkPolicy says so at length).
+//
+// That exemption is the boundary, and it is host-local rather than
+// port-forward-shaped: a pod running with hostNetwork on the gateway's node
+// reaches the listener by the same route. Nothing rendered here is
+// hostNetwork and scheduling one takes a grant the agent under test does not
+// hold, so the claim this policy supports is "no pod on the cluster network",
+// which is not quite "nothing".
+//
+// Rendered only with the backend, deliberately. A deny-all-ingress fence on
+// the gateway is a good idea whatever the backend, but rendering one on every
+// next install is a change to installs that did not ask for this, and it
+// would outlive the object it exists to protect. When an in-cluster caller
+// legitimately needs the gateway, it becomes a peer in this rule.
+func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aInjectName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "inject-netpol"),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": a2aGatewayName(agent)},
+			},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		},
+	}
+}
+
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")
@@ -1634,6 +1799,32 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	podLabels := map[string]string{"app": name}
 	for k, v := range labels {
 		podLabels[k] = v
+	}
+
+	// The inject backend's additions, applied below so the flag appears in
+	// one place rather than three branches inside the pod spec. Off, every
+	// slice is empty and the render is byte-for-byte what it was.
+	var injectEnv []corev1.EnvVar
+	var injectPorts []corev1.ContainerPort
+	var injectMounts []corev1.VolumeMount
+	var injectVolumes []corev1.Volume
+	if a2aInjectBackendEnabled() {
+		injectEnv = []corev1.EnvVar{
+			{Name: a2aInjectListenEnvVar, Value: fmt.Sprintf(":%d", a2aInjectPort)},
+			// Repointed at the operator's own map, which is the only one
+			// carrying the eval author. See a2aInjectPrincipalMapPath.
+			{Name: "A2A_PRINCIPAL_MAP", Value: a2aInjectPrincipalMapPath},
+		}
+		injectPorts = []corev1.ContainerPort{{Name: "inject", ContainerPort: a2aInjectPort}}
+		injectMounts = []corev1.VolumeMount{{
+			Name: "inject-principal-map", MountPath: a2aInjectPrincipalMapPath, ReadOnly: true,
+		}}
+		injectVolumes = []corev1.Volume{{
+			Name: "inject-principal-map",
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aInjectName(agent)},
+			}},
+		}}
 	}
 
 	return &appsv1.Deployment{
@@ -1679,7 +1870,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						// it wants a directory it can traverse, not one it can
 						// write.
 						WorkingDir: "/",
-						Env: []corev1.EnvVar{
+						Env: append([]corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							{Name: "NATS_USER", Value: "gateway"},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
@@ -1751,19 +1942,20 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// name, so the render and the spawner must agree
 							// or every session is refused at connect.
 							{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
-						},
-						VolumeMounts: []corev1.VolumeMount{{
+						}, injectEnv...),
+						Ports: injectPorts,
+						VolumeMounts: append([]corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
-						}},
+						}}, injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: []corev1.Volume{{
+					Volumes: append([]corev1.Volume{{
 						Name: "principal-map",
 						VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 							LocalObjectReference: corev1.LocalObjectReference{Name: "principal-map"},
 							Optional:             ptr.To(true),
 						}},
-					}},
+					}}, injectVolumes...),
 				},
 			},
 		},
@@ -1820,10 +2012,21 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 // bad CIDR and the confinement is gone from pods that are still running, with
 // the status naming the CIDR and saying nothing about the fence.
 func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	for _, np := range []*networkingv1.NetworkPolicy{
+	fences := []*networkingv1.NetworkPolicy{
 		buildA2ANATSNetworkPolicy(agent),
 		buildA2ASessionNetworkPolicy(agent, r.a2aSessionDNSClusterIPs(ctx, agent)),
-	} {
+	}
+	// The gateway fence rides here with the other two, for the reason this
+	// function exists: it is the whole of what withholds an unauthenticated
+	// task-submission endpoint from the pod network, and a refused CR must
+	// not be a window in which deleting it sticks. Its removal when the flag
+	// goes off is reconcileA2AInjectBackend's, not this function's -- a
+	// fence left standing over a Service that is gone denies nothing and
+	// costs nothing, so the ordering hazard runs the safe way.
+	if a2aInjectBackendEnabled() {
+		fences = append(fences, buildA2AGatewayNetworkPolicy(agent))
+	}
+	for _, np := range fences {
 		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
 			return err
 		}
@@ -1986,6 +2189,13 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		}
 	}
 
+	// The inject backend's principal map, BEFORE the Deployment that mounts
+	// it: the ConfigMap volume is not optional, so a gateway pod scheduled
+	// ahead of it would sit unable to start.
+	if err := r.applyA2AInjectBackend(ctx, agent); err != nil {
+		return state, err
+	}
+
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
@@ -1994,7 +2204,98 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
+	// And the removal AFTER it, which is the other half of the same ordering
+	// argument. The re-render above is what stops the gateway listening; a
+	// fence deleted before it lands leaves the previous pod serving the
+	// inject port with nothing selecting it, reachable on its pod IP by
+	// anything in the cluster for as long as the rollout takes. Deleting
+	// after means the window is closed before the guardrail is.
+	if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+		return state, err
+	}
+
 	return state, nil
+}
+
+// applyA2AInjectBackend renders the inject backend's own objects, and does
+// nothing at all when the flag is not set -- removal is removeA2AInjectBackend
+// below, which the caller runs at a different point in the reconcile.
+//
+// The fence is not here: reconcileA2ANetworkFences applies it, earlier in this
+// reconcile and also on the refusal path, for the reason that function exists.
+func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if !a2aInjectBackendEnabled() {
+		return nil
+	}
+	for _, obj := range []client.Object{
+		buildA2AInjectPrincipalMap(agent),
+		buildA2AInjectService(agent),
+	} {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply the A2A inject backend's %T: %w", obj, err)
+		}
+	}
+	return nil
+}
+
+// removeA2AInjectBackend takes the inject backend away when the flag is not
+// set, and is a no-op when it is.
+//
+// Easy to leave out and expensive to leave out. Unsetting the operator's flag
+// re-renders the gateway without the listener, so the Service would go on
+// pointing at a closed port -- harmless -- but the ConfigMap would go on
+// naming a principal nothing checks and the fence would go on denying ingress
+// to a gateway that no longer needs it. None of that is dangerous; all of it
+// is residue on an install that is supposed to look like it never had an eval
+// door.
+//
+// Called AFTER the gateway Deployment is applied, which is what makes the
+// fence safe to drop -- see the call site. Three cached reads on each
+// reconcile of a next install is the standing cost: Service, ConfigMap and
+// NetworkPolicy are all Owns() kinds (see SetupWithManager), so nothing here
+// starts an informer.
+//
+// A teardown entry exists for all three as well, for the flip to `today`
+// where neither this function nor the render runs at all.
+func (r *PlatformAgentReconciler) removeA2AInjectBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if a2aInjectBackendEnabled() {
+		return nil
+	}
+	for _, obj := range r.a2aInjectObjects(agent) {
+		if err := r.deleteOwnedA2AObject(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to remove the A2A inject backend's %T: %w", obj, err)
+		}
+	}
+	return nil
+}
+
+// a2aInjectObjects names the three objects the inject backend renders, for
+// the two callers that have to remove them: this file's flag-off path and
+// the teardown list.
+func (r *PlatformAgentReconciler) a2aInjectObjects(agent *agentv1alpha1.PlatformAgent) []client.Object {
+	name := a2aInjectName(agent)
+	meta := metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}
+	return []client.Object{
+		&corev1.Service{ObjectMeta: meta},
+		&corev1.ConfigMap{ObjectMeta: meta},
+		&networkingv1.NetworkPolicy{ObjectMeta: meta},
+	}
+}
+
+// deleteOwnedA2AObject removes one object this agent owns, tolerating its
+// absence. The ownership check is cleanupA2A's, for the same reason: an
+// object somebody else created under a name we render is not ours to delete.
+func (r *PlatformAgentReconciler) deleteOwnedA2AObject(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(obj, agent) {
+		return fmt.Errorf("refusing to delete unowned A2A %T %s/%s", obj, obj.GetNamespace(), obj.GetName())
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, obj))
 }
 
 // applyA2AGatewayDeployment applies the gateway Deployment and, when the API
@@ -2057,8 +2358,17 @@ type a2aTeardownEntry struct {
 // than the walk it skips, instead of restating how long the walk is and going
 // stale the next time the render grows a step.
 func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
+	injectMeta := metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The inject backend's three, listed whatever the flag says: a flip
+		// to today has to clean up after an operator that WAS deployed with
+		// the flag, and the reads are free (all three are Owns() kinds) and
+		// find nothing on an install that never had it. They go early,
+		// beside the gateway Deployment they belong to.
+		{&corev1.Service{ObjectMeta: injectMeta}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: injectMeta}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: injectMeta}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so it stops answering while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like

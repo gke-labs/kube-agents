@@ -38,6 +38,39 @@ Environment:
         the single-turn behaviour.
     AGENT_DELEGATION_POLL_INTERVAL: Seconds between status turns (default ``30``).
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
+
+    AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
+        hands the prompt to the agent through the A2A gateway's inject backend
+        instead -- ``POST /inject`` with the prompt, then the conversation's
+        transcript folded until the task's terminal, the way the gateway
+        drives a customer conversation under ``spec.mode: next``
+        (:mod:`kube_agents_bench.inject_transport`). Same harness, same
+        ``AgentResult``, same transcript stash for the verifiers. The inject
+        path reads ``AGENT_NAMESPACE``, ``AGENT_CLUSTER_CONTEXT``, the
+        delegation variables, and:
+    AGENT_INJECT_SERVICE: The Service to port-forward to (default
+        ``<AGENT_SERVICE_NAME>-a2a-inject``, which is what the operator
+        renders under its eval flag).
+    AGENT_INJECT_LOCAL_PORT: Local side of that port-forward (default
+        ``28099``). The remote side is always the Service's 8099.
+    AGENT_INJECT_URL: A gateway base URL to use instead of spawning a
+        port-forward.
+    AGENT_INJECT_AUTHOR: The author id the message is sent as, resolved
+        through the gateway's principal map (default ``devops-bench``, the
+        entry the operator renders).
+    AGENT_INJECT_CONVERSATION: Pins the conversation key. Unset (the default)
+        mints a fresh one per invocation, so each task gets its own session
+        record rather than inheriting the previous task's.
+    AGENT_INJECT_ACCEPT_TIMEOUT: Seconds a submitted task may show nothing
+        past the gateway's own placeholder before the run is classified as
+        infrastructure -- nothing is executing on the addressee (default
+        ``120``).
+    AGENT_INJECT_TASK_TIMEOUT: Seconds one task may run before the harness
+        stops it and grades what it produced (default ``1800``). This is the
+        whole task's budget, not a request's: on the api transport
+        ``AGENT_HTTP_TIMEOUT`` bounds one POST and the work's real budget is
+        ``AGENT_DELEGATION_TIMEOUT``, whereas here a single await covers the
+        work, so it takes the same scale as the latter.
 """
 
 from __future__ import annotations
@@ -58,11 +91,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from devops_bench.agents import AgentHarness, AgentResult
+from devops_bench.agents.result import empty_tokens
 
+from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import transcript
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
@@ -89,6 +125,44 @@ SERVICE_API_PORT = 8642
 # harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
+# HTTP endpoint, which is identical under both modes and therefore says nothing
+# about the next stack; ``inject`` goes through the A2A gateway, which is the
+# stack the mode renders.
+TRANSPORT_API = "api"
+TRANSPORT_INJECT = "inject"
+_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
+
+# The inject transport's port-forward target: the Service the operator renders
+# for the gateway's inject backend under its eval flag, listening on 8099. The
+# local side defaults well away from it so a gateway a developer is already
+# forwarding cannot be mistaken for this tunnel.
+_INJECT_SERVICE_SUFFIX = "-a2a-inject"
+_INJECT_REMOTE_PORT = 8099
+_INJECT_DEFAULT_LOCAL_PORT = 28099
+# How long a submitted task may show nothing past the gateway's own
+# placeholder before the run is classified as infrastructure. The placeholder
+# is posted before the submission reaches the bus, so it proves nothing; an
+# edit to it or a second post is the first evidence an executor took the task.
+_INJECT_DEFAULT_ACCEPT_TIMEOUT = "120"
+# The three budgets both transports share, named here rather than spelled at
+# each _numeric_env call: one default per knob, or the two doors disagree
+# about how long a case may take.
+_DEFAULT_HTTP_TIMEOUT = "600"
+_DEFAULT_DELEGATION_TIMEOUT = "1800"
+_DEFAULT_DELEGATION_POLL_INTERVAL = "30"
+# What ``tokens`` say on an inject record: the gateway reports no usage, and a
+# null bucket is the truthful value rather than a zero (``scoring.py`` reads
+# the task's terminal in the trajectory as the liveness signal instead).
+_INJECT_TOKENS_NOTE = "the inject transport carries no token usage; every bucket is null"
+# How long one injected task may run before the harness stops it and grades
+# what it produced. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
+# there, with AGENT_DELEGATION_TIMEOUT covering the work across status turns;
+# on this path one await covers the work, so the budget has to be of the
+# second kind. Borrowing the first cut every case to 600s, which a ten-minute
+# case reached with no terminal and an empty answer.
+_INJECT_DEFAULT_TASK_TIMEOUT = "1800"
 
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
@@ -183,10 +257,15 @@ def _cleanup_port_forwards() -> None:
             _PF_LOG_DIR = None
 
 
-def _kubectl_target() -> list[str]:
-    """The service, namespace and context flags shared by every kubectl call."""
+def _kubectl_target(service: str | None = None) -> list[str]:
+    """The service, namespace and context flags shared by every kubectl call.
+
+    ``service`` defaults to the agent's own Service; the inject transport
+    passes the gateway's inject Service, which lives in the same namespace and
+    the same context.
+    """
     cmd = [
-        f"svc/{os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
+        f"svc/{service or os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
         "-n",
         os.environ.get("AGENT_NAMESPACE", "kubeagents-system"),
     ]
@@ -196,9 +275,11 @@ def _kubectl_target() -> list[str]:
     return cmd
 
 
-def _port_forward_command(local_port: int) -> list[str]:
-    service, *rest = _kubectl_target()
-    return ["kubectl", "port-forward", service, f"{local_port}:{SERVICE_API_PORT}", *rest]
+def _port_forward_command(
+    local_port: int, service: str | None = None, remote_port: int = SERVICE_API_PORT
+) -> list[str]:
+    target, *rest = _kubectl_target(service)
+    return ["kubectl", "port-forward", target, f"{local_port}:{remote_port}", *rest]
 
 
 def _cluster_hint() -> str:
@@ -262,11 +343,15 @@ def _agent_shell(script: str, timeout: float) -> str:
     return proc.stdout
 
 
-def _ensure_port_forward(local_port: int) -> None:
+def _ensure_port_forward(
+    local_port: int, *, service: str | None = None, remote_port: int = SERVICE_API_PORT
+) -> None:
     """Start a background ``kubectl port-forward`` if the port is closed.
 
     An already-open port is a no-op: the harness never assumes it owns the
     transport. Serialised per port, so different ports establish in parallel.
+    ``service`` and ``remote_port`` default to the agent's HTTP endpoint; the
+    inject transport forwards the gateway's inject Service instead.
 
     Raises:
         RuntimeError: The forward could not be spawned, exited, or did not open
@@ -281,7 +366,7 @@ def _ensure_port_forward(local_port: int) -> None:
         if stale is not None:
             _stop_process(stale)
 
-        cmd = _port_forward_command(local_port)
+        cmd = _port_forward_command(local_port, service, remote_port)
         _log.info("port %d closed; establishing port-forward: %s", local_port, " ".join(cmd))
         stderr_log = _pf_log_dir() / f"pf-{local_port}.log"
         try:
@@ -316,7 +401,9 @@ def _ensure_port_forward(local_port: int) -> None:
             raise
 
 
-def _reset_port_forward(local_port: int) -> None:
+def _reset_port_forward(
+    local_port: int, *, service: str | None = None, remote_port: int = SERVICE_API_PORT
+) -> None:
     """Tear this process's forward down and stand a fresh one up.
 
     ``_ensure_port_forward`` returns immediately when ``_port_open`` is true,
@@ -341,7 +428,12 @@ def _reset_port_forward(local_port: int) -> None:
             _log.info("tearing down the port-forward on port %d before retrying", local_port)
             _stop_process(proc)
     # Outside the lock: _ensure_port_forward takes the same non-reentrant one.
-    _ensure_port_forward(local_port)
+    # The agent's endpoint stays the positional-only call the api path has
+    # always made; only another target spells its service and port out.
+    if service is None and remote_port == SERVICE_API_PORT:
+        _ensure_port_forward(local_port)
+    else:
+        _ensure_port_forward(local_port, service=service, remote_port=remote_port)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -791,6 +883,38 @@ def _infra_failure(detail: str) -> AgentResult:
     )
 
 
+def _inject_result(exchange: inject.Exchange) -> AgentResult:
+    """Map a folded conversation onto the canonical result.
+
+    ``output`` and ``final_message`` are the deliverable -- the posts the
+    conversation received for this task that the relay never rewrote, which is
+    what a customer would read as the answer. The trajectory is the
+    conversation itself: the relay does not post ``activity`` artifacts, so no
+    transport reading a conversation carries tool calls. Tokens stay null --
+    the gateway reports no usage -- and ``metadata`` says so rather than
+    inventing a number.
+    """
+    fold = exchange.fold
+    return AgentResult(
+        output=fold.deliverable,
+        trajectory=list(fold.trajectory),
+        tokens=empty_tokens(),
+        errors=[],
+        metadata={
+            "transport": TRANSPORT_INJECT,
+            "final_message": fold.deliverable,
+            "task_id": exchange.task_id,
+            "conversation": exchange.conversation,
+            "terminal_state": fold.terminal or None,
+            "terminal_source": fold.terminal_source or None,
+            "posts": len(fold.posts),
+            "entries": len(fold.entries),
+            "malformed_entries": fold.malformed,
+            "tokens_note": _INJECT_TOKENS_NOTE,
+        },
+    )
+
+
 class _DelegationTransportExhausted(Exception):
     """The delegation wait lost its transport on every status-turn retry.
 
@@ -844,12 +968,24 @@ class KubeAgentsHarness(AgentHarness):
         return result
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
+        if transport not in _TRANSPORTS:
+            return AgentResult.errored(
+                f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
+            )
+        if transport == TRANSPORT_INJECT:
+            return self._execute_inject(prompt)
+
         api_path = os.environ.get("AGENT_API_PATH", "/v1/responses")
         try:
             local_port = _numeric_env("AGENT_LOCAL_PORT", str(SERVICE_API_PORT), int)
-            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", "600", float)
-            delegation_timeout = _numeric_env("AGENT_DELEGATION_TIMEOUT", "1800", float)
-            poll_interval = _numeric_env("AGENT_DELEGATION_POLL_INTERVAL", "30", float)
+            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", _DEFAULT_HTTP_TIMEOUT, float)
+            delegation_timeout = _numeric_env(
+                "AGENT_DELEGATION_TIMEOUT", _DEFAULT_DELEGATION_TIMEOUT, float
+            )
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
+            )
         except ValueError as exc:
             return AgentResult.errored(str(exc))
 
@@ -950,17 +1086,22 @@ class KubeAgentsHarness(AgentHarness):
                     _log.warning("port-forward respawn failed before retry: %s", pf_exc)
 
         if delegation_timeout > 0:
+
+            def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
+                return _post_turn(url, {**body, "input": poll}, headers, turn_timeout)
+
+            def _respawn_tunnel() -> None:
+                _reset_port_forward(local_port)
+
             try:
                 session_id = (
                     self._await_delegated_work(
                         result,
-                        url=url,
-                        body=body,
-                        headers=headers,
+                        turn=_status_turn,
+                        reset=_respawn_tunnel,
                         timeout=timeout,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
-                        local_port=local_port,
                     )
                     or session_id
                 )
@@ -983,17 +1124,226 @@ class KubeAgentsHarness(AgentHarness):
             )
         return result
 
+    def _execute_inject(self, prompt: str) -> AgentResult:
+        """The inject transport: send the prompt through the gateway's front door.
+
+        Mirrors ``_execute``'s retry classes. The tunnel to the inject Service
+        gets the same bounded establishment retry; an exchange that never
+        reaches the gateway is retried through a fresh tunnel up to
+        :data:`_MAX_TRANSPORT_FAILURES` times and then classified as
+        infrastructure; and a task whose conversation shows nothing past the
+        gateway's own placeholder inside ``AGENT_INJECT_ACCEPT_TIMEOUT`` is
+        infrastructure at once, because nothing is executing on the addressee
+        and an empty record is not an answer. A task an executor took and
+        ended ``failed``, ``rejected`` or ``canceled`` IS the agent's own
+        outcome and stays in front of the judge with the terminal on
+        ``errors``; so does a task still running at
+        ``AGENT_INJECT_TASK_TIMEOUT``, after a stop.
+        """
+        try:
+            timeout = _numeric_env(
+                "AGENT_INJECT_TASK_TIMEOUT", _INJECT_DEFAULT_TASK_TIMEOUT, float
+            )
+            accept_timeout = _numeric_env(
+                "AGENT_INJECT_ACCEPT_TIMEOUT", _INJECT_DEFAULT_ACCEPT_TIMEOUT, float
+            )
+            local_port = _numeric_env(
+                "AGENT_INJECT_LOCAL_PORT", str(_INJECT_DEFAULT_LOCAL_PORT), int
+            )
+            delegation_timeout = _numeric_env(
+                "AGENT_DELEGATION_TIMEOUT", _DEFAULT_DELEGATION_TIMEOUT, float
+            )
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
+            )
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+
+        service = os.environ.get("AGENT_INJECT_SERVICE") or (
+            os.environ.get("AGENT_SERVICE_NAME", "platform-agent") + _INJECT_SERVICE_SUFFIX
+        )
+        author = os.environ.get("AGENT_INJECT_AUTHOR", inject.DEFAULT_AUTHOR)
+        # A fresh conversation per invocation unless pinned: the gateway keeps
+        # a session record per conversation, so a shared key would have each
+        # task inherit the previous task's context and, worse, arrive while
+        # its task is still running and be absorbed as a steer.
+        conversation = os.environ.get("AGENT_INJECT_CONVERSATION") or inject.mint_conversation()
+        base_url = os.environ.get("AGENT_INJECT_URL")
+        # A URL given outright is somebody else's tunnel (or a gateway on the
+        # network): nothing to establish and nothing to respawn between
+        # retries.
+        own_tunnel = not base_url
+
+        def _tunnel(reset: bool) -> None:
+            if not own_tunnel:
+                return
+            forward = _reset_port_forward if reset else _ensure_port_forward
+            forward(local_port, service=service, remote_port=_INJECT_REMOTE_PORT)
+
+        # Same establishment retry as the api path's, for the same reason: a
+        # tunnel that cannot come up is the run class, not an answer.
+        transport_failures = 0
+        while True:
+            try:
+                _tunnel(reset=False)
+                break
+            except RuntimeError as exc:
+                transport_failures += 1
+                _log.warning(
+                    "inject: port-forward to svc/%s failed to establish (%d/%d): %s",
+                    service,
+                    transport_failures,
+                    _MAX_TRANSPORT_FAILURES,
+                    exc,
+                )
+                if transport_failures >= _MAX_TRANSPORT_FAILURES:
+                    return _infra_failure(
+                        f"the inject tunnel to svc/{service} failed to establish "
+                        f"{transport_failures} times running; last failure: {exc}"
+                    )
+        if not base_url:
+            # 127.0.0.1 rather than localhost, matching _port_open's probe
+            # host: a v4/v6 mismatch would make the probe and the request
+            # disagree about whether the tunnel is up.
+            base_url = f"http://127.0.0.1:{local_port}"
+
+        deadline = time.monotonic() + timeout
+
+        def _exchange(task: inject.InjectTask) -> inject.Exchange:
+            """One task to its terminal, through the transport retry."""
+            failures = 0
+            while True:
+                try:
+                    task_id = task.submit()
+                    if not task_id:
+                        # The gateway answered the turn and started nothing.
+                        # No agent saw the prompt, so this is the run class
+                        # rather than an answer -- most often an author the
+                        # principal map does not carry, which is a
+                        # misconfigured install.
+                        raise _TransportError(
+                            f"the gateway started no task for the prompt on "
+                            f"{task.conversation}: {task.note}",
+                            retryable=False,
+                        )
+                    return task.await_terminal(
+                        task_id, accept_timeout=accept_timeout, deadline=deadline
+                    )
+                except inject.InjectUnavailable as exc:
+                    failures += 1
+                    _log.warning(
+                        "inject: exchange on %s failed in transport (%d/%d): %s",
+                        task.conversation,
+                        failures,
+                        _MAX_TRANSPORT_FAILURES,
+                        exc,
+                    )
+                    if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
+                        raise
+                    try:
+                        _tunnel(reset=True)
+                    except RuntimeError as pf_exc:
+                        # Counted, not raised: the ceiling above ends it.
+                        _log.warning(
+                            "inject: port-forward respawn failed before retry: %s", pf_exc
+                        )
+
+        task = inject.InjectTask(
+            base_url=base_url, conversation=conversation, prompt=prompt, author=author
+        )
+        try:
+            exchange = _exchange(task)
+        except inject.InjectUnavailable as exc:
+            return _infra_failure(f"the inject exchange on {conversation} failed: {exc}")
+        except _TransportError as exc:
+            return _infra_failure(str(exc))
+
+        if exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
+            # The gateway took the message and published the submission, and
+            # nothing on the bus has touched it since. That is an install with
+            # no executor on the addressee, not an agent that answered badly.
+            task.cancel()
+            return _infra_failure(
+                f"nothing executed task {exchange.task_id} on {exchange.conversation} within "
+                f"{accept_timeout:.0f}s: the conversation shows nothing past the gateway's "
+                "placeholder, so no executor is running on the addressee; stop sent"
+            )
+
+        if exchange.fold.gateway_declared:
+            # The gateway declared this terminal about a task it could not put
+            # on the bus, so no executor ever saw the prompt. Same state on the
+            # wire as an executor's failure and the opposite meaning: grading
+            # it would score an outage as the agent answering badly.
+            return _infra_failure(
+                f"task {exchange.task_id} was ended by the gateway rather than by an executor "
+                f"(state {exchange.fold.terminal}): it never reached the bus, so nothing ran it"
+            )
+
+        result = _inject_result(exchange)
+        if exchange.outcome == inject.OUTCOME_DEADLINE:
+            task.cancel()
+            result.errors.append(
+                f"task {exchange.task_id} did not reach a terminal state within "
+                f"{timeout:.0f}s; stop sent"
+            )
+        elif exchange.fold.terminal != inject.STATE_COMPLETED:
+            result.errors.append(f"task {exchange.task_id} ended {exchange.fold.terminal}")
+
+        if delegation_timeout > 0:
+            # The seam for delegated work, and it is the case runner's rather
+            # than the transport's on purpose (the A2A owner's instruction on
+            # #1661): when agent-initiated delegation becomes a child task on
+            # the bus, this whole block goes and the transport is untouched.
+            # Card ids are read from the trajectory, which on this path
+            # carries no tool calls, so the wait finds nothing outstanding and
+            # settles at once. A status turn is a further message on the same
+            # conversation, the way a second message in a chat thread is --
+            # and it is a new task rather than a steer, because the first
+            # task's terminal has already released the conversation.
+            def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
+                follow = inject.InjectTask(
+                    base_url=base_url,
+                    conversation=exchange.conversation,
+                    prompt=poll,
+                    author=author,
+                )
+                nonlocal deadline
+                deadline = time.monotonic() + turn_timeout
+                try:
+                    turn_exchange = _exchange(follow)
+                except inject.InjectUnavailable as exc:
+                    raise _TransportError(str(exc), retryable=exc.retryable) from exc
+                if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
+                    raise _TransportError(
+                        f"nothing executed status turn {turn_exchange.task_id}", retryable=True
+                    )
+                return _inject_result(turn_exchange), ""
+
+            def _respawn_tunnel() -> None:
+                _tunnel(reset=True)
+
+            try:
+                self._await_delegated_work(
+                    result,
+                    turn=_status_turn,
+                    reset=_respawn_tunnel,
+                    timeout=timeout,
+                    delegation_timeout=delegation_timeout,
+                    poll_interval=poll_interval,
+                )
+            except _DelegationTransportExhausted as exc:
+                return _infra_failure(str(exc))
+        return result
+
     def _await_delegated_work(
         self,
         result: AgentResult,
         *,
-        url: str,
-        body: dict[str, Any],
-        headers: dict[str, str],
+        turn: Callable[[str, float], tuple[AgentResult, str]],
+        reset: Callable[[], None],
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
-        local_port: int,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -1003,8 +1353,12 @@ class KubeAgentsHarness(AgentHarness):
 
         The harness cannot read the board itself (in-cluster SQLite, with only
         ``/v1/responses`` and ``/api/sessions`` exposed), so it asks the agent
-        to, re-POSTing the same stateful ``conversation`` so the agent keeps its
-        context. Cards filed *during* a status turn join the wait.
+        to. ``turn`` issues one status turn -- on the api transport a re-POST
+        of the same stateful ``conversation`` so the agent keeps its context,
+        on the inject transport a further message on the same conversation --
+        and returns the parsed reply with its session id; ``reset`` respawns
+        the transport's tunnel between failed turns. Cards filed *during* a
+        status turn join the wait.
 
         A turn that fails in transport is retried up to
         :data:`_MAX_TRANSPORT_FAILURES` times running -- through a fresh
@@ -1067,9 +1421,7 @@ class KubeAgentsHarness(AgentHarness):
 
             poll = _POLL_PROMPT.format(tool=STATUS_TOOL, ids=", ".join(outstanding))
             try:
-                turn, turn_session = _post_turn(
-                    url, {**body, "input": poll}, headers, min(timeout, remaining)
-                )
+                status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
                 transport_failures += 1
                 _log.warning(
@@ -1092,7 +1444,7 @@ class KubeAgentsHarness(AgentHarness):
                     # merely pacing before the slot is asked for again.
                     if exc.retryable:
                         try:
-                            _reset_port_forward(local_port)
+                            reset()
                         except RuntimeError as pf_exc:
                             # Counted, not raised: a forward that will not
                             # come back is the same outage, and the ceiling
@@ -1131,15 +1483,15 @@ class KubeAgentsHarness(AgentHarness):
             # poll, so the cumulative view would let an agent that has stopped
             # reading the board pass as one still answering, and would mark
             # every turn after the first terminal card as settled.
-            fresh_reported = reported_statuses(new_calls(turn, seen_calls))
+            fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
             _fold_status_turn(
                 result,
-                turn,
+                status_turn,
                 settled=any(s in _TERMINAL_STATUSES for s in fresh_reported.values()),
             )
             # ``observed`` needs each distinct result once, so it stays on the
             # content test -- a replayed reading adds nothing to the answer.
-            observed.extend(merge_new(observed, turn.trajectory))
+            observed.extend(merge_new(observed, status_turn.trajectory))
             session_id = turn_session or session_id
 
             if any(task_id in fresh_reported for task_id in outstanding):
@@ -1153,12 +1505,12 @@ class KubeAgentsHarness(AgentHarness):
                     )
                     timed_out = False
                     break
-            statuses.update(reported_statuses(turn.trajectory))
+            statuses.update(reported_statuses(status_turn.trajectory))
             # dict.fromkeys: order-preserving dedupe, so a card the agent
             # re-filed under the same id is awaited once. The overflow is
             # reported only the first time, since the replayed trajectory
             # re-offers the dropped ids on every poll.
-            merged = list(dict.fromkeys(awaited + delegated_task_ids(turn.trajectory)))
+            merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
             awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
             outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]

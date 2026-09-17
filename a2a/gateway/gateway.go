@@ -554,6 +554,22 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	}
 }
 
+// observeTaskStarted and observeTaskTerminal tell an adapter that implements
+// TaskObserver about a task's two ends. Both are no-ops for every chat
+// backend, which does not implement the interface: a human reads the chat, so
+// the rendered text is the whole of what a chat backend needs.
+func (g *Gateway) observeTaskStarted(conversation, taskID string) {
+	if observer, ok := g.adapter.(TaskObserver); ok {
+		observer.TaskStarted(conversation, taskID)
+	}
+}
+
+func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource) {
+	if observer, ok := g.adapter.(TaskObserver); ok {
+		observer.TaskTerminal(conversation, taskID, state, source)
+	}
+}
+
 // mintSession is first contact with a conversation: contextId is minted
 // here and never changes — the durable name of the conversation on the bus,
 // across every pod incarnation. The mint is create-only (KV Create,
@@ -623,6 +639,15 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		return
 	}
 
+	// Announced before the placeholder below, deliberately: an adapter that
+	// has to correlate its caller's submission with a task (the inject
+	// backend) then learns the id first and never has to decide whether a
+	// post belongs to the task it just submitted. Announced after the two
+	// build steps above and before the publish, so the only way to be told
+	// about a task that never reaches the bus is the publish failure, which
+	// announces its own terminal below. See TaskObserver.
+	g.observeTaskStarted(rec.Key, taskID)
+
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
 	statusMsgID, err := g.adapter.Post(rec.Key, "⏳ submitted…")
@@ -660,6 +685,15 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		delete(g.taskSessions, taskID)
 		delete(g.relays, taskID)
 		g.mu.Unlock()
+		// The task was announced a moment ago and is now over before it
+		// existed: nothing is on the bus, so no executor will ever publish
+		// its terminal and no supervisor path will either. An observer told
+		// about the start is owed the end, or it waits out its own deadline
+		// for an answer that cannot come. Nothing is published here — this
+		// is the gateway telling its own adapter, not a terminal on the
+		// stream, which would be a claim about a task the stream has never
+		// heard of.
+		g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway)
 		return
 	}
 

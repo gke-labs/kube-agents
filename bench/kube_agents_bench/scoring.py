@@ -148,6 +148,15 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
+#: The trajectory entry name the harness's inject transport gives a task's
+#: terminal (``inject_transport.EVENT_ENTRY_TERMINAL``). The gateway carries no
+#: token usage, so an inject record's ``tokens`` are all null and its liveness
+#: signal is the executor's terminal instead. Duplicated rather than imported
+#: for the same reason as the marker above -- importing the transport would
+#: drag the harness's dependencies into the scorer -- and ``test_scoring.py``
+#: asserts the two agree.
+INJECT_TERMINAL_EVENT = "inject.terminal"
+
 #: Field values from devops-bench's ``_build_failed_record``: ``status`` is
 #: ``"failed"`` on every failed record, and ``verification_status`` is
 #: ``"not_evaluated"`` when verification did not run -- which has TWO
@@ -395,6 +404,22 @@ class RepResult:
         return self.outcome in ("pass", "fail")
 
 
+def _inject_terminal_event(trajectory: list[Any]) -> bool:
+    """Whether the trajectory carries an inject-transport task's terminal.
+
+    The inject transport records the conversation the gateway relayed; a
+    terminal entry means an executor took the task and ended it, which is the
+    run evidence a token count gives on the api transport. A task nothing
+    executed never reaches one -- the harness classifies that as
+    infrastructure before a record is written -- so this cannot wave through
+    a run where no agent ran.
+    """
+    for entry in trajectory:
+        if isinstance(entry, dict) and entry.get("name") == INJECT_TERMINAL_EVENT:
+            return True
+    return False
+
+
 def _liveness_failures(record: RunRecord) -> list[str]:
     """Rung 3's signals. Every one must hold for the record to be a real run.
 
@@ -421,10 +446,14 @@ def _liveness_failures(record: RunRecord) -> list[str]:
 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
-    # so the log says which one happened.
+    # so the log says which one happened. The one record that legitimately
+    # carries null buckets is an inject-transport run: the gateway reports no
+    # usage, and its liveness is the task's terminal in the trajectory instead
+    # (see _inject_terminal_event).
     total = record.tokens.get("total")
     if total is None:
-        failures.append("no token accounting on the record (tokens.total is null)")
+        if not _inject_terminal_event(record.trajectory):
+            failures.append("no token accounting on the record (tokens.total is null)")
     elif not isinstance(total, bool) and _as_float(total) == 0:
         failures.append("tokens.total is 0: no model call was billed")
 

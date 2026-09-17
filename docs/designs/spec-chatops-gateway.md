@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
 
 ## Purpose
 
@@ -466,6 +466,76 @@ The adapter interface is what makes the pick cheap: inbound message with verifie
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
 operations, normalized. If the Discord adapter leaks Discord-isms through that interface,
 that's a bug in the interface, and better to learn it on the throwaway backend.
+
+### The inject backend (added 9/17)
+
+A third backend beside Discord and Google Chat, and the one with no human on the other end:
+an HTTP door into `handleInbound` for a program. It is the next-stack analogue of the door
+the eval harness uses today, which posts to the agent's own `/v1/responses` and bypasses chat
+entirely - a path identical under both modes, so a run through it says nothing about the stack
+`mode: next` renders.
+
+**Why it is a backend rather than a bus client.** The harness could publish a submission
+straight to `a2a.tasks.platform.{taskId}.in`, and that proves the bus, the callout, the streams
+and the executor. It leaves out the gateway: its routing, its session registry, the relay back,
+and whatever the router becomes in round 3. It also needs a bus identity, and the only static
+user whose grants fit a requester is the gateway's own - handing a second process the one
+credential that may publish on `.in`. Going through the gateway instead means the gateway keeps
+that credential, mints the ids and the `authority` block itself, and the harness needs neither a
+NATS client nor a principal of its own.
+
+**The two endpoints.**
+
+- `POST /inject` takes a conversation key, an author and the text. The adapter prefixes the key
+  with `inject:` and delivers an `InboundMessage`; from there the turn is indistinguishable from
+  a Discord message. The reply carries the task id, so the caller can await a named task rather
+  than guessing which post belongs to its submission. A turn the gateway answers without minting
+  a task - a steer, a status query, a stop, an author the map does not know - says so, and the
+  reply the conversation received is in the same payload.
+- `GET /conversations/{key}` returns what the relay posted, as a sequence a caller pages through
+  with `after`, plus `wait` to block for something new and `task` to name the task whose terminal
+  the answer should carry. Those three are the whole of "await terminal of task id X". Replies
+  come back the way the relay posts them - the placeholder, the rolling progress line's edits,
+  the deliverable, the terminal - because what a verifier grades has to be what a customer would
+  have read.
+
+The gateway tells the adapter a task's two ends through an optional `TaskObserver` interface the
+chat backends do not implement: a human reads the chat, so rendered text is their whole
+interface, while a program must not have to parse `✅ **completed**` to know a task is over.
+
+**Identity.** An injected author is resolved through the principal map like any other non-gchat
+backend, so the runner needs an entry in one and gets no exemption. `verifiedBy` is
+`inject-network-edge` rather than `principal-map`, deliberately: the map decides _which_
+principal an author id stands for, and nothing authenticates that the caller is that author. The
+audit record should name the mechanism that actually ran.
+
+**Posture, stated out loud: this is a dev and eval backend and the code cannot make it anything
+else.** Neither endpoint authenticates. Anything that reaches the listener can submit a task as
+any principal the map carries and read every reply on every conversation. Three things confine
+it, none of them in the adapter:
+
+1. It is off unless armed, by an operator-level environment variable rather than a CRD field.
+   A CRD field would put "disable every check on the chat door" in the API a cluster's owner
+   edits, and the operator would be obliged to honour it. This is a property of the install being
+   an eval install, so it is set by whoever deploys the operator - the same shape as the A2A
+   image overrides.
+2. Its Service is a ClusterIP. Not a NodePort, not a LoadBalancer.
+3. While it is armed, a NetworkPolicy fences the gateway pod against **every pod on the cluster
+   network**: ingress with no rules. The eval runner reaches the Service through `kubectl
+port-forward`, which enters from the node and is not pod-network traffic - so the
+   authentication is the Kubernetes API session the port-forward already required, borrowed from
+   the cluster. That exemption is host-local rather than port-forward-shaped, which is the honest
+   edge of the claim: a `hostNetwork` pod on the gateway's node reaches the listener by the same
+   route. Nothing here renders one, and scheduling one takes a grant the agent under test does
+   not hold.
+
+An install a user can reach with this armed has handed that user the principal map. Nothing in
+the gateway can detect that; the flag and the fence are the answer.
+
+**What it also settles.** The gateway refuses to start without a backend, which makes it
+crash-loop on any install with neither a Discord token nor a Chat relay - so a `mode: next`
+install never reads Ready and nothing can rollout-gate on it. An eval install with this backend
+armed has a backend, and starts.
 
 ## The Google Chat adapter (added 9/5)
 

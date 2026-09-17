@@ -4,7 +4,8 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 
 ## Layout
 
-- `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. Environment variables are documented in the module docstring.
+- `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. `AGENT_TRANSPORT=inject` swaps the HTTP door for the A2A gateway's (see [Transports](#transports)). Environment variables are documented in the module docstring.
+- `kube_agents_bench/inject_transport.py` — the door half of that second transport: the two HTTP calls, the fold of a conversation's transcript, and one submit-and-await exchange.
 - `kube_agents_bench/parsing.py` — pure payload and trajectory reading: maps a response onto devops-bench's canonical `AgentResult`, and reads back which kanban cards a turn filed, what statuses it reported, and what a finished card delivered.
 - `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
   `/api/v1` interaction contract. It waits for aggregate terminal state before
@@ -42,6 +43,27 @@ PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> 
 ```
 
 This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional, and `./tasks` runs every case. The exports are what `hack/ci-eval-pr.sh` sets, so a local run grades the way the presubmit does; a case with `fixtures:` also needs `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh`. `--no-infra` smokes the agent path only: it skips the deterministic checks, so such a run can neither pass nor fail the gate. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses this. See `--help` for the rest.
+
+## Transports
+
+The harness reaches the agent through one of two doors, selected by `AGENT_TRANSPORT`. Everything else about a run is the same: the same `KubeAgentsHarness`, the same `AgentResult`, the same transcript stash the verifiers read.
+
+- `api` (the default): `kubectl port-forward` to `svc/platform-agent` and `POST /v1/responses`, followed by status turns on the same conversation while delegated cards settle. This door is identical under `spec.mode: today` and `spec.mode: next`, so a run through it says nothing about the next stack.
+- `inject`: the prompt is `POST`ed to the A2A gateway's inject backend, which enters `handleInbound` like a message from any chat backend — routing, the session record, `startTask`, the bus, and the relay posting the reply back. The harness port-forwards the inject Service (`<cr>-a2a-inject`, port 8099) and awaits the terminal of the task the POST returned. What it grades is what the conversation received, which is what a customer would have read.
+
+The inject backend is rendered only when the operator itself was deployed with `A2A_INJECT_BACKEND=true`, and it has no authentication of its own — see the test-backend section of [`spec-chatops-gateway.md`](../docs/designs/spec-chatops-gateway.md). A run against an install without it ends as infrastructure (the tunnel has nothing to reach), never as a graded answer; so does a task no executor took inside `AGENT_INJECT_ACCEPT_TIMEOUT`. A task an executor took and ended `failed` is graded.
+
+What each transport gives the verifiers:
+
+| Verifier                                     | `api`                       | `inject`                                                                                                                                                                                    |
+| -------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `report_contains`, `fleet_resource_property` | yes                         | yes: the deliverable is the post the relay made, which is the text a customer reads                                                                                                         |
+| `tool_called`                                | the delegating turn's calls | no: the relay never posts `activity` artifacts to a conversation, so no transport reading one can see tool calls, whatever the executor publishes                                           |
+| `worker_commands`                            | the delegated cards' logs   | no: with no card ids there is nothing to read back, and the verifier reports `error` rather than an empty list — a rung-2 stop, so a case declaring this check cannot run over `inject` yet |
+| `ledger_issue_contains`                      | yes                         | yes                                                                                                                                                                                         |
+| token accounting (`tokens.*`)                | the session row             | none: the gateway reports no usage, every bucket is null. The counts are not a score, but their presence is a rung-3 liveness signal, so `bench-gate` reads the task's terminal instead     |
+
+Delegation on the inject path is a seam, not a feature: the kanban poll behind the wait stays in the case runner and issues follow-up messages on the same conversation, but with no card ids in the trajectory it settles at once. It is deliberately not in the transport, so it can be deleted whole when agent-initiated delegation becomes a child task on the bus.
 
 ## The gate
 

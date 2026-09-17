@@ -111,8 +111,16 @@ const (
 // verifiedByFor names the mechanism that checked the requester at ingress
 // for one backend (authority.requester.verifiedBy).
 func verifiedByFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return gchatVerifiedBy
+	case injectBackend:
+		// Not "principal-map", although the map is what resolves the
+		// author: on this backend nothing authenticates that the caller IS
+		// the author it names, so the network edge is the whole of the
+		// verification and the audit record says which mechanism actually
+		// ran. See the posture note at the top of inject.go.
+		return injectVerifiedBy
 	}
 	return "principal-map"
 }

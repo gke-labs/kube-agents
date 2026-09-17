@@ -34,6 +34,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "")
 	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
 	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
+	t.Setenv("A2A_INJECT_LISTEN", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the
@@ -379,16 +380,78 @@ func TestFromEnvGchatBackendSelection(t *testing.T) {
 	}
 }
 
+// TestFromEnvInjectBackendSelection: A2A_INJECT_LISTEN selects the dev-only
+// inject backend, and nothing else has to be set for it.
+func TestFromEnvInjectBackendSelection(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("A2A_INJECT_LISTEN", " :8099 ")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != injectBackend {
+		t.Fatalf("Backend() = %q, want %q", cfg.Backend(), injectBackend)
+	}
+	// Trimmed, because a value that is nothing but whitespace must read as
+	// unset rather than as a backend armed on an address net.Listen refuses.
+	if cfg.InjectListen != ":8099" {
+		t.Fatalf("InjectListen = %q, want the trimmed address", cfg.InjectListen)
+	}
+	t.Setenv("A2A_INJECT_LISTEN", "   ")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("a whitespace-only A2A_INJECT_LISTEN must read as no backend at all, not as the inject backend")
+	}
+}
+
 // TestFromEnvOneBackendPerProcess: two backends on one relay durable split
-// event deliveries, and no backend is a misconfiguration, not a default.
+// event deliveries, and no backend is a misconfiguration, not a default. The
+// check counts rather than enumerating pairs, so every pairing is covered
+// here and a fourth backend cannot be armed alongside one nobody thought of.
 func TestFromEnvOneBackendPerProcess(t *testing.T) {
 	setBaseEnv(t)
-	t.Setenv("A2A_GCHAT_RELAY_URL", "http://relay.ns.svc:8081")
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("DISCORD_TOKEN and A2A_GCHAT_RELAY_URL together must refuse")
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{"discord and gchat", map[string]string{
+			"DISCORD_TOKEN": "x", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
+		}},
+		{"discord and inject", map[string]string{
+			"DISCORD_TOKEN": "x", "A2A_INJECT_LISTEN": ":8099",
+		}},
+		{"gchat and inject", map[string]string{
+			"A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081", "A2A_INJECT_LISTEN": ":8099",
+		}},
+		{"all three", map[string]string{
+			"DISCORD_TOKEN": "x", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
+			"A2A_INJECT_LISTEN": ":8099",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("DISCORD_TOKEN", "")
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			_, err := FromEnv()
+			if err == nil {
+				t.Fatal("two backends in one process must refuse")
+			}
+			// The message has to name what is armed, or an operator reading
+			// it cannot tell which variable to unset.
+			for key := range tc.env {
+				if !strings.Contains(err.Error(), key) {
+					t.Errorf("the refusal does not name %s: %v", key, err)
+				}
+			}
+		})
 	}
+
+	setBaseEnv(t)
 	t.Setenv("DISCORD_TOKEN", "")
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
+	t.Setenv("A2A_INJECT_LISTEN", "")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("no backend at all must refuse")
 	}

@@ -38,7 +38,18 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 				"DISCORD_TOKEN":       "tok",
 				"A2A_GCHAT_RELAY_URL": "http://relay",
 			},
-			want: "both DISCORD_TOKEN and A2A_GCHAT_RELAY_URL are set",
+			// The refusal names what is armed, so an operator reading it
+			// knows which variable to unset.
+			want: "more than one backend is configured",
+		},
+		{
+			name: "inject and a chat backend together",
+			env: map[string]string{
+				"NATS_URL":          "nats://127.0.0.1:1",
+				"DISCORD_TOKEN":     "tok",
+				"A2A_INJECT_LISTEN": ":8099",
+			},
+			want: "A2A_INJECT_LISTEN",
 		},
 		{
 			name: "no backend set",
@@ -56,6 +67,7 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			t.Setenv("NATS_URL", "")
 			t.Setenv("DISCORD_TOKEN", "")
 			t.Setenv("A2A_GCHAT_RELAY_URL", "")
+			t.Setenv("A2A_INJECT_LISTEN", "")
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}

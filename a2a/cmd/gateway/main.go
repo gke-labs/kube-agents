@@ -91,6 +91,11 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	switch backend := cfg.Backend(); backend {
 	case "gchat":
 		adapter, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+	case "inject":
+		// Dev and eval installs only; the adapter logs the posture at boot
+		// and the operator renders A2A_INJECT_LISTEN only under its eval
+		// flag. See a2a/gateway/inject.go.
+		adapter, err = gateway.NewInjectAdapter(cfg.InjectListen, log)
 	default:
 		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 	}

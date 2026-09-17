@@ -46,6 +46,7 @@ from kube_agents_bench.cases import CaseSpec, load_case
 from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     INFRA_FAILURE_MARKER,
+    INJECT_TERMINAL_EVENT,
     MISSING,
     Rung,
     grade_case,
@@ -413,6 +414,60 @@ def test_rung_3_each_liveness_signal_alone_blocks(noop_spec, make_run, mutation,
     assert verdict.rung is Rung.NOT_A_REAL_RUN
     assert verdict.blocking is True
     assert needle in verdict.reason
+
+
+def give_it_an_inject_terminal(rec):
+    """Null token buckets plus an inject-transport task terminal.
+
+    What an inject-transport run legitimately looks like: the gateway reports
+    no usage, so every bucket is None, and the evidence that a run happened is
+    the executor's terminal in the trajectory.
+    """
+    rec["tokens"] = {k: None for k in rec["tokens"]}
+    rec["trajectory"] = [
+        {
+            "name": INJECT_TERMINAL_EVENT,
+            "args": {"taskId": "task-abc123", "state": "completed"},
+            "result": None,
+            "status": "completed",
+        }
+    ]
+
+
+def test_rung_3_accepts_null_tokens_when_a_task_terminated(noop_spec, make_run):
+    """The one record that legitimately has no token accounting.
+
+    The A2A gateway reports no usage, so an inject-transport run's buckets are
+    all null -- which rung 3 reads as "no agent ran" everywhere else, and
+    would red every case run through the customer's front door.
+    """
+    verdict = grade_case(noop_spec, [make_run(mutate=give_it_an_inject_terminal)], admitted=False)
+    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+
+
+def test_rung_3_still_blocks_null_tokens_with_no_terminal(noop_spec, make_run):
+    """The exemption is narrow on purpose.
+
+    A skeleton record has null buckets too. What distinguishes the inject run
+    is the terminal, and a trajectory without one has to keep failing -- or
+    the exemption becomes a way for any empty record to pass.
+    """
+
+    def null_tokens_only(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+
+    verdict = grade_case(noop_spec, [make_run(mutate=null_tokens_only)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "tokens.total is null" in verdict.reason
+
+
+def test_the_scorer_and_the_inject_transport_agree_on_the_terminal_entry():
+    """The scorer duplicates the transport's literal rather than importing it,
+    for the reason the marker above is duplicated. Duplicated literals drift;
+    this is what stops it silently."""
+    from kube_agents_bench import inject_transport
+
+    assert INJECT_TERMINAL_EVENT == inject_transport.EVENT_ENTRY_TERMINAL
 
 
 def test_rung_3_ignores_an_empty_output(noop_spec, make_run):

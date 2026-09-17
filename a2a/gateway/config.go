@@ -78,6 +78,15 @@ type Config struct {
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
 
+	// InjectListen is the inject backend's HTTP listen address, and setting
+	// it selects that backend. DEV AND EVAL ONLY: the endpoints carry no
+	// authentication, so the address and the network policy in front of it
+	// are the whole of the access control (inject.go's posture note, and the
+	// test-backend section of spec-chatops-gateway.md). The operator renders
+	// it only under its eval flag; a value here on an install users can
+	// reach hands them the principal map.
+	InjectListen string
+
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
 	// under "default" the rolling line carries the state but never the
@@ -226,12 +235,18 @@ type Config struct {
 	MaxSessions int
 }
 
-// Backend names the chat backend this config arms: "gchat" or "discord".
+// Backend names the backend this config arms: "gchat", "inject" or
+// "discord". FromEnv refuses more than one, so the order here only decides
+// what a hand-built Config means.
 func (c *Config) Backend() string {
-	if c.GchatRelayURL != "" {
+	switch {
+	case c.GchatRelayURL != "":
 		return gchatBackend
+	case c.InjectListen != "":
+		return injectBackend
+	default:
+		return "discord"
 	}
-	return "discord"
 }
 
 // FromEnv loads the config from the environment.
@@ -258,6 +273,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -265,14 +281,29 @@ func FromEnv() (*Config, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	// A silent default here would make a two-backend misconfiguration a
-	// working Discord gateway that quietly never consumes Chat — refuse
-	// both directions instead.
-	switch {
-	case cfg.GchatRelayURL != "" && cfg.DiscordToken != "":
-		return nil, fmt.Errorf("both DISCORD_TOKEN and A2A_GCHAT_RELAY_URL are set: one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend")
-	case cfg.GchatRelayURL == "" && cfg.DiscordToken == "":
-		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret) or A2A_GCHAT_RELAY_URL (the credential proxy's chat relay)")
+	// One backend per gateway process, chosen by which variable is set. A
+	// silent default here would make a two-backend misconfiguration a
+	// working Discord gateway that quietly never consumes Chat — refuse both
+	// directions instead. Counted rather than enumerated pairwise: with a
+	// third backend the pairs are the easy thing to leave a hole in, and the
+	// fourth (Slack, #1248) must not be addable with a combination nobody
+	// checked. Adding a backend is one entry in this list.
+	var armed []string
+	if cfg.GchatRelayURL != "" {
+		armed = append(armed, "A2A_GCHAT_RELAY_URL")
+	}
+	if cfg.InjectListen != "" {
+		armed = append(armed, "A2A_INJECT_LISTEN")
+	}
+	if cfg.DiscordToken != "" {
+		armed = append(armed, "DISCORD_TOKEN")
+	}
+	switch len(armed) {
+	case 1:
+	case 0:
+		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), or A2A_INJECT_LISTEN (the dev-only inject backend)")
+	default:
+		return nil, fmt.Errorf("more than one backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend", strings.Join(armed, ", "))
 	}
 	// Only when the spawn path is armed: a gateway that spawns nothing has
 	// no session identity to name, and demanding one would break every

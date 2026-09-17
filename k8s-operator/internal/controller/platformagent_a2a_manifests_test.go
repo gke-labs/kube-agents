@@ -3631,3 +3631,255 @@ func TestCheckA2AUserGrants(t *testing.T) {
 		})
 	}
 }
+
+// ---- the inject backend (#1704) ------------------------------------------
+//
+// The gateway's inject backend is an unauthenticated HTTP door into
+// handleInbound, for the eval harness. Everything below is about the two
+// properties that keep it from being a hole: it is rendered only when the
+// operator itself was deployed with the flag, and while it is rendered the
+// gateway pod is fenced against every pod on the network.
+
+// a2aInjectAgentState reconciles a next-mode agent twice (finalizer pass,
+// then the real one) and hands back the client, so each inject test states
+// only what it is asserting.
+func a2aInjectAgentState(t *testing.T) (client.Client, *agentv1alpha1.PlatformAgent, *PlatformAgentReconciler, ctrl.Request) {
+	t.Helper()
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+	return cl, agent, r, req
+}
+
+// a2aGatewayEnv reads the rendered gateway container's environment by name.
+func a2aGatewayEnv(t *testing.T, cl client.Client, agent *agentv1alpha1.PlatformAgent) map[string]corev1.EnvVar {
+	t.Helper()
+	dep := &appsv1.Deployment{}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, dep); err != nil {
+		t.Fatalf("gateway Deployment: %v", err)
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e
+	}
+	return env
+}
+
+// TestA2AInjectBackendIsOffWithoutTheFlag is the property the whole design
+// rests on: an ordinary next install renders no inject door at all. Not a
+// closed one, not one behind a fence -- none, so there is nothing to
+// misconfigure and nothing to find.
+func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+
+	// The render, first: nothing in the pod spec even mentions it.
+	dep := buildA2AGatewayDeployment(agent)
+	container := dep.Spec.Template.Spec.Containers[0]
+	for _, e := range container.Env {
+		if e.Name == a2aInjectListenEnvVar {
+			t.Errorf("%s is rendered without the flag", a2aInjectListenEnvVar)
+		}
+		if e.Name == "A2A_PRINCIPAL_MAP" {
+			t.Errorf("A2A_PRINCIPAL_MAP is repointed without the flag: %+v", e)
+		}
+	}
+	if len(container.Ports) != 0 {
+		t.Errorf("the gateway publishes %d container ports without the flag", len(container.Ports))
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if strings.Contains(v.Name, "inject") {
+			t.Errorf("an inject volume is mounted without the flag: %s", v.Name)
+		}
+	}
+
+	// And the cluster: no Service to reach, no map to be admitted by.
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+	name := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	for _, obj := range []client.Object{&corev1.Service{}, &corev1.ConfigMap{}, &networkingv1.NetworkPolicy{}} {
+		if err := cl.Get(ctx, name, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s exists without the flag (err=%v)", obj, name.Name, err)
+		}
+	}
+}
+
+// TestA2AInjectBackendRendersUnderTheFlag: with the operator deployed with
+// the flag, the gateway gets a listener, a map that admits exactly the eval
+// author, and a ClusterIP to reach it on.
+func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+
+	env := a2aGatewayEnv(t, cl, agent)
+	listen := env[a2aInjectListenEnvVar]
+	if listen.Value != fmt.Sprintf(":%d", a2aInjectPort) {
+		t.Errorf("%s = %q, want every interface on the inject port", a2aInjectListenEnvVar, listen.Value)
+	}
+	// The map the gateway reads has to be the one the operator rendered; the
+	// default path is the hand-made Discord map, which carries no eval
+	// author, and a gateway reading it drops every injected message at
+	// verification with nothing in the render looking wrong.
+	if got := env["A2A_PRINCIPAL_MAP"].Value; got != a2aInjectPrincipalMapPath {
+		t.Errorf("A2A_PRINCIPAL_MAP = %q, want the operator's own map at %q", got, a2aInjectPrincipalMapPath)
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatal(err)
+	}
+	container := dep.Spec.Template.Spec.Containers[0]
+	var mounted bool
+	for _, m := range container.VolumeMounts {
+		if m.MountPath == a2aInjectPrincipalMapPath {
+			mounted = true
+			if !m.ReadOnly {
+				t.Error("the inject principal map is mounted writable")
+			}
+		}
+	}
+	if !mounted {
+		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aInjectPrincipalMapPath)
+	}
+	// The other map stays mounted and unread: two ConfigMaps cannot share a
+	// path, and an install with this backend has no Discord one anyway.
+	var stillHasDefault bool
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "principal-map" {
+			stillHasDefault = true
+		}
+	}
+	if !stillHasDefault {
+		t.Error("the flag removed the default principal-map volume; it is shared with the chat backends")
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("inject principal map: %v", err)
+	}
+	if got := cm.Data[a2aInjectAuthor]; got != a2aInjectPrincipal {
+		t.Errorf("the map resolves %q to %q, want %q", a2aInjectAuthor, got, a2aInjectPrincipal)
+	}
+	if len(cm.Data) != 1 {
+		t.Errorf("the map admits %d identities, want exactly the eval author", len(cm.Data))
+	}
+
+	svc := &corev1.Service{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, svc); err != nil {
+		t.Fatalf("inject Service: %v", err)
+	}
+	// ClusterIP is the access control: a LoadBalancer or a NodePort would
+	// publish an unauthenticated task-submission endpoint off-cluster.
+	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Errorf("inject Service type = %q, want ClusterIP", svc.Spec.Type)
+	}
+	if svc.Spec.Selector["app"] != a2aGatewayName(agent) {
+		t.Errorf("inject Service selects %v, want the gateway pod", svc.Spec.Selector)
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != a2aInjectPort {
+		t.Errorf("inject Service ports = %+v, want just the inject port", svc.Spec.Ports)
+	}
+	// The listener and the Service must agree, or a port-forward reaches a
+	// closed port and reads as a broken gateway.
+	if !strings.HasSuffix(listen.Value, fmt.Sprintf(":%d", svc.Spec.Ports[0].Port)) {
+		t.Errorf("the gateway listens on %q and the Service publishes %d", listen.Value, svc.Spec.Ports[0].Port)
+	}
+}
+
+// TestA2AInjectFenceDeniesEveryPod: the fence is the whole of what withholds
+// an unauthenticated endpoint from the cluster, so it has to select the
+// gateway pod and admit nobody. An ingress rule appearing here later is a
+// decision someone has to make deliberately.
+func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+
+	np := &networkingv1.NetworkPolicy{}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, np); err != nil {
+		t.Fatalf("the gateway fence was not rendered with the inject backend: %v", err)
+	}
+	if np.Spec.PodSelector.MatchLabels["app"] != a2aGatewayName(agent) {
+		t.Errorf("the fence selects %v, want the gateway pod", np.Spec.PodSelector.MatchLabels)
+	}
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Errorf("policyTypes = %v, want Ingress alone -- Egress here would cut the gateway off the bus",
+			np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Errorf("the fence admits %d ingress rules; the inject port must be reachable from no pod, "+
+			"only through the node path a port-forward uses", len(np.Spec.Ingress))
+	}
+}
+
+// TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff: unsetting the operator's
+// flag has to take the door with it. Left behind, a Service and a map would
+// sit on an install that is supposed to look like it never had one -- and the
+// next operator roll that re-reads the flag would find them already there.
+func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flag went off: %v", err)
+	}
+	for _, obj := range []client.Object{&corev1.Service{}, &corev1.ConfigMap{}, &networkingv1.NetworkPolicy{}} {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flag going off (err=%v)", obj, key.Name, err)
+		}
+	}
+	if env := a2aGatewayEnv(t, cl, agent); env[a2aInjectListenEnvVar].Value != "" {
+		t.Errorf("the gateway still listens on %q after the flag went off", env[a2aInjectListenEnvVar].Value)
+	}
+}
+
+// TestA2AInjectBackendGoesAwayOnAFlipToToday: the darkness property. A today
+// install must carry no A2A object, and the inject backend's three are
+// exactly the kind that get forgotten -- they are rendered by a branch the
+// teardown path never consults.
+func TestA2AInjectBackendGoesAwayOnAFlipToToday(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flip to today: %v", err)
+	}
+	for _, obj := range []client.Object{&corev1.Service{}, &corev1.ConfigMap{}, &networkingv1.NetworkPolicy{}} {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flip to today (err=%v)", obj, key.Name, err)
+		}
+	}
+}
