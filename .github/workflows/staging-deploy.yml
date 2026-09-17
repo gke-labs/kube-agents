@@ -10,7 +10,8 @@ name: "Staging: Deploy"
 on:
   push:
     tags:
-      # Pushed by staging-promotion-pipeline.yml (Step 4) after green E2E matrix
+      # Pushed by staging-promotion-pipeline.yml (Step 6), after the E2E matrix is
+      # green AND the release-candidate eval has returned GREEN on the candidate.
       # Format: staging_<timestamp>_<commit_sha>
       - "staging_*"
   #checkov:skip=CKV_GHA_7:Standalone launch requires optional image tag, lease policy and force reconcile inputs

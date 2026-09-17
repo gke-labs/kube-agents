@@ -69,8 +69,8 @@ esac
 # Refusing is the point. The alternative is a promotion that pushes its tag,
 # deploys nothing, and reports green — and then never retries, because
 # get_existing_staging_tag finds the tag it just pushed and every later run sets
-# skip_promotion. A red step 4 leaves the candidate unpromoted, so the next
-# validated candidate is picked up normally.
+# skip_promotion. Refusing instead leaves the candidate unpromoted at step 6 of
+# staging-promotion-pipeline.yml, and the next validated candidate is picked up normally.
 #
 # Delete this guard once no rc_*_validated tag predates the trigger rename; it is
 # the same window the script-name fallbacks in deploy-environment.yml and

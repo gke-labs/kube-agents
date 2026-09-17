@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """Waits for the release-candidate eval's verdict on one nominated commit.
 
-NOT WIRED YET, in the same sense as the evalcand_ helpers in common.sh: no
-workflow in this repository runs this script, and the paragraph below describes
-where it is going rather than what runs tonight. Tonight the nightly still
-pushes staging_ straight off a green matrix, and the eval still fires on that
-tag. The pull request that changes staging-promotion-pipeline.yml is what joins the pieces
-up. Everything after this paragraph is true of the script itself and can be
-relied on now.
-
-The nightly pipeline will push an `evalcand_<ts>_<sha>` tag, which fires
+Step 4 of staging-promotion-pipeline.yml pushes an `evalcand_<ts>_<sha>` tag, which fires
 `post-kube-agents-eval-rc` in GoogleCloudPlatform/oss-test-infra. That job runs
 the full eval catalog against the candidate's published images and takes hours.
 This script stands between the nomination and the promotion: it polls the job's
@@ -43,19 +35,22 @@ distinction the build status throws away entirely.
 HOW FAR THAT DISTINCTION GOES TODAY, stated because "RED is a judgement on the
 candidate" is the load-bearing half of it and the driver's split is narrower
 than the sentence above sounds. ci-eval-rc.sh writes NOT RUN when the deploy
-fails, when it never reaches its reporting step, or when hack/ci-eval-pr.sh
-exits 2 with eval-verdict.json saying `outcome: not_evaluated` -- an admitted
-case, or every case, lost every repetition to infrastructure, so the suite
-could not certify a verdict. Every other non-zero exit of hack/ci-eval-pr.sh
-becomes RED, and some of those measured nothing either -- a ledger token that
-would not mint, a runner image short of `uv`, a `bench-gate case` that could
-not grade. Those land here as a settled RED, and a
-settled RED keeps its evalcand_ tag, so that candidate is never measured again.
-It does not stall the lane: the next nightly resolves a newer commit and staging
-advances. It does cost one candidate and leave a rejection in the record that
-was not one. Narrowing it is the driver's job, not this script's: ci-eval-rc.sh
-is the only place that can see which of its own steps failed, and this side of
-the read cannot recover a distinction the word it is handed does not carry.
+fails, when it never reaches its reporting step, when hack/ci-eval-pr.sh exits 2
+with eval-verdict.json saying `outcome: not_evaluated` -- an admitted case, or
+every case, lost every repetition to infrastructure, so the suite could not
+certify a verdict -- and when it exits non-zero without leaving bench-gate's
+per-case roll-up behind at all, which is how a run that stopped before grading
+anything is told apart from a graded catalog. That last one covers the refusals
+that happen before the first case runs, a ledger token that would not mint or a
+runner image short of `uv`, and also a `bench-gate case` that could not grade,
+since exiting 2 there stops the job before the roll-up.
+
+What still arrives as a settled RED is a run that graded a catalog and exited
+non-zero on it without bench-gate declaring the run uncertifiable -- which is
+the verdict the word is meant for. A settled RED keeps its evalcand_ tag, so
+that candidate is never measured again; if one ever turns out to have measured
+nothing after all, the recovery is to delete the tag by hand and let the next
+nightly nominate the commit again.
 
 A missing summary artifact is itself informative rather than a gap. The driver
 writes it on every path that reaches the reporting step, so its absence means
@@ -586,6 +581,14 @@ def poll(
     deadline = started_at + deadline_minutes * SECONDS_PER_MINUTE
     appear_deadline = started_at + appear_deadline_minutes * SECONDS_PER_MINUTE
     seen_build = None
+    # Remembered rather than re-read, because the timeout below is reached from a
+    # sweep that may have found nothing. scan_once returns a prefix only on the
+    # sweep that read the build; a listing that went unreadable, or a build that
+    # dropped out of the scan window, sends it back down the never-ran path with
+    # `base` at None. Reporting that None as the timeout's prefix would hand the
+    # operator a TIMEOUT with no link to the build that timed out, which is the
+    # one thing that summary exists to carry.
+    seen_base = None
     said = set()
 
     def note(message):
@@ -606,13 +609,14 @@ def poll(
             # the log is "the eval picked our tag up", not each of the 160
             # polls that follow it.
             seen_build = build_id
+            seen_base = base
             print(f"build {build_id} is running at {commit}: {spyglass_url(base)}", flush=True)
 
         elapsed = now() - started_at
         if seen_build is None and now() >= appear_deadline:
             return VERDICT_NEVER_RAN, None, None
         if now() >= deadline:
-            return VERDICT_TIMEOUT, seen_build, base
+            return VERDICT_TIMEOUT, seen_build, seen_base
 
         print(
             f"waiting for the eval verdict on {commit}"
@@ -641,10 +645,10 @@ _SUMMARY = {
         "The release-candidate eval FAILED on this candidate, so it was not promoted and"
         " staging stays on the previous build. The linked build says which cases failed."
         " RED is treated as a judgement on the candidate, so the nomination stands and the"
-        " next nightly measures the next candidate. Read the linked build before accepting"
-        " that: the driver reports RED for anything that made the eval step exit non-zero,"
-        " which includes a few ways it can fail without grading a case. If that is what"
-        " happened, delete the evalcand_ tag by hand and the candidate is nominated again."
+        " next nightly measures the next candidate. The runs that graded nothing are"
+        " reported NOT RUN rather than arriving here, so a RED is a graded catalog; if the"
+        " linked build shows otherwise, delete the evalcand_ tag by hand and the candidate"
+        " is nominated again."
     ),
     VERDICT_NOT_RUN: (
         "The release-candidate eval did not measure this candidate, so it was not promoted"
