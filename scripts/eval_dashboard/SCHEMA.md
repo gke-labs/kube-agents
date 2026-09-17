@@ -677,10 +677,12 @@ it is set.
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
-window_hours, p50_s, p95_s, waiting, over_threshold, threshold_p50_s,
-threshold_p95_s, free, total, cause, max_concurrency}` when `verdict` is
-`BREACH` or `UNMEASURED`. `waiting` is every run with no pod yet and `null`
-when Deck was not read; `over_threshold` is the subset past the p95 limit.
+window_hours, p50_s, p95_s, waiting_longest_s, over_threshold,
+threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+longest run has been waiting for a project right now, `0` for an empty queue
+and `null` when Deck was not read; `over_threshold` is the count already past
+the p95 limit.
 `breach_seen` says whether the open episode has ever measured a breach, and
 `since` is the episode's start except that a `BREACH` does not inherit one from
 a stretch that only ever said the queue could not be read. `metrics` carries

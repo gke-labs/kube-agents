@@ -104,7 +104,7 @@ def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:
         "window_hours": 3,
         "p50_s": 22 * 60,
         "p95_s": 61 * 60,
-        "waiting": 6,
+        "waiting_longest_s": 40 * 60,
         "over_threshold": 2,
         "threshold_p50_s": 15 * 60,
         "threshold_p95_s": 45 * 60,
@@ -889,12 +889,17 @@ class PoolNote(RunHarness):
         self.assertEqual(len(self.opener.requests), 2)
 
     def test_a_cause_is_recorded_only_once_the_message_is_sent(self):
-        # A failed send must be retried, so the remedy is not marked told.
-        self.opener.statuses = [500]
+        # A failed send must be retried, so the remedy is not marked told. The
+        # episode has to be open first: on the very first tick main() returns
+        # before write_state, so nothing the guard does can show.
         self.tick(pooled(), self.at(10))
-        self.tick(pooled(), self.at(10, 15))
-        self.assertEqual(len(self.opener.requests), 2, "retried")
-        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"])
+        self.opener.statuses = [500]
+        self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(10, 15))
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"], "the cap was never announced")
+        self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(10, 30))
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP"])
+        # Three attempts: the first note, the cap that 500'd, and its retry.
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳", "⏳"])
 
     def test_a_new_episode_names_its_remedy_again(self):
         # The list is the episode's, not the channel's memory: the same cause a
@@ -1008,12 +1013,12 @@ class PoolNote(RunHarness):
         # The verdict spans seven days and the remedy is read live, so one bad
         # Monday keeps the verdict all week while the remedy tracks a pool that
         # has since drained. With nothing waiting there is no queue to explain.
-        self.tick(pooled(waiting=0, over_threshold=0), self.at(10))
+        self.tick(pooled(waiting_longest_s=0, over_threshold=0), self.at(10))
         self.assertEqual(len(self.opener.requests), 0)
         self.assertIsNone(self.recorded()["pool_verdict"])
 
     def test_the_same_breach_is_told_once_runs_are_waiting(self):
-        self.tick(pooled(waiting=0, over_threshold=0), self.at(10))
+        self.tick(pooled(waiting_longest_s=0, over_threshold=0), self.at(10))
         self.tick(pooled(over_threshold=2), self.at(11))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳"])
         self.assertEqual(self.recorded()["pool_verdict"], "BREACH")
@@ -1022,21 +1027,28 @@ class PoolNote(RunHarness):
         # The Tuesday-3am case: the pool drained overnight, so cause() reads
         # CONTROL_PLANE off a free pool while Monday still holds the verdict.
         self.tick(pooled(), self.at(10))
-        self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting=0, over_threshold=0), self.at(11))
+        self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=0, over_threshold=0), self.at(11))
         self.assertEqual(len(self.opener.requests), 1)
         self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"])
+
+    def test_a_queue_that_has_only_just_formed_says_nothing(self):
+        # A run triggered a minute ago is not a backlog. Accepting it would let
+        # a week-old verdict re-post under whatever remedy the live pool reads
+        # as now -- the case the gate exists for, through a different door.
+        self.tick(pooled(waiting_longest_s=60, over_threshold=0), self.at(10))
+        self.assertEqual(len(self.opener.requests), 0)
 
     def test_a_backlog_under_the_p95_limit_is_still_told(self):
         # The incident this message is for: the pool full all afternoon, every
         # run waiting half an hour, the day's row breached on p50 and nothing
         # yet past 45 minutes. Gating on the p95 subset would keep it quiet.
-        self.tick(pooled(waiting=9, over_threshold=0), self.at(10))
+        self.tick(pooled(waiting_longest_s=31 * 60, over_threshold=0), self.at(10))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳"])
 
     def test_a_breach_is_told_when_the_queue_could_not_be_read(self):
         # Deck unread is not "nothing is waiting". Withholding on it would
         # silence a breach for as long as the read keeps failing.
-        self.tick(pooled(waiting=None, over_threshold=0), self.at(10))
+        self.tick(pooled(waiting_longest_s=None, over_threshold=0), self.at(10))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳"])
 
     def test_the_monitoring_verdicts_are_told_with_no_queue_behind_them(self):
@@ -1045,7 +1057,7 @@ class PoolNote(RunHarness):
         for verdict in ("STALE", "UNMEASURED"):
             with self.subTest(verdict=verdict):
                 self.setUp()
-                self.tick(pooled(verdict=verdict, waiting=0, over_threshold=0), self.at(10))
+                self.tick(pooled(verdict=verdict, waiting_longest_s=0, over_threshold=0), self.at(10))
                 self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⚪"])
 
     def test_a_breach_that_returns_after_a_withheld_stretch_is_told(self):
@@ -1054,7 +1066,7 @@ class PoolNote(RunHarness):
         # named earlier in the episode. The breach would come back silently.
         self.tick(pooled(), self.at(10))
         self.tick(pooled(verdict="STALE"), self.at(10, 15))
-        self.tick(pooled(waiting=0, over_threshold=0), self.at(10, 30))
+        self.tick(pooled(waiting_longest_s=0, over_threshold=0), self.at(10, 30))
         self.assertEqual(self.recorded()["pool_verdict"], "STALE", "nothing was said at 10:30")
         self.tick(pooled(), self.at(10, 45))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪", "⏳"])
@@ -1063,7 +1075,7 @@ class PoolNote(RunHarness):
         # pool_breached is set on the send, not on the reading. Set it on the
         # reading and a week of withheld breaches would close with a ✅ ending
         # an episode the space never heard begin.
-        self.tick(pooled(waiting=0, over_threshold=0), self.at(10))
+        self.tick(pooled(waiting_longest_s=0, over_threshold=0), self.at(10))
         self.tick(cleared(), self.at(10, 15))
         self.assertEqual(len(self.opener.requests), 0)
         self.assertFalse(self.recorded()["pool_breached"])

@@ -936,7 +936,7 @@ class PoolNote(unittest.TestCase):
                 "window_hours": None,
                 "p50_s": 1446,
                 "p95_s": 9438,
-                "waiting": 0,
+                "waiting_longest_s": 0,
                 "over_threshold": 0,
                 "threshold_p50_s": 900,
                 "threshold_p95_s": 2700,
@@ -1047,6 +1047,26 @@ class PoolNote(unittest.TestCase):
         back = blind_at + timedelta(minutes=15)
         note = pooled(now=back, prev=blind, verdict="BREACH", cause="CAPACITY", window_end=back)["pool"]
         self.assertEqual(note["since"], health.iso(back))
+
+    def test_the_longest_live_wait_separates_an_unread_queue_from_an_empty_one(self):
+        # The gate posts on an unread queue and withholds on an empty one, so
+        # None and 0 cannot collapse into each other.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        artifact["queue"]["waiting_runs"] = [{"minutes": 3.0, "pull": 1}, {"minutes": 31.5, "pull": 2}]
+        self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 1890)
+        artifact["queue"]["waiting_runs"] = []
+        self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 0)
+        artifact["queue"]["read"] = False
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_longest_s"])
+
+    def test_a_malformed_waiting_queue_costs_the_figure_not_the_tick(self):
+        # Same filter as the rest of the artifact reader: the adjudicate step
+        # is not continue-on-error.
+        for name, runs in (("a dict", {"minutes": 9}), ("a string in the list", ["9"]), ("a figure infinite", [{"minutes": INF}])):
+            with self.subTest(name):
+                artifact = pressure(verdict="BREACH", cause="CAPACITY")
+                artifact["queue"]["waiting_runs"] = runs
+                self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 0)
 
     def test_the_digest_wait_is_withheld_on_a_day_the_producer_would_not_judge(self):
         # At 13:00 UTC the newest row holds only the overnight runs. One slow

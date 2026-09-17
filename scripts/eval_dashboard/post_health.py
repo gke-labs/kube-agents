@@ -315,13 +315,18 @@ def pool_advisable(pool: dict) -> bool:
     but written to `pool_verdict` reads later as already said, and the next
     live queue under the same cause would then go unannounced.
 
-    `waiting` is every run with no pod yet, not the subset past the p95 limit:
-    a pool full all afternoon with every run waiting half an hour breaches on
-    the day's p50 and has nothing over p95, and that is the incident this
-    message exists for. `None` means Deck was not read, which is not an answer
-    -- an unreadable queue withholds nothing.
+    The queue has to have been waiting a while, against the same p50 limit the
+    periodic breaches a day on. Neither end of the scale works alone: the
+    subset past p95 misses a pool full all afternoon at half an hour a run,
+    which is the incident this message is for, and any queued run at all
+    admits one triggered seconds ago, which is not a backlog and would let a
+    week-old verdict re-post under a freshly read remedy. `None` means Deck was
+    not read, which is not an answer -- an unreadable queue withholds nothing.
     """
-    return pool.get("verdict") != POOL_BREACH or pool.get("waiting") != 0
+    if pool.get("verdict") != POOL_BREACH:
+        return True
+    longest = pool.get("waiting_longest_s")
+    return longest is None or longest > (pool.get("threshold_p50_s") or 0)
 
 
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:

@@ -1041,10 +1041,10 @@ def _section(artifact: dict, key: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _rows(trend: dict) -> list:
-    """The `days[]` array, `[]` when the artifact put something else there."""
-    days = trend.get("days")
-    return days if isinstance(days, list) else []
+def _rows(section: dict, key: str = "days") -> list:
+    """An array field, `[]` when the artifact put something else there."""
+    rows = section.get(key)
+    return rows if isinstance(rows, list) else []
 
 
 def wait_text(seconds) -> str:
@@ -1063,6 +1063,18 @@ def minutes_text(seconds) -> str:
     evidence line cannot drift.
     """
     return "?" if seconds is None else str(int(seconds // SECONDS_PER_MINUTE))
+
+
+def _longest_wait_s(queue: dict) -> int | None:
+    """The longest current wait for a project, or None if Deck was not read.
+
+    None and zero say different things -- "we cannot tell" against "nothing is
+    waiting" -- and the message gate treats them differently.
+    """
+    if not queue.get("read"):
+        return None
+    waits = [_as_seconds(run.get("minutes")) for run in _rows(queue, "waiting_runs") if isinstance(run, dict)]
+    return max([w for w in waits if w is not None], default=0)
 
 
 def _over_limit(row: dict, thresholds: dict) -> bool:
@@ -1165,11 +1177,13 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "window_hours": recent.get("hours") if quotable else None,
         "p50_s": _as_seconds(source.get("p50_minutes")),
         "p95_s": _as_seconds(source.get("p95_minutes")),
-        # Two counts, not one. `waiting` is every run with no pod yet, which is
-        # what "the queue is backed up right now" means and what gates the
-        # message; `over_threshold` is the subset past the p95 limit, which is
-        # what the periodic breaches on and what the CONTROL_PLANE line quotes.
-        "waiting": _section(artifact, "queue").get("waiting"),
+        # How long the longest run has been waiting for a project right now,
+        # which is what gates the message: a run triggered seconds ago is not a
+        # backlog, and `over_threshold` -- the subset already past the p95
+        # limit, which the periodic breaches on and the CONTROL_PLANE line
+        # quotes -- is the other end of the same scale and misses a pool that
+        # has been full all afternoon at half an hour a run.
+        "waiting_longest_s": _longest_wait_s(_section(artifact, "queue")),
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": _as_seconds(thresholds.get("p50_minutes")),
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
