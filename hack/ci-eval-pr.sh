@@ -815,6 +815,10 @@ export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 # completions: 606s / 827s / 1497s / ~2170s on identical inputs. 2700s puts
 # the ceiling above the worst observed; the variance itself is #985's
 # problem, this export just stops mislabeling slowness as wrongness.
+#
+# This is the ceiling every unit inherits. The full-audit units override it
+# per unit in run_one_unit through unit_delegation_timeout (beside
+# unit_cost_hint, below): the measured audit outgrew 2700s too (#1683).
 export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
 
@@ -1623,6 +1627,37 @@ unit_cost_hint() {
   esac
 }
 
+# The harness's delegation ceiling for one unit, in seconds: how long
+# devops-bench keeps polling the Platform Agent for a delegated worker before
+# it grades whatever the parent has said so far. Every unit inherits the
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the six
+# full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
+# a ledger write, one closing line -- get 3600s.
+#
+# Why 3600 (#1683). The nightly of 2026-09-16 (build 2100374258805903360)
+# cut three audits at the 2700s ceiling after their work was done:
+# compliance-rbac-overgrant rep 1's worker rewrote its ledger 2520s after
+# launch and the harness gave up 192s later, while the same case's passing
+# rep needed 160s between its ledger write and its delivered answer;
+# upgrade-readiness-lagging-cluster rep 1 timed out 30s after its ledger was
+# created; fleet-cost-idle-pool rep 1 ran 2739s. The audit's own wall clock
+# at p90 is ~35 minutes (2074s over 903 presubmit repetitions, 2026-09-04 to
+# 09-15) and the relay after the ledger write ~3 minutes, so a run at p90
+# fits under 2700s -- the reps that hit the ceiling are the tail beyond it,
+# whose true length the graded durations cannot show because they are cut
+# at the ceiling. The worst that completed under it needed the whole 2700s;
+# an hour clears that by a third, keeps a unit under the lock deadline a
+# later repetition waits behind (1800s, lock_acquire), and costs at most
+# 900s more on a unit that would otherwise have been graded as a stub. The
+# variance is still #985's problem.
+unit_delegation_timeout() {
+  case "$1" in
+    compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3600 ;;
+    upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3600 ;;
+    *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
+  esac
+}
+
 # Per-task env is decided ONCE, before the fan-out, and handed to each unit:
 # the serial loop exported it globally per iteration, which two concurrent
 # units would trample. Per TASK, not per repetition, so repetitions stay
@@ -1723,6 +1758,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     unset TF_VAR_reuse_existing_cluster
   fi
   export BENCH_NO_INFRA="false"
+  # Per unit, inside this subshell, so the audit units' longer ceiling never
+  # leaks to a sibling lane; see unit_delegation_timeout.
+  export AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
   local start end dir
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true

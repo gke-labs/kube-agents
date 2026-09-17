@@ -1055,6 +1055,93 @@ def test_a_ledger_written_seconds_before_the_run_is_still_stale(token, github):
     assert _ledger_check(required_phrases=["debug-binding"]).verify(5.0).status == "fail"
 
 
+def test_a_ledger_closed_during_this_run_over_a_stale_body_is_named_a_false_clean(token, github):
+    """Rep 2 of the 2026-09-16 nightly, with the pointer kept.
+
+    The worker closed evals-6 #29 as completed with "0 findings" while the
+    planted binding was live. A clean run does not rewrite the body, so the
+    stamp is the previous run's and the stale branch fires -- and it used to
+    say "this run published nothing", the one thing that run had not done.
+    The fail stands; the reason now says what happened (#1683).
+    """
+    _stash_report()
+    stale = _ledger_body(generated_at="2026-08-20T09:00:30+00:00")
+    github.routes[_api()] = (
+        200,
+        {
+            **_issue(stale),
+            "state": "closed",
+            "state_reason": "completed",
+            "closed_at": "2026-08-21T09:20:00Z",
+        },
+    )
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "false clean" in res.reason
+    assert "closed as completed" in res.reason
+    assert "2026-08-21T09:20:00" in res.reason
+    assert "published nothing" not in res.reason
+    assert res.raw["closed_at"] == "2026-08-21T09:20:00+00:00"
+
+
+def test_a_ledger_closed_before_this_run_is_still_a_previous_runs(token, github):
+    # Closed yesterday, by yesterday's run: nothing this run did, so the
+    # previous-run reason stands and the close is not blamed on it.
+    _stash_report()
+    stale = _ledger_body(generated_at="2026-08-20T09:00:30+00:00")
+    github.routes[_api()] = (
+        200,
+        {
+            **_issue(stale),
+            "state": "closed",
+            "state_reason": "completed",
+            "closed_at": "2026-08-20T09:20:00Z",
+        },
+    )
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "previous run's ledger" in res.reason
+    assert "false clean" not in res.reason
+
+
+def test_an_open_stale_ledger_with_an_unparseable_closed_at_is_a_previous_runs(token, github):
+    _stash_report()
+    stale = _ledger_body(generated_at="2026-08-20T09:00:30+00:00")
+    github.routes[_api()] = (200, {**_issue(stale), "state": "open", "closed_at": "not a time"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "previous run's ledger" in res.reason
+
+
+def test_a_report_with_no_url_that_announces_a_clean_close_says_so(token, github):
+    """Rep 2 of the 2026-09-16 nightly as it actually graded: the parent's
+    roll-up said the ledger had been closed and dropped the URL, and the
+    reason was the same sentence a delegation timeout gets (#1683)."""
+    _stash_report(
+        final_message=(
+            "Audit complete. The open ledger issue has been closed; the run "
+            "found 0 findings across 4 audited clusters."
+        )
+    )
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "names no github.com issue URL" in res.reason
+    assert "false clean" in res.reason
+    assert "ledger issue has been closed" in res.reason
+    assert github.calls == []
+
+
+def test_a_report_with_no_url_and_no_clean_claim_keeps_the_generic_reason(token, github):
+    # A delegation that never returned: the parent's receipt names a card and
+    # no outcome. Nothing here claims the ledger was retired.
+    _stash_report(final_message="Delegated the audit to the worker; card t_9fea88bf is running.")
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "no ledger was published (or the audit did not report the one it wrote)" in res.reason
+    assert "false clean" not in res.reason
+    assert github.calls == []
+
+
 def test_clock_skew_tolerance_admits_a_slightly_early_stamp(token, github):
     # The Prow runner and the agent pod are different machines; a stamp 60s
     # before the run's own start is drift, not a previous run.
