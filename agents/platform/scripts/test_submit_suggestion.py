@@ -155,23 +155,24 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.scratch_dir.mkdir()
         self.patch_attr(submit_suggestion, "SCRATCH_DIR", str(self.scratch_dir))
 
-    def seed_origin(self) -> Path:
-        origin = self.tmp_path / "origin.git"
-        seed = self.tmp_path / "seed"
+    def seed_origin(self, branch: str = "main", name: str | None = None) -> Path:
+        repo_name = name or (f"origin_{branch.replace('/', '_')}.git" if branch != "main" else "origin.git")
+        origin = self.tmp_path / repo_name
+        seed = self.tmp_path / f"seed_{branch.replace('/', '_')}"
         seed.mkdir()
         for cmd in (
-            ["git", "init", "--quiet", "--bare", "--initial-branch=main", str(origin)],
-            ["git", "init", "--quiet", "--initial-branch=main", str(seed)],
+            ["git", "init", "--quiet", "--bare", f"--initial-branch={branch}", str(origin)],
+            ["git", "init", "--quiet", f"--initial-branch={branch}", str(seed)],
         ):
             subprocess.run(cmd, check=True, capture_output=True)
-        (seed / "README.md").write_text("seed\n", encoding="utf-8")
+        (seed / "README.md").write_text("seed\n" if branch == "main" else f"seed {branch}\n", encoding="utf-8")
         for argv in (
             ["config", "user.email", "t@example.com"],
             ["config", "user.name", "T"],
             ["add", "README.md"],
-            ["commit", "--quiet", "-m", "seed"],
+            ["commit", "--quiet", "-m", f"seed {branch}"],
             ["remote", "add", "origin", str(origin)],
-            ["push", "--quiet", "origin", "main"],
+            ["push", "--quiet", "origin", branch],
         ):
             git(argv, seed)
         return origin
@@ -985,6 +986,56 @@ class TestContentMode(SubmitSuggestionTestCase):
         endpoint.start()
         self.addCleanup(endpoint.stop)
 
+    def create_custom_store(self, default_branch: str):
+        origin_custom = self.seed_origin(branch=default_branch)
+        url = "https://github.com/acme/fleet.git"
+        identity = {
+            "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+            "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+            "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+            "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+        }
+
+        def custom_runner(argv, cwd):
+            argv = [str(origin_custom) if token == url else token for token in argv]
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                env={**os.environ, **identity},
+            )
+            return GitResult(completed.returncode, completed.stdout, completed.stderr)
+
+        safe_branch = default_branch.replace("/", "_")
+        custom_store = content_workspace.ContentWorkspaceStore(
+            self.tmp_path / "broker" / f"custom_trees_{safe_branch}",
+            self.tmp_path / f"agent-workspace_{safe_branch}",
+            custom_runner,
+        )
+
+        class CustomRouter:
+            workspaces = custom_store
+
+        route = credential_proxy.CredentialProxyHandler._workspace_route
+
+        def custom_call(endpoint, verb, payload):
+            self.verbs.append(verb)
+            try:
+                body = route(CustomRouter(), verb, payload)
+            except content_workspace.ContentWorkspaceError as exc:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    exc.status,
+                    {"status": "blocked", "code": exc.code, "message": str(exc)},
+                ) from exc
+            if body is None:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    404, {"status": "not_found"}
+                )
+            return body
+
+        return custom_store, custom_call
+
     def scratch(self, files: dict) -> Path:
         directory = self.tmp_path / "scratch"
         for name, text in files.items():
@@ -1158,15 +1209,21 @@ class TestContentMode(SubmitSuggestionTestCase):
 
         # 2. When --base and env overrides are omitted, open_handle falls back to "main".
         # If the repository default branch is non-main (e.g. release-trunk), the client permits
-        # the submission call and the broker authoritatively refuses it upon commit/push.
-        prepared2 = self.prepare_content(branch="release-trunk")
+        # the submission call and the unmocked broker authoritatively refuses it upon commit/push (#1498).
+        custom_store, custom_call = self.create_custom_store("release-trunk")
+        self.patch_attr(credential_proxy_client, "_workspace_call", custom_call)
+
+        prepared2 = self.prepare_content(branch="platform-agent/feature-x")
+        self.assertEqual(prepared2["base"], "release-trunk")
+        prepared2["branch"] = "release-trunk"
         source2 = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
         self.verbs.clear()
         with patch.dict(os.environ, {}, clear=True):
-            with patch.object(self.store, "commit", side_effect=content_workspace.ContentWorkspaceError("broker refusal: 'release-trunk' matches default branch")):
-                with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as ctx:
-                    self.submit_content(prepared2, source2, base=None)
-                self.assertIn("broker refusal", str(ctx.exception))
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as ctx:
+                self.submit_content(prepared2, source2, base=None)
+            self.assertIn("remote default", str(ctx.exception))
+            self.assertIn("commit", self.verbs)
+            self.assertNotIn("push", self.verbs)
 
     def test_prepare_content_preserves_remote_default_branch_when_master(self):
         # A repository whose default trunk is `master` rather than `main` must not have

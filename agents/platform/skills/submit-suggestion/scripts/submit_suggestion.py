@@ -580,8 +580,11 @@ def handle_submit(args) -> int:
             "separate feature branch."
         )
 
-    # In directory mode, also refuse if the branch matches the repository's detected default trunk,
-    # preventing agents from bypassing refusal via shell environment overrides (#1498).
+    # In directory mode, check the repository's detected default trunk from local clone
+    # ref metadata as a cooperative guard against accidental submissions when GITOPS_BASE_BRANCH
+    # is overridden in the shell (#1498). Because the agent owns the shared workspace clone,
+    # authoritative protection against deliberate local ref tampering requires setting
+    # CREDENTIAL_PROXY_BASE_BRANCH on the broker or using content mode where the broker isolates the clone.
     detected_default = gitops_workspace._detect_base_branch(workspace, _runner)
     if detected_default and _norm(branch) == _norm(detected_default):
         raise ValueError(
