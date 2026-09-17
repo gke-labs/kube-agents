@@ -383,7 +383,8 @@ surfaced early so the agent knows which findings need a manifest written during 
 declared-intent step reads before it reports a posture as a finding (#1341). It is a separate key
 from `managed_repos` because the managed list feeds the broker's push gate, the repository resolver
 and the minter policy, and a `role: context` marker inside it would have been flattened into a
-writable entry by the shared parser; a key nothing downstream reads is read-only by construction.
+writable entry by the shared parser; a key no write path reads is read-only by construction (the
+minter policy does read it, for a `contents: read` grant the broker's own clone presents).
 The document may carry a `declared` list beside `findings` — a finding's four identity fields plus
 the `repo`, `path` and `excerpt` of the declaration — validated for scope, a non-overlapping
 identity, and a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
