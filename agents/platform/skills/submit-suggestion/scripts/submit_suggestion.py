@@ -161,13 +161,10 @@ def handle_prepare_content(args) -> int:
     # managed-repos list depend on which transport the run happened to pick.
     validate_repo(repo)
     refresh_git_credentials(repo)
-    override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
-        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
-    )
-    base = getattr(args, "base", None) or override or None
+    # The broker alone decides the base branch from the remote's origin/HEAD;
+    # do not forward agent-shell environment overrides (#1498).
     workspace = credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, base=base, branch=branch
+        proxy_endpoint(), repo, branch=branch
     )
     def _norm(b: str) -> str:
         s = (b or "").strip().lower()
@@ -574,6 +571,16 @@ def handle_submit(args) -> int:
             f"CRITICAL SECURITY REFUSAL: Cannot submit on branch '{branch}': head branch "
             f"is the same as base branch '{base}'. Suggestions must be committed and pushed on a "
             "separate feature branch."
+        )
+
+    # In directory mode, also refuse if the branch matches the repository's detected default trunk,
+    # preventing agents from bypassing refusal via shell environment overrides (#1498).
+    detected_default = gitops_workspace._detect_base_branch(workspace, _runner)
+    if detected_default and _norm(branch) == _norm(detected_default):
+        raise ValueError(
+            f"CRITICAL SECURITY REFUSAL: Cannot submit on branch '{branch}': head branch "
+            f"is the repository default branch '{detected_default}'. Suggestions must be committed "
+            "and pushed on a separate feature branch."
         )
 
     push_branch(branch, workspace)

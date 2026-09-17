@@ -355,6 +355,19 @@ class CheckBranchTest(unittest.TestCase):
                 with self.assertRaises(ContentWorkspaceError):
                     check_branch(protected)
 
+        # Ref-prefix normalisation: refs/heads/ and heads/ are stripped before checking
+        for prefixed in (
+            "refs/heads/main",
+            "heads/main",
+            "refs/heads/master",
+            "heads/production",
+            "refs/heads/run/test-cluster/fix-task",
+            "heads/run/test-cluster/fix-task",
+        ):
+            with self.subTest(prefixed=prefixed):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_branch(prefixed)
+
         # Run branches are refused without needing env overrides (#1498)
         with self.assertRaises(ContentWorkspaceError):
             check_branch("run/test-cluster/fix-task")

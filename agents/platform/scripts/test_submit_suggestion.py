@@ -512,6 +512,18 @@ class TestSubmit(SubmitSuggestionTestCase):
         self.assertEqual(self.gh_calls, [])
         self.assertNotIn("platform-agent/fix-netpol", self.origin_branches())
 
+    def test_submit_when_branch_equals_remote_default_branch_is_refused_even_with_base_override(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        # Even if base is overridden to something else, submitting on the repo's detected default branch is refused
+        with patch.object(gitops_workspace, "resolve_base_branch", return_value="custom-base"):
+            with patch.object(gitops_workspace, "_detect_base_branch", return_value="platform-agent/fix-netpol"):
+                with self.assertRaises(ValueError) as caught:
+                    self.submit("platform-agent/fix-netpol", payload["workspace"])
+                self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+                self.assertIn("repository default branch", str(caught.exception))
+        self.assertEqual(self.gh_calls, [])
+
     def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
         """Step 5, and the data loss it used to cause.
 

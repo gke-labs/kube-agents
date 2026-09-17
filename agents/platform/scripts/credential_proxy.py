@@ -1655,16 +1655,25 @@ GIT_MUTATING_SUBCOMMANDS = frozenset(
 
 # git's own global options, split by whether they consume the next argument.
 # Needed to find the subcommand in `git --literal-pathspecs add …` (which
-# audit_report issues) without mistaking a flag for a verb.
+# audit_report issues) without mistaking a flag for a verb. Includes options
+# added in git ≥2.40 so neither `_git_plan` nor the push scanner desynchronises
+# on options such as `--attr-source`, `--config-env`, or `--shallow-file` (#1498).
 _GIT_GLOBAL_WITH_VALUE = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--super-prefix",
+        "--attr-source",
+        "--config-env",
+        "--shallow-file",
+    }
 )
 
-# Additional global options that take a value in git ≥2.40. Consumed by the
-# push scanner so an option value spelled `push` cannot desynchronise it (#1498).
-_GIT_PUSH_GLOBAL_WITH_VALUE = _GIT_GLOBAL_WITH_VALUE | frozenset(
-    {"--attr-source", "--config-env"}
-)
+_GIT_PUSH_GLOBAL_WITH_VALUE = _GIT_GLOBAL_WITH_VALUE
 
 # Directory `core.hooksPath` is pinned to. It lives under the state dir, which
 # is a sidecar-only emptyDir, and is created empty and mode 0500 at startup.
@@ -1840,6 +1849,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    "--shallow-file": "points git at a shallow file outside the shared workspace",
     # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
     # `config` is not a mutating verb so it needs no lease. Demonstrated: the
     # agent writes `alias.zz = !<payload>` into the broker's own global config
@@ -2094,7 +2104,34 @@ def _git_refused_name(argument: str) -> str:
     )
 
 
-def git_push_violation(argv: list[str]) -> str | None:
+def _detect_repo_default_branch(repo_dir: Path | None) -> str | None:
+    if not repo_dir:
+        return None
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo_dir), "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            ref = res.stdout.strip()
+            return ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+    except Exception:
+        pass
+    try:
+        head_file = repo_dir / ".git" / "refs" / "remotes" / "origin" / "HEAD"
+        if head_file.is_file():
+            text = head_file.read_text(encoding="utf-8").strip()
+            if text.startswith("ref:"):
+                ref = text.split(":", 1)[1].strip()
+                return ref.split("/")[-1]
+    except Exception:
+        pass
+    return None
+
+
+def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | None:
     """Refuse direct pushes to protected rollout or base branches (#1498)."""
     if not argv or Path(argv[0]).name != "git":
         return None
@@ -2137,6 +2174,20 @@ def git_push_violation(argv: list[str]) -> str | None:
         elif norm_override.startswith("heads/"):
             norm_override = norm_override[len("heads/"):]
         protected.add(norm_override)
+
+    if cwd:
+        repo_dir = Path(cwd).resolve()
+        _, redirects = _git_plan(argv)
+        for redirect in redirects:
+            repo_dir = (repo_dir / redirect).resolve()
+        detected_default = _detect_repo_default_branch(repo_dir)
+        if detected_default:
+            norm_def = detected_default.strip().lower()
+            if norm_def.startswith("refs/heads/"):
+                norm_def = norm_def[len("refs/heads/"):]
+            elif norm_def.startswith("heads/"):
+                norm_def = norm_def[len("heads/"):]
+            protected.add(norm_def)
 
     has_tags = False
     positional: list[str] = []
@@ -2286,93 +2337,163 @@ def git_argument_violation(argv: list[str]) -> str | None:
     return None
 
 
-def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str] | None:
-    """If `subcommand` is an alias defined in the repo-local `.git/config`, return its argv expansion."""
-    if not cwd or not subcommand:
+GIT_BUILTIN_SUBCOMMANDS = (
+    GIT_MUTATING_SUBCOMMANDS
+    | frozenset(_GIT_REFUSED_SUBCOMMANDS.keys())
+    | frozenset(
+        {
+            "add",
+            "am",
+            "annotate",
+            "apply",
+            "archive",
+            "bisect",
+            "blame",
+            "bundle",
+            "cat-file",
+            "check-attr",
+            "check-ignore",
+            "check-mailmap",
+            "check-ref-format",
+            "config",
+            "count-objects",
+            "describe",
+            "diff",
+            "diff-files",
+            "diff-index",
+            "diff-tree",
+            "difftool",
+            "fast-export",
+            "fast-import",
+            "for-each-ref",
+            "for-each-repo",
+            "format-patch",
+            "fsck",
+            "grep",
+            "hash-object",
+            "help",
+            "init",
+            "log",
+            "ls-files",
+            "ls-remote",
+            "ls-tree",
+            "merge-base",
+            "merge-tree",
+            "name-rev",
+            "notes",
+            "patch-id",
+            "push",
+            "range-diff",
+            "reflog",
+            "remote",
+            "repack",
+            "replace",
+            "rerere",
+            "rev-list",
+            "rev-parse",
+            "shortlog",
+            "show",
+            "show-branch",
+            "show-ref",
+            "status",
+            "stripspace",
+            "symbolic-ref",
+            "tag",
+            "var",
+            "verify-commit",
+            "verify-pack",
+            "verify-tag",
+            "version",
+            "whatchanged",
+        }
+    )
+)
+
+
+def _find_repo_root(cwd: Path | str | None) -> Path | None:
+    if not cwd:
         return None
-    repo_path = Path(cwd).resolve()
-    cur = repo_path
-    config_file = None
+    cur = Path(cwd).resolve()
     while cur != cur.parent:
         candidate_git = cur / ".git"
         if candidate_git.is_dir() and (candidate_git / "config").is_file():
-            config_file = candidate_git / "config"
-            break
+            return cur
         elif candidate_git.is_file():
             try:
                 line = candidate_git.read_text(encoding="utf-8").strip()
                 if line.startswith("gitdir:"):
-                    gitdir = (cur / line.split(":", 1)[1].strip()).resolve()
-                    if (gitdir / "config").is_file():
-                        config_file = gitdir / "config"
-                        break
+                    return cur
             except Exception:
                 pass
         elif cur.name == ".git" and (cur / "config").is_file():
-            config_file = cur / "config"
-            break
+            return cur.parent
         cur = cur.parent
+    return None
 
-    if not config_file or not config_file.is_file():
+
+def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str] | None:
+    """If `subcommand` is an alias defined in the repo-local `.git/config`, return its argv expansion.
+
+    Git never alias-expands builtin subcommands, and expands non-builtin aliases recursively.
+    Uses git config --get to ensure identical lexing, quoting, continuation, and include semantics.
+    """
+    if not cwd or not subcommand:
+        return None
+    if subcommand in GIT_BUILTIN_SUBCOMMANDS:
+        return None
+
+    repo_root = _find_repo_root(cwd)
+    if not repo_root:
         return None
 
     import shlex
 
-    target_alias = subcommand.lower()
+    visited: set[str] = set()
+    current_name = subcommand.lower()
+    accumulated_tokens: list[str] = []
 
-    def parse_config(cfg: Path, visited: set[Path]) -> dict[str, str]:
-        if cfg in visited:
-            return {}
-        visited.add(cfg)
-        aliases: dict[str, str] = {}
-        includes: list[Path] = []
+    while len(visited) < 10:
+        if current_name in GIT_BUILTIN_SUBCOMMANDS:
+            break
+        if current_name in visited:
+            return ["!cycle"]
+        visited.add(current_name)
+
         try:
-            content = cfg.read_text(encoding="utf-8", errors="replace")
+            proc = subprocess.run(
+                ["git", "-C", str(repo_root), "config", "--get", f"alias.{current_name}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
         except Exception:
-            return {}
+            return ["!error"]
 
-        current_section = ""
-        for raw_line in content.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith(("#", ";")):
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                header = line[1:-1].strip()
-                parts = header.split(None, 1)
-                current_section = parts[0].lower() if parts else ""
-                continue
-            if "=" in line:
-                key, _, val = line.partition("=")
-                key = key.strip().lower()
-                val = val.strip()
-                if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-                    val = val[1:-1]
-                if current_section == "alias":
-                    aliases[key] = val
-                elif current_section in ("include", "includeif") and key == "path":
-                    inc_p = Path(val)
-                    if not inc_p.is_absolute():
-                        inc_p = (cfg.parent / inc_p).resolve()
-                    else:
-                        inc_p = inc_p.resolve()
-                    if inc_p.is_file():
-                        includes.append(inc_p)
-        for inc in includes:
-            inc_aliases = parse_config(inc, visited)
-            aliases.update(inc_aliases)
-        return aliases
+        if proc.returncode == 1 and not proc.stderr:
+            # Not an alias in git config
+            break
+        elif proc.returncode != 0:
+            # Fatal error, syntax error, excessive include depth: fail closed!
+            return ["!config_error"]
 
-    try:
-        aliases = parse_config(config_file, set())
-        if target_alias in aliases:
-            raw_val = aliases[target_alias].strip()
+        raw_val = proc.stdout.strip()
+        if not raw_val:
+            break
+        if raw_val.startswith("!"):
+            return ["!" + raw_val[1:].strip()]
+
+        try:
             tokens = shlex.split(raw_val)
-            if raw_val.startswith("!") and tokens and not tokens[0].startswith("!"):
-                tokens[0] = "!" + tokens[0]
-            return tokens
-    except Exception:
-        pass
-    return None
+        except Exception:
+            return ["!shlex_error"]
+
+        if not tokens:
+            break
+
+        accumulated_tokens = tokens + accumulated_tokens[1:] if accumulated_tokens else tokens
+        current_name = accumulated_tokens[0].lower()
+
+    return accumulated_tokens or None
 
 
 def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
@@ -3080,17 +3201,22 @@ class CommandExecutor:
                 if tok == subcommand:
                     sub_idx = i
                     break
+            head = argv[:sub_idx] if sub_idx != -1 else [argv[0]]
             tail = argv[sub_idx + 1:] if sub_idx != -1 else []
-            expanded_argv = [argv[0]] + alias_expansion + tail
+            expanded_argv = head + alias_expansion + tail
 
             arg_violation = git_argument_violation(expanded_argv)
             if arg_violation is not None:
                 return arg_violation
 
-            push_violation = git_push_violation(expanded_argv)
+            push_violation = git_push_violation(expanded_argv, cwd=candidate)
             if push_violation is not None:
                 return push_violation
             subcommand, _ = _git_plan(expanded_argv)
+        else:
+            push_violation = git_push_violation(argv, cwd=candidate)
+            if push_violation is not None:
+                return push_violation
 
         if not self.require_git_lease:
             return None

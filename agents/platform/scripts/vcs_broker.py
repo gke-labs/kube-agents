@@ -502,14 +502,10 @@ class VcsBroker:
             git(root, "init", "--quiet")
             git(root, "remote", "add", "origin", bound.forge.clone_url(bound.repo))
             # Which branch the remote calls its default, from the remote and
-            # not from the request. Review found the `branch == target` check
-            # above bypassed by naming any other existing branch as `target`:
-            # `existing_head` is then set, the base check is skipped, both
-            # ancestry checks hold for a fast-forward, and the push lands on
-            # the shared branch with no proposal. The remote's HEAD is the one
-            # notion of "shared" the broker can establish for itself; a
-            # protected branch that is not the default is the forge's own
-            # branch protection to enforce, and this does not claim otherwise.
+            # not from the request. The broker enforces protected branch policy
+            # across all write doors: main, master, production, the remote default
+            # branch, any operator-configured base override, and any run/** branch
+            # are strictly refused without a pull request.
             default = self._default_branch_of_remote(git, root)
             protected_branches = {"main", "master", "production"}
             if default:

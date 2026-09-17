@@ -1315,7 +1315,7 @@ class GitHardeningTest(unittest.TestCase):
         # Scanning every token cannot disagree with git about where the
         # subcommand is.
         self.assertEqual(
-            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "HEAD"
+            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "help"
         )
         self.assertIsNotNone(
             git_argument_violation(["git", "--attr-source", "HEAD", "help", "-m", "git"])
@@ -1489,6 +1489,54 @@ class GitHardeningTest(unittest.TestCase):
         )
         self.assertIsNone(
             executor.git_lease_violation(["git", "p-feature"], cwd=str(leased_dir))
+        )
+
+        # Recursive alias resolution (Thread 3)
+        self.append_repository_config(
+            repo,
+            "\n[alias]\n\trec-a = rec-b\n\trec-b = push origin main\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "rec-a"], cwd=str(repo))
+        )
+
+        # Builtin subcommands cannot be shadowed by alias (Thread 4)
+        self.append_repository_config(
+            repo,
+            "\n[alias]\n\tpush = status\n",
+        )
+        # Real push outside lease is still mutating and requires a lease (not shadowed to status)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:platform-agent/valid"], cwd=str(repo))
+        )
+
+        # Config parsing edge cases (Thread 7): comments, inline keys, continuations, quotes
+        self.append_repository_config(
+            repo,
+            "\n[alias] ; comment\n\tp-comment = push origin main\n[alias]p-inline = push origin main\n\tp-cont = push \\\n  origin main\n\tp-quote = pu\"sh origin\" main\n",
+        )
+        for alias_name in ("p-comment", "p-inline", "p-cont", "p-quote"):
+            with self.subTest(alias=alias_name):
+                self.assertIsNotNone(
+                    executor.git_lease_violation(["git", alias_name], cwd=str(repo))
+                )
+
+        # --shallow-file and --attr-source in _git_plan (Thread 2 & Thread 6)
+        sub_shallow, _ = credential_proxy._git_plan(["git", "--shallow-file", "x", "push", "origin", "main"])
+        self.assertEqual("push", sub_shallow)
+        sub_attr, _ = credential_proxy._git_plan(["git", "--attr-source", "HEAD", "push", "origin", "main"])
+        self.assertEqual("push", sub_attr)
+        self.assertIsNotNone(
+            credential_proxy.git_argument_violation(["git", "--shallow-file", "/tmp/shallow", "status"])
+        )
+
+        # Directory mode remote default branch protection (Thread 9)
+        repo_trunk = self.repository(executor, name="repo_trunk")
+        remotes_dir = repo_trunk / ".git" / "refs" / "remotes" / "origin"
+        remotes_dir.mkdir(parents=True, exist_ok=True)
+        (remotes_dir / "HEAD").write_text("ref: refs/remotes/origin/release-trunk\n", encoding="utf-8")
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(repo_trunk))
         )
 
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
