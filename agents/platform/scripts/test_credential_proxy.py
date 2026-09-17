@@ -1539,6 +1539,67 @@ class GitHardeningTest(unittest.TestCase):
             executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(repo_trunk))
         )
 
+        # Colliding -C value and alias name (Thread 1)
+        sub_dir = repo / "myalias"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        self.append_repository_config(
+            repo,
+            "\n[alias]\n\tmyalias = push\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "-C", "myalias", "myalias", "origin", "main"], cwd=str(repo))
+        )
+
+        # 11-deep alias chain fails closed (Thread 4)
+        alias_chain = "\n[alias]\n"
+        for i in range(1, 11):
+            alias_chain += f"\ta{i} = a{i+1}\n"
+        alias_chain += "\ta11 = push origin main\n"
+        self.append_repository_config(repo, alias_chain)
+        v_depth = executor.git_lease_violation(["git", "a1"], cwd=str(repo))
+        self.assertIsNotNone(v_depth)
+        self.assertIn("exceeding depth", v_depth or "")
+
+        # Directory mode remote default branch protection via ls-remote (Thread 2 & Thread 6)
+        bare_remote = Path(self.temp_dir.name) / "bare_remote.git"
+        subprocess.run(["git", "init", "--bare", "-b", "release-trunk", str(bare_remote)], check=True, capture_output=True)
+        seed_work = Path(self.temp_dir.name) / "seed_work"
+        subprocess.run(["git", "clone", str(bare_remote), str(seed_work)], check=True, capture_output=True)
+        (seed_work / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(seed_work), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(seed_work), "commit", "-m", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(seed_work), "push", "origin", "release-trunk"], check=True, capture_output=True)
+
+        clone_dir = Path(executor.workspace_dir) / "clone_trunk"
+        subprocess.run(["git", "clone", str(bare_remote), str(clone_dir)], check=True, capture_output=True)
+        # Repoint local origin/HEAD to main
+        subprocess.run(["git", "-C", str(clone_dir), "remote", "set-head", "origin", "main"], check=False, capture_output=True)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
+        )
+        # Delete origin/HEAD
+        subprocess.run(["git", "-C", str(clone_dir), "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"], check=False, capture_output=True)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
+        )
+
+        # Content workspace store honours base_branch argument (#1498, Thread 5)
+        import content_workspace
+        store_flag = content_workspace.ContentWorkspaceStore(
+            Path(self.temp_dir.name) / "trees_flag",
+            Path(self.temp_dir.name) / "agent_flag",
+            executor.execute_workspace_git,
+            base_branch="custom-cli-base",
+        )
+        h = "a" * 32
+        store_flag._workspaces[h] = content_workspace.Workspace(h, "acme/repo", Path(self.temp_dir.name), "main", "sha", shallow=False)
+        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx:
+            store_flag.commit(h, "custom-cli-base", "msg", [])
+        self.assertIn("custom-cli-base", str(ctx.exception))
+        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx:
+            store_flag.push(h, "custom-cli-base")
+        self.assertIn("custom-cli-base", str(ctx.exception))
+
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
         # `_execute` refuses a cwd outside the shared workspace and the lease
         # gate resolves cwd plus every `-C`, but neither looks at `--git-dir`.

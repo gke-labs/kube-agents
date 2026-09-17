@@ -203,8 +203,27 @@ def resolve_base_branch(
     return resolved
 
 
+def _remote_default_branch(run: Runner, workspace: str | Path, remote: str = "origin") -> str | None:
+    """Query the remote directly via ls-remote --symref to find its true HEAD (#1498)."""
+    result = run(
+        ["git", "ls-remote", "--symref", remote, "HEAD"],
+        cwd=str(workspace),
+        check=False,
+    )
+    for line in (getattr(result, "stdout", "") or "").splitlines():
+        if line.startswith("ref: refs/heads/") and line.rstrip().endswith("HEAD"):
+            branch = line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()
+            if branch:
+                return branch
+    return None
+
+
 def _detect_base_branch(workspace: str | Path, runner: Runner | None) -> str | None:
     run = runner or _plain_runner
+    # Re-ask the remote directly first so local edits to origin/HEAD cannot spoof the default branch (#1498)
+    remote_head = _remote_default_branch(run, workspace)
+    if remote_head:
+        return remote_head
     head = _origin_head(run, workspace)
     if head:
         return head

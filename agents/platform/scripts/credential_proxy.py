@@ -2104,23 +2104,42 @@ def _git_refused_name(argument: str) -> str:
     )
 
 
-def _detect_repo_default_branch(repo_dir: Path | None) -> str | None:
+def _detect_repo_default_branch(repo_dir: Path | None, remote: str = "origin") -> str | None:
     if not repo_dir:
         return None
+    # 1. Ask the remote server directly via ls-remote --symref so that local edits
+    # to .git/refs/remotes/origin/HEAD or deleting origin/HEAD cannot bypass the guard (#1498).
     try:
         res = subprocess.run(
-            ["git", "-C", str(repo_dir), "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            ["git", "-C", str(repo_dir), "ls-remote", "--symref", remote, "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            for line in (res.stdout or "").splitlines():
+                if line.startswith("ref: refs/heads/") and line.rstrip().endswith("HEAD"):
+                    branch = line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()
+                    if branch:
+                        return branch
+    except Exception:
+        pass
+    # 2. Fallback to local symbolic-ref if ls-remote is offline or unavailable
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo_dir), "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
         )
         if res.returncode == 0:
             ref = res.stdout.strip()
-            return ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+            return ref.split("/", 1)[1] if ref.startswith(f"{remote}/") else ref
     except Exception:
         pass
+    # 3. Fallback to reading the ref file directly
     try:
-        head_file = repo_dir / ".git" / "refs" / "remotes" / "origin" / "HEAD"
+        head_file = repo_dir / ".git" / "refs" / "remotes" / remote / "HEAD"
         if head_file.is_file():
             text = head_file.read_text(encoding="utf-8").strip()
             if text.startswith("ref:"):
@@ -2175,20 +2194,6 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
             norm_override = norm_override[len("heads/"):]
         protected.add(norm_override)
 
-    if cwd:
-        repo_dir = Path(cwd).resolve()
-        _, redirects = _git_plan(argv)
-        for redirect in redirects:
-            repo_dir = (repo_dir / redirect).resolve()
-        detected_default = _detect_repo_default_branch(repo_dir)
-        if detected_default:
-            norm_def = detected_default.strip().lower()
-            if norm_def.startswith("refs/heads/"):
-                norm_def = norm_def[len("refs/heads/"):]
-            elif norm_def.startswith("heads/"):
-                norm_def = norm_def[len("heads/"):]
-            protected.add(norm_def)
-
     has_tags = False
     positional: list[str] = []
     idx = 0
@@ -2223,6 +2228,24 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
             continue
         positional.append(arg)
         idx += 1
+
+    remote_name = "origin"
+    if positional and ":" not in positional[0] and not positional[0].startswith("+"):
+        remote_name = positional[0]
+
+    if cwd:
+        repo_dir = Path(cwd).resolve()
+        _, redirects = _git_plan(argv)
+        for redirect in redirects:
+            repo_dir = (repo_dir / redirect).resolve()
+        detected_default = _detect_repo_default_branch(repo_dir, remote=remote_name)
+        if detected_default:
+            norm_def = detected_default.strip().lower()
+            if norm_def.startswith("refs/heads/"):
+                norm_def = norm_def[len("refs/heads/"):]
+            elif norm_def.startswith("heads/"):
+                norm_def = norm_def[len("heads/"):]
+            protected.add(norm_def)
 
     # In `git push [<repository> [<refspec>...]]`, the first positional argument
     # is the repository unless no positional arguments are supplied. Even if
@@ -2452,7 +2475,8 @@ def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str
     current_name = subcommand.lower()
     accumulated_tokens: list[str] = []
 
-    while len(visited) < 10:
+    MAX_ALIAS_DEPTH = 10
+    for _ in range(MAX_ALIAS_DEPTH):
         if current_name in GIT_BUILTIN_SUBCOMMANDS:
             break
         if current_name in visited:
@@ -2492,8 +2516,27 @@ def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str
 
         accumulated_tokens = tokens + accumulated_tokens[1:] if accumulated_tokens else tokens
         current_name = accumulated_tokens[0].lower()
+    else:
+        # Loop exhausted MAX_ALIAS_DEPTH without reaching a non-alias or builtin: fail closed (#1498)!
+        return ["!max_depth"]
 
     return accumulated_tokens or None
+
+
+def _find_subcommand_index(argv: list[str]) -> int | None:
+    """Find the index of the subcommand token in argv, walking past global options."""
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return None
+        if not token.startswith("-"):
+            return index
+        name, sep, _ = token.partition("=")
+        if name in _GIT_GLOBAL_WITH_VALUE and not sep:
+            index += 1
+        index += 1
+    return None
 
 
 def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
@@ -3192,17 +3235,18 @@ class CommandExecutor:
         alias_expansion = _read_repo_alias(candidate, subcommand)
         if alias_expansion:
             if alias_expansion[0].startswith("!"):
+                if alias_expansion[0] in ("!cycle", "!max_depth", "!config_error", "!error", "!shlex_error"):
+                    return (
+                        f"`git` alias recursion or configuration error ({alias_expansion[0][1:]}) is refused: "
+                        "aliases must expand cleanly without cycles, errors, or exceeding depth."
+                    )
                 return (
                     "`git` alias executing a shell command (`!`) is refused: "
                     "shell aliases cannot be executed through the credential proxy."
                 )
-            sub_idx = -1
-            for i, tok in enumerate(argv):
-                if tok == subcommand:
-                    sub_idx = i
-                    break
-            head = argv[:sub_idx] if sub_idx != -1 else [argv[0]]
-            tail = argv[sub_idx + 1:] if sub_idx != -1 else []
+            sub_idx = _find_subcommand_index(argv)
+            head = argv[:sub_idx] if sub_idx is not None else [argv[0]]
+            tail = argv[sub_idx + 1:] if sub_idx is not None else []
             expanded_argv = head + alias_expansion + tail
 
             arg_violation = git_argument_violation(expanded_argv)
@@ -3609,7 +3653,7 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
-def build_workspace_store(executor: CommandExecutor):
+def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
     """The content-passing store, or None when the feature is off.
 
     Returning None rather than an inert object is deliberate: the handler tests
@@ -3630,6 +3674,7 @@ def build_workspace_store(executor: CommandExecutor):
         executor.content_workspace_root,
         executor.workspace_dir,
         executor.execute_workspace_git,
+        base_branch=base_branch,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
@@ -4845,12 +4890,14 @@ def serve(args: argparse.Namespace) -> None:
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
-    CredentialProxyHandler.workspaces = build_workspace_store(executor)
     CredentialProxyHandler.base_branch = (
         getattr(args, "base_branch", "")
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
         or os.getenv("GITOPS_BASE_BRANCH", "")
     ).strip()
+    CredentialProxyHandler.workspaces = build_workspace_store(
+        executor, base_branch=CredentialProxyHandler.base_branch
+    )
     CredentialProxyHandler.vcs = build_vcs_broker(
         executor, base_branch=CredentialProxyHandler.base_branch
     )

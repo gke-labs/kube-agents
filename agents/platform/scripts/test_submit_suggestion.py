@@ -513,15 +513,25 @@ class TestSubmit(SubmitSuggestionTestCase):
         self.assertNotIn("platform-agent/fix-netpol", self.origin_branches())
 
     def test_submit_when_branch_equals_remote_default_branch_is_refused_even_with_base_override(self):
-        payload = self.prepare()
+        # Set origin default trunk to release-trunk (a non-standard trunk)
+        subprocess.run(["git", "--git-dir", str(self.origin), "branch", "release-trunk", "main"], check=True)
+        subprocess.run(["git", "--git-dir", str(self.origin), "symbolic-ref", "HEAD", "refs/heads/release-trunk"], check=True)
+
+        payload = self.prepare(branch="platform-agent/fix-netpol")
         self.commit(payload["workspace"])
-        # Even if base is overridden to something else, submitting on the repo's detected default branch is refused
-        with patch.object(gitops_workspace, "resolve_base_branch", return_value="custom-base"):
-            with patch.object(gitops_workspace, "_detect_base_branch", return_value="platform-agent/fix-netpol"):
-                with self.assertRaises(ValueError) as caught:
-                    self.submit("platform-agent/fix-netpol", payload["workspace"])
-                self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-                self.assertIn("repository default branch", str(caught.exception))
+        # Switch to release-trunk in workspace so assert_on_branch passes
+        subprocess.run(["git", "-C", str(payload["workspace"]), "checkout", "-B", "release-trunk"], check=True)
+        # Repoint local clone's origin/HEAD to another ref to simulate an agent edit (#1498, Thread 7)
+        subprocess.run(
+            ["git", "-C", str(payload["workspace"]), "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            check=True,
+        )
+        # Even if base is overridden to main, submitting on the repo's true remote default branch (release-trunk) is refused
+        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "main"}):
+            with self.assertRaises(ValueError) as caught:
+                self.submit("release-trunk", payload["workspace"])
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+            self.assertIn("repository default branch 'release-trunk'", str(caught.exception))
         self.assertEqual(self.gh_calls, [])
 
     def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
@@ -1124,20 +1134,6 @@ class TestContentMode(SubmitSuggestionTestCase):
         self.assertIn("is the same as base branch", str(ctx.exception))
         self.assertNotIn("commit", self.verbs)
         self.assertNotIn("push", self.verbs)
-
-        # Test without --base flag: open_handle resolves base via gitops_workspace.resolve_base_branch()
-        # with environment clear so check_branch passes and open_handle -> handle_submit_content refuses (#1498).
-        self.verbs.clear()
-        resolved_base = "custom-resolved-trunk"
-        prepared["branch"] = resolved_base
-        with mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch.object(gitops_workspace, "resolve_base_branch", return_value=resolved_base):
-            with self.assertRaises(ValueError) as ctx:
-                self.submit_content(prepared, source)
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
-            self.assertIn("is the same as base branch", str(ctx.exception))
-            self.assertNotIn("commit", self.verbs)
-            self.assertNotIn("push", self.verbs)
 
         # Submitting to a run branch is refused by check_branch before reaching the broker (#1498)
         run_base = "run/test-cluster/b-0011"

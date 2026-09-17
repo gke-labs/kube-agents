@@ -482,7 +482,7 @@ def check_expected_sha(value: object, field: str) -> str:
     return sha
 
 
-def check_branch(name: object) -> str:
+def check_branch(name: object, base_branch: str = "") -> str:
     """A branch name the broker is willing to *author*.
 
     `check_branch_name` first, then the protected set, so a suggestion can never
@@ -494,7 +494,8 @@ def check_branch(name: object) -> str:
     branch = check_branch_name(name)
     protected = set(PROTECTED_BRANCHES)
     override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        base_branch.strip()
+        or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
         or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
     )
     if override:
@@ -592,6 +593,7 @@ class ContentWorkspaceStore:
         tree_root: str | Path,
         agent_workspace_root: str | Path,
         runner: GitRunner,
+        base_branch: str = "",
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -614,6 +616,11 @@ class ContentWorkspaceStore:
             # the `git_hooks_dir` chmod in the executor already warns.
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
         self._runner = runner
+        self.base_branch = (
+            base_branch.strip()
+            or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+            or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+        )
         self._workspaces: dict[str, Workspace] = {}
         # One lock, held across the whole of every public verb.
         #
@@ -1126,7 +1133,7 @@ class ContentWorkspaceStore:
                     "this workspace was opened shallow, which makes it "
                     "read-only; reopen it without a depth to author a change"
                 )
-            branch = check_branch(branch)
+            branch = check_branch(branch, base_branch=self.base_branch)
             norm_branch = branch.strip()
             if norm_branch.startswith("refs/heads/"):
                 norm_branch = norm_branch[len("refs/heads/"):]
@@ -1145,9 +1152,16 @@ class ContentWorkspaceStore:
             elif norm_default.startswith("heads/"):
                 norm_default = norm_default[len("heads/"):]
 
+            norm_configured = self.base_branch.strip()
+            if norm_configured.startswith("refs/heads/"):
+                norm_configured = norm_configured[len("refs/heads/"):]
+            elif norm_configured.startswith("heads/"):
+                norm_configured = norm_configured[len("heads/"):]
+
             if (
                 (norm_base and norm_branch.casefold() == norm_base.casefold())
                 or (norm_default and norm_branch.casefold() == norm_default.casefold())
+                or (norm_configured and norm_branch.casefold() == norm_configured.casefold())
                 or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
             ):
                 raise ContentWorkspaceError(
@@ -1314,7 +1328,7 @@ class ContentWorkspaceStore:
         """
         with self._lock:
             workspace = self.get(handle)
-            branch = check_branch(branch)
+            branch = check_branch(branch, base_branch=self.base_branch)
             norm_branch = branch.strip()
             if norm_branch.startswith("refs/heads/"):
                 norm_branch = norm_branch[len("refs/heads/"):]
@@ -1333,9 +1347,16 @@ class ContentWorkspaceStore:
             elif norm_default.startswith("heads/"):
                 norm_default = norm_default[len("heads/"):]
 
+            norm_configured = self.base_branch.strip()
+            if norm_configured.startswith("refs/heads/"):
+                norm_configured = norm_configured[len("refs/heads/"):]
+            elif norm_configured.startswith("heads/"):
+                norm_configured = norm_configured[len("heads/"):]
+
             if (
                 (norm_base and norm_branch.casefold() == norm_base.casefold())
                 or (norm_default and norm_branch.casefold() == norm_default.casefold())
+                or (norm_configured and norm_branch.casefold() == norm_configured.casefold())
                 or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
             ):
                 raise ContentWorkspaceError(
