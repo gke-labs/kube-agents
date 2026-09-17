@@ -35,10 +35,10 @@ gets back. Three things follow:
 ### How today's transport fails all three
 
 The `kubeagents` harness reaches the agent over `kubectl port-forward` to the `platform-agent`
-Service and `POST /v1/responses` with the API key read out of `platform-agent-secrets`. That
-door is not a customer's: no shipped surface calls the Responses endpoint from outside the
-cluster. It is also identical in both modes, because the mode switch renders the bus beside the
-agent and leaves the agent's HTTP server as it was.
+Service and `POST /v1/responses` with the API key the presubmit reads out of
+`platform-agent-secrets`. That door is not a customer's: no shipped surface calls the Responses
+endpoint from outside the cluster. It is also identical in both modes, because the mode switch
+renders the bus beside the agent and leaves the agent's HTTP server as it was.
 
 The reply it grades is the Responses payload. When the agent delegates by filing a kanban card,
 the harness re-prompts the same conversation every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30
@@ -80,7 +80,8 @@ The exchange, in the gateway's own shape:
    `platform`.
 4. Fold status and artifact updates as `tasks/get` folds them and return when the terminal
    `status-update` lands or `AGENT_HTTP_TIMEOUT` elapses, publishing `cancel` on the way out of a
-   timeout. No model turn is spent on status.
+   timeout. On this path that variable bounds the whole task, not one request as it does on the
+   api transport. No model turn is spent on status.
 5. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
    executor publishes them. Token counts are not on the bus; the record says so rather than
@@ -98,8 +99,7 @@ back as lifecycle events with a `result` artifact. These are exactly the compone
 run had down while the job stayed green.
 
 **What it skips.** Chat, Pub/Sub, the relay, the gateway's session registry and routing, the
-`authority` block, the allowed-users gate, and the reply rendered into the thread. The stage is a
-shortcut and is deleted by stage 2.
+`authority` block, the allowed-users gate, and the reply rendered into the thread.
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
 `resource_property`, `fleet_resource_property` and `ledger_issue_contains` read the cluster and
@@ -132,9 +132,11 @@ What it adds to the proof: the relay pulls the A2A subscription, the gateway aut
 broker with its own audience, the gateway mints the session and the `authority` block, the
 allowed-users gate admits the sender, and the reply reaches the thread.
 
-The stage is blocked on product work the gateway spec's status line names as not yet rendered by
-the operator: the Google Chat adapter's env, including the relay URL; the projected relay token
-and the `a2a-chat` audience on the broker (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`); the gateway's
+The stage is blocked on product work the status line of
+[`spec-chatops-gateway.md`](spec-chatops-gateway.md), which is canonical for this list, names as
+not yet rendered by the operator: the Google Chat adapter's env, including the relay URL; the
+projected relay token and the `a2a-chat` audience on the broker
+(`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`); the gateway's
 ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`; the broker NetworkPolicy admitting the A2A
 gateway pod; the allowed-users set carried to the gateway (`A2A_GCHAT_ALLOWED_USERS`); and the
 second Pub/Sub subscription with its IAM, which the composition does not yet provision. Two
@@ -161,9 +163,11 @@ The caveat that decides how much of the time cost stage 1 removes: the bridge ru
 `hermes -p platform chat -Q -q <prompt>` per task and publishes its terminal when that turn ends.
 If the platform persona still delegates by filing a kanban card inside the turn, the terminal
 says the card was filed, not that the work is done, and the harness is polling again one hop
-further in. Stage 1 therefore keeps the kanban poll behind the same wait, entered only when the
-result names card ids, so delegating cases still complete. Whether that fallback is permanent is
-the second open question.
+further in. What stage 1 does after such a terminal turns on the second open question below. If
+delegation becomes a child task on the bus, the harness awaits the child's terminal and the poll
+is not ported. If kanban stays the delegation mechanism under `next`, delegating cases complete
+only if the harness re-enters the kanban poll when the result names card ids, with the time cost
+described above moved one hop further in.
 
 ## The CI flag
 
@@ -203,6 +207,6 @@ the measurement record.
 - **Does delegation from the platform persona become a child task on the bus,** with its own
   terminal the requester can await, and if so on the bridge path or only on the session-worker
   path? The gateway's delegate flow spawns a worker for a turn a user prefixes, which is a user
-  affordance rather than agent-initiated delegation. If a child task is coming, the harness
-  should await its terminal from the start rather than porting the kanban poll; if kanban stays
-  the delegation mechanism under `next` for a while, the poll stays and so does its time cost.
+  affordance rather than agent-initiated delegation. The answer decides what stage 1 does after
+  a terminal whose result names card ids: await the child task's terminal, or re-enter the kanban
+  poll one hop further in and keep its time cost.
