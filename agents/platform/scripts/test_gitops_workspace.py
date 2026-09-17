@@ -1151,6 +1151,27 @@ class TestContextRepos(WorkspaceTestCase):
                 [{"repo": "acme/terraform-live", "ref": None}],
             )
 
+    def test_a_null_ref_is_refused_rather_than_read_as_no_pin(self):
+        # `"ref": null` is what a JSON-emitting template writes for an unset
+        # variable, at least as often as `""`, and the value it stands in
+        # for is the same lost pin. The key is present, so it is not the
+        # absent key that means "no pin": the entry carries the JSON
+        # spelling under `refused_ref`, the repository is skipped and owed,
+        # and the ledger names it until the key is removed or filled.
+        context = '[{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": null}]'
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(
+                    gitops_workspace.get_context_github_repo_entries(),
+                    [{"repo": "acme/terraform-live", "ref": None, "refused_ref": "null"}],
+                )
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["acme/terraform-live"])
+        joined = "\n".join(logs.output)
+        self.assertIn("Refusing ref", joined)
+        self.assertIn("'null'", joined)
+        self.assertIn("skips this repository", joined)
+
     def test_a_non_github_entry_is_skipped_from_the_entries_too(self):
         context = (
             '[{"type": "gitlab", "url": "https://gitlab.com/acme/live", "ref": "main"}, '
