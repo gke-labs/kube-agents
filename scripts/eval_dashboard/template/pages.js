@@ -1626,10 +1626,12 @@ function trendKeyChangesHtml(t, changes) {
 // the table view carry it so focus and an open table survive a re-render.
 function trendCardHtml(t, title, sub, points, keyChanges, metric, range, link, perDomain, footer, key) {
   const markers = trendMarkers(t, keyChanges, link);
+  // The charts' accessible name is the card's name as text (`title` is markup).
+  const name = key.startsWith("domain:") ? domainWords(key.slice("domain:".length)) : key.slice("case:".length);
   if (!points.length) return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><p class="mut">No record in the store for this scope.</p></div>`;
   return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><div class="tgrid">` +
-    `<div><div class="small mut">Pass rate by night</div>${trendChartHtml(t, points, "rate", null, range, markers, `${title}: pass rate by night`, key)}${trendLegendHtml("rate", null, t)}</div>` +
-    `<div><div class="small mut">Judged ${esc(metric || "quality")} by night · advisory</div>${metric ? trendChartHtml(t, points, "judged", metric, range, markers, `${title}: ${metric} by night`, key) : `<p class="mut">No judged metric in the store yet.</p>`}${metric ? trendLegendHtml("judged", metric, t) : ""}</div>` +
+    `<div><div class="small mut">Pass rate by night</div>${trendChartHtml(t, points, "rate", null, range, markers, `${name}: pass rate by night`, key)}${trendLegendHtml("rate", null, t)}</div>` +
+    `<div><div class="small mut">Judged ${esc(metric || "quality")} by night · advisory</div>${metric ? trendChartHtml(t, points, "judged", metric, range, markers, `${name}: ${metric} by night`, key) : `<p class="mut">No judged metric in the store yet.</p>`}${metric ? trendLegendHtml("judged", metric, t) : ""}</div>` +
     `</div>${footer || ""}${trendTableHtml(t, points, metric, perDomain, key)}</div>`;
 }
 

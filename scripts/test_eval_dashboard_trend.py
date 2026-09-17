@@ -91,6 +91,7 @@ def data_with_nightly(cases, runs=()):
             "runs": list(runs)}
 
 
+HOSTILE_CASE = "<img src=x onerror=alert(2)>"
 NIGHT_1_RUN = {"build_id": NIGHT_1_BUILD, "tier": "nightly", "job": "ci-kube-agents-eval-nightly", "pr": None, "head_sha": "b458323",
                "started": "2026-09-17T00:00:10+00:00", "finished": "2026-09-17T05:55:00+00:00", "result": "SUCCESS", "eval_verdict": "RED",
                "duration_s": 21290, "log_url": f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/{NIGHT_1_BUILD}", "tasks": []}
@@ -313,7 +314,7 @@ class TrendPageTest(unittest.TestCase):
         data = load_fixture()
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "domain": d, "active": True, "nightly_active": True} for n, d in DOMAINS]
-        data["cases"].append({"name": "<img src=x onerror=alert(2)>", "domain": "cost", "active": True, "nightly_active": True})
+        data["cases"].append({"name": HOSTILE_CASE, "domain": "cost", "active": True, "nightly_active": True})
         data["runs"].append(copy.deepcopy(NIGHT_1_RUN))
         # Health history with one past incident on the crashloop case, for the Brief's link.
         history = history_lines(
@@ -350,6 +351,11 @@ class TrendPageTest(unittest.TestCase):
                 r = copy.deepcopy(base[0])
                 r.update(case="sparse-case", recorded_at=at, build=build, object=f"{LOCATION}/sparse-case/x/{build}.jsonl")
                 dense.append(r)
+            # A record whose own case name is hostile (parse_records only asks
+            # for a string): the store is the one input that reaches the page.
+            hostile = copy.deepcopy(base[0])
+            hostile.update(case=HOSTILE_CASE, recorded_at="2026-09-30T05:50:00Z", build="21007300000000000000", object=f"{LOCATION}/hostile/x/30.jsonl")
+            dense.append(hostile)
             (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z", lead_days=14)))
             cls.dense = render_to(root / "dense", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "dense.json")])
         cls.page = cls.out / "trend.html"
@@ -493,6 +499,23 @@ class TrendPageTest(unittest.TestCase):
             xs = [float(v) for v in re.findall(r'[ML]([0-9.]+),', d)]
             self.assertTrue(max(xs) < marker or min(xs) > marker, (min(xs), max(xs), marker))
         self.assertIn("OutcomeValidity: not recorded that night", judged)
+
+    def test_a_hostile_case_name_in_a_store_record_renders_as_text_everywhere(self):
+        # Reached through its domain: the case-id grammar keeps the name out
+        # of the fragment, so the domain view is the only route to its card.
+        app = dom_text(self.dense / "trend.html", fragment="#domain=cost")
+        name = "&lt;img src=x onerror=alert(2)&gt;"
+        self.assertIn("<h1>cost on main</h1>", app)
+        # The case-id grammar drops the name from the link, so its title links the overview.
+        self.assertIn(f'<h3><a href="trend.html#"><code>{name}</code></a></h3>', app)
+        self.assertIn(f'aria-label="{name}: pass rate by night"', app, "the chart's accessible name is text, not markup")
+        self.assertIn(f'data-hit="case:{name}:rate:0"', app)
+        self.assertIn(f'data-tv="case:{name}"', app)
+        self.assertIn("Table view · 1 night", app)
+        self.assertNotIn("<img", app)
+        self.assertNotIn("alert(2)>", app)
+        # The domain card pools it: one case, and the chip for its domain is text too.
+        self.assertIn("<small>1 case pooled per night</small>", app)
 
     def test_hit_targets_are_disjoint_and_cover_the_plot_at_a_months_density(self):
         # SVG hit-testing returns the topmost element: overlapping rects
