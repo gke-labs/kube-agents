@@ -211,6 +211,13 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      # The job's wall clock, for the store read's budget below: first, so
+      # the full-history checkout and the tool setups count against it
+      # (timeout-minutes runs from the runner's pick-up; the seconds of
+      # bring-up before this step are inside JOB_TAIL_S).
+      - name: Note when the job started
+        run: echo "JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -222,10 +229,6 @@ jobs:
           # The job token holds issues/PR write; nothing here pushes, and
           # render's git log is local, so the token does not stay on disk.
           persist-credentials: false
-
-      # The job's wall clock, for the store read's budget below.
-      - name: Note when the job started
-        run: echo "JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

@@ -134,7 +134,7 @@ let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 let live = false;
 // What the reader has clicked on the Grid and the Cases page. URL parameters
 // seed it; a chip or a cell changes it and re-renders.
-const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false };
+const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false, openTables: new Set() };
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -1456,7 +1456,7 @@ function trendRange(pointSets, link) {
 // the trailing admission window, the bar) or "judged" (a line of means with
 // the spread band; a lone night is a hollow point). One series colour, the
 // page accent; text in text tokens; the tooltip carries every value.
-function trendChartHtml(t, points, kind, metric, range, markers, title) {
+function trendChartHtml(t, points, kind, metric, range, markers, title, key) {
   const g = PAGE.trendChart;
   const plotW = g.width - g.left - g.right, plotH = g.height - g.top - g.bottom;
   const x = (ms) => g.left + (range.toMs === range.fromMs ? plotW / 2 : (ms - range.fromMs) / (range.toMs - range.fromMs) * plotW);
@@ -1539,7 +1539,7 @@ function trendChartHtml(t, points, kind, metric, range, markers, title) {
     } else if (metric) lines.push(`${metric}: not recorded that night`);
     if (p.key) lines.push(`key ${p.key}`);
     const tip = lines.join("\n");
-    parts.push(`<rect class="hit" tabindex="0" x="${x0.toFixed(1)}" y="${g.top}" width="${Math.max(0, x1 - x0).toFixed(1)}" height="${plotH}" data-tip="${esc(tip)}" aria-label="${esc(tip)}"><title>${esc(tip)}</title></rect>`);
+    parts.push(`<rect class="hit" tabindex="0" data-hit="${esc(`${key}:${kind}:${i}`)}" x="${x0.toFixed(1)}" y="${g.top}" width="${Math.max(0, x1 - x0).toFixed(1)}" height="${plotH}" data-tip="${esc(tip)}" aria-label="${esc(tip)}"><title>${esc(tip)}</title></rect>`);
   });
   return `<svg class="tchart" viewBox="0 0 ${g.width} ${g.height}" role="img" aria-label="${esc(title)}">${parts.join("")}</svg>`;
 }
@@ -1564,7 +1564,9 @@ function trendMarkers(t, keyChanges, link) {
 }
 
 // The table twin of a scope's charts: every value the charts draw.
-function trendTableHtml(t, points, metric, perDomain) {
+// `key` names the card (its case or domain) so the table's open state
+// survives a re-render (ui.openTables, kept by onToggle).
+function trendTableHtml(t, points, metric, perDomain, key) {
   const rows = points.map((p) => {
     const night = trendNight(t, p.night);
     const when = night.href ? `<a href="${esc(night.href)}">${esc(night.label)}</a>` : esc(night.label);
@@ -1573,7 +1575,7 @@ function trendTableHtml(t, points, metric, perDomain) {
     const spread = s && isNumber(s.low) && isNumber(s.high) && (s.nights != null ? s.nights > 1 : (s.cases || 0) > 1) ? `${fmtMean(s.low)} – ${fmtMean(s.high)}` : "—";
     return `<tr><td>${when}</td>${perDomain ? `<td>${p.cases}</td>` : ""}<td>${esc(fmtRate(p.passes, p.runs))}</td><td>${p.window ? esc(`${fmtRate(p.window.passes, p.window.runs)}${p.window.full ? "" : p.window.cut ? " · past this read" : " · not full"}`) : "—"}</td><td>${j ? `${fmtMean(j.mean)} <span class="mut">n=${j.n}</span>` : "—"}</td><td>${spread}</td><td class="mut">${esc(perDomain ? (p.keys || []).join(", ") : p.key || "")}</td></tr>`;
   }).reverse();
-  return `<details class="tv"><summary>Table view · ${plural(points.length, "night")}</summary><table class="tt"><thead><tr><th>Night</th>${perDomain ? "<th>Cases</th>" : ""}<th>Pass rate</th><th>Trailing window</th><th>${esc(metric || "judged")}</th><th>Spread</th><th>Version key</th></tr></thead><tbody>${rows.join("")}</tbody></table></details>`;
+  return `<details class="tv" data-tv="${esc(key)}"${ui.openTables.has(key) ? " open" : ""}><summary>Table view · ${plural(points.length, "night")}</summary><table class="tt"><thead><tr><th>Night</th>${perDomain ? "<th>Cases</th>" : ""}<th>Pass rate</th><th>Trailing window</th><th>${esc(metric || "judged")}</th><th>Spread</th><th>Version key</th></tr></thead><tbody>${rows.join("")}</tbody></table></details>`;
 }
 
 function trendRecordHtml(rec) {
@@ -1594,13 +1596,15 @@ function trendKeyChangesHtml(t, changes) {
   return `<p class="rec"><b>Version key changed</b> (pooling never crosses one):</p><ul class="merges">${items.join("")}</ul>`;
 }
 
-function trendCardHtml(t, title, sub, points, keyChanges, metric, range, link, perDomain, footer) {
+// `key` is the card's stable name (a case or a domain): the hit targets and
+// the table view carry it so focus and an open table survive a re-render.
+function trendCardHtml(t, title, sub, points, keyChanges, metric, range, link, perDomain, footer, key) {
   const markers = trendMarkers(t, keyChanges, link);
   if (!points.length) return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><p class="mut">No record in the store for this scope.</p></div>`;
   return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><div class="tgrid">` +
-    `<div><div class="small mut">Pass rate by night</div>${trendChartHtml(t, points, "rate", null, range, markers, `${title}: pass rate by night`)}${trendLegendHtml("rate", null, t)}</div>` +
-    `<div><div class="small mut">Judged ${esc(metric || "quality")} by night · advisory</div>${metric ? trendChartHtml(t, points, "judged", metric, range, markers, `${title}: ${metric} by night`) : `<p class="mut">No judged metric in the store yet.</p>`}${metric ? trendLegendHtml("judged", metric, t) : ""}</div>` +
-    `</div>${footer || ""}${trendTableHtml(t, points, metric, perDomain)}</div>`;
+    `<div><div class="small mut">Pass rate by night</div>${trendChartHtml(t, points, "rate", null, range, markers, `${title}: pass rate by night`, key)}${trendLegendHtml("rate", null, t)}</div>` +
+    `<div><div class="small mut">Judged ${esc(metric || "quality")} by night · advisory</div>${metric ? trendChartHtml(t, points, "judged", metric, range, markers, `${title}: ${metric} by night`, key) : `<p class="mut">No judged metric in the store yet.</p>`}${metric ? trendLegendHtml("judged", metric, t) : ""}</div>` +
+    `</div>${footer || ""}${trendTableHtml(t, points, metric, perDomain, key)}</div>`;
 }
 
 function trendStatusHtml(t) {
@@ -1639,7 +1643,7 @@ function trendHtml(link) {
     body = found.map((name) => {
       const c = cases[name];
       const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">its domain, ${esc(domainWords(c.domain))} →</a></p>`;
-      return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer);
+      return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer, `case:${name}`);
     }).join("");
     if (missing.length) body += `<div class="tcard"><h3><code>${missing.map(esc).join("</code>, <code>")}</code></h3><p class="mut">No record in the store for ${missing.length === 1 ? "this case" : "these cases"} inside the window: ${missing.length === 1 ? "it has" : "they have"} not run on a recording night yet, or the name is not a case.</p></div>`;
     const title = scope.cases.length === 1 ? `<code>${esc(scope.cases[0])}</code> on main` : `${plural(scope.cases.length, "case")} on main`;
@@ -1650,12 +1654,12 @@ function trendHtml(link) {
     const d = domains[scope.domain];
     const members = (d.cases || []).filter((name) => cases[name]);
     const range = trendRange([d.points || [], ...members.map((name) => cases[name].points || [])], link);
-    body = trendCardHtml(t, esc(domainWords(scope.domain)), `${plural(members.length, "case")} pooled per night`, d.points || [], d.key_changes, metric, range, link, true, "") +
-      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendHref([name]))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record))).join("")}</div>`;
+    body = trendCardHtml(t, esc(domainWords(scope.domain)), `${plural(members.length, "case")} pooled per night`, d.points || [], d.key_changes, metric, range, link, true, "", `domain:${scope.domain}`) +
+      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendHref([name]))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record), `case:${name}`)).join("")}</div>`;
     return head(`${esc(domainWords(scope.domain))} on main`) + trendStatusHtml(t) + ctl + readLine + body + footHtml();
   }
   const range = trendRange(domainNames.map((name) => domains[name].points || []), link);
-  body = domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendDomainHref(name))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "")).join("");
+  body = domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendDomainHref(name))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "", `domain:${name}`)).join("");
   return head("Scores over time on main") + trendStatusHtml(t) + ctl + readLine + body + footHtml();
 }
 
@@ -1676,6 +1680,17 @@ function onTrendPointer(event) {
   const left = Math.min(px + 14, window.innerWidth - tip.offsetWidth - 8);
   tip.style.left = `${Math.max(8, left)}px`;
   tip.style.top = `${Math.max(8, py - tip.offsetHeight - 12)}px`;
+}
+
+// The Trend page's table views: <details> keeps its open state in the DOM
+// only, and the poll's re-render rebuilds the DOM, so the state is kept
+// here by card. `toggle` does not bubble; the listener is on the capture
+// phase.
+function onToggle(event) {
+  const details = event.target;
+  if (!(details instanceof HTMLDetailsElement) || details.dataset.tv == null) return;
+  if (details.open) ui.openTables.add(details.dataset.tv);
+  else ui.openTables.delete(details.dataset.tv);
 }
 
 /* ---- clicks on the Grid and the Cases page ---- */
@@ -1733,9 +1748,14 @@ function renderAll(scroll = false) {
   const link = linkState();
   const app = document.getElementById("app");
   const page = document.body.dataset.page in renderers ? document.body.dataset.page : "brief";
-  // A re-render (a click, the poll) must not move the Grid under the reader.
+  // A re-render (a click, the poll) must not move the Grid under the reader,
+  // nor take the Trend page's focused night (its tooltip with it) from a
+  // keyboard reader: the hit target is found again by its key after the
+  // render and focused.
   const scrolled = document.querySelector(".gscroll");
   const keepLeft = scrolled ? scrolled.scrollLeft : null;
+  const active = document.activeElement;
+  const focusedHit = active && app.contains(active) && active.dataset && active.dataset.hit != null ? active.dataset.hit : null;
   try {
     if (!briefLoaded) throw new Error(`the page's data element (#${PAGE.inlineBrief}) is missing or unreadable`);
     app.innerHTML = renderers[page](link) + (page === "trend" ? '<div class="ttip" id="ttip" role="tooltip"></div>' : "");
@@ -1744,6 +1764,10 @@ function renderAll(scroll = false) {
   }
   document.title = PAGE.titles[page];
   renderFreshness();
+  if (focusedHit != null) {
+    const again = app.querySelector(`[data-hit="${CSS.escape(focusedHit)}"]`);
+    if (again) again.focus();
+  }
   // The section is rendered just above, after the browser looked for the
   // anchor, and a `view=` fragment names no element anyway: scroll by hand.
   if (scroll && link.view) {
@@ -1792,6 +1816,7 @@ async function refresh() {
 }
 
 document.getElementById("app").addEventListener("click", onClick);
+document.getElementById("app").addEventListener("toggle", onToggle, true);
 for (const type of ["pointermove", "pointerout", "focusin", "focusout"]) document.getElementById("app").addEventListener(type, onTrendPointer);
 renderAll(true);
 // Polling is attempted everywhere, a file:// preview included: a failed

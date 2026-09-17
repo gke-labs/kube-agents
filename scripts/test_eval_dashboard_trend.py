@@ -21,6 +21,7 @@ from eval_dashboard import render, store, trend
 from test_eval_dashboard_pages import (
     chrome,
     clicked_page,
+    dom_html,
     dom_text,
     health_doc,
     history_lines,
@@ -324,18 +325,26 @@ class TrendPageTest(unittest.TestCase):
                 unittest.mock.patch.object(render, "recent_merges", return_value=None):
             cls.out = render_to(root / "site", data, health=health_doc("GREEN"), history=history, extra_args=["--store", str(root / "store.json")])
             cls.bare = render_to(root / "bare", data, health=health_doc("GREEN"))
-            # A read that failed this tick: the prior document with error set.
-            stale = store_doc(records, error="2026-09-17T14:30:00Z: gsutil ls gs://kube-agents-evals-bench/evidence: AccessDeniedException: 403")
+            # A read that failed this tick: the prior document with error set,
+            # a cap that trimmed one case and a line that would not parse.
+            stale = store_doc(records, error="2026-09-17T14:30:00Z: gsutil ls gs://kube-agents-evals-bench/evidence: AccessDeniedException: 403",
+                              truncated={"rca-remediation-pr": 2}, warnings=["gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value"])
             (root / "stale.json").write_text(json.dumps(stale))
             cls.stale = render_to(root / "stale", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "stale.json")])
             empty = store_doc([])
             (root / "empty.json").write_text(json.dumps(empty))
             cls.empty = render_to(root / "empty", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "empty.json")])
-            # A month of nights: the density a quarter's chart works at.
+            # A month of nights at one key (the density a quarter's chart works
+            # at; rca fails two of three every night), read with a lead-in,
+            # plus a sparse case whose pool runs out at the read's edge.
             dense = []
             for day in range(1, 31):
-                dense += later_night(base, day, f"21007{day:02d}0000000000000")
-            (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z")))
+                dense += later_night(base, day, f"21007{day:02d}0000000000000", passes={"rca-remediation-pr": 1})
+            for at, build in (("2026-06-20T05:50:00Z", "2100620000000000009"), ("2026-09-15T05:50:00Z", "21007150000000000000")):
+                r = copy.deepcopy(base[0])
+                r.update(case="sparse-case", recorded_at=at, build=build, object=f"{LOCATION}/sparse-case/x/{build}.jsonl")
+                dense.append(r)
+            (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z", lead_days=14)))
             cls.dense = render_to(root / "dense", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "dense.json")])
         cls.page = cls.out / "trend.html"
 
@@ -424,13 +433,54 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("Judged OutcomeValidity by night", dom_text(self.page, fragment="#metric=Nope"))
         self.assertIn("No record in the store for this case inside the window", dom_text(self.page, fragment="#cases=no-such-case"))
 
+    def test_the_record_line_and_the_window_labels_say_admit_demote_and_cut_on_the_page(self):
+        admit = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
+        self.assertIn("<b>Record today: the record would admit it.</b> 21/21 across 7 nights at the current key against a bar of 95% over 20", admit)
+        self.assertIn("100% of 21</text>", admit, "the window label of a full window carries no caveat")
+        demote = dom_text(self.dense / "trend.html", fragment="#cases=rca-remediation-pr")
+        self.assertIn("<b>Record today: the record would demote it.</b> 7/21 across 7 nights at the current key against a bar of 95% over 20", demote)
+        # The sparse case: one record at the read's edge (06-20, the read began 06-19), one drawn.
+        cut = dom_text(self.dense / "trend.html", fragment="#cases=sparse-case")
+        self.assertIn("<b>Record today: not knowable from this read.</b> 6/6 across 2 nights at the current key inside this read; the store may hold older records at this key that admission pools and this page did not read", cut)
+        self.assertIn("100% of 6 · window reaches past this read</text>", cut, "the chart label")
+        self.assertIn("trailing window: 100% (6/6) across 2 nights · reaches past this read", cut, "the tooltip")
+        self.assertIn("<td>100% (6/6) · past this read</td>", cut, "the table twin")
+        self.assertNotIn("window not full", cut)
+        self.assertNotIn(" · not full yet", cut, "the legend's '(hollow: not full yet)' is the only mention")
+        # A short pool that started inside the read stays "not full" / collecting (the main fixture's eighth night).
+        short = dom_text(self.page, fragment="#cases=rca-remediation-pr")
+        self.assertIn("<b>Record today: collecting.</b> 2/3 across 1 night at the current key, 17 more runs before the window is full", short)
+        self.assertIn("67% of 3 · window not full</text>", short)
+        self.assertIn(" · not full yet", short)
+        self.assertNotIn("past this read", short)
+
+    def test_the_stale_banner_also_names_a_trimmed_case_and_an_unreadable_line(self):
+        stale = dom_text(self.stale / "trend.html")
+        self.assertIn('<p class="stale">The read was capped at 200 objects per case per version key for 1 case (rca-remediation-pr); their oldest nights inside the window are not drawn.</p>', stale)
+        self.assertIn('<p class="stale">1 record in the store could not be read and is left out: <code>gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value</code></p>', stale)
+        self.assertNotIn('class="stale"', dom_text(self.page), "a clean read carries neither note")
+
+    def test_the_polls_re_render_keeps_an_open_table_view_and_the_focused_night(self):
+        # The page's own script rendered; open the first table view and
+        # focus a night, then let the poll's renderAll (the failed fetch
+        # from file://) rebuild #app inside the virtual-time budget.
+        script = ('document.querySelector("details.tv").open = true;'
+                  'document.querySelector(\'[data-hit="case:rca-remediation-pr:rate:2"]\').focus();'
+                  'setTimeout(() => { const a = document.activeElement; document.body.dataset.focused = a && a.dataset ? a.dataset.hit || "other" : "none";'
+                  ' document.body.dataset.tip = document.getElementById("ttip").style.display; }, 1500);')
+        html = dom_html(scripted_page(self.page, script), fragment="#cases=rca-remediation-pr")
+        self.assertIn('<details class="tv" data-tv="case:rca-remediation-pr" open="">', html)
+        self.assertIn('data-focused="case:rca-remediation-pr:rate:2"', html)
+        self.assertIn('data-tip="block"', html, "the focused night's tooltip is showing again")
+
     def test_hit_targets_are_disjoint_and_cover_the_plot_at_a_months_density(self):
         # SVG hit-testing returns the topmost element: overlapping rects
         # would name a later night than the one under the pointer.
         app = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
         svg = re.search(r'<svg class="tchart"[^>]*pass rate by night.*?</svg>', app, re.DOTALL).group(0)
-        rects = [(float(x), float(w)) for x, w in re.findall(r'<rect class="hit" tabindex="0" x="([0-9.]+)" y="\d+" width="([0-9.]+)"', svg)]
+        rects = [(float(x), float(w)) for x, w in re.findall(r'<rect class="hit" tabindex="0" data-hit="[^"]*" x="([0-9.]+)" y="\d+" width="([0-9.]+)"', svg)]
         self.assertEqual(len(rects), 30)
+        self.assertIn('data-hit="case:agent-kanban-smoke:rate:0"', svg)
         for (x0, w0), (x1, _) in itertools.pairwise(rects):
             self.assertLessEqual(x0 + w0, x1 + 0.11, "adjacent hit targets overlap")
             self.assertGreaterEqual(x0 + w0, x1 - 0.11, "a gap between adjacent hit targets")
