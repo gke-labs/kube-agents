@@ -519,6 +519,10 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "verdict": doc["verdict"],
                 "cause": doc["cause"],
                 "day": day["day"],
+                # The capture predates the `recent` block, which is also what
+                # the first tick after a deploy reads: the note falls back to
+                # the worst day rather than losing its numbers.
+                "window_hours": None,
                 "p50_s": int(day["p50_minutes"] * 60),
                 "p95_s": int(day["p95_minutes"] * 60),
                 "over_threshold": doc["queue"]["over_threshold"],
@@ -531,6 +535,14 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
             {key: note[key] for key in note if key not in ("since", "measured_at")},
         )
         self.assertEqual(health.parse_iso(doc["window_end"]), health.parse_iso(note["measured_at"]))
+        # And once the periodic writes the block, the note quotes it instead:
+        # the same keys, read from `recent` rather than the day's row.
+        doc["recent"] = {"hours": pool_pressure.RECENT_WINDOW_HOURS, "runs": 31, "judged": True,
+                         "p50_minutes": 18.0, "p95_minutes": 52.0, "worst_minutes": 61.0}
+        fresh = health.pool_note(doc, POOL_PRESSURE_AS_OF, None)
+        self.assertEqual(fresh["window_hours"], pool_pressure.RECENT_WINDOW_HOURS)
+        self.assertIsNone(fresh["day"])
+        self.assertEqual(fresh["p50_s"], 1080)
         # The digest reads the newest day's row, not the seven-day aggregate.
         self.assertEqual(int(day["p50_minutes"] * 60), health.pool_wait_p50_s(doc, POOL_PRESSURE_AS_OF))
 

@@ -1124,11 +1124,20 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     # (pool_pressure.py's `breached_days or live_breach`) and never on the
     # seven-day aggregate, which after one bad day sits back inside its own
     # limit -- printing it under "onboard a project" contradicts the alert.
-    day = _worst_breached_day(trend, thresholds) or {}
+    #
+    # The recent stretch comes first when it has the runs to be judged, because
+    # a verdict that lasts a week outlives the day that earned it: a Thursday
+    # incident is otherwise evidenced by Monday. Below the sample floor the
+    # periodic withholds the percentiles, and the worst breached day is what is
+    # left to show.
+    recent = _section(artifact, "recent")
+    day = {} if recent.get("judged") else (_worst_breached_day(trend, thresholds) or {})
+    source = recent if recent.get("judged") else day
     return note | {
         "day": day.get("day"),
-        "p50_s": _as_seconds(day.get("p50_minutes")),
-        "p95_s": _as_seconds(day.get("p95_minutes")),
+        "window_hours": recent.get("hours") if recent.get("judged") else None,
+        "p50_s": _as_seconds(source.get("p50_minutes")),
+        "p95_s": _as_seconds(source.get("p95_minutes")),
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": _as_seconds(thresholds.get("p50_minutes")),
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
@@ -1181,13 +1190,32 @@ def pool_evidence(pool: dict) -> str:
     return f"backed-up pool: {pool_measurement(pool)}{projects}"
 
 
+def pool_span(pool: dict) -> str | None:
+    """Which stretch the note's numbers cover, or None when it carries none.
+
+    `pool_note` sets `window_hours` when the periodic could judge the recent
+    stretch and `day` when it fell back to the worst breached day, so the three
+    readers that quote numbers do not each decide which it was. A label with no
+    numbers under it is worse than no label: a breach carried by the live queue
+    alone has neither, and would otherwise read "median wait ?".
+    """
+    if pool.get("p50_s") is None and pool.get("p95_s") is None:
+        return None
+    hours = pool.get("window_hours")
+    if hours:
+        return f"last {hours}h"
+    return f"worst day {pool['day']}" if pool.get("day") else None
+
+
 def pool_measurement(pool: dict) -> str:
-    """Where the breach is, in the periodic's own terms: the worst day, the
-    live queue, or both. post_health and the page read the same two fields."""
+    """Where the breach is, in the periodic's own terms: the stretch it
+    measured, the live queue, or both. post_health and the page read the same
+    fields."""
     parts = []
-    if pool.get("day"):
+    span = pool_span(pool)
+    if span:
         parts.append(
-            f"{pool['day']} median {wait_text(pool['p50_s'])} against"
+            f"{span} median {wait_text(pool['p50_s'])} against"
             f" {minutes_text(pool['threshold_p50_s'])} min,"
             f" p95 {wait_text(pool['p95_s'])} against"
             f" {minutes_text(pool['threshold_p95_s'])}"
@@ -1199,7 +1227,7 @@ def pool_measurement(pool: dict) -> str:
         )
     # A BREACH always has one or the other; this is what a contract violation
     # reads as, rather than a sentence with a blank in it.
-    return "; ".join(parts) or "the periodic reported a breach with no day and no live queue"
+    return "; ".join(parts) or "the periodic reported a breach with no measured stretch and no live queue"
 
 
 # --------------------------------------------------------------------------- #

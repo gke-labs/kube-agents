@@ -212,8 +212,8 @@ class HealthInputsTest(unittest.TestCase):
         self.assertEqual(
             render.normalize_health(health_doc("GREEN", pool=note))["pool"],
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
-             "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "over_threshold": 2, "threshold_p50_s": 900,
-             "threshold_p95_s": 2700},
+             "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "over_threshold": 2,
+             "threshold_p50_s": 900, "threshold_p95_s": 2700},
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"verdict": "WEDGED"}))["pool"]["verdict"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"p50_s": "ages"}))["pool"]["p50_s"])
@@ -665,6 +665,11 @@ class BrowserTest(unittest.TestCase):
         both = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolboth", self.data,
                                   health=health_doc("GREEN", pool=note | {"over_threshold": 2})) / "index.html")
         self.assertIn("p95 61 min against 45; 2 runs queued past the 45 min limit.", both)
+        # The usual case: the periodic judged the recent stretch, so the
+        # sentence names it rather than a day up to a week old.
+        recent = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrecent", self.data,
+                                    health=health_doc("GREEN", pool=note | {"day": None, "window_hours": 3})) / "index.html")
+        self.assertIn("over the last 3h the median wait was 22 min against a 15 min limit", recent)
         # A breach with no bad day in the week -- one run stuck past p95 right
         # now -- has no median to quote and counts the queue instead.
         live = dom_text(render_to(pathlib.Path(self.tmp.name) / "poollive", self.data,

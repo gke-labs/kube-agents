@@ -230,6 +230,7 @@ function normalizeHealth(raw) {
       since: parseIso(pool.since) != null ? pool.since : null,
       measured_at: parseIso(pool.measured_at) != null ? pool.measured_at : null,
       day: typeof pool.day === "string" && PAGE.poolDayRe.test(pool.day) ? pool.day : null,
+      window_hours: count(pool.window_hours),
       p50_s: count(pool.p50_s),
       p95_s: count(pool.p95_s),
       over_threshold: count(pool.over_threshold),
@@ -272,9 +273,12 @@ function poolSentence(h) {
   // compliant median, and quoting the median alone puts a passing number
   // forward as the evidence.
   const found = [];
-  if (p.day != null && p.p50_s != null && p.p95_s != null && p.threshold_p50_s != null && p.threshold_p95_s != null) {
+  // health.pool_span: the recent stretch when the periodic could judge it, the
+  // worst breached day when it could not.
+  const span = p.window_hours ? `over the last ${p.window_hours}h` : p.day != null ? `on ${esc(p.day)}` : null;
+  if (span != null && p.p50_s != null && p.p95_s != null && p.threshold_p50_s != null && p.threshold_p95_s != null) {
     found.push(
-      `on ${esc(p.day)} the median wait was ${waitText(p.p50_s)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit` +
+      `${span} the median wait was ${waitText(p.p50_s)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit` +
         `, p95 ${waitText(p.p95_s)} against ${Math.floor(p.threshold_p95_s / 60)}`,
     );
   }

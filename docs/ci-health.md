@@ -210,7 +210,7 @@ causes have four different remedies and one of them spends money:
 ```text
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
 Consider onboarding a project.
-Worst day 2026-09-06: median wait 24 min against a 15 min limit; p95 157 min against 45.
+Last 3h: median wait 24 min against a 15 min limit; p95 157 min against 45.
 2 runs waiting right now, past the 45 min p95 limit.
 Runs still pass; /retest makes the queue longer.
 ```
@@ -219,6 +219,17 @@ Those are the numbers the verdict was reached on. The periodic breaches on a
 day's row or on runs queued past p95 right now, never on the seven-day window,
 which one bad day leaves inside its own limit. A breach on only one of the two
 carries only that line.
+
+The stretch quoted is the last three hours, not the worst day, which a
+week-long verdict leaves up to six days older than the incident. Too quiet a
+stretch to judge — five runs, as a day's row needs — falls back to that day,
+and the label says which it was.
+
+A ⏳ also needs runs waiting at the moment of the reading. The remedy is
+recomputed hourly from a live count of leased projects while the verdict stands
+for a week, so a pool that filled on Monday and drained by Tuesday would
+otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The
+two ⚪ messages below are exempt; neither advises anything.
 
 `concurrency cap` (raise it), `runs not starting` (projects were free, so the
 delay is Prow's; the message names the build cluster) and `queue backed up`
@@ -245,6 +256,11 @@ all. Both link to the periodic's job history, which tells the two apart. The
 stopped message carries **no numbers**: `latest-build.txt` keeps resolving
 after the periodic dies, so a stopped job reads as an unchanging healthy
 artifact.
+
+This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods and
+fixture drift. A full pool is a capacity fact, not a defect a code change
+closes; its remedies are onboarding and raising the cap, which are planned
+work. Chat, the Brief and the digest carry it, and nothing opens.
 
 The digest carries the median wait every morning whether or not anything is
 wrong (`typical wait`, beside `typical run`), and repeats a one-line version

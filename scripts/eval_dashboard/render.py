@@ -545,6 +545,9 @@ def normalize_health(raw) -> dict | None:
             # `day` is rendered into the sentence, so it is checked for shape
             # and not only for being a string.
             "day": pool.get("day") if isinstance(pool.get("day"), str) and POOL_DAY_RE.fullmatch(pool["day"]) else None,
+            # Which stretch p50_s/p95_s cover: set when they come from the
+            # recent window, null when they are the worst breached day's.
+            "window_hours": pool.get("window_hours") if is_count(pool.get("window_hours")) else None,
             "p50_s": pool.get("p50_s") if is_count(pool.get("p50_s")) else None,
             "p95_s": pool.get("p95_s") if is_count(pool.get("p95_s")) else None,
             "over_threshold": pool.get("over_threshold") if is_count(pool.get("over_threshold")) else None,

@@ -90,17 +90,21 @@ def slow(**note):
 
 def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:00", **over):
     """health.py's rule-8 note. The default is the #1069 incident's shape: a
-    full pool, and a 22-minute median on 2026-09-03 against the runbook's 15.
-    The numbers are that day's row, never the seven-day window -- the window
-    is not what the periodic breached on."""
+    full pool, two runs queued past the limit, and a 22-minute median over the
+    last three hours against the runbook's 15. Never the seven-day window --
+    that is not what the periodic breached on, and a verdict lasting a week
+    outlives the day that earned it. A live queue is in the default because
+    decide() posts no breach without one; `day` with `window_hours=None` is
+    the fallback, for a stretch too thin for the periodic to judge."""
     note = {
         "since": since,
         "verdict": verdict,
         "measured_at": "2026-09-04T11:23:00+00:00",
-        "day": "2026-09-03",
+        "day": None,
+        "window_hours": 3,
         "p50_s": 22 * 60,
         "p95_s": 61 * 60,
-        "over_threshold": 0,
+        "over_threshold": 2,
         "threshold_p50_s": 15 * 60,
         "threshold_p95_s": 45 * 60,
         "free": 0,
@@ -620,6 +624,16 @@ class Digest(RunHarness):
         self.tick(pooled(wait_s=22 * 60), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[1].split("\n")[1],
+            "⏳ Queue backed up — last 3h: median wait 22 min against a 15 min limit;"
+            " p95 61 min against 45.",
+        )
+
+    def test_the_digest_falls_back_to_the_worst_day_when_the_recent_stretch_is_too_thin(self):
+        thin = {"day": "2026-09-03", "window_hours": None}
+        self.tick(pooled(wait_s=22 * 60, **thin), T0.replace(hour=7))
+        self.tick(pooled(wait_s=22 * 60, **thin), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
             "⏳ Queue backed up — worst day 2026-09-03: median wait 22 min against a 15 min limit;"
             " p95 61 min against 45.",
         )
@@ -631,7 +645,7 @@ class Digest(RunHarness):
         self.tick(pooled(wait_s=24, p50_s=24), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[1].split("\n")[1],
-            "⏳ Queue backed up — worst day 2026-09-03: median wait 24s against a 15 min limit;"
+            "⏳ Queue backed up — last 3h: median wait 24s against a 15 min limit;"
             " p95 61 min against 45.",
         )
 
@@ -735,10 +749,21 @@ class PoolNote(RunHarness):
         )
         self.assertEqual(
             lines[1],
+            "Last 3h: median wait 22 min against a 15 min limit; p95 61 min against 45.",
+        )
+        self.assertEqual(lines[2], "2 runs waiting right now, past the 45 min p95 limit.")
+        self.assertEqual(lines[3], "Runs still pass; /retest makes the queue longer.")
+        self.assertEqual(lines[4], f"{URL}#view=agent")
+
+    def test_the_worst_breached_day_stands_in_when_the_recent_stretch_is_too_thin(self):
+        # Under MIN_SAMPLES_FOR_RECENT_VERDICT the periodic withholds the
+        # recent percentiles, and health.py sends the worst breached day
+        # instead. The label has to change with them.
+        self.tick(pooled(day="2026-09-03", window_hours=None), self.at(10))
+        self.assertEqual(
+            self.first()[1],
             "Worst day 2026-09-03: median wait 22 min against a 15 min limit; p95 61 min against 45.",
         )
-        self.assertEqual(lines[2], "Runs still pass; /retest makes the queue longer.")
-        self.assertEqual(lines[3], f"{URL}#view=agent")
 
     def test_a_breach_with_no_bad_day_counts_the_runs_queued_right_now(self):
         # One run stuck past p95 breaches a week with no bad day in it, and
@@ -753,7 +778,7 @@ class PoolNote(RunHarness):
         lines = self.first()
         self.assertEqual(
             lines[1],
-            "Worst day 2026-09-03: median wait 22 min against a 15 min limit; p95 61 min against 45.",
+            "Last 3h: median wait 22 min against a 15 min limit; p95 61 min against 45.",
         )
         self.assertEqual(lines[2], "1 run waiting right now, past the 45 min p95 limit.")
 
@@ -764,14 +789,16 @@ class PoolNote(RunHarness):
             "⏳ *Smoke gate: concurrency cap* — the pool has 30 projects but the concurrency cap is only 26. Raise the cap.",
         )
 
-    def test_the_control_plane_message_hedges_and_names_the_build_cluster(self):
-        # "looks like", not "is": occupancy is sampled live, the waits are a
-        # window, so a free pool now can sit beside real contention then.
+    def test_the_control_plane_message_states_the_cause_and_names_the_build_cluster(self):
+        # No hedge: decide() posts this only while runs are waiting, and the
+        # queue and the occupancy are read in one pass, so a free pool and a
+        # backed-up queue describe one moment rather than two.
         self.tick(pooled(cause="CONTROL_PLANE", free=4), self.at(10))
         lines = self.first()
         self.assertEqual(
             lines[0],
-            "⏳ *Smoke gate: runs not starting* — 4 of 30 projects were free, so this looks like Prow rather than the pool.",
+            "⏳ *Smoke gate: runs not starting* — 4 of 30 projects"
+            " were free while runs waited, so this is Prow rather than the pool.",
         )
         self.assertEqual(lines[1], "Check the build cluster: kube-agents-prow, project kube-agents-prow.")
         self.assertIn("median wait 22 min", lines[2])
@@ -975,6 +1002,57 @@ class PoolNote(RunHarness):
         # ordinary median; whole minutes would render it "0 min".
         self.tick(pooled(p50_s=24), self.at(10))
         self.assertIn("median wait 24s against a 15 min limit", self.opener.texts[0])
+
+    def test_a_breach_with_an_empty_queue_says_nothing(self):
+        # The verdict spans seven days and the remedy is read live, so one bad
+        # Monday keeps the verdict all week while the remedy tracks a pool that
+        # has since drained. With nothing waiting there is no queue to explain.
+        self.tick(pooled(over_threshold=0), self.at(10))
+        self.assertEqual(len(self.opener.requests), 0)
+        self.assertIsNone(self.recorded()["pool_verdict"])
+
+    def test_the_same_breach_is_told_once_runs_are_waiting(self):
+        self.tick(pooled(over_threshold=0), self.at(10))
+        self.tick(pooled(over_threshold=2), self.at(11))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳"])
+        self.assertEqual(self.recorded()["pool_verdict"], "BREACH")
+
+    def test_a_cause_that_flips_over_an_empty_queue_says_nothing(self):
+        # The Tuesday-3am case: the pool drained overnight, so cause() reads
+        # CONTROL_PLANE off a free pool while Monday still holds the verdict.
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(cause="CONTROL_PLANE", free=25, over_threshold=0), self.at(11))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"])
+
+    def test_the_monitoring_verdicts_are_told_with_no_queue_behind_them(self):
+        # Neither advises anything, so neither depends on runs waiting: the
+        # news is that the periodic stopped answering.
+        for verdict in ("STALE", "UNMEASURED"):
+            with self.subTest(verdict=verdict):
+                self.setUp()
+                self.tick(pooled(verdict=verdict, over_threshold=0), self.at(10))
+                self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⚪"])
+
+    def test_a_breach_that_returns_after_a_withheld_stretch_is_told(self):
+        # Recording a withheld breach as told closes both triggers at once:
+        # the verdict matches what the state says was said, and the cause was
+        # named earlier in the episode. The breach would come back silently.
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(verdict="STALE"), self.at(10, 15))
+        self.tick(pooled(over_threshold=0), self.at(10, 30))
+        self.assertEqual(self.recorded()["pool_verdict"], "STALE", "nothing was said at 10:30")
+        self.tick(pooled(), self.at(10, 45))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪", "⏳"])
+
+    def test_a_breach_nobody_was_told_about_is_not_owed_a_clear(self):
+        # pool_breached is set on the send, not on the reading. Set it on the
+        # reading and a week of withheld breaches would close with a ✅ ending
+        # an episode the space never heard begin.
+        self.tick(pooled(over_threshold=0), self.at(10))
+        self.tick(cleared(), self.at(10, 15))
+        self.assertEqual(len(self.opener.requests), 0)
+        self.assertFalse(self.recorded()["pool_breached"])
 
 
 # --------------------------------------------------------------------------- #

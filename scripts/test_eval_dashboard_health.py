@@ -932,6 +932,7 @@ class PoolNote(unittest.TestCase):
                 "verdict": "BREACH",
                 "measured_at": health.iso(T0),
                 "day": "2026-09-06",
+                "window_hours": None,
                 "p50_s": 1446,
                 "p95_s": 9438,
                 "over_threshold": 0,
@@ -944,10 +945,35 @@ class PoolNote(unittest.TestCase):
             },
         )
         self.assertIn(
-            "backed-up pool: 2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
+            "backed-up pool: worst day 2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
             " 0 of 30 projects free",
             result["evidence"],
         )
+
+    def test_the_recent_stretch_beats_the_worst_day_when_the_periodic_judged_it(self):
+        # The verdict lasts a week, so Monday's row is still the worst day on
+        # Thursday. Quoting it dates the evidence to a queue that has drained.
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 18.0,
+                  "p95_minutes": 52.0, "worst_minutes": 61.0}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertEqual(note["window_hours"], 3)
+        self.assertIsNone(note["day"], "one label, so the messages need no tie-break")
+        self.assertEqual(note["p50_s"], 1080)
+        self.assertEqual(note["p95_s"], 3120)
+        self.assertEqual(
+            health.pool_measurement(note),
+            "last 3h median 18 min against 15 min, p95 52 min against 45",
+        )
+
+    def test_the_worst_day_stands_in_when_the_recent_stretch_is_too_thin_to_judge(self):
+        # A quiet Sunday holds fewer runs than the periodic will judge on, and
+        # it withholds the percentiles rather than quoting a handful.
+        recent = {"hours": 3, "runs": 2, "judged": False, "p50_minutes": None,
+                  "p95_minutes": None, "worst_minutes": None}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertIsNone(note["window_hours"])
+        self.assertEqual(note["day"], "2026-09-06")
+        self.assertEqual(note["p50_s"], 1446)
 
     def test_the_worst_breached_day_wins_even_when_it_breached_on_p95_alone(self):
         # Excess over either limit, so a day that went over on p95 only is
@@ -986,7 +1012,7 @@ class PoolNote(unittest.TestCase):
         line = next(one for one in result["evidence"] if one.startswith("backed-up pool"))
         self.assertNotIn("None", line)
         self.assertEqual(
-            "backed-up pool: 2026-09-06 median 24 min against 15 min, p95 157 min against 45",
+            "backed-up pool: worst day 2026-09-06 median 24 min against 15 min, p95 157 min against 45",
             line,
         )
 
@@ -994,7 +1020,7 @@ class PoolNote(unittest.TestCase):
         note = pooled(verdict="BREACH", cause="CAPACITY", over_threshold=1)["pool"]
         self.assertEqual(
             health.pool_measurement(note),
-            "2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
+            "worst day 2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
             " 1 run waiting now past 45 min",
         )
 

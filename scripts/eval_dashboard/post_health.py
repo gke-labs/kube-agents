@@ -86,11 +86,11 @@ try:
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, pool_span, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, pool_span, wait_text
 
 STATE_SCHEMA_VERSION = 1
 
@@ -309,6 +309,14 @@ def pool_was_read(health: dict) -> bool:
     return bool((health.get("metrics") or {}).get("queue_wait_read"))
 
 
+def pool_advisable(pool: dict) -> bool:
+    """Whether the note is worth posting, and whether its verdict is worth
+    recording as told. The two answers have to match: a breach withheld here
+    but written to `pool_verdict` reads later as already said, and the next
+    live queue under the same cause would then go unannounced."""
+    return pool.get("verdict") != POOL_BREACH or bool(pool.get("over_threshold"))
+
+
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:
     """Which message kinds go out this tick.
 
@@ -345,15 +353,21 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     if health.get("slow") and not (prev or {}).get("slow"):
         kinds.append(KIND_SLOW)
 
-    # Rule 8, once per episode, plus a re-post when the verdict changes or on a
-    # cause not yet named this episode. The cause picks the remedy and is
-    # recomputed from live occupancy hourly, so a long breach can switch from
-    # "onboard a project" to "raise the cap" with the verdict unchanged. Each
-    # cause once, since occupancy crosses zero repeatedly.
+    # Rule 8, once per episode, plus a re-post on a verdict change or a cause
+    # not yet named this episode. A breach message also needs a live queue: the
+    # verdict spans seven days while the remedy is read live, so one bad day
+    # keeps the verdict for a week and the remedy tracks a pool that has since
+    # drained. `over_threshold` shares the cause's instant. The two monitoring
+    # verdicts are exempt -- neither advises anything.
     pool = health.get("pool") or {}
     told = prev or {}
-    if pool and (
-        pool.get("verdict") != told.get("pool_verdict") or pool.get("cause") not in (told.get("pool_causes") or [])
+    if (
+        pool
+        and pool_advisable(pool)
+        and (
+            pool.get("verdict") != told.get("pool_verdict")
+            or pool.get("cause") not in (told.get("pool_causes") or [])
+        )
     ):
         kinds.append(KIND_POOL)
     # Unlike rule 7, rule 8 says when it is over. The periodic judges a rolling
@@ -632,11 +646,16 @@ def pool_numbers(pool: dict) -> list[str]:
     "against 15/45" makes the reader pair four numbers positionally, and gets
     it wrong. The periodic breaches on a day's row, on runs queued past p95
     right now, or on both, so the message quotes whichever it was -- the
-    seven-day window it is not judged on can sit well inside its own limit."""
+    seven-day window it is not judged on can sit well inside its own limit.
+
+    The recent stretch leads when the periodic could judge it, and the worst
+    breached day stands in when it could not; `pool_note` picks between them
+    and only one of `window_hours` and `day` survives that choice."""
     lines = []
-    if pool.get("day"):
+    span = pool_span(pool)
+    if span:
         lines.append(
-            f"Worst day {pool['day']}: median wait {wait_text(pool.get('p50_s'))}"
+            f"{span.capitalize()}: median wait {wait_text(pool.get('p50_s'))}"
             f" against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
             f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
         )
@@ -665,13 +684,13 @@ def pool_cause_text(pool: dict) -> str:
             f" but the concurrency cap is only {figure(pool.get('max_concurrency'))}. Raise the cap."
         )
     if cause == CAUSE_CONTROL_PLANE:
-        # "looks like", not "is": occupancy is read live while the waits come
-        # from a window, so a pool free now can sit beside real contention
-        # then (pool_pressure.py's cause()).
+        # The queue and the occupancy are read in one pass, and decide() posts
+        # this only while runs are waiting, so both describe one moment. That
+        # is what used to need "looks like".
         return (
             f"*Smoke gate: runs not starting* — {figure(pool.get('free'))} of"
             f" {figure(pool.get('total'))} projects"
-            " were free, so this looks like Prow rather than the pool.\n"
+            " were free while runs waited, so this is Prow rather than the pool.\n"
             f"Check the build cluster: {POOL_BUILD_CLUSTER}, project {POOL_BUILD_PROJECT}."
         )
     if cause == CAUSE_UNKNOWN:
@@ -827,16 +846,17 @@ def pool_digest_line(pool: dict) -> str:
         return f"⚪ No pool numbers{since} — {POOL_PRESSURE_JOB} has stopped reporting."
     if verdict == POOL_UNMEASURED:
         return "⚪ Queue wait unknown — the hourly pool check couldn't read how long recent runs waited."
-    if pool.get("over_threshold") and not pool.get("day"):
-        waiting = pool["over_threshold"]
+    span = pool_span(pool)
+    if not span:
+        waiting = pool.get("over_threshold") or 0
         return (
             f"⏳ Queue backed up — {waiting} {plural(waiting, 'run')} waiting"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
-    # Both figures, as pool_numbers does: the day breaches on p50 or p95, so
+    # Both figures, as pool_numbers does: the stretch breaches on p50 or p95, so
     # the median on its own can be a passing number standing in as the reason.
     return (
-        f"⏳ Queue backed up — worst day {figure(pool.get('day'))}:"
+        f"⏳ Queue backed up — {span}:"
         f" median wait {wait_text(pool.get('p50_s'))} against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
         f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
     )
@@ -1057,14 +1077,21 @@ def run(
     # change inside one episode is its own message (see decide). The clear is
     # held to the same bar: dropping the verdict on a send that failed would
     # lose the only "it is over" the space ever gets.
-    told_pool = (KIND_POOL in sent or KIND_POOL not in kinds) and (
-        KIND_POOL_CLEAR in sent or KIND_POOL_CLEAR not in kinds
+    # A withheld breach is not one of the "nothing was due" cases: see
+    # pool_advisable.
+    withheld = bool(health.get("pool")) and not pool_advisable(health["pool"])
+    told_pool = (
+        (KIND_POOL in sent or KIND_POOL not in kinds)
+        and (KIND_POOL_CLEAR in sent or KIND_POOL_CLEAR not in kinds)
+        and not withheld
     )
     # `pool_verdict` cannot answer "did this episode breach": a breach that goes
     # ⚪ overwrites it, and the ✅ is then owed to nobody. This bit outlives the
-    # ⚪ and only the clear drops it.
+    # ⚪ and only the clear drops it. Set on the send, because a breach decide()
+    # withheld for want of a live queue was never announced, and the ✅ would
+    # then end an episode the space never heard begin.
     pool_breached = bool(before.get("pool_breached"))
-    if told_pool and pool_was_read(health):
+    if KIND_POOL in sent:
         pool_breached = pool_breached or (health.get("pool") or {}).get("verdict") == POOL_BREACH
     if KIND_POOL_CLEAR in sent:
         pool_breached = False
