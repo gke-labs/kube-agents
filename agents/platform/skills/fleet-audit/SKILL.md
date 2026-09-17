@@ -664,7 +664,9 @@ For `hpa-cannot-scale`, the one slug that names both a posture and a fault, the 
 `minor` dangling-target fault is reported on stderr and not applied.
 The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
 machine-readable form yet; a match there is moved here by the worker with the lines that pin the
-property as `excerpt`.
+property as `excerpt`. A posture a `declares:` note covers is written to `findings` like any other
+and the join moves it; a candidate the worker leaves out because it found the note itself gives the
+join nothing to move, and the declaration never reaches the ledger.
 
 What the shape enforces:
 
