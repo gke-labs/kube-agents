@@ -4,7 +4,9 @@
 Usage::
 
     python3 scripts/eval_dashboard/store.py --location gs://bucket/evidence \\
-        [--prior store.json] [--window-days 90] [--out store.json]
+        [--prior store.json] [--window-days 90] [--lead-days 14] [--out store.json]
+    python3 scripts/eval_dashboard/store.py --location gs://bucket/evidence \\
+        --prior store.json --fail-with "<why this tick read nothing>" [--out store.json]
 
 The evidence store is where the nightly appends one record per case per
 night (``docs/designs/eval-scorer.md``, "What is stored"): one immutable
@@ -31,20 +33,26 @@ does not hold are read (``gsutil cat``, in chunks). A tick therefore costs
 one ``ls`` of the prefix plus last night's objects, whatever the store's
 age. Without a prior, everything inside the window is read once.
 
-THE WINDOW AND THE CAP. The Trend page shows ``--window-days`` (90, a
-quarter) of nights; objects whose name stamps them older are not fetched.
-Inside the window the newest ``--max-objects`` per case *per key* are
-read, the gate's own cap, and ``truncated`` says per case how many older
-objects that left out -- a cap that is silent reads as "I considered
-everything" when it did not. One object per case per night keeps a
-quarter (about 91 objects) well under the 200; the cap binds only if the
-nightly records more than twice a night.
+THE WINDOW, THE LEAD-IN AND THE CAP. The Trend page draws ``--window-days``
+(90, a quarter) of nights, and the read reaches ``--lead-days`` (14)
+further back: the trailing window the page draws beside a night pools the
+nights before it, and the gate pools without any date window, so the
+first drawn nights need the nights before them or the page would call a
+window "not full" that admission read whole (a 20-run window is seven
+nights at three repetitions; two weeks covers a missed night or two).
+Objects whose name stamps them older than window plus lead-in are not
+fetched. Inside that span the newest ``--max-objects`` per case *per key*
+are read, the gate's own cap, and ``truncated`` says per case how many
+older objects that left out -- a cap that is silent reads as "I
+considered everything" when it did not. One object per case per night
+keeps the span (about 104 objects) well under the 200; the cap binds only
+if the nightly records about twice a night.
 
 THE OUTPUT is what ``render.py --store`` reads (SCHEMA.md,
 "store.json")::
 
-    {schema_version: 1, source, read_at, window_days, max_objects,
-     listed, truncated{case: n}, warnings[], records[]}
+    {schema_version: 1, source, read_at, window_days, lead_days, max_objects,
+     listed, fetched, truncated{case: n}, warnings[], error, records[]}
 
 ``records[]`` is every record read, each the JSON object as written plus
 ``object`` (its URL) and ``build`` (the Prow build id from the name; the
@@ -55,8 +63,13 @@ FAILURE POSTURE: a page, not a gate. A listing that fails writes the prior
 document back with ``error`` set and ``read_at`` unchanged, so the Trend
 page shows the last good read and says the store could not be read this
 tick; with no prior either, nothing is written and the exit is non-zero.
-The workflow runs this step best-effort and renders without ``--store``
-when it produced nothing, so the other pages publish regardless.
+``--fail-with REASON`` does the same without touching the store: the
+workflow calls it when this script was killed (its ``timeout``) or
+crashed, or when the job has no wall clock left to read at all, so every
+failure class reaches the page the same way, as a stale read that says
+why. The workflow runs this step best-effort and renders without
+``--store`` when it produced nothing, so the other pages publish
+regardless.
 """
 
 from __future__ import annotations
@@ -72,8 +85,11 @@ import subprocess
 import sys
 
 SCHEMA_VERSION = 1
-#: How many nights the Trend page carries. A quarter, per #1493's question.
+#: How many nights the Trend page draws. A quarter, per #1493's question.
 DEFAULT_WINDOW_DAYS = 90
+#: How much further back the read reaches so the first drawn night's
+#: trailing window pools the nights before it, as admission did (docstring).
+DEFAULT_LEAD_DAYS = 14
 #: Newest objects read per case per key: the gate's cap, the same default
 #: and the same environment variable (bench/kube_agents_bench/evidence_store.py).
 DEFAULT_MAX_OBJECTS = 200
@@ -196,13 +212,13 @@ def stamp_ms(stamp: str) -> float | None:
     return parsed.timestamp() * 1000
 
 
-def select_objects(urls: list[str], location: str, *, now_ms: float, window_days: int, max_objects: int) -> tuple[list[str], dict[str, int]]:
-    """The URLs worth reading: inside the window by their name's stamp, then
-    the newest ``max_objects`` per case per key directory. Returns them
-    sorted, with ``{case: objects the cap left out}``. A name that is not
-    in the layout is skipped: the store's own reader would refuse it, and
-    the page has nothing to say about it."""
-    since_ms = now_ms - window_days * 24 * 3600 * 1000
+def select_objects(urls: list[str], location: str, *, now_ms: float, window_days: int, max_objects: int, lead_days: int = 0) -> tuple[list[str], dict[str, int]]:
+    """The URLs worth reading: inside the window plus the lead-in by their
+    name's stamp, then the newest ``max_objects`` per case per key
+    directory. Returns them sorted, with ``{case: objects the cap left
+    out}``. A name that is not in the layout is skipped: the store's own
+    reader would refuse it, and the page has nothing to say about it."""
+    since_ms = now_ms - (window_days + lead_days) * 24 * 3600 * 1000
     by_dir: dict[str, list[tuple[str, str]]] = {}
     for url in urls:
         parsed = parse_url(url, location)
@@ -293,8 +309,8 @@ def load_prior(path: pathlib.Path | None) -> dict | None:
 
 
 def read_store(location: str, *, prior: dict | None = None, window_days: int = DEFAULT_WINDOW_DAYS,
-               max_objects: int | None = None, now: datetime.datetime | None = None,
-               gsutil: str = "gsutil", runner=None) -> dict:
+               lead_days: int = DEFAULT_LEAD_DAYS, max_objects: int | None = None,
+               now: datetime.datetime | None = None, gsutil: str = "gsutil", runner=None) -> dict:
     """The store.json document for ``location``: one listing, the prior's
     records kept where the listing still names them, the rest fetched.
     Raises ``RuntimeError`` when the listing fails; the CLI decides what
@@ -302,7 +318,7 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
     now = now or datetime.datetime.now(UTC)
     cap = max_objects if max_objects is not None else max_objects_from_env()
     urls = list_objects(location, gsutil, runner)
-    wanted, truncated = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, max_objects=cap)
+    wanted, truncated = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, lead_days=lead_days, max_objects=cap)
     known: dict[str, dict] = {}
     if prior and prior.get("source") == location.rstrip("/"):
         for record in prior.get("records") or []:
@@ -324,6 +340,7 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
         "source": location.rstrip("/"),
         "read_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "window_days": window_days,
+        "lead_days": lead_days,
         "max_objects": cap,
         "listed": len(urls),
         "fetched": len(to_read),
@@ -338,28 +355,38 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--location", required=True, metavar="GS_PREFIX", help="the store, e.g. gs://kube-agents-evals-bench/evidence")
     parser.add_argument("--prior", type=pathlib.Path, default=None, help="the store.json the last refresh published; its records are kept without a fetch (missing or unreadable: read everything in the window)")
-    parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS, metavar="N", help=f"read objects stamped inside the last N days (default {DEFAULT_WINDOW_DAYS})")
+    parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS, metavar="N", help=f"the page draws objects stamped inside the last N days (default {DEFAULT_WINDOW_DAYS})")
+    parser.add_argument("--lead-days", type=int, default=DEFAULT_LEAD_DAYS, metavar="N", help=f"read N days further back than the window so the first drawn nights' trailing windows are whole (default {DEFAULT_LEAD_DAYS})")
     parser.add_argument("--max-objects", type=int, default=None, metavar="N", help=f"newest objects per case per key (default {MAX_OBJECTS_ENV} or {DEFAULT_MAX_OBJECTS}, the gate's cap)")
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("store.json"))
     parser.add_argument("--gsutil", default="gsutil", help="gsutil binary to invoke")
+    parser.add_argument("--fail-with", metavar="REASON", default=None, help="read nothing: write --prior back with `error` set to REASON (the workflow's path when this script was killed or had no time to run); exit 1 without a prior")
     args = parser.parse_args(argv)
     if args.window_days < 1:
         parser.error("--window-days must be at least 1")
+    if args.lead_days < 0:
+        parser.error("--lead-days must be at least 0")
     if args.max_objects is not None and args.max_objects < 1:
         parser.error("--max-objects must be at least 1")
 
     prior = load_prior(args.prior)
-    try:
-        doc = read_store(args.location, prior=prior, window_days=args.window_days, max_objects=args.max_objects, gsutil=args.gsutil)
-    except RuntimeError as exc:
+
+    def keep_prior(why: str) -> int:
         if prior is None:
-            print(f"error: {exc}; no prior store.json to fall back on", file=sys.stderr)
+            print(f"error: {why}; no prior store.json to fall back on", file=sys.stderr)
             return 1
-        prior = dict(prior)
-        prior["error"] = f"{utc_now()}: {exc}"
-        args.out.write_text(json.dumps(prior, separators=(",", ":")) + "\n", encoding="utf-8")
-        print(f"warning: {exc}; wrote the prior read of {prior.get('read_at')} to {args.out}", file=sys.stderr)
+        stale = dict(prior)
+        stale["error"] = f"{utc_now()}: {why}"
+        args.out.write_text(json.dumps(stale, separators=(",", ":")) + "\n", encoding="utf-8")
+        print(f"warning: {why}; wrote the prior read of {stale.get('read_at')} to {args.out}", file=sys.stderr)
         return 0
+
+    if args.fail_with is not None:
+        return keep_prior(args.fail_with.strip() or "the store was not read this tick")
+    try:
+        doc = read_store(args.location, prior=prior, window_days=args.window_days, lead_days=args.lead_days, max_objects=args.max_objects, gsutil=args.gsutil)
+    except RuntimeError as exc:
+        return keep_prior(str(exc))
     for warning in doc["warnings"]:
         print(f"warning: {warning}", file=sys.stderr)
     args.out.write_text(json.dumps(doc, separators=(",", ":")) + "\n", encoding="utf-8")

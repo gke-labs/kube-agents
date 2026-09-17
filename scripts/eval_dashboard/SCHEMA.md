@@ -656,31 +656,39 @@ each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
 `trend` is `trend.py`'s block from `store.json` (below), the evidence
-store's read: `{source, read_at, error, window_days, max_objects,
+store's read: `{source, read_at, error, window_days, lead_days, max_objects,
 truncated{case: n}, warnings[], records, metrics[], default_metric,
 spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{}}`.
 Without a `--store` every field is empty or `null` and the page says the
-store was not read; `error` set means the last read failed and the rest is
-the read before it. `keys{}` maps a key id
+store was not read; `error` set means the last read failed or was not
+attempted and the rest is the read before it. The page draws the
+`window_days` before `read_at`; the `lead_days` before that were read too
+(store.py) and their records feed the first drawn nights' windows and
+spreads and appear nowhere else (not as points, nights, key changes or in
+`records`). `keys{}` maps a key id
 (`<setup_id>/<judge_model>/<scoring_version>-f<fleet>-v<verifiers>`) to its
-five components. `nights[]` is every night the store holds a record for,
-oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
+five components. `nights[]` is every night inside the drawn window the
+store holds a record for, oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
 `build:<prow build id>` from the object name (or `at:<recorded_at>` for a
 record without one), `started` and `log_url` the collector's when that
 build is a nightly run in `data.json` (`null` otherwise); the page dates
 every night by `at`, the stamp its points and markers are placed by, and
 uses `build` only for the link to the report. `cases{}` is per case `{domain, points[],
-key_changes[], record}`: `points[]` oldest first, one per record, `{night,
+key_changes[], record}` (a case recorded in the lead-in only is absent):
+`points[]` oldest first, one per record inside the drawn window, `{night,
 at, build, commit, key, runs, passes, blocked, infra, judged{metric:
-{mean, n, spread{low, high, nights}}}, window{runs, passes, lines, full}}`
-— `window` is what computed admission reads at that night (the newest
-whole records at the same key pooled to `bar.min_runs`; `full` when
-reached) and `spread` the range of the case's nightly means over the last
-`spread_nights` at the same key (`nights` 1 is no spread); `key_changes[]`
-is `{night, at, from, to, changed[]}` for every record whose key differs
-from the one before; `record` is `{state, key, runs, passes, lines, rate,
-bar, as_of}` with `state` in `would-admit|would-demote|collecting`, the
-newest window against the bar. `domains{}` is per domain `{cases[],
+{mean, n, spread{low, high, nights}}}, window{runs, passes, lines, full,
+cut}}` — `window` is what computed admission reads at that night (the
+newest whole records at the same key pooled to `bar.min_runs`; `full` when
+reached; `cut` when the pool ran out within two days of the read's start,
+so the store may hold older records at that key that admission pools and
+this read did not reach) and `spread` the range of the case's nightly means
+over the last `spread_nights` at the same key (`nights` 1 is no spread);
+`key_changes[]` is `{night, at, from, to, changed[]}` for every record
+inside the drawn window whose key differs from the one before; `record` is
+`{state, key, runs, passes, lines, rate, bar, as_of}` with `state` in
+`would-admit|would-demote|collecting|cut`, the newest window against the
+bar (`cut`: the window is not knowable from this read). `domains{}` is per domain `{cases[],
 points[], key_changes[]}` with `points[]` the cases pooled per night
 `{night, at, runs, passes, cases, keys[], judged{metric: {mean, n, low,
 high, cases}}}` (`mean` weighted by `n`, `low`/`high` the range of the
@@ -691,17 +699,20 @@ run never writes it), so nothing here is a presubmit's.
 
 The evidence store (`docs/designs/eval-scorer.md`, "What is stored")
 as one document: `{schema_version, source, read_at, window_days,
-max_objects, listed, fetched, truncated{case: n}, warnings[], error,
-records[]}`. `records[]` is every object read inside the last
-`window_days` (90) and under `max_objects` per case per key
+lead_days, max_objects, listed, fetched, truncated{case: n}, warnings[],
+error, records[]}`. `records[]` is every object read inside the last
+`window_days` plus `lead_days` (90 and 14: the page draws the window and
+pools the lead-in into its first nights) and under `max_objects` per case per key
 (`EVAL_BASELINE_MAX_OBJECTS`, 200, the gate's own cap), each the JSON line
 as written — `{case, recorded_at, commit, key{setup_id, scoring_version,
 judge_model, fleet, verifiers}, runs, passes, blocked?, infra?, judged?}` —
 plus `object` (its URL) and `build` (the Prow build id from the object
 name, `null` when the name carries none). `truncated` says per case how
 many older objects the cap left out; `warnings[]` names each line that
-would not parse (skipped, never fatal); `error` is set when the listing
-failed and the document is the prior read written back. The reader lists
+would not parse (skipped, never fatal); `error` is set when the read did
+not happen — the listing failed, or the workflow called `--fail-with` for a
+read its `timeout` killed or its wall clock could not fit — and the
+document is the prior read written back with the reason. The reader lists
 the prefix once and fetches only the objects the prior `store.json`
 (`--prior`, the copy `render.py` published beside `data.json`) does not
 hold: objects are immutable and the store append-only, so a record once

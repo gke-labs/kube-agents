@@ -33,8 +33,10 @@ incident links to the record around the night it started. What "score" means
 there — the deterministic pass rate is the gate's number, judged quality is
 advisory and never a single point — is defined once, in
 [`docs/designs/eval-scorer.md`, "What a score is"](designs/eval-scorer.md#what-a-score-is).
-A store read that fails or times out leaves the Trend page on its last good
-read and every other page unaffected.
+A store read that fails, times out or finds no wall clock left after the collect
+leaves the Trend page on its last good read, marked stale with the reason, and
+every other page unaffected. The read reaches two weeks past the page's 90-day
+window so the first drawn night's admission window is as whole as the gate's.
 The same tick comments on each pull request whose run went red or whose
 build node went away (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss or a seeded-fixture drift

@@ -74,6 +74,15 @@ def store_doc(records, **extra):
     return doc
 
 
+def scripted_page(page: pathlib.Path, script: str) -> pathlib.Path:
+    """A copy of the rendered page that runs ``script`` after the page's own
+    script rendered (test_eval_dashboard_pages.clicked_page, for a
+    sequence rather than one click)."""
+    copy_path = page.with_name(page.stem + "-scripted" + page.suffix)
+    copy_path.write_text(page.read_text().replace("</body>", f"<script>{script}</script></body>", 1))
+    return copy_path
+
+
 def data_with_nightly(cases, runs=()):
     return {"schema_version": 1, "generated_at": NOW,
             "cases": [{"name": n, "domain": d, "active": True, "nightly_active": True} for n, d in cases],
@@ -119,7 +128,7 @@ class NightOneTest(unittest.TestCase):
         self.assertEqual(rca["domain"], "remediation")
         (point,) = rca["points"]
         self.assertEqual((point["runs"], point["passes"], point["key"], point["build"]), (3, 2, KEY_1, NIGHT_1_BUILD))
-        self.assertEqual(point["window"], {"runs": 3, "passes": 2, "lines": 1, "full": False})
+        self.assertEqual(point["window"], {"runs": 3, "passes": 2, "lines": 1, "full": False, "cut": False})
         self.assertEqual(point["judged"]["OutcomeValidity"]["n"], 3)
         self.assertEqual(point["judged"]["OutcomeValidity"]["spread"]["nights"], 1, "one night is no spread")
         self.assertEqual(rca["key_changes"], [])
@@ -187,6 +196,66 @@ class ManyNightsTest(unittest.TestCase):
         self.assertEqual((state["runs"], state["passes"]), (21, 2 + 3 + 2 + 3 + 2 + 3 + 2))
         clean = trend.record_state(self.doc["cases"]["agent-kanban-smoke"]["points"][:7])
         self.assertEqual((clean["state"], clean["runs"], clean["passes"]), ("would-admit", 21, 21))
+
+
+class LeadInTest(unittest.TestCase):
+    """The read reaches ``lead_days`` past the drawn window (store.py): those
+    nights pool into the first drawn nights' windows and spreads and are
+    drawn nowhere; a window that still ran out at the read's edge is
+    ``cut``, not ``collecting``. Read at Thu 2026-09-17 14:09 UTC with a
+    10-day window and a 14-day lead-in: drawn from 09-07 14:09, read from
+    08-24 14:09."""
+
+    @classmethod
+    def setUpClass(cls):
+        base = night_one_records()
+        records = []
+        for day in range(1, 7):  # six nights in the lead-in
+            records += later_night(base, day, f"21007{day:02d}0000000000000", judged={"OutcomeValidity": 0.5 + day / 100})
+        for day in (8, 9, 10):  # three drawn nights
+            records += later_night(base, day, f"21007{day:02d}0000000000000", judged={"OutcomeValidity": 0.9})
+
+        def one(case, at, build):
+            r = copy.deepcopy(base[0])  # agent-kanban-smoke: 3 of 3
+            r.update(case=case, recorded_at=at, build=build, object=f"{LOCATION}/{case}/x/{build}.jsonl")
+            return r
+
+        extra = [
+            one("gone-case", "2026-09-03T05:50:00Z", "2100903000000000001"),  # lead-in only
+            one("sparse-case", "2026-08-25T05:50:00Z", "2100825000000000002"),  # at the read's edge...
+            one("sparse-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...so this pool may go on past it
+            one("young-case", "2026-09-05T05:50:00Z", "2100905000000000003"),  # started well inside the read...
+            one("young-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...so this pool is genuinely short
+        ]
+        cls.doc = trend.trend_document(store_doc(records + extra, window_days=10, lead_days=14), data_with_nightly(DOMAINS))
+
+    def test_the_lead_in_is_pooled_and_not_drawn(self):
+        doc = self.doc
+        self.assertEqual((doc["window_days"], doc["lead_days"]), (10, 14))
+        self.assertEqual(sorted(doc["cases"]), sorted([n for n, _ in DOMAINS] + ["sparse-case", "young-case"]), "a case recorded in the lead-in only is not on the page")
+        kanban = doc["cases"]["agent-kanban-smoke"]
+        self.assertEqual([p["at"][:10] for p in kanban["points"]], ["2026-09-08", "2026-09-09", "2026-09-10"])
+        self.assertEqual(kanban["points"][0]["window"], {"runs": 21, "passes": 21, "lines": 7, "full": True, "cut": False}, "the first drawn night pools the six lead-in nights before it")
+        self.assertEqual(kanban["points"][0]["judged"]["OutcomeValidity"]["spread"]["nights"], 7)
+        self.assertEqual(kanban["record"]["state"], "would-admit")
+        self.assertEqual(doc["records"], 3 * 4 + 2)
+        self.assertEqual([n["at"][:10] for n in doc["nights"]], ["2026-09-08", "2026-09-09", "2026-09-10"])
+        self.assertEqual(doc["domains"]["chat-and-routing"]["points"][0]["at"][:10], "2026-09-08")
+
+    def test_a_pool_that_ran_out_at_the_reads_edge_is_cut_and_one_that_ran_out_inside_it_is_collecting(self):
+        sparse = self.doc["cases"]["sparse-case"]
+        self.assertEqual([p["at"][:10] for p in sparse["points"]], ["2026-09-09"])
+        self.assertEqual(sparse["points"][0]["window"], {"runs": 6, "passes": 6, "lines": 2, "full": False, "cut": True})
+        self.assertEqual((sparse["record"]["state"], sparse["record"]["runs"], sparse["record"]["lines"]), ("cut", 6, 2))
+        young = self.doc["cases"]["young-case"]
+        self.assertEqual(young["points"][0]["window"], {"runs": 6, "passes": 6, "lines": 2, "full": False, "cut": False})
+        self.assertEqual(young["record"]["state"], "collecting")
+
+    def test_a_store_without_a_read_time_or_lead_draws_everything(self):
+        base = night_one_records()
+        doc = trend.trend_document(store_doc(base, read_at="junk"), data_with_nightly(DOMAINS))
+        self.assertEqual((doc["read_at"], doc["window_days"], doc["lead_days"], doc["records"]), (None, 90, 0, 4))
+        self.assertFalse(doc["cases"]["agent-kanban-smoke"]["points"][0]["window"]["cut"], "with no read edge nothing is cut")
 
 
 class StoreStatesTest(unittest.TestCase):
@@ -347,6 +416,24 @@ class TrendPageTest(unittest.TestCase):
         # A metric the store does not carry falls back to the default; an unknown case says so.
         self.assertIn("Judged OutcomeValidity by night", dom_text(self.page, fragment="#metric=Nope"))
         self.assertIn("No record in the store for this case inside the window", dom_text(self.page, fragment="#cases=no-such-case"))
+
+    def test_a_chip_writes_the_link_so_the_pages_own_links_still_navigate(self):
+        # A scope chip, then the domain view's case title: the title wins,
+        # because the chip wrote the fragment instead of pinning a state
+        # the hashchange would not clear.
+        script = ('document.querySelector(\'button[data-scope="upgrades"]\').click();'
+                  'window.addEventListener("hashchange", () => { document.querySelector(\'a[href="trend.html#cases=upgrades-fleet-version-table"]\').click(); }, { once: true });')
+        app = dom_text(scripted_page(self.page, script))
+        self.assertIn("<h1><code>upgrades-fleet-version-table</code> on main</h1>", app)
+        self.assertNotIn("<h1>upgrades on main</h1>", app)
+        # A metric chip keeps the scope it was clicked in and lands in the fragment
+        # (recorded beside #app: the poll's re-render would wipe it inside).
+        script = ('document.querySelector(\'button[data-metric="ToolInvocation"]\').click();'
+                  'window.addEventListener("hashchange", () => { document.getElementById("app").insertAdjacentHTML("afterend", `<p id="where">${location.hash}</p>`); }, { once: true });')
+        app = dom_text(scripted_page(self.page, script), fragment="#domain=remediation")
+        self.assertIn("<h1>remediation on main</h1>", app)
+        self.assertIn("Judged ToolInvocation by night · advisory", app)
+        self.assertIn('<p id="where">#domain=remediation&amp;metric=ToolInvocation</p>', app)
 
     def test_no_store_a_failed_read_and_an_empty_store_say_so(self):
         bare = dom_text(self.bare / "trend.html")

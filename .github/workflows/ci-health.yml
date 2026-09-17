@@ -174,6 +174,12 @@ env:
   EVIDENCE_STORE: gs://kube-agents-evals-bench/evidence
   STORE_TIMEOUT_S: "600"
   COLLECT_TIMEOUT_S: "1500"
+  # The refresh job's timeout-minutes in seconds (move the two together),
+  # and what the store read must leave on that clock for the adjudicator,
+  # the render and the post after it (recent ticks spend 80-150 s on the
+  # whole job).
+  JOB_TIMEOUT_S: "1800"
+  JOB_TAIL_S: "240"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
   # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
@@ -216,6 +222,10 @@ jobs:
           # The job token holds issues/PR write; nothing here pushes, and
           # render's git log is local, so the token does not stay on disk.
           persist-credentials: false
+
+      # The job's wall clock, for the store read's budget below.
+      - name: Note when the job started
+        run: echo "JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -301,29 +311,43 @@ jobs:
           '
 
       # The Trend page's input, still as the reader (step A). Best-effort by
-      # construction: a failed listing writes the prior read back with its
-      # error; a timeout or a crash falls back to the prior itself, so the
-      # page stays on its last good read either way (docs/ci-health.md
-      # promises that); with no prior at all the step leaves no
-      # work/store.json, the render below skips --store, and the page says
-      # the store was not read. The other pages publish in every case. The
-      # prior is the copy render.py published beside data.json last tick,
-      # so a tick fetches only last night's objects. Skipped after a failed
-      # collect: nothing renders then, and the read would only spend the
-      # job's budget on a document no step consumes.
+      # construction: whatever stops the read (a failed listing, store.py
+      # killed by its timeout or crashed, no wall clock left after the
+      # collect) writes the last published store.json back with `error`
+      # set, so the page keeps its last good read and says it is stale and
+      # why (docs/ci-health.md promises that); with no prior at all the
+      # step leaves no work/store.json, the render below skips --store, and
+      # the page says the store was not read. The other pages publish in
+      # every case. The prior is the copy render.py published beside
+      # data.json last tick, so a tick fetches only last night's objects.
+      # Skipped after a failed collect: nothing renders then.
+      #
+      # The job has one wall clock (timeout-minutes) and two budgeted reads
+      # before the publisher half, the collect and this one, whose budgets
+      # sum past it. This read gets what the collect left less JOB_TAIL_S,
+      # and is not started when that is under a minute: a job-level timeout
+      # is not continue-on-error and would cancel the health verdict, the
+      # render and the post, not just this page.
       - name: Read the evidence store for the Trend page (best-effort)
         if: steps.collect.outcome == 'success'
         continue-on-error: true
         run: |
           gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json || echo "no published store.json yet; reading the whole window"
-          timeout "$STORE_TIMEOUT_S" python3 scripts/eval_dashboard/store.py \
-            --location "$EVIDENCE_STORE" \
-            --prior work/prior-store.json \
-            --out work/store.json \
-            || {
-              echo "::warning::store.py failed or timed out (exit $?); the Trend page renders from the last published store.json"
-              [ -f work/prior-store.json ] && cp work/prior-store.json work/store.json
-            }
+          keep_prior() {
+            echo "::warning::$1; the Trend page shows the last published store.json as a stale read"
+            python3 scripts/eval_dashboard/store.py --location "$EVIDENCE_STORE" --prior work/prior-store.json --out work/store.json --fail-with "$1"
+          }
+          left=$(( JOB_TIMEOUT_S - JOB_TAIL_S - ($(date +%s) - JOB_STARTED) ))
+          budget=$(( left < STORE_TIMEOUT_S ? left : STORE_TIMEOUT_S ))
+          if [ "$budget" -lt 60 ]; then
+            keep_prior "the store was not read: ${left}s of the job's wall clock left after the collect"
+          else
+            timeout "$budget" python3 scripts/eval_dashboard/store.py \
+              --location "$EVIDENCE_STORE" \
+              --prior work/prior-store.json \
+              --out work/store.json \
+              || keep_prior "store.py failed or timed out (exit $?, budget ${budget}s)"
+          fi
 
       # ---- B. everything that writes or posts, as the dedicated publisher --
       - name: Authenticate to Google Cloud (dashboard publisher and Chat app)

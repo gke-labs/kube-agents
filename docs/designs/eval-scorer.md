@@ -200,9 +200,10 @@ no `storage.objects.delete` on either identity); what is bounded is the read. Th
 newest `EVAL_BASELINE_MAX_OBJECTS` (200) objects **per case per key**
 ([Reading is capped, and says so](#reading-is-capped-and-says-so)), and the nightly writes one
 object per case per night, so the cap holds about 200 nights at one key — six and a half months —
-against the 91 a quarter needs. The Trend page reads the same cap over a 90-day window and says
-which cases the cap trimmed, if it ever does; a version-key change starts a new directory and
-does not consume the old one's budget.
+against the 91 a quarter needs. The Trend page draws a 90-day window, reads two weeks further back
+so the first drawn night's admission window pools the nights before it as the gate does, applies the
+same cap and says which cases it trimmed, if it ever does; a version-key change starts a new
+directory and does not consume the old one's budget.
 
 ## What is stored
 

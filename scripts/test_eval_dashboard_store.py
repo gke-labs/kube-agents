@@ -152,17 +152,22 @@ class ReadStoreTest(unittest.TestCase):
         # A stray object outside the layout is not read.
         objects[f"{LOCATION}/notes.jsonl"] = "{}\n"
         now = datetime.datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
-        doc = read(FakeGsutil(objects), now=now, window_days=3, max_objects=2)
+        doc = read(FakeGsutil(objects), now=now, window_days=3, lead_days=0, max_objects=2)
         # Window: 09-03 12:00 onwards keeps days 4 and 5 (day 3 05:00 is outside). Cap: two per key, so nothing more is cut here...
         self.assertEqual(doc["listed"], 12)
+        self.assertEqual((doc["window_days"], doc["lead_days"]), (3, 0))
         self.assertEqual(sorted((r["case"], r["recorded_at"]) for r in doc["records"]), [
             ("case-a", "2026-09-04T05:00:00Z"), ("case-a", "2026-09-05T04:00:00Z"), ("case-a", "2026-09-05T05:00:00Z"),
             ("case-b", "2026-09-04T05:00:00Z"), ("case-b", "2026-09-05T05:00:00Z")])
         self.assertEqual(doc["truncated"], {})
         # ...and with a wider window the cap binds per key and is reported per case.
-        doc = read(FakeGsutil(objects), now=now, window_days=30, max_objects=2)
+        doc = read(FakeGsutil(objects), now=now, window_days=30, lead_days=0, max_objects=2)
         self.assertEqual(doc["truncated"], {"case-a": 3, "case-b": 3})
         self.assertEqual(len([r for r in doc["records"] if r["case"] == "case-a"]), 3, "two at the current key, one at the old one")
+        # The lead-in reaches past the window: one more day brings day 3 in (the page pools it, does not draw it).
+        doc = read(FakeGsutil(objects), now=now, window_days=3, lead_days=1, max_objects=5)
+        self.assertEqual((doc["window_days"], doc["lead_days"]), (3, 1))
+        self.assertEqual(sorted(r["recorded_at"][:10] for r in doc["records"] if r["case"] == "case-b"), ["2026-09-03", "2026-09-04", "2026-09-05"])
 
     def test_a_malformed_line_is_a_warning_and_the_rest_is_read(self):
         objects = fixture_objects()
@@ -245,6 +250,7 @@ class CliTest(unittest.TestCase):
             self.assertIn("4 records (4 objects fetched, 4 listed, 0 warnings)", err)
             doc = json.loads(out.read_text())
             self.assertEqual(len(doc["records"]), 4)
+            self.assertEqual((doc["window_days"], doc["lead_days"]), (store.DEFAULT_WINDOW_DAYS, store.DEFAULT_LEAD_DAYS))
             gsutil = FakeGsutil()
             code, err = self.run_cli(["--location", LOCATION, "--prior", str(out), "--out", str(out)], gsutil)
             self.assertEqual(code, 0, err)
@@ -268,10 +274,32 @@ class CliTest(unittest.TestCase):
             self.assertIn("AccessDeniedException", kept["error"])
             self.assertIn("wrote the prior read", err)
 
+    def test_fail_with_keeps_the_prior_with_the_reason_and_reads_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "store.json"
+            self.run_cli(["--location", LOCATION, "--out", str(out)], FakeGsutil())
+            good = json.loads(out.read_text())
+            gsutil = FakeGsutil()
+            code, err = self.run_cli(["--location", LOCATION, "--prior", str(out), "--out", str(out), "--fail-with", "store.py failed or timed out (exit 124, budget 600s)"], gsutil)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(gsutil.calls, [], "the store is not touched")
+            kept = json.loads(out.read_text())
+            self.assertEqual((kept["records"], kept["read_at"]), (good["records"], good["read_at"]))
+            self.assertTrue(kept["error"].endswith(": store.py failed or timed out (exit 124, budget 600s)"), kept["error"])
+            self.assertIn("wrote the prior read", err)
+            # Without a prior there is nothing to keep: exit 1 and no file, as for a failed listing.
+            other = pathlib.Path(tmp) / "none.json"
+            code, err = self.run_cli(["--location", LOCATION, "--prior", str(pathlib.Path(tmp) / "missing.json"), "--out", str(other), "--fail-with", "no wall clock left"], FakeGsutil())
+            self.assertEqual(code, 1)
+            self.assertFalse(other.exists())
+            self.assertIn("no wall clock left; no prior store.json", err)
+
     def test_arguments_are_validated(self):
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 store.main(["--location", LOCATION, "--window-days", "0"])
+            with self.assertRaises(SystemExit):
+                store.main(["--location", LOCATION, "--lead-days", "-1"])
             with self.assertRaises(SystemExit):
                 store.main(["--location", LOCATION, "--max-objects", "0"])
 

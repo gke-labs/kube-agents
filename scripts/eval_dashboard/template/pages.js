@@ -134,7 +134,7 @@ let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 let live = false;
 // What the reader has clicked on the Grid and the Cases page. URL parameters
 // seed it; a chip or a cell changes it and re-renders.
-const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false, scope: null, metric: null };
+const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false };
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -323,6 +323,19 @@ const caseHref = (name) => `${PAGE.pages.cases}#${enc(name)}`;
 // incident with its start and end), or on a domain.
 const trendHref = (cases, sinceMs = null, untilMs = null) => `${PAGE.pages.trend}#${scopeParams({ cases, sinceMs, untilMs }).join("&")}`;
 const trendDomainHref = (domain) => `${PAGE.pages.trend}#domain=${enc(domain)}`;
+// The Trend page's own state as a link: the current link with `patch`
+// applied (`cases`, `domain`, `metric`, `sinceMs`, `untilMs`). The page's
+// chips write this into the fragment rather than into `ui`: its domain and
+// case titles are same-document navigations, and a chip state that
+// outlived them pinned the view while the URL moved on. One source of
+// truth, and a chip's choice is in a link that can be pasted.
+function trendStateHref(link, patch) {
+  const state = { cases: [...link.cases], domain: link.domain, metric: link.metric, sinceMs: link.sinceMs, untilMs: link.untilMs, ...patch };
+  const params = scopeParams({ cases: state.cases, sinceMs: state.sinceMs, untilMs: state.untilMs });
+  if (!state.cases.length && state.domain) params.push(`domain=${enc(state.domain)}`);
+  if (state.metric) params.push(`metric=${enc(state.metric)}`);
+  return `${PAGE.pages.trend}#${params.join("&")}`;
+}
 const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 /* ---- links out ---- */
@@ -1408,20 +1421,20 @@ function trendNight(t, id) {
   return { night, ms, label: ms != null ? et(ms) : "an unknown night", href: onReport ? nightHref({ build: night.build }) : (night && night.log_url ? night.log_url : null) };
 }
 
-// The judged metric the page draws: the chip or the link, when it is one the
-// store carries; else the default (rung 6's metric when present).
+// The judged metric the page draws: the link's (a chip writes the link),
+// when it is one the store carries; else the default (rung 6's metric when
+// present).
 function trendMetric(t, link) {
   const metrics = Array.isArray(t.metrics) ? t.metrics.filter((m) => typeof m === "string") : [];
-  const wanted = ui.metric || link.metric;
+  const wanted = link.metric;
   if (wanted && metrics.includes(wanted)) return wanted;
   return typeof t.default_metric === "string" && metrics.includes(t.default_metric) ? t.default_metric : (metrics[0] || null);
 }
 
-// What the page is scoped to: a chip wins, then the link's cases, then its
-// domain, else the overview of every domain.
+// What the page is scoped to, from the link alone (a chip writes the
+// link): its cases, then its domain, else the overview of every domain.
 function trendScope(t, link) {
   const domains = trendDomains(t);
-  if (ui.scope != null) return ui.scope && domains[ui.scope] ? { domain: ui.scope } : { all: true };
   if (link.cases.size) return { cases: [...link.cases] };
   if (link.domain && domains[link.domain]) return { domain: link.domain };
   return { all: true };
@@ -1477,7 +1490,7 @@ function trendChartHtml(t, points, kind, metric, range, markers, title) {
     if (line.length > 1) parts.push(`<path class="line" d="${line.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p.window.passes / p.window.runs).toFixed(1)}`).join(" ")}"></path>`);
     for (const p of line) parts.push(`<circle class="dot${p.window.full ? "" : " lone"}" cx="${x(pointAt(p)).toFixed(1)}" cy="${y(p.window.passes / p.window.runs).toFixed(1)}" r="${g.dot}"></circle>`);
     const last = line[line.length - 1];
-    if (last) parts.push(label(x(pointAt(last)), y(last.window.passes / last.window.runs), `${pct(last.window.passes / last.window.runs)} of ${last.window.runs}${last.window.full ? "" : " · window not full"}`));
+    if (last) parts.push(label(x(pointAt(last)), y(last.window.passes / last.window.runs), `${pct(last.window.passes / last.window.runs)} of ${last.window.runs}${last.window.full ? "" : last.window.cut ? " · window reaches past this read" : " · window not full"}`));
   } else if (metric) {
     const withMetric = drawn.filter((p) => p.judged && p.judged[metric]);
     const band = withMetric.filter((p) => { const j = p.judged[metric]; const s = j.spread || j; return isNumber(s.low) && isNumber(s.high) && (s.nights == null ? (s.cases || 0) > 1 : s.nights > 1); });
@@ -1510,7 +1523,7 @@ function trendChartHtml(t, points, kind, metric, range, markers, title) {
     const lines = [`${night.label}${p.commit ? ` · ${String(p.commit).slice(0, 7)}` : ""}`];
     if (kind === "rate") {
       lines.push(`nightly pass rate: ${fmtRate(p.passes, p.runs)}${p.cases ? ` over ${plural(p.cases, "case")}` : ""}`);
-      if (p.window) lines.push(`trailing window: ${fmtRate(p.window.passes, p.window.runs)} across ${plural(p.window.lines, "night")}${p.window.full ? "" : " · not full yet"}`);
+      if (p.window) lines.push(`trailing window: ${fmtRate(p.window.passes, p.window.runs)} across ${plural(p.window.lines, "night")}${p.window.full ? "" : p.window.cut ? " · reaches past this read" : " · not full yet"}`);
       if (p.blocked || p.infra) lines.push(`${p.blocked || 0} blocked · ${p.infra || 0} infra, not in the rate`);
     } else if (metric && p.judged && p.judged[metric]) {
       const j = p.judged[metric], s = j.spread || j;
@@ -1552,18 +1565,20 @@ function trendTableHtml(t, points, metric, perDomain) {
     const j = metric && p.judged ? p.judged[metric] : null;
     const s = j ? (j.spread || j) : null;
     const spread = s && isNumber(s.low) && isNumber(s.high) && (s.nights != null ? s.nights > 1 : (s.cases || 0) > 1) ? `${fmtMean(s.low)} – ${fmtMean(s.high)}` : "—";
-    return `<tr><td>${when}</td>${perDomain ? `<td>${p.cases}</td>` : ""}<td>${esc(fmtRate(p.passes, p.runs))}</td><td>${p.window ? esc(`${fmtRate(p.window.passes, p.window.runs)}${p.window.full ? "" : " · not full"}`) : "—"}</td><td>${j ? `${fmtMean(j.mean)} <span class="mut">n=${j.n}</span>` : "—"}</td><td>${spread}</td><td class="mut">${esc(perDomain ? (p.keys || []).join(", ") : p.key || "")}</td></tr>`;
+    return `<tr><td>${when}</td>${perDomain ? `<td>${p.cases}</td>` : ""}<td>${esc(fmtRate(p.passes, p.runs))}</td><td>${p.window ? esc(`${fmtRate(p.window.passes, p.window.runs)}${p.window.full ? "" : p.window.cut ? " · past this read" : " · not full"}`) : "—"}</td><td>${j ? `${fmtMean(j.mean)} <span class="mut">n=${j.n}</span>` : "—"}</td><td>${spread}</td><td class="mut">${esc(perDomain ? (p.keys || []).join(", ") : p.key || "")}</td></tr>`;
   }).reverse();
   return `<details class="tv"><summary>Table view · ${plural(points.length, "night")}</summary><table class="tt"><thead><tr><th>Night</th>${perDomain ? "<th>Cases</th>" : ""}<th>Pass rate</th><th>Trailing window</th><th>${esc(metric || "judged")}</th><th>Spread</th><th>Version key</th></tr></thead><tbody>${rows.join("")}</tbody></table></details>`;
 }
 
 function trendRecordHtml(rec) {
   if (!rec) return "";
-  const words = { "would-admit": "the record would admit it", "would-demote": "the record would demote it", collecting: "collecting" };
+  const words = { "would-admit": "the record would admit it", "would-demote": "the record would demote it", collecting: "collecting", cut: "not knowable from this read" };
   const bar = rec.bar || {};
   const detail = rec.state === "collecting"
     ? `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key, ${Math.max(0, (bar.min_runs || 20) - rec.runs)} more runs before the window is full`
-    : `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key against a bar of ${pct(bar.rate || 0.95)} over ${bar.min_runs || 20}`;
+    : rec.state === "cut"
+      ? `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key inside this read; the store may hold older records at this key that admission pools and this page did not read`
+      : `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key against a bar of ${pct(bar.rate || 0.95)} over ${bar.min_runs || 20}`;
   return `<p class="rec"><b>Record today: ${esc(words[rec.state] || rec.state)}.</b> ${esc(detail)} <span class="mut">(as of ${esc(et(parseIso(rec.as_of)))}; the roster decides, the record informs)</span></p>`;
 }
 
@@ -1672,8 +1687,13 @@ function onClick(event) {
   else if (d.toggle === "retired") ui.showRetired = true;
   else if (d.toggle === "close") ui.selected = null;
   else if (d.build && d.case) ui.selected = { build: d.build, case: d.case };
-  else if (d.scope != null) ui.scope = d.scope;
-  else if (d.metric) ui.metric = d.metric;
+  else if (d.scope != null || d.metric) {
+    // The Trend page's chips navigate (trendStateHref); the hashchange
+    // re-renders, and a chip that names the current state changes nothing.
+    const href = d.metric ? trendStateHref(linkState(), { metric: d.metric }) : trendStateHref(linkState(), { cases: [], domain: d.scope || null });
+    location.hash = href.slice(href.indexOf("#"));
+    return;
+  }
   renderAll();
   if (d.build && d.case) {
     const panel = document.getElementById("detail");
