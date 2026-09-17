@@ -676,9 +676,16 @@ gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 it is set.
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
-pool"): `{since, verdict, measured_at}` always, plus `{day, window_hours,
-p50_s, p95_s, over_threshold, threshold_p50_s, threshold_p95_s, free, total,
-cause, max_concurrency}` when `verdict` is `BREACH` or `UNMEASURED`. The two
+pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
+window_hours, p50_s, p95_s, waiting, over_threshold, threshold_p50_s,
+threshold_p95_s, free, total, cause, max_concurrency}` when `verdict` is
+`BREACH` or `UNMEASURED`. `waiting` is every run with no pod yet and `null`
+when Deck was not read; `over_threshold` is the subset past the p95 limit.
+`breach_seen` says whether the open episode has ever measured a breach, and
+`since` is the episode's start except that a `BREACH` does not inherit one from
+a stretch that only ever said the queue could not be read. `metrics` carries
+both across a tick that read no artifact, as `pool_since` and
+`pool_breach_seen`. The two
 figures are never the seven-day window's — the periodic breaches on a day's row
 or on runs queued past p95 right now, and the window sits back inside its own
 limit after one bad day. Exactly one of `window_hours` and `day` says which

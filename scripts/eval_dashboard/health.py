@@ -1121,9 +1121,19 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         verdict = POOL_STALE
     elif verdict not in (POOL_BREACH, POOL_UNMEASURED):
         return None
+    # `since` opens on the first note and carries through the episode, but a
+    # BREACH does not inherit one from a stretch that only ever said the queue
+    # could not be read: "runs are waiting since Monday" over two days nobody
+    # measured claims more than the readings do. `breach_seen` is what makes
+    # the two directions differ -- a breach that goes STALE and comes back
+    # keeps its real start, because that start was measured.
+    before = prev or {}
+    breach_seen = bool(before.get("breach_seen")) or verdict == POOL_BREACH
+    carried = before.get("since") if verdict != POOL_BREACH or before.get("breach_seen") else None
     note = {
-        "since": (prev or {}).get("since") or iso(now),
+        "since": carried or iso(now),
         "verdict": verdict,
+        "breach_seen": breach_seen,
         "measured_at": iso(measured) if measured else None,
     }
     if verdict == POOL_STALE:
@@ -1155,6 +1165,11 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "window_hours": recent.get("hours") if quotable else None,
         "p50_s": _as_seconds(source.get("p50_minutes")),
         "p95_s": _as_seconds(source.get("p95_minutes")),
+        # Two counts, not one. `waiting` is every run with no pod yet, which is
+        # what "the queue is backed up right now" means and what gates the
+        # message; `over_threshold` is the subset past the p95 limit, which is
+        # what the periodic breaches on and what the CONTROL_PLANE line quotes.
+        "waiting": _section(artifact, "queue").get("waiting"),
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": _as_seconds(thresholds.get("p50_minutes")),
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
@@ -1188,6 +1203,12 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
     except (KeyError, TypeError, ValueError):
         return None
     if (measured.date() - day).days >= POOL_DIGEST_DAYS:
+        return None
+    if not latest.get("judged"):
+        # The producer withholds a row's verdict below its sample floor and
+        # prints "(too few runs to judge)" instead. At 13:00 UTC the newest row
+        # holds only the overnight runs, so a single slow one would otherwise
+        # be the morning's "typical wait" and the evidence a queue had cleared.
         return None
     return _as_seconds(latest.get("p50_minutes"))
 
@@ -1641,8 +1662,15 @@ def adjudicate(
     # across those ticks itself: it is written every tick, muted or not,
     # where the poster's state file freezes on a mute or a crash and would
     # hand a later episode an older episode's start.
-    held = ((prev or {}).get("pool") or {}).get("since") or ((prev or {}).get("metrics") or {}).get("pool_since")
-    pool = pool_note(pool_pressure, pool_clock, {"since": held})
+    prior = ((prev or {}).get("pool") or {})
+    before_metrics = (prev or {}).get("metrics") or {}
+    held = prior.get("since") or before_metrics.get("pool_since")
+    # Whether the open episode has ever measured a breach, carried the same way
+    # and for the same reason as its start: pool_note refuses to date a breach
+    # from a monitoring-only stretch, and a blind tick must not answer that
+    # question by forgetting.
+    seen = prior.get("breach_seen") if prior else before_metrics.get("pool_breach_seen")
+    pool = pool_note(pool_pressure, pool_clock, {"since": held, "breach_seen": bool(seen)})
     if pool:
         evidence.append(pool_evidence(pool))
     stale_after = DEFAULT_STALE_AFTER
@@ -1687,6 +1715,7 @@ def adjudicate(
     # the artifact and wrote no note ended the episode, so the next breach is
     # a new one and starts from its own clock.
     out["metrics"]["pool_since"] = pool["since"] if pool else (None if out["metrics"]["queue_wait_read"] else held)
+    out["metrics"]["pool_breach_seen"] = pool["breach_seen"] if pool else (False if out["metrics"]["queue_wait_read"] else bool(seen))
     if age is not None:
         out["metrics"]["data_age_s"] = int(age.total_seconds())
     return out

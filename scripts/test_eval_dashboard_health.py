@@ -931,10 +931,12 @@ class PoolNote(unittest.TestCase):
                 "since": health.iso(T0),
                 "verdict": "BREACH",
                 "measured_at": health.iso(T0),
+                "breach_seen": True,
                 "day": "2026-09-06",
                 "window_hours": None,
                 "p50_s": 1446,
                 "p95_s": 9438,
+                "waiting": 0,
                 "over_threshold": 0,
                 "threshold_p50_s": 900,
                 "threshold_p95_s": 2700,
@@ -1008,6 +1010,54 @@ class PoolNote(unittest.TestCase):
         self.assertIsNone(health.pool_span(note))
         self.assertEqual(health.pool_measurement(note), "4 runs waiting now past 45 min")
 
+    def test_a_breach_after_a_monitoring_stretch_is_dated_from_the_breach(self):
+        # The periodic dies Monday and comes back Wednesday reporting a queue.
+        # Carrying Monday's start would put "runs are waiting to start since
+        # Monday" on the lede over two days nobody measured.
+        dead = T0 - timedelta(hours=4)
+        stale = pooled(verdict="BREACH", cause="CAPACITY", window_end=dead)
+        self.assertEqual(stale["pool"]["verdict"], "STALE")
+        self.assertFalse(stale["pool"]["breach_seen"])
+        back = T0 + timedelta(days=2)
+        note = pooled(now=back, prev=stale, verdict="BREACH", cause="CAPACITY", window_end=back)["pool"]
+        self.assertEqual(note["since"], health.iso(back), "dated from the first reading that saw it")
+        self.assertTrue(note["breach_seen"])
+
+    def test_a_breach_that_goes_stale_and_returns_keeps_its_real_start(self):
+        # The other direction, and why breach_seen exists rather than a plain
+        # verdict comparison: that start was measured.
+        first = pooled(verdict="BREACH", cause="CAPACITY")
+        blind_at = T0 + timedelta(hours=1)
+        stale = pooled(now=blind_at, prev=first, verdict="BREACH", cause="CAPACITY", window_end=blind_at - timedelta(hours=4))
+        self.assertEqual(stale["pool"]["verdict"], "STALE")
+        back = blind_at + timedelta(hours=1)
+        note = pooled(now=back, prev=stale, verdict="BREACH", cause="CAPACITY", window_end=back)["pool"]
+        self.assertEqual(note["since"], health.iso(T0), "one episode, and it breached at the start")
+
+    def test_a_blind_tick_does_not_forget_that_the_episode_never_breached(self):
+        # The same question across a tick that read no artifact. metrics
+        # carries it beside the start, or the breach would date itself from
+        # the monitoring stretch again.
+        dead = T0 - timedelta(hours=4)
+        stale = pooled(verdict="BREACH", cause="CAPACITY", window_end=dead)
+        blind_at = T0 + timedelta(minutes=15)
+        blind = health.adjudicate(data(), blind_at, stale, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(blind["pool"])
+        self.assertFalse(blind["metrics"]["pool_breach_seen"])
+        back = blind_at + timedelta(minutes=15)
+        note = pooled(now=back, prev=blind, verdict="BREACH", cause="CAPACITY", window_end=back)["pool"]
+        self.assertEqual(note["since"], health.iso(back))
+
+    def test_the_digest_wait_is_withheld_on_a_day_the_producer_would_not_judge(self):
+        # At 13:00 UTC the newest row holds only the overnight runs. One slow
+        # run would otherwise be the morning's "typical wait" and the evidence
+        # the queue had cleared.
+        artifact = pressure(verdict="OK", today_p50=40.0)
+        artifact["trend"]["days"][-1] |= {"runs": 1, "judged": False}
+        self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
+        artifact["trend"]["days"][-1]["judged"] = True
+        self.assertEqual(health.pool_wait_p50_s(artifact, T0), 2400)
+
     def test_the_worst_breached_day_wins_even_when_it_breached_on_p95_alone(self):
         # Excess over either limit, so a day that went over on p95 only is
         # still picked ahead of a quieter day that went over on p50.
@@ -1080,7 +1130,7 @@ class PoolNote(unittest.TestCase):
         result = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED), pool_pressure=sentinel)
         self.assertEqual(
             result["pool"],
-            {"since": health.iso(T0), "verdict": "STALE", "measured_at": None},
+            {"since": health.iso(T0), "verdict": "STALE", "breach_seen": False, "measured_at": None},
         )
         self.assertTrue(result["metrics"]["queue_wait_read"], "the fetch worked; the periodic did not")
         self.assertIsNone(result["metrics"]["queue_wait_p50_s"])
@@ -1196,7 +1246,7 @@ class PoolNote(unittest.TestCase):
         # window_end is the only signal that the numbers stopped.
         measured = T0 - timedelta(hours=4)
         note = pooled(verdict="BREACH", cause="CAPACITY", window_end=measured)["pool"]
-        self.assertEqual(note, {"since": health.iso(T0), "verdict": "STALE", "measured_at": health.iso(measured)})
+        self.assertEqual(note, {"since": health.iso(T0), "verdict": "STALE", "breach_seen": False, "measured_at": health.iso(measured)})
         self.assertIn(
             f"queue wait unmeasured: last reading {health.iso(measured)};"
             " the hourly pool-pressure job has missed the last few",

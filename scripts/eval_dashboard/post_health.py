@@ -313,8 +313,15 @@ def pool_advisable(pool: dict) -> bool:
     """Whether the note is worth posting, and whether its verdict is worth
     recording as told. The two answers have to match: a breach withheld here
     but written to `pool_verdict` reads later as already said, and the next
-    live queue under the same cause would then go unannounced."""
-    return pool.get("verdict") != POOL_BREACH or bool(pool.get("over_threshold"))
+    live queue under the same cause would then go unannounced.
+
+    `waiting` is every run with no pod yet, not the subset past the p95 limit:
+    a pool full all afternoon with every run waiting half an hour breaches on
+    the day's p50 and has nothing over p95, and that is the incident this
+    message exists for. `None` means Deck was not read, which is not an answer
+    -- an unreadable queue withholds nothing.
+    """
+    return pool.get("verdict") != POOL_BREACH or pool.get("waiting") != 0
 
 
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:

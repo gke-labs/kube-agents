@@ -226,7 +226,9 @@ hours have to be over a limit themselves to be quoted, and hold five runs, as a
 day's row needs; otherwise the worst day is what is left to show, and the label
 says which it was.
 
-A ⏳ also needs runs waiting at the moment of the reading. The remedy is
+A ⏳ also needs runs waiting at the moment of the reading — any queued run, not
+only one already past the p95 limit, because a pool full all afternoon with
+every run waiting half an hour is the case this message is for. The remedy is
 recomputed hourly from a live count of leased projects while the verdict stands
 for a week, so a pool that filled on Monday and drained by Tuesday would
 otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The
