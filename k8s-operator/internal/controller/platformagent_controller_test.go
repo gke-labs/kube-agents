@@ -5323,6 +5323,63 @@ func TestSyncGithubTokenMinterConfigMap_ContextReposNeedTheReadScope(t *testing.
 	}
 }
 
+// A repository named `default` has a policy key equal to the base template's.
+// Rendering it would overwrite default.yaml -- with the read-only policy for a
+// context entry, after which the next reconcile derives every managed policy
+// from a template with no write scope. Neither list may claim that key.
+func TestSyncGithubTokenMinterConfigMap_NeverClaimsTheBaseTemplate(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data:       map[string]string{"default.yaml": minterTemplateWithReadScope},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	key := client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}
+	managed := `[{"type":"github","url":"https://github.com/test-org/gitops"}]`
+
+	for _, lists := range []struct {
+		name, managed, context string
+	}{
+		{"context repository named default", managed, `[{"type":"github","url":"https://github.com/test-org/default"}]`},
+		{"managed repository named default", `[{"type":"github","url":"https://github.com/test-org/gitops"},{"type":"github","url":"https://github.com/test-org/default"}]`, ""},
+	} {
+		t.Run(lists.name, func(t *testing.T) {
+			// Two reconciles: the second is the one that would read an
+			// overwritten template.
+			for i := 0; i < 2; i++ {
+				if err := r.syncGithubTokenMinterConfigMap(ctx, agent, lists.managed, lists.context); err != nil {
+					t.Fatalf("sync %d failed: %v", i, err)
+				}
+			}
+			updatedCM := &corev1.ConfigMap{}
+			if err := cl.Get(ctx, key, updatedCM); err != nil {
+				t.Fatalf("get failed: %v", err)
+			}
+			if updatedCM.Data["default.yaml"] != minterTemplateWithReadScope {
+				t.Errorf("default.yaml was rewritten:\n%s", updatedCM.Data["default.yaml"])
+			}
+			if _, ok := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])["platform-agent-scope"]; !ok {
+				t.Errorf("gitops.yaml lost its write scope: %s", updatedCM.Data["gitops.yaml"])
+			}
+			if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml" {
+				t.Errorf("expected only gitops.yaml tracked, got %q", ann)
+			}
+		})
+	}
+}
+
 func TestReconcileGitopsStateConfigMap_SyncsContextRepos(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{

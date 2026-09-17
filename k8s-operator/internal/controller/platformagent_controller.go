@@ -75,6 +75,10 @@ const (
 	// derived from.
 	minterConfigMapName   = "github-token-minter-config"
 	minterBaseTemplateKey = "default.yaml"
+	// minterPolicyKeySuffix turns a bare repository name into its policy key. A
+	// repository whose key would be minterBaseTemplateKey is skipped: rendering
+	// it would overwrite the template every other policy is derived from.
+	minterPolicyKeySuffix = ".yaml"
 	// minterReadScope is the scope a context repository's policy carries and
 	// nothing else: contents: read, as the chart's default.yaml declares it. A
 	// default.yaml without it predates the read grant and renders no context
@@ -1189,6 +1193,15 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 				"list", listName, "repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
 			continue
 		}
+		if bareRepo+minterPolicyKeySuffix == minterBaseTemplateKey {
+			// The base template is never claimed: a policy rendered under its
+			// key becomes the template the next reconcile derives every policy
+			// from, and a read-only rendering there strips the write scope from
+			// every managed repository.
+			logger.Info("skipping repository whose minter policy key would be the base template",
+				"list", listName, "repo", fullRepo, "key", minterBaseTemplateKey)
+			continue
+		}
 		if _, exists := seen[bareRepo]; exists {
 			continue
 		}
@@ -1283,7 +1296,7 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	expected := make(map[string]string, len(allBareRepos)+len(contextBareRepos))
 	writeContent := renderRepoPolicy(baseTemplate, allBareRepos)
 	for _, bareRepo := range allBareRepos {
-		expected[bareRepo+".yaml"] = writeContent
+		expected[bareRepo+minterPolicyKeySuffix] = writeContent
 	}
 	if len(contextBareRepos) > 0 {
 		readContent, ok := renderReadOnlyPolicy(baseTemplate, contextBareRepos)
@@ -1292,7 +1305,7 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 				"scope", minterReadScope, "repos", contextBareRepos)
 		} else {
 			for _, bareRepo := range contextBareRepos {
-				expected[bareRepo+".yaml"] = readContent
+				expected[bareRepo+minterPolicyKeySuffix] = readContent
 			}
 		}
 	}
