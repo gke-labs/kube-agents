@@ -40,8 +40,8 @@ For any request that concerns runtime behavior of workloads on a **single, speci
      4. **Evaluate the findings:**
         - A probe that completes with `existence: true` (or confirms workload presence in `result` or `metadata`) counts as a match.
         - A probe that blocks (e.g. `needs_input`), fails, or times out (including cards stuck in `ready`) does **not** count as a match for the target workload. Record any blocked/failed/unresponsive probe in your synthesis.
-        - **Exactly one cluster matches:** proceed to step 2 to delegate the debugging investigation to that cluster's profile. In your report, state clearly which cluster was resolved and how (e.g. *"Resolved `payments-api` in namespace `seeded-debug` to cluster `seeded-a` after fleet discovery"*). Never resolve silently.
-        - **Zero clusters match, multiple clusters match, or probes block/fail leaving ambiguity:** *then* ask the user for clarification, stating explicitly which clusters were checked and what was found on each (including any clusters where the probe blocked or failed). Ask only after looking.
+        - **Exactly one cluster matches:** proceed to step 2 to delegate the debugging investigation to that cluster's profile. In your report, state clearly which cluster was resolved and how (e.g. _"Resolved `payments-api` in namespace `seeded-debug` to cluster `seeded-a` after fleet discovery"_). Never resolve silently.
+        - **Zero clusters match, multiple clusters match, or probes block/fail leaving ambiguity:** _then_ ask the user for clarification, stating explicitly which clusters were checked and what was found on each (including any clusters where the probe blocked or failed). Ask only after looking.
 
 2. **Create the card** with the request in the body:
 

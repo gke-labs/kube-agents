@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # (/opt/defaults/scripts); in the repo they live in deploy/shared.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"))
 
-import cluster_agent_profile as cap  # noqa: E402
+import cluster_agent_profile as cap
+import sandbox_exec  # noqa: E402
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -523,6 +524,27 @@ class CreateProfileTest(unittest.TestCase):
         self.assertEqual(cfg["backends"], [])
 
 
+class ResolveProfilesBaseTest(unittest.TestCase):
+    def test_resolves_when_hermes_home_is_profile_home(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+
+    def test_resolves_when_platform_agent_home_is_set(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": "/custom/profiles/platform", "PLATFORM_AGENT_HOME": "/srv/agent"},
+            clear=True,
+        ):
+            self.assertEqual(cap._resolve_data_root(), Path("/srv/agent"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/agent/profiles"))
+
+    def test_resolves_standard_root_hermes_home(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+
+
 class ListProfilesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="cap-list-test-"))
@@ -607,7 +629,12 @@ class DeleteProfileTest(unittest.TestCase):
 
         self.assertFalse(home.exists())
         mock_sub_run.assert_called_once()
-        mock_sbox_run.assert_called_once_with(["rm", "-rf", "/opt/data/profiles/cluster-target"], timeout=15)
+        mock_sbox_run.assert_called_once_with(
+            ["rm", "-rf", "/opt/data/profiles/cluster-target"],
+            check=True,
+            timeout=15,
+            principal=sandbox_exec.TERMINAL_PRINCIPAL,
+        )
 
 
 class SandboxStubTest(unittest.TestCase):

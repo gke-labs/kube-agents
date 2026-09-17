@@ -1315,6 +1315,29 @@ class TestClusterProfileTools(unittest.TestCase):
         mock_list.assert_called_once_with()
         self.assertEqual(result, "cluster-a\ncluster-b")
 
+    def test_list_cluster_profiles_unmocked_with_profile_hermes_home(self):
+        tmp = Path(tempfile.mkdtemp(prefix="mcp-profiles-test-"))
+        try:
+            profiles_dir = tmp / "profiles"
+            profiles_dir.mkdir()
+            platform_home = profiles_dir / "platform"
+            platform_home.mkdir()
+            cluster_dir = profiles_dir / "cluster-prod"
+            cluster_dir.mkdir()
+            (cluster_dir / "USER.md").write_text("- project: p\n- cluster: c\n", encoding="utf-8")
+            (cluster_dir / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n", encoding="utf-8"
+            )
+
+            import cluster_agent_profile as cap
+
+            with patch.dict(os.environ, {"HERMES_HOME": str(platform_home)}), \
+                 patch.object(cap, "PROFILES_BASE", cap._resolve_profiles_base()):
+                result = platform_mcp_server.list_cluster_profiles()
+                self.assertEqual(result, "cluster-prod")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     @patch("cluster_agent_profile.profile_name")
     def test_get_cluster_profile_name_calls_profile_name(self, mock_pname):
         mock_pname.return_value = "cluster-myproj-myclust-us-central1"

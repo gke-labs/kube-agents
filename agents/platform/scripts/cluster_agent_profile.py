@@ -31,7 +31,35 @@ from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, ove
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+def _resolve_data_root() -> Path:
+    """Resolve the data PVC root containing the profiles/ directory.
+
+    In a Platform Agent worker, kanban session, or gateway child, HERMES_HOME is pointed
+    at the profile home (<root>/profiles/platform) while PLATFORM_AGENT_HOME points to
+    the data PVC root (/opt/data). If PLATFORM_AGENT_HOME is unset and HERMES_HOME points
+    directly to a profile home, derive the root from HERMES_HOME.parent.parent.
+    """
+    if os.environ.get("PLATFORM_AGENT_HOME"):
+        return Path(os.environ["PLATFORM_AGENT_HOME"])
+    raw_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    if raw_home.parent.name == "profiles":
+        return raw_home.parent.parent
+    return raw_home
+
+
+def _resolve_profiles_base() -> Path:
+    """Resolve the directory containing all profile subdirectories."""
+    if os.environ.get("PLATFORM_AGENT_HOME"):
+        return Path(os.environ["PLATFORM_AGENT_HOME"]) / "profiles"
+    raw_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    if raw_home.parent.name == "profiles":
+        return raw_home.parent
+    return raw_home / "profiles"
+
+
+HERMES_HOME = _resolve_data_root()
 # Operator-rendered config overlays and profile-targeted plugin image volumes. The
 # entrypoint applies both at pod startup; a profile scaffolded here appears later, so it
 # has to pick them up itself (see create_profile steps 2c/2d).
@@ -50,7 +78,7 @@ SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
-PROFILES_BASE = HERMES_HOME / "profiles"
+PROFILES_BASE = _resolve_profiles_base()
 
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
@@ -473,7 +501,12 @@ def delete_profile(name: str) -> None:
         shutil.rmtree(home, ignore_errors=True)
     if sandbox_exec.sandbox_enabled():
         try:
-            sandbox_exec.run(["rm", "-rf", f"/opt/data/profiles/{name}"], timeout=15)
+            sandbox_exec.run(
+                ["rm", "-rf", f"/opt/data/profiles/{name}"],
+                check=True,
+                timeout=15,
+                principal=sandbox_exec.TERMINAL_PRINCIPAL,
+            )
         except Exception as e:  # noqa: BLE001
             log(f"sandbox cleanup of profile {name} skipped: {e}")
 
