@@ -769,13 +769,14 @@ class ContentWorkspaceStore:
     def _remote_config(workspace: Workspace) -> tuple[tuple[str, str], ...]:
         """The git config a fetch of this workspace carries.
 
-        Made current again first rather than replayed from the clone. The
-        clone-time token may have expired over the workspace's lifetime, and
-        the repository's role may have changed under it: a repository that was
-        context at `open` and is managed by `commit` is refused a fresh read
-        token, the refusal empties the layer, and the fetch falls through to
-        the ambient credential that now covers it instead of failing on a stale
-        one with the helper reset.
+        Made current again first rather than replayed from the clone: the
+        clone-time token may have expired over the workspace's lifetime, and a
+        fresh mint is what a fetch on a live token needs. The layer keeps the
+        ambient helper cleared either way, so a repository that was context at
+        `open` and is managed by `commit` is refused a fresh read token and the
+        fetch runs with no credential at all, never on the write token this
+        handle was opened without; reopening the repository is what presents
+        the credential its new role earns.
         """
         if workspace.credential is None:
             return ()

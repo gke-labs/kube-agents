@@ -1922,16 +1922,29 @@ class CloneCredentialTest(unittest.TestCase):
         self.assertIsNone(other.credential)
 
     def test_a_credential_that_could_not_be_minted_leaves_the_clone_credential_less(self):
-        # `MintedReadCredential.ensure` swallows a failed mint and answers an
-        # empty `git_config`; the store then clones exactly as it did before
-        # the credential existed.
-        credential = FakeCredential(())
+        # The real credential, not a fake: `MintedReadCredential.ensure`
+        # swallows a failed mint, and the layer it then hands the clone holds
+        # no token and clears `credential.helper`, so the clone runs with no
+        # credential at all rather than on whatever helper the sidecar's
+        # global config installed for the write token.
+        from providers.credentials import MintedReadCredential
+
+        def mint(provider, repo):
+            raise RuntimeError("the minter is down")
+
+        credential = MintedReadCredential("github", mint, "github.com")
         runner = ConfigRecordingRunner()
         store = self.store(runner, lambda repo: credential)
-        workspace = store.open("acme/tf-live")
-        self.assertEqual(["acme/tf-live"], credential.ensured)
-        self.assertEqual({()}, set(runner.configs))
-        self.assertEqual(["git", "clone", "--quiet"], runner.calls[0][0][:3])
+        with self.assertLogs("credential-proxy.vcs", level="WARNING"):
+            workspace = store.open("acme/tf-live")
+        clone = runner.subcommands.index("clone")
+        self.assertEqual(["git", "clone", "--quiet"], runner.calls[clone][0][:3])
+        self.assertEqual((("credential.helper", ""),), runner.configs[clone])
+        self.assertEqual(
+            {()},
+            {config for index, config in enumerate(runner.configs) if index != clone},
+            "every local git in the open ran with no layer",
+        )
         self.assertIs(credential, workspace.credential)
 
     def test_a_store_without_a_selector_hands_its_runner_no_config_at_all(self):

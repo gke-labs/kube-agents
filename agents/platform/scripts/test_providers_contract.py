@@ -416,8 +416,9 @@ class ReadCredentialTest(unittest.TestCase):
             return "s3cret\n"
 
         credential = MintedReadCredential("acme", mint, "acme.example")
-        # Nothing to present before it is made current.
-        self.assertEqual((), credential.git_config("acme/infra"))
+        # No token to present before it is made current; the helper is
+        # cleared regardless, because this is a context repository's layer.
+        self.assertEqual((("credential.helper", ""),), credential.git_config("acme/infra"))
         credential.ensure("acme/infra")
         self.assertEqual([("acme", "acme/infra")], minted)
 
@@ -439,10 +440,12 @@ class ReadCredentialTest(unittest.TestCase):
         # The API side is not part of the read path.
         self.assertEqual({}, credential.headers("acme/infra"))
 
-    def test_a_failed_mint_including_a_refusal_is_swallowed_into_no_credential(self):
+    def test_a_failed_mint_including_a_refusal_is_swallowed_into_a_credential_less_clone(self):
         # The asymmetry with `BrokeredCredential`: there is no token when the
         # mint is refused, so proceeding is a credential-less clone, not a
-        # verb running on a token that was just refused.
+        # verb running on a token that was just refused. Credential-less means
+        # the helper the write token lives in is cleared too: a Minty outage
+        # must not turn a context read into a read on the write token.
         for failure in (RuntimeError("the minter is down"), PermissionError("not a context repository")):
             with self.subTest(failure=type(failure).__name__):
 
@@ -452,13 +455,15 @@ class ReadCredentialTest(unittest.TestCase):
                 credential = MintedReadCredential("acme", mint, "acme.example")
                 with self.assertLogs("credential-proxy.vcs", level="WARNING") as logs:
                     credential.ensure("acme/infra")
-                self.assertEqual((), credential.git_config("acme/infra"))
+                self.assertEqual(
+                    (("credential.helper", ""),), credential.git_config("acme/infra")
+                )
                 self.assertNotIn("not a context", "\n".join(logs.output), "no detail crosses")
 
-    def test_no_mint_operation_means_nothing_to_present(self):
+    def test_no_mint_operation_means_no_token_and_the_helper_still_cleared(self):
         credential = MintedReadCredential("acme", None, "acme.example")
         credential.ensure("acme/infra")
-        self.assertEqual((), credential.git_config("acme/infra"))
+        self.assertEqual((("credential.helper", ""),), credential.git_config("acme/infra"))
 
     def test_a_second_ensure_replaces_the_token_rather_than_keeping_a_stale_one(self):
         tokens = iter(["first", "second"])

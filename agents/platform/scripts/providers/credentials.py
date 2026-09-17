@@ -56,9 +56,10 @@ HTTP_EXTRAHEADER_KEY = "http.https://{host}/.extraheader"
 EXTRAHEADER_USERNAME = "x-access-token"
 # `credential.helper` set to the empty string clears every helper configured
 # below it in git's precedence, which in the broker means the one the CLI
-# installed for the write token. Without this, a 401 from a bad read token
-# would fall back to the write credential -- the fallback this credential
-# exists to make impossible.
+# installed for the write token. Without this, a 401 from a bad read token --
+# or the challenge a clone with no token at all gets -- would fall back to the
+# write credential, the fallback this credential exists to make impossible.
+# So a MintedReadCredential presents it whether or not a token was minted.
 CREDENTIAL_HELPER_KEY = "credential.helper"
 
 
@@ -141,7 +142,9 @@ class MintedReadCredential:
     never installed anywhere. `ensure` asks the executor to mint it, `git_config`
     hands it to the one git invocation the caller is about to run as an
     `extraheader`, and the process it was handed to is the only place it ever
-    lives.
+    lives. The same layer clears `credential.helper`, with or without a
+    token: the ambient helper is never consulted for a context repository,
+    so the line holds when the mint fails as well as when it succeeds.
 
     Two things are asymmetric with `BrokeredCredential`, on purpose:
 
@@ -149,9 +152,9 @@ class MintedReadCredential:
       proceeds with no credential. The refusal there stops a verb from running
       on a *valid* token against a repository just refused; here there is no
       token when the mint is refused, so proceeding means a credential-less
-      clone -- what every context repository got before this existed, which
-      is correct for a public one and fails for a private one the way it
-      always did.
+      clone, with the helper cleared so it is one: a public repository reads
+      as it always did, and a private one fails on the missing token rather
+      than being tried on the write one.
     * `headers` is empty. The API side is not part of the read path: a context
       repository is cloned and read, and the collaboration verbs on it are the
       write gate's business.
@@ -183,14 +186,15 @@ class MintedReadCredential:
         return {}
 
     def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
+        helper_cleared = (CREDENTIAL_HELPER_KEY, "")
         if not self._token:
-            return ()
+            return (helper_cleared,)
         basic = base64.b64encode(
             f"{EXTRAHEADER_USERNAME}:{self._token}".encode("utf-8")
         ).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
-            (CREDENTIAL_HELPER_KEY, ""),
+            helper_cleared,
         )
 
 

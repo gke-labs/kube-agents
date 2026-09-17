@@ -2374,10 +2374,12 @@ resolves the repository's registered role from the ConfigMap — `managed`,
 context repository asks the forge for `read_credential(repo)`: a credential that
 can read that one repository, obtained per clone, presented to the broker's own
 `git` as a per-invocation config layer, and installed nowhere. A credential that
-cannot be obtained falls back to the credential-less clone. On GitHub it is a
-`contents: read` App installation token minted from the repository's own minter
-policy, which the operator renders per context repository; a forge without a
-read-only credential answers `NoCredential` and the clone proceeds as before.
+cannot be obtained falls back to the credential-less clone, with the ambient
+helper cleared in that same layer so the write token is never tried in its
+place. On GitHub it is a `contents: read` App installation token minted from the
+repository's own minter policy, which the operator renders per context
+repository; a forge without a read-only credential answers `NoCredential` and
+the clone proceeds as before.
 The write gate does not consult the role, so a context repository stays refused
 by `commit`, `push`, the collaboration verbs and the refresh route; the verbs'
 credential-less read path for public repositories remains open as above.
