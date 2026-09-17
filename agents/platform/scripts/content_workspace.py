@@ -767,9 +767,19 @@ class ContentWorkspaceStore:
 
     @staticmethod
     def _remote_config(workspace: Workspace) -> tuple[tuple[str, str], ...]:
-        """The git config a fetch of this workspace carries: what its clone did."""
+        """The git config a fetch of this workspace carries.
+
+        Made current again first rather than replayed from the clone. The
+        clone-time token may have expired over the workspace's lifetime, and
+        the repository's role may have changed under it: a repository that was
+        context at `open` and is managed by `commit` is refused a fresh read
+        token, the refusal empties the layer, and the fetch falls through to
+        the ambient credential that now covers it instead of failing on a stale
+        one with the helper reset.
+        """
         if workspace.credential is None:
             return ()
+        workspace.credential.ensure(workspace.repo)
         return tuple(workspace.credential.git_config(workspace.repo))
 
     # -- lifecycle -------------------------------------------------------

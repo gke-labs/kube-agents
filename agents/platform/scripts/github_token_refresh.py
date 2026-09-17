@@ -82,6 +82,13 @@ MINTY_REQUEST_TIMEOUT_SECONDS = 5
 CLI_SETUP_TIMEOUT_SECONDS = 15
 GCLOUD_TIMEOUT_SECONDS = 5
 
+#: The retry policy for one Minty request, shared by the write and the read-only
+#: mint: three attempts, half a second before the second, doubling after.
+#: Bounded so the whole mint fits inside the broker's executor timeout.
+MINTY_MAX_ATTEMPTS = 3
+MINTY_INITIAL_DELAY_SECONDS = 0.5
+MINTY_BACKOFF_FACTOR = 2.0
+
 # What `gh` prints when the credential is the problem, as opposed to the
 # repository, the network, or the rate limit. Matched case-insensitively
 # against stderr: the REST paths emit `HTTP 401: Bad credentials`, the GraphQL
@@ -299,9 +306,9 @@ def request_minty_token(
     repositories: Sequence[str],
     scope: str,
     *,
-    max_attempts: int = 3,
-    initial_delay: float = 0.5,
-    backoff_factor: float = 2.0,
+    max_attempts: int = MINTY_MAX_ATTEMPTS,
+    initial_delay: float = MINTY_INITIAL_DELAY_SECONDS,
+    backoff_factor: float = MINTY_BACKOFF_FACTOR,
 ) -> str:
     """One installation token from Minty for `repositories` under `scope`, with bounded retries."""
     headers = {"Content-Type": "application/json", "X-OIDC-Token": oidc_token}
@@ -426,9 +433,9 @@ def mint_read_only_token(target_repo: str | None) -> str:
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
-    max_attempts: int = 3,
-    initial_delay: float = 0.5,
-    backoff_factor: float = 2.0,
+    max_attempts: int = MINTY_MAX_ATTEMPTS,
+    initial_delay: float = MINTY_INITIAL_DELAY_SECONDS,
+    backoff_factor: float = MINTY_BACKOFF_FACTOR,
 ) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
     repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()

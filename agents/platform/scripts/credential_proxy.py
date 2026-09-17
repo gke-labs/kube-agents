@@ -363,17 +363,27 @@ def managed_repositories() -> frozenset[str]:
     Returning empty for both would make them indistinguishable in the log at the
     moment an operator most needs to tell them apart.
     """
-    global _managed_repository_cache
+    return _cached_repository_slugs("_managed_repository_cache", "get_managed_github_repos")
+
+
+def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str]:
+    """One ConfigMap list, lowercased and cached for MANAGED_REPOSITORY_CACHE_SECONDS.
+
+    The cache is a named module global rather than a dict entry because tests
+    (and anyone invalidating by hand) reset it by assigning `None` to that
+    name; the reader is looked up on `gitops_workspace` at call time so a
+    patched reader is the one consulted.
+    """
     now = time.monotonic()
     with _managed_repository_lock:
-        cached = _managed_repository_cache
+        cached = globals()[cache_name]
         if cached is not None and cached[0] > now:
             return cached[1]
-    from gitops_workspace import get_managed_github_repos
+    import gitops_workspace
 
-    slugs = frozenset(slug.lower() for slug in get_managed_github_repos())
+    slugs = frozenset(slug.lower() for slug in getattr(gitops_workspace, reader_name)())
     with _managed_repository_lock:
-        _managed_repository_cache = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
+        globals()[cache_name] = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
     return slugs
 
 
@@ -400,18 +410,7 @@ def context_repositories() -> frozenset[str]:
     that separation is the safety property. Raises when unreadable, for the
     reason `managed_repositories` gives.
     """
-    global _context_repository_cache
-    now = time.monotonic()
-    with _managed_repository_lock:
-        cached = _context_repository_cache
-        if cached is not None and cached[0] > now:
-            return cached[1]
-    from gitops_workspace import get_context_github_repos
-
-    slugs = frozenset(slug.lower() for slug in get_context_github_repos())
-    with _managed_repository_lock:
-        _context_repository_cache = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
-    return slugs
+    return _cached_repository_slugs("_context_repository_cache", "get_context_github_repos")
 
 
 def repository_role(repository: str) -> str:
@@ -1818,6 +1817,11 @@ FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
 # step by test rather than by import, because importing the helper here would
 # import its CLI side into the broker.
 FORGE_READ_ONLY_FLAG = "--read-only"
+
+# How much of a failed helper's stderr reaches the broker log. The full text is
+# bounded only by the executor's output ceiling, which is not a log line; this
+# runs on every failed cron tick.
+FORGE_HELPER_LOG_DETAIL_CHARS = 1000
 
 # What may be spliced into that filename. Closed, anchored and lowercase: a
 # provider name reaching a path is the one place a forge's own string could
@@ -3328,39 +3332,57 @@ class CommandExecutor:
         provider's own name -- so a second forge that needs a brokered
         credential ships a helper and edits nothing in this file.
 
-        The provider is matched against a closed grammar before it reaches a
-        path. It comes from a forge class rather than from a request today, and
-        the check is what keeps that true if a route ever passes one through.
-
         Whether the repository is one this install acts on is settled here too,
         for the reason `_repository_is_permitted` gives: this is the call that
         spends the token, so it is the call that has to ask.
         """
-        if not _PROVIDER_RE.fullmatch(provider or ""):
-            raise ValueError("provider is not a forge name")
+        helper = self._forge_helper(provider)
         if not repository_is_managed(repository):
             raise PermissionError(f"{repository} is not a repository this install manages")
-        helper = Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
+        self._run_forge_helper(provider, helper, [repository], "credential refresh")
+
+    @staticmethod
+    def _forge_helper(provider: str) -> Path:
+        """The helper that performs a forge's privileged operations, by name.
+
+        The provider is matched against a closed grammar before it reaches a
+        path. It comes from a forge class rather than from a request today, and
+        the check is what keeps that true if a route ever passes one through.
+        """
+        if not _PROVIDER_RE.fullmatch(provider or ""):
+            raise ValueError("provider is not a forge name")
+        return Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
+
+    def _run_forge_helper(
+        self, provider: str, helper: Path, arguments: list[str], action: str
+    ) -> ExecutionResult:
+        """Run a forge helper after its caller has settled admission, or raise.
+
+        An absent helper is a refusal rather than a no-op. A credential
+        strategy that asked to be made current and silently was not is a 401
+        later, from inside a clone, that reads like the repository is gone.
+
+        A failure's detail is logged here and not returned: it crosses back
+        into the sandbox otherwise, and this is the one place a broker outage is
+        diagnosable. Redacted before it is bounded, so a token cut in half by
+        the slice is not what survives. `action` names the operation in the log
+        line and the exception, and nothing else about the two operations
+        differs on this path.
+        """
         if not helper.is_file():
-            # An absent helper is a refusal rather than a no-op. A credential
-            # strategy that asked to be made current and silently was not is a
-            # 401 later, from inside a clone, that reads like the repository is
-            # gone.
             raise RuntimeError(f"no credential refresh helper for {provider}")
-        result = self.execute_internal([str(helper), repository])
+        result = self.execute_internal([str(helper), *arguments])
         if result.exit_code != 0:
-            # Logged here and not returned: the detail crosses back into the
-            # sandbox otherwise, and it is the one place a broker outage is
-            # diagnosable. Redacted before it is bounded, so a token cut in half
-            # by the slice is not what survives.
             detail = redact_credentials(result.stderr.strip())
             LOGGER.warning(
-                "%s credential refresh exited %d%s",
+                "%s %s exited %d%s",
                 provider,
+                action,
                 result.exit_code,
-                f": {detail[:1000]}" if detail else "",
+                f": {detail[:FORGE_HELPER_LOG_DETAIL_CHARS]}" if detail else "",
             )
-            raise RuntimeError("credential refresh failed")
+            raise RuntimeError(f"{action} failed")
+        return result
 
     def mint_read_credential(self, provider: str, repository: str) -> str:
         """A read-only token for one clone of a context repository, or raise.
@@ -3382,25 +3404,14 @@ class CommandExecutor:
         helper wrote to stderr is logged redacted on failure, as the refresh
         path does, and stdout is not.
         """
-        if not _PROVIDER_RE.fullmatch(provider or ""):
-            raise ValueError("provider is not a forge name")
+        helper = self._forge_helper(provider)
         if repository_role(repository) != ROLE_CONTEXT:
             raise PermissionError(
                 f"{repository} is not a context repository of this install"
             )
-        helper = Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
-        if not helper.is_file():
-            raise RuntimeError(f"no credential refresh helper for {provider}")
-        result = self.execute_internal([str(helper), FORGE_READ_ONLY_FLAG, repository])
-        if result.exit_code != 0:
-            detail = redact_credentials(result.stderr.strip())
-            LOGGER.warning(
-                "%s read-only credential mint exited %d%s",
-                provider,
-                result.exit_code,
-                f": {detail[:1000]}" if detail else "",
-            )
-            raise RuntimeError("read-only credential mint failed")
+        result = self._run_forge_helper(
+            provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
+        )
         token = result.stdout.strip()
         if not token:
             raise RuntimeError("read-only credential mint returned no token")

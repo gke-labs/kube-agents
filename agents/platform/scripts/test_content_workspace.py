@@ -1903,6 +1903,11 @@ class CloneCredentialTest(unittest.TestCase):
         fetch = runner.subcommands.index("fetch")
         self.assertEqual(self.HEADER, runner.configs[fetch])
         self.assertEqual(
+            ["acme/tf-live", "acme/tf-live"],
+            credential.ensured,
+            "made current again before the fetch, not replayed from the clone",
+        )
+        self.assertEqual(
             {()},
             {config for index, config in enumerate(runner.configs) if index != fetch},
         )
