@@ -30,10 +30,23 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 1. **Resolve the cluster's profile name** (the kanban `assignee`):
 
-   ```bash
-   python3 /opt/data/scripts/cluster_agent_profile.py name \
-     --project "<project>" --cluster "<cluster>" --location "<location>"
-   ```
+   - **If the request names a specific cluster**, resolve its profile name directly:
+
+     ```bash
+     python3 /opt/data/scripts/cluster_agent_profile.py name \
+       --project "<project>" --cluster "<cluster>" --location "<location>"
+     ```
+
+   - **If the request does NOT name a cluster** (names only a namespace or workload):
+     **Do not ask the user which cluster before searching.** You have fleet-wide read visibility and per-cluster Cluster Agents; the user does not. Resolve the cluster before asking:
+     1. **Enumerate the fleet:** list active Cluster Agent profiles:
+        ```bash
+        python3 /opt/data/scripts/cluster_agent_profile.py list
+        ```
+     2. **Fan out a read-only existence check:** create one card per profile in one burst (no `parents`), asking each Cluster Agent whether the target namespace/workload exists on its cluster (e.g. `kanban_create(assignee="<profile>", title="Check existence: <workload> in <namespace>", body="Check whether namespace '<namespace>' or workload '<workload>' exists on this cluster. Return existence: true/false in metadata and result.")`).
+     3. **Evaluate the findings:**
+        - **Exactly one cluster matches:** proceed to step 2 to delegate the debugging investigation to that cluster's profile. In your report, state clearly which cluster was resolved and how (e.g. *"Resolved `payments-api` in namespace `seeded-debug` to cluster `seeded-a` after fleet discovery"*). Never resolve silently.
+        - **Zero or multiple clusters match:** *then* ask the user for clarification, stating explicitly which clusters were checked and what was found. Ask only after looking.
 
 2. **Create the card** with the request in the body:
 

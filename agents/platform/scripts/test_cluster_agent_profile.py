@@ -523,5 +523,61 @@ class CreateProfileTest(unittest.TestCase):
         self.assertEqual(cfg["backends"], [])
 
 
+class ListProfilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-list-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_nonexistent_directory_returns_empty(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.assertEqual(cap.list_profiles(), [])
+
+    def test_filters_reserved_and_files(self):
+        (self.tmp / "default").mkdir()
+        (self.tmp / "platform").mkdir()
+        (self.tmp / "not-a-dir.txt").touch()
+        (self.tmp / "cluster-beta").mkdir()
+        (self.tmp / "cluster-alpha").mkdir()
+
+        self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
+
+    def test_cmd_list_prints_sorted(self):
+        (self.tmp / "cluster-zeta").mkdir()
+        (self.tmp / "cluster-beta").mkdir()
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            cap.cmd_list(mock.MagicMock())
+        self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
+
+
+class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.skill_path = (
+            repo_root / "agents" / "platform" / "skills" / "cluster-agent-lifecycle" / "SKILL.md"
+        )
+        self.assertTrue(self.skill_path.is_file(), f"missing {self.skill_path}")
+        self.content = self.skill_path.read_text(encoding="utf-8")
+
+    def test_delegation_handles_unnamed_cluster_via_fleet_enumeration(self):
+        # The procedure must explicitly guide resolution when the cluster name is omitted (#953).
+        self.assertIn("cluster_agent_profile.py list", self.content)
+        # Must instruct checking before asking the user
+        self.assertIn("existence", self.content.lower())
+        # Must instruct asking only after searching / looking
+        self.assertRegex(
+            self.content,
+            r"[Aa]sk only after (looking|checking|searching)",
+        )
+        # Must require identifying which cluster was picked in the report
+        self.assertIn("Never resolve silently", self.content)
+
+
 if __name__ == "__main__":
     unittest.main()
