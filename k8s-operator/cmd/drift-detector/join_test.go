@@ -46,6 +46,16 @@ type stubGetter struct {
 
 func (g *stubGetter) Get(ctx context.Context, ref ResourceRef) (*unstructured.Unstructured, error) {
 	g.refs = append(g.refs, ref)
+	// Checked first, and whether or not block is set, because a stub that
+	// consults ctx only while blocking cannot tell an expired lookup context
+	// from a live one. Dropping the timeout line from newJoiner leaves every
+	// joiner at a zero timeout, which is an already-expired deadline and fails
+	// every real GET with "context deadline exceeded" -- and without this the
+	// stub would hand back the object regardless and the whole suite would stay
+	// green. The deadline the join sets is only as load-bearing as this line.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if g.block != nil {
 		select {
 		case <-g.block:
@@ -274,6 +284,15 @@ func TestJoinBoundsTheLookup(t *testing.T) {
 	// A control plane that has stopped answering must not hold the batch past
 	// the Pub/Sub ack deadline, so the lookup carries its own timeout rather
 	// than inheriting only the pull loop's context.
+	// The default is asserted separately from the bound. Overriding j.timeout
+	// below is what makes the rest of this test finish in milliseconds, but it
+	// also means the rest of it would pass against a joiner whose default was
+	// never set -- so the value the running binary actually uses is checked
+	// here, where newJoiner is the only place it comes from.
+	if def := newJoiner(nil, joinCluster(), nil, nil).timeout; def != joinRequestTimeout {
+		t.Errorf("newJoiner timeout = %s, want %s", def, joinRequestTimeout)
+	}
+
 	blocked := make(chan struct{})
 	defer close(blocked)
 
@@ -385,19 +404,44 @@ func TestReconciledBy(t *testing.T) {
 }
 
 func TestReconciledByDoesNotInventAClaimFromTwoMissingTimes(t *testing.T) {
-	// The zero-time skip in reconciledBy is only load-bearing here. Against a
-	// real changedAt a zero UpdatedAt sorts before it and declines the claim by
-	// accident; when the record's own timestamp is also zero, neither is before
-	// the other, "at or after" reads true, and the detector reports a reconcile
-	// built entirely out of values it does not have.
+	// Neither side has a time, so neither is before the other, "at or after"
+	// reads true, and without a guard the detector reports a reconcile built
+	// entirely out of values it does not have.
 	//
-	// A record with no timestamp is what a payload whose time field did not
-	// parse leaves behind -- json.Unmarshal zeroes what it cannot match.
+	// A record with no timestamp does not require a malformed payload: the
+	// field is a plain time.Time, so an absent or null `timestamp` decodes to
+	// the zero value without error. A genuinely malformed one fails
+	// json.Unmarshal and is nacked before it reaches here.
 	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller"}}, time.Time{})
 	if claim {
 		t.Errorf("Reconciled = true by %q, want no claim when neither the change nor the manager has a time", manager)
+	}
+}
+
+func TestReconciledByDoesNotClaimAgainstAChangeWithNoTimestamp(t *testing.T) {
+	// The mirror of the test above, and the one the zero-time guard is really
+	// for. Where two missing times merely fail to order, a missing changedAt
+	// against a manager with a real time orders the wrong way round: the zero
+	// time sorts before every real one, so "at or after" is true for any
+	// configured manager that has ever written the object, and the detector
+	// reports its most recent write as the reconcile for a change it cannot
+	// place in time at all.
+	//
+	// Every other case in this file gives changedAt a real value, which is why
+	// the accidental ordering that covers a zero UpdatedAt looked like it
+	// covered both.
+	wroteLongBefore := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+
+	claim, manager := j.reconciledBy(
+		[]fieldOwner{{Manager: "argocd-controller", UpdatedAt: wroteLongBefore}},
+		time.Time{},
+	)
+	if claim {
+		t.Errorf("Reconciled = true by %q, want no claim: the change has no timestamp, so nothing can be shown to follow it", manager)
 	}
 }
 

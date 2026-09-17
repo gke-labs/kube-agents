@@ -60,7 +60,18 @@ const (
 
 	// exitFailure is the status returned when realMain reports an error.
 	exitFailure = 1
+
+	// projectNumberDigits is the character set a project number is made of, and
+	// the whole of the test for one: a GCP project ID must start with a
+	// lowercase letter, so a value that is nothing but digits cannot be an ID.
+	projectNumberDigits = "0123456789"
 )
+
+// looksLikeProjectNumber reports whether --project was given as a project
+// number rather than a project ID.
+func looksLikeProjectNumber(project string) bool {
+	return project != "" && strings.TrimLeft(project, projectNumberDigits) == ""
+}
 
 // flags holds the parsed command line.
 type flags struct {
@@ -119,7 +130,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs := flag.NewFlagSet(commandName, flag.ContinueOnError)
 	f := &flags{}
 
-	fs.StringVar(&f.project, "project", "", "GCP project holding the drift audit subscription. Required.")
+	fs.StringVar(&f.project, "project", "",
+		"GCP project holding the drift audit subscription. Required. With the join on this must be the project ID and not the project number: a Pub/Sub path accepts either, but the join matches this against each record's project_id, so a number would match nothing.")
 	fs.StringVar(&f.subscription, "subscription", defaultSubscriptionName, "Pub/Sub subscription to pull audit records from.")
 	fs.Int64Var(&f.maxMessages, "max-messages", defaultMaxMessages, "Messages requested per pull.")
 	fs.StringVar(&f.automationPrincipals, "automation-principals", "",
@@ -133,7 +145,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.inCluster, "in-cluster", false,
 		"Read live objects using the Pod's own ServiceAccount. Mutually exclusive with --kubeconfig; setting neither of the two disables the join.")
 	fs.StringVar(&f.clusterName, "cluster-name", "",
-		"GKE cluster name the join's credentials reach. Required with --kubeconfig or --in-cluster; records from any other cluster are counted unreachable rather than looked up on the wrong one.")
+		"GKE cluster name the join's credentials reach. Required with --kubeconfig or --in-cluster; records from any other cluster are counted unreachable rather than looked up on the wrong one. Checked at startup against the cluster those credentials actually reach, and a disagreement stops the process.")
 	fs.StringVar(&f.clusterLocation, "cluster-location", "",
 		"GKE location (region or zone) of --cluster-name. Required with it: a cluster name is unique only within a project and location, so without this a same-named cluster elsewhere would be read as this one.")
 	fs.StringVar(&f.gitopsManagers, "gitops-managers", "",
@@ -219,6 +231,18 @@ func realMain(argv []string) error {
 	if !hasCredentials && (f.clusterName != "" || f.clusterLocation != "") {
 		return errors.New("--cluster-name or --cluster-location was given without --in-cluster or --kubeconfig, so nothing would read live objects from it")
 	}
+	// Refused only with the join on, because the two consumers of --project
+	// disagree about what it may be. A Pub/Sub resource path accepts a project
+	// number as readily as an ID, so the pull works either way and a detector
+	// with no credentials is right to take it as given; the join then compares
+	// the same string against resource.labels.project_id, which is always the
+	// ID. A number therefore matches no record at all, and does it silently --
+	// every lookup is counted unreachable, which is also what a correctly
+	// configured single-cluster detector reports for the rest of the project.
+	// Nothing distinguishes the two at runtime, so the distinction is made here.
+	if hasCredentials && looksLikeProjectNumber(f.project) {
+		return fmt.Errorf("--project=%s is a project number, but the join matches it against each record's project_id, which is always the project ID: pass the ID, or drop --in-cluster/--kubeconfig to run without the join", f.project)
+	}
 
 	// Cancelled on SIGINT or SIGTERM, which stops the pull loop. Settling the
 	// batch it was working on does not run on this context -- see
@@ -257,6 +281,23 @@ func realMain(argv []string) error {
 		}
 	} else {
 		log.Printf("%s: live-object join enabled for cluster %q (gitops-managers=%q)", commandName, join.cluster, f.gitopsManagers)
+
+		// Checked against join.cluster rather than a second identity built from
+		// the same flags, so the value verified here is the one matches() will
+		// use rather than a copy that could drift from it.
+		//
+		// Fatal on a mismatch. See verifyClusterIdentity: this is the one
+		// startup check whose failure mode produces confident wrong output
+		// instead of a count, so it is the one that refuses to run.
+		line, err := verifyClusterIdentity(ctx, join.cluster, func(probeCtx context.Context) (clusterIdentity, error) {
+			return observeCluster(probeCtx, f.kubeconfig, f.inCluster)
+		})
+		if err != nil {
+			return err
+		}
+		if line != "" {
+			log.Printf("%s: %s", commandName, line)
+		}
 	}
 
 	// Log the path actually pulled, not the flag: --subscription accepts a bare

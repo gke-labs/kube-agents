@@ -265,6 +265,17 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 			argv:    []string{"--project", "p", "--cluster-location", "us-central1"},
 			wantErr: "without --in-cluster or --kubeconfig",
 		},
+		{
+			// A project number pulls the subscription perfectly well and then
+			// matches no record at all, because the join compares it against
+			// project_id, which is always the ID. Everything comes out
+			// unreachable -- which is also what a healthy single-cluster
+			// detector reports for the rest of the project, so nothing at
+			// runtime tells the two apart.
+			name:    "project given as a number with the join enabled",
+			argv:    []string{"--project", "123456789012", "--in-cluster", "--cluster-name", "prod-a", "--cluster-location", "us-central1"},
+			wantErr: "is a project number",
+		},
 	}
 
 	for _, tc := range tests {
@@ -277,6 +288,26 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 				t.Errorf("realMain(%v) error = %q, want it to contain %q", tc.argv, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestLooksLikeProjectNumber(t *testing.T) {
+	// The whole test is "nothing but digits", and it is exact rather than
+	// heuristic because a GCP project ID must begin with a lowercase letter.
+	// Worth pinning both directions: widened, this rejects real project IDs at
+	// startup and the detector will not run at all.
+	for value, want := range map[string]bool{
+		"123456789012":        true,
+		"1":                   true,
+		"example-project":     false,
+		"project-2":           false,
+		"2nd-project":         false, // not a legal project ID either, but not this check's business
+		"":                    false,
+		"123456789012-backup": false,
+	} {
+		if got := looksLikeProjectNumber(value); got != want {
+			t.Errorf("looksLikeProjectNumber(%q) = %v, want %v", value, got, want)
+		}
 	}
 }
 

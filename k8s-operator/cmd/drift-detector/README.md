@@ -47,20 +47,20 @@ The join needs Kubernetes permissions on top of that, and they are not the same 
 groups including CRDs. A resource it cannot read comes out `failed` with the RBAC error on the
 line, not silently unenriched.
 
-| Flag                      | Default                          | Notes                                                                                                                                                |
-| ------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--project`               | —                                | Required. The project holding the subscription.                                                                                                      |
-| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                      |
-| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                        |
-| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                |
-| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain. |
-| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                   |
-| `--in-cluster`            | `false`                          | Read live objects with the Pod's own ServiceAccount. Mutually exclusive with `--kubeconfig`.                                                         |
-| `--kubeconfig`            | empty                            | Read live objects through this kubeconfig. Mutually exclusive with `--in-cluster`; setting neither of the two disables the join.                     |
-| `--cluster-name`          | empty                            | The GKE cluster those credentials reach. Required with either of the two above, and an error without them.                                           |
-| `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                  |
-| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly. Empty means no reconciliation claim is made.               |
-| `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                            |
+| Flag                      | Default                          | Notes                                                                                                                                                                                                                                                                 |
+| ------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--project`               | —                                | Required. The project holding the subscription. With the join on it must be the project **ID**, not the project number: a Pub/Sub path accepts either, but the join matches this against each record's `project_id`, so a number matches nothing. Refused at startup. |
+| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                                                                                                                                       |
+| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                                                                                                                                         |
+| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                                                                                                                                 |
+| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain.                                                                                                                  |
+| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                                                                                                                                    |
+| `--in-cluster`            | `false`                          | Read live objects with the Pod's own ServiceAccount. Mutually exclusive with `--kubeconfig`.                                                                                                                                                                          |
+| `--kubeconfig`            | empty                            | Read live objects through this kubeconfig. Mutually exclusive with `--in-cluster`; setting neither of the two disables the join.                                                                                                                                      |
+| `--cluster-name`          | empty                            | The GKE cluster those credentials reach. Required with either of the two above, and an error without them. Checked at startup against the cluster they actually reach; a disagreement stops the process.                                                              |
+| `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                                                                                                                                   |
+| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly. Empty means no reconciliation claim is made.                                                                                                                                |
+| `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                             |
 
 ## Classification
 
@@ -212,6 +212,25 @@ supply the other two. Matching on the name alone would read `prod/deployments/ap
 not fail: it returns a real object and reports its ownership as though it were the audited one. The
 same reasoning drives `targetCluster.identity` in `k8s-event-watcher`.
 
+**Startup checks that triple against the cluster the credentials actually reach, and refuses to run
+if they disagree.** The triple decides which records the join will serve; the credentials decide
+where it reads them from, and nothing else connects the two. A Pod in `us-east4` started from the
+`us-central1` manifest, or a local run against the wrong `kubectl` context, would otherwise pass
+every flag check and enrich one cluster's records from the other's objects — the failure the triple
+exists to prevent, reached from the other end. It is the one startup check that stops the process
+rather than logging, because it is the only one whose failure produces confident wrong output: every
+lookup succeeds, so no outcome is counted `failed` or `unreachable` and the shutdown counts read
+healthy. Where the ack-deadline check costs redelivery, this one costs correctness.
+
+The two credential modes are checked from different evidence. `--in-cluster` reads the node's
+`cluster-name` and `cluster-location` metadata attributes, which is exact — the Pod reads its own
+cluster, and that needs no IAM grant. `--kubeconfig` has no such channel, so the check parses the
+`gke_<project>_<location>_<cluster>` context name `gcloud container clusters get-credentials`
+writes. Either source failing is "not established", never "mismatch": a kind cluster publishes no
+GKE attributes and a renamed or hand-written context parses as nothing, and both log a line saying
+the identity went unverified and carry on, because refusing there would break the local runs
+`--kubeconfig` exists for.
+
 Five outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
 them, not in the order `join` decides them — and one of those decisions is worth knowing on its own:
 the `no_object` test runs before the credential check, so a delete is `no_object` whether or not the
@@ -239,9 +258,13 @@ and a write in the same second is far likelier to be the reconcile than a coinci
 not even recorded at the same precision: `metav1.Time` marshals as RFC 3339 with no fractional part,
 so every `managedFields` timestamp arrives floored to the whole second, while the audit timestamp
 keeps its nanoseconds from Cloud Logging. The comparison floors the audit side to match — without
-that, a reconcile 400ms into the same second reads as earlier than the change it answered. An entry with
-no recorded time is skipped rather than guessed at: guessing "after" hides real drift, guessing
-"before" invents a reconcile that never happened. With the flag unset the detector cannot tell a
+that, a reconcile 400ms into the same second reads as earlier than the change it answered. A missing
+time on _either_ side declines the claim rather than guessing at it: guessing "after" hides real
+drift, guessing "before" invents a reconcile that never happened. Both sides matter because the zero
+time sorts before every real one, so a record that arrived without a `timestamp` — an absent or null
+key decodes to the zero time without error — would otherwise read as "at or after" against any
+configured manager that had ever touched the object, and report that manager's last write as the
+reconcile for a change the detector cannot place in time. With the flag unset the detector cannot tell a
 GitOps controller from any other client, so `Reconciled` is false everywhere and means "not shown to
 be reconciled", never "shown not to be".
 

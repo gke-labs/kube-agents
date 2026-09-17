@@ -376,21 +376,42 @@ func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, s
 	if len(j.gitopsManagers) == 0 {
 		return false, ""
 	}
+	// A change with no recorded time cannot be placed against anything, so no
+	// write can be shown to have followed it and the honest answer is no claim.
+	//
+	// This is the half the comparison gets backwards rather than merely misses.
+	// The zero time sorts before every real one, so a zero changedAt makes
+	// "at or after" true for every configured manager that has ever touched the
+	// object, and the first one encountered is reported as having reconciled a
+	// change whose time the detector does not know -- the "guess after, hide
+	// real drift" outcome the rest of this function refuses to make, arriving
+	// through the input rather than the logic.
+	//
+	// Reachable without anything being malformed. Timestamp is a plain
+	// time.Time under `json:"timestamp"`, so a payload that omits the key, or
+	// sends null, decodes to the zero time and no error -- parseAuditEntry has
+	// no non-zero requirement to fail. A *malformed* timestamp is the case that
+	// never gets here, because json.Unmarshal rejects it and the record is
+	// nacked.
+	if changedAt.IsZero() {
+		return false, ""
+	}
 	for _, owner := range owners {
 		if !j.gitopsManagers[owner.Manager] {
 			continue
 		}
 		// A manager with no recorded time cannot be placed relative to the
-		// change, and guessing in either direction is worse than not claiming:
-		// guessing "after" hides real drift, guessing "before" invents a
-		// reconcile that never happened.
+		// change either, and guessing in either direction is worse than not
+		// claiming: guessing "after" hides real drift, guessing "before"
+		// invents a reconcile that never happened.
 		//
-		// The comparison below does not cover this on its own. A zero
-		// UpdatedAt sorts before any real changedAt, so it reads as "before"
-		// and declines the claim by accident -- until changedAt is itself zero,
-		// which a record whose timestamp did not parse gives you. Then neither
-		// is before the other, the comparison reads "at or after", and the
-		// detector invents a reconcile out of two missing values.
+		// Redundant against the comparison below, now that a zero changedAt
+		// returns above: a zero UpdatedAt sorts before any real changedAt, so
+		// it reads as "before" and declines the claim anyway. Kept because the
+		// two zero cases are one rule and splitting it across a guard and an
+		// accident of ordering is how the second one came to be missing. No
+		// test can tell this line from its absence, and a mutation pass will
+		// say so.
 		if owner.UpdatedAt.IsZero() {
 			continue
 		}
