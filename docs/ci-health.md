@@ -22,6 +22,19 @@ before, and the wall clock, with a link to the dashboard's Nightly report
 since the day before yesterday, says so instead of numbers.
 `scripts/eval_dashboard/nightly.py` derives the line and the report from the
 same nightly runs.
+The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
+the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
+and incremental) and renders the dashboard's Trend page (`trend.html`,
+`scripts/eval_dashboard/trend.py`): per case and per domain, the pass rate by
+night with the admission window beside it, the judged quality by night with the
+spread the store can support, and a marker on every night the version key
+changed. The Cases page links each case to its trend and the Brief's last
+incident links to the record around the night it started. What "score" means
+there — the deterministic pass rate is the gate's number, judged quality is
+advisory and never a single point — is defined once, in
+[`docs/designs/eval-scorer.md`, "What a score is"](designs/eval-scorer.md#what-a-score-is).
+A store read that fails leaves the Trend page on its last good read and every
+other page unaffected.
 The same tick comments on each pull request whose run went red or whose
 build node went away (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss or a seeded-fixture drift
