@@ -1660,6 +1660,12 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
 
+# Additional global options that take a value in git ≥2.40. Consumed by the
+# push scanner so an option value spelled `push` cannot desynchronise it (#1498).
+_GIT_PUSH_GLOBAL_WITH_VALUE = _GIT_GLOBAL_WITH_VALUE | frozenset(
+    {"--attr-source", "--config-env"}
+)
+
 # Directory `core.hooksPath` is pinned to. It lives under the state dir, which
 # is a sidecar-only emptyDir, and is created empty and mode 0500 at startup.
 # A hook only runs if git finds an executable file of the right name in the
@@ -2093,7 +2099,8 @@ def git_push_violation(argv: list[str]) -> str | None:
     if not argv or Path(argv[0]).name != "git":
         return None
 
-    # Locate 'push' subcommand by walking past value-taking global options
+    # Locate 'push' subcommand by walking past global options. The first
+    # non-option token after global options is the subcommand slot.
     idx = 1
     push_idx = -1
     while idx < len(argv):
@@ -2101,13 +2108,15 @@ def git_push_violation(argv: list[str]) -> str | None:
         if arg == "--":
             break
         name, sep, _ = arg.partition("=")
-        if name in _GIT_GLOBAL_WITH_VALUE and not sep:
+        if name in _GIT_PUSH_GLOBAL_WITH_VALUE and not sep:
             idx += 2
+            continue
+        if arg.startswith("-"):
+            idx += 1
             continue
         if arg == "push":
             push_idx = idx
-            break
-        idx += 1
+        break
 
     if push_idx == -1:
         return None
@@ -2263,10 +2272,16 @@ def git_argument_violation(argv: list[str]) -> str | None:
     if "config" in rest:
         for argument in rest:
             clean = argument.split("=", 1)[0].strip().lower()
-            if clean.startswith("alias.") or clean == "alias":
+            if (
+                clean.startswith("alias.")
+                or clean == "alias"
+                or clean.startswith("include.")
+                or clean.startswith("includeif.")
+                or clean == "include"
+            ):
                 return (
-                    "`git config` configuring an alias is refused: git aliases cannot be "
-                    "configured through the credential proxy."
+                    "`git config` configuring an alias or config include is refused: "
+                    "git aliases and includes cannot be configured through the credential proxy."
                 )
     return None
 
@@ -2301,15 +2316,60 @@ def _read_repo_alias(cwd: Path | str | None, subcommand: str | None) -> list[str
     if not config_file or not config_file.is_file():
         return None
 
-    try:
-        import configparser
-        import shlex
+    import shlex
 
-        parser = configparser.ConfigParser()
-        parser.read(config_file, encoding="utf-8")
-        if parser.has_section("alias") and parser.has_option("alias", subcommand):
-            val = parser.get("alias", subcommand)
-            return shlex.split(val)
+    target_alias = subcommand.lower()
+
+    def parse_config(cfg: Path, visited: set[Path]) -> dict[str, str]:
+        if cfg in visited:
+            return {}
+        visited.add(cfg)
+        aliases: dict[str, str] = {}
+        includes: list[Path] = []
+        try:
+            content = cfg.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return {}
+
+        current_section = ""
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                header = line[1:-1].strip()
+                parts = header.split(None, 1)
+                current_section = parts[0].lower() if parts else ""
+                continue
+            if "=" in line:
+                key, _, val = line.partition("=")
+                key = key.strip().lower()
+                val = val.strip()
+                if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+                    val = val[1:-1]
+                if current_section == "alias":
+                    aliases[key] = val
+                elif current_section in ("include", "includeif") and key == "path":
+                    inc_p = Path(val)
+                    if not inc_p.is_absolute():
+                        inc_p = (cfg.parent / inc_p).resolve()
+                    else:
+                        inc_p = inc_p.resolve()
+                    if inc_p.is_file():
+                        includes.append(inc_p)
+        for inc in includes:
+            inc_aliases = parse_config(inc, visited)
+            aliases.update(inc_aliases)
+        return aliases
+
+    try:
+        aliases = parse_config(config_file, set())
+        if target_alias in aliases:
+            raw_val = aliases[target_alias].strip()
+            tokens = shlex.split(raw_val)
+            if raw_val.startswith("!") and tokens and not tokens[0].startswith("!"):
+                tokens[0] = "!" + tokens[0]
+            return tokens
     except Exception:
         pass
     return None
@@ -3000,8 +3060,6 @@ class CommandExecutor:
         checked by the skill (`gitops_workspace.assert_lease_owner`), which is
         the only layer that knows which lease it holds.
         """
-        if not self.require_git_lease:
-            return None
         if not argv or Path(argv[0]).name != "git":
             return None
         subcommand, redirects = _git_plan(argv)
@@ -3012,6 +3070,11 @@ class CommandExecutor:
 
         alias_expansion = _read_repo_alias(candidate, subcommand)
         if alias_expansion:
+            if alias_expansion[0].startswith("!"):
+                return (
+                    "`git` alias executing a shell command (`!`) is refused: "
+                    "shell aliases cannot be executed through the credential proxy."
+                )
             sub_idx = -1
             for i, tok in enumerate(argv):
                 if tok == subcommand:
@@ -3019,10 +3082,18 @@ class CommandExecutor:
                     break
             tail = argv[sub_idx + 1:] if sub_idx != -1 else []
             expanded_argv = [argv[0]] + alias_expansion + tail
+
+            arg_violation = git_argument_violation(expanded_argv)
+            if arg_violation is not None:
+                return arg_violation
+
             push_violation = git_push_violation(expanded_argv)
             if push_violation is not None:
                 return push_violation
             subcommand, _ = _git_plan(expanded_argv)
+
+        if not self.require_git_lease:
+            return None
 
         if subcommand not in GIT_MUTATING_SUBCOMMANDS:
             return None

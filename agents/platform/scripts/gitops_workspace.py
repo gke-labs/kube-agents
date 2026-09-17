@@ -177,9 +177,10 @@ def resolve_base_branch(
 
     Resolution order:
 
-    1. `GITOPS_BASE_BRANCH`. For a repository whose default branch is not the
-       branch the fleet deploys from — a `release` line, say. Nothing this
-       function can observe would tell it that, so an operator has to.
+    1. `CREDENTIAL_PROXY_BASE_BRANCH` or `GITOPS_BASE_BRANCH`. For a repository
+       whose default branch is not the branch the fleet deploys from — a `release`
+       line, say. Nothing this function can observe would tell it that, so an operator
+       has to.
     2. `origin/HEAD` in the clone. `git clone` sets it from the default the
        remote advertises, which is the right answer for every ordinary
        repository, and it costs one `symbolic-ref`.

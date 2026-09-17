@@ -532,6 +532,17 @@ class TestResolveBaseBranch(WorkspaceTestCase):
         with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release"}):
             self.assertEqual(self.resolve(), "release")
 
+    def test_credential_proxy_base_branch_override_beats_gitops_base_and_remote(self):
+        self.origin_head = "origin/main"
+        with patch.dict(
+            os.environ,
+            {
+                "CREDENTIAL_PROXY_BASE_BRANCH": "custom-cred-base",
+                "GITOPS_BASE_BRANCH": "gitops-base",
+            },
+        ):
+            self.assertEqual(self.resolve(), "custom-cred-base")
+
     def test_no_clone_yet_falls_back_without_running_git(self):
         self.assertEqual(
             gitops_workspace.resolve_base_branch(None, self.runner), "main"

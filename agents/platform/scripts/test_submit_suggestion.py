@@ -283,14 +283,20 @@ class TestCheckBranch(unittest.TestCase):
         )
 
     def test_configured_gitops_base_branch_is_refused(self):
-        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "run/test-cluster/fix-task"}):
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
             with self.assertRaises(ValueError) as caught:
-                submit_suggestion.check_branch("run/test-cluster/fix-task")
+                submit_suggestion.check_branch("custom-gitops-base")
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+            with self.assertRaises(ValueError) as caught:
+                submit_suggestion.check_branch("refs/heads/custom-gitops-base")
             self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
 
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "run/test-cluster/broker-task"}):
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-cred-base"}):
             with self.assertRaises(ValueError) as caught:
-                submit_suggestion.check_branch("run/test-cluster/broker-task")
+                submit_suggestion.check_branch("custom-cred-base")
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+            with self.assertRaises(ValueError) as caught:
+                submit_suggestion.check_branch("heads/custom-cred-base")
             self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
 
     def test_explicit_base_branch_is_refused(self):
@@ -1218,6 +1224,9 @@ class TestContentMode(SubmitSuggestionTestCase):
             ["commit", "--quiet", "-m", "seed custom"],
             ["remote", "add", "origin", str(origin_custom)],
             ["push", "--quiet", "origin", "release-trunk"],
+            ["checkout", "-b", "feature/custom-base"],
+            ["push", "--quiet", "origin", "feature/custom-base"],
+            ["checkout", "release-trunk"],
         ):
             git(argv, seed_custom)
 
@@ -1270,6 +1279,18 @@ class TestContentMode(SubmitSuggestionTestCase):
         self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
         self.assertIn("is the same as base branch 'release-trunk'", str(ctx.exception))
         self.assertIn("close", self.verbs)
+
+        # Opening with an explicit custom base preserves remote default in workspace.default_branch
+        # and refuses broker commit and push targeting the remote default (Thread 7).
+        ws_custom = custom_store.open("acme/fleet", base="feature/custom-base")
+        self.assertEqual(ws_custom.default_branch, "release-trunk")
+        self.assertEqual(ws_custom.base, "feature/custom-base")
+        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx_commit:
+            custom_store.commit(ws_custom.handle, "release-trunk", "hostile commit", [])
+        self.assertIn("remote default", str(ctx_commit.exception))
+        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx_push:
+            custom_store.push(ws_custom.handle, "release-trunk")
+        self.assertIn("remote default", str(ctx_push.exception))
 
     def test_a_body_file_reaches_gh_intact_in_content_mode(self):
         """The safe channel has to be the safe channel in both transports.

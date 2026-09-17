@@ -1394,6 +1394,15 @@ class GitHardeningTest(unittest.TestCase):
         self.assertIsNotNone(
             git_argument_violation(["git", "config", "--add", "alias.st", "status"])
         )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "include.path", "/opt/data/scratch/aliases"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--add", "include.path", "more.cfg"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "includeIf.gitdir:foo.path", "more.cfg"])
+        )
 
         # In a repository with repo-local aliases in .git/config, executing an alias that
         # resolves to a push to a protected or run branch is refused by git_lease_violation (#1498).
@@ -1401,7 +1410,7 @@ class GitHardeningTest(unittest.TestCase):
         repo = self.repository(executor)
         self.append_repository_config(
             repo,
-            "\n[alias]\n\tp-main = push origin main\n\tp-run = push origin HEAD:refs/heads/run/test/task\n\tp-feature = push origin HEAD:platform-agent/valid\n",
+            "\n[alias]\n\tp-main = push origin main\n\tp-run = push origin HEAD:refs/heads/run/test/task\n\tp-feature = push origin HEAD:platform-agent/valid\n\tshell-push = !sh -c 'git push origin HEAD:refs/heads/main'\n\tbad-bisect = bisect run /payload.sh\n",
         )
         # Aliases resolving to protected/run pushes are refused even without a lease
         self.assertIsNotNone(
@@ -1410,6 +1419,63 @@ class GitHardeningTest(unittest.TestCase):
         self.assertIsNotNone(
             executor.git_lease_violation(["git", "p-run"], cwd=str(repo))
         )
+        # Shell aliases with ! are refused (Thread 1)
+        v = executor.git_lease_violation(["git", "shell-push"], cwd=str(repo))
+        self.assertIsNotNone(v)
+        self.assertIn("shell aliases cannot be executed", v or "")
+
+        # Alias expanding to refused subcommand (bisect run) is refused (Thread 1)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "bad-bisect"], cwd=str(repo))
+        )
+
+        # Alias checks run even when require_git_lease is False (Thread 9)
+        executor.require_git_lease = False
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "p-main"], cwd=str(repo))
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "shell-push"], cwd=str(repo))
+        )
+        executor.require_git_lease = True
+
+        # Capitalized [Alias] header, duplicate keys, and % in value (Thread 5)
+        repo2 = self.repository(executor)
+        self.append_repository_config(
+            repo2,
+            "\n[Alias]\n\tcap-p = push origin main\n\tremote.origin.fetch = +refs/heads/*:refs/remotes/origin/*\n\tremote.origin.fetch = +refs/pull/*:refs/remotes/pull/*\n\tpercent = log --format=%H\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "cap-p"], cwd=str(repo2))
+        )
+
+        # include.path is followed and aliases inside it are checked (Thread 6)
+        inc_file = repo2 / "extra.inc"
+        inc_file.write_text("[alias]\n\tinc-p = push origin main\n", encoding="utf-8")
+        self.append_repository_config(
+            repo2,
+            f"\n[include]\n\tpath = {inc_file}\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "inc-p"], cwd=str(repo2))
+        )
+
+        # Bare 'push' token before '--' in non-subcommand position is NOT refused as push (Thread 2)
+        self.assertIsNone(
+            credential_proxy.git_push_violation(["git", "stash", "push", "-m", "wip"])
+        )
+        self.assertIsNone(
+            credential_proxy.git_push_violation(["git", "commit", "-m", "push"])
+        )
+        self.assertIsNone(
+            credential_proxy.git_push_violation(["git", "checkout", "-b", "push"])
+        )
+
+        # --attr-source push push origin is refused as refspec-less push (Thread 8)
+        v_attr = credential_proxy.git_push_violation(["git", "--attr-source", "push", "push", "origin"])
+        self.assertIsNotNone(v_attr)
+        self.assertIn("explicit destination refspec", v_attr or "")
+
         # An alias resolving to a mutating push to a valid feature branch requires a lease
         self.assertIsNotNone(
             executor.git_lease_violation(["git", "p-feature"], cwd=str(repo))

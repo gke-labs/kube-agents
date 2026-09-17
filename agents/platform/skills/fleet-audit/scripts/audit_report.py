@@ -1113,8 +1113,8 @@ def base_branch() -> str:
     origin/main` then failed, and the whole remediation half of the run died
     after the findings had already been written. Resolution lives in
     `gitops_workspace` so that `submit-suggestion` gets the same answer; see
-    `resolve_base_branch` for the order (`GITOPS_BASE_BRANCH`, then
-    `origin/HEAD`, then `main`).
+    `resolve_base_branch` for the order (`CREDENTIAL_PROXY_BASE_BRANCH` /
+    `GITOPS_BASE_BRANCH`, then `origin/HEAD`, then `main`).
 
     Answering `main` with no workspace is deliberate, not a fallback that got
     forgotten: `resolve_base_branch` cannot ask a clone that does not exist yet,
