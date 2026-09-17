@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS.
+# NIGHTLY-TIER ACTIVE — an entry in hack/eval/nightly-cases.txt (#1342).
 #
 # Domain: cluster debugging. Journey: the reported stall is not there, and
 # the correct answer is to say so.

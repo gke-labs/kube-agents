@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS since 2026-08-25,
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt since 2026-08-25,
 # and since 2026-08-26 THE AUDIT-MACHINERY CANARY: the one full audit scenario
 # kept in the presubmit. It exercises SOP dispatch, delegation to a worker,
 # the GitHub token minter, and the ledger write end to end, and it is the

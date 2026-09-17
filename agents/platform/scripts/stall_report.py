@@ -651,8 +651,9 @@ def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
 
     One kubectl call per kind, not one for the namespace. In the Cluster
     Agent's shell, kubectl is the credential-proxy shim: the broker cuts a
-    reply at its output cap (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
-    default) and hands back the prefix with kubectl's own exit code, so a busy
+    reply at its output cap (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 8 MiB as the
+    operator deploys it; the broker's own default is 4 MiB) and hands back the
+    prefix with kubectl's own exit code, so a busy
     namespace read in one call arrives as JSON cut mid-string. Read per kind,
     an overflow costs that one kind, and a warning names it; only a scan that
     could read no kind at all is an error.

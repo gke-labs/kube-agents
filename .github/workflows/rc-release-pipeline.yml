@@ -58,7 +58,7 @@ jobs:
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-create-tag.outputs.skip_rc != 'true'
     # inherit, not an explicit mapping. The called deploy-environment job reads
-    # GH_APP_ID and GH_APP_PRIVATE_KEY, which are `rc` ENVIRONMENT secrets, and a
+    # GH_APP_ID, which is an `rc` ENVIRONMENT secret, and a
     # `uses:` job cannot declare an environment — so a `secrets:` mapping written
     # here resolves at repository scope and forwards empties. Observed: with the
     # mapping in place that job logged GITHUB_APP_ID as empty five hours after the

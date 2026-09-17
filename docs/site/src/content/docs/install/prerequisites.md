@@ -12,7 +12,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 - **Terraform** — the install engine is the [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) composition; the installer (`install.sh`) pre-flights `terraform` and offers to install it from HashiCorp's tap (Homebrew) or apt repository. It is equally the _teardown_ engine, and `./uninstall.sh` installs nothing on your behalf — with an install to tear down and no terraform, it refuses with exit 1, so a machine that has only ever run the installer's auto-install cannot tear the install down. (Against a target with no Terraform state there is nothing to destroy, so it exits 3 without needing terraform at all.)
 - **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The installer points it at the GKE cluster it creates.
 - **Docker or Podman** — required for manual deployments that build images (`make -C k8s-operator docker-build`, Method 2) and the local development workflow (`make dev-rebuild-agent`, Method 3). Not required for stock installs (Methods 0 & 1).
-- **Go** — required only for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Not required for stock installs.
+- **Go** (`1.27+`) — required for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Importing a GitHub App private key (`.pem`) during GitOps installation also needs Go on the host machine, but only `1.21+`: that path builds the Minty CLI, not the operator. Not required if the Cloud KMS key is pre-provisioned or GitOps is not enabled.
 - **Bash** — the installer scripts are bash (including the `/bin/bash` macOS ships).
 - **`jq`, `gh`, `helm`, `git`** — the rest of the CLI set the installer pre-flights up front and offers to install when missing.
 - **`gcloud beta` component** — required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`). Not required for standard fresh installs.
@@ -151,15 +151,18 @@ Pick one at least:
 
 Or route one of these keys through a self-hosted LiteLLM gateway — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a Gemini API-key template.
 
-## GitOps repo (for `submit-suggestion`)
+## GitOps repo & GitHub token minter (for `submit-suggestion`)
 
-The declarative workflow needs a GitHub repo to file PRs against.
+The declarative workflow routes infrastructure mutations through pull requests via the GitHub token minter (Minty). When GitOps is enabled, prepare:
 
-- A GitHub repo **owned by an organization**. Minty looks the installation up under `/orgs/{org}/`, so a repo owned by a personal account cannot be used — see [token minter](/kube-agents/deploy/token-minter/). A free organization is enough.
-- A GitHub App with `contents:write`, `pull_requests:write`, and `issues:write` permissions, installed on that repo. The App itself may be owned by the organization or by your personal account.
-- The App's private key wrapped in a GCP KMS key — the [`github-minter` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter) creates the keyring and an import-only signing key, and the installer (`install.sh`) imports the downloaded `.pem` into it via the Minty CLI (a one-shot step, so the key material never enters Terraform state).
+- **GitHub Organization:** A GitHub repo **owned by an organization**. Minty queries `/orgs/{org}/installation`, so personal accounts fail token minting with HTTP 404 — see [Token minter](/kube-agents/deploy/token-minter/). A free organization is sufficient.
+- **GitHub App:** A GitHub App with `contents:write`, `pull_requests:write`, and `issues:write` permissions, installed on that repo (see upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter#readme)).
+- **GitHub App ID:** Numeric ID of the created App.
+- **Cloud KMS Key & Private Key Import:** The App's private key imported into a Cloud KMS asymmetric signing key in your cluster's region (default `github-token-minter-keyring` / `github-token-minter-key`). Because Cloud KMS keys cannot be deleted in GCP, this import is a permanent one-time step.
+  - **Option 1 (Automated import via `install.sh`):** Provide `--github-pem-path="/path/to/app-private-key.pem"` during install. `install.sh` creates the KMS key, runs the Minty CLI to import the key, and you can delete the local `.pem` file immediately after. Needs Go 1.21+ on the installer host — the Minty CLI asks for Go 1.24, and 1.21 onwards downloads that toolchain on demand. Distribution packages are often older (Debian 12 ships 1.19, Ubuntu 22.04 ships 1.18); `install.sh` checks before it builds and tells you if yours cannot work. This is unrelated to the Go version needed to build the operator.
+  - **Option 2 (Pre-provisioned Ahead-Of-Time):** Pre-provision the KMS key and import the private key upfront following the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) (recommended for CI/CD and release pipelines). `install.sh` detects the existing `ENABLED` version and skips `.pem` handling.
 
-See [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) for the full Minty setup.
+See [Deploy → Token minter](/kube-agents/deploy/token-minter/) and the upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter#readme) guide for complete setup details.
 
 ## Ready to install
 

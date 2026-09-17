@@ -214,7 +214,7 @@ if [ "$MODE" = "apply" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
     --location "${kms_location}" --project "${PROJECT_ID}" \
     --filter='state=ENABLED' --format='value(name)' 2>/dev/null || true; } | head -1)"
   if [ -z "${minter_key_version}" ]; then
-    echo "::error title=The minter's signing key has no ENABLED version::GITHUB_APP_ID is set on '${ENV_NAME}', but the KMS key the token minter signs with has no enabled version — so this apply would render enable_github_minter = false and DESTROY the minter. Re-import the App key (k8s-operator/config/integrations/github/README.md), or unset the GH_APP_ID secret on this environment to reconcile without a minter."
+    echo "::error title=The minter's signing key has no ENABLED version::GITHUB_APP_ID is set on '${ENV_NAME}', but the KMS key the token minter signs with has no enabled version — so this apply would render enable_github_minter = false and DESTROY the minter. Re-import the App key (https://github.com/abcxyz/github-token-minter), or unset the GH_APP_ID secret on this environment to reconcile without a minter."
     summary "### Reconcile refused — \`${ENV_NAME}\`"
     summary ""
     summary "The token minter's KMS signing key has no enabled version, so applying would destroy the minter."

@@ -345,6 +345,7 @@ data:
       workspace_root: /opt/data
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
+    HERMES_HOME_MODE=2770
     KUBEAGENTS_MODE=today
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
@@ -653,6 +654,9 @@ spec:
               name: settings
               readOnly: true
               subPath: SETTINGS.md
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
       enableServiceLinks: false
       serviceAccountName: platformagent-shell
       shareProcessNamespace: false
@@ -677,6 +681,10 @@ spec:
                   audience: kubeagents-credential-proxy
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 420
+            name: platformagent-gitops-state
+          name: gitops-state-volume
   updateStrategy: {}
   volumeClaimTemplates:
     - metadata:
@@ -883,6 +891,8 @@ spec:
               value: /tmp/credential-proxy/home
             - name: CREDENTIAL_PROXY_POLICY
               value: /etc/credential-proxy/policy.json
+            - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
+              value: "8388608"
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
@@ -1118,6 +1128,7 @@ spec:
         kubeagents.x-k8s.io/config-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/fluent-bit-config-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/secret-env-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/settings-config-hash: <SHA256_FOR_TESTS>
       labels:
         app: platformagent-gateway
@@ -1198,6 +1209,8 @@ spec:
               value: kubeagents-system
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
+            - name: HERMES_HOME_MODE
+              value: "2770"
             - name: HERMES_WRITE_SAFE_ROOT
               value: /opt/data:/home/agent
             - name: TERMINAL_CWD
@@ -1301,6 +1314,8 @@ spec:
               value: /opt/data
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
+            - name: HERMES_HOME_MODE
+              value: "2770"
             - name: HOME
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH

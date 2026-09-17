@@ -28,10 +28,13 @@ Ready and tainted, slot b's control plane is still one minor behind its
 channel -- and reports the roles whose fixture is there but not in the shape
 the cases depend on.
 
-`scripts/verify_ci_pool_project.py` runs it after the presence pass and fails
-a project whose fixtures have drifted; a scheduled scan of every pool project
-from the CI health bot is the follow-up on #1550 (detection is this script's
-whole job -- nothing here, and nothing in the presubmit, acts on a drift).
+It runs in two places. `scripts/verify_ci_pool_project.py` runs it after the
+presence pass and fails a project whose fixtures have drifted. The CI health
+bot's hourly scan (`scripts/eval_dashboard/fixture_state.py`, #1550) runs it
+against every pool project with `--report`, which writes each role's verdict
+as JSON beside the summary so the scan need not parse the warnings. Detection
+is this script's whole job -- nothing here, and nothing in the presubmit, acts
+on a drift.
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline
@@ -52,6 +55,7 @@ repository bug and exits 1.
 Usage:
     hack/fleet-fixture-state.py [--dir DIR] [--catalog PATH] [--project ID]
                                 [--wait SECONDS] [--interval SECONDS]
+                                [--report PATH]
 
 Inputs (flags win over the environment):
     BENCH_FLEET_KUBECONFIG_DIR         the directory hack/fleet-kubeconfigs.sh wrote
@@ -63,6 +67,11 @@ Output: everything goes to stderr, ending in one summary line:
 
     Seeded-fleet fixture state: N role(s) in their designed state, D drifted,
     U not checked (project P)
+
+With `--report PATH` the same verdicts are written as JSON, one entry per
+catalog role: `converged`, `drifted` or `unchecked` with the lines above as
+`detail`, `unpublished` for a role the runner wrote no kubeconfig for, and
+`no_state` for one that declares no assertions.
 
 Exit 0 whenever the fleet was looked at, whatever it found; 1 on a repository
 bug (unreadable catalog, malformed `state` entry, missing directory).
@@ -167,6 +176,15 @@ SUMMARY_FORMAT = (
     "Seeded-fleet fixture state: {converged} role(s) in their designed state, "
     "{drifted} drifted, {unchecked} not checked (project {project})"
 )
+
+# `--report` verdicts, one per catalog role. The first three are the summary
+# line's three counts; the last two are roles the summary does not count.
+REPORT_SCHEMA_VERSION = 1
+VERDICT_CONVERGED = "converged"
+VERDICT_DRIFTED = "drifted"
+VERDICT_UNCHECKED = "unchecked"
+VERDICT_UNPUBLISHED = "unpublished"
+VERDICT_NO_STATE = "no_state"
 
 EXIT_OK = 0
 EXIT_REPOSITORY_BUG = 1
@@ -588,7 +606,7 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
     return drift, unreadable
 
 
-def run(directory: Path, catalog: Path, project_override: str | None, wait: float, interval: float) -> int:
+def run(directory: Path, catalog: Path, project_override: str | None, wait: float, interval: float, report: Path | None = None) -> int:
     if not directory.is_dir() or not (directory / MARKER_FILE).exists():
         print(
             f"ERROR: {directory} is not a directory hack/fleet-kubeconfigs.sh wrote; "
@@ -646,6 +664,7 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
 
     drifted = 0
     unchecked = 0
+    verdicts: dict[str, tuple[str, list[str]]] = {role: (VERDICT_CONVERGED, []) for role in converged}
     for role in sorted(pending):
         drift, unreadable = last[role]
         # Positive evidence wins: an assertion that was READ and failed is drift
@@ -658,6 +677,7 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
             path = directory / f"{role}{DRIFT_SUFFIX}"
             path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
             os.chmod(path, 0o600)
+            verdicts[role] = (VERDICT_DRIFTED, lines)
             _warn(
                 f"fixture role '{role}' is present but not in its designed state in "
                 f"{project}; the cases that depend on it cannot be graded against it: "
@@ -665,6 +685,7 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
             )
         else:
             unchecked += 1
+            verdicts[role] = (VERDICT_UNCHECKED, list(unreadable))
             try:
                 (directory / f"{role}{DRIFT_SUFFIX}").unlink()
             except FileNotFoundError:
@@ -679,7 +700,32 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         ),
         file=sys.stderr,
     )
+    if report is not None:
+        write_report(report, project, roles, verdicts, converged=len(converged), drifted=drifted, unchecked=unchecked)
     return EXIT_OK
+
+
+def write_report(path: Path, project: str, roles: dict[str, dict], verdicts: dict[str, tuple[str, list[str]]], **counts: int) -> None:
+    """Every catalog role's verdict as JSON, for a caller that runs this
+    script per project and must not parse its warnings. A role the runner
+    published no kubeconfig for is `unpublished` (the runner already said
+    why on its own stderr); one with no `state` list is `no_state`."""
+    entries = {}
+    for role, spec in sorted(roles.items()):
+        if role in verdicts:
+            verdict, detail = verdicts[role]
+        elif not spec["state"]:
+            verdict, detail = VERDICT_NO_STATE, []
+        else:
+            verdict, detail = VERDICT_UNPUBLISHED, []
+        entries[role] = {"cluster_slot": spec["cluster_slot"], "state": verdict, "detail": detail}
+    document = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "project": project,
+        "roles": entries,
+        "summary": dict(counts),
+    }
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -707,10 +753,11 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds to keep re-reading drifted roles before recording drift (default: 0, one pass)",
     )
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS, help="seconds between passes")
+    parser.add_argument("--report", help="also write every role's verdict as JSON to this path")
     args = parser.parse_args(argv)
     if not args.dir:
         parser.error("no directory: pass --dir or set BENCH_FLEET_KUBECONFIG_DIR")
-    return run(Path(args.dir), Path(args.catalog), args.project, args.wait, args.interval)
+    return run(Path(args.dir), Path(args.catalog), args.project, args.wait, args.interval, Path(args.report) if args.report else None)
 
 
 if __name__ == "__main__":

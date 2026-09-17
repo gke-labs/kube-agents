@@ -407,3 +407,48 @@ func TestFromEnvRefusesAnUnknownDisplayMode(t *testing.T) {
 		t.Fatalf("FromEnv() = %+v, %v", cfg, err)
 	}
 }
+
+// The advisory `…events` writer-class check has to be tightenable by config,
+// because the instruction attached to it is "flip this one retention window
+// after the split reaches an install" and a flip that needs a new image does
+// not get made. The default is the loose one: a strict gateway started before
+// the window elapses refuses supervisor terminals written before the split.
+func TestFromEnvStrictEventsWriter(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StrictEventsWriter {
+		t.Fatal("StrictEventsWriter defaults on; pre-split supervisor terminals would be refused")
+	}
+	if SupervisorAgreement(cfg).StrictEventsWriter {
+		t.Fatal("the default config produced a strict agreement policy")
+	}
+
+	t.Setenv("A2A_STRICT_EVENTS_WRITER", "true")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.StrictEventsWriter {
+		t.Fatal("A2A_STRICT_EVENTS_WRITER=true did not tighten the config")
+	}
+	if !SupervisorAgreement(cfg).StrictEventsWriter {
+		t.Fatal("the tightened config did not reach the agreement policy")
+	}
+	// The supervisor name is not lost when the flag moves.
+	if got := SupervisorAgreement(cfg).Supervisor; got != gatewayParty.Session {
+		t.Fatalf("Supervisor = %q, want %q", got, gatewayParty.Session)
+	}
+
+	t.Setenv("A2A_STRICT_EVENTS_WRITER", "yes")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StrictEventsWriter {
+		t.Fatal("a near-miss value tightened the check; the safe direction is loose")
+	}
+}

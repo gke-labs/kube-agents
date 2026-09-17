@@ -121,6 +121,7 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("scripts/profile_plugins.py", "deploy/shared/profile_plugins.py"),
     ("scripts/otel_config.py", "deploy/shared/otel_config.py"),
     ("scripts/sandbox_mirror.py", "deploy/shared/sandbox_mirror.py"),
+    ("scripts/sqlite_journal_migrate.py", "deploy/shared/sqlite_journal_migrate.py"),
 )
 
 # What a specialist profile home actually contains, which is not the whole of

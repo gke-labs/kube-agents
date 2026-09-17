@@ -937,6 +937,30 @@ class TestReportToChat(unittest.TestCase):
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
     @patch("urllib.request.urlopen")
+    def test_a_degraded_relay_says_which_degradation_the_route_reported(self, mock_urlopen):
+        """The sentence comes from the route, not from this tool.
+
+        `degraded` has one cause today and the route names it in `relay_detail`;
+        the tool prints that as sent and keeps no sentence of its own beside it,
+        which is what lets a second cause land in the route without a change
+        here. The agent's next move follows from that sentence, so it has to be
+        the route's.
+        """
+        detail = "the Chat Agent turn did not compose a report"
+        mock_urlopen.return_value = self._urlopen(
+            json.dumps(
+                {"status": "delivered", "relay": "degraded", "relay_detail": detail, "session_id": "s1"}
+            ).encode()
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn(detail, result)
+        self.assertNotIn("[unrelayed]", result)
+        # Unchanged whichever cause it was: delivered, and no retry.
+        self.assertNotIn("ERROR", result)
+        self.assertIn("do not send it again", result.lower())
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
     def test_a_composed_relay_is_a_plain_success(self, mock_urlopen):
         """`ok` is what the route sends when the Chat Agent framed the report."""
         mock_urlopen.return_value = self._urlopen(

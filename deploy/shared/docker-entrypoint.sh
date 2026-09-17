@@ -26,6 +26,14 @@ export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
 
+# The WAL-to-DELETE conversion (deploy/shared/sqlite_journal_migrate.py). Named here
+# because two places use it: the owner runs it at step 1.7 and a non-owner waits on
+# its --check below the shared-state gate. The PVC copy is the fallback for an image
+# whose /opt/defaults predates the script, and for the tests, which run these steps
+# against a temporary home.
+SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"
+[ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] || SQLITE_JOURNAL_MIGRATE_SCRIPT="$TARGET_DIR/scripts/sqlite_journal_migrate.py"
+
 # Pre-export AGENT_BROWSER_EXECUTABLE_PATH before running stage2-hook.sh.
 # Why: Upstream stage2-hook.sh scans for Playwright's Chromium binary and
 # attempts to export it to s6-overlay by creating /run/s6/container_environment/.
@@ -34,7 +42,8 @@ export INSTALL_DIR="/opt/hermes"
 # By pre-exporting AGENT_BROWSER_EXECUTABLE_PATH here, stage2-hook.sh detects
 # [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] is false and cleanly skips writing to /run/s6/.
 if [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] && [ -d "/opt/hermes/.playwright" ]; then
-    export AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    export AGENT_BROWSER_EXECUTABLE_PATH
 fi
 
 # 1. Execute upstream container initialization natively (inherits 100% of upstream updates)
@@ -173,7 +182,7 @@ if ! agent_owns_shared_state "$@"; then
     # plain manifest, `docker run`, the kustomize bases, a test harness — a missing
     # config.yaml means nobody is coming to write it, and pausing would turn a fast
     # failure into a two-minute one for no possible gain.
-    if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ ! -f "$TARGET_DIR/config.yaml" ]; then
+    if [ -n "${HERMES_MANAGED_DIR:-}" ]; then
         _wait_secs="${AGENT_SHARED_STATE_WAIT_SECS:-120}"
         # A non-numeric value would make the `-lt` below a shell ERROR, and `set -e` is on
         # — so a typo in a knob for waiting would kill the container outright, which is
@@ -185,16 +194,42 @@ if ! agent_owns_shared_state "$@"; then
                 _wait_secs=120
                 ;;
         esac
-        echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
-        _waited=0
-        while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
-            sleep 1
-            _waited=$((_waited + 1))
-        done
-        if [ -f "$TARGET_DIR/config.yaml" ]; then
-            echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
-        else
-            echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+        if [ ! -f "$TARGET_DIR/config.yaml" ]; then
+            echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
+            _waited=0
+            while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ -f "$TARGET_DIR/config.yaml" ]; then
+                echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
+            else
+                echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+            fi
+        fi
+        # The same bounded wait for the owner's step 1.7, the WAL-to-DELETE conversion.
+        # Unlike the config file, this one is real in the shipped image: the owner
+        # converts the databases in place, and a non-owner that opens one mid-switch
+        # holds exactly the concurrent connection the conversion refuses to run under,
+        # so the two would settle into "left in WAL" on every start. --check exits
+        # non-zero only while the managed scope pins `delete` and a governed header
+        # still reads WAL; every other answer, including a script that cannot read the
+        # config, is "nothing to wait for". Same budget, same proceed-anyway ending.
+        if [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            _waited=0
+            while ! "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" --check \
+                    --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" 2>/dev/null; do
+                if [ "$_waited" -ge "$_wait_secs" ]; then
+                    echo "[ENTRYPOINT] WARN: a database under $TARGET_DIR still reads WAL after ${_wait_secs}s with journal_mode=delete pinned; starting '$*' anyway (the owner converts it at its next start)." >&2
+                    break
+                fi
+                [ "$_waited" -gt 0 ] || echo "[ENTRYPOINT] a database under $TARGET_DIR still reads WAL with journal_mode=delete pinned; waiting up to ${_wait_secs}s for the owner's conversion (step 1.7)." >&2
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ "$_waited" -gt 0 ] && [ "$_waited" -lt "$_wait_secs" ]; then
+                echo "[ENTRYPOINT] the WAL-to-DELETE conversion finished after ${_waited}s; continuing." >&2
+            fi
         fi
         unset _wait_secs _waited
     fi
@@ -378,6 +413,34 @@ if command -v flock >/dev/null 2>&1; then
         # behaviour, so the worst case is no worse than before the lock.
         flock -w 300 9 || echo "WARN: timed out waiting for the $TARGET_DIR bootstrap lock; proceeding concurrently with the peer container" >&2
     fi
+fi
+
+# 1.7 Convert the SQLite databases on this volume out of WAL, once, when the operator
+# has pinned `database.journal_mode: delete` in the managed scope.
+#
+# The operator pins it whenever the agent pod has a runtime class (renderConfigYAML in
+# platformagent_manifests.go): under gVisor the volume is a 9p gofer mount that accepts
+# WAL and then corrupts it, and two databases went that way in three days (#610).
+# Hermes honours the pin for a database it creates, but never downgrades one whose
+# header already reads WAL — apply_wal_with_fallback returns an on-disk WAL database
+# before it consults the setting, because a live downgrade under a concurrent opener
+# destroys committed-but-uncheckpointed frames. So a volume that ran in WAL before the
+# pin, which is every install this was written for, needs one conversion, and it has
+# to happen HERE: after the lock above, so one container does it, and before step 2,
+# because everything below opens a database somewhere (the cron reconcile, the kanban
+# board, the session store). The non-owner's wait below the shared-state gate is the
+# other half: a sidecar holds off opening a database until this has run.
+#
+# The script checkpoints each database with TRUNCATE first and switches only when
+# SQLite reports the switch took. A database another process holds open is left as it
+# is and logged, and the next start retries; nothing here can make a file worse than
+# WAL already left it. Best-effort: the gate is in the script (no pin, no conversion),
+# so an image started without the operator — compose, a plain manifest, the kustomize
+# bases — runs a no-op, and a host without the venv skips the step outright.
+if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" \
+        --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" \
+        || echo "WARN: the WAL-to-DELETE conversion did not finish (exit $?); a database still in WAL is converted at the next start" >&2
 fi
 
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
@@ -1115,6 +1178,7 @@ sync_profile_skills() {
     #
     # $_src is NOT shared: it is the read-only image template inside this container,
     # so only the destination side needs this.
+    # shellcheck disable=SC3028 # the next two lines fall back to hostname and $$ where HOSTNAME is unset
     _tag="${HOSTNAME:-}"
     [ -n "$_tag" ] || _tag="$(hostname 2>/dev/null || true)"
     [ -n "$_tag" ] || _tag="$$"
@@ -1556,6 +1620,7 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
     OTEL_COMPAT_CONFIG="$HOME/.hermes/plugins/hermes_otel/config.yaml"
     mkdir -p "$(dirname "$OTEL_COMPAT_CONFIG")"
+    # shellcheck disable=SC3013 # -ef is implemented by dash and busybox ash, the shells this image runs
     if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
         ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
     fi

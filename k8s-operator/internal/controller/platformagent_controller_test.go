@@ -658,9 +658,14 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	}
 	// No plugins, so no 30s plugin recheck. There is no collector Service in the fake
 	// client either, so telemetry falls through to the managed default and asks to be
-	// re-probed later.
-	if res.RequeueAfter != otelRediscoverAfter {
-		t.Errorf("expected RequeueAfter %v, got %v", otelRediscoverAfter, res.RequeueAfter)
+	// re-probed later. The Secret re-read asks sooner, and the pass returns the sooner
+	// of the two — so the telemetry deadline is still met, by a requeue that also
+	// picks up a rotated key.
+	if res.RequeueAfter != secretEnvReprobeInterval {
+		t.Errorf("expected RequeueAfter %v, got %v", secretEnvReprobeInterval, res.RequeueAfter)
+	}
+	if res.RequeueAfter > otelRediscoverAfter {
+		t.Errorf("RequeueAfter %v misses the telemetry re-probe deadline %v", res.RequeueAfter, otelRediscoverAfter)
 	}
 
 	// Verify Deployment was created with RuntimeClassName "gvisor"

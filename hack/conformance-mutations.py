@@ -1100,6 +1100,48 @@ Mutation(
         "hole are what this mutation holds shut",
     ),
     Mutation(
+        "A3-supervisor-terminal-back-on-events",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.supervisor",',
+         '\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.events",'),
+        "test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject",
+        "move the gateway's supervisor publish back onto the executors' events "
+        "subject -- the pre-split render, and the change a rollback of the "
+        "relay durable would tempt. Every executor's subject is two-writer "
+        "again and a forged supervisor terminal is indistinguishable on replay",
+    ),
+    Mutation(
+        "A3-second-supervisor-writer",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",',
+         '\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",'),
+        "test_A3_the_supervisor_subject_has_exactly_one_writer",
+        "grant the static worker publish on the supervisor subject, the shape "
+        "a bridge-side janitor written against the shared credential would "
+        "take. The subject then no longer says who wrote there",
+    ),
+    Mutation(
+        "A3-session-writes-its-own-supervisor-subject",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskSupervisorSubject(pod, "*"),\n\t\t},'),
+        "test_A3_the_supervisor_subject_has_exactly_one_writer",
+        "derive a session a grant on its own supervisor subject -- the "
+        "helpful-looking change that lets a worker adapter finalise itself "
+        "after a harness crash. An executor can then declare itself dead as "
+        "infrastructure",
+    ),
+    Mutation(
+        "A3-session-per-task-wildcard",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskInSubject(pod, "*"),\n\t\t},'),
+        "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
+        "widen the session's task-plane grant toward the per-task wildcard the "
+        "cards sketched, which puts the executor in its own in-subject writer "
+        "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
         "harness-fixture-emptied",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("\nkind: StatefulSet\n", "\nkind: StatefulSetXX\n"),

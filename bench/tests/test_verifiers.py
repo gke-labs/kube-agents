@@ -443,6 +443,207 @@ def test_the_shipped_list_accepts_both_renderings_of_the_restart_count():
     assert _shipped_list_verdict("Both pods show **Restart Count**: `0`.") == "pass"
 
 
+# ------------------ the upgrades probe's shipped phrase list
+
+# The same shape as the block above, for the same reason: this list is edited
+# from the outside after a presubmit fails a correct report. The 2026-09-15
+# widening (#1254) added eight spellings, measured over 117 repetitions on
+# eight pool projects. Read out of the task file, never copied.
+_UPGRADES_PROBE = TASKS / "upgrades-lagging-master-probe" / "task.yaml"
+_LAG_OBJECTIVE = "the-probe-identifies-the-version-lag"
+
+# Verbatim `output` fields from the graded records, wrapping and trailing
+# whitespace aside -- _normalize collapses both.
+
+# kube-agents-evals-30 rep 1, build 2098104602489524224. The largest single
+# miss of the old list: the agent negates the question instead of using a lag
+# word. Nine of the 21 rescues read this way.
+_LAG_NEGATES_THE_QUESTION = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_3ab97dd8`. The answer will post into this thread as soon as it's ready.
+
+[System note: Kanban card t_3ab97dd8 completed. The specialist's response was posted to the chat stream. The user is now reading it.]
+
+Task `t_3ab97dd8` has finished. Here is the full result from the platform agent:
+
+No, the cluster `seeded-b` is not on the current default version for its release channel.
+
+## Current State
+* **Current Control Plane Version**: `1.34.10-gke.1328000`
+* **Release Channel**: `REGULAR`
+* **Channel Default Version**: `1.35.7-gke.1150000`
+
+## Recommendation
+The cluster should be upgraded to the current REGULAR channel default version `1.35.7-gke.1150000` to align with the recommended release channel state.
+"""
+
+# kube-agents-evals-12 rep 8, build 2097813968994177024. On that fleet the
+# planted version has aged out of REGULAR entirely rather than sitting one
+# release behind, so the agent describes an absence, not a lag.
+_LAG_AS_ABSENCE_FROM_THE_CHANNEL = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_fae88406`. The answer will post into this thread as soon as it's ready.
+
+- **t_fae88406** · platform · Check seeded-b control plane version against release channel — **done**
+
+Here is the result:
+
+**The `seeded-b` cluster control plane is running a version no longer offered by its release channel.**
+
+## What's wrong
+
+- **seeded-b** — The current control plane version is `1.34.10-gke.1328000`, but this version is not among the valid versions currently offered by the cluster's configured `REGULAR` release channel.
+
+## Details
+
+- **Current control plane version:** `1.34.10-gke.1328000`
+- **Configured release channel:** `REGULAR`
+- **Valid REGULAR channel versions:**
+  - `1.36.3-gke.1640000`
+  - `1.36.3-gke.1537000`
+  - `1.35.7-gke.1222000`
+  - `1.35.7-gke.1150000` (Default)
+  - `1.34.10-gke.1236000`
+  - `1.34.10-gke.1106000`
+
+The cluster's version (`1.34.10-gke.1328000`) has been removed from the REGULAR channel's valid version list. Note that this version *is* currently available in the RAPID channel.
+"""
+
+# The two wrong answers in the corpus, both kube-agents-evals-3, build
+# 2097884694312914944, reps 4 and 5. Each reads both versions correctly and
+# then calls the cluster current because a NO_MINOR_UPGRADES exclusion holds
+# the lag. This is the defect the case exists to catch.
+_WRONG_EXCLUSION_MEANS_UP_TO_DATE = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_3a6c2c77`. The answer will post into this thread as soon as it's ready.
+
+Task `t_3a6c2c77` has completed. Here is the full result from the **platform** agent:
+
+## Control Plane Version Status
+
+The `seeded-b` cluster's control plane is currently **up to date** with its configured release channel.
+
+## Details
+
+- **Current Control Plane Version:** `1.34.10-gke.1106000`
+- **Configured Release Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.7-gke.1150000`
+
+Although the current version (`1.34.10-gke.1106000`) is older than the channel's default version (`1.35.7-gke.1150000`), the cluster has a maintenance exclusion in place (`hold-the-minor-lag`) that blocks minor version upgrades until `2026-11-22`. Because of this exclusion, the current version is considered up to date based on the cluster's active configuration.
+
+## Sources
+- `gcloud container clusters list`
+- `gcloud container get-server-config`
+"""
+
+_WRONG_LAG_IS_EXPECTED = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_f3a4de53`. The answer will post into this thread as soon as it's ready.
+
+The task `t_f3a4de53` is now `done`.
+
+Here is the complete result from the platform agent:
+
+Cluster `seeded-b` is currently on control plane version `1.34.10-gke.1106000`, while its `REGULAR` release channel currently defaults to `1.35.7-gke.1150000`.
+
+## Findings
+- **Cluster**: seeded-b
+- **Current control plane version**: `1.34.10-gke.1106000`
+- **Release channel**: `REGULAR`
+- **Channel default version**: `1.35.7-gke.1150000`
+
+The cluster's control plane version is older than its configured release channel's default version. This difference is expected as the cluster has an active maintenance exclusion (`hold-the-minor-lag`) scoped to `NO_MINOR_UPGRADES` covering the window from `2026-08-24` through `2026-11-22`.
+
+## Sources
+- `gcloud container clusters describe`
+- `gcloud container get-server-config`
+"""
+
+_WRONG_ANSWERS = {
+    "exclusion-means-up-to-date": _WRONG_EXCLUSION_MEANS_UP_TO_DATE,
+    "lag-is-expected": _WRONG_LAG_IS_EXPECTED,
+}
+
+# Both scored higher than anything shipped, and both are absent because each
+# one matches the two reports above. They are the natural next widening, so
+# the reason is pinned here rather than left in a task-file comment.
+_PHRASES_CUT_FOR_RESCUING_A_WRONG_ANSWER = ["channel default", "older than"]
+
+
+def _upgrades_probe_check() -> dict:
+    spec = yaml.safe_load(_UPGRADES_PROBE.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _LAG_OBJECTIVE]
+    assert len(entries) == 1, f"{_LAG_OBJECTIVE} is not in {_UPGRADES_PROBE.name}"
+    check = entries[0]["check"]
+    # A floor, not the current count: narrowing the list is a pass this file
+    # invites, and pinning the length would fail here first under a message
+    # blaming the parse.
+    assert len(check.get("any_of_phrases") or []) >= 7, check
+    return check
+
+
+def _upgrades_verdict(report: str) -> str:
+    transcript.set(report, [])
+    v = parse_node(_upgrades_probe_check())
+    assert isinstance(v, ReportContainsVerifier)
+    return v.verify(5.0).status
+
+
+@pytest.mark.parametrize(
+    "report",
+    [_LAG_NEGATES_THE_QUESTION, _LAG_AS_ABSENCE_FROM_THE_CHANNEL],
+    ids=["negates-the-question", "absence-from-the-channel"],
+)
+def test_the_shipped_list_accepts_the_reports_it_was_widened_for(report):
+    """Both read the versions, state the lag and recommend the upgrade.
+
+    The old seven rejected both on wording alone. Read through `parse_node` on
+    the shipped check rather than a hand-built verifier, so the phrase list
+    and the normalization it is matched under are both the production ones.
+    """
+    assert _upgrades_verdict(report) == "pass"
+
+
+@pytest.mark.parametrize("report", _WRONG_ANSWERS.values(), ids=_WRONG_ANSWERS.keys())
+def test_the_shipped_list_still_fails_the_maintenance_exclusion_excuse(report):
+    """Both recorded wrong answers, pinned as written.
+
+    Not the general property, which does not hold: these phrases match a
+    description of the gap, so a report that words the gap and still calls the
+    cluster current passes -- as it already does on the old seven via "behind".
+    What this pins is that no widening rescues these two.
+    """
+    assert _upgrades_verdict(report) == "fail"
+
+
+@pytest.mark.parametrize("phrase", _PHRASES_CUT_FOR_RESCUING_A_WRONG_ANSWER)
+def test_a_phrase_that_rescues_a_wrong_answer_stays_out_of_the_list(phrase):
+    """Why each is absent, not just that it is.
+
+    The second assertion is the reason. If a later edit stops the wrong
+    answers from saying these words, the first assertion becomes arbitrary
+    and this one says so.
+    """
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert phrase not in shipped
+    for name, report in _WRONG_ANSWERS.items():
+        assert verifiers._normalize(phrase) in verifiers._normalize(report), name
+
+
+def test_the_channel_absence_phrase_keeps_its_preposition():
+    """"aged out" alone sits inside "managed outage" -- the "of" is the anchor.
+
+    Same discipline the check's own comment claims for "lag" in "flag": the
+    phrase has to be unusable as a substring of ordinary prose.
+    """
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert "aged out" not in shipped
+    assert "aged out of" in shipped
+    for innocent in ("a Google-managed outage window", "damaged outside the window"):
+        assert "aged out" in verifiers._normalize(innocent)
+        assert "aged out of" not in verifiers._normalize(innocent)
+
+
 def test_forbidden_phrase_is_normalized_too():
     """Emphasis must not be a way to smuggle a forbidden phrase past."""
     _stash("the fix will cost **$40** a month")

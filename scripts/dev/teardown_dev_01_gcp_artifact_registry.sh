@@ -13,6 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 INSTALLER_DIR="${REPO_ROOT}/scripts/installer"
+# shellcheck disable=SC2034 # read by the installer's load_state, sourced below
 VARS_FILE="${INSTALLER_DIR}/vars.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────

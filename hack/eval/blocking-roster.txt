@@ -1,0 +1,41 @@
+# The blocking roster: the presubmit cases that can red a pull request on a
+# graded failure (BOOTSTRAP_ADMITTED).
+#
+# One case id per line; `#` starts a comment, blank lines are skipped.
+# hack/ci-eval-pr.sh reads this file at startup as the default of
+# BOOTSTRAP_ADMITTED (an environment override still wins, for a laptop run)
+# and refuses to start on a name that is not in presubmit-cases.txt: the
+# roster is a subset of the presubmit by construction. The eval dashboard
+# (scripts/eval_dashboard) reads the same file for its "blocking" pill.
+#
+# A case named here arms rung 4 -- three failed repetitions red the job --
+# and, while the evidence store holds nothing for it at the current version
+# key, leaves rung 6 quiet. Under the default EVAL_ADMISSION_MODE=roster this
+# list is the whole answer to "which case can red a pull request on a graded
+# failure"; the store's record beside it says whether the evidence agrees.
+# The prose -- the admission bar, who is held out and on which issue, the
+# rung scoping, the demotion protocol -- lives in docs/eval-gate-roster.md,
+# deliberately: docs/ edits are inert to the eval, so a review finding
+# against that prose costs no 2-hour run (#1179). Edit the list here, the
+# prose there.
+#
+# WHO APPROVES. Adding or removing a name here changes what blocks, so
+# hack/OWNERS puts this file under the eval-crew alias with no_parent_owners
+# (#1546). Never add a case in the pull request that makes it pass
+# (.agents/rules/eval_driven_development.md): a seat is earned on the
+# record, which the verdict's "Record says" column reports per case.
+#
+# Demoting a flaky case is a one-line same-day edit: delete its name,
+# referencing the issue that names its re-admission condition and citing
+# what the record says about it.
+
+reliability-pdb-probe
+security-overgrant-probe
+upgrades-lagging-master-probe
+consistency-authorized-networks-probe
+cost-idle-pool-probe
+obtainability-remediation-proposal
+cluster-agent-crashloop-debug
+cluster-agent-crashloop-misleading-symptom
+cluster-agent-crashloop-evidence-chain
+agent-kanban-smoke

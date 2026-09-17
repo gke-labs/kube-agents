@@ -116,6 +116,17 @@ CI on files you did not touch. Prefer the installed binary over `npx prettier`, 
 package against the npm registry on every run and fails outright behind an authenticated mirror —
 that failure is why this step has previously been skipped rather than run.
 
+**Shell scripts.** If you change a `.sh` file, run `make shellcheck`. The `validate` job runs the
+same target on every pull request, and it is a required check, so a warning-severity finding in
+any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
+shellcheck step in `.github/workflows/validate.yml`) from
+<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
+package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two releases behind, and a
+release two behind reports a different set of findings than CI.
+Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
+command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
+place, and the comment above the target says why.
+
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
 ```bash
@@ -170,8 +181,10 @@ version before opening the pull request.
 and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
 loop while you work:
 
-- `make validate` — the `Validate Repo Structure` job; fails if skills live under
-  `agents/*/defaults/skills/` instead of `agents/*/skills/`.
+- `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
+  check; see **Shell scripts** above for the release to install.
+- `make validate` — the structure check in the `Validate Repo Structure` job; fails if skills
+  live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
 - `make -C k8s-operator test` — manifests, generate, fmt, vet, the envtest download, the
   operator's Python tests, then `go test`; what the `Operator Tests` job runs.
 - `make test-integration` — the seam tier only, for a component another one talks to across a
@@ -322,20 +335,21 @@ The two labels are the two people:
   `trusted_team_for_sticky_lgtm: Googlers` is configured, which means a push after the label lands
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
-  the changed paths — [`OWNERS`](../OWNERS) at the root, [`bench/tasks/OWNERS`](../bench/tasks/OWNERS)
-  for the eval cases and [`hack/OWNERS`](../hack/OWNERS) for `hack/ci-eval-pr.sh` alone, with
-  [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last two name
-  only `eval-crew` and set `no_parent_owners`, so a root approver's `/approve` does not clear
-  a change to a case or to the presubmit roster (#1546). An approver's
+  the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
+  presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
+  alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
+  to what the presubmit runs or what blocks; the nightly file and the case directories under
+  `bench/tasks/` fall through to the root approvers (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
   change from someone in `OWNERS` starts with the `approved` half already satisfied and waits only
   on the `lgtm` (#1075).
 
 Everyone `.github/auto_request_review.yml` can assign is an `OWNERS` approver for what it assigns
-them: its `bench/tasks/**` and `hack/ci-eval-pr.sh` entries send a change there to its own
-`eval-crew` group, so the reviewer the bot's green check summons can clear both labels in one
-action. Not every `eval-crew` member is a root approver, so a change that also touches root-owned
+them: its `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt` entries send a
+change there to its own `eval-crew` group, so the reviewer the bot's green check summons can clear
+both labels in one action. Not every `eval-crew` member is a root approver, so a change that also touches root-owned
 paths still waits on a root approver's `/approve` after that review. The bot never requests the
 author, so a member's own case or roster change goes to the rest of the group, with the author's
 `approved` already on it (#1075). That is a property of two lists agreeing today — the alias in

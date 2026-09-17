@@ -45,20 +45,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install shellcheck (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Install shellcheck (macOS)
-        if: runner.os == 'macOS'
-        run: brew install shellcheck || true
-
-      - name: Run shellcheck static analysis
-        run: |
-          shellcheck install.sh
-          shellcheck uninstall.sh
-          shellcheck upgrade.sh
-
       - name: Install deterministic dry-run command stubs
         shell: bash
         run: |

@@ -1,0 +1,56 @@
+{
+  "insertId": "fe6ca30b-887e-4bfd-84a9-444c7b33ef0e",
+  "labels": {
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": "access granted by IAM permissions.",
+    "mutation.webhook.admission.k8s.io/round_0_index_5": "{\"configuration\":\"pod-ready.config.common-webhooks.networking.gke.io\",\"webhook\":\"pod-ready.common-webhooks.networking.gke.io\",\"mutated\":false}",
+    "mutation.webhook.admission.k8s.io/round_0_index_6": "{\"configuration\":\"warden-mutating.config.common-webhooks.networking.gke.io\",\"webhook\":\"warden-mutating.common-webhooks.networking.gke.io\",\"mutated\":false}",
+    "pod-security.kubernetes.io/enforce-policy": "privileged:latest"
+  },
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "fe6ca30b-887e-4bfd-84a9-444c7b33ef0e",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {
+      "principalEmail": "engineer@example.com"
+    },
+    "authorizationInfo": [
+      {
+        "permission": "io.k8s.core.v1.pods.create",
+        "resource": "core/v1/namespaces/default/pods/crashloop-probe"
+      }
+    ],
+    "methodName": "io.k8s.core.v1.pods.create",
+    "request": {
+      "_trimmed": "body removed for the fixture; the detector does not decode it"
+    },
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "kubectl/v1.36.3 (linux/amd64) kubernetes/0f29094"
+    },
+    "resourceName": "core/v1/namespaces/default/pods/crashloop-probe",
+    "response": {
+      "_trimmed": "body removed for the fixture; the detector does not decode it"
+    },
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 7,
+      "message": "pods \"crashloop-probe\" is forbidden: failed quota: default-quota: must specify limits.cpu for: crashloop-probe; limits.memory for: crashloop-probe; requests.cpu for: crashloop-probe; requests.memory for: crashloop-probe"
+    }
+  },
+  "receiveTimestamp": "2026-08-18T20:36:32.291377087Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "us-east4",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-08-18T20:36:19.032809Z"
+}

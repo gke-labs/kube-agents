@@ -323,6 +323,277 @@ def rbac_rules(documents: tuple[dict, ...]) -> list[tuple[str, dict]]:
             collected.append((f"{document['kind']} {name}", rule))
     return collected
 
+class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
+    """A3 on the A2A bus: identity is derived from the subject, so the subject
+    must have the writer set it claims.
+
+    The bus has no per-message signing and the server cannot stamp a
+    publisher's identity into a message (measured, `round_2/test-plan-stage0-
+    checks.md`). What a consumer can trust is the subject a message arrived
+    on, because NATS enforces publish permissions at the connection -- and
+    only where the set of principals whose grants reach that subject is
+    exactly the set the subject names. `from` is publisher-asserted; a forged
+    `from` on a subject with two writers is impersonation asserted by the
+    caller, which is A3's historical attack in a new spelling. These assert
+    the writer sets, over every rendered principal's publish list with the
+    same wildcard rules the server applies, so a grant added to the wrong
+    principal is a red test rather than a quiet widening.
+
+    The executor's grants are not in the map: the callout derives them from
+    the attested pod name (`sessionGrants`), so the session half reads that
+    derivation.
+    """
+
+    SUPERVISOR_PROBE = "a2a.tasks.chat-otter-1a2b.task-0001.supervisor"
+    EVENTS_PROBE = "a2a.tasks.chat-otter-1a2b.task-0001.events"
+    IN_PROBE = "a2a.tasks.chat-otter-1a2b.task-0001.in"
+
+    @staticmethod
+    def _subject_matches(pattern: str, subject: str) -> bool:
+        """NATS wildcard matching: `*` one token, `>` the rest, literal otherwise."""
+        p = pattern.split(".")
+        s = subject.split(".")
+        for i, token in enumerate(p):
+            if token == ">":
+                return len(s) > i
+            if i >= len(s):
+                return False
+            if token != "*" and token != s[i]:
+                return False
+        return len(p) == len(s)
+
+    @classmethod
+    def _go_publish_grants(cls) -> dict[str, tuple[list[str], bool]]:
+        """Each `...Identity` builder's publish list, keyed by NATS user.
+
+        The second element says whether the list was read in full. Most
+        builders return a struct literal, which is exact; `worker` and `seed`
+        assemble theirs in a local variable and append a shared helper whose
+        entries are Go constant concatenations (`"$JS.API.STREAM.INFO." +
+        a2aTasksStream`). Evaluating those here would be reimplementing the
+        compiler in a test, so those are reported as partial and the served
+        config below is what the assertions actually read for them.
+
+        What this must never do is report a list it could not read as empty.
+        It did, and an empty list satisfies every writer-set assertion in this
+        class vacuously -- which is how the `worker` grant on `…events` came
+        to report as absent while the served config still carried it.
+        """
+        source = h.text("a2a_identities")
+        grants = {}
+        for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
+            body = h.go_function_body(source, builder)
+            user = re.search(r'user:\s*"([^"]+)"', body)
+            if user is None:
+                raise AssertionError(f"{builder} renders no user name")
+            field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
+            if field is None:
+                grants[user.group(1)] = ([], True)
+            elif field.group(1).startswith("[]string{"):
+                grants[user.group(1)] = (re.findall(r'"([^"]+)"', field.group(1)), True)
+            else:
+                name = field.group(1)
+                regions = re.findall(
+                    rf"\n\t{name} :?= (?:append\({name}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
+                    body,
+                    re.DOTALL,
+                )
+                if not regions:
+                    raise AssertionError(f"{builder} builds `{name}` in a shape this test cannot read")
+                # Comments inside these blocks quote the very subjects they
+                # explain the absence of, so they are stripped before reading.
+                bare = [re.sub(r"//[^\n]*", "", r) for r in regions]
+                grants[user.group(1)] = ([g for r in bare for g in re.findall(r'"([^"]+)"', r)], False)
+        return grants
+
+    @classmethod
+    def _conf_publish_grants(cls) -> dict[str, list[str]]:
+        """Every static user's publish allow-list, out of the rendered nats.conf.
+
+        The served artifact, in the spirit of `rendered_policy_rules`: the Go
+        map is what someone wrote, this is what the server enforces, and the
+        concatenated grants are already resolved here by the compiler that
+        emitted it. It covers the statically authenticated users only --
+        `provision` and `session` authenticate through the callout and appear
+        in no file.
+        """
+        conf = h.text("a2a_rendered_nats_conf")
+        grants = {}
+        for block in re.finditer(
+            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[(.*?)\]\s*\}", conf, re.DOTALL
+        ):
+            grants[block.group(1)] = re.findall(r'"([^"]+)"', block.group(2))
+        return grants
+
+    @classmethod
+    def _rendered_publish_grants(cls) -> dict[str, list[str]]:
+        """Every rendered principal's publish list, keyed by NATS user.
+
+        The UNION of both readings, per principal. Neither alone is safe to
+        assert on. The served config is the only place `worker` and `seed`
+        can be read in full, because their Go lists concatenate constants; but
+        it is a generated file, so a mutation of the Go source does not move
+        it, and reading it alone let a mutation that puts the gateway's
+        terminals back on `…events` survive with every test green. The union
+        is also the honest reading of a containment invariant: a subject is
+        reachable if EITHER the map we edit or the config we serve grants it,
+        and the two disagreeing is itself a finding the precondition below
+        raises.
+        """
+        grants = {
+            user: list(allow)
+            for user, allow in cls._conf_publish_grants().items()
+            if user != "callout"
+        }
+        for user, (allow, complete) in cls._go_publish_grants().items():
+            if user not in grants and not complete:
+                raise AssertionError(
+                    f"{user} is in no served config and its Go publish list cannot be read in full"
+                )
+            merged = grants.setdefault(user, [])
+            merged.extend(g for g in allow if g not in merged)
+        return grants
+
+    @classmethod
+    def _session_publish_derivation(cls) -> str:
+        """The literal Publish list `sessionGrants` starts from, as Go source."""
+        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        block = re.search(r"Publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
+        assert block is not None, "sessionGrants no longer starts from a Publish literal"
+        return block.group(1)
+
+    def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
+        """The principals the writer-set tests iterate, so a moved one is loud.
+
+        Asserts each one renders a NON-EMPTY list, not merely that its key is
+        present. The weaker check passed while two principals read as zero
+        grants, and a principal with zero grants satisfies every writer-set
+        assertion in this class vacuously.
+        """
+        grants = self._rendered_publish_grants()
+        for user in ("gateway", "worker", "web", "seed", "provision"):
+            self.assertIn(user, grants, f"{user} is no longer a rendered principal")
+            self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
+        self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
+
+    def test_A3_precondition_every_served_user_is_built_by_an_identity(self) -> None:
+        """The two files name the same principals, and agree wherever both are exact.
+
+        One is hand-edited and one is generated from it, and the writer-set
+        tests are only as true as the reader that feeds them. For the builders
+        that return a struct literal the comparison is exact; for the two that
+        concatenate Go constants it is the literal head, which is where every
+        task subject in this class lives.
+        """
+        served = self._conf_publish_grants()
+        declared = self._go_publish_grants()
+        for user, allow in served.items():
+            if user == "callout":
+                continue  # its own account's login, not a principal in the identity map
+            self.assertIn(user, declared, f"{user} is served by NATS and built by no identity")
+            grants, complete = declared[user]
+            if complete:
+                self.assertEqual(sorted(allow), sorted(grants), f"{user}: served config and Go map disagree")
+            else:
+                self.assertEqual(
+                    sorted(grants),
+                    sorted(g for g in allow if g in set(grants)),
+                    f"{user}: the Go map's literal grants are not all served",
+                )
+                self.assertTrue(grants, f"{user}: no literal grants read at all")
+
+    def test_A3_the_supervisor_subject_has_exactly_one_writer(self) -> None:
+        """`…supervisor` is written by the supervisor and nobody else.
+
+        The token exists so that "the supervisor declared it dead" can only
+        be written by the supervisor: before it, supervisor terminals shared
+        `…events` with the executor, and a session that ended its own task
+        wearing the gateway's `from` was indistinguishable on replay from
+        the gateway ending it. The gateway is the supervisor for the chat
+        sessions it spawns; the dispatcher's janitor inherits the token at
+        stage 3 and joins this set when it does, deliberately.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.SUPERVISOR_PROBE) for g in grants)
+        )
+        self.assertEqual(["gateway"], writers)
+        self.assertNotIn(
+            "TaskSupervisorSubject",
+            self._session_publish_derivation(),
+            "the callout derives a session a publish grant on its own supervisor "
+            "subject; an executor that can write there can end its own task and "
+            "have the record read as infrastructure",
+        )
+
+    def test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject(self) -> None:
+        """The executor's subject has one writer class, and it is not the supervisor.
+
+        Asserted separately from the exact-set test below because that one
+        is a known violation, and an expected failure records its first
+        failing clause and stops: this half holds today and has to stay
+        visible on its own.
+        """
+        gateway = self._rendered_publish_grants()["gateway"]
+        reaching = [g for g in gateway if self._subject_matches(g, self.EVENTS_PROBE)]
+        self.assertEqual(
+            [], reaching,
+            f"the gateway's publish grants {reaching} reach an executor's events "
+            f"subject; a supervisor terminal there is exactly what a hostile "
+            f"executor would forge",
+        )
+
+    def test_A3_the_executors_grant_does_not_reach_its_own_in_subject(self) -> None:
+        """Writers of `…in` are requesters; the executor is not one.
+
+        The per-task grant the cards sketched, `a2a.tasks.{addressee}.{taskId}.>`,
+        would put the executor in its own `…in` writer set -- steering and
+        cancelling itself as if from the user. The derivation publishes the
+        events subject and nothing else on the task plane; `…in` appears in
+        it only as a consumer FILTER (a read), which is what the assertion
+        distinguishes.
+        """
+        publish = self._session_publish_derivation()
+        self.assertIn("lib.TaskEventsSubject(pod", publish)
+        self.assertNotIn("TaskInSubject", publish, "the session's Publish literal reaches its own in subject")
+        self.assertNotIn(
+            "a2a.tasks.", publish,
+            "a literal task-plane grant in the session derivation; the derivation "
+            "is supposed to name subjects through the lib helpers so the token "
+            "grammar and the class are the library's",
+        )
+        gateway = self._rendered_publish_grants()["gateway"]
+        self.assertTrue(
+            any(self._subject_matches(g, self.IN_PROBE) for g in gateway),
+            "the requester can no longer write the in subject; the probe below is then vacuous",
+        )
+
+    @h.known_violation("A3", "round_2/a2-followon-launch.md A5 (F-2); gke-labs/kube-agents#1316")
+    def test_A3_the_events_subject_has_no_rendered_writer(self) -> None:
+        """KNOWN VIOLATION. The static `worker` still writes every executor's `…events`.
+
+        After the split the only legitimate writer of a task's `…events` is
+        its executor, whose grant is derived per session and appears in no
+        map -- so the rendered map should hold NO principal whose publish
+        grant reaches the subject. `worker` does: `a2a.tasks.*.*.events` for
+        every addressee, the shared credential the Hermes bridge sidecar
+        still authenticates with. The wildcard is over the ADDRESSEE token, so
+        it reaches a chat session's `…events` exactly as it reaches a
+        profile's: the callout's per-session derivation bounds what a session
+        can forge -- it cannot write another session's subject -- but it takes
+        no writer away from `worker`, so no addressee's `…events` is
+        decision-grade for a consumer until A5 retires the user.
+
+        Deleting this decorator is the signal A5 landed.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.EVENTS_PROBE) for g in grants)
+        )
+        self.assertEqual([], writers, f"rendered principals reaching an executor's events subject: {writers}")
+
 
 class A4DelegationAttenuates(unittest.TestCase):
     """A4: a delegated token is a strict subset, and triggering is delegation."""

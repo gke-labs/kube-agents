@@ -534,10 +534,12 @@ platformAgent:
         # install renders today.
         #
         # Separate from deployment.availability.runtimeClassName, and
-        # deliberately: the agent pod holds WAL-mode SQLite, which gVisor
-        # corrupts, and the sandbox pod holds none. This is the field that lets
-        # an install put a user-space kernel between the model's code and the
-        # node without doing the same to the agent.
+        # deliberately: the agent pod holds SQLite whose WAL mode gVisor
+        # corrupts (that field pins Hermes' databases to DELETE for the
+        # reason; the CRD reference has the detail), and the sandbox pod
+        # holds none. This is the field that lets an install put a user-space
+        # kernel between the model's code and the node without doing the same
+        # to the agent.
         #
         # On Standard, needs a node pool created with `--sandbox type=gvisor`;
         # the gke-cluster module's enable_gvisor_node_pool creates one.

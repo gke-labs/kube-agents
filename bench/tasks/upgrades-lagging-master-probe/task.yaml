@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, and what takes
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
 # `upgrades` off the coverage allowlist in docs/designs/domains.yaml.
 #
 # A PROBE, not the audit. The full security-patch-orchestrator sweep exists
@@ -87,8 +87,18 @@ verification_spec:
       # already been burned by: "lag" sits inside "flag" and "older" inside
       # "folder" (see upgrade-readiness-lagging-cluster's spec history), so
       # neither bare form appears here.
-      any_of_phrases:
-        [
+      #
+      # Measured over 117 repetitions on eight pool projects (#1254 is the
+      # record, not the fix): the first seven caught 87, all fifteen 108, and
+      # all 21 rescues are correct answers that failed on wording alone.
+      #
+      # These match a DESCRIPTION of the gap, not the verdict, so a report
+      # that words the gap and still calls the cluster current passes. Not
+      # new -- "behind" does it too -- and narrowing costs 15 of the 21
+      # rescues without closing it. The composed verdict is the judge's.
+      # "channel default" and bare "older than" stay out: they match the two
+      # recorded wrong answers as written.
+      any_of_phrases: [
           "behind",
           "lagging",
           "not current",
@@ -96,6 +106,21 @@ verification_spec:
           "outdated",
           "one minor",
           "newer version",
+          # The lag as absence from the channel's list, for fleets whose
+          # planted version has aged out of REGULAR entirely. The "of" is
+          # load-bearing: bare "aged out" sits inside "managed outage".
+          "no longer offered",
+          "aged out of",
+          "not a valid version",
+          # The lag as the question negated, and the largest miss: "not on the
+          # current default" carries nine of the 21 rescues.
+          "not on the current default",
+          "not on the default",
+          "not running the default",
+          "trailing the channel default",
+          # The lag as a comparison. Qualified with "version": bare "older
+          # than" matches the two wrong answers, bare "older" is in "folder".
+          "older version than",
         ]
   - name: no-invented-cves
     role: objective

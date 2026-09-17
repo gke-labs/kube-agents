@@ -465,8 +465,8 @@ if [ "${SKIP_FLEET}" != "true" ]; then
       -backend-config="bucket=${STATE_BUCKET}" \
       -backend-config="prefix=seeded-fleet"
     # fleet_reader_token_creators defaults to both runners, the presubmit's and
-    # the nightly's, so this apply also grants each of them impersonation on
-    # seeded-fleet-reader. Do not pass it with -var; variables.tf says why
+    # the nightly's, and to the CI health bot, so this apply also grants each of
+    # them impersonation on seeded-fleet-reader. Do not pass it with -var; variables.tf says why
     # every apply has to carry the same value.
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )

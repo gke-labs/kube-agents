@@ -393,7 +393,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 
 - `enabled` — the agent's shell runs in a StatefulSet of its own, reached over SSH with the keypair in the agent's credential Secret (`SANDBOX_SSH_PRIVATE_KEY` and its public half in `<name>-shell-authorized-keys`). **This is not a toggle: `false` is refused** with `Degraded`/`ShellSandboxCannotBeDisabled`, which changes nothing about the running workload. Absent or `true` are the same thing. With no keypair the sandbox Pod cannot start at all — the Secret it mounts is not optional — so the operator reports `Degraded`/`ShellSandboxKeysMissing` rather than leaving the Pod in `ContainerCreating` with the reason only in a Pod event. Every install surface generates the pair; a bare `helm install` that passes none is the way to reach that state.
 - `image` — overrides the sandbox image. Empty takes the operator's default.
-- `runtimeClassName` — runs the sandbox Pod under a sandboxed container runtime, `gvisor` being the one GKE offers. Unset by default. Separate from [`spec.deployment.availability.runtimeClassName`](#specdeployment), which governs the agent Pod: that Pod holds WAL-mode SQLite, which gVisor corrupts on the gofer-backed mount, and the sandbox Pod holds none — so an install can sandbox the untrusted Pod without sandboxing the trusted one. On GKE Standard the cluster needs a node pool created with `--sandbox type=gvisor`; Autopilot ships the RuntimeClass natively. A RuntimeClass the cluster does not have leaves the CR `Degraded` naming it, rather than a Pod sitting `Pending`.
+- `runtimeClassName` — runs the sandbox Pod under a sandboxed container runtime, `gvisor` being the one GKE offers. Unset by default. Separate from [`spec.deployment.availability.runtimeClassName`](#specdeployment), which governs the agent Pod: that Pod holds SQLite databases whose WAL mode gVisor corrupts on the gofer-backed mount, and setting the agent Pod's field pins Hermes' own databases to the DELETE journal mode (the Session KV store is not covered; see `availability.runtimeClassName` under [`spec.deployment`](#specdeployment)), while the sandbox Pod holds none — so an install can sandbox the untrusted Pod without sandboxing, or slowing, the trusted one. On GKE Standard the cluster needs a node pool created with `--sandbox type=gvisor`; Autopilot ships the RuntimeClass natively. A RuntimeClass the cluster does not have leaves the CR `Degraded` naming it, rather than a Pod sitting `Pending`.
 
 The GitHub-writing skills hand the credential broker file content and a commit message rather than a directory both sides mount, so the agent never holds a `.git`. There is no field for it: the broker keeps the checkout on its own state volume, which closes git's config-driven exec surface — a hook, a pager, a `filter.*.clean`, an `ext::` transport — and an install that could turn that off would be choosing to keep it open.
 
@@ -411,7 +411,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   scheduled. Pod-scoped, so it covers the agent, both injected sidecars, anything in
   `initContainers`/`sidecars`, and the OCI image volumes `AgentPlugin`s mount.
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
-- `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`.
+- `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper: a sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it ([#610](https://github.com/gke-labs/kube-agents/issues/610)). The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
 - `initContainers` / `sidecars` — standard init and sidecar containers.
 - `extraVolumes` / `extraVolumeMounts` — custom volumes and mounts for the main container.
@@ -622,9 +622,12 @@ is _not_ a security sandbox — see the
 
 **What is pinned is narrow, on purpose.** `/etc/hermes` is machine-global — one file for every
 profile in the pod, not just `default` — so it carries only what is identical for every profile
-_and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode` and
-`display.platforms`. The reasoning is that as long as a human can reach the agent (`platforms`) and
-the agent can reason (`model`), anything else it breaks it can be talked into fixing.
+_and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode`,
+`display.platforms`, `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
+profile) and, when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
+corrupted database is found only after the sessions in it are unreadable). The reasoning is that as long as a
+human can reach the agent (`platforms`) and the agent can reason (`model`), anything else it breaks it can be
+talked into fixing.
 
 Everything else the operator owns for the front door goes in `profile-default.overlay.yaml`
 instead: `plugins.enabled` for AgentPlugins with no `targetProfile`, those plugins' non-gateway
@@ -661,7 +664,7 @@ from chat. The platform credentials and endpoints that have no `config.yaml` equ
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
 
-That file also pins two values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
+That file also pins three values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
 the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
 because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
 file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
@@ -670,7 +673,12 @@ credential proxy, the startup probe and every in-pod loopback call get `401 Inva
 The container entrypoint warns at boot when this pin and the container env disagree.
 The credential that guards the API from _outside_ is `API_SERVER_EXTERNAL_KEY`, set from
 `hermes.apiServerSecretRef`; the sidecar authenticates the caller against it and swaps in the sentinel.
-The second is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
+The second is `HERMES_HOME_MODE=2770`, the mode Hermes re-applies to `$HERMES_HOME` at every process
+start. The container env carries it too, but that is the lowest-precedence of the three layers, so a
+`HERMES_HOME_MODE=0777` line the agent writes into the PVC `.env` outranks it and widens every
+directory Hermes secures on the shared volume.
+
+The third is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
 contract (`docs/designs/spec-mode-switch.md`). It is pinned always, with the real value, because an
 absent key is a key the agent may write, and it is read back by exactly one module,
 `agents/platform/scripts/runtime_mode.py`.
@@ -730,6 +738,44 @@ to the front door's overlay. The `agent` subtree holding the execution limits is
 config and writable only by the operator. That is a coordination boundary rather than a security one — plugin code executes
 in-process and could change these at runtime — but it keeps limits with board-wide consequences in
 one reviewable place.
+
+### Rotating a Secret rolls the pod
+
+Credentials reach the agent pod as environment, through `SecretKeyRef`, and a container's
+environment is fixed for the life of the pod: editing the Secret changes nothing a running container
+can see. So the operator does for Secrets what the config hash does for ConfigMaps. It reads the
+Secret keys the rendered pod spec consumes as environment, digests them with SHA-256, and stamps the
+result on the pod template as `kubeagents.x-k8s.io/secret-env-hash`. Rotating one of those keys moves
+the digest, which changes the template, which rolls the pod onto the new value. Both pods that read
+credentials this way are stamped: the gateway and the credential proxy.
+
+Four details decide whether you will see it happen.
+
+- **Within fifteen minutes, not immediately.** The operator does not watch Secrets — it holds no
+  `list` or `watch` on them, deliberately — so nothing wakes a reconcile when one changes. A healthy
+  pass instead asks to be requeued after `secretEnvReprobeInterval`, and the re-read happens then.
+  `kubectl rollout restart deployment/<agent>-gateway` still works and is immediate.
+- **Only what the pod reads as environment.** A key no container references is not in the digest, and
+  editing it rolls nothing. Neither does a key the pod _mounts_: the kubelet refreshes a mounted
+  Secret file in place, so hashing one would roll a pod over a change it was going to see anyway. The
+  gateway mounts exactly one item of `platform-agent-secrets` that way, `SANDBOX_SSH_PRIVATE_KEY`,
+  and because an init container copies it into an `emptyDir` at pod start, rotating that one key
+  still needs a restart — as it did before this change. The shell sandbox mounts its own
+  `<agent>-shell-authorized-keys`, and deliberately never names `platform-agent-secrets` at all.
+- **Whichever Secret the pod actually names.** The refs are read off the rendered pod spec, so a CR
+  that supplies its own `SecretKeyRef` pointing at a different Secret is covered without naming it
+  anywhere.
+- **A missing Secret is not an error.** It digests to a marker, so creating the Secret later moves the
+  digest and rolls the pod, and an install whose credentials arrive after the agent behaves the way
+  you would expect. A Secret the operator cannot read for any other reason — an API error rather than
+  a `NotFound` — keeps the digest the last good pass computed, so a blip neither rolls the pod nor
+  stops the rest of the reconcile.
+
+**The roll is a stop-start.** At the default single replica the gateway's update strategy is
+`Recreate`, so the old pod is terminated before the new one starts and the agent is unreachable
+across the gap — up to the startup budget of roughly ten minutes on a cold image pull. Expect one
+such restart per agent the first time an operator carrying this change reconciles: the annotation is
+new, so the first pass adds it and the template changes once, whether or not anything was rotated.
 
 ## Reconcile behavior
 

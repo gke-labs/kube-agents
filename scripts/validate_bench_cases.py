@@ -6,7 +6,7 @@ run the agent, score, read the log. Most of the mistakes are static. A domain
 slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
 nothing; a fixture role the seeded fleet does not define is a case addressing
 a defect that was never planted; a check with no assertion is a check that
-cannot fail; a case in no `TASKS` entry never runs at all; a case with no
+cannot fail; a case no roster file under `hack/eval/` names never runs; a case with no
 `owner:` has nobody to answer when it flakes; a fixture carrying a real
 address or a credential is a leak the moment it merges. None of those needs a
 cluster to find.
@@ -45,9 +45,23 @@ from typing import Any
 
 import yaml
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import eval_rosters  # noqa: E402
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
-EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
+# The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
+# runs, what the nightly adds. A case is registered by being in one of them.
+PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
+NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
+ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The synthetic result key validate_all() reports a broken roster parse under,
+# so a tree whose roster files cannot be read fails loudly instead of calling
+# every case an orphan.
+ROSTER_PARSE_KEY = "<hack/eval rosters>"
+# A FIXTURE_NOT_READY reason must name the issue that plants the fixture.
+ISSUE_REFERENCE = re.compile(r"#\d+")
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # The role vocabulary, owned by the catalogue that sits beside the Terraform
@@ -135,6 +149,32 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+}
+
+# Cases whose fixture does not exist at all, waiting on the issue that plants
+# it. The one state left between "registered" and "excluded on purpose"
+# (decided 2026-09-15 on #1546/#1564): a new case lands in
+# hack/eval/nightly-cases.txt by default and earns a presubmit seat on its
+# record, and the commented-out registration the TASKS array used to carry is
+# retired -- a `#` line in a roster file is a comment, and this validator
+# rejects a case path inside one. A case belongs here only when nothing in the
+# repository can run it yet; a case the agent fails, or that a harness limit
+# blocks, runs in the nightly and shows that on its record. Every reason names
+# the issue; the entry goes when the fixture lands and the case moves to the
+# nightly file in the same pull request.
+FIXTURE_NOT_READY = {
+    "obtainability-declared-intent-no-finding": (
+        "#1341: needs a second multi-replica workload as a fixture role of its "
+        "own in bench/tf/fleet/fixtures.json (a declaration for checkout-gateway "
+        "would silence the five active cases that grade it) and a knowledge/ "
+        "declaration seeded in each pool project's *-infra repository"
+    ),
+    "vcs-history-only-fact": (
+        "#1253: needs the git-access-ab/r200 branch pushed to every pool "
+        "project's GitOps repository; the dev project carries it, the pool does "
+        "not, so the case fails with the branch absent, which is broken rather "
+        "than red"
+    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
@@ -329,36 +369,48 @@ def fixture_catalog_disagreements() -> list[str]:
 
 
 def registered_cases() -> set[str] | None:
-    """Case names in the TASKS and NIGHTLY_TASKS arrays, commented entries included.
+    """Case names the eval runs: hack/eval/presubmit-cases.txt and nightly-cases.txt.
 
-    A commented TASKS entry counts: it is registered, pending activation,
-    which is how the Phase 2 scenarios wait for the seeded fleet. A
-    NIGHTLY_TASKS entry counts too: the nightly tier (EVAL_TIER=nightly in
-    hack/ci-eval-pr.sh) runs it every night, which is more registered than a
-    commented entry, not less.
+    An entry in either file is registered; the presubmit one runs on every
+    pull request, the nightly one every night (EVAL_TIER=nightly in
+    hack/ci-eval-pr.sh). A commented-out path counts for nothing -- that
+    parking state is retired; a case whose fixture does not exist waits in
+    FIXTURE_NOT_READY instead, and commented_out_registrations() reports the
+    comment as a finding.
 
-    Both arrays are read from the script's text rather than by executing it:
-    the script provisions clusters and reads secrets, so running it to ask a
-    question is not an option. The parse is deliberately narrow -- the two
-    named =( ... ) blocks only -- and returns None when TASKS is missing, so
-    a drifted parse fails loudly rather than calling every case an orphan.
-    NIGHTLY_TASKS missing is not None: were the array renamed away, its cases
-    would surface as named orphans, which is the better failure.
+    The files are read with the same parse the script applies
+    (scripts/eval_rosters.py). Returns None when a file is missing or holds a
+    line that is not a ./tasks/<id>/task.yaml path, so a broken roster fails
+    loudly rather than calling every case an orphan.
     """
-    text = EVAL_SCRIPT.read_text(encoding="utf-8")
-    # Multi-line arrays end at a line holding only ")": stopping at the first
-    # bare ")" character instead would truncate the block at a parenthesis
-    # inside a comment and silently drop every entry below it.
-    match = re.search(r"^TASKS=\((.*?)^\)", text, re.M | re.S) or re.search(
-        r"^TASKS=\((.*)\)\s*$", text, re.M
-    )
-    if match is None:
-        return None
-    blocks = [match.group(1)]
-    nightly = re.search(r"^NIGHTLY_TASKS=\((.*?)^\)", text, re.M | re.S)
-    if nightly is not None:
-        blocks.append(nightly.group(1))
-    return set(re.findall(r"tasks/([A-Za-z0-9_-]+)/task\.yaml", "\n".join(blocks)))
+    names: set[str] = set()
+    for path in ROSTER_FILES:
+        try:
+            names |= set(eval_rosters.case_names(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return None
+    return names
+
+
+def commented_out_registrations() -> dict[str, str]:
+    """Case ids that appear as a case path inside a roster-file comment.
+
+    Keyed by case id, valued by the file. The commented-out registration was
+    the parking state for a case whose fixture or blocker was not ready; it is
+    retired because it was indistinguishable from a case nobody had decided
+    about. A case that cannot run yet is a FIXTURE_NOT_READY entry with its
+    issue; a case that can run is a nightly entry.
+    """
+    found: dict[str, str] = {}
+    for path in ROSTER_FILES:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for name in eval_rosters.commented_out_cases(text):
+            where = path.relative_to(REPO_ROOT).as_posix() if path.is_relative_to(REPO_ROOT) else path.as_posix()
+            found.setdefault(name, where)
+    return found
 
 
 def bench_cases() -> dict[str, pathlib.Path]:
@@ -650,15 +702,22 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 "and is still graded by the judge-only fallback"
             )
 
-    # Registration. hack/ci-eval-pr.sh runs the cases in TASKS and, on the
-    # nightly tier, NIGHTLY_TASKS -- and only those.
-    if registered is not None and name not in registered and name not in KNOWN_UNREGISTERED:
+    # Registration. hack/ci-eval-pr.sh runs the cases in
+    # hack/eval/presubmit-cases.txt and, on the nightly tier,
+    # hack/eval/nightly-cases.txt -- and only those.
+    if (
+        registered is not None
+        and name not in registered
+        and name not in KNOWN_UNREGISTERED
+        and name not in FIXTURE_NOT_READY
+    ):
         problems.append(
-            "is registered nowhere and never runs. Add it to TASKS in "
-            "hack/ci-eval-pr.sh (a commented entry counts as registered, "
-            "pending activation), or to NIGHTLY_TASKS there if it is "
-            "nightly-tier, or add a reviewed KNOWN_UNREGISTERED entry "
-            "in scripts/validate_bench_cases.py with the reason it must not run"
+            "is registered nowhere and never runs. Add it to "
+            "hack/eval/nightly-cases.txt (where a new case lands; a presubmit "
+            "seat is earned on its record), or, if its fixture does not exist "
+            "yet, add a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py "
+            "naming the issue that plants it, or a reviewed KNOWN_UNREGISTERED "
+            "entry with the reason it must not run"
         )
 
     return problems
@@ -687,16 +746,18 @@ def validate_all() -> dict[str, list[str]]:
     registered = registered_cases()
     if registered is None:
         return {
-            "<TASKS array>": [
-                "could not find a TASKS=( ... ) array in hack/ci-eval-pr.sh -- "
-                "the script changed shape and this parse needs updating"
+            ROSTER_PARSE_KEY: [
+                "could not read hack/eval/presubmit-cases.txt and "
+                "hack/eval/nightly-cases.txt as case lists -- a file is missing "
+                "or holds a line that is not a ./tasks/<id>/task.yaml path"
             ]
         }
     if not registered:
         return {
-            "<TASKS array>": [
-                "the TASKS array in hack/ci-eval-pr.sh parsed to no cases -- "
-                "either the array is empty or this parse has drifted"
+            ROSTER_PARSE_KEY: [
+                "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt "
+                "parsed to no cases -- either both are empty or this parse has "
+                "drifted"
             ]
         }
     results: dict[str, list[str]] = {}
@@ -706,6 +767,19 @@ def validate_all() -> dict[str, list[str]]:
             results[name] = validate_case(name, path, registered=registered)
         except CaseError as exc:
             results[name] = [str(exc)]
+    # The retired parking state: a case path inside a roster-file comment. It
+    # is a finding against the case when the case exists, and against the
+    # roster files when it does not (a comment can name anything).
+    for name, where in commented_out_registrations().items():
+        finding = (
+            f"is commented out in {where}. That parking state is retired: move "
+            "the case to hack/eval/nightly-cases.txt, or, if its fixture does not "
+            "exist yet, to FIXTURE_NOT_READY in scripts/validate_bench_cases.py "
+            "with its issue, and delete the comment"
+        )
+        results.setdefault(name if name in results else ROSTER_PARSE_KEY, []).append(
+            finding if name in results else f"{name} {finding}"
+        )
     return results
 
 
@@ -877,9 +951,23 @@ def stale_allowlist_entries() -> list[str]:
         ("KNOWN_UNREGISTERED", KNOWN_UNREGISTERED),
         ("KNOWN_NO_DOMAIN", KNOWN_NO_DOMAIN),
         ("KNOWN_JUDGE_ONLY", KNOWN_JUDGE_ONLY),
+        ("FIXTURE_NOT_READY", FIXTURE_NOT_READY),
     ):
         stale += [f"{label}: {name}" for name in sorted(entries) if name not in existing]
+    # A FIXTURE_NOT_READY entry that a roster file also names is a case that
+    # runs: the fixture landed and the entry outlived it.
+    registered = registered_cases() or set()
+    stale += [
+        f"FIXTURE_NOT_READY: {name} (also in a roster file)"
+        for name in sorted(FIXTURE_NOT_READY)
+        if name in registered
+    ]
     return stale
+
+
+def fixture_not_ready_without_issue() -> list[str]:
+    """FIXTURE_NOT_READY entries whose reason names no issue."""
+    return sorted(name for name, reason in FIXTURE_NOT_READY.items() if not ISSUE_REFERENCE.search(reason))
 
 
 def main(argv: list[str] | None = None) -> int:

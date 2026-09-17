@@ -6,7 +6,7 @@ ConfigMap, the Workload Identity KSA, and the NetworkPolicy. The GCP half —
 the minter GSA, its Workload Identity binding, and the import-only KMS signing
 key — is terraform/modules/github-minter; the GitHub App private key is
 imported into that key outside the chart (install.sh runs the import, or see
-the module README for the manual command).
+the module README, which links the upstream guide for doing it by hand).
 */}}
 {{- if .Values.githubMinter.enabled }}
 {{- $m := .Values.githubMinter }}

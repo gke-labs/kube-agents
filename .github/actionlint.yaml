@@ -4,7 +4,7 @@
 # `on.workflow_call.secrets` block alone. It has no model of ENVIRONMENT or
 # repository secrets, so it reports every secret
 # deploy-environment.yml's `deploy-environment` job reads from the environment
-# it declares — GH_APP_ID and GH_APP_PRIVATE_KEY for the token minter, and the
+# it declares — GH_APP_ID for the token minter, and the
 # model-provider and Slack credentials the job now carries so that a
 # destroy-and-rebuild installs the same configuration a reconcile would — as
 # undefined properties. These patterns silence that.
@@ -34,7 +34,6 @@ paths:
   .github/workflows/deploy-environment.yml:
     ignore:
       - 'property "gh_app_id" is not defined in object type \{.*gemini_api_key:'
-      - 'property "gh_app_private_key" is not defined in object type \{.*gemini_api_key:'
       - 'property "anthropic_api_key" is not defined in object type \{.*gemini_api_key:'
       - 'property "openai_api_key" is not defined in object type \{.*gemini_api_key:'
       - 'property "slack_bot_token" is not defined in object type \{.*gemini_api_key:'

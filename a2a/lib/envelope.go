@@ -39,8 +39,12 @@ const (
 	KindTopicUpdate    Kind = "topic-update"
 )
 
-// Party identifies a sender or addressee. Routing and display only; never an
-// authorization input.
+// Party identifies a sender or addressee. Never the source of authority or of
+// identity - both come from the subject an envelope was delivered on - but
+// `from` is checked for agreement with that subject (CheckSubjectAgreement):
+// on an identity-bearing subject a `from` that does not name the writer the
+// subject implies is a protocol error, and the envelope is refused rather
+// than re-attributed. Display still reads it; nothing decides on it.
 type Party struct {
 	Session   string `json:"session"`
 	AgentType string `json:"agentType,omitempty"`

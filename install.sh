@@ -367,6 +367,10 @@ PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
 PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
+PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
+PARAM_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+PARAM_KMS_KEYRING="${KMS_KEYRING:-}"
+PARAM_KMS_KEY="${KMS_KEY:-}"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -482,9 +486,15 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
-  --gitops-org=ORG              GitHub Org/Username for GitOps repo
+  --gitops-org=ORG              GitHub Org for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
                                 currently gke-fleet-iac)
+  --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
+  --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
+  --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
+                                currently github-token-minter-keyring)
+  --kms-key=KEY                 Cloud KMS Key Name for token minter (default: DEFAULT_KMS_KEY,
+                                currently github-token-minter-key)
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
@@ -582,6 +592,10 @@ parse_args() {
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; shift ;;
+      --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
+      --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
       --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
@@ -675,8 +689,8 @@ EOF
 # Minimum tool versions, kept in scripts/installer/min_versions.sh so the
 # numbers live in exactly one place. This installer is also downloaded and run
 # on its own, before any checkout exists, so the source is guarded: in that
-# case the workspace step clones the repository and the check runs against the
-# clone's copy.
+# case source_provisioning_helpers re-sources this file out of the clone at
+# step 2, which is what the Go floor at step 12 relies on.
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
 _min_versions="${_script_dir}/scripts/installer/min_versions.sh"
 if [ -r "$_min_versions" ]; then
@@ -685,8 +699,20 @@ if [ -r "$_min_versions" ]; then
   # shellcheck source=scripts/installer/min_versions.sh disable=SC1091
   source "$_min_versions"
 else
+  # Reached when install.sh runs without the repository beside it, which is
+  # the documented `curl … | bash` path. Every require_min_* the script calls
+  # needs an arm here: the calls are unguarded, so a missing one is not a
+  # skipped check but an undefined command, and `set -u`/`|| return 1` turns
+  # that 127 into a failure of whatever was being attempted.
+  #
+  # These stubs hold only until the clone arrives. The gcloud and terraform
+  # floors run at step 1 and so are genuinely unenforceable on this path --
+  # there is no checkout yet to state a number. The Go floor is not: it runs
+  # at step 12, and source_provisioning_helpers has replaced this stub with
+  # the clone's copy by then.
   require_min_gcloud_version() { return 0; }
   require_min_terraform_version() { return 0; }
+  require_min_go_version() { return 0; }
 fi
 unset _min_versions
 
@@ -1035,7 +1061,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME PLATFORM_AGENT_PERMISSION_SET \
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH; do
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
@@ -1131,7 +1157,6 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
-  write_env_var "$tmp" GITHUB_PEM_PATH "${GITHUB_PEM_PATH:-}"
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
   write_env_var "$tmp" USER_PROFILE_ENABLED "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   write_env_var "$tmp" HERMES_DASHBOARD_ENABLED "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
@@ -1413,6 +1438,15 @@ source_provisioning_helpers() {
   # gke_dns_endpoint_flag, for the credentials fetch before the health checks.
   # shellcheck source=/dev/null
   source "${SCRIPT_DIR}/gke_dns_endpoint.sh"
+  # The version floors. On the `curl … | bash` path the guard near the top of
+  # this file had no file to read them from and armed no-op stubs instead; the
+  # clone has the file, so the real checks replace those stubs here. This is
+  # what makes the Go floor at import_github_pem an actual check on that path
+  # rather than an unconditional `return 0` — it runs at step 12, long after
+  # this step 2. (The gcloud and terraform floors are already past by now:
+  # they run at step 1, before any checkout exists to read a number from.)
+  # shellcheck source=/dev/null
+  source "${SCRIPT_DIR}/min_versions.sh"
   print_success "Loaded installer defaults from scripts/installer/installer_common.sh"
 }
 
@@ -1441,6 +1475,8 @@ resolve_shared_defaults() {
   PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
   PARAM_CHAT_SUB_NAME="${PARAM_CHAT_SUB_NAME:-}"
   PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
+  PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
 }
@@ -1864,6 +1900,11 @@ auto_install_tool() {
         sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin 2>/dev/null || \
           sudo apt-get install -y gke-gcloud-auth-plugin 2>/dev/null || \
           (command -v gcloud >/dev/null 2>&1 && gcloud components install gke-gcloud-auth-plugin -q) || true
+      elif [ "$tool" = "go" ]; then
+        sudo apt-get update >/dev/null 2>&1 || true
+        if ! sudo apt-get install -y golang-go 2>/dev/null; then
+          sudo apt-get install -y golang 2>/dev/null || true
+        fi
       else
         sudo apt-get update >/dev/null 2>&1 || true
         sudo apt-get install -y "$tool" || true
@@ -2595,6 +2636,97 @@ validate_existing_cluster_opt_in_flags() {
   fi
 }
 
+# Validates that non-interactive minter configuration has either an ENABLED KMS key
+# (Path 2: AOT) or a valid PEM file path (Path 1: automated import) whenever there
+# is an explicit intention to configure the token minter.
+validate_non_interactive_minter_config() {
+  local app_id="$1" pem_path="$2" keyring="$3" key="$4" region="$5" project_id="$6" org="${7:-}"
+  # If neither App ID nor PEM path is provided, the token minter is omitted (optional feature).
+  if [ -z "$app_id" ] && [ -z "$pem_path" ]; then
+    return 0
+  fi
+
+  # Explicit intention to configure minter exists:
+  if [ -n "$pem_path" ] && [ -z "$app_id" ]; then
+    print_error "--github-pem-path was provided, but --github-app-id is missing."
+    print_info "The GitHub token minter requires both a GitHub App ID and an asymmetric signing key."
+    return 1
+  fi
+
+  if [ -n "$app_id" ] && [ -z "$org" ]; then
+    print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but --gitops-org is missing."
+    print_info "The GitHub token minter requires an organization to mint installation access tokens for."
+    return 1
+  fi
+
+  local kms_loc existing_kms_ver=""
+  kms_loc="$(derive_kms_location "$region")"
+  existing_kms_ver="$(kms_key_enabled_version "$key" "$keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+
+  if [ -n "$existing_kms_ver" ]; then
+    return 0
+  fi
+
+  if [ -n "$pem_path" ] && [ ! -f "$pem_path" ]; then
+    print_error "GitHub App private key PEM file does not exist or is not a regular file: '${pem_path}'."
+    return 1
+  fi
+
+  if [ -z "$pem_path" ]; then
+    print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
+    print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    print_info "To install without the token minter, omit --github-app-id."
+    return 1
+  fi
+  return 0
+}
+
+# The half of the PEM decision the early preflight could not make.
+#
+# A .pem deleted after a successful import is the documented end state, not an
+# error: docs/site/src/content/docs/deploy/token-minter.md and
+# .agents/skills/install-kube-agents/SKILL.md both tell the operator to remove
+# it. So a missing file is fatal only when the signing key has no ENABLED
+# version to fall back on.
+#
+# A function rather than a block inside main(), because reaching step 8 costs a
+# live project and a cluster: inverting the ENABLED test below left all 398
+# tests green while it was inline, and no test could reach it to say otherwise.
+#
+# Reads and clears the global PARAM_GITHUB_PEM_PATH instead of echoing a value.
+# The point of resolving it here is that every later consumer in step 8 -- the
+# locals the step copies it into, the interview, the non-interactive validator
+# -- sees one answer, and a captured stdout would leave the global behind.
+#
+# Callers must run this below source_provisioning_helpers: derive_kms_location
+# and kms_key_enabled_version live in installer_common.sh and
+# DEFAULT_KMS_KEYRING in install.defaults.env, and a `curl | bash` run has no
+# copy of either before the clone.
+resolve_missing_pem_against_kms() {
+  local region="$1" project_id="$2"
+
+  if [ -z "$PARAM_GITHUB_PEM_PATH" ] || [ -e "$PARAM_GITHUB_PEM_PATH" ]; then
+    return 0
+  fi
+
+  local pem_keyring pem_key pem_kms_loc pem_enabled_ver=""
+  pem_keyring="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  pem_key="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
+  pem_kms_loc="$(derive_kms_location "$region")"
+  pem_enabled_ver="$(kms_key_enabled_version "$pem_key" "$pem_keyring" "$pem_kms_loc" "$project_id" 2>/dev/null || true)"
+
+  if [ -n "$pem_enabled_ver" ]; then
+    print_info "Cloud KMS key ${pem_keyring}/${pem_key} already has an ENABLED version (${pem_enabled_ver}); ignoring missing local PEM path '${PARAM_GITHUB_PEM_PATH}'."
+    PARAM_GITHUB_PEM_PATH=""
+    return 0
+  fi
+
+  print_error "GitHub App private key PEM file does not exist: '${PARAM_GITHUB_PEM_PATH}'."
+  print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
+  print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  return 1
+}
+
 # Enumerates pending existing-cluster mutations for the pre-flight summary
 summarize_existing_cluster_mutations() {
   local project_id="$1" cluster_name="$2" region="$3" enable_gvisor="${4:-false}"
@@ -2702,12 +2834,13 @@ apply_managed_otel_scope() {
 # One-shot import of the GitHub App private key into the minter's KMS signing
 # key, via the Minty CLI. The PEM never enters Terraform state — that is why
 # this is not a Terraform resource. Skipped when a key version is already
-# ENABLED (the import happened on an earlier run) and downgraded to printed
-# instructions when Go is unavailable.
+# ENABLED (the import happened on an earlier run), downgraded to printed
+# instructions when no PEM is provided, and auto-installs Go if missing.
 import_github_pem() {
   local project_id="$1" region="$2"
   [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
   local pem_path="${GITHUB_PEM_PATH:-}"
+  pem_path="$(expand_tilde_path "$pem_path")"
   local kms_location keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
   kms_location="$(derive_kms_location "$region")"
 
@@ -2722,8 +2855,7 @@ import_github_pem() {
   # `go run github.com/abcxyz/github-token-minter/cmd/minty@<tag>`
   # cannot work: the upstream go.mod declares the module without the /v2 suffix
   # its v2 tags require, so Go rejects the version with or without /v2 in the
-  # path. The gcloud-only recovery recipe lives in
-  # k8s-operator/config/integrations/github/README.md.
+  # path. Upstream guide: https://github.com/abcxyz/github-token-minter
   local import_cmd="git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR} && cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_location} -key-ring=${keyring} -key=${key} -private-key=@<path-to-pem>"
   if [ -z "$pem_path" ] || [ ! -f "$pem_path" ]; then
     print_warning "No GitHub App private key PEM available (GITHUB_PEM_PATH='${pem_path}')."
@@ -2731,11 +2863,25 @@ import_github_pem() {
     return 0
   fi
   if ! command -v go >/dev/null 2>&1; then
-    print_warning "Go is not installed, so the App key cannot be imported automatically."
-    print_info "Import it manually: ${import_cmd/<path-to-pem>/$pem_path}"
-    print_info "Without Go, the gcloud-only import recipe is in k8s-operator/config/integrations/github/README.md."
-    return 0
+    print_info "Go is required to build the Minty CLI for initial private key import into Cloud KMS."
+    # Said before the attempt rather than after it. auto_install_tool ends in
+    # `exit 1` when the tool is still missing afterwards, which is what every
+    # host it has no package manager for gets -- and from inside that exit
+    # there is nowhere left to say what to do instead. The run stops either
+    # way: the minter is enabled in the generated configuration, so the
+    # readiness gate after this import refuses the apply without a key. What
+    # the operator loses is the recipe, and only on the path where they need
+    # it most, so print it while there is still a stdout to print it to.
+    print_info "If Go cannot be installed on this host, import the key by hand instead: ${import_cmd/<path-to-pem>/$pem_path}"
+    auto_install_tool "go"
   fi
+  # auto_install_tool judges success by `command -v`, which a Go far too old to
+  # build the CLI answers just as well — and on Debian 12 and Ubuntu 22.04 that
+  # is exactly what its `apt-get install golang-go` leaves behind. Checked here
+  # rather than left to `go run`: that call is wrapped in `retry 6 5` below, so
+  # a toolchain that cannot satisfy the CLI's go.mod costs six attempts and
+  # then advises retrying the same command by hand.
+  require_min_go_version || return 1
   # The ring and key normally come from Terraform, but this import runs
   # BEFORE the apply — the minter Deployment cannot pass readiness without an
   # imported key, and the composition's helm release waits on every
@@ -2792,7 +2938,7 @@ import_github_pem() {
     print_info "Create them by hand with:"
     print_info "  gcloud kms keyrings create ${keyring} --location=${kms_location} --project=${project_id}"
     print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
-    print_info "Then import the PEM with the recipe in k8s-operator/config/integrations/github/README.md."
+    print_info "Then import the PEM following: https://github.com/abcxyz/github-token-minter"
     return 0
   fi
 
@@ -2807,9 +2953,11 @@ import_github_pem() {
       -private-key=@"$pem_abs"); then
     print_success "GitHub App private key imported into ${keyring}/${key}."
   else
-    print_warning "PEM import failed; the minter deployment stays unready until it succeeds."
+    print_error "PEM import failed: Minty CLI could not import the private key into Cloud KMS (${keyring}/${key})."
     print_info "Retry manually: ${import_cmd/<path-to-pem>/$pem_path}"
-    print_info "If Go itself is the problem (killed compiler, no toolchain), the gcloud-only recipe is in k8s-operator/config/integrations/github/README.md."
+    print_info "See https://github.com/abcxyz/github-token-minter for the upstream troubleshooting guide."
+    rm -rf "$minty_dir"
+    return 1
   fi
   rm -rf "$minty_dir"
 }
@@ -2904,7 +3052,6 @@ run_menu_system() {
   local github_app_id="${GITHUB_APP_ID:-}"
   local kms_keyring="${KMS_KEYRING:-}"
   local kms_key="${KMS_KEY:-}"
-  local github_pem_path="${GITHUB_PEM_PATH:-}"
   local image_tag="${PARAM_IMAGE_TAG:-}"
 
   while true; do
@@ -3024,7 +3171,12 @@ run_menu_system() {
         esac
         ;;
       5)
-        prompt_read "GitHub Org / Username" github_org "$github_org"
+        # An organization, never a login: the minter resolves App installations
+        # at /orgs/{org}/installation, so a personal account deploys cleanly and
+        # then 404s every token request. The fresh-install interview settles
+        # this with github_account_type; this panel does not verify it, so the
+        # least it can do is stop suggesting the value that cannot work.
+        prompt_read "GitHub Organization" github_org "$github_org"
         prompt_read "GitOps Repository Name" github_repo "$github_repo"
         ;;
       6)
@@ -3073,7 +3225,6 @@ run_menu_system() {
         save_env_var GITHUB_APP_ID "$github_app_id"
         save_env_var KMS_KEYRING "$kms_keyring"
         save_env_var KMS_KEY "$kms_key"
-        save_env_var GITHUB_PEM_PATH "$github_pem_path"
         print_success "Updated configuration saved to: $INSTALL_ENV_FILE"
 
         # One engine for every kind of change: a full terraform apply
@@ -3133,6 +3284,41 @@ main() {
   local image_tag=""
   resolve_effective_image_tag image_tag "." "${PARAM_IMAGE_TAG:-}" || exit 1
   validate_immutable_ref "$image_tag" || exit 1
+
+  # Local-only checks on the GitHub App private key path. The other half of this
+  # decision — that a missing .pem is harmless once the signing key holds an
+  # ENABLED version, which is the state this installer's own documentation tells
+  # the operator to leave behind — cannot be made here. kms_key_enabled_version
+  # and derive_kms_location arrive with installer_common.sh at step 2, the
+  # keyring and key defaults with resolve_shared_defaults beside it, and the
+  # lookup itself needs an authenticated gcloud and a resolved project and
+  # region, none of which exist this early. It runs at step 8 instead, beside
+  # the only consumer.
+  #
+  # Nor is the path expanded here: expand_tilde_path is in installer_common.sh,
+  # which is not sourced yet either. So a `~/...` value does not match -e below,
+  # falls through this block untouched, and is expanded and judged at step 8.
+  # That costs nothing in practice — a ~ typed on the command line is expanded
+  # by the operator's own shell before install.sh sees it, so what reaches here
+  # is a quoted flag value or a path out of install.env.
+  #
+  # What is left is what the filesystem alone can answer about an already-usable
+  # path. A path that exists but is not a readable regular file is a typo or a
+  # permission problem rather than a deleted key, and no KMS state makes it
+  # right, so it is worth catching before the installer does any work. A path
+  # that is simply absent is not decided here.
+  if [ -n "$PARAM_GITHUB_PEM_PATH" ]; then
+    if [ -e "$PARAM_GITHUB_PEM_PATH" ]; then
+      if [ ! -f "$PARAM_GITHUB_PEM_PATH" ]; then
+        print_error "GitHub App private key PEM path is not a regular file: '${PARAM_GITHUB_PEM_PATH}'."
+        exit 1
+      fi
+      if [ ! -r "$PARAM_GITHUB_PEM_PATH" ]; then
+        print_error "GitHub App private key PEM file is not readable: '${PARAM_GITHUB_PEM_PATH}'."
+        exit 1
+      fi
+    fi
+  fi
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
   print_step "1. Checking Prerequisites & Installing Missing Tools"
@@ -3665,15 +3851,29 @@ main() {
 
   # 8. GitOps Infrastructure Repository Connection
   print_step "8. GitOps Infrastructure Repository Setup"
-  local github_org="${PARAM_GITOPS_ORG:-}"
+
+  # A leading ~ survived the early preflight untouched, because the function
+  # that resolves it lives in installer_common.sh and that file was not sourced
+  # yet. Resolved here, ahead of every test and every copy below, so the whole
+  # step judges one real path.
+  if [ -n "$PARAM_GITHUB_PEM_PATH" ]; then
+    PARAM_GITHUB_PEM_PATH="$(expand_tilde_path "$PARAM_GITHUB_PEM_PATH")"
+  fi
+
+  # The half of the PEM decision the early preflight could not make. Called
+  # here because by this point installer_common.sh is sourced,
+  # resolve_shared_defaults has filled the keyring and key, gcloud is
+  # authenticated, and project and region are settled -- step 5 can still
+  # change the region, and it has run. Called before the locals below copy
+  # PARAM_GITHUB_PEM_PATH, so every consumer in this step sees one answer.
+  resolve_missing_pem_against_kms "$region" "$project_id" || exit 1
+
+  local github_org="$PARAM_GITOPS_ORG"
   local github_repo="$PARAM_GITOPS_REPO"
-  # Env fallbacks, not bare empties: the non-interactive path never reaches
-  # the interview prompts below, so GITHUB_APP_ID / GITHUB_PEM_PATH exported
-  # into the run are the only way an automated install can enable the minter.
-  local github_app_id="${GITHUB_APP_ID:-}"
-  local kms_keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
-  local kms_key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
-  local github_pem_path="${GITHUB_PEM_PATH:-}"
+  local github_app_id="$PARAM_GITHUB_APP_ID"
+  local kms_keyring="$PARAM_KMS_KEYRING"
+  local kms_key="$PARAM_KMS_KEY"
+  local github_pem_path="$PARAM_GITHUB_PEM_PATH"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # An install that already names an org has a repository to connect, so
@@ -3733,13 +3933,88 @@ main() {
           exit 1
         fi
       done
-      prompt_read "GitOps Repository Name" github_repo "${github_repo:-$DEFAULT_GITOPS_REPO}"
+      prompt_read "GitOps Repository Name" github_repo "${github_repo}"
 
       print_info "GitHub access uses the short-lived GitHub App token minter."
-      prompt_read "GitHub App ID" github_app_id "${github_app_id}"
-      prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring:-$DEFAULT_KMS_KEYRING}"
-      prompt_read "Cloud KMS Key Name" kms_key "${kms_key:-$DEFAULT_KMS_KEY}"
-      prompt_read "Path to downloaded GitHub App Private Key (.pem)" github_pem_path "${github_pem_path}"
+      prompt_read "GitHub App ID (optional, press Enter to skip token minter)" github_app_id "${github_app_id}"
+      if [ -n "$github_app_id" ]; then
+        prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring}"
+        prompt_read "Cloud KMS Key Name" kms_key "${kms_key}"
+
+        local kms_loc existing_kms_ver=""
+        kms_loc="$(derive_kms_location "$region")"
+        existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+        if [ -n "$existing_kms_ver" ]; then
+          print_success "Cloud KMS key ${kms_keyring}/${kms_key} already has an ENABLED version (${existing_kms_ver}); skipping PEM prompt."
+        else
+          while true; do
+            prompt_read "Path to downloaded GitHub App Private Key (.pem)" github_pem_path "${github_pem_path}"
+            if [ -z "$github_pem_path" ]; then
+              print_warning "No PEM path entered. The token minter will be deferred unless key version 1 is imported into KMS."
+              break
+            fi
+            github_pem_path="$(expand_tilde_path "$github_pem_path")"
+            if [ -f "$github_pem_path" ]; then
+              break
+            fi
+            print_error "File not found: '${github_pem_path}'. Please enter a valid path to your .pem file, or leave blank to defer."
+          done
+          if [ -n "$github_pem_path" ] && [ -f "$github_pem_path" ]; then
+            if ! command -v go >/dev/null 2>&1; then
+              # Say it now, install it later. This runs inside step 8, which
+              # --dry-run and --generate-only both cross before they exit, and
+              # auto_install_tool exits 1 in the first and `sudo apt-get
+              # install`s in the second. Neither mode imports anything, so
+              # neither has any business refusing over Go or putting a package
+              # on the operator's machine. import_github_pem makes the same
+              # check where the toolchain is actually about to be used.
+              print_warning "Go toolchain ('go') is required to import the GitHub App private key into Cloud KMS via the Minty CLI; the installer will offer to install it when the import runs."
+            fi
+          fi
+        fi
+      else
+        print_info "No GitHub App ID entered; skipping token minter setup."
+        github_pem_path=""
+      fi
+    else
+      # Deliberately not clearing github_org / github_repo / github_app_id /
+      # github_pem_path here. "Skip for now" is the operator declining the
+      # interview, not asking for a teardown, and the four names are exactly
+      # the ones write_tfvars_from_state's three-way guard reads
+      # (scripts/installer/installer_common.sh): emptying them renders
+      # enable_github_minter = false, and the apply then removes a deployed
+      # minter's GSA, its Workload Identity binding, and the chart's
+      # Deployment, Service, NetworkPolicy and KSA — while install.env, which
+      # this run does not rewrite, goes on recording a minter that is gone.
+      #
+      # On a fresh install they are already empty, so the minter is skipped
+      # either way and this arm changes nothing. On a re-run the loaded values
+      # are the whole reason the minter survives. The comment above the
+      # interview prompts makes the same point about empty defaults.
+      if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
+        print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
+      else
+        print_info "GitOps repository connection skipped."
+      fi
+    fi
+  else
+    if [ -n "$github_pem_path" ]; then
+      github_pem_path="$(expand_tilde_path "$github_pem_path")"
+    fi
+
+    validate_non_interactive_minter_config "$github_app_id" "$github_pem_path" "$kms_keyring" "$kms_key" "$region" "$project_id" "$github_org" || exit 1
+
+    if [ -n "$github_app_id" ] && [ -n "$github_pem_path" ]; then
+      local kms_loc existing_kms_ver=""
+      kms_loc="$(derive_kms_location "$region")"
+      existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+      if [ -z "$existing_kms_ver" ]; then
+        if ! command -v go >/dev/null 2>&1; then
+          # Warning only, for the reason given on the interactive arm above:
+          # step 8 runs before --dry-run and --generate-only exit.
+          print_warning "Go toolchain ('go') is required to import the GitHub App private key into Cloud KMS via the Minty CLI; the installer will install it when the import runs."
+        fi
+      fi
     fi
   fi
 
@@ -4048,8 +4323,8 @@ main() {
   export USER_PROFILE_ENABLED="$PARAM_USER_PROFILE_ENABLED"
   export HERMES_DASHBOARD_ENABLED="$PARAM_ENABLE_WEBUI"
   export REGISTRY_PREFIX="$registry_prefix"
-  export ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
-  export ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
+  export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
   # Exported only when asked for, the way it was only ever persisted when asked
   # for: an empty value here is an override the installer never took a flag
   # for, turning "leave the third-party images upstream" from a default into an
@@ -4267,7 +4542,7 @@ main() {
   # pass readiness once the key is imported. The generator enabled the
   # minter on the promise of this import, so a failed one stops the run
   # here rather than wedging the apply.
-  import_github_pem "$project_id" "$region"
+  import_github_pem "$project_id" "$region" || exit 1
   local minter_enabled_version=""
   minter_enabled_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
     "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"

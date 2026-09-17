@@ -14,7 +14,14 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
   If you're starting from a fresh project, the installer creates the GKE cluster
   for you. You do **not** need to pre-install
   [cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster)
-  — the composition installs it automatically if it isn't already present.
+  — the composition installs it automatically if it isn't already present. If
+  you plan to connect a GitOps repository for automated PRs
+  (`submit-suggestion`), you need a GitHub App and a Cloud KMS signing key
+  holding its private key: either hand the installer the `.pem` with
+  `--github-pem-path` and it imports the key, or pre-provision it Ahead-Of-Time
+  (AOT) — see
+  [Prerequisites](/kube-agents/install/prerequisites/#gitops-repo--github-token-minter-for-submit-suggestion)
+  and [Token minter](/kube-agents/deploy/token-minter/).
 </Aside>
 
 ## Run the Zero-Friction One-Liner Installer
@@ -72,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
    ./install.sh
    ```
 
-   The run is interactive: it prompts for the values it needs (project ID, region, new or existing cluster, the new cluster's shape, chat integrations, model provider and API key, GitOps repo, agent permission set, gVisor, web UI, and memory). When run from an official release checkout or bundle, `install.sh` automatically uses that release version and verifies that local files match the container images. Answers are saved to `install.env` (git-ignored, `chmod 600`), the install's configuration; `terraform/examples/full-install/terraform.tfvars` is regenerated from it on every run, so the two stay in step. A re-run loads `install.env` first, so a flag you omit keeps the value it records instead of reverting to a default. The installer then runs the composition's `lifecycle.sh apply`, and a re-run reconciles every change through one `terraform apply` — safe to Ctrl-C and run again.
+   The run is interactive: it prompts for the values it needs (project ID, region, new or existing cluster, the new cluster's shape, chat integrations, model provider and API key, GitOps repo, agent permission set, gVisor, web UI, and memory). When run from an official release checkout or bundle, `install.sh` automatically uses that release version and verifies that local files match the container images. Answers are saved to `install.env` (git-ignored, `chmod 600`), the install's configuration; `terraform/examples/full-install/terraform.tfvars` is regenerated from it on every run, so the two stay in step. A re-run loads `install.env` first, so a flag you omit keeps the value it records instead of reverting to a default — with one exception: the installer never writes `--github-pem-path` there. After the first import the private key lives in Cloud KMS, so a re-run needs neither the flag nor the file, and you are meant to delete the `.pem`. The installer then runs the composition's `lifecycle.sh apply`, and a re-run reconciles every change through one `terraform apply` — safe to Ctrl-C and run again.
 
    <Aside type="caution">
      **Working on `main` (Developers only):** If you clone the repository from
@@ -117,6 +124,7 @@ Changing your mind later is the same engine: running the installer with `--menu`
 - `--enable-network-policy` — authorizes enabling the legacy Calico NetworkPolicy addon and node enforcement when adopting a GKE Standard cluster without Dataplane V2 (may recreate nodes and restart workloads; required on such clusters, else the install aborts).
 - `--gvisor=false` — runs the agent on the standard container runtime. The default is `true`: the agent executes model-authored commands, so it runs under the `gvisor` RuntimeClass unless you say otherwise. Autopilot, the default shape, ships that RuntimeClass and needs no node pool, from GKE 1.27.4-gke.800 onwards — the installer stops before applying anything if an Autopilot cluster it is adopting is older than that. On a Standard cluster the sandbox needs a node pool of its own, which the run provisions (the `gke-cluster` module's `enable_gvisor_node_pool`).
 - `--enable-google-chat` — provisions the Google Chat Pub/Sub backend and enables the CR's `googleChat` integration.
+- `--gitops-org=ORG`, `--gitops-repo=REPO`, `--github-app-id=ID`, `--github-pem-path=PATH` — configures GitOps PR automation via the in-cluster GitHub token minter (Minty). When `--github-pem-path` is provided, `install.sh` imports the private key into Cloud KMS during install; alternatively, pre-provision the key AOT beforehand (see [Token minter](/kube-agents/deploy/token-minter/)).
 - `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.
 
 Run the installer with `--help` (e.g. `./install.sh --help`) for the full list.

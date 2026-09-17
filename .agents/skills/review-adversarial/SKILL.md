@@ -198,7 +198,11 @@ can quote the exact rule and the exact line that breaks it — no style preferen
 the doc" inferences. Name the file and quote the rule so the report can cite it. This is also
 where docs drift belongs: one canonical home per fact, generated `<!-- BEGIN GENERATED -->` regions
 regenerated rather than hand-edited, identifiers verified against source rather than against other
-docs. `review-docs-drift` is the exhaustive form of that check and the author is required to have
+docs. A hunk under `docs/site/` that arrives with a `ci`, `build`, or `feat(ci)` change — a diff that
+also touches `.github/workflows/`, `hack/`, or the pool scripts — is a prompt to ask whether the
+page is a runbook: the site is for people running kube-agents on their own clusters, and
+`.agents/rules/documentation.md` names the homes a maintainer page goes to instead.
+`review-docs-drift` is the exhaustive form of that check and the author is required to have
 run it before opening — which is a reason to read what they reported, not a reason to skip this
 angle. **Prose this change makes false is a finding on the same footing as a bug**, not a style
 note: a comment, a document, an in-tree statement that described the old behaviour and now

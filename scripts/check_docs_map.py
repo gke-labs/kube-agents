@@ -4,7 +4,7 @@
 ``docs/README.md`` is the hand-maintained map of every ``.md``/``.mdx`` file in
 the repository. Hand-maintained means it drifts: a PR adds, moves, renames, or
 deletes a document and forgets the map. This check makes that drift a CI
-failure instead of a review-time hope. Three checks:
+failure instead of a review-time hope. Four checks:
 
 * **Coverage** -- every git-tracked ``.md``/``.mdx`` file must be matched by at
   least one backticked path (or glob) somewhere in the map's inventory tables
@@ -29,6 +29,15 @@ failure instead of a review-time hope. Three checks:
   matched is a run of spaces immediately before a ``|`` -- where prettier's
   padding always lands -- so a double space inside a prose cell is not a
   failure.
+* **Site audience** -- no row in the published-site table may name
+  maintainers, CI engineers, or contributors in its audience cell. The site is
+  for people running kube-agents on their own clusters
+  (``.agents/rules/documentation.md``); a page for another reader belongs at one
+  of the other homes the ``AGENTS.md`` canonical-home table names, and its row
+  in that section of the map. The CLA page (``contributing.md``) is the one
+  exemption. A map with no published-site table is an error, not a clean
+  report: the table is found by its heading, and a reworded heading would
+  otherwise leave the check evaluating zero rows and printing green.
 
 Deliberately NOT checked: any *count*. The map used to state a repository
 document total and a per-family file count, and both were verified here. They
@@ -79,6 +88,31 @@ SELF = "docs/README.md"
 # away and the author would have no way to satisfy the check.
 ALIGNMENT_PADDING = "  |"
 
+# The published-site inventory table: from its heading to the next heading of
+# any level. Closing on `###` alone would run the table into section 5 the day
+# it becomes the last subsection of the inventory.
+SITE_SECTION_START = "### `docs/site/src/content/docs/`"
+HEADING_PREFIX = "#"
+NO_SITE_TABLE_ERROR = (
+    "{map} has no heading starting '{start}' -- the site-audience check found no "
+    "published-site table to read; restore the heading or update SITE_SECTION_START"
+)
+
+# Readers the site is not for. A site row whose audience cell names one is a
+# page that belongs at another home (.agents/rules/documentation.md, "Who the
+# site is for"). Matched in the LAST cell only: a purpose cell may say a page
+# points contributors off-site without the page being for them.
+MAINTAINER_AUDIENCE_RE = re.compile(r"\b(?:maintainers?|CI engineers?|contributors?)\b", re.IGNORECASE)
+CELL_DELIMITER = "|"
+
+# The one site page allowed to name contributors: the CLA and community
+# guidelines have to be reachable from the public site, and the page points at
+# the repository for everything else (.agents/rules/documentation.md).
+AUDIENCE_EXEMPT_SITE_PAGES = {"`contributing.md`"}
+
+# A header-separator row (|---|---|) is made of these characters only.
+SEPARATOR_ROW_CHARS = {"|", "-", ":", " "}
+
 
 def in_dot_dir(path: str) -> bool:
     """True for paths under a root-level dot-directory (.agents/, .github/, …).
@@ -118,7 +152,7 @@ def inventory_rows(text: str) -> list[str]:
         if not stripped.startswith("|"):
             continue
         # Skip header-separator rows (|---|---|).
-        if set(stripped) <= {"|", "-", ":", " "}:
+        if set(stripped) <= SEPARATOR_ROW_CHARS:
             continue
         rows.append(stripped)
     return rows
@@ -138,6 +172,60 @@ def realigned_rows(text: str) -> list[tuple[int, str]]:
         if stripped.startswith("|") and ALIGNMENT_PADDING in stripped:
             rows.append((number, stripped))
     return rows
+
+
+def display_path(path: Path) -> Path:
+    """Repository-relative when the path is inside the repository, otherwise as given."""
+    try:
+        return path.relative_to(REPO)
+    except ValueError:
+        return path
+
+
+def has_site_table(text: str) -> bool:
+    """True when the map carries the heading the site-audience check reads from."""
+    return any(line.strip().startswith(SITE_SECTION_START) for line in text.splitlines())
+
+
+def preconditions(text: str) -> list[str]:
+    """Reasons a run cannot be trusted to have checked the site table at all."""
+    errors = []
+    if not has_site_table(text):
+        errors.append(NO_SITE_TABLE_ERROR.format(map=display_path(MAP), start=SITE_SECTION_START))
+    return errors
+
+
+def site_rows(text: str) -> list[tuple[int, str]]:
+    """(line number, row) for every data row of the published-site table."""
+    rows = []
+    inside = False
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith(SITE_SECTION_START):
+            inside = True
+            continue
+        if inside and stripped.startswith(HEADING_PREFIX):
+            break
+        if not inside or not stripped.startswith(CELL_DELIMITER):
+            continue
+        if set(stripped) <= SEPARATOR_ROW_CHARS:
+            continue
+        rows.append((number, stripped))
+    return rows[1:]  # drop the header row
+
+
+def maintainer_audience_rows(text: str) -> list[tuple[int, str, str]]:
+    """Site rows whose audience cell (the last one) names a reader the site is not for."""
+    flagged = []
+    for number, row in site_rows(text):
+        cells = [c.strip() for c in row.strip(CELL_DELIMITER).split(CELL_DELIMITER)]
+        if cells[0] in AUDIENCE_EXEMPT_SITE_PAGES:
+            continue
+        audience = cells[-1]
+        match = MAINTAINER_AUDIENCE_RE.search(audience)
+        if match:
+            flagged.append((number, cells[0], match.group(0)))
+    return flagged
 
 
 def inventory_tokens(text: str) -> Iterator[tuple[int, str]]:
@@ -199,6 +287,11 @@ def main() -> int:
     total_actual = sum(1 for f in files if not in_dot_dir(f))
     files.discard(SELF)
     text = MAP.read_text(encoding="utf-8")
+    errors = preconditions(text)
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}")
+        return 1
 
     covered: set[str] = set()
     stale: list[tuple[str, str]] = []  # (row path-cell token, reason)
@@ -215,11 +308,12 @@ def main() -> int:
     required = {f for f in files if not in_dot_dir(f)}
     missing = sorted(required - covered)
     realigned = realigned_rows(text)
+    misplaced = maintainer_audience_rows(text)
 
     ok = True
     if missing:
         ok = False
-        print(f"{len(missing)} tracked doc(s) missing from the map inventory ({MAP.relative_to(REPO)}):")
+        print(f"{len(missing)} tracked doc(s) missing from the map inventory ({display_path(MAP)}):")
         for f in missing:
             print(f"  MISSING  {f}")
     if stale:
@@ -229,18 +323,25 @@ def main() -> int:
             print(f"  STALE    `{token}` -- {reason}")
     if realigned:
         ok = False
-        print(f"{len(realigned)} column-aligned table row(s) in {MAP.relative_to(REPO)} "
+        print(f"{len(realigned)} column-aligned table row(s) in {display_path(MAP)} "
               "-- re-pad them as `| cell | cell |`; aligning a table rewrites every "
               "row and conflicts with every open pull request:")
         for number, line in realigned:
             print(f"  PADDING  line {number}: {line[:72]}…")
+    if misplaced:
+        ok = False
+        print(f"{len(misplaced)} published-site row(s) in {display_path(MAP)} whose audience "
+              "cell names a reader the site is not for -- move the page to the home the "
+              "AGENTS.md canonical-home table gives it, and its row to that section:")
+        for number, path, word in misplaced:
+            print(f"  AUDIENCE line {number}: {path} -- {word!r}")
     if ok:
         exempt = len(files) - len(required)
         print(
             f"Documentation map inventory covers all {len(required)} tracked docs "
             f"({total_actual} counting the map itself), no stale path cells, no "
-            f"re-aligned table rows ({exempt} root-level dot-directory tooling "
-            "files exempt)."
+            f"re-aligned table rows, no site row addressed to maintainers "
+            f"({exempt} root-level dot-directory tooling files exempt)."
         )
     return 0 if ok else 1
 

@@ -72,7 +72,7 @@ hypothetical — it is what kept the audit scenarios commented out in `TASKS` in
 `hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks returned `status: "error"` without
 an `issues: read` credential the Prow job supplied. That was rung 2 working, not misfiring; the job
 mounts one now. The canary `compliance-rbac-overgrant` runs on every presubmit, and the other audit
-scenarios run in the nightly tier only (`NIGHTLY_TASKS` in `hack/ci-eval-pr.sh`), kept
+scenarios run in the nightly tier only (`hack/eval/nightly-cases.txt`), kept
 out of the presubmit on cost. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
@@ -813,13 +813,16 @@ merge-rate data:
 
 Three numbers in it are priced rather than measured. The repetition count is the script's default 3
 unless the job sets `EVAL_REPETITIONS`. The timeout is `480m`, not the presubmit's `360m`: the
-twenty-six-task matrix prices at ~532–552 serial minutes at three repetitions (the `NIGHTLY_TASKS`
-comment in `hack/ci-eval-pr.sh`), and the presubmit realised only ~1.15× on whole-job wall clock
-against its serial matrix estimate on 2026-09-10 (the periodic's timeout comment; the fixed
-provision-and-deploy term is inside that figure, which is why it sits far below the unit-loop
-speed-ups measured under [Open items](#open-items)), at which the night projects to ~470–490
-minutes — `360m` would truncate most
-nights, and the job gates nothing, so a long night costs a lease and nothing else. The fan-out is
+twenty-six-task matrix priced at ~532–552 serial minutes at three repetitions, and the presubmit
+realised only ~1.15× on whole-job wall clock against its serial matrix estimate on 2026-09-10 (the
+periodic's timeout comment; the fixed provision-and-deploy term is inside that figure, which is
+why it sits far below the unit-loop speed-ups measured under [Open items](#open-items)), at which
+that night projected to ~470–490 minutes — `360m` would truncate most nights, and the job gates
+nothing, so a long night costs a lease and nothing else. The thirty-nine-task matrix since
+2026-09-16 prices at ~775–795 serial minutes (the budget paragraph in
+`hack/eval/nightly-cases.txt`), which at 1.15× is ~675–690 — over `480m` — and fits only if the
+nightly, alone on the quota and two lanes wider, realises ~1.65×; the first nights measure it
+(#1491). The fan-out is
 `EVAL_TASK_PARALLELISM=6`, wider than the presubmit's 4, because the nightly is alone on the model
 quota at its hour. The binding constraint on the first two is that `gpu-stress-test-diagnosis`
 re-applies its OpenTofu GPU stack on **every** repetition, so the cost per repetition is not the ~90s
@@ -971,7 +974,7 @@ inconvenient.
 
 ### The roster, and the mode
 
-`BOOTSTRAP_ADMITTED` names the cases that block. A listed case arms rung 4 by the list's say-so.
+`BOOTSTRAP_ADMITTED`, read from `hack/eval/blocking-roster.txt`, names the cases that block. A listed case arms rung 4 by the list's say-so.
 While the store holds nothing for it at the current key it also leaves rung 6 quiet and contributes
 nothing to `main`'s side of the aggregate; once the nightly has appended a partial window
 (`collecting`), that evidence feeds both.
@@ -1009,7 +1012,7 @@ that did not reach it, silently disarms the case it was meant to protect, and th
 exactly the way it would have if the list were right. `bench-gate suite` therefore intersects the
 list against the ids it actually graded and prints every unmatched name on stderr and as a banner
 in the markdown verdict. It is a warning rather than a red: the list is also legitimately allowed
-to name a case that is deactivated in the `TASKS` array or skipped on a given run, and redding for
+to name a case that is not in `hack/eval/presubmit-cases.txt` or skipped on a given run, and redding for
 that would make the roster harder to hold than the thing it protects.
 
 ## How "judged scores below main's baseline" is determined
@@ -1181,9 +1184,9 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   | 3    | 51          | **184min** | 0.82× | **1.30×** | **1.96×** |
 
   `150m` would still have been a guaranteed timeout, which is what made #2669 a prerequisite rather
-  than a follow-up. The rows count the matrix at seventeen active tasks; recount the uncommented
-  entries in `TASKS` rather than trusting the number here, which has fallen behind the matrix three
-  times.
+  than a follow-up. The rows count the matrix at seventeen active tasks; recount
+  `hack/eval/presubmit-cases.txt` rather than trusting the number here, which has fallen behind the
+  matrix three times.
 
   **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
   now runs the matrix as a bounded parallel fan-out of (task, repetition) units
@@ -1235,7 +1238,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   request can replace, and nothing in this repository fails when it runs out. Four successive
   numbers have been invalidated the same way. Activating a case and raising the budget should be one
   change in two repositories, not a change and a follow-up — the comment above `EVAL_REPETITIONS` in
-  `hack/ci-eval-pr.sh` says so where someone about to uncomment a line will read it.
+  `hack/ci-eval-pr.sh` says so where someone about to add a presubmit line will read it.
 
   **Retry-on-failure — one repetition, two more only if the first fails — is the obvious way to buy
   that runtime back, and it is deliberately not taken.** On a green run it would cost 17

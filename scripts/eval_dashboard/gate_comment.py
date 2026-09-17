@@ -492,8 +492,8 @@ def parse_args(argv):
     parser.add_argument("--state", required=True, help="this script's state: local path or gs:// object")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the pull requests live in")
     parser.add_argument("--now", type=health.parse_when, help="evaluate as of this ISO 8601 time (default: data.json's generated_at, else the wall clock)")
-    parser.add_argument("--admitted", help="comma-separated admitted roster (default: BOOTSTRAP_ADMITTED in hack/ci-eval-pr.sh)")
-    parser.add_argument("--ci-eval-script", type=pathlib.Path, default=health.CI_EVAL_SCRIPT, help=argparse.SUPPRESS)
+    parser.add_argument("--admitted", help="comma-separated admitted roster (default: hack/eval/blocking-roster.txt)")
+    parser.add_argument("--blocking-roster", "--ci-eval-script", dest="blocking_roster", type=pathlib.Path, default=health.BLOCKING_ROSTER_FILE, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="print the comments instead of posting; still updates --state")
     return parser.parse_args(argv)
 
@@ -505,7 +505,7 @@ def main(argv=None, runner=subprocess.run, gh_runner=None) -> int:
     if data is None or health_doc is None:
         log(f"ERROR: {args.data} and {args.health} must both be readable JSON objects")
         return 1
-    roster = health.Roster.fixed(name for name in args.admitted.split(",") if name) if args.admitted else health.Roster.from_script(args.ci_eval_script)
+    roster = health.Roster.fixed(name for name in args.admitted.split(",") if name) if args.admitted else health.Roster.from_file(args.blocking_roster)
     now = args.now or health.parse_iso(data.get("generated_at")) or datetime.now(UTC)
     gh = ghcli.Gh(args.repo, gh_runner or runner, dry_run=args.dry_run)
     state = post_health.read_state(args.state, runner)

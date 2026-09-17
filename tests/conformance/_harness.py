@@ -268,6 +268,29 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
     ),
+    # A3's task-plane writer sets. The bus principals are data in one Go file
+    # (the rendered map and the static nats.conf users come from the same
+    # list), except the session's, which the callout derives from the
+    # attested pod name at mint time and which is therefore in no map at all.
+    # Two files, two modules, and the writer-set invariant is about the union.
+    "a2a_identities": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("func gatewayIdentity", "func workerIdentity", "a2a.tasks.*.*.supervisor"),
+    ),
+    "a2a_session_grants": Source(
+        "a2a/authcallout/session.go",
+        ("func sessionGrants", "lib.TaskEventsSubject(pod,"),
+    ),
+    # What the server actually loads, as opposed to what the Go builders say.
+    # The writer-set tests read both and assert they agree: the Go map is what
+    # a developer edits, this is what NATS enforces, and a reader of only the
+    # first has been wrong before -- a builder that assembled its list in a
+    # local variable instead of a struct literal parsed as *no grants at all*,
+    # which made A3's own known violation report as closed.
+    "a2a_rendered_nats_conf": Source(
+        "a2a/authcallout/testdata/rendered-nats.conf",
+        ("user: worker", "auth_users:", "a2a.tasks.*.*.supervisor"),
+    ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
         "scripts/sync-upstream-skills.py",

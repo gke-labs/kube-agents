@@ -19,7 +19,7 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -115,6 +115,48 @@ prettier-check: ## Check Markdown/YAML formatting (CI runs this).
 
 prettier-write: ## Reformat all Markdown/YAML in place.
 	$(PRETTIER) --write "**/*.md" "**/*.yaml" "**/*.yml"
+
+# Every tracked shell script through shellcheck. The `validate` job in
+# .github/workflows/validate.yml runs this target on every pull request with
+# the shellcheck release it pins there, so a warning in a tracked script fails
+# the merge; run it with that release locally, since the apt package is older
+# and reports a different set. No `-s`: each shebang decides the dialect, so
+# deploy/shared/docker-entrypoint.sh (`#!/bin/sh`) is checked as POSIX sh.
+# SC1090 joins SC1091 in the exclude list because scripts/installer/common.sh
+# sources a runtime path that `-x` cannot follow; every other finding is fixed
+# or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
+# list is how a real finding gets silenced.
+#
+# The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
+# copies of google/skills that scripts/sync-upstream-skills.py deletes and
+# re-copies wholesale (AGENTS.md, Skills Guidelines), and its substitution
+# hooks rewrite SKILL.md only, so a directive or fix written into one of their
+# .sh files lasts until the next sync and the target goes red on a tree nobody
+# edited by hand. A warning in one of them is fixed upstream, not here.
+SHELLCHECK_PATHSPEC := *.sh
+SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-*
+SHELLCHECK_SEVERITY := warning
+SHELLCHECK_EXCLUDE := SC1090,SC1091
+
+shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
+		exit 1; \
+	}
+	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
+
+# ruff's error-only rules: syntax errors (E9), comparisons that are always
+# wrong (F63), misplaced control flow (F7) and undefined names (F82) -- the
+# class of defect #1413 fixed by hand. tests/test_lint_python.py runs this same
+# command, so `make test-python` and `make coverage` already enforce it on
+# every pull request; this target is the developer entry point, and the test
+# asserts its rule set matches this one. --isolated because the repository has
+# no ruff config file and a user-level one must not change the verdict. ruff
+# itself comes from requirements-test.txt (`make test-python-deps`).
+RUFF_SELECT := E9,F63,F7,F82
+
+lint-python: ## Run ruff's error rules over every Python file (the set tests/test_lint_python.py enforces).
+	@python3 -m ruff check --isolated --select $(RUFF_SELECT) .
 
 # Unit tests for every Python helper outside k8s-operator/, which has its own
 # target. Mostly stdlib-only -- the skill helpers shell out to gh/kubectl
@@ -540,7 +582,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_docs.py --check
@@ -553,6 +595,9 @@ docs-check-terminology:
 
 docs-check-map:
 	@python3 scripts/check_docs_map.py
+
+docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
+	@python3 scripts/check_docs_audience.py
 
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py

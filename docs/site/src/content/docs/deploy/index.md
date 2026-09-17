@@ -15,3 +15,4 @@ Pages in this section:
 - [**Release versioning & promotion**](/kube-agents/deploy/release-versioning/) — how candidate builds are promoted to SemVer releases across Docker images, Helm charts, and Terraform modules.
 - [**Telemetry**](/kube-agents/deploy/telemetry/) — OpenTelemetry + Prometheus + Cloud Logging.
 - [**GitOps with ArgoCD**](/kube-agents/deploy/gitops-argocd/) — standing up the reconciler that applies what the agent proposes.
+- [**Rolling back a release**](/kube-agents/deploy/rollback/) — moving an install from GA release N back to N-1 with the N-1 checkout's `upgrade.sh`, and what that leaves in place.

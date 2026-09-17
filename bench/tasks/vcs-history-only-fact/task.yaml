@@ -26,7 +26,8 @@
 # `git-access-ab/r200` must exist in the GitOps repository the install under
 # test manages. It does in the dev project; each eval pool project's
 # `<project>-infra` repository needs it pushed once at fleet activation, which
-# is why the registration is parked until that step is done.
+# is why the case waits as a FIXTURE_NOT_READY entry in
+# scripts/validate_bench_cases.py (#1253) rather than in a roster file.
 #
 # Expected cost bracket: ~150-400s -- one delegation round trip, one broker
 # clone (a 200-file corpus, well under the bundle ceiling) and a local `git log`.

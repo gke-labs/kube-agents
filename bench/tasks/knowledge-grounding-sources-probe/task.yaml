@@ -35,7 +35,7 @@
 # pull request on the pool's provisioning date rather than on the diff.
 #
 # Isolation class: read-only (no cluster touched at all).
-# Tier: nightly -- registered in hack/ci-eval-pr.sh NIGHTLY_TASKS since
+# Tier: nightly -- registered in hack/eval/nightly-cases.txt since
 # 2026-09-09, after one presubmit cycle in TASKS (#945: 2/3 on the build
 # above, then 3/3 on build 2097414338968031232 once the citation check was
 # widened). Held out of presubmit deliberately, not for cost or flake:

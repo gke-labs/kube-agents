@@ -28,15 +28,37 @@ import (
 
 const (
 	// defaultMaxMessages is how many messages one Pull asks for. The surviving
-	// post-sink stream measured about 0.7 messages a second, so this drains a
-	// couple of minutes of backlog per round trip and is far below the API's
-	// 1000 ceiling.
+	// post-sink stream measured about 0.7 messages a second on a two-cluster
+	// project and up to 10 a second on three busier ones, so a round trip
+	// drains somewhere between ten seconds and two minutes of backlog -- and
+	// stays far below the API's 1000 ceiling at either end.
 	defaultMaxMessages = 100
 
 	// idlePollInterval is how long to wait after an empty Pull before asking
 	// again. Synchronous pull returns promptly when the backlog is empty, so
 	// without this the loop spins against the API.
 	idlePollInterval = 5 * time.Second
+
+	// idleReportInterval is how long the loop goes delivering nothing before it
+	// says so. Without it a detector whose subscription is empty is completely
+	// silent: an empty Pull is not an error, so there is no retry line, no
+	// batch-skip line, and no progress line either, because the progress line
+	// is driven from driftFilter.Handle and a record that never arrives never
+	// reaches it. A Log Router sink whose filter stopped matching therefore
+	// reads exactly like a fleet nobody is changing -- and it is the failure
+	// this whole pipeline is least able to notice, because "no drift" is the
+	// expected steady state.
+	//
+	// Deliberately the same length as countsLogMaxInterval: between the two,
+	// the pod logs something every fifteen minutes in every state it can be in,
+	// which is the property an operator actually wants and neither delivers
+	// alone.
+	idleReportInterval = countsLogMaxInterval
+
+	// unattributedListSeparator joins the principal names in a progress line.
+	// A comma and a space rather than a space alone, because an entry is
+	// "principal=count" and unattributedOverflowLabel contains spaces.
+	unattributedListSeparator = ", "
 
 	// pullBackoffInitial and pullBackoffMax bound the exponential backoff
 	// applied after a failed Pull. The ceiling is deliberately shorter than
@@ -195,8 +217,9 @@ func (p *pubsubSource) Nack(ctx context.Context, ackIDs []string) error {
 	return nil
 }
 
-// recordHandler consumes one parsed audit record. T2 classifies, T3 enriches,
-// and T4 injects behind this signature; T1 ships logRecord.
+// recordHandler consumes one parsed audit record. T3 enriches and T4 injects
+// behind this signature; what ships behind it today is driftFilter.Handle,
+// which classifies and then forwards what survives to logActionable.
 type recordHandler func(AuditRecord)
 
 // subscriberCounts is what the loop has done since it started. Exported
@@ -223,6 +246,14 @@ type subscriber struct {
 	maxMessages int64
 	idleWait    time.Duration
 	counts      subscriberCounts
+
+	// idleReport is how long the loop tolerates delivering nothing before
+	// logging that fact. A field rather than the constant read directly, so a
+	// test can drive the branch without waiting a quarter of an hour.
+	idleReport time.Duration
+
+	// now is the clock idleReport is measured against. nil means time.Now.
+	now func() time.Time
 }
 
 func newSubscriber(source messageSource, handle recordHandler, maxMessages int64) *subscriber {
@@ -234,12 +265,27 @@ func newSubscriber(source messageSource, handle recordHandler, maxMessages int64
 		handle:      handle,
 		maxMessages: maxMessages,
 		idleWait:    idlePollInterval,
+		idleReport:  idleReportInterval,
 	}
 }
 
+// clock reads the loop's injectable time source.
+func (s *subscriber) clock() time.Time {
+	if s.now == nil {
+		return time.Now()
+	}
+	return s.now()
+}
+
 // Run pulls until the context is cancelled, returning the context's error.
+//
+// lastDelivery starts at the current time rather than the zero value, so the
+// first idle line is owed idleReportInterval after start-up instead of on the
+// first empty pull. The startup line has already said the loop is alive; the
+// idle line's job is to keep saying it.
 func (s *subscriber) Run(ctx context.Context) error {
 	backoff := pullBackoffInitial
+	lastDelivery := s.clock()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -261,6 +307,12 @@ func (s *subscriber) Run(ctx context.Context) error {
 		backoff = pullBackoffInitial
 
 		if len(messages) == 0 {
+			// Reset on report rather than only on delivery, so a subscription
+			// that stays empty says so every interval instead of once.
+			if now := s.clock(); now.Sub(lastDelivery) >= s.idleReport {
+				logIdle(s.idleReport, s.counts)
+				lastDelivery = now
+			}
 			if !sleepCtx(ctx, s.idleWait) {
 				return ctx.Err()
 			}
@@ -268,6 +320,11 @@ func (s *subscriber) Run(ctx context.Context) error {
 		}
 
 		s.processBatch(ctx, messages)
+		// After the batch, not before: a subscription delivering steadily must
+		// never report itself idle, and settling a full batch is the slowest
+		// step in the loop. Reading the clock on the near side would start the
+		// interval before the work rather than at the end of it.
+		lastDelivery = s.clock()
 	}
 }
 
@@ -341,31 +398,69 @@ func (s *subscriber) Counts() subscriberCounts {
 	return s.counts
 }
 
-// logRecord is T1's handler: it writes the parsed record to the structured log
-// and does nothing else. T1's acceptance criterion is that a kubectl patch
-// shows up here, with all five fields populated and the resource path
-// decomposed.
-func logRecord(record AuditRecord) {
-	// project and location are logged alongside the cluster name because a
-	// cluster name is only unique within a project and a location -- the fleet
-	// ambiguity AuditRecord's comment describes. Reading the log without them
-	// cannot tell two same-named clusters apart, which is the mistake T2's
-	// classification would then inherit.
-	log.Printf("drift-detector: audit cluster=%s project=%s location=%s principal=%q verb=%s method=%s resource=%s group=%q version=%s namespace=%q name=%q subresource=%q user_agent=%q timestamp=%s insert_id=%s",
+// logCountsProgress reports the running tally every countsLogInterval records,
+// so that the measurement survives a pod that is killed rather than stopped and
+// so that a detector seeing no human changes still says it is alive.
+func logCountsProgress(handled int, counts TierCounts, unattributed []string) {
+	if len(unattributed) == 0 {
+		log.Printf("%s: progress handled=%d (%s)", commandName, handled, counts)
+		return
+	}
+	log.Printf("%s: progress handled=%d (%s) unattributed_principals=[%s]",
+		commandName, handled, counts, strings.Join(unattributed, unattributedListSeparator))
+}
+
+// logIdle reports that the subscription has delivered nothing for a while.
+//
+// The running totals go out with it because they are what separates the two
+// cases an operator has to tell apart: a detector that has been working and
+// has gone quiet carries non-zero counts, while one whose sink or subscription
+// was never wired up correctly reports zeroes and has done since it started.
+// Without them the line says the process is alive, which is the less useful
+// half of the question.
+func logIdle(interval time.Duration, counts subscriberCounts) {
+	log.Printf("%s: idle, no messages delivered in %s (parsed=%d skipped=%d failed=%d)",
+		commandName, interval, counts.Parsed, counts.Skipped, counts.Failed)
+}
+
+// logActionable is T2's terminal handler: a record that survived the tier and
+// outcome filters, which is a successful change made by a person. T3 replaces
+// this with the managedFields join and T4 with the inject.
+func logActionable(record AuditRecord) {
+	// method= carries the fully qualified audit method, which is the only field
+	// here that names the API group and version: Resource.String() renders
+	// namespace/resource/name/subresource and drops both, so without it a DRIFT
+	// line for "prod/widgets/foo" cannot be told from a same-named CRD in
+	// another group. It is also the string to paste back into a
+	// `gcloud logging read` filter to find the entry again.
+	log.Printf("drift-detector: DRIFT cluster=%s project=%s location=%s principal=%q method=%s verb=%s resource=%s user_agent=%q timestamp=%s insert_id=%s",
 		record.Cluster,
 		record.Project,
 		record.Location,
 		record.Principal,
-		record.Verb,
 		record.MethodName,
+		record.Verb,
 		record.Resource.String(),
-		record.Resource.Group,
-		record.Resource.Version,
-		record.Resource.Namespace,
-		record.Resource.Name,
-		record.Resource.Subresource,
 		record.UserAgent,
 		record.Timestamp.Format(time.RFC3339),
+		record.InsertID,
+	)
+}
+
+// logDroppedRecord reports one filtered record, behind --log-dropped. The tier
+// and the reason are both given because they answer different questions: the
+// tier is what the principal was taken to be, the reason is why that meant no
+// inject. A record dropped for a failed call carries the tier it would have
+// had, which is what makes "my change was rejected" distinguishable from "my
+// change was classified as automation".
+func logDroppedRecord(record AuditRecord, tier Tier, reason string) {
+	log.Printf("drift-detector: dropped tier=%s reason=%q cluster=%s principal=%q verb=%s resource=%s insert_id=%s",
+		tier,
+		reason,
+		record.Cluster,
+		record.Principal,
+		record.Verb,
+		record.Resource.String(),
 		record.InsertID,
 	)
 }

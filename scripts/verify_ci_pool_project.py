@@ -215,13 +215,36 @@ RUNNERS = (
     ("The nightly runner", "the nightly periodic", NIGHTLY_RUNNER_MEMBER),
 )
 
-# Every (label, member) that may mint a token as the fleet reader: the two
-# runners today. Its own tuple rather than a read of RUNNERS because the two
-# sets are about to diverge -- the CI health bot's hourly fixture scan (#1612)
-# borrows the reader without leasing a project, so it joins this list and not
-# RUNNERS. Kept equal to bench/tf/fleet's `fleet_reader_token_creators`
-# default by scripts/test_verify_ci_pool_project.py.
-FLEET_READER_TOKEN_CREATORS = tuple((label, member) for label, _, member in RUNNERS)
+# The one borrower of seeded-fleet-reader that leases no project: the CI health
+# bot's hourly seeded-fleet scan (.github/workflows/ci-health.yml,
+# docs/ci-health.md "The seeded-fleet scan") runs as
+# eval-dashboard-publisher@kube-agents-prow and impersonates the reader in every
+# pool project, holding nothing else there. Without the grant the scan reports
+# the project as "not checked" and fixture drift there goes unseen.
+CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com"
+
+# What a runner loses without the token-creator grant; the bot's loss is
+# different and is spelled out in its own entry below.
+_RUNNER_WITHOUT_TOKEN_CREATOR = (
+    "every fleet check it runs in this project runs under its own read-write "
+    "credential. Re-apply bench/tf/fleet against {project_id}."
+)
+
+# Every member that must hold roles/iam.serviceAccountTokenCreator on the
+# fleet reader, as (label, member, what a missing grant costs and how to repair
+# it): the two runners, then the CI health bot. Kept equal to bench/tf/fleet's
+# `fleet_reader_token_creators` default by scripts/test_verify_ci_pool_project.py.
+FLEET_READER_TOKEN_CREATORS = tuple(
+    (label, member, _RUNNER_WITHOUT_TOKEN_CREATOR) for label, _, member in RUNNERS
+) + (
+    (
+        "The CI health bot",
+        CI_HEALTH_BOT_MEMBER,
+        "its hourly seeded-fleet scan reports {project_id} as not checked and fixture "
+        "drift there goes unseen. Re-apply bench/tf/fleet against {project_id}, or run "
+        "the grant in docs/ci-health.md (The seeded-fleet scan).",
+    ),
+)
 
 # The set kube-agents-evals holds, matched literally rather than by permission.
 # Not minimal -- container.admin subsumes container.developer, viewer subsumes
@@ -1033,14 +1056,13 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             for b in policy.get("bindings", []):
                 if b.get("role") == "roles/iam.serviceAccountTokenCreator":
                     token_creators.update(b.get("members", []))
-            for label, member in FLEET_READER_TOKEN_CREATORS:
+            for label, member, consequence in FLEET_READER_TOKEN_CREATORS:
                 if member not in token_creators:
                     passed = False
                     details.append(
                         f"{label} ({member.split(':', 1)[1]}) is missing "
-                        f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so every "
-                        f"fleet check it runs in this project runs under its own read-write "
-                        f"credential. Re-apply bench/tf/fleet against {project_id}."
+                        f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so "
+                        + consequence.format(project_id=project_id)
                     )
         except Exception as exc:
             passed = False

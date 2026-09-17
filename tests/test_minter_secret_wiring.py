@@ -1,8 +1,7 @@
 """How the RC pipeline delivers the token minter's environment secrets.
 
-GH_APP_ID and GH_APP_PRIVATE_KEY live on the `rc` GitHub environment. Reaching
-them from a called workflow takes two things at once, and having only one of
-them fails silently:
+GH_APP_ID lives on the `rc` GitHub environment. Reaching it from a called
+workflow takes two things at once, and having only one of them fails silently:
 
   1. the called workflow's job declares `environment: rc`, and
   2. the calling job passes `secrets: inherit`.
@@ -97,11 +96,11 @@ class RcMinterSecretWiringTest(unittest.TestCase):
                 job = next(iter(jobs.values()))
                 self.assertEqual(job.get("environment"), "${{ inputs.github_environment }}")
 
-    def test_the_called_job_reads_both_app_secrets_from_the_environment(self):
+    def test_the_called_job_reads_app_id_secret_from_the_environment(self):
         """Pins what the inherit is for, so a rename cannot quietly orphan it."""
         body = _DEPLOY.read_text()
-        for secret in ("secrets.GH_APP_ID", "secrets.GH_APP_PRIVATE_KEY"):
-            self.assertIn(secret, body)
+        self.assertIn("secrets.GH_APP_ID", body)
+        self.assertNotIn("secrets.GH_APP_PRIVATE_KEY", body)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS.
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt.
 #
 # Domain: cluster debugging. Journey: the reported fault is not there, and
 # the correct answer is to say so.

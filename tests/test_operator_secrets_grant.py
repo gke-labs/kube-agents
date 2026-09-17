@@ -1,12 +1,18 @@
 """The operator's `secrets` grant, and the ceiling on it.
 
-Two callers need a Secret verb on `manager-role`:
+Three callers need a Secret verb on `manager-role`:
 
 - `checkShellSandboxKeys` needs `get`. It asks whether the sandbox's
   authorized-keys Secret exists so the CR can say so, because that Secret is the
   one mount a pod cannot start without, and a missing one is otherwise fifteen
   minutes of `ContainerCreating` with the cause on an object nobody is looking
   at. It reads no value out of the Secret and creates that Secret nowhere.
+- `stampSecretEnvHash` needs `get`, and unlike the caller above it **reads the
+  values**: it digests the Secret keys the agent pod consumes as environment onto
+  the pod template, so that rotating one rolls the pod
+  (`k8s-operator/internal/controller/platformagent_secret_hash.go`). Which
+  Secrets it reads is decided by the rendered pod spec, so a CR- or
+  plugin-supplied `SecretKeyRef` is covered. Every read is by name and uncached.
 - The `mode: next` A2A render needs `create`/`update`/`patch`/`delete`. The
   operator generates the NATS credential Secret once and repairs a missing key,
   renders the config Secret, and deletes the config Secret on the way back to
@@ -15,7 +21,7 @@ Two callers need a Secret verb on `manager-role`:
 The verb set was `{get}` until the A2A render landed. It widened once,
 deliberately, and this file is what keeps it from widening again by accident:
 the set is pinned exactly, so an addition fails here rather than passing
-silently under the trivy ignore.
+silently under the trivy ignore. The digest caller added no verb.
 
 `list` and `watch` are the ones that stay refused, and they are asserted
 separately below rather than left implicit in the exact-set check. They are the
@@ -74,7 +80,7 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             f"expected one rule naming {SECRETS_RESOURCE}, found {len(rules)}: {rules}",
         )
 
-    def test_the_secret_verbs_are_exactly_the_set_two_callers_need(self):
+    def test_the_secret_verbs_are_exactly_the_set_three_callers_need(self):
         rule = _secret_rules()[0]
         self.assertEqual(set(rule.get("verbs") or []), PERMITTED_SECRET_VERBS)
         self.assertEqual(rule.get("apiGroups"), [CORE_API_GROUP])

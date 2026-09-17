@@ -2154,7 +2154,7 @@ class IamGrantsTest(unittest.TestCase):
     def _fleet_reader_policy(self, members=None):
         """seeded-fleet-reader's own policy, with every listed borrower on it."""
         if members is None:
-            members = [member for _, member in checker.FLEET_READER_TOKEN_CREATORS]
+            members = [member for _, member, _ in checker.FLEET_READER_TOKEN_CREATORS]
         return json.dumps(
             {"bindings": [{"role": "roles/iam.serviceAccountTokenCreator", "members": members}]}
         )
@@ -2614,7 +2614,7 @@ class IamGrantsTest(unittest.TestCase):
         # postdates every apply. "Every other" rather than the presubmit's
         # alone so that a borrower added to FLEET_READER_TOKEN_CREATORS later
         # (the CI health bot, #1612) does not turn this into a two-finding case.
-        others = [m for _, m in checker.FLEET_READER_TOKEN_CREATORS if m != checker.NIGHTLY_RUNNER_MEMBER]
+        others = [m for _, m, _ in checker.FLEET_READER_TOKEN_CREATORS if m != checker.NIGHTLY_RUNNER_MEMBER]
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
@@ -2629,6 +2629,28 @@ class IamGrantsTest(unittest.TestCase):
         self.assertEqual(len(token_creator), 1, result.details)
         self.assertIn("The nightly runner (eval-baseline-recorder@kube-agents-prow", token_creator[0])
         self.assertNotIn("prowjob-default-sa", token_creator[0])
+
+    def test_fleet_reader_missing_only_the_health_bot_fails_and_names_it(self):
+        # The pool's state before the grant in docs/ci-health.md was run: every
+        # runner can borrow the reader, the CI health bot's hourly scan cannot,
+        # so the project is invisible to fixture-drift detection.
+        runners = [m for _, m, _ in checker.FLEET_READER_TOKEN_CREATORS if m != checker.CI_HEALTH_BOT_MEMBER]
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy(members=runners)),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        bot = [d for d in result.details if "CI health bot" in d]
+        self.assertEqual(len(bot), 1, result.details)
+        self.assertIn("eval-dashboard-publisher@kube-agents-prow", bot[0])
+        self.assertIn("docs/ci-health.md", bot[0])
+        self.assertFalse(any("The Prow runner" in d for d in result.details), result.details)
+        self.assertFalse(any("The nightly runner" in d for d in result.details), result.details)
 
     def test_fleet_reader_account_absent_fails(self):
         # kube-agents-evals and -2, -3, -4 as they stood on 2026-09-03: fleets
@@ -2801,7 +2823,7 @@ class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
         self.assertIsNotNone(default, "fleet_reader_token_creators has no default")
         members = re.findall(r'"([^"]+)"', default.group(1))
         self.assertEqual(
-            sorted(members), sorted(member for _, member in checker.FLEET_READER_TOKEN_CREATORS)
+            sorted(members), sorted(member for _, member, _ in checker.FLEET_READER_TOKEN_CREATORS)
         )
 
 

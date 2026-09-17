@@ -268,12 +268,24 @@ make undeploy-litellm
 
 The GitHub Token Broker (Minty) can be deployed to the Kubernetes cluster using the `kustomize` targets in the Makefile.
 
+> [!NOTE]
+> **Ahead-Of-Time (AOT) Infrastructure & Local Development:**
+>
+> - This manual `make deploy-github` path requires **Ahead-Of-Time (AOT)** provisioning: the GitHub App and Cloud KMS asymmetric signing key (with its imported private key) must be provisioned upfront (unlike `install.sh --github-pem-path`, which can import `.pem` automatically).
+> - For **local operator development** (`make run`, Kind, Minikube), Minty is completely **optional** and not required for reconciling `PlatformAgent` resources or cluster observation. It is only dialed at runtime when GitOps skills (`submit-suggestion`, `fleet-audit`) open pull requests.
+> - Setup guides: [Token minter](../docs/site/src/content/docs/deploy/token-minter.md) and upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter).
+
 ### Prerequisites
 
 Before deploying the GitHub integration, ensure you have:
 
-1. Created the `github-app-credentials` Secret containing your GitHub App ID in the destination namespace.
-2. Completed the Workload Identity and GCP Cloud KMS setup (see [config/integrations/github/README.md](config/integrations/github/README.md) for details).
+1. Created the `github-app-credentials` Secret containing your GitHub App ID (`app-id`) in the destination namespace:
+   ```bash
+   kubectl create secret generic github-app-credentials \
+     --namespace kubeagents-system \
+     --from-literal=app-id="<GITHUB_APP_ID>"
+   ```
+2. Completed the Workload Identity and GCP Cloud KMS AOT setup (see [config/integrations/github/README.md](config/integrations/github/README.md) for details).
 
 ### Step-by-Step Deployment
 

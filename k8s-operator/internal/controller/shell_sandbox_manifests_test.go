@@ -71,10 +71,11 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	// The whole list, by name, rather than a count: every volume here is a way to
 	// put bytes into the pod the agent can run arbitrary commands in, so adding one
-	// should be a decision someone makes on purpose. Exactly four are allowed —
+	// should be a decision someone makes on purpose. Exactly five are allowed —
 	// the authorized-keys Secret, the SETTINGS.md ConfigMap, the token the shell
-	// presents to the credential runtime, and the empty mount over ~/.hermes.
-	// Anything else fails here and gets argued about in review.
+	// presents to the credential runtime, the empty mount over ~/.hermes, and the
+	// GitOps state ConfigMap. Anything else fails here and gets argued about in
+	// review.
 	//
 	// The third one is a credential, unlike the others, and it is here because
 	// the alternative is not "the sandbox holds nothing" but "the sandbox cannot
@@ -86,11 +87,17 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	// cannot be replaced with a writable directory, which is the one write channel
 	// the sandbox has back into the agent pod. See shellSandboxHermesHomePath;
 	// that it is empty and read-only is asserted below.
+	//
+	// The fifth is two repository lists an administrator wrote, read-only, the
+	// same ConfigMap the agent container mounts; it is a ConfigMap and not a
+	// Secret, which TestShellSandboxReadsTheGitopsStateFromDisk asserts along
+	// with the path (#1590).
 	allowed := map[string]bool{
 		shellSandboxKeysVolume:                 true,
 		shellSandboxSettingsVolume:             true,
 		shellSandboxCredentialProxyTokenVolume: true,
 		shellSandboxHermesHomeVolume:           true,
+		gitopsStateVolumeName:                  true,
 	}
 	byName := map[string]corev1.Volume{}
 	for _, v := range pod.Volumes {
@@ -253,6 +260,77 @@ func TestShellSandboxRetainsItsVolumesOnDeleteAndScale(t *testing.T) {
 	if len(claims) != 2 || !claims[shellSandboxDataVolume] || !claims[shellSandboxSshdVolume] {
 		t.Fatalf("expected %q and %q volumeClaimTemplates, got %#v",
 			shellSandboxDataVolume, shellSandboxSshdVolume, sts.Spec.VolumeClaimTemplates)
+	}
+}
+
+// The skills that end in a pull request or a ledger issue run in this pod, and
+// gitops_workspace._read_state_key reads the managed-repository list from
+// GITOPS_STATE_PATH (default /etc/gitops/managed_repos) when the file is there
+// and otherwise runs `kubectl get configmap` with the shell's ambient context.
+// Without this mount every prepare in the sandbox took the fallback, and in a
+// fleet task the ambient context is usually a fleet cluster with no
+// kubeagents-system namespace (#1590). The mount has to be the agent
+// container's, at the agent container's path, because no environment variable
+// set on this container reaches an ssh session: deploy/sandbox/entrypoint.sh
+// forwards an allowlist, and GITOPS_STATE_PATH is deliberately not on it.
+func TestShellSandboxReadsTheGitopsStateFromDisk(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+	pod := sts.Spec.Template.Spec
+
+	var volume *corev1.Volume
+	for i := range pod.Volumes {
+		if pod.Volumes[i].Name == gitopsStateVolumeName {
+			volume = &pod.Volumes[i]
+		}
+	}
+	if volume == nil {
+		t.Fatalf("expected the %q volume, got %#v", gitopsStateVolumeName, pod.Volumes)
+	}
+	// A ConfigMap, never a Secret: this is the one volume shared with the agent
+	// container, and what makes sharing it safe is that it carries nothing but
+	// repository names. Built by the same function the agent and broker pods
+	// use, so the three cannot name different ConfigMaps.
+	if volume.ConfigMap == nil {
+		t.Fatalf("expected %q to be a ConfigMap volume, got %#v", gitopsStateVolumeName, volume.VolumeSource)
+	}
+	if want := agent.Name + "-gitops-state"; volume.ConfigMap.Name != want {
+		t.Errorf("expected the %q ConfigMap, got %q", want, volume.ConfigMap.Name)
+	}
+	if volume.ConfigMap.Optional != nil && *volume.ConfigMap.Optional {
+		t.Error("the state ConfigMap is reconciled before this StatefulSet, as it is before the agent's Deployment; optional here would turn a missing ConfigMap into an empty repository list instead of a pod that waits for it")
+	}
+
+	var mount *corev1.VolumeMount
+	for i, m := range pod.Containers[0].VolumeMounts {
+		if m.Name == gitopsStateVolumeName {
+			mount = &pod.Containers[0].VolumeMounts[i]
+		}
+	}
+	if mount == nil {
+		t.Fatalf("expected %q to be mounted in the shell container, got %#v", gitopsStateVolumeName, pod.Containers[0].VolumeMounts)
+	}
+	// The path is the contract with gitops_workspace.py's default, since no
+	// variable crosses sshd to override it; the agent container's mount is the
+	// same path, so the two pods read the same file by the same name.
+	if mount.MountPath != gitopsStateDir {
+		t.Errorf("expected the state mounted at %q (gitops_workspace.py's default parent), got %q", gitopsStateDir, mount.MountPath)
+	}
+	if !mount.ReadOnly {
+		t.Errorf("expected %q to be mounted read-only: the shell registers nothing", gitopsStateVolumeName)
+	}
+	if mount.SubPath != "" {
+		t.Errorf("expected a directory mount, got subPath %q: a subPath mount does not receive ConfigMap updates", mount.SubPath)
+	}
+	// Whatever the agent container mounts for this volume, the sandbox mounts the
+	// same way -- the reader is the same script in both pods.
+	for _, m := range buildDefaultVolumeMounts(defaultAgentHome) {
+		if m.Name != gitopsStateVolumeName {
+			continue
+		}
+		if m.MountPath != mount.MountPath || m.ReadOnly != mount.ReadOnly || m.SubPath != mount.SubPath {
+			t.Errorf("the sandbox's mount %#v differs from the agent container's %#v", *mount, m)
+		}
 	}
 }
 

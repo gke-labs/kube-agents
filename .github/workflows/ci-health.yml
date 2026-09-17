@@ -23,11 +23,13 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #   A. Collect runs as github-actions@kube-agents-prow. It is the only
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
-#      archive and the prior data.json and writes the merged data.json to
-#      the runner's disk. It writes nothing to any bucket. A read grant for
-#      the dedicated publisher has been requested from the OSS Prow owners;
-#      once it lands, this step switches account and the job is
-#      single-identity.
+#      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
+#      (kube-agents-owned; it holds objectViewer there too, and whichever
+#      account replaces it needs the same) and the prior data.json, and
+#      writes the merged data.json to the runner's disk. It writes nothing
+#      to any bucket. A read grant for the dedicated publisher has been
+#      requested from the OSS Prow owners; once it lands, this step
+#      switches account and the job is single-identity.
 #   B. Everything else runs as eval-dashboard-publisher@kube-agents-prow --
 #      the dedicated publisher hack/ci-eval-pr.sh names for this bucket. It
 #      holds roles/storage.objectUser on gs://kube-agents-dashboards and is
@@ -85,27 +87,53 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the job asks for pull-requests: write and issues: write and nothing else
 # does: the poster files the tracking issue a new OUTAGE lacks (label
 # presubmit-gate; it adopts a human's if one names the same cases, and
-# never closes one) and, for a new lost_pods condition, the issue the
-# cluster owner is owed (same label; it adopts a human's naming the same
-# nodes); scripts/eval_dashboard/gate_comment.py leaves one comment per
+# never closes one) and, for a new lost_pods or fixture_drift condition, the
+# issue the cluster owner or the fleet owner is owed (same label; it adopts
+# a human's naming the same nodes or roles);
+# scripts/eval_dashboard/gate_comment.py leaves one comment per
 # pull request whose smoke run went red -- or lost its build node -- since
 # the last tick, edited in place on later runs. Both are best-effort: a
 # GitHub failure is a warning, retried next tick, never a failed run.
+#
+# A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
+# runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
+# every pool project (scripts/eval_dashboard/fixture_state.py) and publishes
+# fixture-state.json beside health.json; the adjudicator reads it for the
+# fixture_drift condition, the digest carries one line of it, and a scan
+# that could check nothing is said once and is never a drift. Its own job
+# rather than a step gated on the top-of-hour tick, because it needs kubectl
+# and gke-gcloud-auth-plugin, runs thirty projects for a few minutes, and
+# must never delay the 15-minute verdict: the tick reads whatever scan is
+# published, and a late one is "stale" in health.json. Two crons fire at the
+# top of the hour; each run's `github.event.schedule` sends it to one job.
+# Every read the scan makes runs as that project's seeded-fleet reader, so
+# the publisher needs one grant per pool project and nothing on the project
+# itself (docs/ci-health.md, "The seeded-fleet scan"); a project without it
+# scans as "not checked".
 
 on:
   schedule:
+    # The refresh-and-adjudicate tick.
     - cron: "*/15 * * * *"
+    # The seeded-fleet scan (header). The :00 firing of the tick's cron is a
+    # separate run; the job guards below keep the two apart.
+    - cron: "0 * * * *"
+  #checkov:skip=CKV_GHA_7:One boolean, fixture_state_scan, which decides whether a manual run also scans the fleet; nothing is built and no input reaches a shell
   workflow_dispatch:
+    inputs:
+      fixture_state_scan:
+        description: "Also run the seeded-fleet scan (the hourly fixture-state job)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   id-token: write
 
-# One tick at a time. A slow tick overlapping the next would race on the
-# published data.json and the last-posted state object.
-concurrency:
-  group: ci-health
-  cancel-in-progress: false
+# One tick at a time, and one scan at a time -- set per job below rather than
+# here: a slow tick overlapping the next would race on the published
+# data.json and the last-posted state object, but the scan must not hold a
+# tick (or be held by one), so the two jobs queue on groups of their own.
 
 env:
   DASHBOARD_BUCKET: gs://kube-agents-dashboards/evals
@@ -119,16 +147,19 @@ env:
   CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
   # the smoke-test presubmit's archive, the nightly periodic's log prefix
-  # (same bucket, so the reader's grant already covers it; until the
-  # periodic exists the prefix lists nothing, which collect.py notes and
-  # carries on -- it is not the refusal line below until a night is on
-  # record, after which a prefix that stops listing is), the bound collect.py
+  # (its own bucket, gs://kube-agents-evals-nightly-logs, since the nightly's
+  # identity cannot write the cluster default; the collect step's
+  # github-actions@kube-agents-prow holds objectViewer on it. Until a night
+  # lands there the prefix holds no objects, which collect.py notes and
+  # carries on -- with or without a night on record from the old bucket; a
+  # prefix that fails to list for any other reason once a night is on
+  # record is the refusal line below), the bound collect.py
   # applies to a prior it finds unusable (a corrupt download; a missing one
   # stops the step before collect.py runs), and the freshness-badge
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
-  NIGHTLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/
+  NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -137,15 +168,26 @@ env:
   COLLECT_TIMEOUT_S: "1500"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
+  # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
+  # projects scanned at once, the ceiling per project for the runner and the
+  # state check together (a healthy project takes ~20 s; the ceiling is for
+  # a hung API server), and the ceiling for the whole scan.
+  FIXTURE_STATE_WORKERS: "6"
+  FIXTURE_STATE_PROJECT_TIMEOUT_S: "300"
+  FIXTURE_STATE_TIMEOUT_S: "1500"
 
 jobs:
   refresh-and-adjudicate:
     # Credentialed and schedule-triggered: never on a fork, never from a ref
     # other than main (.agents/rules/github_actions.md, and the guard
-    # rationale in the header).
-    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
+    # rationale in the header). The hourly cron's run belongs to the scan
+    # job below; a dispatch runs this job whatever its inputs.
+    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main' && (github.event_name != 'schedule' || github.event.schedule == '*/15 * * * *')
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: ci-health
+      cancel-in-progress: false
     # The workflow-level grant plus the two writes the header explains: the
     # gate comment on a pull request (a red run, or a lost build node) and
     # the tracking issue (an OUTAGE, or a lost_pods condition).
@@ -216,7 +258,7 @@ jobs:
           # attempt (header). Seed once by hand and the next tick is
           # incremental.
           if ! gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
-            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and write the bucket)"
+            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
@@ -276,15 +318,21 @@ jobs:
           # No state yet is the first tick, not an error.
           gsutil -q cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
           gsutil -q cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
+          # The hourly seeded-fleet scan's latest document (the scan job
+          # below); none yet means the scan has not run, and the adjudicator
+          # then has no fixture_state to report.
+          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true
 
       - name: Adjudicate
         run: |
           # --posted-state is the poster's file, read for the tracking issue
-          # the bot filed so health.json can cite it.
+          # the bot filed so health.json can cite it; --fixture-state is the
+          # hourly scan's document, for the fixture_drift condition.
           python3 scripts/eval_dashboard/health.py \
             --data work/data.json \
             --prev work/health-prev.json \
             --posted-state work/health-state.json \
+            --fixture-state work/fixture-state.json \
             --out work/health.json
           python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'
 
@@ -421,3 +469,86 @@ jobs:
             echo "::error::the Chat post failed (see its step); health.json was still published and the message is retried next tick"
           fi
           exit 1
+
+  # ---- The hourly seeded-fleet scan (header) ---------------------------------
+  fixture-state-scan:
+    # Same fork and ref guards as the tick. Runs on the hourly cron's firing,
+    # or on a dispatch that asked for it.
+    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main' && (github.event.schedule == '0 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.fixture_state_scan))
+    runs-on: ubuntu-latest
+    # FIXTURE_STATE_TIMEOUT_S plus setup and the upload.
+    timeout-minutes: 35
+    # The publisher's grant on the bucket is all this job writes with; it
+    # holds no GitHub write at all.
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: ci-health-fixture-state-scan
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      # kubectl for the presence probes and the state reads;
+      # gke-gcloud-auth-plugin for the kubeconfig gcloud writes before the
+      # runner rewrites it to the reader's exec credential (the plugin is the
+      # fallback when that rewrite cannot mint, and then every read fails as
+      # the publisher, which holds nothing on the project: "not checked").
+      - name: Set up Cloud SDK (with kubectl and the GKE auth plugin)
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          install_components: gke-gcloud-auth-plugin,kubectl
+
+      - name: Authenticate to Google Cloud (dashboard publisher)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_HEALTH_SA }}
+
+      # The same login the tick does (its comment explains why): gsutil and
+      # `gcloud auth print-access-token --impersonate-service-account` both
+      # need the credential to be the active account.
+      - name: Make the publisher credential active for gsutil and gcloud
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
+      - name: Fetch the previous scan
+        run: |
+          mkdir -p work
+          # The previous document rides along as `previous` in the new one,
+          # which is how the adjudicator asks "drifted last scan too?" from
+          # one file. None yet is the first scan.
+          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state-prior.json || echo "no previous fixture-state.json; first scan"
+
+      # Never reds on what it finds: a project the publisher cannot read, a
+      # missing grant, a hung API server are all "not checked" with a reason
+      # in the document. Only a repository bug (no project mapping, no
+      # catalog) or the ceiling exits non-zero here.
+      - name: Scan every pool project's seeded fleet
+        run: |
+          timeout "$FIXTURE_STATE_TIMEOUT_S" python3 scripts/eval_dashboard/fixture_state.py \
+            --out work/fixture-state.json \
+            --prior work/fixture-state-prior.json \
+            --workers "$FIXTURE_STATE_WORKERS" \
+            --project-timeout "$FIXTURE_STATE_PROJECT_TIMEOUT_S"
+
+      - name: Upload fixture-state.json next to health.json
+        run: |
+          gsutil -q -h "Cache-Control: no-cache" cp work/fixture-state.json "$DASHBOARD_BUCKET/fixture-state.json"
+          python3 -c '
+          import json
+          doc = json.load(open("work/fixture-state.json"))
+          s = doc["summary"]
+          print(f"{s['checked']} of {s['projects']} projects checked; drifted on {s['drifted_projects']}; roles healthy {s['healthy']}, drifted {s['drifted']}, not checked {s['not_checked']}")
+          for project, entry in sorted(doc["projects"].items()):
+              drifted = [r for r, v in entry["roles"].items() if v["state"] == "drifted"]
+              if drifted or entry.get("error"):
+                  print(f"  {project}: " + ("drifted: " + ", ".join(drifted) if drifted else "not checked: " + entry["error"]))
+          '

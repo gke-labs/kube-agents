@@ -46,10 +46,11 @@ workflow, because the repository's other recurring jobs already live there and t
 apply needs nothing Cloud Build has that Actions lacks. The workflow does not exist
 yet; creating it is the fleet owner's call (#1550). Until it does, a manual `tofu apply`
 after any suspected drift is the reconcile. Detecting the drift is a separate job, and
-it is `hack/fleet-fixture-state.py`'s: today the pool verifier runs it against one
-project when asked; a scheduled scan of every pool project from the CI health bot, which
-reports a repeated drift the way it reports a lost build node, is the follow-up pull
-request on #1550. The presubmit does not run it and does not act on a drift: an eval
+it is `hack/fleet-fixture-state.py`'s: the pool verifier runs it against one project
+when asked, and the CI health bot's hourly scan runs it against every pool project and
+reports a repeated drift the way it reports a lost build node
+([`docs/ci-health.md`](../../../docs/ci-health.md), "The seeded-fleet scan"). The
+presubmit does not run it and does not act on a drift: an eval
 run's verdict is about the pull request, and skipping or excusing cases on the fleet's
 account is deliberately not part of evals v1. The script's `--wait` exists for a
 fixture that has just been rescheduled (the crashloop needs its first restart before
@@ -262,8 +263,12 @@ Applying this stack is what makes it true. It provisions
 the project and nothing else, and grants `roles/iam.serviceAccountTokenCreator` on that
 account to the members in `var.fleet_reader_token_creators` — which defaults to
 `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, the identity every
-presubmit runs as, and `eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com`,
-the nightly periodic's. `hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
+presubmit runs as, to `eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com`,
+the nightly periodic's, and to `eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com`,
+the CI health bot, whose hourly fixture-state scan reads every pool project's fleet as
+the reader and holds nothing else on the project
+([`docs/ci-health.md`](../../../docs/ci-health.md), "The seeded-fleet scan").
+`hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
 account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential
 naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
 `kubectl` asks for one.

@@ -294,14 +294,6 @@ jobs:
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
-          # Optional, and the lesser of the two routes. Importing the App's private
-          # key into the minter's KMS key by hand is the better one: the key ring
-          # survives every teardown, so the import is a one-off and the signing
-          # material never enters Actions. This is the bootstrap path — set it and
-          # provision_environment.sh writes it to a private temporary file,
-          # because install.sh takes a path (GITHUB_PEM_PATH) and never a value.
-          # Either way the import is skipped once the key has an enabled version.
-          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
           # Unset (the default) reports a failed teardown as an annotation and a
           # job-summary entry and provisions on top of whatever survived; truthy
           # makes it a hard stop. Whether a candidate validated against stale

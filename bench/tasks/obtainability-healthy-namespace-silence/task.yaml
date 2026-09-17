@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, one of the three
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, one of the three
 # activations that take the reliability domain to five enabled tasks
 # (#1049). The two parking reasons from #984 are both answered: the prompt
 # below uses the located pattern (its 0.0 was the unlocated-prompt failure

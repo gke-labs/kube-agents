@@ -323,11 +323,17 @@ full.
 `githubMinter.*` renders the minty Deployment, Service, NetworkPolicy,
 Workload Identity KSA, and rule ConfigMap, plus the `github-app-credentials`
 Secret when `githubMinter.appId` is set (leave it empty to manage that Secret
-yourself). `org` and `repo` are required when enabled. This is the Kubernetes
+yourself). `enabled` defaults to `false`; `org` and `repo` are required when
+it is on, and `org` must be a GitHub **organization**: Minty resolves App
+installations at `/orgs/{org}/installation`, which does not exist for a
+personal account. `kms.keyring`, `kms.key` and `kms.keyVersion` address the
+Cloud KMS key version holding the App's private key. This is the Kubernetes
 half only: the minter GSA, its Workload Identity binding, and the import-only
 KMS signing key come from `terraform/modules/github-minter`, and the App
 private key must be imported into that key (see the module README) before the
-Deployment passes its readiness probe.
+Deployment passes its readiness probe. The chart never imports it;
+`install.sh --github-pem-path` does, or you import it yourself Ahead-Of-Time —
+see the [Token minter guide](https://gke-labs.github.io/kube-agents/deploy/token-minter/).
 
 ### Telemetry
 

@@ -288,6 +288,9 @@ _TOOL_READ_VERBS = {
     "gcloud": {
         "list", "describe", "info", "version", "get-iam-policy", "search", "read",
         "list-usable", "get-nat-mapping-info", "get-server-config",
+        # The leaf verbs the broker's read allowlist admits for the GCE fleet
+        # and networking reads; a cron prompt that spells them is a read here too.
+        "get-serial-port-output", "get-status", "list-nodes",
     },
     "gsutil": {"ls", "stat", "cat", "du", "hash", "ver", "version"},
     "gh": {"view", "list", "status", "diff"},

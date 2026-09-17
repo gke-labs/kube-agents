@@ -285,6 +285,66 @@ EXIT_UNMEASURED = 2
 # a run that could not measure. 64 is EX_USAGE from sysexits.h.
 EXIT_USAGE = 64
 
+# The --junit file, one <testcase> per row, is what the TestGrid tab reads: its
+# `testgrid-in-cell-metric: value` annotation names a JUnit property, and where
+# a case carries one TestGrid prints the number in the cell and graphs it over
+# time. Row names are a published interface -- TestGrid keys a row's history on
+# the name, so renaming one starts a new row and abandons the old one's history.
+# Only the verdict row can fail: TestGrid counts consecutive failures per row,
+# so a metric row that could also fail would alert about the breach the verdict
+# row is already alerting about. A number the run could not measure is a
+# skipped row, never a zero, because a zero graphs as a healthy reading.
+JUNIT_SUITE_NAME = "pool-pressure"
+JUNIT_METRIC_PROPERTY = "value"
+JUNIT_ROW_VERDICT = "pool pressure within threshold"
+JUNIT_ROW_P50 = "setup p50 minutes"
+JUNIT_ROW_P95 = "setup p95 minutes"
+JUNIT_ROW_QUEUE = "longest live queue minutes"
+JUNIT_ROW_FREE = "free pool projects"
+JUNIT_ROW_NAMES = (
+    JUNIT_ROW_VERDICT,
+    JUNIT_ROW_P50,
+    JUNIT_ROW_P95,
+    JUNIT_ROW_QUEUE,
+    JUNIT_ROW_FREE,
+)
+# The setup rows are also skipped, not graphed, when the number does not cover
+# the window the row names: a sweep that read GCS and found no runs has
+# percentiles of zero, and a sweep the deadline cut short has percentiles over
+# fewer days that would sit on the graph beside whole-window points and read as
+# one of them. The trend source carries no error string in either case.
+JUNIT_NO_RUNS_MESSAGE = "no runs were created in the window"
+JUNIT_TRUNCATED_MESSAGE = (
+    "the sweep ran out of time and covers only {window_start} onward, "
+    "not the whole window"
+)
+JUNIT_ENCODING = "utf-8"
+JUNIT_INDENT = "  "
+JUNIT_DECLARATION = "<?xml version='1.0' encoding='{encoding}'?>"
+JUNIT_TAG_FAILURE = "failure"
+JUNIT_TAG_SKIPPED = "skipped"
+# The file is written by hand rather than through the standard library's
+# `xml` package: the repository's semgrep audit rejects that import wholesale
+# because its parsers accept external entities, and nothing here parses. The
+# layout and escaping follow ElementTree's, so a reader gets the same bytes.
+# `&` is replaced first so a later entity is not escaped again; an attribute
+# value also escapes the quote and the whitespace a parser would otherwise fold.
+XML_TEXT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+XML_ATTRIBUTE_ESCAPES = XML_TEXT_ESCAPES + (
+    ('"', "&quot;"),
+    ("\r", "&#13;"),
+    ("\n", "&#10;"),
+    ("\t", "&#09;"),
+)
+# Skip messages and the failure body carry raw stderr from kubectl and gcloud.
+# Escaping covers markup but passes any other control byte through, and one
+# escape sequence makes the whole file unparseable -- every row gone on exactly
+# the run that had a source failure to report. Everything outside XML 1.0's
+# Char production is dropped before it reaches an attribute or text node.
+XML_INVALID_CHARS = re.compile(
+    "[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
+)
+
 
 def _gap(start: Optional[datetime], end: Optional[datetime]) -> Optional[float]:
     """Seconds between two stamps, or None if either is missing.
@@ -1556,6 +1616,142 @@ def cause(
     ] + _cap_at_pool_caveat(pool_state, concurrency)
 
 
+def _xml_escape(text: str, escapes: Sequence[Tuple[str, str]]) -> str:
+    for char, entity in escapes:
+        text = text.replace(char, entity)
+    return text
+
+
+def _xml_text(text: Optional[str]) -> str:
+    return XML_INVALID_CHARS.sub("", text or "")
+
+
+def _xml_open(tag: str, attributes: Dict[str, str]) -> str:
+    """`<tag a="b"` without its closing bracket; attributes in the order given."""
+    return f"<{tag}" + "".join(
+        f' {name}="{_xml_escape(value, XML_ATTRIBUTE_ESCAPES)}"'
+        for name, value in attributes.items()
+    )
+
+
+def _xml_element(tag: str, attributes: Dict[str, str], text: str = "") -> str:
+    """One childless element on one line, self-closing when it has no text."""
+    if not text:
+        return _xml_open(tag, attributes) + " />"
+    return f"{_xml_open(tag, attributes)}>{_xml_escape(text, XML_TEXT_ESCAPES)}</{tag}>"
+
+
+def _junit_case(name: str, inner: Sequence[str]) -> List[str]:
+    """A <testcase> as lines: self-closing when empty, else wrapping `inner`,
+    which is indented one level further."""
+    attributes = {"name": name, "classname": JUNIT_SUITE_NAME}
+    if not inner:
+        return [_xml_element("testcase", attributes)]
+    return (
+        [_xml_open("testcase", attributes) + ">"]
+        + [JUNIT_INDENT + line for line in inner]
+        + ["</testcase>"]
+    )
+
+
+def _junit_value(value) -> List[str]:
+    metric = {"name": JUNIT_METRIC_PROPERTY, "value": str(value)}
+    return [
+        "<properties>",
+        JUNIT_INDENT + _xml_element("property", metric),
+        "</properties>",
+    ]
+
+
+def _junit_skip(message: Optional[str]) -> List[str]:
+    # The reason goes in both places because JUnit readers differ on which
+    # they show: the attribute is the schema's, the text is what several print.
+    reason = _xml_text(message) or SEGMENT_UNMEASURED
+    return [_xml_element(JUNIT_TAG_SKIPPED, {"message": reason}, reason)]
+
+
+def _junit_failure(message: str, text: str) -> List[str]:
+    attributes = {"message": _xml_text(message)}
+    return [_xml_element(JUNIT_TAG_FAILURE, attributes, _xml_text(text))]
+
+
+def junit_report(summary: dict) -> str:
+    """The run as JUnit, one <testcase> per row, from the same data --json emits.
+
+    The rows, what may fail, and why a number the run could not measure is a
+    skipped row rather than a zero are with the JUNIT_* constants above.
+    """
+    trend = summary["trend"]
+    queue = summary["queue"]
+    pool = summary["pool"]
+
+    # Each row is (name, tag of its one child or None, that child's lines).
+    rows: List[Tuple[str, Optional[str], List[str]]] = []
+
+    def add(name: str, tag: Optional[str] = None, inner: Sequence[str] = ()) -> None:
+        rows.append((name, tag, list(inner)))
+
+    if summary["exit_code"] != EXIT_OK:
+        message = summary["verdict"]
+        if summary["cause"]:
+            message += f" ({summary['cause']})"
+        body = "\n".join(summary["cause_text"]) or trend["error"]
+        add(JUNIT_ROW_VERDICT, JUNIT_TAG_FAILURE, _junit_failure(message, body))
+    else:
+        add(JUNIT_ROW_VERDICT)
+
+    # Skipped unless the percentile covers the window the row names; the
+    # constants above say why an empty or a cut-short window is not graphed.
+    if not trend["read"]:
+        setup_measured, setup_skip = False, trend["error"]
+    elif trend["truncated"]:
+        setup_measured = False
+        setup_skip = JUNIT_TRUNCATED_MESSAGE.format(window_start=trend["window_start"])
+    elif trend["runs"] == 0:
+        setup_measured, setup_skip = False, JUNIT_NO_RUNS_MESSAGE
+    else:
+        setup_measured, setup_skip = True, None
+    for name, key in ((JUNIT_ROW_P50, "p50_minutes"), (JUNIT_ROW_P95, "p95_minutes")):
+        if setup_measured:
+            add(name, "properties", _junit_value(trend[key]))
+        else:
+            add(name, JUNIT_TAG_SKIPPED, _junit_skip(setup_skip))
+
+    # An empty queue is a measured zero: Deck was read and nothing was waiting.
+    if queue["read"]:
+        longest = max((run["minutes"] for run in queue["waiting_runs"]), default=0.0)
+        add(JUNIT_ROW_QUEUE, "properties", _junit_value(longest))
+    else:
+        add(JUNIT_ROW_QUEUE, JUNIT_TAG_SKIPPED, _junit_skip(queue["error"]))
+
+    if pool["read"]:
+        add(JUNIT_ROW_FREE, "properties", _junit_value(pool["free"]))
+    else:
+        add(JUNIT_ROW_FREE, JUNIT_TAG_SKIPPED, _junit_skip(pool["error"]))
+
+    suite = {
+        "name": JUNIT_SUITE_NAME,
+        "tests": str(len(rows)),
+        "failures": str(sum(tag == JUNIT_TAG_FAILURE for _, tag, _ in rows)),
+        "skipped": str(sum(tag == JUNIT_TAG_SKIPPED for _, tag, _ in rows)),
+    }
+    lines = [
+        JUNIT_DECLARATION.format(encoding=JUNIT_ENCODING),
+        _xml_open("testsuite", suite) + ">",
+    ]
+    for name, _, inner in rows:
+        lines.extend(JUNIT_INDENT + line for line in _junit_case(name, inner))
+    lines.append("</testsuite>")
+    return "\n".join(lines) + "\n"
+
+
+def write_junit(path: str, summary: dict) -> None:
+    """Write junit_report() to `path`, creating the directory above it."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(junit_report(summary), encoding=JUNIT_ENCODING)
+
+
 class _Parser(argparse.ArgumentParser):
     """An ArgumentParser that exits EXIT_USAGE rather than argparse's own 2."""
 
@@ -1576,6 +1772,7 @@ def measure(
     from_dir: Optional[str] = None,
     as_json: bool = False,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+    junit_path: Optional[str] = None,
 ) -> int:
     window_end = as_of or datetime.now(timezone.utc)
     window_start = window_end - timedelta(days=window_days)
@@ -1602,6 +1799,15 @@ def measure(
         live,
         pool,
     )
+
+    # Written before the report is printed, and a write that fails is reported
+    # rather than raised: the exit code is the verdict, and the tab still shows
+    # pass/fail from the job status when the file is missing.
+    if junit_path is not None:
+        try:
+            write_junit(junit_path, summary)
+        except OSError as exc:
+            print(f"could not write --junit file {junit_path}: {exc}", file=sys.stderr)
 
     if as_json:
         # The rendered report travels inside the payload rather than beside it.
@@ -1711,6 +1917,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--junit",
+        default=None,
+        metavar="PATH",
+        help=(
+            "also write the findings as a JUnit file at this path, one test case "
+            "per row, for the TestGrid tab's in-cell metric. Only the verdict row "
+            "can fail; a number the run could not measure is a skipped row. The "
+            "exit code is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--from-dir",
         default=None,
         help=(
@@ -1752,6 +1969,7 @@ def main() -> int:
         from_dir=args.from_dir,
         as_json=args.json,
         deadline_seconds=args.deadline_seconds,
+        junit_path=args.junit,
     )
 
 

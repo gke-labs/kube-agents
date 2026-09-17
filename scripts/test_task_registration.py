@@ -1,12 +1,13 @@
-"""Every bench case is valid, and either in the presubmit's TASKS array or excluded.
+"""Every bench case is valid, and in a roster file under hack/eval/ or excluded.
 
-`hack/ci-eval-pr.sh` runs the tasks listed in its TASKS array, and only those:
-tasks under bench/tasks/ are not picked up automatically, the script's own
-comment says so, and nothing owned the difference between "left out on
-purpose" and "nobody remembered". That is how agent-kanban-smoke -- a task
-whose whole point is to smoke the deployed pipeline -- sat registered nowhere
-while the presubmit ran one task for months. A task nobody registered is the
-same failure as a domain nobody covered.
+`hack/ci-eval-pr.sh` runs the cases named in hack/eval/presubmit-cases.txt
+and, under EVAL_TIER=nightly, hack/eval/nightly-cases.txt -- and only those:
+tasks under bench/tasks/ are not picked up automatically, the files' headers
+say so, and nothing owned the difference between "left out on purpose" and
+"nobody remembered". That is how agent-kanban-smoke -- a task whose whole
+point is to smoke the deployed pipeline -- sat registered nowhere while the
+presubmit ran one task for months. A task nobody registered is the same
+failure as a domain nobody covered.
 
 This test owns that difference, and four more like it. The rules and the
 allowlists live in scripts/validate_bench_cases.py, which `make
@@ -17,23 +18,24 @@ TestEveryTaskIsValid's whole-set assertion is for -- see its docstring for the
 rules that leaked through before it existed. `make bench-case-check` is
 invoked by no workflow; this lint, reached through PYTHON_TEST_DIRS in the
 Makefile and run by .github/workflows/python-tests.yml, is the whole of the
-enforcement on a pull request. A case passes by being named in
-TASKS (a commented-out entry counts: it is registered, pending activation,
-which is how scenarios wait for the seeded fleet), by an entry in
-NIGHTLY_TASKS (the nightly tier, which EVAL_TIER=nightly appends to TASKS --
-the runner this docstring once said did not exist), or by a reviewed entry in
-the validator's KNOWN_UNREGISTERED with the reason.
+enforcement on a pull request. A case passes by an entry in the presubmit
+file, by an entry in the nightly file (where a new case lands by default and
+earns a presubmit seat on its record -- decided 2026-09-15 on #1546/#1564),
+by a FIXTURE_NOT_READY entry in the validator naming the issue that plants
+its fixture, or by a reviewed KNOWN_UNREGISTERED entry with the reason. The
+commented-out registration the script's TASKS array used to accept is
+retired: a case path inside a roster-file comment is a finding.
 
 This lint and scripts/test_domain_coverage.py ratchet together. That one
 counts a domain covered only when a task carrying its slug and a non-empty
-verification_spec has an ACTIVE, uncommented TASKS entry, so a
-registered-but-dormant task never counts as coverage; this one guarantees
-every task is at least registered and internally valid.
+verification_spec is in the PRESUBMIT file, so a nightly-only task never
+counts as coverage; this one guarantees every task is at least registered
+and internally valid.
 
-TASKS is read from the script's text rather than by executing it: the script
-provisions clusters and reads secrets, so running it to ask a question is not
-an option. The parse is deliberately narrow -- the TASKS=( ... ) block only --
-and a parse that finds nothing fails loudly rather than passing vacuously.
+The files are read with the parse in scripts/eval_rosters.py, the Python copy
+of the sed the script applies; scripts/test_eval_rosters.py holds the two to
+the same answer. A parse that finds nothing fails loudly rather than passing
+vacuously.
 """
 
 import contextlib
@@ -57,32 +59,83 @@ import validate_bench_cases as validator  # noqa: E402
 # but a test needs to say which one it means.
 DELETE = object()
 
+import eval_rosters  # noqa: E402
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 
 class TestEveryTaskIsRegistered(unittest.TestCase):
-    def test_every_task_is_in_tasks_or_nightly_or_excluded_by_name(self):
+    def test_every_task_is_in_presubmit_or_nightly_or_excluded_by_name(self):
         registered = validator.registered_cases()
         self.assertIsNotNone(
             registered,
-            "Could not find a TASKS=( ... ) array in hack/ci-eval-pr.sh -- "
-            "the script changed shape and the validator's parse needs updating.",
+            "Could not read hack/eval/presubmit-cases.txt and nightly-cases.txt "
+            "as case lists -- a file is missing or holds a malformed line.",
         )
+        excluded = set(validator.KNOWN_UNREGISTERED) | set(validator.FIXTURE_NOT_READY)
         orphans = sorted(
-            name
-            for name in validator.bench_cases()
-            if name not in registered and name not in validator.KNOWN_UNREGISTERED
+            name for name in validator.bench_cases() if name not in registered and name not in excluded
         )
         self.assertEqual(
             orphans,
             [],
             "\n\nThese bench tasks are registered nowhere and never run:\n  "
             + "\n  ".join(orphans)
-            + "\n\nEither add each to TASKS in hack/ci-eval-pr.sh (a commented "
-            "entry counts as registered, pending activation), or add it to "
-            "KNOWN_UNREGISTERED in scripts/validate_bench_cases.py with the "
-            "reason it must not run.",
+            + "\n\nAdd each to hack/eval/nightly-cases.txt (where a new case "
+            "lands), or to FIXTURE_NOT_READY in scripts/validate_bench_cases.py "
+            "with the issue that plants its fixture, or to KNOWN_UNREGISTERED "
+            "there with the reason it must not run.",
+        )
+
+    def test_every_task_is_in_exactly_one_place(self):
+        # Presubmit, nightly, FIXTURE_NOT_READY and KNOWN_UNREGISTERED are
+        # four answers to one question; a case with two of them has a stale
+        # one. The shell rejects the presubmit/nightly overlap itself (it
+        # would run the case twice a night); the allowlist overlaps are the
+        # validator's stale sweep, asserted here as one set rule.
+        homes = {
+            "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
+            "nightly-cases.txt": set(eval_rosters.nightly_cases()),
+            "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
+            "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
+        }
+        seen: dict[str, list[str]] = {}
+        for label, names in homes.items():
+            for name in names:
+                seen.setdefault(name, []).append(label)
+        doubled = {name: where for name, where in seen.items() if len(where) > 1}
+        self.assertEqual(doubled, {}, "\n\nThese cases are named in more than one place:")
+
+    def test_no_case_is_parked_as_a_comment(self):
+        # The retired state: a `# ./tasks/<id>/task.yaml` line. It was how
+        # scenarios waited for the seeded fleet, and it was indistinguishable
+        # from a case nobody had decided about.
+        self.assertEqual(
+            validator.commented_out_registrations(),
+            {},
+            "\n\nThese cases are commented out in a roster file. Move each to "
+            "hack/eval/nightly-cases.txt, or to FIXTURE_NOT_READY with its issue.",
+        )
+
+    def test_every_fixture_not_ready_entry_names_its_issue(self):
+        self.assertEqual(
+            validator.fixture_not_ready_without_issue(),
+            [],
+            "\n\nThese FIXTURE_NOT_READY reasons name no issue (#<number>); the "
+            "entry is a wait on something, and the issue is what it waits on.",
+        )
+
+    def test_the_blocking_roster_is_a_subset_of_the_presubmit(self):
+        # The shell refuses to start otherwise; this is the same rule where
+        # it costs a second rather than a cluster lease.
+        roster = set(eval_rosters.blocking_roster())
+        self.assertTrue(roster, "hack/eval/blocking-roster.txt parsed to no cases")
+        outside = sorted(roster - set(eval_rosters.presubmit_cases()))
+        self.assertEqual(
+            outside,
+            [],
+            "\n\nThese blocking-roster entries are not presubmit cases; a case "
+            "cannot block a pull request it does not run on:\n  " + "\n  ".join(outside),
         )
 
     def test_the_exclusion_lists_do_not_rot(self):
@@ -98,61 +151,25 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
             "match no bench task any more; delete them:\n  " + "\n  ".join(stale),
         )
 
-    def test_the_parse_reads_a_nonempty_array(self):
-        # If the TASKS parse ever comes back empty the first test would call
+    def test_the_parse_reads_nonempty_files(self):
+        # If the roster parse ever comes back empty the first test would call
         # every task an orphan; fail with the real story instead.
         self.assertTrue(
             validator.registered_cases(),
-            "The TASKS array in hack/ci-eval-pr.sh parsed to no tasks -- "
-            "either the array is empty or the validator's parse has drifted.",
-        )
-
-    def test_the_array_is_declared_exactly_once(self):
-        # The parse reads the first TASKS=( ... ) block. A later reassignment
-        # would silently win in the shell while this test kept reading the
-        # first -- the one escape that would not fail loudly red.
-        # Anchored to line start: FAILED_TASKS=( contains the bare substring,
-        # and so do NIGHTLY_TASKS=( and the tier switch's TASKS+=(, neither of
-        # which is a reassignment.
-        count = len(re.findall(r"^TASKS=\(", EVAL_SCRIPT.read_text(), re.M))
-        self.assertEqual(
-            count,
-            1,
-            f"hack/ci-eval-pr.sh declares TASKS=( {count} times; this test "
-            "reads the first, the shell obeys the last -- keep it to one.",
-        )
-
-    def test_the_nightly_array_is_declared_exactly_once(self):
-        # Same escape as above, for the nightly half of the registration
-        # parse: the validator reads the first NIGHTLY_TASKS=( ... ) block.
-        count = len(re.findall(r"^NIGHTLY_TASKS=\(", EVAL_SCRIPT.read_text(), re.M))
-        self.assertEqual(
-            count,
-            1,
-            f"hack/ci-eval-pr.sh declares NIGHTLY_TASKS=( {count} times; the "
-            "validator reads the first, the shell obeys the last -- keep it "
-            "to one.",
+            "hack/eval/presubmit-cases.txt and nightly-cases.txt parsed to no "
+            "cases -- either both are empty or the validator's parse has drifted.",
         )
 
     def test_a_nightly_entry_counts_as_registered(self):
         # The property scripts/test_ci_eval_nightly.py's tier tests stand on:
-        # a case listed only in NIGHTLY_TASKS is registered, not an orphan.
-        # Read the array the same way the shell does rather than hand-listing
-        # its contents, so this holds through every future re-tiering.
-        text = EVAL_SCRIPT.read_text()
-        block = re.search(r"^NIGHTLY_TASKS=\((.*?)^\)$", text, re.M | re.S)
-        self.assertIsNotNone(block, "NIGHTLY_TASKS=( ... ) block not found")
-        nightly = {
-            name
-            for name in re.findall(r'^\s*"\./tasks/([A-Za-z0-9_-]+)/task\.yaml"', block.group(1), re.M)
-        }
-        self.assertTrue(nightly, "NIGHTLY_TASKS parsed to no active entries")
+        # a case listed only in the nightly file is registered, not an orphan.
+        nightly = set(eval_rosters.nightly_cases())
+        self.assertTrue(nightly, "hack/eval/nightly-cases.txt parsed to no entries")
         registered = validator.registered_cases()
         self.assertTrue(
             nightly <= registered,
-            f"NIGHTLY_TASKS entries missing from registered_cases(): "
-            f"{sorted(nightly - registered)} -- the validator's nightly parse "
-            "has drifted from the script.",
+            f"nightly entries missing from registered_cases(): "
+            f"{sorted(nightly - registered)} -- the validator's parse has drifted.",
         )
 
 
@@ -228,7 +245,7 @@ class TestEveryTaskIsValid(unittest.TestCase):
         self._assert_none(
             "does not match its directory name",
             "These cases disagree with their own directory name, which is "
-            "what TASKS, the results file and every lint key on:",
+            "what the roster files, the results file and every lint key on:",
         )
 
     def test_every_task_claims_a_known_domain(self):
@@ -978,8 +995,8 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
             stale = validator.stale_allowlist_entries()
         self.assertIn("KNOWN_NO_DOMAIN: deleted-case", stale)
 
-    def test_all_three_allowlists_are_swept(self):
-        for name in ("KNOWN_UNREGISTERED", "KNOWN_NO_DOMAIN", "KNOWN_JUDGE_ONLY"):
+    def test_all_four_allowlists_are_swept(self):
+        for name in ("KNOWN_UNREGISTERED", "KNOWN_NO_DOMAIN", "KNOWN_JUDGE_ONLY", "FIXTURE_NOT_READY"):
             with self.subTest(allowlist=name):
                 with unittest.mock.patch.dict(
                     getattr(validator, name), {"deleted-case": "gone"}, clear=False
@@ -1005,12 +1022,45 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
         self.assertIn("duplicate entry name", str(raised.exception))
 
     def test_the_sweep_reports_real_cases_not_a_parse_failure(self):
-        # validate_all() returns a synthetic "<TASKS array>" row when the parse
-        # breaks, and every needle-based assertion in TestEveryTaskIsValid
+        # validate_all() returns a synthetic ROSTER_PARSE_KEY row when the
+        # parse breaks, and every needle-based assertion in TestEveryTaskIsValid
         # would then pass over an empty corpus.
         results = validator.validate_all()
-        self.assertNotIn("<TASKS array>", results)
+        self.assertNotIn(validator.ROSTER_PARSE_KEY, results)
         self.assertEqual(set(results), set(validator.bench_cases()))
+
+    def test_a_fixture_not_ready_entry_that_a_roster_also_names_is_stale(self):
+        with unittest.mock.patch.dict(
+            validator.FIXTURE_NOT_READY, {"agent-kanban-smoke": "#1 waiting"}, clear=False
+        ):
+            self.assertIn(
+                "FIXTURE_NOT_READY: agent-kanban-smoke (also in a roster file)",
+                validator.stale_allowlist_entries(),
+            )
+
+    def test_a_fixture_not_ready_reason_without_an_issue_is_reported(self):
+        with unittest.mock.patch.dict(
+            validator.FIXTURE_NOT_READY, {"some-case": "waiting on a fixture"}, clear=False
+        ):
+            self.assertEqual(validator.fixture_not_ready_without_issue(), ["some-case"])
+
+    def test_a_commented_out_registration_is_a_finding(self):
+        # The retired parking state, planted in a scratch copy of the roster
+        # files so the real tree stays untouched.
+        with tempfile.TemporaryDirectory() as tmp:
+            presubmit = pathlib.Path(tmp) / "presubmit-cases.txt"
+            nightly = pathlib.Path(tmp) / "nightly-cases.txt"
+            presubmit.write_text("./tasks/agent-kanban-smoke/task.yaml\n")
+            nightly.write_text(
+                "# blocked on #1\n# ./tasks/cluster-provision-kanban/task.yaml\n"
+                "./tasks/obtainability-planted-pdb/task.yaml\n"
+            )
+            with unittest.mock.patch.object(validator, "ROSTER_FILES", (presubmit, nightly)):
+                found = validator.commented_out_registrations()
+                results = validator.validate_all()
+        self.assertEqual(list(found), ["cluster-provision-kanban"])
+        self.assertIn("is commented out in", " ".join(results["cluster-provision-kanban"]))
+        self.assertIn("That parking state is retired", " ".join(results["cluster-provision-kanban"]))
 
     def test_one_unreadable_case_does_not_hide_the_others(self):
         broken = validator.TASKS_DIR / "zz-not-a-real-case" / "task.yaml"

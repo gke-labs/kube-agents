@@ -888,13 +888,22 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # Chat Agent framed it for everyone. The relay adapter — the other caller of
     # this route — reads the same two fields; a sibling that reads only one
     # reports a half-delivered report as a clean one.
+    #
+    # `relay_detail` is the route's own wording for the degradation, so this
+    # end stops hard-coding it: `degraded` has one cause today (the Chat Agent
+    # turn did not compose the report; a leg that never landed keeps `relay:
+    # ok` and shows up in `undelivered` instead). Older routes do not send it;
+    # the sentence they used to get is the fallback.
     session = payload.get("session_id", "?")
     labels, caveats = [], []
     if payload.get("relay") == "degraded":
         labels.append("degraded")
         caveats.append(
-            "the Chat Agent turn failed, so the user sees your raw text marked "
-            "[unrelayed] rather than a composed message"
+            str(payload.get("relay_detail") or "").strip()
+            or (
+                "the Chat Agent turn failed, so the user sees your raw text marked "
+                "[unrelayed] rather than a composed message"
+            )
         )
     undelivered = str(payload.get("undelivered") or "").strip()
     if undelivered:

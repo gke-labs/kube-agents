@@ -437,13 +437,7 @@ exit 0
 
 
 class GithubMinterInputsTest(unittest.TestCase):
-    """The minter half of provisioning: exit-code propagation, the PEM, and the warning.
-
-    The exit-code case is the one that would ship silently. The script stopped ending on
-    `./install.sh "${INSTALL_ARGS[@]}"` — it captures the status so the staged PEM can be
-    removed first — and a `|| INSTALL_STATUS=$?` that is not re-raised turns every failed
-    install into a green provisioning step.
-    """
+    """The minter half of provisioning: exit-code propagation and minter configuration guards."""
 
     def _run(self, overrides, install_exit=0, install_body=""):
         tmp = tempfile.TemporaryDirectory()
@@ -487,57 +481,13 @@ exit {install_exit}
         self.assertEqual(
             proc.returncode,
             7,
-            "install.sh's exit code must survive the PEM-cleanup restructure; a green "
+            "install.sh's exit code must be propagated; a green "
             f"step for a failed install is invisible. stdout:\n{proc.stdout}",
         )
 
     def test_a_successful_install_still_succeeds(self):
         proc, _ = self._run({}, install_exit=0)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_private_key_is_staged_readable_only_by_its_owner_and_then_removed(self):
-        # The mock records the path and mode install.sh was handed, because the file is
-        # gone by the time the script returns — which is the other half of the contract.
-        proc, tmp_dir = self._run(
-            {"GH_APP_PRIVATE_KEY": "-----BEGIN RSA PRIVATE KEY-----\nabc\n"},
-            install_body=(
-                'printf "%s\\n" "${GITHUB_PEM_PATH}" > pem_path.txt\n'
-                'stat -f "%Lp" "${GITHUB_PEM_PATH}" > pem_mode.txt '
-                '2>/dev/null || stat -c "%a" "${GITHUB_PEM_PATH}" > pem_mode.txt\n'
-                'cp "${GITHUB_PEM_PATH}" pem_contents.txt\n'
-            ),
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-
-        pem_path = (tmp_dir / "pem_path.txt").read_text().strip()
-        self.assertTrue(pem_path, "install.sh was not handed a GITHUB_PEM_PATH")
-        self.assertEqual((tmp_dir / "pem_mode.txt").read_text().strip(), "600")
-        self.assertIn("BEGIN RSA PRIVATE KEY", (tmp_dir / "pem_contents.txt").read_text())
-        self.assertFalse(
-            pathlib.Path(pem_path).exists(),
-            "the staged private key must not outlive the install",
-        )
-
-    def test_the_staged_key_is_removed_even_when_the_install_fails(self):
-        proc, tmp_dir = self._run(
-            {"GH_APP_PRIVATE_KEY": "-----BEGIN RSA PRIVATE KEY-----\nabc\n"},
-            install_exit=1,
-            install_body='printf "%s\\n" "${GITHUB_PEM_PATH}" > pem_path.txt\n',
-        )
-        self.assertEqual(proc.returncode, 1)
-        pem_path = (tmp_dir / "pem_path.txt").read_text().strip()
-        self.assertFalse(
-            pathlib.Path(pem_path).exists(),
-            "a failed install must not leave raw key material behind",
-        )
-
-    def test_no_pem_path_is_set_when_no_key_is_supplied(self):
-        proc, tmp_dir = self._run(
-            {},
-            install_body='printf "[%s]\\n" "${GITHUB_PEM_PATH:-}" > pem_path.txt\n',
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual((tmp_dir / "pem_path.txt").read_text().strip(), "[]")
 
     def test_partial_minter_config_stops_the_deploy(self):
         # The environment-secret trap: org and repo resolve, the App ID arrives empty,
@@ -572,7 +522,7 @@ exit {install_exit}
         )
         combined = proc.stdout + proc.stderr
         self.assertNotIn(
-            "Tearing down existing RC environment",
+            "Tearing down the existing environment",
             combined,
             "the guard must fire before uninstall.sh destroys the environment",
         )

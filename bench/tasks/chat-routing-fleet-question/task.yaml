@@ -1,5 +1,5 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# Registered in hack/eval/nightly-cases.txt (nightly tier) since 2026-09-15,
+# commented out of the presubmit's TASKS array before that.
 #
 # Domain: chat and routing. Journey: ask the fleet a question through the
 # front door; it must be routed to the right specialist via kanban, and the
@@ -10,15 +10,16 @@
 # the specialist to read.
 # Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 #
-# NOT ACTIVATABLE by uncommenting, but no longer for the routing reason this
+# NOT a presubmit candidate yet, but no longer for the routing reason this
 # header used to give. hack/ci-eval-pr.sh exports a single AGENT_SERVICE_NAME
 # ("platform-agent") and the runner port-forwards that one service -- and the
 # 2026-08-31 measurement (chat-routing-board-read's activating run, build
 # 2094517532634386432) settled that this endpoint serves the front-door
 # (default) profile, the profile this prompt needs, so the harness can reach
 # it. What holds it now is that it has never been run (validated: false
-# below) -- uncommenting a case nobody has watched pass is how a case that
-# can only fail reds every pull request -- and its delegation objective rides
+# below) -- a presubmit seat for a case nobody has watched pass is how a case
+# that can only fail reds every pull request; the nightly is where it earns
+# the record -- and its delegation objective rides
 # the worker round trip whose dropped results #1097 is investigating. See
 # DRAFTS.md, blocker A2, for the measurement record. The verification_spec
 # below is written against the front door and stands unchanged.

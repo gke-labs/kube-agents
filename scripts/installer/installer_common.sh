@@ -455,6 +455,45 @@ save_secret_env_var() {
   fi
 }
 
+# ─── Operator-supplied paths ──────────────────────────────────────────────────
+# Expands a leading ~ in an operator-supplied path.
+#
+# `${path/#\~/$HOME}` looks equivalent and is not: the replacement expands
+# $HOME whether or not the pattern matched, so under `set -Eeuo pipefail` an
+# ordinary absolute path aborted the caller with `HOME: unbound variable`
+# whenever HOME happened to be unset. install.sh's kube_agents_clone_dir is a
+# function rather than a constant for the same reason, and names the same
+# environments: a systemd system unit, or a container with no passwd entry.
+#
+# So HOME is read only when there is a ~ to resolve, and when it is genuinely
+# needed and missing the failure names the path that could not be expanded
+# rather than the variable the operator never set.
+#
+# Per this file's contract the caller owns print_error, and because callers
+# read this function's stdout the message is redirected to stderr; the failure
+# travels by return code. Note that a ~ usually never reaches here at all --
+# an unquoted one on the command line is expanded by the operator's own shell
+# before the installer sees it. What does reach here is a quoted flag value or
+# a path read out of install.env.
+expand_tilde_path() {
+  local path="$1"
+  case "$path" in
+    # The slash sits outside the quotes so shellcheck's SC2088 stays enforced in
+    # this block rather than being suppressed across it. The tilde stays quoted
+    # because the pattern has to match one the shell did not expand.
+    "~" | "~"/*)
+      if [ -z "${HOME:-}" ]; then
+        print_error "Cannot expand '~' in '${path}': HOME is unset. Pass an absolute path instead." >&2
+        return 1
+      fi
+      printf '%s' "${HOME}${path#\~}"
+      ;;
+    *)
+      printf '%s' "$path"
+      ;;
+  esac
+}
+
 # ─── GitOps repository input names ────────────────────────────────────────────
 # The installer's GitOps coordinates are GITOPS_ORG / GITOPS_REPO. They used to
 # be GITHUB_ORG / GITHUB_REPO, which collided with two other things that mean
@@ -1617,7 +1656,7 @@ write_tfvars_from_state() {
       enable_github_minter="true"
     else
       print_warning "GitHub minter deferred: its KMS signing key has no ENABLED version, no App private key PEM is at hand (GITHUB_PEM_PATH), and a minter deployed without the key never passes readiness."
-      print_info "Provide the PEM (or import the key: k8s-operator/config/integrations/github/README.md) and re-run — the next run adds the minter to the existing install."
+      print_info "Provide the PEM via --github-pem-path (or pre-import the key into Cloud KMS: https://github.com/abcxyz/github-token-minter) and re-run — the next run adds the minter to the existing install."
     fi
   fi
 

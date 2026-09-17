@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -149,10 +151,80 @@ type nopDispatcher struct{}
 
 func (nopDispatcher) Dispatch(context.Context, TriageEvent) {}
 
+// preflightStub answers the preflight's SelfSubjectAccessReviews on a fake
+// clientset, which has no answer of its own for the resource. deny names the
+// verb to refuse ("" refuses nothing) with reason as the review's
+// status.reason; err, when set, fails every review instead. Both are read
+// under a lock because the grant test changes them while Run is holding.
+type preflightStub struct {
+	mu      sync.Mutex
+	deny    string
+	reason  string
+	err     error
+	reviews atomic.Int64
+	// evaluationError, when set, is put on every refused review's status: the
+	// authorizer's "I could not decide" alongside allowed=false.
+	evaluationError string
+}
+
+func (s *preflightStub) set(deny, reason string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deny, s.reason, s.err = deny, reason, err
+}
+
+// stubPreflight installs a preflightStub with the given first answer on client.
+func stubPreflight(client *fake.Clientset, deny, reason string, err error) *preflightStub {
+	s := &preflightStub{deny: deny, reason: reason, err: err}
+	client.PrependReactor("create", "selfsubjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		s.reviews.Add(1)
+		s.mu.Lock()
+		deny, reason, err, evaluationError := s.deny, s.reason, s.err, s.evaluationError
+		s.mu.Unlock()
+		if err != nil {
+			return true, nil, err
+		}
+		review := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SelfSubjectAccessReview)
+		attrs := review.Spec.ResourceAttributes
+		if attrs.Group != "" || attrs.Resource != "events" || attrs.Namespace != "" {
+			return true, nil, fmt.Errorf("unexpected preflight review %+v; want core events at the cluster scope", attrs)
+		}
+		review.Status.Allowed = attrs.Verb != deny
+		if !review.Status.Allowed {
+			review.Status.Reason = reason
+			review.Status.EvaluationError = evaluationError
+		}
+		return true, review, nil
+	})
+	return s
+}
+
+// stubIdentity answers whoAmI's SelfSubjectReview on a fake clientset with
+// username, or fails it with err when set.
+func stubIdentity(client *fake.Clientset, username string, err error) {
+	client.PrependReactor("create", "selfsubjectreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if err != nil {
+			return true, nil, err
+		}
+		review := action.(k8stesting.CreateAction).GetObject().(*authenticationv1.SelfSubjectReview)
+		review.Status.UserInfo.Username = username
+		return true, review, nil
+	})
+}
+
+// allowPreflight is what every test that is not about the preflight wants:
+// both verbs allowed, so Run builds the informer at once and the test observes
+// the reflector, not a hold.
+func allowPreflight(client *fake.Clientset) *preflightStub {
+	return stubPreflight(client, "", "", nil)
+}
+
 // listFailingClient returns a fake clientset whose every Event list fails with
-// listErr, and a counter of how many lists were attempted.
+// listErr, and a counter of how many lists were attempted. The preflight is
+// allowed: these tests are about what the reflector does with the refusal.
 func listFailingClient(listErr error) (*fake.Clientset, *atomic.Int64) {
 	client := fake.NewClientset()
+	allowPreflight(client)
 	var attempts atomic.Int64
 	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
 		attempts.Add(1)
@@ -338,6 +410,7 @@ func equalBools(a, b []bool) bool {
 func TestRun_ForbiddenWatchAfterSyncIsHeld(t *testing.T) {
 	logs := captureLog(t)
 	client := fake.NewClientset()
+	allowPreflight(client)
 	var watchAttempts atomic.Int64
 	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
 		watchAttempts.Add(1)
@@ -383,6 +456,7 @@ func TestRun_ForbiddenWatchAfterSyncIsHeld(t *testing.T) {
 func TestRun_ForbiddenWatchAfterSyncReportsDownThenUp(t *testing.T) {
 	captureLog(t)
 	client := fake.NewClientset()
+	allowPreflight(client)
 	var refuse atomic.Bool
 	refuse.Store(true)
 	var watchAttempts atomic.Int64
@@ -575,6 +649,7 @@ func initialEventsEndBookmark() *corev1.Event {
 func TestRun_WatchListMode_ForbiddenWatchAfterSyncReportsDownThenUp(t *testing.T) {
 	captureLog(t)
 	underlying := fake.NewClientset()
+	allowPreflight(underlying)
 	var refuse atomic.Bool
 	var listAttempts, watchAttempts atomic.Int64
 	var lastCall atomic.Value
@@ -633,6 +708,277 @@ func TestRun_WatchListMode_ForbiddenWatchAfterSyncReportsDownThenUp(t *testing.T
 	}
 	if got, _ := callBeforeRecovery.Load().(string); got != "refused watch" {
 		t.Errorf("the call before the recovering watch was %q; want the refused watch, with no List between the hold and the recovery", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation")
+	}
+}
+
+// countingListClient returns a fake clientset that answers Event lists as the
+// fake does by default, and a counter of how many lists were attempted.
+func countingListClient() (*fake.Clientset, *atomic.Int64) {
+	client := fake.NewClientset()
+	var attempts atomic.Int64
+	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		attempts.Add(1)
+		return false, nil, nil
+	})
+	return client, &attempts
+}
+
+// whoAmI names the identity the API server authenticated, and when it cannot,
+// says which credential the cluster is reached with and why the name is
+// missing, so the denial line never shows a bare blank where the identity
+// should be.
+func TestWhoAmI(t *testing.T) {
+	cases := []struct {
+		name     string
+		profile  string
+		username string
+		err      error
+		want     string
+	}{
+		{name: "google identity named", profile: "gke_p_l_c", username: "sa@p.iam.gserviceaccount.com", want: "sa@p.iam.gserviceaccount.com"},
+		{name: "service account named", profile: "direct", username: "system:serviceaccount:kubeagents-system:kubeagents-platform-agent", want: "system:serviceaccount:kubeagents-system:kubeagents-platform-agent"},
+		{name: "review fails on the direct cluster", profile: "direct", err: errors.New("the server could not find the requested resource"),
+			want: "the process's own credential (in a pod, its service account) (not named: SelfSubjectReview the server could not find the requested resource)"},
+		{name: "review fails on a profile cluster", profile: "gke_p_l_c", err: errors.New("forbidden"),
+			want: "the pod's Google identity (not named: SelfSubjectReview forbidden)"},
+		{name: "review returns no username", profile: "gke_p_l_c", username: "",
+			want: "the pod's Google identity (not named: SelfSubjectReview returned no username)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			stubIdentity(client, tc.username, tc.err)
+			w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "c", Profile: tc.profile}, 0)
+			if got := w.whoAmI(context.Background()); got != tc.want {
+				t.Errorf("whoAmI() = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A list the preflight says is denied never reaches the reflector: over a
+// window in which the default backoff would have relisted, no Event list is
+// attempted at all, one preflight line names the cluster, the verb and the
+// authorizer's reason, the caller hears nothing, and the denied verb costs one
+// review per check. Cancelling during the hold ends Run with an error, as a
+// cancelled sync does.
+func TestRun_PreflightDeniedListBuildsNoInformer(t *testing.T) {
+	logs := captureLog(t)
+	client, lists := countingListClient()
+	stub := stubPreflight(client, "list", `requires one of ["container.events.list"] permission(s)`, nil)
+	stubIdentity(client, "kubeagents-platform-agent@proj.iam.gserviceaccount.com", nil)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "denied", Profile: "gke_proj_us-central1_denied"}, 0)
+	w.forbiddenHold = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	rec := &transitionRecorder{}
+	go func() { done <- w.Run(ctx, rec.record) }()
+
+	// Long enough for the default backoff to have retried at least once more
+	// had an informer been built (first retry lands 0.8s to 1.6s after the
+	// initial attempt).
+	time.Sleep(2500 * time.Millisecond)
+
+	if got := lists.Load(); got != 0 {
+		t.Errorf("want no Event list for a cluster denied at preflight, got %d", got)
+	}
+	if got := stub.reviews.Load(); got != 1 {
+		t.Errorf("want exactly one review per check for a denied list, got %d", got)
+	}
+	want := `[denied] events list denied at preflight for kubeagents-platform-agent@proj.iam.gserviceaccount.com, holding 1h0m0s before the next check: requires one of ["container.events.list"] permission(s)`
+	if got := strings.Count(logs.String(), want); got != 1 {
+		t.Errorf("want exactly one preflight line %q, got %d in:\n%s", want, got, logs.String())
+	}
+	if strings.Contains(logs.String(), "forbidden, holding") || strings.Contains(logs.String(), "informer error") {
+		t.Errorf("a cluster held at preflight must not reach the reflector:\n%s", logs.String())
+	}
+	if got := rec.snapshot(); len(got) != 0 {
+		t.Errorf("a cluster held at preflight reported %v; want nothing", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Run should report an error when stopped while held at preflight")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation; the preflight hold is not selecting on the context")
+	}
+}
+
+// An identity that may list but not watch is held before its list: the line
+// names watch, both verbs were asked, and no Event list is attempted. The
+// denial carries no reason, as RBAC's do, so the line says what that means
+// and, with the identity unnamed, which credential the cluster is reached by.
+func TestRun_PreflightDeniedWatchBuildsNoInformer(t *testing.T) {
+	logs := captureLog(t)
+	client, lists := countingListClient()
+	stub := stubPreflight(client, "watch", "", nil)
+	stubIdentity(client, "", apierrors.NewNotFound(schema.GroupResource{Group: "authentication.k8s.io", Resource: "selfsubjectreviews"}, ""))
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only", Profile: "direct"}, 0)
+	w.forbiddenHold = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	rec := &transitionRecorder{}
+	go func() { done <- w.Run(ctx, rec.record) }()
+
+	want := "[list-only] events watch denied at preflight for the process's own credential (in a pod, its service account) (not named: SelfSubjectReview selfsubjectreviews.authentication.k8s.io \"\" not found), holding 1h0m0s before the next check: no reason given (Kubernetes RBAC returns none; grant list and watch on events to this identity)"
+	eventually(t, 10*time.Second, func() bool { return strings.Contains(logs.String(), want) }, "the preflight line naming watch")
+	time.Sleep(500 * time.Millisecond)
+
+	if got := lists.Load(); got != 0 {
+		t.Errorf("want no Event list for a cluster whose watch is denied at preflight, got %d", got)
+	}
+	if got := stub.reviews.Load(); got != 2 {
+		t.Errorf("want two reviews per check when the list is allowed and the watch denied, got %d", got)
+	}
+	if got := strings.Count(logs.String(), "denied at preflight"); got != 1 {
+		t.Errorf("want exactly one preflight line, got %d in:\n%s", got, logs.String())
+	}
+	if got := rec.snapshot(); len(got) != 0 {
+		t.Errorf("a cluster held at preflight reported %v; want nothing", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Run should report an error when stopped while held at preflight")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation")
+	}
+}
+
+// A permission granted during the hold is picked up on the next check: the
+// informer is built then, syncs, and the caller hears true, with no restart.
+func TestRun_PreflightGrantDuringHoldStartsTheInformer(t *testing.T) {
+	logs := captureLog(t)
+	client, lists := countingListClient()
+	stub := stubPreflight(client, "list", "", nil)
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "granted"}, 0)
+	w.forbiddenHold = 200 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	rec := &transitionRecorder{}
+	go func() { done <- w.Run(ctx, rec.record) }()
+
+	eventually(t, 10*time.Second, func() bool { return stub.reviews.Load() >= 1 }, "the first check")
+	if got := lists.Load(); got != 0 {
+		t.Fatalf("want no Event list before the grant, got %d", got)
+	}
+	if got := rec.snapshot(); len(got) != 0 {
+		t.Fatalf("a cluster held at preflight reported %v; want nothing", got)
+	}
+
+	stub.set("", "", nil)
+	eventually(t, 10*time.Second, func() bool { return rec.count() >= 1 }, "the sync to be reported after the grant")
+	if got, want := rec.snapshot(), []bool{true}; !equalBools(got, want) {
+		t.Errorf("transitions after the grant = %v; want %v", got, want)
+	}
+	if got := lists.Load(); got < 1 {
+		t.Errorf("want the informer's list once the preflight passes, got %d", got)
+	}
+	if got := strings.Count(logs.String(), "denied at preflight"); got < 1 {
+		t.Errorf("want at least one preflight line before the grant in:\n%s", logs.String())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation")
+	}
+}
+
+// A review that fails is inconclusive, not a no: one line says so and the
+// informer is built as it would have been without the preflight, so the list
+// is attempted and the sync reported.
+func TestRun_PreflightErrorFallsThroughToTheInformer(t *testing.T) {
+	logs := captureLog(t)
+	client, lists := countingListClient()
+	stub := stubPreflight(client, "", "", apierrors.NewInternalError(errors.New("authorization webhook unavailable")))
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "unsure"}, 0)
+	w.forbiddenHold = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	rec := &transitionRecorder{}
+	go func() { done <- w.Run(ctx, rec.record) }()
+
+	eventually(t, 10*time.Second, func() bool { return rec.count() >= 1 }, "the sync to be reported")
+	if got, want := rec.snapshot(), []bool{true}; !equalBools(got, want) {
+		t.Errorf("transitions = %v; want %v", got, want)
+	}
+	if got := lists.Load(); got < 1 {
+		t.Errorf("want the informer's list after an inconclusive preflight, got %d", got)
+	}
+	if got := stub.reviews.Load(); got != 1 {
+		t.Errorf("want one review before falling through, got %d", got)
+	}
+	want := "[unsure] preflight inconclusive, starting the informer anyway: SelfSubjectAccessReview for list events: "
+	if got := strings.Count(logs.String(), want); got != 1 {
+		t.Errorf("want exactly one inconclusive line %q, got %d in:\n%s", want, got, logs.String())
+	}
+	if strings.Contains(logs.String(), "denied at preflight") {
+		t.Errorf("an inconclusive preflight must not read as a denial:\n%s", logs.String())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation")
+	}
+}
+
+// A review the authorizer could not decide — allowed=false with an
+// evaluationError, which is what a webhook authorizer that cannot reach its
+// backend produces — is inconclusive, not a denial: the API server would have
+// answered the list itself with a 500 the reflector retries within seconds,
+// so holding here would withhold a cluster the reflector would have watched.
+func TestRun_PreflightEvaluationErrorIsInconclusive(t *testing.T) {
+	logs := captureLog(t)
+	client, lists := countingListClient()
+	stub := stubPreflight(client, "list", "", nil)
+	stub.evaluationError = "webhook authorizer: connection refused"
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "undecided"}, 0)
+	w.forbiddenHold = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	rec := &transitionRecorder{}
+	go func() { done <- w.Run(ctx, rec.record) }()
+
+	eventually(t, 10*time.Second, func() bool { return rec.count() >= 1 }, "the sync to be reported")
+	if got, want := rec.snapshot(), []bool{true}; !equalBools(got, want) {
+		t.Errorf("transitions = %v; want %v", got, want)
+	}
+	if got := lists.Load(); got < 1 {
+		t.Errorf("want the informer's list after an undecided preflight, got %d", got)
+	}
+	want := "[undecided] preflight inconclusive, starting the informer anyway: SelfSubjectAccessReview for list events: authorizer could not decide: webhook authorizer: connection refused"
+	if got := strings.Count(logs.String(), want); got != 1 {
+		t.Errorf("want exactly one inconclusive line %q, got %d in:\n%s", want, got, logs.String())
+	}
+	if strings.Contains(logs.String(), "denied at preflight") {
+		t.Errorf("an undecided review must not read as a denial:\n%s", logs.String())
 	}
 
 	cancel()

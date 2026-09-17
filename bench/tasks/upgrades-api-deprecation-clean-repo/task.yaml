@@ -1,6 +1,7 @@
-# COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
-# registers it pending activation. Held by the same maintainer's call that
-# holds the skill's Phase-1 and Phase-2 cases: commented out pending #1254.
+# NIGHTLY — registered in hack/eval/nightly-cases.txt since 2026-09-15,
+# commented out of the presubmit's TASKS array before that. Held out of the
+# presubmit by the same maintainer's call that holds the skill's Phase-1 and
+# Phase-2 cases: no presubmit seat pending #1254.
 # Its eval loop was not run (`validated: false`): the only install its author
 # could reach (the robot's) links no GitOps repository, so the scan there has
 # nothing to read, and no fleet-linked install was available to that account.

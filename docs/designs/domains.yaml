@@ -10,9 +10,9 @@
 #
 # A task claims a domain with a top-level `domain: <slug>` field in its
 # task.yaml. It counts as covering the domain only when it also carries a
-# non-empty verification_spec AND is an active (uncommented) entry in
-# hack/ci-eval-pr.sh's TASKS array. Covered means running: a spec-ready task
-# registered commented-out leaves its domain uncovered until it activates.
+# non-empty verification_spec AND is an entry in hack/eval/presubmit-cases.txt.
+# Covered means running on every pull request: a nightly-only task leaves its
+# domain uncovered until its line moves to the presubmit file.
 #
 # `allowlist` names the domains that are known-uncovered today. Delete entries
 # as Phase 2 ACTIVATES scenarios; the lint refuses both an uncovered domain that
@@ -29,8 +29,8 @@
 # evidence and graded on the reply -- while the audit-SOP machinery itself
 # (dispatch, delegation, token minter, ledger write) is exercised end to end
 # by exactly one audit kept as a canary, under the `fleet-audits` domain.
-# The full audit scenarios run in the nightly tier (NIGHTLY_TASKS in
-# hack/ci-eval-pr.sh); only an uncommented TASKS entry counts as coverage.
+# The full audit scenarios run in the nightly tier (hack/eval/nightly-cases.txt);
+# only an entry in hack/eval/presubmit-cases.txt counts as coverage.
 
 domains:
   - slug: chat-and-routing
@@ -90,5 +90,8 @@ allowlist:
   # tofu-provisioned — the wall-clock floor of the presubmit (#1202 trim
   # addendum). Delete this entry when
   # a non-tofu incident-triage probe activates in presubmit, or when the
-  # coverage contract formally recognizes the nightly tier (#1175).
+  # coverage contract formally recognizes the nightly tier (#1175). That
+  # probe is incident-triage-oom-event-probe (#1023), in
+  # hack/eval/nightly-cases.txt since 2026-09-15; moving its line to the
+  # presubmit file is what deletes this entry.
   - incident-triage

@@ -1,4 +1,5 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS.
+# Registered in hack/eval/nightly-cases.txt (nightly tier) since 2026-09-15;
+# commented out of the presubmit's TASKS array before that.
 #
 # Domain: cluster debugging. Journey: the symptom is Pending pods rather than
 # a crashloop, and the cause is outside the workload's own manifest.
@@ -12,7 +13,7 @@
 # fixture, then failed against each mutation a misbehaving agent would make,
 # then passed again on revert.
 #
-# What keeps it commented out is the agent half, and this is the one case of
+# What keeps it out of the presubmit is the agent half, and this is the one case of
 # the four that a scored run has already answered. It went active, ran on
 # 2026-08-26, and came back out: the agent read the cluster, applied nothing
 # (all three safeguards green) and misdiagnosed, blaming a missing label on
@@ -20,8 +21,8 @@
 # deliberately empty — instead of CPU exhaustion on pinned-inference-pool.
 # The fixture is not at fault; see the deactivation comment in
 # hack/ci-eval-pr.sh for what was checked. A case the agent cannot pass reds
-# every pull request in the repository, so uncomment this when the agent can
-# diagnose a capped pool, not before.
+# every pull request in the repository, so it earns a presubmit seat on its
+# nightly record when the agent can diagnose a capped pool, not before.
 #
 # Four of the other five cluster-debugging cases are crashloops on the same
 # payments-api fixture, so that symptom class is measured four ways and this

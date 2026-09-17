@@ -1,0 +1,61 @@
+{
+  "insertId": "fb041e37-b9e3-4203-8dd1-af6f4c1b5574",
+  "labels": {
+    "authentication.kubernetes.io/credential-id": "X509SHA256=1111111111111111111111111111111111111111111111111111111111111111",
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": ""
+  },
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "fb041e37-b9e3-4203-8dd1-af6f4c1b5574",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {
+      "principalEmail": "system:node:gke-prod-1-pool-1-abcd1234-node"
+    },
+    "authorizationInfo": [
+      {
+        "granted": true,
+        "permission": "io.k8s.core.v1.pods.delete",
+        "resource": "core/v1/namespaces/gke-gmp-system/pods/collector-9gt27"
+      }
+    ],
+    "methodName": "io.k8s.core.v1.pods.delete",
+    "request": {
+      "@type": "meta.k8s.io/__internal.DeleteOptions",
+      "apiVersion": "meta.k8s.io/__internal",
+      "gracePeriodSeconds": 0,
+      "kind": "DeleteOptions",
+      "preconditions": {
+        "uid": "4cfda351-c52f-4728-98f9-8d43f8aa4a06"
+      }
+    },
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "kubelet/v1.35.7 (linux/amd64) kubernetes/532e3c3"
+    },
+    "resourceName": "core/v1/namespaces/gke-gmp-system/pods/collector-9gt27",
+    "response": {
+      "_trimmed": "body removed for the fixture; the detector does not decode it",
+      "_type": "core.k8s.io/v1.Pod"
+    },
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 0
+    }
+  },
+  "receiveTimestamp": "2026-09-15T22:57:17.198543330Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "us-east1",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-09-15T22:57:16.658605Z"
+}

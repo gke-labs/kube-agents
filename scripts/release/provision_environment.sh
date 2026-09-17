@@ -16,10 +16,7 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # shellcheck source=scripts/release/teardown_common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/teardown_common.sh"
 
-# Before the temp file, so a missing coordinate aborts without leaving one
-# behind — this script deliberately carries no EXIT trap to clean it up. A trap
-# that ends on a successful command hands ITS status to the shell, which would
-# turn a `set -u` abort on a missing input into a green step.
+# Verify required GCP/GKE inputs before executing any destructive teardown.
 teardown_require_inputs
 
 # Half-configured minter: refuse before anything is destroyed.
@@ -251,36 +248,5 @@ else
   INSTALL_ARGS+=(--memory=file)
 fi
 
-# install.sh imports the GitHub App private key into the minter's KMS signing key
-# (import_github_pem), and it takes a path rather than a value — GITHUB_PEM_PATH.
-# A secret only exists here as a variable, so it has to be materialised.
-#
-# The import is skipped when the key already has an ENABLED version, so in each
-# environment this only does work on the first install after the key is created:
-# lifecycle.sh's adopt-kms re-adopts the key ring on every apply, and uninstall.sh's
-# "Kept by design" summary records that GCP cannot delete key rings at all. The
-# teardown does not disable the version either -- lifecycle.sh's forget_kms runs
-# `terraform state rm` on the crypto key before the destroy, so the destroy never
-# reaches it; adopt-kms's restore_key_versions is the backstop for a bare
-# `terraform destroy` that skipped forget_kms.
-#
-# Written with a restrictive umask rather than chmod after the fact, so the key is
-# never briefly world-readable, and removed after install.sh rather than in an EXIT
-# trap — see the note at the top of this file for why this script has none.
-PEM_TMP=""
-if [ -n "${GH_APP_PRIVATE_KEY:-}" ] && [ -z "${GITHUB_PEM_PATH:-}" ]; then
-  PEM_TMP="$(umask 077 && mktemp)"
-  printf '%s\n' "${GH_APP_PRIVATE_KEY}" >"${PEM_TMP}"
-  export GITHUB_PEM_PATH="${PEM_TMP}"
-  echo "==> GitHub App private key staged for KMS import (imported only if the minter's key has no enabled version)."
-fi
-
 echo "==> Provisioning the environment at the candidate commit via canonical install.sh..."
-INSTALL_STATUS=0
-./install.sh "${INSTALL_ARGS[@]}" || INSTALL_STATUS=$?
-
-if [ -n "${PEM_TMP}" ]; then
-  rm -f "${PEM_TMP}"
-fi
-
-exit "${INSTALL_STATUS}"
+./install.sh "${INSTALL_ARGS[@]}"

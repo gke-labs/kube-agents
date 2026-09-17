@@ -20,7 +20,11 @@ writer of; the scheduled job is otherwise stateless.
 A fourth message, rarer than the others: when health.json reports that
 data.json itself has stopped refreshing (`stale`), the space is told once,
 and once more when it resumes -- a silent stall would otherwise freeze the
-state and keep the digest reporting old numbers as current.
+state and keep the digest reporting old numbers as current. A fifth, of the
+same shape: when the hourly seeded-fleet scan could check no pool project
+at all (health.json's `fixture_state.unknown`, the bot's grant missing), the
+space is told once, and once more when the scan sees the fleet again. That
+is never a drift. The digest carries one line on the latest scan.
 
 A fifth, one line and once per episode: when health.json carries a `slow`
 note (the gate's green runs are taking far longer than usual, #1586), the
@@ -40,8 +44,12 @@ the same cases -- gate_issue.py files one with the workflow's GitHub token
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
 the cluster owner, unless an open `presubmit-gate` issue already names the
-lost nodes. It never closes an issue. A GitHub failure is a warning: the
-message goes out with "no issue yet" and the next change asks again.
+lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
+designed state on two consecutive hourly scans or on three pool projects at
+once, #1550) files one for the fleet owner the same way, unless an open
+`presubmit-gate` issue already names the drifted roles. It never closes an
+issue. A GitHub failure is a warning: the message goes out with "no issue
+yet" and the next change asks again.
 
 Delivery is the Google Chat REST API with the job's service account acting
 as a Chat app: POST https://chat.googleapis.com/v1/{space}/messages with an
@@ -96,6 +104,10 @@ GREEN = "GREEN"
 OUTAGE = "OUTAGE"
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_SHARED_BREAK = "shared_break"
+CONDITION_FIXTURE_DRIFT = "fixture_drift"
+# health.json's summary of the hourly seeded-fleet scan (health.py,
+# fixture_state_block); absent before the scan has ever published.
+FIXTURE_STATE_KEY = "fixture_state"
 # The 24h window health.py reports metrics over, for a health.json that
 # predates the `window_hours` field.
 DEFAULT_WINDOW_HOURS = 24
@@ -109,7 +121,8 @@ KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
 KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
 KIND_DIGEST = "digest"  # the daily numbers
-TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_SLOW)
+KIND_FIXTURE_SCAN = "fixture_scan"  # the fleet scan sees nothing, or sees again
+TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_SLOW, KIND_FIXTURE_SCAN)
 
 # Where the message goes. The space is a resource name, the token a bearer
 # credential minted by the workflow; the webhook is the legacy alternative.
@@ -171,6 +184,10 @@ NO_ISSUE_TEXT = "no issue yet — file one with the presubmit-gate label"
 # Mirrors health.py's STORM_COOLDOWN: a run started the minute the last
 # storm-hit run finished still overlaps its tail.
 STORM_COOLDOWN = timedelta(minutes=30)
+# Where the fleet scan's grant and semantics are written down, for the
+# message that says the scan is blind.
+FIXTURE_SCAN_DOC = "docs/ci-health.md"
+FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects named."
 
 # gsutil is how the state object is read and written; publish.py uses the
 # same header so a reader never gets an hour-stale copy.
@@ -279,6 +296,8 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
 
     if bool(health.get("stale")) != bool((prev or {}).get("stale")):
         kinds.append(KIND_STALE)
+    if fixture_unknown(health) != bool((prev or {}).get("fixture_unknown")):
+        kinds.append(KIND_FIXTURE_SCAN)
 
     # The slow note goes out when the note appears, not when it clears: the
     # digest carries it while it lasts, and "back to normal" is not news.
@@ -423,6 +442,32 @@ def nodes_text(nodes) -> str:
     return f"{count} nodes" if count > 1 else "a node"
 
 
+def fixture_state_of(health: dict) -> dict:
+    block = health.get(FIXTURE_STATE_KEY)
+    return block if isinstance(block, dict) else {}
+
+
+def fixture_unknown(health: dict) -> bool:
+    """The latest scan could check no pool project (the grant is missing,
+    or kubectl is): the bot is blind to the fleet, which is not a drift."""
+    return bool(fixture_state_of(health).get("unknown"))
+
+
+def plural(count: int, one: str, many: str | None = None) -> str:
+    return one if count == 1 else (many if many is not None else one + "s")
+
+
+def fixture_drift_sentence(health: dict, since: str) -> str:
+    incident = health.get("incident") or {}
+    roles = list(incident.get("roles") or [])
+    projects = list(incident.get("projects") or [])
+    return (
+        f"seeded {plural(len(roles), 'fixture')} {', '.join(roles) or '(unnamed)'} out of designed state"
+        f" on {len(projects)} pool {plural(len(projects), 'project')} since {since};"
+        f" a red on a case that depends on {plural(len(roles), 'it', 'them')} from a run that leased one of those projects is the fixture, not the code."
+    )
+
+
 def cause_sentence(health: dict) -> str:
     """One sentence a reader can answer "is it me?" from."""
     incident = health.get("incident") or {}
@@ -446,6 +491,8 @@ def cause_sentence(health: dict) -> str:
         return f"quota storm {window} hit {prs} PRs."
     if condition == "setup_deaths":
         return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
+    if condition == CONDITION_FIXTURE_DRIFT:
+        return fixture_drift_sentence(health, since)
     return health.get("cause") or "no single cause"
 
 
@@ -464,6 +511,10 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Not your code; retest once new jobs are running.{tracking}"]
+    elif condition == CONDITION_FIXTURE_DRIFT:
+        tag = issue_tag(issue)
+        tracking = f" Tracking {tag}." if tag else ""
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the fleet is re-applied. {FIXTURE_RECONCILE_HINT}{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))
@@ -507,6 +558,44 @@ def render_slow(health: dict) -> str:
     )
 
 
+def render_fixture_scan(health: dict) -> str:
+    block = fixture_state_of(health)
+    when = clock(parse_iso(block.get("scanned_at")))
+    total = block.get("projects") or 0
+    if block.get("unknown"):
+        reason = f" ({block['reason']})" if block.get("reason") else ""
+        return (
+            f"⚪ *Seeded-fleet scan can't see the fleet* — the {when} scan checked none of {total} pool projects{reason}."
+            f" Fixture drift goes unseen until that is fixed; the bot's grant is in {FIXTURE_SCAN_DOC}."
+        )
+    return f"⚪ *Seeded-fleet scan sees the fleet again* — the {when} scan checked {block.get('checked', 0)} of {total} pool projects."
+
+
+def fixture_digest_line(health: dict) -> str | None:
+    """One line on the latest fleet scan for the digest; None before the
+    scan has ever published."""
+    block = fixture_state_of(health)
+    if not block:
+        return None
+    when = clock(parse_iso(block.get("scanned_at")))
+    total = block.get("projects") or 0
+    checked = block.get("checked") or 0
+    if block.get("stale"):
+        return f"🧭 *Seeded fleet:* the last scan ({when}) is stale; someone check the scan job."
+    if block.get("unknown"):
+        reason = f" ({block['reason']})" if block.get("reason") else ""
+        return f"🧭 *Seeded fleet:* the {when} scan could check none of {total} pool projects{reason}."
+    drifted = block.get("drifted") or {}
+    if drifted:
+        roles = sorted({role for roles in drifted.values() for role in roles})
+        return (
+            f"🧭 *Seeded fleet:* {len(drifted)} of {checked} checked pool projects drifted at {when}"
+            f" ({', '.join(roles)}); a red on a case that depends on {plural(len(roles), 'it', 'them')} there is the fixture, not the code."
+        )
+    unchecked = f", {total - checked} not checked" if total > checked else ""
+    return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, every fixture in its designed state{unchecked}."
+
+
 def short_cause(prev: dict) -> str:
     condition = prev.get("condition")
     if condition == "shared_break":
@@ -517,6 +606,8 @@ def short_cause(prev: dict) -> str:
         return "setup failures"
     if condition == CONDITION_LOST_PODS:
         return "the build cluster lost nodes"
+    if condition == CONDITION_FIXTURE_DRIFT:
+        return "seeded fixtures had drifted"
     return prev.get("cause") or "unknown cause"
 
 
@@ -565,6 +656,9 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     if data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
         lines.append(NIGHTLY_URL)
+    fleet = fixture_digest_line(health)
+    if fleet:
+        lines.append(fleet)
     lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
@@ -576,6 +670,8 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_digest(health, now, data)
     if kind == KIND_STALE:
         return render_stale(health)
+    if kind == KIND_FIXTURE_SCAN:
+        return render_fixture_scan(health)
     if kind == KIND_SLOW:
         return render_slow(health)
     return render_change(health, prev, issue)
@@ -683,7 +779,12 @@ def run(
     if issue_tag(health.get("issue")) and health["issue"] not in carried:
         carried.append(health["issue"])
     issue = next((candidate for candidate in [health.get("issue"), *carried] if issue_for(candidate, condition)), None)
-    wants_issue = KIND_CHANGE in kinds and (health.get("state") == OUTAGE or condition == CONDITION_LOST_PODS) and not issue and not health.get("tracking_issues")
+    wants_issue = (
+        KIND_CHANGE in kinds
+        and (health.get("state") == OUTAGE or condition in (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT))
+        and not issue
+        and not health.get("tracking_issues")
+    )
     if tracker is not None and wants_issue:
         incident = health.get("incident") or {}
         since = parse_iso(health.get("since"))
@@ -725,12 +826,14 @@ def run(
     # from here (`--posted-state`) into the next health.json.
     told_state = KIND_CHANGE in sent or KIND_RECOVERY in sent
     told_stale = KIND_STALE in sent
+    told_fixture = KIND_FIXTURE_SCAN in sent
     told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,
         # fresh start is not announced later as a change.
         told_state = told_state or (KIND_CHANGE not in kinds and KIND_RECOVERY not in kinds)
         told_stale = told_stale or KIND_STALE not in kinds
+        told_fixture = told_fixture or KIND_FIXTURE_SCAN not in kinds
     source = health if told_state else before
     state = {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -743,6 +846,7 @@ def run(
         "issue": issue if source.get("state") not in (None, GREEN) else None,
         "issues": carried if source.get("state") not in (None, GREEN) else [],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
+        "fixture_unknown": fixture_unknown(health) if told_fixture else bool(before.get("fixture_unknown")),
         "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),

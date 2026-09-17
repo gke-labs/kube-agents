@@ -66,7 +66,7 @@ owner: maintainers
 # agent -- and the thing under test is whether that pipeline delivered. The
 # session this prompt reaches is not that one and holds none of its context: it
 # is the platform agent, because hack/ci-eval-pr.sh exports a single
-# AGENT_SERVICE_NAME and port-forwards that one service, so every entry in TASKS
+# AGENT_SERVICE_NAME and port-forwards that one service, so every case in the matrix
 # lands there. That profile carries the kanban toolset (agents/platform/
 # config.yaml lists it under the top-level `toolsets`), which is all the board
 # read needs. So the prompt must not let the agent answer from its own
@@ -283,7 +283,7 @@ verification_spec:
   # cluster_name output -- the host cluster, passed straight through.
   #
   # That, and not the runner's own `get-credentials` before the task loop, is
-  # what makes it true. Any deployer: tofu task earlier in TASKS re-points the
+  # what makes it true. Any deployer: tofu task earlier in the matrix re-points the
   # ambient context to its own cluster on the way past, which is why the stack
   # itself fetches into a kubeconfig of its own rather than inheriting one.
   #

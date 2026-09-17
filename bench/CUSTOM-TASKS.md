@@ -210,10 +210,10 @@ covers no row gets a reviewed `KNOWN_NO_DOMAIN` entry instead of an absent field
 `docs/designs/bench-case-format.md` is the contract, and this section is the how-to.
 The slugs live in `docs/designs/domains.yaml`, and
 `scripts/test_domain_coverage.py` counts a domain as covered only when a task carries its
-slug AND a non-empty `verification_spec` AND is an active (uncommented) entry in
-`hack/ci-eval-pr.sh`'s `TASKS` array — covered means running, so a spec-ready task
-registered commented-out leaves its domain honestly uncovered until it activates, and
-activating it forces the allowlist edit in `domains.yaml` in the same change. devops-bench
+slug AND a non-empty `verification_spec` AND is an entry in
+`hack/eval/presubmit-cases.txt` — covered means running on every pull request, so a
+nightly-only task leaves its domain honestly uncovered until its line moves to the presubmit
+file, and that move forces the allowlist edit in `domains.yaml` in the same change. devops-bench
 ignores the extra key (`extra: "ignore"` on its task model), so the field is free to carry.
 
 Every task also carries a top-level `owner:` — a GitHub login without the at sign, or
@@ -230,15 +230,14 @@ defaults to `false`, so no existing task needs the field, and like `domain:` it 
 `bench-gate` rather than by devops-bench. It must be a bare YAML boolean; the validator rejects a
 quoted one, which is a string and truthy.
 
-A new task must also be registered: the presubmit runs only what the `TASKS` array in
-`hack/ci-eval-pr.sh` names, the nightly adds what `NIGHTLY_TASKS` names (appended when
-the job exports `EVAL_TIER=nightly`), and `scripts/test_task_registration.py` fails the
-build for a task that appears in neither. A commented-out `TASKS` entry counts as
-registered, pending activation — that is how scenarios wait for infrastructure that does
-not exist yet; a `NIGHTLY_TASKS` entry is for a validated case too slow, too redundant,
-or outside the core journeys the presubmit gate is for (the rule's one statement is
-`docs/designs/bench-case-format.md` §Registration) — and a task that deliberately must
-not run needs a reviewed entry in `scripts/validate_bench_cases.py`'s
+A new task must also be registered: the presubmit runs only what
+`hack/eval/presubmit-cases.txt` names, the nightly adds what `hack/eval/nightly-cases.txt`
+names (appended when the job exports `EVAL_TIER=nightly`), and
+`scripts/test_task_registration.py` fails the build for a task that appears in neither. A
+new task goes in the nightly file and earns a presubmit seat on its record (the rule's one
+statement is `docs/designs/bench-case-format.md` §Registration); a task whose fixture does
+not exist yet waits in `scripts/validate_bench_cases.py`'s `FIXTURE_NOT_READY` with its
+issue, and a task that deliberately must not run needs a reviewed entry in that file's
 `KNOWN_UNREGISTERED` with the reason.
 
 A task whose verification reads live cluster state also carries `fixtures:`, a list of

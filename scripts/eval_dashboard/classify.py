@@ -76,6 +76,11 @@ try:
 except ImportError:  # imported by path (render.py run as a script)
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import tiers
+try:
+    import eval_rosters
+except ImportError:  # run as a script: scripts/ is not on sys.path yet
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import eval_rosters
 
 # --- Shared break (#1269, #1278; #1171 a week earlier) -----------------------
 # Other pull requests' runs are looked at when they finished inside this
@@ -163,11 +168,10 @@ VERDICT_INFRA = "infra"
 # --- Roster -------------------------------------------------------------------
 # Only an admitted case reds a pull request (AGENTS.md, "The behavioural
 # presubmit gate"); a hold-out failing is reported but never blamed. Read
-# from the checkout; when the script is missing every case counts as
-# admitted, which over-reports rather than hides.
+# from the checkout's hack/eval/blocking-roster.txt; when the file is missing
+# every case counts as admitted, which over-reports rather than hides.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-CI_EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
-ROSTER_RE = re.compile(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}]*)\}"')
+BLOCKING_ROSTER_FILE = eval_rosters.BLOCKING_ROSTER_FILE
 
 # The grader prefixes every reason with its score; the reader wants the
 # check name and what was missing.
@@ -386,15 +390,15 @@ def excerpt_of(task: dict) -> str | None:
 _ROSTER_CACHE: dict[str, frozenset | None] = {}
 
 
-def admitted_cases(script: pathlib.Path = CI_EVAL_SCRIPT) -> frozenset | None:
-    """BOOTSTRAP_ADMITTED from hack/ci-eval-pr.sh; None when unreadable."""
-    key = str(script)
+def admitted_cases(roster_file: pathlib.Path = BLOCKING_ROSTER_FILE) -> frozenset | None:
+    """The blocking roster from hack/eval/blocking-roster.txt; None when unreadable."""
+    key = str(roster_file)
     if key not in _ROSTER_CACHE:
         roster = None
         try:
-            match = ROSTER_RE.search(script.read_text())
-            if match:
-                roster = frozenset(name for name in match.group(1).split(",") if name)
+            names = eval_rosters.parse_blocking_roster(roster_file.read_text())
+            if names:
+                roster = frozenset(names)
         except OSError:
             roster = None
         _ROSTER_CACHE[key] = roster

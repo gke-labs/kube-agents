@@ -1,5 +1,5 @@
-# PARKED — registered as a commented-out entry in hack/ci-eval-pr.sh TASKS,
-# not active. The health signal this case grades is a REPOSITORY DECLARATION
+# PARKED — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
+# (#1341), in no roster file under hack/eval/ until its fixture exists. The health signal this case grades is a REPOSITORY DECLARATION
 # rather than workload health: the obtainability SOP's declared-intent step
 # (§4a, #1341) reads the linked repositories before it reports a posture, and
 # a two-replica workload whose missing PodDisruptionBudget is declared on
@@ -9,7 +9,8 @@
 # contract, 0 the only correct count) with the reason for the zero moved
 # from the cluster into the repository.
 #
-# Two things have to exist before this line is uncommented, and neither is
+# Two things have to exist before this case joins hack/eval/nightly-cases.txt,
+# and neither is
 # repository work this case can carry:
 #   1. The declaration. Each eval project's GitOps repo
 #      (gke-agentic/<project>-infra, hack/ci-deploy.sh gitops_repo_for_project)

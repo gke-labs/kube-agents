@@ -138,6 +138,24 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --permission-set="read-only"
 ```
 
+When enabling GitOps pull-request automation, also provide the GitOps repository and GitHub App parameters:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --non-interactive \
+  --project-id="YOUR_GCP_PROJECT_ID" \
+  --cluster-name="platform-agent-host" \
+  --region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only" \
+  --gitops-org="YOUR_GITHUB_ORG" \
+  --gitops-repo="YOUR_GITOPS_REPO" \
+  --github-app-id="YOUR_GITHUB_APP_ID" \
+  --github-pem-path="/path/to/app-private-key.pem"
+```
+
+_(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md).)_
+
 To run pre-flight checks and output configuration state (`terraform.tfvars` and
 `/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also
 validates the Terraform configuration, and previews the full resource plan when Application
@@ -172,21 +190,21 @@ Before beginning installation, ensure your environment meets the requirements fo
 - **Method 2 (Manual Kubernetes / Kustomize)**: Advanced manual manifest deployment.
 - **Method 3 (Local Development & Testing)**: Building and running operator binaries and container images locally.
 
-| CLI Tool / Utility              | Required Version                                | Verification Command               | Description                                                                                                                                                                                | Applies To                                  |
-| :------------------------------ | :---------------------------------------------- | :--------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------ |
-| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                   | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                                                                                      | **All Methods**                             |
-| **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                               | **All Methods** (GKE)                       |
-| **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                   | **All Methods**                             |
-| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                          | **Methods 0 & 1**                           |
-| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path and standalone chart install; the engine itself uses the Terraform Helm provider.                                                                                 | **Methods 0, 1, & 2**                       |
-| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`.                                                                                                        | **All Methods**                             |
-| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                          | **Methods 0 & 1**                           |
-| **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                  | **All Methods**                             |
-| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                         | **All Methods**                             |
-| **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`). | **Optional (CMEK / Backup Plan lifecycle)** |
-| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                       | **Method 2 only**                           |
-| **Go**                          | `1.27+`                                         | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, or building operator binaries.                                                              | **Methods 2 & 3 only**                      |
-| **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                         | **Methods 2 & 3 only**                      |
+| CLI Tool / Utility              | Required Version                                | Verification Command               | Description                                                                                                                                                                                                            | Applies To                                       |
+| :------------------------------ | :---------------------------------------------- | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
+| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                   | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                                                                                                                  | **All Methods**                                  |
+| **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                           | **All Methods** (GKE)                            |
+| **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                               | **All Methods**                                  |
+| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                      | **Methods 0 & 1**                                |
+| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path and standalone chart install; the engine itself uses the Terraform Helm provider.                                                                                                             | **Methods 0, 1, & 2**                            |
+| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`.                                                                                                                                    | **All Methods**                                  |
+| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                                                      | **Methods 0 & 1**                                |
+| **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                              | **All Methods**                                  |
+| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                     | **All Methods**                                  |
+| **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                             | **Optional (CMEK / Backup Plan lifecycle)**      |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                   | **Method 2 only**                                |
+| **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. | **Methods 2 & 3, or Method 0/1 with PEM import** |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                     | **Methods 2 & 3 only**                           |
 
 A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
 NetworkPolicy enforcement, and the rest of the site's
@@ -540,6 +558,10 @@ kubectl patch secret platform-agent-secrets -n kubeagents-system --type=merge \
 kubectl rollout restart deployment/platform-agent-gateway -n kubeagents-system
 ```
 
+The restart buys promptness, not correctness: the operator notices the changed
+Secret within fifteen minutes and rolls the gateway itself. See
+[Rotating a Secret rolls the pod](docs/site/src/content/docs/operator/platformagent-crd.md#rotating-a-secret-rolls-the-pod).
+
 Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
 
@@ -611,6 +633,8 @@ kubectl rollout status deployment -n kubeagents-system
 
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 
+`make deploy-github` renders the minter's Kubernetes half and imports nothing, so on this path the GitHub App and the Cloud KMS asymmetric signing key — the latter already holding the imported private key — must exist beforehand (see the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Token minter guide](docs/site/src/content/docs/deploy/token-minter.md)). `install.sh --github-pem-path` performs that import for you; this path has no equivalent.
+
 `GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the installer's preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
 
 `GITHUB_ORG`/`GITHUB_REPO` here, not the `GITOPS_ORG`/`GITOPS_REPO` the installer takes: this is the hand-driven `make deploy-github` path, whose envsubst allowlist in `k8s-operator/Makefile` passes the `GITHUB_*` names. The rename is scoped to the installer's own inputs.
@@ -624,7 +648,11 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 # renders the gateway's Workload Identity ServiceAccount from them.
 make deploy-litellm
 
-# Deploy GitHub Integration (requires pre-configured github-app-credentials secret and env vars)
+# Deploy GitHub Integration (requires pre-provisioned Cloud KMS key and pre-created credentials secret)
+kubectl create secret generic github-app-credentials \
+  --namespace kubeagents-system \
+  --from-literal=app-id="your-github-app-id"
+
 export PROJECT_ID="your-gcp-project-id"
 export REGION="your-gcp-region"
 export CLUSTER_NAME="your-gke-cluster-name"

@@ -248,13 +248,15 @@ type PlatformAgentReconciler struct {
 // `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
 // confers none of its permissions on the operator itself.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
-// `get` and nothing else on secrets, and checkShellSandboxKeys is the only caller. It asks
-// whether the sandbox's authorized-keys Secret exists so the status can say so; it never reads
-// a value out of one, and the operator creates that Secret nowhere. The read goes through
-// r.APIReader rather than the cached client on purpose: a cached Get of a type the manager does
-// not already watch starts a cluster-wide Secret informer, which would both hold every Secret in
-// the cluster in the operator's memory and, on any cluster where this grant is trimmed, block
-// WaitForCacheSync forever behind a forbidden LIST.
+// `get` and nothing else on secrets, for two callers. checkShellSandboxKeys asks whether
+// the sandbox's authorized-keys Secret exists so the status can say so; it never reads a
+// value out of one, and the operator creates that Secret nowhere. stampSecretEnvHash does
+// read values: it digests the Secret keys a pod consumes as environment onto that pod's
+// template, so rotating one rolls the pod (platformagent_secret_hash.go). Both read by
+// name. Both go through r.APIReader rather than the cached client on purpose: a cached Get
+// of a type the manager does not already watch starts a cluster-wide Secret informer, which
+// would both hold every Secret in the cluster in the operator's memory and, on any cluster
+// where this grant is trimmed, block WaitForCacheSync forever behind a forbidden LIST.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
@@ -670,17 +672,29 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: rbacReprobeInterval}, nil
 	}
 
+	// Secret material reaches the gateway as environment, and a container's
+	// environment is fixed for the life of the pod. Secrets are deliberately
+	// outside this controller's watch set (see the grant above), so nothing
+	// wakes a reconcile when one changes: the pass that re-reads them is the
+	// only thing that notices a rotated key, and it has to be asked for.
+	// stampSecretEnvHash does the reading; this is what guarantees it happens
+	// while nothing else about the agent is changing.
+	requeueAfter := secretEnvReprobeInterval
+
 	// Default and None are the telemetry outcomes that can improve without anything else
 	// changing — someone installs a collector and nothing about this agent is touched.
 	// Reconciles are event-driven and can be quiet for hours, so nudge the probe rather
 	// than wait for an unrelated event. Every other source is explicit or already found
 	// something, and needs no polling. None especially: it is the outcome that leaves the
 	// agent exporting nowhere, so it is the one an operator most wants picked up promptly
-	// once they install a collector.
+	// once they install a collector. Taken as a deadline rather than the answer, because
+	// the secret re-read above has one of its own and the sooner of the two wins. The two
+	// intervals are equal today, so this min picks neither — it is here so that shortening
+	// one of them later does not silently lengthen the other.
 	if otlpSource == otlpSourceDefault || otlpSource == otlpSourceNone {
-		return ctrl.Result{RequeueAfter: otelRediscoverAfter}, nil
+		requeueAfter = min(requeueAfter, otelRediscoverAfter)
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // pluginStatusNeedsRecheck reports whether plugin status is still provisional.
@@ -1238,6 +1252,9 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		}
 
 		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
+		if err := r.stampSecretEnvHash(ctx, agent, sts, &sts.Spec.Template); err != nil {
+			return err
+		}
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
@@ -1250,6 +1267,9 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	}
 
 	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
+	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
+		return err
+	}
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -1507,9 +1527,18 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
 func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	// This pod, not the gateway, is where the Slack and Teams tokens and the
+	// model-provider keys are read out of a Secret as environment, so it needs
+	// the same digest — see platformagent_secret_hash.go. Stamping only the
+	// gateway would have left the credentials most likely to be rotated
+	// reaching a container that never restarts.
+	proxy := buildCredentialProxyDeployment(agent, policyHash)
+	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
+		return err
+	}
 	objs := []client.Object{
 		buildCredentialProxyService(agent),
-		buildCredentialProxyDeployment(agent, policyHash),
+		proxy,
 		buildCredentialProxyNetworkPolicy(agent),
 	}
 	for _, obj := range objs {

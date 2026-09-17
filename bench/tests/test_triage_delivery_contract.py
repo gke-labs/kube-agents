@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The triage delivery contract, held together across the three files that own it.
+"""The triage delivery contract, held together across the files that own it.
 
 ``_triage_task_body`` (agents/platform/scripts/session_kv_server.py) writes the
 report template a Cluster Agent fills in. It permits two shapes, and the
@@ -29,8 +29,8 @@ template:
 * ``actionable_report`` (deploy/docker/patches/kanban_notifier.py) decides in
   production whether a completed card earns an ``incidents`` row — whether a
   reply saying ``apply`` will find a report to act on. Three regexes.
-* ``autoops-warning-event-triage``'s delivery objective decides whether the eval
-  case passes. Phrase lists in a task.yaml.
+* The delivery objective of each case in ``CASE_PATHS`` decides whether that
+  eval case passes. Phrase lists in a task.yaml.
 
 So one decision lives in three files, joined by string literals. **The
 template↔notifier half of that join is already held**, by
@@ -88,13 +88,15 @@ from kube_agents_bench.verifiers import ReportContainsVerifier, _normalize
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: The case whose delivery objective this module pins. Named, not globbed: it
-#: is the only case in `domain: incident-triage` and the only task.yaml in the
-#: tree containing "What to do" or "To authorize:", so a glob over the
-#: directory would cover exactly this file today and silently cover nothing on
-#: the day it is renamed. A second case adopting the delivery contract should
-#: be added to a list here rather than left to a pattern.
-CASE_PATH = REPO_ROOT / "bench" / "tasks" / "autoops-warning-event-triage" / "task.yaml"
+#: The cases whose delivery objective this module pins. Named, not globbed: a
+#: glob over the directory would cover exactly these files today and silently
+#: cover nothing on the day one is renamed. `incident-triage-oom-event-probe`
+#: (#1023) carries the incumbent's check verbatim; a further case adopting the
+#: delivery contract is added here rather than left to a pattern.
+CASE_PATHS = [
+    REPO_ROOT / "bench" / "tasks" / "autoops-warning-event-triage" / "task.yaml",
+    REPO_ROOT / "bench" / "tasks" / "incident-triage-oom-event-probe" / "task.yaml",
+]
 CHECK_NAME = "triage-delivers-an-actionable-report"
 
 #: The template's home, and the function inside it that returns the card body.
@@ -216,17 +218,23 @@ def _report_shapes() -> dict[str, str]:
     }
 
 
-def _delivery_check() -> dict:
-    document = yaml.safe_load(CASE_PATH.read_text())
+def _delivery_check(case_path: Path) -> dict:
+    document = yaml.safe_load(case_path.read_text())
     entry = next(
         (e for e in document["verification_spec"] if e.get("name") == CHECK_NAME), None
     )
     assert entry is not None, (
-        f"{CASE_PATH.parent.name} has no {CHECK_NAME!r} objective. If it was "
-        "renamed, rename CHECK_NAME with it; if it was deleted, delete this "
-        "module rather than leaving it asserting nothing."
+        f"{case_path.parent.name} has no {CHECK_NAME!r} objective. If it was "
+        "renamed, rename CHECK_NAME with it; if it was deleted, remove the case "
+        "from CASE_PATHS rather than leaving this module asserting nothing."
     )
     return entry["check"]
+
+
+@pytest.fixture(params=CASE_PATHS, ids=lambda p: p.parent.name)
+def case_path(request) -> Path:
+    """Every test below runs once per case that carries the contract."""
+    return request.param
 
 
 @pytest.fixture(autouse=True)
@@ -236,7 +244,7 @@ def _clean_stash():
     transcript.clear()
 
 
-def _eval_check_accepts(report: str) -> bool:
+def _eval_check_accepts(report: str, case_path: Path) -> bool:
     """The case's own objective, run through the real verifier.
 
     Constructed from the task.yaml rather than restated, which is what makes
@@ -244,11 +252,11 @@ def _eval_check_accepts(report: str) -> bool:
     the edit instead of against a copy of what it used to say.
     """
     transcript.set(report, [])
-    return ReportContainsVerifier(**_delivery_check()).verify(5.0).success
+    return ReportContainsVerifier(**_delivery_check(case_path)).verify(5.0).success
 
 
 @pytest.mark.parametrize("shape", ["lettered", "single-option"])
-def test_the_eval_check_accepts_both_template_shapes(shape):
+def test_the_eval_check_accepts_both_template_shapes(shape, case_path):
     """The regression #1101 was filed for.
 
     The objective used to require "Option A", a token the single-option shape is
@@ -256,7 +264,7 @@ def test_the_eval_check_accepts_both_template_shapes(shape):
     a rule the template had already decided the other way. #1057 lost three
     graded repetitions to it.
     """
-    assert _eval_check_accepts(_report_shapes()[shape])
+    assert _eval_check_accepts(_report_shapes()[shape], case_path)
 
 
 @pytest.mark.parametrize("shape", ["lettered", "single-option"])
@@ -272,7 +280,7 @@ def test_the_notifier_gate_accepts_both_template_shapes(shape):
 @pytest.mark.parametrize(
     "report", [SUMMARY_ONLY_REPORT, EMPTY_SECTION_REPORT, NO_HEADING_REPORT]
 )
-def test_both_gates_reject_a_report_with_nothing_to_act_on(report):
+def test_both_gates_reject_a_report_with_nothing_to_act_on(report, case_path):
     """Neither gate may be satisfiable by everything.
 
     Without this the module would pass just as happily against a check that
@@ -281,11 +289,11 @@ def test_both_gates_reject_a_report_with_nothing_to_act_on(report):
     under it, and a call to action with no section — so a relaxation on either
     side of the contract trips at least one of them.
     """
-    assert not _eval_check_accepts(report)
+    assert not _eval_check_accepts(report, case_path)
     assert not actionable_report(report)
 
 
-def test_every_phrase_the_case_requires_is_still_in_the_template():
+def test_every_phrase_the_case_requires_is_still_in_the_template(case_path):
     """The join itself, stated directly.
 
     The tests above would catch a template reword through the shapes it
@@ -299,7 +307,7 @@ def test_every_phrase_the_case_requires_is_still_in_the_template():
     # would fail a literal `in` -- and a false red on a case that works is the
     # one failure mode this module must not introduce.
     text = _normalize(_template_text())
-    check = _delivery_check()
+    check = _delivery_check(case_path)
     required = check.get("required_phrases", [])
     assert WHAT_TO_DO_PHRASE in required, (
         f"{CHECK_NAME} no longer requires {WHAT_TO_DO_PHRASE!r}. `actionable_report` "

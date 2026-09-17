@@ -163,6 +163,39 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual([p["build"] for p in brief["pending"]], ["3000000000000000004"], "the Grid's running columns are the presubmit's")
 
 
+class BuildUrlTest(unittest.TestCase):
+    """The links follow the bucket the collector read the build from
+    (``runs[].log_url``); a record without the field is from the bucket the
+    nightly used before 2026-09-15 and is linked there."""
+
+    URL = "https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/3000000000000000005"
+
+    def test_a_recorded_log_url_wins_and_the_transcript_hangs_off_it(self):
+        run = {"build_id": "3000000000000000005", "job": JOB, "log_url": self.URL}
+        self.assertEqual(nightly.build_url(run), self.URL)
+        self.assertEqual(nightly.transcript_url(run, "case-b"), self.URL + "/artifacts/eval_case-b_rep1.log")
+        # Not a Spyglass page: fall back rather than link it.
+        run["log_url"] = "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/3000000000000000005/"
+        self.assertEqual(nightly.build_url(run), f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/3000000000000000005")
+
+    def test_a_record_without_the_field_links_the_legacy_bucket(self):
+        self.assertEqual(nightly.build_url({"build_id": NIGHT_1, "job": JOB}), f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_1}")
+        self.assertEqual(nightly.build_url({"build_id": NIGHT_1}), f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_1}", "the default job")
+        self.assertIsNone(nightly.build_url({"build_id": "bogus", "log_url": self.URL}))
+
+    def test_the_night_report_and_a_running_night_carry_the_recorded_url(self):
+        data = two_nights()
+        for run in data["runs"]:
+            if run["build_id"] == NIGHT_2:
+                run["log_url"] = self.URL
+        reports = nightly.night_reports(data)
+        self.assertEqual([n["log_url"] for n in reports], [self.URL, f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_1}"])
+        self.assertEqual(reports[0]["cases"][0]["transcript_url"], self.URL + "/artifacts/eval_case-a_rep1.log")
+        data["pending_builds"] = [{"build_id": "3000000000000000005", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly", "log_url": self.URL}]
+        now = datetime.datetime.fromisoformat(NOW)
+        self.assertEqual(nightly.running_nights(data, now)[0]["log_url"], self.URL)
+
+
 class DigestLineTest(unittest.TestCase):
     def line(self, data, at=DIGEST_AT):
         return nightly.digest_line(data, at, clock=lambda value: post_health.clock(value, weekday=True))

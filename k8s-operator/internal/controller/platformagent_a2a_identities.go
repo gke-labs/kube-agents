@@ -138,7 +138,15 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 
 // gateway: task requester, chat-session supervisor, session-registry owner.
 // Production scopes supervisor publish to sessions the gateway spawned;
-// statically that collapses to the task-events wildcard.
+// statically that collapses to the task-supervisor wildcard.
+//
+// The supervisor's terminal goes on `…supervisor`, the executor's events on
+// `…events`, and the gateway holds publish on the first and not the second.
+// Before the split it held `a2a.tasks.*.*.events`, which made every executor's
+// subject two-writer: a session that terminated its own task wearing the
+// gateway's `from` was indistinguishable on replay from the gateway declaring
+// it dead. Now the subject says who wrote there and NATS enforces it at
+// publish; `from` is checked for agreement by consumers, never trusted.
 func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	_ = ns
 	return a2aIdentity{
@@ -166,7 +174,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// in-flight delivery on ANY stream.
 		publish: []string{
 			"a2a.tasks.*.*.in",
-			"a2a.tasks.*.*.events",
+			"a2a.tasks.*.*.supervisor",
 			"$KV.session-state.>",
 			"$JS.API.>",
 			"$JS.ACK.TASKS.>",
@@ -175,6 +183,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		},
 		subscribe: []string{
 			"a2a.tasks.*.*.events",
+			"a2a.tasks.*.*.supervisor",
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",

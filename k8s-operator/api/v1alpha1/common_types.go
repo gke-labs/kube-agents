@@ -214,9 +214,13 @@ type ShellSandboxSpec struct {
 	//
 	// Separate from deployment.availability.runtimeClassName, which governs the
 	// agent pod, because the two pods do not want the same answer. The agent pod
-	// holds WAL-mode SQLite, which gVisor corrupts on the gofer-backed mount
-	// (#610); the sandbox pod holds none. Splitting the field is what lets an
-	// install sandbox the untrusted pod without sandboxing the trusted one.
+	// holds SQLite databases whose WAL mode gVisor corrupts on the gofer-backed
+	// mount (#610). Setting the agent pod's field pins Hermes' own databases
+	// (state.db, kanban.db and the stores Hermes opens the same way) to the
+	// DELETE journal mode; the session KV store this repository runs beside
+	// Hermes stays in WAL and is not covered. The sandbox pod holds none.
+	// Splitting the field is what lets an install sandbox the untrusted pod
+	// without sandboxing, or slowing, the trusted one.
 	//
 	// On GKE Standard this needs a node pool created with `--sandbox
 	// type=gvisor`; the operator reports Degraded rather than leaving the pod
@@ -590,7 +594,13 @@ type AvailabilitySpec struct {
 	// +optional
 	Affinity *corev1.Affinity `json:"affinity,omitempty"`
 
-	// RuntimeClassName refers to a RuntimeClass object in the cluster.
+	// RuntimeClassName refers to a RuntimeClass object in the cluster. When set,
+	// the operator also pins `database.journal_mode: delete` in the agent pod's
+	// managed config and the entrypoint converts Hermes' existing databases
+	// (state.db, kanban.db and the stores Hermes opens the same way) out of WAL
+	// once, because a sandboxed runtime such as gVisor serves the data volume
+	// over a gofer mount that corrupts SQLite's WAL mode (#610). The session KV
+	// store this repository runs beside Hermes is not covered by the pin.
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 }

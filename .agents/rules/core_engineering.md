@@ -51,7 +51,8 @@ top-of-file declaration, and there is no second place for a literal to hide.
 
 ### Enforcement
 
-No linter checks this. The repository runs `go fmt`, `go vet`, pytest, shellcheck (the three
-installer scripts only), and prettier; none of them has a magic-number rule enabled, and no
-`golangci-lint` or `ruff` config exists. This is a review expectation, and the pre-PR adversarial
-pass is where it gets caught.
+No linter checks this. The repository runs `go fmt`, `go vet`, pytest, shellcheck at warning
+severity over every tracked script (`make shellcheck`, the upstream-synced `gke-*` skills
+excepted), ruff's error-only rules (`make lint-python`), and prettier; none of them has a
+magic-number rule enabled, and no `golangci-lint` config exists. This is a review expectation,
+and the pre-PR adversarial pass is where it gets caught.
