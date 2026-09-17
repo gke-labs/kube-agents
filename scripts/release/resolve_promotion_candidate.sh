@@ -8,11 +8,21 @@
 #                   candidate exists at all, or the newest one predates the
 #                   shared-pipeline restructure and the workflows would drive it
 #                   with scripts and a suite selector its tree does not have.
-#   skip_promotion  the candidate is already promoted — a staging_* tag points at
-#                   its commit. The night still deploys and tests it; only the tag
-#                   push is skipped. That is what makes re-running the pipeline on
-#                   the same candidate a no-op rather than a second tag, and it is
-#                   why the nightly matrix keeps running on quiet nights.
+#   skip_promotion  the candidate has already been through the promotion path —
+#                   an evalcand_* or staging_* tag points at its commit. The night
+#                   still deploys and tests it; the nomination, the eval wait and
+#                   the tag push are all skipped. That is what makes re-running the
+#                   pipeline on the same candidate a no-op rather than a second
+#                   tag, and it is why the nightly matrix keeps running on quiet
+#                   nights.
+#
+# The promotion path has two tags because the eval gates the second one. The
+# nightly nominates the candidate by pushing evalcand_<core>, which is what starts
+# post-kube-agents-eval-rc in GoogleCloudPlatform/oss-test-infra; staging_<core>,
+# the tag staging-deploy.yml reacts to, is pushed only once that eval comes back
+# green. Both tags are derived here so the pipeline never composes either one
+# itself — see the evalcand_ section of common.sh for why a leftover evalcand_ tag
+# on a rejected candidate is inert while a leftover staging_ tag would not be.
 #
 # Every skip is exit 0. The exits that are not: a tag that does not resolve to a
 # commit, and a hand-passed tag the RC pipeline never validated or whose tree
@@ -39,6 +49,7 @@ if [ -n "${RC_TAG}" ]; then
 fi
 
 COMMIT_SHA=""
+EVALCAND_TAG=""
 STAGING_TAG=""
 SKIP_PIPELINE="false"
 SKIP_PROMOTION="false"
@@ -72,6 +83,7 @@ else
     exit 1
   fi
 
+  EVALCAND_TAG="$(evalcand_tag_for_rc "${RC_TAG}")"
   STAGING_TAG="$(staging_tag_for_rc "${RC_TAG}")"
 
   # A candidate that predates the shared-pipeline restructure is skipped whole
@@ -105,10 +117,23 @@ else
     SKIP_REASON="Candidate '${RC_TAG}' (${COMMIT_SHA:0:7}) predates the shared-pipeline restructure, so its tree does not carry the suite selector and scripts these workflows drive it with. Waiting for the RC pipeline to validate a newer candidate."
     echo "ℹ️ ${SKIP_REASON}" >&2
   else
+    # Either tag is enough to skip, and both are checked rather than just the
+    # first rung. Going forward an evalcand_ tag always precedes a staging_ one,
+    # so checking the nomination alone would be sufficient — but candidates
+    # promoted before the eval gate landed carry a staging_ tag and no evalcand_
+    # one, and keying on the nomination alone would re-nominate every one of them
+    # and spend hours of a leased project re-measuring a build that is already on
+    # staging. The staging_ check is what makes the transition free; it can be
+    # dropped once no such candidate can still be the newest validated one.
+    existing_evalcand_tag="$(get_existing_evalcand_tag "${COMMIT_SHA}")"
     existing_staging_tag="$(get_existing_staging_tag "${COMMIT_SHA}")"
-    if [ -n "${existing_staging_tag}" ]; then
+    if [ -n "${existing_evalcand_tag}" ]; then
       SKIP_PROMOTION="true"
-      SKIP_REASON="Commit ${COMMIT_SHA:0:7} is already promoted as '${existing_staging_tag}'; the matrix still runs, nothing is tagged."
+      SKIP_REASON="Commit ${COMMIT_SHA:0:7} is already nominated as '${existing_evalcand_tag}'; the matrix still runs, no eval is started and nothing is tagged."
+      echo "ℹ️ ${SKIP_REASON}" >&2
+    elif [ -n "${existing_staging_tag}" ]; then
+      SKIP_PROMOTION="true"
+      SKIP_REASON="Commit ${COMMIT_SHA:0:7} is already promoted as '${existing_staging_tag}'; the matrix still runs, no eval is started and nothing is tagged."
       echo "ℹ️ ${SKIP_REASON}" >&2
     fi
   fi
@@ -118,6 +143,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     echo "commit_sha=${COMMIT_SHA}"
     echo "rc_tag=${RC_TAG}"
+    echo "evalcand_tag=${EVALCAND_TAG}"
     echo "staging_tag=${STAGING_TAG}"
     echo "skip_pipeline=${SKIP_PIPELINE}"
     echo "skip_promotion=${SKIP_PROMOTION}"
@@ -129,6 +155,7 @@ echo "======================================================================"
 echo "🌙 RESOLVED NIGHTLY PROMOTION CANDIDATE"
 echo "Candidate RC Tag:   ${RC_TAG:-<none>}"
 echo "Commit SHA:         ${COMMIT_SHA:-<none>}"
+echo "Eval-Candidate Tag: ${EVALCAND_TAG:-<none>}"
 echo "Staging Tag:        ${STAGING_TAG:-<none>}"
 echo "Skip Pipeline:      ${SKIP_PIPELINE}"
 echo "Skip Promotion:     ${SKIP_PROMOTION}"

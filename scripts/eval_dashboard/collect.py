@@ -371,7 +371,7 @@ _FINAL_VERDICT = re.compile(
 #   🏷️ RELEASE CANDIDATE EVAL
 #   Candidate:   staging_2609092307_5b5ad10 (5b5ad10163cf10c73871b279518c7165c098bec9)
 #   Tier:        nightly
-#   Verdict:     GREEN (advisory: this lane gates nothing)
+#   Verdict:     GREEN (GREEN promotes this candidate to staging)
 #   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>
 # The Artifacts line is absent when the driver ran outside Prow (no JOB_NAME
 # or BUILD_ID), so it is optional here. The whole banner is absent when the
@@ -826,8 +826,11 @@ def build_release(build_id: str, read) -> dict | None:
         "commit": (banner["commit"] or run["head_sha"] or "")[:7] or None,
         "tier": banner["tier"],
         "verdict": banner["verdict"],
-        # Prow's own verdict on the job, which is not the eval's: the lane is
-        # advisory, so a RED candidate still reports SUCCESS. It is here for
+        # Prow's own verdict on the job, which is not the eval's. They agree on
+        # a red candidate now that the job no longer swallows the driver's exit
+        # code, and part on a lane that broke before measuring anything: a
+        # failed deploy exits non-zero with a NOT RUN banner, so the job is red
+        # while the verdict says nothing about the candidate. It is here for
         # the case where the banner is missing entirely, where it is the only
         # thing that says whether the job survived.
         "result": run["result"],

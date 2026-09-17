@@ -295,8 +295,9 @@ jobs:
           # document with nothing new; publishing that would stamp old runs
           # with a fresh generated_at. Refuse, so the stall stays visible.
           #
-          # The RC glob is excluded on purpose. This lane is advisory and must
-          # not be able to stall the dashboard: an RC listing that fails leaves
+          # The RC glob is excluded on purpose. What that lane's verdict gates
+          # is the staging deploy, not this dashboard, and it must not be able
+          # to stall it: an RC listing that fails leaves
           # releases[] carried forward from the prior and stales nothing, and
           # `gsutil ls` exits non-zero on a prefix with no objects, so a week
           # with no release candidate would otherwise stop every publish. Both

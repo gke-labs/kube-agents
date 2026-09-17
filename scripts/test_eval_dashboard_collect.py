@@ -1511,7 +1511,7 @@ class TestReleaseCandidateParsing(unittest.TestCase):
         banner = collect.parse_rc_banner(
             "Admitted-case pass rate: 88.5% (main: 91.0%, margin -2.5%)\n"
             "🏷️ RELEASE CANDIDATE EVAL\n"
-            "Verdict:     RED (advisory: this lane gates nothing)\n"
+            "Verdict:     RED (GREEN promotes this candidate to staging)\n"
         )
         self.assertEqual(banner["pass_rate"], 0.885)
         self.assertEqual(banner["baseline_rate"], 0.91)

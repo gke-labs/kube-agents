@@ -341,14 +341,24 @@ Additive, optional, and safe to omit — consumers must default them.
   `artifacts_url` are then `null` — but `commit` is not, when Prow recorded
   a `revision`: it falls back to that ref's first 7 characters, which for a
   tag-push postsubmit is the same commit the banner would have named.
-  `artifacts_url` is additionally `null` for a run outside Prow.
-- `verdict` — the eval's, which is **not** the job's: the lane is advisory,
-  so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
-  config's doing — it runs the driver under `|| true` — not the driver's, so
-  a future config that drops the `|| true` would make the two agree without
-  anything here changing. `NOT RUN` is
-  the deploy-failed path — nothing was measured, so it is not a judgement
-  on the candidate.
+  `artifacts_url` is additionally `null` for a run outside Prow. `rc_tag` is
+  whatever tag the job fired on, so the store holds two families: records
+  from before the gate landed carry a `staging_` tag, the deploy tag the job
+  then triggered on, and records after it carry the `evalcand_` tag the
+  nightly now pushes ahead of the deploy. Nothing reads the prefix.
+- `verdict` — the eval's, which is still not the job's, though they now
+  mostly agree: the job runs the driver bare, so a `RED` candidate leaves a
+  `FAILURE` in `result`. They part on `NOT RUN`, the deploy-failed path,
+  where the driver exits with the deploy's status and the build is
+  `FAILURE` even though nothing about the candidate was measured. That gap
+  is the reason `verdict` is recorded separately at all, and the reason the
+  promotion reads this word rather than `result`: `RED` holds the candidate
+  back for good, `NOT RUN` lets a later nightly nominate the same commit
+  again. The promotion reads it out of the build's own
+  `artifacts/rc-eval-summary.md` rather than from here — this store is the
+  dashboard's, and nothing decides from it — so a `null` here is a run whose
+  banner was missing, which is the same run the promotion would have found
+  no summary for.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
   may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
   line. `baseline_rate` and `margin` are `null` while the baseline store

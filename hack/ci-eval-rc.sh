@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Release-candidate eval (the periodic job's entrypoint)
+# Release-candidate eval (the postsubmit job's entrypoint)
 # ==============================================================================
 # Resolve the newest release candidate, check it out, deploy its published
-# images, and evaluate them. Non-gating: the verdict is reported, and nothing
-# here can hold up a release. How wide that evaluation is depends on a tier
-# switch that has not landed yet -- see RC_EVAL_TIER below, which is the one
-# place in this file describing something the repository does not have.
+# images, and evaluate them. GATING: the verdict this writes is what decides
+# whether the candidate reaches the staging cluster. Step 5 of
+# nightly-pipeline.yml polls this run's artifacts and pushes the staging_ tag
+# staging-deploy.yml triggers on only when the summary below says GREEN. How
+# wide that evaluation is depends on a tier switch that has not landed yet --
+# see RC_EVAL_TIER below, which is the one place in this file describing
+# something the repository does not have.
+#
+# The word in the summary is the verdict, not this script's exit status, and the
+# three-way split is why. An exit status has two values and this lane has three
+# outcomes: a candidate that failed the catalog, a candidate that passed it, and
+# a run that measured nothing at all -- a lease that never came, a deploy that
+# failed, a dormancy gate. Collapsing the third into either of the others is a
+# candidate held back for a broken lane or promoted on an eval that never ran.
 #
 # The four steps, and why they need a driver at all:
 #
@@ -59,10 +69,10 @@
 # config's to run -- as a separate step, unconditionally, whatever this script
 # exits with. hack/ci-teardown.sh explains what a leased project left holding a
 # live install does to the next lease that gets it (#1006), and this lane
-# borrows the same pool the presubmit eval does, so skipping it is the one way
-# a non-gating lane can still cost somebody a run.
+# borrows the same pool the presubmit eval does, so skipping it costs somebody
+# else a run on top of whatever it cost this one.
 #
-# The path of this file is a CONTRACT: the periodic job in oss-test-infra
+# The path of this file is a CONTRACT: post-kube-agents-eval-rc in oss-test-infra
 # invokes hack/ci-eval-rc.sh by name. Do not rename it.
 # ==============================================================================
 
@@ -270,6 +280,29 @@ main() {
     "${script_dir}/${EVAL_SCRIPT}" || eval_status=$?
     if [ "${eval_status}" -eq 0 ]; then
       verdict="GREEN"
+    elif [ -n "${artifacts_dir}" ] && [ ! -f "${artifacts_dir}/${RC_VERDICT_FILE}" ]; then
+      # A non-zero eval that graded nothing. ci-eval-pr.sh exits 1 for its own
+      # preflight refusals as well as for a red catalog -- a ledger token that
+      # would not mint, a runner image short of `uv`, an EVAL_REPETITIONS that
+      # is not a positive integer -- and all of those happen before the first
+      # case runs. bench-gate's --markdown-out is what separates them: the
+      # roll-up writes it, so its absence means the roll-up was never reached
+      # and no case was graded.
+      #
+      # Which matters more here than it reads. RED is settled: step 5b leaves
+      # the evalcand_ tag in place, resolve_promotion_candidate.sh skips the
+      # commit from then on, and the candidate is never measured again. Calling
+      # a preflight failure RED therefore retires a candidate over a broken
+      # runner. NOT RUN withdraws the nomination instead and a later nightly
+      # asks again, which is the right answer for a run that measured nothing.
+      #
+      # It does not catch every such case: an eval that reached its roll-up and
+      # failed there because every repetition hit an infrastructure fault writes
+      # the file and is still reported RED. Separating that one needs an exit
+      # code from bench-gate that says "evaluated nothing", which this script
+      # cannot infer from the outside.
+      verdict="NOT RUN"
+      echo "ERROR: evaluating ${rc_tag} (${rc_commit_sha:0:7}) failed with status ${eval_status} without writing ${RC_VERDICT_FILE}, so no case was graded. This is not a verdict on the candidate." >&2
     else
       verdict="RED"
     fi
@@ -285,7 +318,7 @@ main() {
   echo "🏷️ RELEASE CANDIDATE EVAL"
   echo "Candidate:   ${rc_tag} (${rc_commit_sha})"
   echo "Tier:        ${RC_EVAL_TIER}"
-  echo "Verdict:     ${verdict} (advisory: this lane gates nothing)"
+  echo "Verdict:     ${verdict} (GREEN promotes this candidate to staging)"
   if [ -n "${deck_url}" ]; then
     echo "Artifacts:   ${deck_url}"
   fi
@@ -307,9 +340,13 @@ main() {
         echo "| Run | ${deck_url} |"
       fi
       echo
-      echo "Advisory. This lane reports and does not gate: a red verdict here"
-      echo "does not hold a release, and the non-inferiority comparison stays"
-      echo "advisory while the baseline store is maturing."
+      echo "This verdict decides whether the candidate reaches staging. Step 5"
+      echo "of nightly-pipeline.yml reads the row above out of this file:"
+      echo "GREEN pushes the staging_ tag that deploys the candidate, RED holds"
+      echo "it back for good, and NOT RUN withdraws the nomination so a later"
+      echo "nightly can measure the same candidate again. The non-inferiority"
+      echo "comparison inside the eval stays advisory while the baseline store"
+      echo "is maturing, and does not contribute to the word above."
       echo
       if [ -f "${verdict_path}" ]; then
         echo "Per-case detail is in \`${RC_VERDICT_FILE}\` alongside this file."
@@ -317,6 +354,12 @@ main() {
         echo "The candidate was never evaluated: deploying it failed with"
         echo "status ${deploy_status}. Nothing here is a judgement on the"
         echo "candidate. The build log above is where it stopped."
+      elif [ "${eval_status}" -ne 0 ]; then
+        echo "The eval exited ${eval_status} without writing"
+        echo "\`${RC_VERDICT_FILE}\`, so it stopped before grading a case --"
+        echo "a preflight refusal rather than a red catalog. Nothing here is a"
+        echo "judgement on the candidate. The build log above is where it"
+        echo "stopped."
       else
         echo "No \`${RC_VERDICT_FILE}\` was written: the run did not reach the"
         echo "verdict step. The build log above is where it stopped."
@@ -327,13 +370,13 @@ main() {
 
   # The restore hint is the EXIT trap's, so that the failure paths get it too.
 
-  # The failing step's own status is preserved rather than forced to 0. Which
-  # one the job reports is the JOB's decision (an `|| true` in its config),
-  # kept there so "non-gating" is one line in the config a reader can see,
-  # instead of a swallowed exit code here that makes a red run
-  # indistinguishable from a green one to anything reading exit statuses.
-  # Deploy first: on that path eval_status is 0 because the eval never ran,
-  # and returning it would call a run that measured nothing a success.
+  # The failing step's own status is preserved rather than forced to 0, which is
+  # what makes the Prow job red and the failure visible to a human reading Deck.
+  # It is deliberately NOT what the promotion reads: the status cannot say which
+  # of the two non-green outcomes happened, and the poller consults it only to
+  # contradict the summary written above. Deploy first: on that path eval_status
+  # is 0 because the eval never ran, and returning it would call a run that
+  # measured nothing a success.
   if [ "${deploy_status}" -ne 0 ]; then
     exit "${deploy_status}"
   fi

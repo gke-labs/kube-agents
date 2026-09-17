@@ -53,7 +53,7 @@ are clean.
 
 Long-lived environments are reconciled and deployed atomically using `./upgrade.sh --upgrade-mode=full`:
 
-- **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the nightly pipeline pushes a `staging_*` tag after its full E2E test matrix passes on a fresh nightly cluster. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
+- **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the nightly pipeline pushes a `staging_*` tag. The nightly pushes it only after two gates: its full E2E test matrix passes on a fresh nightly cluster, and the release-candidate eval returns GREEN on the `evalcand_*` tag it pushes first. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
 
 A deploy takes the live-test lease before it applies anything (see

@@ -2,9 +2,15 @@
 
 Step 1 of the nightly pipeline has two skips that mean different things, and
 this summary is where a reader tells them apart: SKIP_PIPELINE means no
-candidate and no run, SKIP_PROMOTION means the matrix runs but a pass pushes
-nothing because the commit is already tagged for staging. Rendering one as the
-other would report a night that did nothing as a night that tested something.
+candidate and no run, SKIP_PROMOTION means the matrix runs but a pass nominates
+nothing because the commit has already been through the promotion path.
+Rendering one as the other would report a night that did nothing as a night that
+tested something.
+
+The "Promotes" line has its own trap. A green matrix stopped being sufficient
+when the release-candidate eval became a gate, so wording that credits the
+matrix alone would tell a reader the tag follows from the run they are looking
+at, when it follows from an eval that has not started yet.
 """
 
 import pathlib
@@ -19,6 +25,7 @@ _SCRIPT = _REPO_ROOT / "scripts" / "release" / "record_nightly_candidate_summary
 
 _COMMIT = "1234567890abcdef1234567890abcdef12345678"
 _RC_TAG = "rc_20260830_120000_1234567_validated"
+_EVALCAND_TAG = "evalcand_20260830_120000_1234567"
 _STAGING_TAG = "staging_20260830_120000_1234567"
 
 
@@ -31,6 +38,7 @@ class RecordNightlyCandidateSummaryTest(unittest.TestCase):
         env_overrides = {
             "COMMIT_SHA": _COMMIT,
             "RC_TAG": _RC_TAG,
+            "EVALCAND_TAG": _EVALCAND_TAG,
             "STAGING_TAG": _STAGING_TAG,
             "SKIP_PIPELINE": "false",
             "SKIP_PROMOTION": "false",
@@ -58,8 +66,9 @@ class RecordNightlyCandidateSummaryTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"| Candidate | `{_RC_TAG}` |", summary)
         self.assertIn(f"| Commit | `{_COMMIT}` |", summary)
+        self.assertIn(f"| Eval-candidate tag | `{_EVALCAND_TAG}` |", summary)
         self.assertIn(f"| Staging tag | `{_STAGING_TAG}` |", summary)
-        self.assertIn("| Promotes | yes, if the matrix passes |", summary)
+        self.assertIn("| Promotes | yes, if the matrix and the eval pass |", summary)
 
     def test_skip_pipeline_reports_no_matrix_and_no_table(self):
         proc, summary = self._run(
@@ -85,10 +94,16 @@ class RecordNightlyCandidateSummaryTest(unittest.TestCase):
         self.assertNotIn("| Candidate |", summary)
 
     def test_skip_promotion_still_reports_the_candidate(self):
-        """The matrix runs; only the tag push is skipped. Both facts must show."""
+        """The matrix runs; the nomination and the tag push are skipped."""
         _, summary = self._run({"SKIP_PROMOTION": "true"})
         self.assertIn(f"| Candidate | `{_RC_TAG}` |", summary)
-        self.assertIn("| Promotes | no — already promoted |", summary)
+        self.assertIn("| Promotes | no — already nominated or promoted |", summary)
+
+    def test_the_promotes_line_does_not_credit_the_matrix_alone(self):
+        """A green matrix nominates a candidate; the eval is what promotes it."""
+        _, summary = self._run()
+        self.assertNotIn("| Promotes | yes, if the matrix passes |", summary)
+        self.assertIn("eval", summary)
 
     def test_reason_is_appended_when_the_pipeline_runs(self):
         _, summary = self._run(
@@ -111,6 +126,7 @@ class RecordNightlyCandidateSummaryTest(unittest.TestCase):
                 overrides={
                     "COMMIT_SHA": _COMMIT,
                     "RC_TAG": _RC_TAG,
+                    "EVALCAND_TAG": _EVALCAND_TAG,
                     "STAGING_TAG": _STAGING_TAG,
                     "SKIP_PIPELINE": "false",
                     "SKIP_PROMOTION": "false",
