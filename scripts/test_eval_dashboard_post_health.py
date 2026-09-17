@@ -19,7 +19,7 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import post_health
 
@@ -1350,6 +1350,135 @@ class BucketState(unittest.TestCase):
         self.assertEqual(calls[0], ["gsutil", "-q", "cat", "gs://bucket/evals/health-state.json"])
         self.assertEqual(calls[1][:5], ["gsutil", "-q", "-h", "Cache-Control: no-cache", "cp"])
         self.assertEqual(calls[1][-1], "gs://bucket/evals/health-state.json")
+
+
+# --------------------------------------------------------------------------- #
+# Fixture drift (#1550): the hourly seeded-fleet scan's condition
+# --------------------------------------------------------------------------- #
+
+# 2026-09-14 (a Monday) 13:00Z is 9:00 AM EDT: the scan that fired.
+SCAN_AT = "2026-09-14T13:00:00+00:00"
+DRIFT_ROLE = "crashloop-workload"
+DRIFT_PROJECTS = ("kube-agents-evals-1", "kube-agents-evals-2", "kube-agents-evals-3")
+DRIFT_DETAIL = "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0"
+BLIND_REASON = "cannot mint a token as seeded-fleet-reader@kube-agents-evals-1.iam.gserviceaccount.com (is roles/iam.serviceAccountTokenCreator granted to the bot?): ERROR: PERMISSION_DENIED"
+T14 = datetime(2026, 9, 14, 13, 30, tzinfo=timezone.utc)  # 9:30 AM EDT, outside the digest window
+
+
+def fixture_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None):
+    return {"scanned_at": scanned, "projects": projects, "checked": checked, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
+
+
+def fixture_drift(since=SCAN_AT, roles=(DRIFT_ROLE,), projects=DRIFT_PROJECTS, evidence=()):
+    doc = health("DEGRADED", f"seeded fixture drift: {', '.join(roles)} out of designed state on {len(projects)} pool project(s)", since=since, condition="fixture_drift", window=(since, None))
+    doc["incident"].update({"roles": list(roles), "projects": list(projects), "drift": {p: {r: [DRIFT_DETAIL] for r in roles} for p in projects}})
+    doc["evidence"] = list(evidence)
+    doc["fixture_state"] = fixture_block(drifted={p: list(roles) for p in projects})
+    return doc
+
+
+class FixtureDrift(RunHarness):
+    """The seeded-fleet scan's condition (#1550): one message naming the roles
+    and the projects, the fleet owner's issue once, a human's issue naming the
+    roles adopted, the digest's line on the latest scan, and a blind scan said
+    once each way and never filed."""
+
+    def environ(self):
+        return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
+
+    def test_a_new_drift_condition_posts_once_and_files_the_fleet_owner_issue(self):
+        rc, err = self.tick(fixture_drift(evidence=[f"{DRIFT_ROLE} drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"]), T14, environ=self.environ())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(
+            self.opener.texts,
+            [
+                (
+                    "🟡 *Smoke gate: flaky* — seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET;"
+                    " a red on a case that depends on it from a run that leased one of those projects is the fixture, not the code. Retest once the fleet is re-applied."
+                    " Fleet owner: re-apply bench/tf/fleet in the projects named. Tracking #1300.\n"
+                    f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
+                )
+            ],
+        )
+        method, path, body = self.gh.calls[-1]
+        self.assertEqual((method, path), ("POST", "repos/gke-labs/kube-agents/issues"))
+        self.assertEqual(body["title"], "Seeded fleet drift: crashloop-workload out of designed state on 3 pool projects since Mon 9:00 AM ET")
+        self.assertEqual(body["labels"], ["presubmit-gate"])
+        for expected in ("- `crashloop-workload`", "- `kube-agents-evals-2`", f"    - {DRIFT_DETAIL}", "re-apply `bench/tf/fleet`", "the fleet owner should re-apply the stack", "latest scan 2026-09-14T13:00:00+00:00", "at the 13:00 UTC scan"):
+            self.assertIn(expected, body["body"])
+        self.assertEqual(self.recorded()["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "fixture_drift"})
+        # The same condition next tick is silence.
+        self.tick(fixture_drift(), T14 + timedelta(minutes=15), environ=self.environ())
+        self.assertEqual(len(self.opener.texts), 1)
+        self.assertEqual(len(self.gh.writes()), 1)
+
+    def test_a_human_issue_naming_the_roles_is_adopted(self):
+        gh = FakeGh(open_issues=[{"number": 1290, "html_url": "https://github.com/gke-labs/kube-agents/issues/1290", "title": "crashloop-workload sits Pending on the fleet again", "body": ""}])
+        self.tick(fixture_drift(), T14, environ=self.environ(), gh=gh)
+        self.assertTrue(self.opener.texts[0].endswith(f"Tracking #1290.\n{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"))
+        self.assertEqual(gh.writes(), [])
+        self.assertEqual(self.recorded()["issue"]["condition"], "fixture_drift")
+
+    def test_the_recovery_says_the_fixtures_had_drifted_and_comments(self):
+        self.tick(fixture_drift(), T14, environ=self.environ())
+        later = T14 + timedelta(hours=2)
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        self.tick(green, later, environ=self.environ())
+        self.assertEqual(self.opener.texts[-1].splitlines()[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (seeded fixtures had drifted, #1300).")
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
+        self.assertIsNone(self.recorded()["issue"])
+
+    def test_the_cause_sentence_the_gate_comment_box_carries(self):
+        self.assertEqual(
+            post_health.cause_sentence(fixture_drift()),
+            "seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET; a red on a case that depends on it from a run that leased one of those projects is the fixture, not the code.",
+        )
+        two = fixture_drift(roles=(DRIFT_ROLE, "no-pdb-workload"), projects=("kube-agents-evals-1",))
+        self.assertEqual(
+            post_health.cause_sentence(two),
+            "seeded fixtures crashloop-workload, no-pdb-workload out of designed state on 1 pool project since 9:00 AM ET; a red on a case that depends on them from a run that leased one of those projects is the fixture, not the code.",
+        )
+
+    def test_the_digest_carries_one_line_on_the_latest_scan(self):
+        def line(block):
+            doc = health("GREEN")
+            if block is not None:
+                doc["fixture_state"] = block
+            return [text for text in post_health.render_digest(doc, T14).splitlines() if text.startswith("🧭")]
+
+        self.assertEqual(line(None), [], "before the scan has ever published, no line")
+        self.assertEqual(line(fixture_block()), ["🧭 *Seeded fleet:* 30 of 30 pool projects checked at 9:00 AM ET, every fixture in its designed state."])
+        self.assertEqual(line(fixture_block(checked=28)), ["🧭 *Seeded fleet:* 28 of 30 pool projects checked at 9:00 AM ET, every fixture in its designed state, 2 not checked."])
+        self.assertEqual(
+            line(fixture_block(drifted={"kube-agents-evals-1": [DRIFT_ROLE], "kube-agents-evals-4": [DRIFT_ROLE, "no-pdb-workload"]})),
+            ["🧭 *Seeded fleet:* 2 of 30 checked pool projects drifted at 9:00 AM ET (crashloop-workload, no-pdb-workload); a red on a case that depends on them there is the fixture, not the code."],
+        )
+        self.assertEqual(line(fixture_block(checked=0, unknown=True, reason=BLIND_REASON)), [f"🧭 *Seeded fleet:* the 9:00 AM ET scan could check none of 30 pool projects ({BLIND_REASON})."])
+        self.assertEqual(line(fixture_block(stale=True)), ["🧭 *Seeded fleet:* the last scan (9:00 AM ET) is stale; someone check the scan job."])
+
+    def test_a_blind_scan_is_said_once_each_way_and_is_never_a_change(self):
+        blind = health("GREEN")
+        blind["fixture_state"] = fixture_block(checked=0, unknown=True, reason=BLIND_REASON)
+        self.tick(blind, T14, environ=self.environ())
+        self.assertEqual(
+            self.opener.texts,
+            [f"⚪ *Seeded-fleet scan can't see the fleet* — the 9:00 AM ET scan checked none of 30 pool projects ({BLIND_REASON}). Fixture drift goes unseen until that is fixed; the bot's grant is in docs/ci-health.md."],
+        )
+        self.assertEqual((self.recorded()["state"], self.recorded()["fixture_unknown"]), ("GREEN", True))
+        self.tick(blind, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "said once")
+        seeing = health("GREEN")
+        seeing["fixture_state"] = fixture_block(scanned="2026-09-14T14:00:00+00:00")
+        self.tick(seeing, T14 + timedelta(hours=1))
+        self.assertEqual(self.opener.texts[-1], "⚪ *Seeded-fleet scan sees the fleet again* — the 10:00 AM ET scan checked 30 of 30 pool projects.")
+        self.assertFalse(self.recorded()["fixture_unknown"])
+        self.assertEqual(self.gh.writes(), [], "nothing is filed for a blind scan")
+
+    def test_a_health_json_without_the_block_changes_nothing(self):
+        self.tick(health("GREEN"), T14)
+        self.assertEqual(self.opener.texts, [])
+        self.assertFalse(self.recorded()["fixture_unknown"])
 
 
 if __name__ == "__main__":

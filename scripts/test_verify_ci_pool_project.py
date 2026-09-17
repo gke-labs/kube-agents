@@ -2152,9 +2152,9 @@ class IamGrantsTest(unittest.TestCase):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
 
     def _fleet_reader_policy(self, members=None):
-        """seeded-fleet-reader's own policy, with the Prow runner able to borrow it."""
+        """seeded-fleet-reader's own policy, with the Prow runner and the CI health bot able to borrow it."""
         if members is None:
-            members = [checker.PROW_RUNNER_MEMBER]
+            members = list(checker.FLEET_READER_TOKEN_CREATORS)
         return json.dumps(
             {"bindings": [{"role": "roles/iam.serviceAccountTokenCreator", "members": members}]}
         )
@@ -2578,6 +2578,26 @@ class IamGrantsTest(unittest.TestCase):
             result.details,
         )
 
+    def test_fleet_reader_missing_only_the_health_bot_fails_and_names_it(self):
+        # The pool's state before the grant in docs/ci-health.md was run: the
+        # runner can borrow the reader, the CI health bot's hourly scan cannot,
+        # so the project is invisible to fixture-drift detection.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy(members=[checker.PROW_RUNNER_MEMBER])),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        bot = [d for d in result.details if "CI health bot" in d]
+        self.assertEqual(len(bot), 1, result.details)
+        self.assertIn("eval-dashboard-publisher@kube-agents-prow", bot[0])
+        self.assertIn("docs/ci-health.md", bot[0])
+        self.assertFalse(any("The Prow runner" in d for d in result.details), result.details)
+
     def test_fleet_reader_account_absent_fails(self):
         # kube-agents-evals and -2, -3, -4 as they stood on 2026-09-03: fleets
         # applied before the module grew the account. NOT_FOUND is not a denial,
@@ -2710,12 +2730,13 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
-    """PROW_RUNNER_MEMBER must equal bench/tf/fleet's token-creator default.
+    """FLEET_READER_TOKEN_CREATORS must equal bench/tf/fleet's token-creator default.
 
-    The verifier asserts one member holds the grant and Terraform grants it to
-    another, and neither reads the other. Rename the runner in one place and the
-    verifier fails every correctly-applied project -- or, worse round, passes a
-    project whose grant went to an account that no longer runs anything.
+    The verifier asserts these members hold the grant and Terraform grants it to
+    others, and neither reads the other. Rename the runner or the bot in one
+    place and the verifier fails every correctly-applied project -- or, worse
+    round, passes a project whose grant went to an account that no longer runs
+    anything.
     """
 
     def test_matches_the_variable_default(self):
@@ -2727,7 +2748,7 @@ class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
         default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
         self.assertIsNotNone(default, "fleet_reader_token_creators has no default")
         members = re.findall(r'"([^"]+)"', default.group(1))
-        self.assertEqual(members, [checker.PROW_RUNNER_MEMBER])
+        self.assertEqual(members, list(checker.FLEET_READER_TOKEN_CREATORS))
 
 
 class ExitStatusTest(unittest.TestCase):

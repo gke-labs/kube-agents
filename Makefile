@@ -116,15 +116,16 @@ prettier-check: ## Check Markdown/YAML formatting (CI runs this).
 prettier-write: ## Reformat all Markdown/YAML in place.
 	$(PRETTIER) --write "**/*.md" "**/*.yaml" "**/*.yml"
 
-# Every tracked shell script through shellcheck, not the three front-door
-# scripts CI's installer-matrix-test.yml checks on its own. No `-s`: each
-# shebang decides the dialect, so deploy/shared/docker-entrypoint.sh
-# (`#!/bin/sh`) is checked as POSIX sh. SC1090 joins SC1091 in the exclude list
-# because scripts/installer/common.sh sources a runtime path that `-x` cannot
-# follow; every other finding is fixed or carries an inline
-# `# shellcheck disable=SCnnnn # reason`, so widening this list is how a real
-# finding gets silenced. Wiring the target into CI is a workflow edit and a
-# separate change.
+# Every tracked shell script through shellcheck. The `validate` job in
+# .github/workflows/validate.yml runs this target on every pull request with
+# the shellcheck release it pins there, so a warning in a tracked script fails
+# the merge; run it with that release locally, since the apt package is older
+# and reports a different set. No `-s`: each shebang decides the dialect, so
+# deploy/shared/docker-entrypoint.sh (`#!/bin/sh`) is checked as POSIX sh.
+# SC1090 joins SC1091 in the exclude list because scripts/installer/common.sh
+# sources a runtime path that `-x` cannot follow; every other finding is fixed
+# or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
+# list is how a real finding gets silenced.
 #
 # The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
 # copies of google/skills that scripts/sync-upstream-skills.py deletes and
@@ -139,7 +140,7 @@ SHELLCHECK_EXCLUDE := SC1090,SC1091
 
 shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
 	@command -v shellcheck >/dev/null 2>&1 || { \
-		echo "shellcheck needs the shellcheck binary: apt install shellcheck, brew install shellcheck, or see https://github.com/koalaman/shellcheck#installing"; \
+		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
 		exit 1; \
 	}
 	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)

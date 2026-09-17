@@ -4,9 +4,11 @@
 recipe line that carries a `## description`, and nothing else in the
 repository names the targets. A target whose `##` comment is dropped, or which
 is renamed or deleted, therefore vanishes from the only place a contributor
-would look, and no other check notices. The `shellcheck` and `lint-python`
-targets are the developer entry points for two gates that otherwise run only
-by hand and from the unit suite, so this pins them to the help output.
+would look, and no other check notices. `lint-python` is the developer entry
+point for a gate the unit suite runs (`tests/test_lint_python.py`) and
+`shellcheck` for the one the `validate` job in `.github/workflows/validate.yml`
+runs (tests/test_shellcheck_gate_wiring.py pins that step); `make help` is
+where a contributor discovers both, so this pins them to the help output.
 """
 
 import pathlib

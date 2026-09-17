@@ -10,7 +10,7 @@ Why the clone is *leased*
 -------------------------
 The first version of this file put every repository at one flat path, a pure
 function of `owner/name`. That is exactly one working tree for the whole pod,
-and the pod runs many agents at once: six audit crons, plus every kanban worker
+and the pod runs many agents at once: the audit crons, plus every kanban worker
 the dispatcher spawns, plus whatever the operator is doing interactively. In the
 incident that prompted this design, the `submit-suggestion` skill ran
 `git checkout -b …` and `git push -f` inside the tree a fleet audit was midway
@@ -726,6 +726,13 @@ def extract_github_slug(entry: str) -> str | None:
 
 
 DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
+# How long `_read_state_key`'s ConfigMap fallback read waits on the API server
+# before giving up.
+# One namespaced GET against an in-cluster endpoint, so this is not a budget so
+# much as a ceiling on a call that has no other one: unbounded, an API server
+# that accepts the connection and then stops talking hangs the caller forever
+# rather than failing it, and nothing between this call and whatever deadline
+# encloses the run would report that as a read failure.
 GITOPS_STATE_READ_TIMEOUT_SECONDS = 30
 
 
@@ -813,6 +820,9 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
     except FileNotFoundError as e:
         raise RuntimeError("kubectl binary not found in PATH") from e
     except subprocess.TimeoutExpired as e:
+        # Same RuntimeError as every other failure here, because every caller
+        # already handles one and none of them can do anything with a distinct
+        # type: a list that cannot be read is a list that cannot be read.
         raise RuntimeError(
             f"Timed out after {GITOPS_STATE_READ_TIMEOUT_SECONDS}s reading ConfigMap "
             f"{cfg_name} in namespace {ns}"

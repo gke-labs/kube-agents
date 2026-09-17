@@ -57,6 +57,39 @@ jobs:
       - name: Validate Structure
         run: make validate
 
+      # A step in this job rather than a job of its own, because `validate` is
+      # already on main's required-status-checks list and a new job name is
+      # not: a check that is not required does not gate, however red it goes.
+      #
+      # The release tarball rather than `apt install shellcheck`: the apt
+      # package on ubuntu-latest is 0.9.0, two releases behind what the tree
+      # is cleared against, and a rule added or tightened since then reports
+      # differently here than on a maintainer's laptop. Pinned by version and
+      # SHA-256 for the same reason every third-party action is pinned to a
+      # commit: a moving `latest` turns a new upstream rule into a red check on
+      # a pull request that changed no shell. Bumping the pin means running
+      # `make shellcheck` with the new release first and clearing what it adds.
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
+          echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          # `make shellcheck` takes whichever binary PATH resolves first, so
+          # assert it is this one and not a package the runner image ships.
+          shellcheck --version | grep -Fx "version: ${SHELLCHECK_VERSION#v}"
+
+      # The same command a contributor runs locally, so the two cannot disagree
+      # about the pathspec, severity or exclude list; the Makefile owns all
+      # three and says why each is set as it is.
+      - name: Run shellcheck over every tracked shell script
+        run: make shellcheck
+
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:

@@ -1527,5 +1527,179 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(health.load_json(out)["runs"], trimmed["runs"])
 
 
+# --------------------------------------------------------------------------- #
+# Rule 3c: fixture drift (the hourly seeded-fleet scan)
+# --------------------------------------------------------------------------- #
+
+DRIFT_ROLE = "crashloop-workload"
+OTHER_ROLE = "no-pdb-workload"
+DRIFT_DETAIL = "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0 (why: the crashloop cases read an OOMKilled termination)"
+BLIND_REASON = "cannot mint a token as seeded-fleet-reader@kube-agents-evals-1.iam.gserviceaccount.com (is roles/iam.serviceAccountTokenCreator granted to the bot?): ERROR: PERMISSION_DENIED"
+
+
+def project(i):
+    return f"kube-agents-evals-{i}"
+
+
+def scan(drifted=None, previous=None, at=None, projects=30, checked=None):
+    """A fixture-state.json as scripts/eval_dashboard/fixture_state.py writes
+    it: `drifted` {project: [roles]} this scan, `previous` the same for the
+    scan before, every other role healthy -- or not checked on every project
+    outside `checked` when it is given."""
+    drifted = drifted or {}
+    at = at or T0 - timedelta(minutes=5)
+    entries = {}
+    for i in range(1, projects + 1):
+        name = project(i)
+        readable = checked is None or name in checked
+        roles = {}
+        for role in (DRIFT_ROLE, OTHER_ROLE):
+            if not readable:
+                roles[role] = {"state": "not_checked", "detail": [BLIND_REASON]}
+            elif role in drifted.get(name, []):
+                roles[role] = {"state": "drifted", "detail": [DRIFT_DETAIL]}
+            else:
+                roles[role] = {"state": "healthy", "detail": []}
+        entries[name] = {"roles": roles}
+    return {
+        "schema_version": 1,
+        "scanned_at": health.iso(at),
+        "projects": entries,
+        "previous": {"scanned_at": health.iso(at - timedelta(hours=1)), "drifted": previous or {}},
+    }
+
+
+class FixtureDrift(unittest.TestCase):
+    def judge(self, scan_doc, prev=None, now=T0, doc=None, posted=None):
+        doc = doc or data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
+        return health.adjudicate(doc, now, prev, health.Roster.fixed(ADMITTED), posted=posted, fixture_state_doc=scan_doc)
+
+    def test_no_scan_means_no_condition_and_no_block(self):
+        result = self.judge(None)
+        self.assertEqual((result["state"], result["fixture_state"]), ("GREEN", None))
+        self.assertFalse(any("fixture" in line for line in result["evidence"]))
+
+    def test_one_project_once_is_evidence_not_a_condition(self):
+        result = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}))
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIn(f"{DRIFT_ROLE} drifted on 1 pool project(s) ({project(1)}) at the 23:55 UTC scan; not yet repeated or widespread", result["evidence"])
+        block = result["fixture_state"]
+        self.assertEqual((block["projects"], block["checked"], block["drifted"], block["unknown"], block["stale"]), (30, 30, {project(1): [DRIFT_ROLE]}, False, False))
+        self.assertEqual(block["scanned_at"], health.iso(T0 - timedelta(minutes=5)))
+
+    def test_the_same_role_on_the_same_project_two_scans_running_degrades(self):
+        result = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [DRIFT_ROLE]}))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertEqual(result["cause"], f"seeded fixture drift: {DRIFT_ROLE} out of designed state on 1 pool project(s)")
+        self.assertEqual(result["since"], health.iso(T0), "the first tick enters directly: the scan is the currency")
+        incident = result["incident"]
+        self.assertEqual((incident["prs"], incident["runs"], incident["window_end"]), ([], 0, None))
+        self.assertEqual(incident["window_start"], health.iso(T0 - timedelta(minutes=5)))
+        self.assertEqual((incident["roles"], incident["projects"]), ([DRIFT_ROLE], [project(1)]))
+        self.assertEqual(incident["drift"], {project(1): {DRIFT_ROLE: [DRIFT_DETAIL]}})
+        self.assertIn(f"{DRIFT_ROLE} drifted on 1 pool project(s) ({project(1)}) at the 23:55 UTC scan, the 2nd consecutive scan on {project(1)}", result["evidence"])
+        self.assertEqual(
+            result["advice"],
+            f"A red on a case that depends on {DRIFT_ROLE} from a run that leased {project(1)} is the fixture, not your change;"
+            " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile).",
+        )
+        self.assertEqual(result["failing_cases"], [])
+
+    def test_previous_drift_on_another_project_or_role_does_not_count(self):
+        self.assertEqual(self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(2): [DRIFT_ROLE]}))["state"], "GREEN")
+        self.assertEqual(self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [OTHER_ROLE]}))["state"], "GREEN")
+
+    def test_three_projects_in_one_scan_degrade_and_two_do_not(self):
+        three = {project(i): [DRIFT_ROLE] for i in (1, 2, 3)}
+        result = self.judge(scan(drifted=three))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertEqual(result["incident"]["projects"], [project(1), project(2), project(3)])
+        self.assertEqual(result["cause"], f"seeded fixture drift: {DRIFT_ROLE} out of designed state on 3 pool project(s)")
+        self.assertEqual(self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2)}))["state"], "GREEN")
+        # Two roles on two projects each is still two projects per role.
+        self.assertEqual(self.judge(scan(drifted={project(1): [DRIFT_ROLE, OTHER_ROLE], project(2): [DRIFT_ROLE, OTHER_ROLE]}))["state"], "GREEN")
+
+    def test_only_the_firing_roles_make_the_incident(self):
+        drifted = {project(i): [DRIFT_ROLE] for i in (1, 2, 3)}
+        drifted[project(4)] = [OTHER_ROLE]
+        result = self.judge(scan(drifted=drifted))
+        self.assertEqual((result["incident"]["roles"], result["incident"]["projects"]), ([DRIFT_ROLE], [project(1), project(2), project(3)]))
+        self.assertEqual(result["fixture_state"]["drifted"], drifted, "the block carries every drift, firing or not")
+        self.assertTrue(any(line.startswith(f"{OTHER_ROLE} drifted on 1 pool project(s)") and line.endswith("not yet repeated or widespread") for line in result["evidence"]))
+
+    def test_evidence_names_four_projects_then_counts(self):
+        drifted = {project(i): [DRIFT_ROLE] for i in range(1, 8)}
+        result = self.judge(scan(drifted=drifted))
+        self.assertIn(f"{DRIFT_ROLE} drifted on 7 pool project(s) ({project(1)}, {project(2)}, {project(3)}, {project(4)} and 3 more) at the 23:55 UTC scan", result["evidence"])
+
+    def test_ranked_below_every_run_based_condition(self):
+        lost_doc = data(*(lost(100 + i, i, T0 - timedelta(minutes=5 * i)) for i in range(3)))
+        result = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}), doc=lost_doc)
+        self.assertEqual(result["condition"], "lost_pods")
+        self.assertTrue(any(line.startswith(f"{DRIFT_ROLE} drifted on 3 pool project(s)") for line in result["evidence"]), "the drift stays as context")
+
+    def test_a_stale_scan_is_ignored_with_a_note(self):
+        result = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=T0 - timedelta(hours=4)))
+        self.assertEqual(result["state"], "GREEN")
+        self.assertTrue(result["fixture_state"]["stale"])
+        self.assertIn(f"fixture-state scan is 4h old (last {health.iso(T0 - timedelta(hours=4))}); ignored, check the scan job", result["evidence"])
+        fresh = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=T0 - timedelta(hours=2, minutes=59)))
+        self.assertEqual(fresh["state"], "DEGRADED", "inside three hours the scan counts")
+
+    def test_a_scan_that_saw_nothing_is_unknown_never_a_drift(self):
+        result = self.judge(scan(checked=set()))
+        self.assertEqual(result["state"], "GREEN")
+        block = result["fixture_state"]
+        self.assertEqual((block["unknown"], block["checked"], block["reason"]), (True, 0, BLIND_REASON))
+        self.assertIn(f"fixture-state scan at 23:55 UTC could check none of 30 pool projects ({BLIND_REASON})", result["evidence"])
+        # One readable project is a scan, not a blind one.
+        partial = self.judge(scan(checked={project(1)}))
+        self.assertEqual((partial["fixture_state"]["unknown"], partial["fixture_state"]["checked"]), (False, 1))
+
+    def test_it_ends_the_hour_the_scan_clears_and_holds_while_it_does_not(self):
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        self.assertEqual(prev["condition"], "fixture_drift")
+        later = T0 + timedelta(hours=1)
+        held = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=later - timedelta(minutes=5)), prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "fixture_drift", health.iso(T0)))
+        cleared = self.judge(scan(at=later - timedelta(minutes=5)), prev=held, now=later)
+        self.assertEqual((cleared["state"], cleared["condition"], cleared["recovering"]), ("GREEN", None, False), "no three-green-runs bar: the scan is the recovery")
+        # One project still drifted, not repeated: the condition is over.
+        one = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, at=later - timedelta(minutes=5)), prev=held, now=later)
+        self.assertEqual(one["state"], "GREEN")
+
+    def test_a_scan_that_could_not_see_the_incident_holds_it(self):
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        cases = {
+            "absent": (None, "no fixture-state scan was read this tick"),
+            "stale": (scan(at=later - timedelta(hours=4)), "the fixture-state scan is stale"),
+            "blind": (scan(at=at, checked=set()), "the fixture-state scan could check no project"),
+            "one project not checked": (scan(at=at, checked={project(i) for i in range(1, 31)} - {project(2)}), f"the fixture-state scan could not read {project(2)}"),
+        }
+        for name, (doc, why) in cases.items():
+            with self.subTest(name):
+                held = self.judge(doc, prev=prev, now=later)
+                self.assertEqual((held["state"], held["condition"], held["since"], held["recovering"]), ("DEGRADED", "fixture_drift", health.iso(T0), False))
+                self.assertEqual(held["incident"], prev["incident"], "the held tick keeps the incident it entered with")
+                self.assertIn(f"fixture drift held: {why}; a scan that reads those projects clean ends it", held["evidence"])
+        # A project the incident did not name being unreadable is not a hold.
+        other = self.judge(scan(at=at, checked={project(i) for i in range(1, 31)} - {project(9)}), prev=prev, now=later)
+        self.assertEqual((other["state"], other["condition"]), ("GREEN", None))
+        # The hold is not "recovering": no three-green-runs line is added.
+        self.assertFalse(any("consecutive green runs" in line for line in self.judge(None, prev=prev, now=later)["evidence"]))
+
+    def test_the_posters_issue_is_cited_for_the_condition_it_was_filed_for(self):
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        owner = {"number": 1400, "url": "https://github.com/gke-labs/kube-agents/issues/1400", "condition": "fixture_drift"}
+        cited = self.judge(firing, posted={"issue": owner})
+        self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner, ["#1400"]))
+        other = dict(owner, condition="lost_pods")
+        self.assertIsNone(self.judge(firing, posted={"issue": other})["issue"])
+
+
 if __name__ == "__main__":
     unittest.main()

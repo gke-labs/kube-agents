@@ -54,6 +54,15 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// credentialProxyMaxOutputBytes caps each stream a brokered command returns;
+	// the paragraph above its use ties the figure to the proxy container's
+	// memory limit, and the cap test asserts the pair.
+	credentialProxyMaxOutputBytes = "8388608"
+	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
+	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
+	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
+	// is not an alternative.
+	hermesHomeMode = "2770"
 	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
 	// shell_sandbox_manifests.go the sandbox's claim at the same path.
 	//
@@ -368,9 +377,10 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and the only pin here that is not about chat. Every other key below
-	// exists because the agent could otherwise write a competing value into the PVC .env;
-	// this one exists because something already does, on every boot, without being asked.
+	// UNCONDITIONAL, and one of the three pins here that are not about chat. Every chat key
+	// below exists because the agent could otherwise write a competing value into the PVC
+	// .env; this one exists because something already does, on every boot, without being
+	// asked.
 	//
 	// Hermes' Docker stage2 hook generates a strong random API_SERVER_KEY into
 	// $HERMES_HOME/.env whenever that file does not already carry one, and
@@ -394,6 +404,20 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// sidecar's AGENT_API_UPSTREAM_KEY and to the probe's bearer, reintroducing exactly
 	// the several-parties-must-agree problem this closes.
 	add("API_SERVER_KEY", loopbackAgentAPIKey)
+
+	// Another non-chat pin, and it closes a claim the container env cannot make on its
+	// own. Setting HERMES_HOME_MODE in Container.Env puts it in the LOWEST-precedence
+	// layer of the three: the managed .env beats the PVC .env beats the process
+	// environment. So a single `HERMES_HOME_MODE=0777` line in $HERMES_HOME/.env — which
+	// the agent can write, and which sandbox-credential-cleanup does not remove, so it
+	// survives every upgrade — silently widens every directory hermes secures on the
+	// shared PVC. Sessions, memories and logs open to anything else that mounts it, and
+	// the pod stays green throughout.
+	//
+	// Not a regression this branch introduced; the route predates it. But the container
+	// env alone was never the guarantee it reads as, and pinning here is what makes it
+	// one: save_env_value refuses to write a key this file holds.
+	add("HERMES_HOME_MODE", hermesHomeMode)
 
 	// The mode pin, also unconditional and also not about chat. The managed key
 	// is the only way the mode reaches the agent runtime, and pinning it is what
@@ -1911,6 +1935,23 @@ type renderOptions struct {
 	otlpDisabled bool
 }
 
+// lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
+// surviving one where it already sits. Order is otherwise untouched, so on the ordinary
+// render -- no plugin naming an operator-owned variable -- the result is the input.
+func lastWinsEnv(env []corev1.EnvVar) []corev1.EnvVar {
+	lastIndex := make(map[string]int, len(env))
+	for i, e := range env {
+		lastIndex[e.Name] = i
+	}
+	out := make([]corev1.EnvVar, 0, len(lastIndex))
+	for i, e := range env {
+		if lastIndex[e.Name] == i {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -2274,6 +2315,33 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "HERMES_MANAGED_DIR",
 		Value: managedScopeDir,
+	})
+	// The other half of the umask note at the top of this file. That umask governs what
+	// the entrypoints create; this governs what Hermes then re-tightens. Hermes chmods
+	// HERMES_HOME and ten named subdirectories to 0700 on every process start, and a cron
+	// or kanban worker runs with HERMES_HOME pointed at profiles/platform — so 0700 locks
+	// every other uid on this volume out of the profile. The case that found it was the
+	// credential proxy, which ran in this Pod as uid 10001 and got EACCES filing a
+	// kubeconfig under the profile; #913 moved the proxy to a Pod of its own, so every
+	// container the operator itself renders onto this volume is one uid now. Two readers
+	// remain. The dashboard container runs Hermes against the same directories, and a
+	// container the CR supplies under spec.deployment.sidecars with a runAsUser of its own
+	// mounts the claim under a second uid with nothing to refuse it
+	// (platformagent_data_volume_uid_test.go). Group access is what keeps either from
+	// being a lockout: every container on the volume is in gid 10000, and no uid on it
+	// reaches `other`. Setgid so children keep inheriting the group the way the umask
+	// already assumes.
+	//
+	// A chmod cannot substitute for this. `ensure_hermes_home` re-applies the mode before
+	// the worker does any work, so a directory widened by hand is 0700 again by the time
+	// the first process runs.
+	//
+	// Appended after the plugin merge like HERMES_MANAGED_DIR above it: an arbitrary value
+	// here would widen every directory Hermes secures on the PVC, so it is not a plugin's
+	// to set.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "HERMES_HOME_MODE",
+		Value: hermesHomeMode,
 	})
 	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
 	// own home while the shell is local. agent/file_safety.py checks the path prefix in
@@ -3147,6 +3215,41 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
 		{Name: "CREDENTIAL_PROXY_POLICY", Value: "/etc/credential-proxy/policy.json"},
+		// 8 MiB, twice the proxy's own default. Every command an agent runs
+		// arrives here -- its `kubectl` in the sandbox is a shim that posts an
+		// argv vector to this pod -- so this cap, not the API server, is what
+		// bounds a cluster dump. On 2026-08-30 the fleet-audit workload dump
+		// for kube-agents-host measured 3,866,719 bytes against the 4 MiB
+		// default: 92% of it, roughly twelve more workloads from the edge.
+		// Crossing it truncates the JSON mid-string, which fails the
+		// collectors' parse gate and drops that whole cluster out of
+		// compliance-audit and ai-security-audit as a coverage gap.
+		//
+		// The cap does not bound the read: `_execute` takes the subprocess to
+		// completion with `communicate()` before it slices, so the full output
+		// is resident whatever this says. What it does bound is the slice that
+		// survives, and that copy is then JSON-escaped and encoded for the
+		// response -- so raising it costs on the order of three times the
+		// increase per in-flight request rather than nothing.
+		//
+		// Which is what puts a ceiling on it, and the ceiling is the proxy
+		// container's own memory limit (buildCredentialProxyContainer) rather
+		// than anything about the fleet. Count five live copies of a capped
+		// output per stream -- the subprocess bytes, the slice, the decoded str,
+		// the JSON-escaped str, the encoded response -- and two capped streams
+		// per command, because `_execute` truncates stdout and stderr in two
+		// independent calls, so the cap is a per-stream ceiling. Ten copies,
+		// then, against the five-way kanban fan-out resolveResources sizes the
+		// agent container for, plus the front-door session, each issuing one
+		// command. At 8 MiB that is 480 MiB of burst on top of the 256Mi the
+		// container requests at rest, which its 1Gi limit absorbs; at 16 MiB --
+		// the value this carried while the proxy was a sidecar with a 2Gi limit
+		// -- it does not, and an OOMKill here takes gcloud, kubectl, gh and git
+		// away from every agent the proxy serves. Raising this means raising the
+		// limit with it, and the cap test asserts the pair so the two cannot
+		// drift apart silently -- it is the arithmetic above, so believe it over
+		// this paragraph if they ever disagree again.
+		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
@@ -3360,6 +3463,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 			result = append(result, env)
 		}
 	}
+	// No dedup pass over `custom` here, deliberately. The reserved set above
+	// closes managed-vs-custom: every `managed` name is in it. Custom-vs-custom
+	// is closed a layer earlier -- `custom` is `spec.deployment.env` and
+	// nothing else, and DeploymentSpec.Env carries +listType=map
+	// +listMapKey=name, so the API server refuses a CR that repeats a name
+	// before the operator ever sees it. Adding `lastWinsEnv` here would read as
+	// though that were in doubt.
 	return result
 }
 
@@ -3673,10 +3783,11 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
 	// otherwise turn the shared-state setup off for the whole agent, and the symptom —
 	// plugins mounted but never enabled — would look like the plugin was broken rather
-	// than the cause. Appending after the merge leaves the operator's entry last, and the
-	// kubelet collapses duplicate env names last-wins. Same mechanism, same reason, as
+	// than the cause. Appending after the merge leaves the operator's entry last, and
+	// lastWinsEnv below keeps the last of each name. Same mechanism, same reason, as
 	// CREDENTIAL_PROXY_URL in buildPodTemplateSpec; both are pinned by tests, because a
-	// reordering here is silent.
+	// reordering here is silent. What happens without that collapse is not the kubelet
+	// picking a winner -- see the comment on lastWinsEnv below, which owns that.
 	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
 		Name:  sharedStateSetupEnvVar,
 		Value: sharedStateSetupOwner,
@@ -3710,6 +3821,21 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
 	})
+
+	// Every "appended after the merge" comment above rests on the kubelet collapsing a
+	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`
+	// carries `patchMergeKey=name` and the controller applies server-side, so the API
+	// server refuses the object before it exists:
+	//
+	//   .spec.template.spec.containers[name="platform-agent"].env:
+	//   duplicate entries for key [name="HERMES_HOME_MODE"]
+	//
+	// So a plugin naming one of those variables did not lose the argument -- it stalled
+	// the gateway's reconciliation outright, leaving the running pod on whatever it last
+	// had and nothing in the Deployment to show why. Collapse here, once, at the only
+	// point every append has already run, rather than at each of them; last-wins is the
+	// semantics they were all written for, so this changes no rendered value.
+	gatewayEnvVars = lastWinsEnv(gatewayEnvVars)
 
 	containers := []corev1.Container{
 		{
@@ -3760,6 +3886,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// agent had changed for itself.
 				Name:  "HERMES_MANAGED_DIR",
 				Value: managedScopeDir,
+			},
+			{
+				// Same value as the gateway's for a second reason: this container runs
+				// Hermes against the same directories, so a different mode here would mean
+				// the two containers took turns re-chmod'ing the PVC out from under each
+				// other on every start.
+				Name:  "HERMES_HOME_MODE",
+				Value: hermesHomeMode,
 			},
 			{
 				Name:  "HOME",

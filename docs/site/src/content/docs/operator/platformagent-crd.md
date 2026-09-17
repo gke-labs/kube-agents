@@ -664,7 +664,7 @@ from chat. The platform credentials and endpoints that have no `config.yaml` equ
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
 
-That file also pins two values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
+That file also pins three values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
 the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
 because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
 file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
@@ -673,7 +673,12 @@ credential proxy, the startup probe and every in-pod loopback call get `401 Inva
 The container entrypoint warns at boot when this pin and the container env disagree.
 The credential that guards the API from _outside_ is `API_SERVER_EXTERNAL_KEY`, set from
 `hermes.apiServerSecretRef`; the sidecar authenticates the caller against it and swaps in the sentinel.
-The second is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
+The second is `HERMES_HOME_MODE=2770`, the mode Hermes re-applies to `$HERMES_HOME` at every process
+start. The container env carries it too, but that is the lowest-precedence of the three layers, so a
+`HERMES_HOME_MODE=0777` line the agent writes into the PVC `.env` outranks it and widens every
+directory Hermes secures on the shared volume.
+
+The third is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
 contract (`docs/designs/spec-mode-switch.md`). It is pinned always, with the real value, because an
 absent key is a key the agent may write, and it is read back by exactly one module,
 `agents/platform/scripts/runtime_mode.py`.

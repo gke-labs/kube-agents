@@ -84,6 +84,11 @@ NIGHTLY_AT_SPLIT = [
 # obtainability-declared-intent-no-finding (#1341) and vcs-history-only-fact
 # (#1253) -- have no fixture at all and wait in the validator's
 # FIXTURE_NOT_READY instead.
+# Registered in the nightly file after the split, in file order, each by the
+# pull request that authored the case (a new case lands in the nightly first).
+ADDED_AFTER_THE_SPLIT = [
+    "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625
+]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",
     "obtainability-refusal-direct-mutation",
@@ -150,7 +155,7 @@ class SplitLostNothingTest(unittest.TestCase):
         self.assertEqual(eval_rosters.blocking_roster(), ROSTER_AT_SPLIT)
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases(self):
-        self.assertEqual(eval_rosters.nightly_cases(), NIGHTLY_AT_SPLIT + MOVED_TO_NIGHTLY)
+        self.assertEqual(eval_rosters.nightly_cases(), NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY)
 
     def test_the_script_no_longer_carries_the_arrays(self):
         # A literal array creeping back in would be a second source of truth

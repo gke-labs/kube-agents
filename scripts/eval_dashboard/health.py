@@ -11,7 +11,9 @@ the node the pod was on (lost pods -- #1478). Nobody derives that from a
 heatmap at 8am, so this turns the procedure into a job.
 
 It is a pure function: data.json (schema v1, SCHEMA.md) plus the previously
-written health.json in, health.json out::
+written health.json in -- and, when the hourly seeded-fleet scan has
+published one, fixture-state.json (scripts/eval_dashboard/fixture_state.py)
+-- health.json out::
 
     {state, since, cause, failing_cases, evidence, advice, slow, pool, metrics, generated_at}
 
@@ -58,9 +60,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import tiers
+    from . import fixture_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import fixture_state
     import tiers
 try:
     import eval_rosters
@@ -81,9 +84,11 @@ SHARED_BREAK = "shared_break"
 STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
 LOST_PODS = "lost_pods"
-# The conditions whose evidence is a count of runs that never became full
-# runs; rule 6's entry check takes the count itself as currency.
-COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS)
+FIXTURE_DRIFT = "fixture_drift"
+# The conditions whose evidence is not a full run -- a count of runs that
+# never became one, or the fleet scan's verdict; rule 6's entry check takes
+# the evidence itself as currency.
+COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT)
 
 # Prow's job verdicts (SCHEMA.md: runs[].result). ABORTED is a superseded
 # push, not a statement about the gate, and is counted nowhere below except
@@ -225,6 +230,38 @@ READER_TZ = ZoneInfo("America/Toronto")
 READER_TZ_LABEL = "ET"
 NOON = 12
 
+# --- Rule 3c: fixture drift -> DEGRADED (#1550, #1544) -----------------------
+# Incident: #1278 again, seen from the fleet's side. The presence probes kept
+# passing while every slot-a fixture sat Pending; the designed-state check
+# (hack/fleet-fixture-state.py) is what would have said so, and the CI health
+# workflow now runs it against every pool project once an hour and publishes
+# fixture-state.json beside health.json (scripts/eval_dashboard/
+# fixture_state.py). Nothing in the presubmit runs this check and nothing
+# acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so a drifted role
+# reds the cases that depend on it on the runs that lease those projects;
+# the run-based rules above see that red as it happens, and this rule names
+# the cause and its owner (the fleet's reconcile). DEGRADED, not an OUTAGE:
+# it is a few cases on some projects, with the fix in someone's hands.
+#
+# The rule: the same role drifted on the same project in
+# FIXTURE_DRIFT_CONSECUTIVE_SCANS consecutive scans, or on
+# FIXTURE_DRIFT_MIN_PROJECTS projects in one scan. One scan on one project is
+# not enough: in #1278's retest sweep the crashloop fixture lagged the node
+# repair by about 40 minutes on one project (it needs its first restart
+# before OOMKilled evidence exists), and one hourly scan can land inside that
+# window; the second scan is an hour later. Three projects at once is the
+# fleet-wide shape (#1278 was all 30) and waits for nothing. A scan older than
+# FIXTURE_STATE_MAX_AGE (three missed hourly scans) is the scan job being
+# broken, not the fleet, and is ignored with a note. A scan that could check
+# no project at all (the bot's grant missing) is `unknown`: said once by the
+# poster, never a drift. Ranked below every run-based condition, because
+# those red a run and this one does not.
+FIXTURE_DRIFT_MIN_PROJECTS = 3
+FIXTURE_DRIFT_CONSECUTIVE_SCANS = 2
+FIXTURE_STATE_MAX_AGE = timedelta(hours=3)
+# How many projects an evidence line names before "and N more".
+EVIDENCE_MAX_PROJECTS = 4
+
 # --- Rule 5: what GREEN reports ----------------------------------------------
 METRICS_WINDOW = timedelta(hours=24)
 WALL_CLOCK_PERCENTILES = (50, 90)
@@ -328,6 +365,7 @@ CAUSE_SHARED_BREAK = "shared fixture/environment break: {cases}"
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
+CAUSE_FIXTURE_DRIFT = "seeded fixture drift: {roles} out of designed state on {projects} pool project(s)"
 ADVICE_OUTAGE = "Don't retest yet; the failing cases share a cause. Tracking: {tracking}"
 ADVICE_OUTAGE_NO_ISSUE = "no issue filed yet — file one with the presubmit-gate label"
 ADVICE_STORM = "Retest after {when} UTC; runs started inside the storm lose repetitions to 429s."
@@ -341,6 +379,10 @@ ADVICE_LOST_PODS = (
     " Cluster owner: check the node events and autorepair."
 )
 UNKNOWN_NODE = "(name unknown)"
+ADVICE_FIXTURE_DRIFT = (
+    "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
+    " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
+)
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
     " after {count} consecutive green runs on distinct PRs."
@@ -773,6 +815,90 @@ def lost_pods(runs, now: datetime) -> dict:
     }
 
 
+def _project_list(projects) -> str:
+    shown = ", ".join(projects[:EVIDENCE_MAX_PROJECTS])
+    extra = len(projects) - EVIDENCE_MAX_PROJECTS
+    return f"{shown} and {extra} more" if extra > 0 else shown
+
+
+def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
+    """Rule 3c over fixture-state.json. Returns {fires, known, stale, unknown,
+    scanned_at, roles, projects, drift, current, checked, total, reason,
+    evidence}.
+
+    `current` is every project's drifted roles this scan, firing or not;
+    `roles` and `projects` are the ones that fire; `drift` is
+    {project: {role: [what the scan observed]}} for those; `read` is
+    {project: [roles the scan could read there]}, what rule 6's exit checks.
+    """
+    out = {
+        "fires": False,
+        "known": False,
+        "stale": False,
+        "unknown": False,
+        "scanned_at": None,
+        "roles": [],
+        "projects": [],
+        "drift": {},
+        "current": {},
+        "read": {},
+        "checked": 0,
+        "total": 0,
+        "reason": None,
+        "evidence": [],
+    }
+    if not isinstance(state_doc, dict):
+        return out
+    out["known"] = True
+    scanned_at = parse_iso(state_doc.get(fixture_state.KEY_SCANNED_AT))
+    out["scanned_at"] = scanned_at
+    projects = state_doc.get(fixture_state.KEY_PROJECTS)
+    out["total"] = len(projects) if isinstance(projects, dict) else 0
+    out["checked"] = fixture_state.checked_projects(state_doc)
+    if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
+        out["stale"] = True
+        age = f"{int((now - scanned_at).total_seconds() // 3600)}h" if scanned_at else "of unknown age"
+        out["evidence"].append(f"fixture-state scan is {age} old (last {iso(scanned_at) or 'never'}); ignored, check the scan job")
+        return out
+    if out["total"] and out["checked"] == 0:
+        out["unknown"] = True
+        out["reason"] = fixture_state.not_checked_reason(state_doc)
+        out["evidence"].append(
+            f"fixture-state scan at {hhmm(scanned_at)} UTC could check none of {out['total']} pool projects"
+            + (f" ({out['reason']})" if out["reason"] else "")
+        )
+        return out
+    current = fixture_state.drift_map(state_doc)
+    previous = fixture_state.previous_drift_map(state_doc)
+    out["current"] = current
+    out["read"] = fixture_state.read_map(state_doc)
+    role_projects: dict[str, list[str]] = {}
+    for project, roles in current.items():
+        for role in roles:
+            role_projects.setdefault(role, []).append(project)
+    firing: dict[str, list[str]] = {}
+    for role, projs in sorted(role_projects.items()):
+        repeated = [project for project in projs if role in previous.get(project, [])]
+        line = f"{role} drifted on {len(projs)} pool project(s) ({_project_list(projs)}) at the {hhmm(scanned_at)} UTC scan"
+        if repeated:
+            line += f", the {FIXTURE_DRIFT_CONSECUTIVE_SCANS}nd consecutive scan on {_project_list(repeated)}"
+        fires = len(projs) >= FIXTURE_DRIFT_MIN_PROJECTS or bool(repeated)
+        if fires:
+            firing[role] = projs
+        else:
+            line += "; not yet repeated or widespread"
+        out["evidence"].append(line)
+    if firing:
+        out["fires"] = True
+        out["roles"] = sorted(firing)
+        out["projects"] = sorted({project for projs in firing.values() for project in projs})
+        out["drift"] = {
+            project: {role: fixture_state.drift_detail(state_doc, project, role) for role in out["roles"] if project in firing[role]}
+            for project in out["projects"]
+        }
+    return out
+
+
 def percentile(values: list[float], pct: int) -> float | None:
     if not values:
         return None
@@ -1167,6 +1293,12 @@ def advice_for(
             when=reader_clock(parse_iso(incident.get("window_start"))),
             count=incident.get("runs", 0),
         )
+    if condition == FIXTURE_DRIFT:
+        incident = incident or {}
+        return ADVICE_FIXTURE_DRIFT.format(
+            roles=", ".join(incident.get("roles") or []) or "the drifted fixture roles",
+            projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
+        )
     return ADVICE_SETUP
 
 
@@ -1175,14 +1307,16 @@ def advice_for(
 # --------------------------------------------------------------------------- #
 
 
-def assess(runs, now: datetime, roster: Roster) -> dict:
-    """Apply rules 1-4 to the runs visible at `now`; no hysteresis yet."""
+def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None = None) -> dict:
+    """Apply rules 1-4 to the runs visible at `now`, and rule 3c to the
+    fleet scan when one was given; no hysteresis yet."""
     visible = [run for run in runs if run.finished <= now]
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
     r2 = storm(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
+    r3c = fixture_drift(fixture_state_doc, now)
 
     if r1["fires"]:
         state, condition = OUTAGE, SHARED_BREAK
@@ -1196,10 +1330,13 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
     elif r3["fires"]:
         state, condition = DEGRADED, SETUP_DEATHS
         cause = CAUSE_SETUP.format(count=len(r3["deaths"]), prs=_pr_list(r3["prs"]))
+    elif r3c["fires"]:
+        state, condition = DEGRADED, FIXTURE_DRIFT
+        cause = CAUSE_FIXTURE_DRIFT.format(roles=", ".join(r3c["roles"]), projects=len(r3c["projects"]))
     else:
         state, condition, cause = GREEN, None, ""
 
-    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r3["evidence"] + r1["pr_caused"]
+    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
     if r1["fires"] and r2["fires"]:
         # Both true at once on 2026-09-02: the break is the state, the
         # storm is context the reader still needs.
@@ -1235,6 +1372,19 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
             "nodes": r3b["nodes"],
             "event": r3b["event"],
         }
+    elif condition == FIXTURE_DRIFT:
+        # No pull requests and no runs: the scan is the evidence. The
+        # window opens at the scan that fired; the roles, the projects and
+        # what was observed on each are what the message and the issue name.
+        incident = {
+            "prs": [],
+            "runs": 0,
+            "window_start": iso(r3c["scanned_at"]),
+            "window_end": None,
+            "roles": r3c["roles"],
+            "projects": r3c["projects"],
+            "drift": r3c["drift"],
+        }
     else:
         incident = None
     return {
@@ -1250,6 +1400,7 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
         "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
         "roster": roster,
+        "fixture": r3c,
     }
 
 
@@ -1282,6 +1433,28 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
         LOST_PODS: lambda run: last_lost_pod is not None and run.finished <= last_lost_pod,
     }.get(condition, lambda run: False)
     return not any(carries(run) for run in recent)
+
+
+def fixture_drift_hold(fixture: dict, incident: dict | None) -> str | None:
+    """Rule 6's exit for fixture_drift: why this tick's scan cannot end the
+    incident, or None when it can. Entering took a scan that saw the drift;
+    leaving takes a scan that could see the same roles on the same projects
+    and no longer shows it. A scan that is missing, stale, blind, or that
+    recorded one of the incident's projects as not checked (its runner timed
+    out, the grant went away) shows nothing about the fixture, so the
+    incident holds rather than posting a recovery nothing observed."""
+    if not fixture.get("known"):
+        return "no fixture-state scan was read this tick"
+    if fixture.get("stale"):
+        return "the fixture-state scan is stale"
+    if fixture.get("unknown"):
+        return "the fixture-state scan could check no project"
+    roles = set((incident or {}).get("roles") or [])
+    read = fixture.get("read") or {}
+    unread = sorted(project for project in (incident or {}).get("projects") or [] if not roles <= set(read.get(project, [])))
+    if unread:
+        return f"the fixture-state scan could not read {_project_list(unread)}"
+    return None
 
 
 def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
@@ -1319,6 +1492,15 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
     if raw_state != GREEN:
         return _keep(raw_state, assessed["condition"], assessed["cause"], assessed["failing_cases"], now, recovering=False)
     prev_condition = prev.get("condition")
+    if prev_condition == FIXTURE_DRIFT:
+        # The scan is the evidence both ways: the hourly scan that could read
+        # the incident's roles on its projects and no longer shows the
+        # repeated or widespread drift is the recovery (three green runs
+        # could all have leased healthy projects and say nothing about the
+        # fixture), and a scan that could not see them is not.
+        if fixture_drift_hold(assessed["fixture"], prev.get("incident")) is None:
+            return _keep(GREEN, None, "", [], now, recovering=False)
+        return _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
     if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"]):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
@@ -1346,6 +1528,7 @@ def adjudicate(
     wall_clock: datetime | None = None,
     posted: dict | None = None,
     pool_pressure: dict | None = None,
+    fixture_state_doc: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
 
@@ -1358,10 +1541,13 @@ def adjudicate(
     dropped on recovery; it also holds the pool episode's start across a tick
     that read no artifact. `pool_pressure` is the pool-pressure periodic's
     artifact (rule 8); absent, the note and the digest's wait are None.
+    `fixture_state_doc` is the hourly fleet scan's fixture-state.json when one
+    is published; rule 3c reads it and the `fixture_state` block below
+    summarises it for the poster.
     """
     if runs is None:
         runs = load_runs(data)
-    assessed = assess(runs, now, roster)
+    assessed = assess(runs, now, roster, fixture_state_doc)
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:
@@ -1378,6 +1564,8 @@ def adjudicate(
         )
     elif decided["state"] != assessed["state"] and SEVERITY[assessed["state"]] > SEVERITY[decided["state"]]:
         evidence.append(f"{assessed['state']} condition seen but not yet current; holding {decided['state']}")
+    elif decided["condition"] == FIXTURE_DRIFT and not assessed["fixture"]["fires"]:
+        evidence.append(f"fixture drift held: {fixture_drift_hold(assessed['fixture'], (prev or {}).get('incident'))}; a scan that reads those projects clean ends it")
 
     # A held state (recovering, or a worse condition not yet current) keeps
     # the previous tick's numbers: the assessment's incident describes the
@@ -1435,6 +1623,7 @@ def adjudicate(
         "advice": advice,
         "recovering": decided["recovering"],
         "stale": stale,
+        "fixture_state": fixture_state_block(assessed["fixture"]),
         "slow": slow,
         "pool": pool,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
@@ -1456,6 +1645,24 @@ def adjudicate(
     if age is not None:
         out["metrics"]["data_age_s"] = int(age.total_seconds())
     return out
+
+
+def fixture_state_block(fixture: dict) -> dict | None:
+    """health.json's `fixture_state`: the scan's time, how many projects it
+    could read, every project's drifted roles this scan, and whether the
+    scan was stale or saw nothing (`unknown`, with the commonest reason).
+    None when no fixture-state.json was given."""
+    if not fixture.get("known"):
+        return None
+    return {
+        "scanned_at": iso(fixture["scanned_at"]),
+        "projects": fixture["total"],
+        "checked": fixture["checked"],
+        "drifted": fixture["current"],
+        "unknown": fixture["unknown"],
+        "stale": fixture["stale"],
+        "reason": fixture["reason"],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1654,6 +1861,7 @@ def parse_args(argv):
     )
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
     parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
+    parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
     parser.add_argument("--case-notes", type=pathlib.Path, default=DEFAULT_CASE_NOTES, help="case-notes.yaml for tracking issues")
     roster = parser.add_mutually_exclusive_group()
     roster.add_argument("--admitted", help="comma-separated admitted roster (default: hack/eval/blocking-roster.txt)")
@@ -1701,6 +1909,7 @@ def main(argv=None) -> int:
             wall_clock=None if args.now else wall_clock,
             posted=load_json(args.posted_state),
             pool_pressure=load_json(args.pool_pressure),
+            fixture_state_doc=load_json(args.fixture_state),
         )
         text = json.dumps(health, indent=2) + "\n"
 

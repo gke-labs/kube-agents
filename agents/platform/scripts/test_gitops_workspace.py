@@ -764,7 +764,13 @@ class TestResolveRepo(WorkspaceTestCase):
 
     def test_it_falls_back_to_the_git_remote(self):
         module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: "acme/from-remote"
+        # `cwd=None`, the real signature of `get_current_git_repo`: the
+        # workspace branch of `resolve_repo` calls it as `(cwd=...)` inside a
+        # bare `except Exception: pass`, so a zero-arg stub raising TypeError
+        # there would be swallowed and this fallback reached for a reason other
+        # than the one it exercises. That branch is not taken here, but the
+        # stub should not be what decides that.
+        module.get_current_git_repo = lambda cwd=None: "acme/from-remote"
         with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(
                 gitops_workspace.resolve_repo(),
@@ -1111,6 +1117,38 @@ class TestContextRepos(WorkspaceTestCase):
                 gitops_workspace.get_managed_github_repos()
             self.assertIn("kubectl binary not found", str(caught.exception))
 
+    def _no_state_file(self):
+        """Point the read past any `/etc/gitops` the host happens to mount.
+
+        Without this the two entry-point tests below take the file path on a
+        machine that has one and never reach `kubectl`, the way the sibling
+        pin on `get_managed_repo_entries` already guards against.
+        """
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        return patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)})
+
+    def test_get_managed_github_repos_bounds_the_kubectl_read(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return CompletedProcess(args=cmd, returncode=0, stdout="{}", stderr="")
+
+        with self._no_state_file(), patch("subprocess.run", side_effect=fake_run):
+            gitops_workspace.get_managed_github_repos()
+        self.assertEqual(
+            captured.get("timeout"), gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS
+        )
+
+    def test_get_managed_github_repos_raises_on_kubectl_timeout(self):
+        with self._no_state_file(), patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["kubectl"], 30),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_github_repos()
+            self.assertIn("Timed out", str(caught.exception))
+
     def test_get_managed_github_repos_raises_on_invalid_json(self):
         fake_cm = CompletedProcess(
             args=["kubectl"],
@@ -1172,7 +1210,7 @@ class TestContextRepos(WorkspaceTestCase):
 
     def test_all_sources_failing_raises_runtime_error(self):
         module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: None
+        module.get_current_git_repo = lambda cwd=None: None
         with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.resolve_repo()

@@ -31,14 +31,17 @@ variable "cluster_prefix" {
 }
 
 variable "fleet_reader_token_creators" {
-  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. This is the eval project's Prow runner identity: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as that identity, so without an entry here the runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). Defaults to that identity -- the same account in every pool project. Override it when applying this stack outside the CI pool."
+  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. Two callers need it: the eval project's Prow runner identity, because hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as that identity and without an entry here falls back to its own cluster-admin credential (loudly); and the CI health bot (eval-dashboard-publisher@kube-agents-prow), whose hourly fixture-state scan (.github/workflows/ci-health.yml, docs/ci-health.md) runs every gcloud and kubectl read as the reader and holds no grant of its own on the project, so a project without its entry scans as 'not checked'. Defaults to both -- the same two accounts in every pool project. Override it when applying this stack outside the CI pool."
   type        = list(string)
 
   # Defaulted here rather than passed with -var, because the resource is keyed
   # by member: an apply that does not carry the value plans the binding for
   # destruction, dropping the project back to the runner's write credential.
   # Observed as `1 to destroy` on kube-agents-evals-16 (gke-labs/kube-agents#1051).
-  default = ["serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"]
+  default = [
+    "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com",
+    "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com",
+  ]
 
   # A bare email here applies cleanly and grants nothing: the IAM API treats an
   # unprefixed member as invalid, and the mistake would only surface as the

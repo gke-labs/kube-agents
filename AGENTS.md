@@ -340,9 +340,10 @@ Agents with a user in the loop follow this file.
   — the labels, `OWNERS`, `/hold`, and why GitHub's settings page reads as though nothing is
   required.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
-  on changed Markdown and YAML, a local Docker build of the agent runner, the image-layer budget if
-  you added a `RUN` or `COPY` to `deploy/docker/Dockerfile`, and `go build` inside whichever Go
-  module you touched (`k8s-operator/`, `a2a/`).
+  on changed Markdown and YAML, `make shellcheck` on changed shell scripts, a local Docker build of
+  the agent runner, the image-layer budget if you added a `RUN` or `COPY` to
+  `deploy/docker/Dockerfile`, and `go build` inside whichever Go module you touched
+  (`k8s-operator/`, `a2a/`).
   Each has a constraint that costs a CI run to rediscover — the pinned prettier version, the
   mandatory `--platform linux/amd64`, the layer ceiling that only fails after merge. The
   commands and those reasons are in
