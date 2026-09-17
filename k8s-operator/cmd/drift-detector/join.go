@@ -46,8 +46,10 @@ const (
 	// survives at. metav1.Time marshals with time.RFC3339, which has no
 	// fractional part, so every entry the API server returns is floored to the
 	// whole second -- while an audit record's timestamp comes from Cloud Logging
-	// with nanoseconds intact. reconciledBy compares the two and has to floor the
-	// audit side to match, or the same-second case it documents never fires.
+	// with nanoseconds intact. reconciledBy puts both on this grid before
+	// comparing them, so its rule is "a later second" and not "a later instant":
+	// the second the change landed in is the one an entry cannot claim from,
+	// because an entry sharing it may be the change.
 	managedFieldsTimeGranularity = time.Second
 
 	// deleteVerb is the audit verb for a call that removed the object. There is
@@ -133,10 +135,10 @@ type DriftEvent struct {
 	// joinEnriched.
 	Owners []fieldOwner
 
-	// Reconciled reports that a configured GitOps manager wrote to the object
-	// at or after the audited change -- so whatever the person did has since
-	// been overwritten by the GitOps controller and there may be nothing left
-	// to revert.
+	// Reconciled reports that a configured GitOps manager wrote to the object in
+	// a later second than the audited change -- so whatever the person did has
+	// since been overwritten by the GitOps controller and there may be nothing
+	// left to revert.
 	//
 	// False when --gitops-managers is unset, because with nothing configured
 	// the detector cannot tell a GitOps controller from any other client and
@@ -348,20 +350,19 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 }
 
 // reconciledBy reports whether a configured GitOps manager wrote to the object
-// at or after the audited change.
+// in a later second than the audited change.
 //
-// "At or after" rather than "after" because the audit timestamp and the
-// managedFields timestamp are recorded by different components and a GitOps
-// write in the same second as the audited change is far likelier to be the
-// reconcile than a coincidence.
+// Both sides are put on the same grid first, because they are not recorded at
+// the same precision. A managedFields time arrives floored to the second
+// (managedFieldsTimeGranularity), an audit time arrives from Cloud Logging with
+// nanoseconds, and comparing them raw would make a reconcile at 12:00:01.2 --
+// stored as 12:00:01 -- sort before a change at 12:00:00.6 only by accident of
+// how much of the second had elapsed. Flooring the audit side removes that.
 //
-// Delivering that takes the truncation below, because the two sides are not
-// recorded at the same precision. A managedFields time arrives floored to the
-// second (managedFieldsTimeGranularity), an audit time arrives with nanoseconds,
-// and comparing them raw makes the same-second case the one case that never
-// fires: a reconcile at 12:00:00.9 is stored as 12:00:00, which sorts before a
-// change at 12:00:00.6 and is skipped as though it had happened first. Flooring
-// the audit side puts both on the grid the coarser side already uses.
+// On that grid the comparison is strictly after, not at-or-after, and the loop
+// below says why: an entry sharing the change's second may be the change. That
+// costs the reconcile that lands inside the same second and buys the guarantee
+// that a write can never answer itself.
 //
 // This is deliberately the weakest claim the data supports. It does not say the
 // person's change was reverted -- the GitOps controller may have written an
@@ -369,10 +370,11 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 // there before. Deciding what actually happened is the agent's job; this flag
 // exists so the agent is told when there is reason to look.
 //
-// Weak is not the same as cheap, though, and the loop below declines three
-// things outright: a change with no time, a manager with no time, and a claim
-// made through a subresource. The last is the one that would otherwise fire
-// constantly rather than rarely -- see the comment on it.
+// Weak is not the same as cheap, though, and the loop below declines four
+// things outright: a change with no time, a manager with no time, a claim made
+// through a subresource, and a write in the audited change's own second. The
+// last two are the ones that would otherwise fire constantly rather than
+// rarely -- see the comments on them.
 func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, string) {
 	// Redundant with the loop below -- a nil map returns false for every
 	// lookup, so every owner would be skipped anyway -- and kept because it is
@@ -385,12 +387,12 @@ func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, s
 	// write can be shown to have followed it and the honest answer is no claim.
 	//
 	// This is the half the comparison gets backwards rather than merely misses.
-	// The zero time sorts before every real one, so a zero changedAt makes
-	// "at or after" true for every configured manager that has ever touched the
-	// object, and the first one encountered is reported as having reconciled a
-	// change whose time the detector does not know -- the "guess after, hide
-	// real drift" outcome the rest of this function refuses to make, arriving
-	// through the input rather than the logic.
+	// The zero time sorts before every real one, so a zero changedAt puts every
+	// configured manager that has ever touched the object strictly after it, and
+	// the first one encountered is reported as having reconciled a change whose
+	// time the detector does not know -- the "guess after, hide real drift"
+	// outcome the rest of this function refuses to make, arriving through the
+	// input rather than the logic.
 	//
 	// Reachable without anything being malformed. Timestamp is a plain
 	// time.Time under `json:"timestamp"`, so a payload that omits the key, or
@@ -411,10 +413,10 @@ func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, s
 		// Kustomization, a HelmRelease, an Application -- under the same manager
 		// name, on every loop, seconds apart. Without this the systematic case
 		// is the wrong one: `flux suspend kustomization apps` patches
-		// spec.suspend, the controller's next status write lands at or after the
-		// audited change, and the event goes out Reconciled while the person's
-		// change stands untouched. That is the reading T4 would act on to
-		// suppress the inject.
+		// spec.suspend, the controller's next status write lands a few seconds
+		// after the audited change, and the event goes out Reconciled while the
+		// person's change stands untouched. That is the reading T4 would act on
+		// to suppress the inject.
 		//
 		// Skipping the entry rather than requiring it to match the audited
 		// change's own subresource, which looks sharper and is wrong for
@@ -443,7 +445,40 @@ func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, s
 		if owner.UpdatedAt.IsZero() {
 			continue
 		}
-		if !owner.UpdatedAt.Before(changedAt.Truncate(managedFieldsTimeGranularity)) {
+		// Strictly after, on the floored grid: a write in the *same* second as
+		// the audited change cannot be shown to be a different write from it.
+		//
+		// Manager is self-declared -- ownership() copies whatever the client put
+		// in --field-manager -- so a person running
+		// `kubectl apply --server-side --field-manager=kustomize-controller`
+		// produces one entry carrying the configured name, no subresource, and a
+		// time floored into the audited change's own second. Under "at or after"
+		// that entry satisfies the claim by construction, and the change goes out
+		// Reconciled on the strength of being itself. It needs no intent to
+		// happen: configure a manager name ordinary kubectl also emits, as an
+		// older Argo CD install's kubectl-client-side-apply is, and every human
+		// apply self-marks.
+		//
+		// The price is the reconcile that genuinely lands inside the same second,
+		// which is now missed. That is the case the flooring was added for, and
+		// giving it up buys the guarantee that the audited write can never be its
+		// own answer -- a false claim suppresses the report, a missed one merely
+		// leaves it noisy, and this function fails in the second direction
+		// everywhere else. A reconcile that crosses the second boundary, which is
+		// the ordinary one, still claims.
+		//
+		// Both sides floored, which is what makes the line read as "a later
+		// second" rather than "a later instant". Either truncation alone gives
+		// the same answers for the values that actually arrive here, so a
+		// mutation pass will call each one redundant: the manager's side is
+		// already whole-second, and a whole second later than floor(changedAt) is
+		// later than changedAt too. The manager's side stops being redundant the
+		// moment a sub-second UpdatedAt reaches here from anywhere -- floor the
+		// audit side only, and 12:00:00.9 answers 12:00:00.2 and the self-claim
+		// above is back -- which is the case the test pins. The audit side stays
+		// because half a rule stated in code and half in a comment is how the
+		// other half goes missing.
+		if owner.UpdatedAt.Truncate(managedFieldsTimeGranularity).After(changedAt.Truncate(managedFieldsTimeGranularity)) {
 			return true, owner.Manager
 		}
 	}

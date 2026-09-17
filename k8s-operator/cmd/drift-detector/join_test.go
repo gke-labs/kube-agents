@@ -336,11 +336,12 @@ func TestReconciledBy(t *testing.T) {
 			wantManager: "argocd-controller",
 		},
 		{
-			name:        "a write in the same instant counts, because the two clocks are different components",
-			managers:    map[string]bool{"argocd-controller": true},
-			owners:      []fieldOwner{{Manager: "argocd-controller", UpdatedAt: changedAt}},
-			wantClaim:   true,
-			wantManager: "argocd-controller",
+			name:     "a write in the change's own second does not count, because it may be the change",
+			managers: map[string]bool{"argocd-controller": true},
+			owners:   []fieldOwner{{Manager: "argocd-controller", UpdatedAt: changedAt}},
+			// Manager is self-declared, so a person applying with
+			// --field-manager=argocd-controller produces exactly this entry.
+			wantClaim: false,
 		},
 		{
 			name:      "a configured manager that last wrote before the change is not a reconcile",
@@ -454,9 +455,12 @@ func TestReconciledByIgnoresAStatusWriteAnsweringASpecChange(t *testing.T) {
 }
 
 func TestReconciledByDoesNotInventAClaimFromTwoMissingTimes(t *testing.T) {
-	// Neither side has a time, so neither is before the other, "at or after"
-	// reads true, and without a guard the detector reports a reconcile built
-	// entirely out of values it does not have.
+	// Neither side has a time. The strict comparison declines this on its own --
+	// the zero time is not after itself -- and the guard above it is what makes
+	// that a decision rather than an accident of how two absent values happen to
+	// sort. Pinned here so a future comparison that reads the two zeroes as a
+	// match cannot report a reconcile built entirely out of values the detector
+	// does not have.
 	//
 	// A record with no timestamp does not require a malformed payload: the
 	// field is a plain time.Time, so an absent or null `timestamp` decodes to
@@ -474,8 +478,8 @@ func TestReconciledByDoesNotClaimAgainstAChangeWithNoTimestamp(t *testing.T) {
 	// The mirror of the test above, and the one the zero-time guard is really
 	// for. Where two missing times merely fail to order, a missing changedAt
 	// against a manager with a real time orders the wrong way round: the zero
-	// time sorts before every real one, so "at or after" is true for any
-	// configured manager that has ever written the object, and the detector
+	// time sorts before every real one, so any configured manager that has ever
+	// written the object lands strictly after it, and the detector
 	// reports its most recent write as the reconcile for a change it cannot
 	// place in time at all.
 	//
@@ -495,28 +499,80 @@ func TestReconciledByDoesNotClaimAgainstAChangeWithNoTimestamp(t *testing.T) {
 	}
 }
 
-func TestReconciledByFindsAReconcileInTheSameSecondAsTheChange(t *testing.T) {
-	// The case the "at or after" rule exists for, and the one a raw comparison
-	// gets wrong. A managedFields time survives only to the whole second --
-	// metav1.Time marshals with time.RFC3339, which has no fractional part --
-	// while an audit timestamp arrives from Cloud Logging with nanoseconds. So a
-	// reconcile 300ms after the change is stored as the start of that second,
-	// which sorts *before* the change and reads as "already there".
+func TestReconciledByDeclinesAWriteInTheChangesOwnSecond(t *testing.T) {
+	// An entry sharing the change's second may *be* the change. Manager is
+	// self-declared, so `kubectl apply --server-side
+	// --field-manager=argocd-controller` produces exactly this fieldOwner, and a
+	// claim here would report the audited write as its own reconcile.
 	//
 	// Written with a sub-second changedAt because that is the only way to see
-	// it: every other timestamp in this file lands on a second boundary, where
-	// truncation is a no-op and the bug is invisible.
+	// the comparison at all: every other timestamp in this file lands on a
+	// second boundary, where truncation is a no-op.
 	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 600_000_000, time.UTC)
-	reconciledAt := changedAt.Truncate(time.Second) // what the API server returns
+	sameSecond := changedAt.Truncate(time.Second) // what the API server returns
+
+	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+
+	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: sameSecond}}, changedAt); claim {
+		t.Errorf("Reconciled = true by %q, want no claim: the write in the change's own second may be the change", manager)
+	}
+}
+
+func TestReconciledByClaimsAWriteFromTheNextSecond(t *testing.T) {
+	// The ordinary reconcile, and the reason the audit side is floored. Without
+	// the truncation this comparison would turn on how much of the change's
+	// second had already elapsed: a reconcile stored as 12:00:01 against a
+	// change at 12:00:00.6 is 400ms later, but against a change recorded at
+	// 12:00:01.4 -- the same second on the API server's grid -- a raw comparison
+	// would read it as earlier.
+	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 600_000_000, time.UTC)
+	reconciledAt := changedAt.Truncate(time.Second).Add(time.Second)
 
 	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: reconciledAt}}, changedAt)
 	if !claim {
-		t.Error("Reconciled = false, want true: a GitOps write in the same second as the change is the reconcile")
+		t.Error("Reconciled = false, want true: a GitOps write in the second after the change is the reconcile")
 	}
 	if manager != "argocd-controller" {
 		t.Errorf("ReconciledBy = %q, want argocd-controller", manager)
+	}
+}
+
+func TestReconciledByFloorsTheManagerSideToo(t *testing.T) {
+	// A managedFields time arrives whole-second today, so flooring the audit
+	// side alone happens to give the same answers -- an integer second after
+	// floor(changedAt) is after changedAt as well. This is the case where the
+	// two spellings part company: a sub-second UpdatedAt inside the change's own
+	// second, which flooring only the audit side reads as a reconcile and
+	// reopens the self-claim with. Pinned so the rule stays "a later second"
+	// rather than resting on how the value reached us.
+	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 200_000_000, time.UTC)
+	sameSecond := changedAt.Add(700 * time.Millisecond)
+
+	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+
+	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: sameSecond}}, changedAt); claim {
+		t.Errorf("Reconciled = true by %q, want no claim: %v and %v are the same second", manager, sameSecond, changedAt)
+	}
+}
+
+func TestReconciledByDoesNotLetAnApplyReconcileItself(t *testing.T) {
+	// The whole shape, as it arrives from a cluster: a person applies with the
+	// configured manager's name, the API server records one entry under that
+	// name, and nothing else has touched the object. Before the strictly-after
+	// rule this reported Reconciled -- the reading T4 acts on to suppress the
+	// inject -- for a change that stands untouched.
+	const manager = "kustomize-controller"
+	changedAt := time.Date(2026, 9, 17, 9, 30, 12, 250_000_000, time.UTC)
+
+	j := newJoiner(nil, joinCluster(), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
+
+	claim, claimed := j.reconciledBy([]fieldOwner{
+		{Manager: manager, Operation: "Apply", UpdatedAt: changedAt.Truncate(time.Second), Paths: []string{"spec.replicas"}},
+	}, changedAt)
+	if claim {
+		t.Errorf("Reconciled = true by %q, want no claim: the only write is the audited one wearing the manager's name", claimed)
 	}
 }
 

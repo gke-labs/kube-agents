@@ -149,7 +149,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.clusterLocation, "cluster-location", "",
 		"GKE location (region or zone) of --cluster-name. Required with it: a cluster name is unique only within a project and location, so without this a same-named cluster elsewhere would be read as this one.")
 	fs.StringVar(&f.gitopsManagers, "gitops-managers", "",
-		"Comma-separated managedFields managers that are the GitOps controller (for example argocd-controller). Matched exactly, and only on writes to the object: a claim these managers made through a subresource such as status is not counted as a reconcile. Empty means ownership is reported without any reconciliation claim.")
+		"Comma-separated managedFields managers that are the GitOps controller (for example argocd-controller). Matched exactly, and only on writes to the object in a second later than the audited change: a claim made through a subresource such as status does not count, and neither does one sharing the change's own second, which a person applying under the manager's name would produce. Empty means ownership is reported without any reconciliation claim.")
 	fs.DurationVar(&f.batchJoinBudget, "batch-join-budget", defaultBatchJoinBudget,
 		"Longest one batch may spend on live-object lookups before the rest fail open. Keep it to half the subscription's ack deadline or less, leaving the rest for the batch's Ack; startup reads the real deadline and warns when it does not. Exceeding the whole deadline means Pub/Sub redelivers the batch this process is still working on.")
 

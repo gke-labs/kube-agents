@@ -59,7 +59,7 @@ line, not silently unenriched.
 | `--kubeconfig`            | empty                            | Read live objects through this kubeconfig. Mutually exclusive with `--in-cluster`; setting neither of the two disables the join.                                                                                                                                      |
 | `--cluster-name`          | empty                            | The GKE cluster those credentials reach. Required with either of the two above, and an error without them. Checked at startup against the cluster they actually reach; a disagreement stops the process.                                                              |
 | `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                                                                                                                                   |
-| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource. Empty means no reconciliation claim is made.                                                            |
+| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource, in a second later than the audited change. Empty means no reconciliation claim is made.                 |
 | `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                             |
 
 ## Classification
@@ -251,22 +251,35 @@ on a lookup error would discard the finding to protect the annotation on it. An 
 `enriched` is a `DRIFT` line without an `owners=` field, never a missing line.
 
 **`reconciled_by=` is a positive claim only.** With `--gitops-managers` set, a named manager whose
-`managedFields` timestamp is at or after the audited change marks the event `Reconciled` — the
-GitOps controller has written since, so there may be nothing left to revert. At or after rather than
-after, because the audit timestamp and the `managedFields` timestamp come from different components
-and a write in the same second is far likelier to be the reconcile than a coincidence. The two are
-not even recorded at the same precision: `metav1.Time` marshals as RFC 3339 with no fractional part,
-so every `managedFields` timestamp arrives floored to the whole second, while the audit timestamp
-keeps its nanoseconds from Cloud Logging. The comparison floors the audit side to match — without
-that, a reconcile 400ms into the same second reads as earlier than the change it answered. A missing
-time on _either_ side declines the claim rather than guessing at it: guessing "after" hides real
-drift, guessing "before" invents a reconcile that never happened. Both sides matter because the zero
-time sorts before every real one, so a record that arrived without a `timestamp` — an absent or null
-key decodes to the zero time without error — would otherwise read as "at or after" against any
+`managedFields` timestamp falls in a later second than the audited change marks the event
+`Reconciled` — the GitOps controller has written since, so there may be nothing left to revert. A
+missing time on _either_ side declines the claim rather than guessing at it: guessing "after" hides
+real drift, guessing "before" invents a reconcile that never happened. Both sides matter because the
+zero time sorts before every real one, so a record that arrived without a `timestamp` — an absent or
+null key decodes to the zero time without error — would otherwise read as earlier than any
 configured manager that had ever touched the object, and report that manager's last write as the
-reconcile for a change the detector cannot place in time. With the flag unset the detector cannot tell a
-GitOps controller from any other client, so `Reconciled` is false everywhere and means "not shown to
-be reconciled", never "shown not to be".
+reconcile for a change the detector cannot place in time. With the flag unset the detector cannot
+tell a GitOps controller from any other client, so `Reconciled` is false everywhere and means "not
+shown to be reconciled", never "shown not to be".
+
+**Both sides are floored to the second first, and the comparison is strict.** The two timestamps
+come from different components and are not recorded at the same precision: `metav1.Time` marshals as
+RFC 3339 with no fractional part, so every `managedFields` timestamp arrives floored to the whole
+second, while the audit timestamp keeps its nanoseconds from Cloud Logging. Flooring the audit side
+to match is what stops which of them sorts first turning on how much of the second had elapsed.
+
+On that shared grid, a write in the change's own second does not claim — because it may _be_ the
+change. A manager name is self-declared: the API server copies whatever the client passed in
+`--field-manager` and verifies nothing, so `kubectl apply --server-side
+--field-manager=kustomize-controller` run by a person produces a single entry carrying the
+configured name, no subresource, and a time floored into the audited change's own second. Under an
+at-or-after rule that entry satisfies the claim by construction, and the change goes out
+`Reconciled` on the strength of being itself. It needs no intent: configure a manager name that
+ordinary `kubectl` also emits and every human apply self-marks. The price of the strict comparison
+is the reconcile that genuinely lands inside the same second, which is now missed — a false claim
+suppresses the report, a missed one only leaves it noisy, and this is the direction every other
+judgment here fails in. A reconcile that crosses the second boundary, which is the ordinary one,
+still claims.
 
 **A claim made through a subresource does not count.** `managedFields` records a write to `status`
 as its own entry, and every GitOps controller writes `.status` on its own custom resources — a

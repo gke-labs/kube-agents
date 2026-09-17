@@ -175,7 +175,7 @@ func TestOwnershipDecodesEveryEntry(t *testing.T) {
 		t.Errorf("owners[1].Subresource = %q, want status", owners[1].Subresource)
 	}
 	// A nil entry.Time is legal upstream; it must not become a wall-clock
-	// reading, because reconciledBy treats "at or after the change" as a
+	// reading, because reconciledBy treats a write later than the change as a
 	// reconcile and a defaulted now() would claim one on every lookup.
 	if !owners[1].UpdatedAt.IsZero() {
 		t.Errorf("owners[1].UpdatedAt = %v, want the zero time for an entry with no Time", owners[1].UpdatedAt)
