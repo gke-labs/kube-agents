@@ -18,10 +18,37 @@ from pathlib import Path
 from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
-from agent_common_server import _run_env, CONFIG_PATH
+from agent_common_server import _run_env
+from chat_platforms import enabled_chat_platforms
 from gke_endpoint import dns_endpoint_args
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+
+# Session origins that name no chat platform. `POST /sessions` stamps
+# `k8s-watcher` on an event session at creation, and
+# `session_kv_server._register_session_routing` overwrites it with the platform
+# the alert actually reached. A row still carrying one of these holds a
+# `chat_id`/`thread_id` whose platform is unrecorded — the pair still identifies
+# the thread a reply will arrive in, but it cannot be *addressed*, because a
+# `hermes send` target needs the platform and the row does not say.
+#
+# The same call about the same rows as `NON_CHAT_ORIGINS` in
+# `deploy/docker/patches/kanban_event_routing.py`, which already declines to
+# substitute a route it reads one of these from. `api_server` is carried here
+# for that symmetry rather than because this endpoint returns it: that value is
+# stamped on the kanban subscription row, and no writer of `session_metadata`
+# produces it. Keep the two sets in step.
+NON_CHAT_SESSION_ORIGINS = frozenset({"api_server", "k8s-watcher"})
+
+# The suffix on the variable naming a platform's home channel — where a
+# notification goes when it has no session thread to reply under. Derived from
+# the platform name rather than tabulated against it, as
+# `deploy/docker/plugins/chat/adapter.py` already does, so that a platform added
+# to `chat_platforms.CHAT_PLATFORMS` cannot silently miss an entry here. A
+# platform whose variable is unset is addressed by bare name: `hermes send`
+# resolves the channel from Hermes' own config, which is what an install that
+# enables a platform without rendering a home channel relies on.
+HOME_CHANNEL_ENV_SUFFIX = "_HOME_CHANNEL"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
 # synchronously — it creates the session, runs a whole Chat Agent turn (its own
@@ -726,37 +753,47 @@ def send_notification(message: str, session_id: str = "") -> str:
     import urllib.request
     import json
     import os
-    
-    def get_enabled_platforms() -> list[str]:
-        platforms_found = []
-        try:
-            import yaml
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r") as f:
-                    cfg = yaml.safe_load(f) or {}
-                platforms = cfg.get("platforms", {})
-                if platforms.get("slack", {}).get("enabled"):
-                    platforms_found.append("slack")
-                if platforms.get("google_chat", {}).get("enabled"):
-                    platforms_found.append("google_chat")
-        except Exception:
-            pass
 
-        if not platforms_found:
-            if os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_HOME_CHANNEL"):
-                platforms_found.append("slack")
-            if os.environ.get("GOOGLE_CHAT_PROJECT_ID") or os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"):
-                platforms_found.append("google_chat")
-
-        if not platforms_found:
-            platforms_found.append("google_chat")
-
-        return platforms_found
-
-    enabled_platforms = get_enabled_platforms()
+    # `chat_platforms` rather than another local answer to the same question.
+    # The copy this replaces read CONFIG_PATH and then
+    # `SLACK_BOT_TOKEN or SLACK_HOME_CHANNEL`, and never the managed scope — so
+    # on an operator-managed pod, where `renderConfigYAML` writes the CR's answer
+    # to /etc/hermes/config.yaml and CONFIG_PATH carries no `enabled` key at all,
+    # it resolved off the environment. A credential-proxy install has no bot
+    # token by design and a home channel rendered regardless, which is why it
+    # could name Slack on a pod whose CR had turned Slack off (#743). Every other
+    # reader of this question already reads the managed scope first.
+    enabled_platforms = enabled_chat_platforms()
     targets = []
     chat_id = None
     thread_id = None
+
+    def home_channel_targets() -> list[str]:
+        """Every enabled platform, at its home channel where one is rendered."""
+        composed = []
+        for platform in enabled_platforms:
+            home_channel = os.environ.get(
+                platform.upper() + HOME_CHANNEL_ENV_SUFFIX, ""
+            ).strip()
+            composed.append(f"{platform}:{home_channel}" if home_channel else platform)
+        return composed
+
+    def attempt(target: str) -> tuple[bool, str]:
+        """Post to one target; report whether it landed and what to say about it."""
+        platform_name = target.split(":", 1)[0]
+        try:
+            # Stays in the agent pod. `hermes` is not cluster tooling: it needs
+            # the profiles on the data PVC and the gateway on loopback, and the
+            # sandbox image does not carry the binary.
+            res = subprocess.run(
+                ["hermes", "send", "--to", target, message],
+                capture_output=True, text=True, check=True, env=_run_env()
+            )
+            return True, f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}"
+        except subprocess.CalledProcessError as e:
+            return False, f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}"
+        except Exception as e:
+            return False, f"ERROR: {platform_name}: {e}"
 
     if session_id:
         try:
@@ -769,9 +806,20 @@ def send_notification(message: str, session_id: str = "") -> str:
                     thread_id = meta.get("thread_id")
                     chat_id = meta.get("chat_id")
                     session_platform = meta.get("platform")
-                    if not session_platform or session_platform == "k8s-watcher":
-                        session_platform = "slack" if "slack" in enabled_platforms else "google_chat"
-                    if thread_id and chat_id:
+                    if not session_platform or session_platform in NON_CHAT_SESSION_ORIGINS:
+                        # The row carries coordinates but not who they belong to.
+                        # Guessing pairs one platform's name with another's ids,
+                        # and `hermes send` rejects that pair outright rather
+                        # than degrading to the home channel — so the guess does
+                        # not risk a misdelivery, it guarantees a non-delivery
+                        # (#743). Leave `targets` empty and let the home-channel
+                        # broadcast below carry the report.
+                        log(
+                            f"session {session_id} records no chat platform "
+                            f"({session_platform or 'unset'!r}); posting to the "
+                            "home channel rather than guessing a thread"
+                        )
+                    elif thread_id and chat_id:
                         # Construct explicit target for send_message_tool
                         targets.append(f"{session_platform}:{chat_id}:{thread_id}")
         except Exception as exc:
@@ -782,35 +830,37 @@ def send_notification(message: str, session_id: str = "") -> str:
             # (tests/integration/test_seam_mcp_stdio.py).
             print(f"Failed to resolve session metadata for threading: {exc}", file=sys.stderr)
 
-    if not targets:
-        for p in enabled_platforms:
-            if p == "slack":
-                home_channel = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
-                targets.append(f"slack:{home_channel}" if home_channel else "slack")
-            elif p == "google_chat":
-                home_channel = os.environ.get("GOOGLE_CHAT_HOME_CHANNEL", "").strip()
-                targets.append(f"google_chat:{home_channel}" if home_channel else "google_chat")
-            else:
-                targets.append(p)
+    threaded_targets = list(targets)
 
     results = []
-    for target in targets:
-        platform_name = target.split(":", 1)[0]
-        try:
-            # Stays in the agent pod. `hermes` is not cluster tooling: it needs
-            # the profiles on the data PVC and the gateway on loopback, and the
-            # sandbox image does not carry the binary.
-            res = subprocess.run(
-                ["hermes", "send", "--to", target, message],
-                capture_output=True, text=True, check=True, env=_run_env()
-            )
-            results.append(f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}")
-        except subprocess.CalledProcessError as e:
-            results.append(f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}")
-        except Exception as e:
-            results.append(f"ERROR: {platform_name}: {e}")
+    delivered = False
+    for target in threaded_targets or home_channel_targets():
+        landed, line = attempt(target)
+        delivered = delivered or landed
+        results.append(line)
 
-    # after a successful hermes send, persist the report for two-way reply context if threaded
+    if threaded_targets and not delivered:
+        # Every thread target failed, so the report has reached nobody. The
+        # broadcast used to be gated on whether a target was *composed* rather
+        # than on whether one *landed*, which let a single unsendable address
+        # suppress the fallback that would have delivered the report anyway
+        # (#743). A duplicate is not a risk here: this runs only where nothing
+        # was delivered at all.
+        results.append("NOTE: thread delivery failed; falling back to the home channel.")
+        for target in home_channel_targets():
+            _, line = attempt(target)
+            results.append(line)
+
+    # Persist the report for two-way reply context whenever the row gave us a
+    # thread, which is not the same as having posted into it. Both new paths
+    # above reach here with the coordinates set: the unattributable-platform
+    # case, where the report went to the home channel, and the fallback, where
+    # the thread send failed. Writing the row anyway is deliberate — a reply
+    # still arrives in *this* thread, and `incident_context` keys on the
+    # chat_id/thread_id pair without the platform, so the row is the only thing
+    # that makes such a reply mean anything. What neither path can do is key a
+    # row on the home channel the report actually reached: a bare `hermes send`
+    # returns no thread id to key one on.
     if chat_id and thread_id:
         try:
             req = urllib.request.Request(

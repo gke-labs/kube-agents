@@ -177,7 +177,7 @@ same session instead of starting a new one.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
 knows what Option B was. Three paths write it: the cron report relay, in-process; `send_notification`, when
-a Platform Agent posts into a thread; and the kanban notifier, when it delivers a card whose result carries
+the session row names a thread, whether or not the report was posted into it; and the kanban notifier, when it delivers a card whose result carries
 a fix a reply could authorise into one. Only the last of those is on the event-triage path, and it is the only one
 that gates on the report's shape rather than on where the write came from — the notifier cannot tell an
 event-triage card from an ordinary one by the time it runs, so the artifact is the test.
