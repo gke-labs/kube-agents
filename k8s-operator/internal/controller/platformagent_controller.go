@@ -1160,16 +1160,18 @@ func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
 // minterBareRepos returns the bare repository names in reposStr (a managed_repos
 // or context_repos JSON list) that belong to primaryOrg, deduplicated and
 // sorted. An empty primaryOrg accepts every organisation, as the managed sync
-// always has. listName is for the log lines only.
-func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) []string {
+// always has. listName is for the log lines only. A list that is not JSON is
+// an error, never an empty result: the caller skips the whole sync on it,
+// because an empty result would read as "no repositories" and prune every
+// policy the operator tracks.
+func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) ([]string, error) {
 	reposStr = strings.TrimSpace(reposStr)
 	if reposStr == "" {
-		return nil
+		return nil, nil
 	}
 	repos, err := parseManagedRepos(reposStr)
 	if err != nil {
-		logger.Error(err, "skipping minter policy sync for unparseable repository list in ConfigMap", "list", listName)
-		return nil
+		return nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
 	}
 	seen := make(map[string]struct{}, len(repos))
 	var bare []string
@@ -1209,7 +1211,7 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 		bare = append(bare, bareRepo)
 	}
 	sort.Strings(bare)
-	return bare
+	return bare, nil
 }
 
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
@@ -1282,11 +1284,24 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		}
 	}
 
-	allBareRepos := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
+	// Both lists are parsed before anything is computed from either: an
+	// unparseable one skips the sync and leaves the ConfigMap as it is, as the
+	// managed-only sync always did. Treating it as empty would prune every
+	// tracked policy and break every write until the JSON was repaired.
+	allBareRepos, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
+	if err != nil {
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateManagedReposKey)
+		return nil
+	}
+	contextCandidates, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	if err != nil {
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateContextReposKey)
+		return nil
+	}
 	// Managed wins: a repository registered in both lists is written to, so its
 	// policy is the write one, and it is left out of the read-only list too.
 	var contextBareRepos []string
-	for _, bareRepo := range minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey) {
+	for _, bareRepo := range contextCandidates {
 		if !slices.Contains(allBareRepos, bareRepo) {
 			contextBareRepos = append(contextBareRepos, bareRepo)
 		}

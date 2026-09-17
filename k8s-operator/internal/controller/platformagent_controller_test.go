@@ -5437,6 +5437,82 @@ func TestReconcileGitopsStateConfigMap_SyncsContextRepos(t *testing.T) {
 // (enum validation rejects it at admission — the fake client, like a newer CRD
 // with an older binary, does not). The contract from the mode spec: Degraded
 // with reason ModeNotRecognized, today's stack still rendered, and a requeue.
+func TestSyncGithubTokenMinterConfigMap_UnparseableListLeavesTheConfigMapAlone(t *testing.T) {
+	// A hand-edited list that is not JSON must skip the sync, as it did before
+	// context_repos was read: an error that read as "no repositories" would
+	// prune every operator-tracked policy and break every write until the
+	// JSON is repaired.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	const trackedPolicy = "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
+	const trackedReadPolicy = "version: minty.abcxyz.dev/v2\nscope:\n  platform-agent-read-scope:\n    permissions:\n      contents: read\n    repositories:\n    - tf-live\n"
+	const trackedKeys = "repo-1.yaml,tf-live.yaml"
+	validManaged := `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	validContext := `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`
+
+	cases := []struct {
+		name         string
+		managedRepos string
+		contextRepos string
+	}{
+		{name: "malformed managed_repos", managedRepos: "[{", contextRepos: validContext},
+		{name: "malformed context_repos", managedRepos: validManaged, contextRepos: "[{"},
+		{name: "both malformed", managedRepos: "[{", contextRepos: "not json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			minterCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "github-token-minter-config",
+					Namespace:   "test-ns",
+					Annotations: map[string]string{AnnotationManagedMinterKeys: trackedKeys},
+				},
+				Data: map[string]string{
+					"default.yaml": minterTemplateWithReadScope,
+					"repo-1.yaml":  trackedPolicy,
+					"tf-live.yaml": trackedReadPolicy,
+				},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+
+			if err := r.syncGithubTokenMinterConfigMap(ctx, agent, tc.managedRepos, tc.contextRepos); err != nil {
+				t.Fatalf("syncGithubTokenMinterConfigMap returned an error for an unparseable list: %v", err)
+			}
+
+			got := &corev1.ConfigMap{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+				t.Fatalf("failed to get ConfigMap: %v", err)
+			}
+			if got.Data["repo-1.yaml"] != trackedPolicy {
+				t.Errorf("repo-1.yaml changed under an unparseable list: got %q", got.Data["repo-1.yaml"])
+			}
+			if got.Data["tf-live.yaml"] != trackedReadPolicy {
+				t.Errorf("tf-live.yaml changed under an unparseable list: got %q", got.Data["tf-live.yaml"])
+			}
+			if got.Data["default.yaml"] != minterTemplateWithReadScope {
+				t.Errorf("default.yaml changed under an unparseable list")
+			}
+			if ann := got.Annotations[AnnotationManagedMinterKeys]; ann != trackedKeys {
+				t.Errorf("ownership annotation changed under an unparseable list: got %q, want %q", ann, trackedKeys)
+			}
+			if got.ResourceVersion != minterCM.ResourceVersion {
+				t.Errorf("the ConfigMap was written (resourceVersion %s -> %s); an unparseable list must skip the sync", minterCM.ResourceVersion, got.ResourceVersion)
+			}
+		})
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 	scheme := setupScheme()
 
