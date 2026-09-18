@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -24,6 +25,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
 
 const (
@@ -80,31 +83,28 @@ const (
 	joinClientBurst         = maxMessagesCeiling
 )
 
-// newObjectGetter builds a live-object reader for one directly reachable
-// cluster.
+// newObjectGetter builds a live-object reader for the one directly reachable
+// cluster -- the pod's own, or whichever a local run's --kubeconfig names.
 //
-// One cluster, because that is the whole of what this task ships. The audit
-// subscription is project-wide and carries every cluster in it, so a detector
-// wired this way enriches the records from its own cluster and reports the rest
-// as joinUnreachable -- visibly, as a count, rather than by quietly reporting
-// them unenriched. Reaching the others means reading the cluster_identity block
-// out of each Cluster Agent profile, asking the GKE API where that cluster's
-// control plane is, and authenticating to all of them as this pod's own Google
-// identity -- one token source shared across the fleet, not a credential per
-// cluster. internal/clusterprofiles does exactly that and returns a rest.Config
-// per cluster, which is the shape a dynamic.Interface is built from; wiring it
-// up here is the next task, and this function is what it replaces.
+// This is one of the join's two credential sources and the narrower one.
+// --profiles-dir contributes the rest of the fleet through
+// discoverProfileClusters below; the two are additive, and buildClusterSet
+// merges them. The direct cluster is kept as its own source rather than being
+// left to the profile scan because it has to be readable from the first second
+// of a fresh install, before cluster_agent_reconcile.py has given the
+// management cluster a profile like every other cluster in the project -- the
+// same reason k8s-event-watcher keeps --in-cluster alongside --profiles-dir.
 //
-// Worth carrying across with it: that package deliberately does not read a
-// kubeconfig back out of the sandbox volume, because anything written there is
-// writable by the model and this process would attach a cloud-platform token to
-// whatever host it was pointed at. --kubeconfig below is an operator-supplied
-// path for local runs, not a discovery mechanism, and the fan-in must not turn
-// it into one.
+// Its credentials are also not equivalent to a profile's. This reaches
+// kubernetes.default.svc as the pod's Kubernetes service account and never
+// leaves the cluster; a profile authenticates as the pod's Google identity
+// against the control-plane endpoint, which an IAM set without
+// roles/container.viewer or a master authorized network excluding the pod's
+// egress can refuse. So when both name the same cluster, this one wins.
 //
-// Returns nil with no error when neither source is configured. A detector
-// without cluster credentials is a supported mode: it is how the binary has run
-// since T1, and the join degrades to a count rather than refusing to start.
+// Returns nil with no error when neither flag is set. A detector without
+// cluster credentials is a supported mode: it is how the binary has run since
+// T1, and the join degrades to a count rather than refusing to start.
 func newObjectGetter(kubeconfig string, inCluster bool) (objectGetter, error) {
 	cfg, err := joinRESTConfig(kubeconfig, inCluster)
 	if err != nil || cfg == nil {
@@ -146,9 +146,189 @@ func joinRESTConfig(kubeconfig string, inCluster bool) (*rest.Config, error) {
 		return nil, nil
 	}
 
+	applyJoinThrottle(cfg)
+	return cfg, nil
+}
+
+// applyJoinThrottle lifts client-go's client-side rate limit out of the way of
+// --batch-join-budget on one config, whichever credential source produced it.
+//
+// A function rather than two assignments at each site because the profile
+// clusters get their configs from internal/clusterprofiles, which knows nothing
+// about this binary's budget and leaves QPS at zero -- and zero is not
+// "unlimited" but client-go's DefaultQPS=5, as joinClientQPS explains at
+// length. Missing it on the profile path would throttle exactly the clusters
+// the fan-in added, and do it invisibly: the budget expires mid-queue and the
+// records come back as a bare "context deadline exceeded", indistinguishable
+// from a slow control plane.
+func applyJoinThrottle(cfg *rest.Config) {
 	cfg.QPS = joinClientQPS
 	cfg.Burst = joinClientBurst
-	return cfg, nil
+}
+
+// profilesDiscovery is the profile scan discoverProfileClusters runs. Its zero
+// value reaches the real GKE API with this process's own Google credentials;
+// the tests replace its Describe and TokenSource fields so the scan needs
+// neither. OnSkip is set per call instead, because the message it writes is
+// this binary's rather than the package's.
+//
+// The same seam k8s-event-watcher uses, deliberately: two binaries scanning the
+// same directory the same way is the reason the scan is a package.
+var profilesDiscovery clusterprofiles.Discoverer
+
+// profileCluster is one fleet cluster the join can read, discovered from a
+// Cluster Agent profile rather than from a credential flag.
+type profileCluster struct {
+	Identity clusterIdentity
+	Profile  string
+	Getter   objectGetter
+
+	// Config is what Getter reads on, kept for the same reason joinRESTConfig is
+	// split out of newObjectGetter: dynamic.NewForConfig copies the config into a
+	// client and offers no way back to it, so a test holding only the getter
+	// cannot tell a throttled config from one left at client-go's DefaultQPS=5.
+	// That default is silent when it bites -- see joinClientQPS -- so it is worth
+	// a field to be able to assert it is gone.
+	Config *rest.Config
+}
+
+// identityFromProfile converts a discovered identity into the form an audit
+// record is matched against.
+//
+// Field by field rather than positionally, and not a type conversion: the two
+// structs carry the same three strings in a different order
+// (clusterprofiles.Identity is Project, Cluster, Location), so a conversion
+// would not compile but a positional composite literal would -- and would read
+// every record's location against a cluster name. This is the transposition
+// hazard clusterIdentity's own doc comment exists for, arriving between two
+// packages instead of between three parameters.
+func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
+	return clusterIdentity{
+		Project:  id.Project,
+		Location: id.Location,
+		Cluster:  id.Cluster,
+	}
+}
+
+// discoverProfileClusters turns a Hermes profiles directory into one live-object
+// reader per Cluster Agent profile, dropping the clusters whose records this
+// subscription will never carry.
+//
+// project is --project, and the filter is not an optimisation. The subscription
+// is a project-level sink, so every record on it names a cluster in that
+// project; a profile for a cluster elsewhere -- which the Platform Agent
+// legitimately creates, since a fleet can span projects -- produces a client no
+// record can ever match. Dropping it costs nothing either way: the token is
+// minted once inside Discover and shared, and dynamic.NewForConfig opens no
+// connection. What the drop buys is keeping a real misconfiguration visible --
+// an operator who pointed --project at the wrong project sees "8 clusters
+// skipped, outside project" instead of a detector that starts cleanly and
+// enriches nothing.
+//
+// Failure policy is internal/clusterprofiles's, and it is the watcher's: a
+// missing directory is fatal because discovery runs once and a restart fixes
+// it, an unreadable one degrades, and a single bad profile is skipped so that
+// one unparseable config.yaml cannot cost the whole fleet. What this adds is
+// the second half of that last rule -- a cluster whose dynamic client will not
+// build is skipped too, for the same reason.
+//
+// Every skip is logged and counted. The count is what the startup line reports,
+// because a fan-in that silently reached six of seven clusters looks exactly
+// like a fleet with six clusters in it.
+//
+// An empty dir is --profiles-dir unset, and returns nothing without scanning.
+// The check is here rather than at the call site because it is the same
+// mistake, not a caller's convenience: Discover calls os.ReadDir, "" is ENOENT,
+// and ENOENT is the one condition the package treats as fatal -- so a detector
+// that simply did not ask for the fan-in would refuse to start.
+func discoverProfileClusters(ctx context.Context, dir, project string) ([]profileCluster, int, error) {
+	if dir == "" {
+		return nil, 0, nil
+	}
+
+	skipped := 0
+	skip := func(profile string, err error) {
+		if profile == clusterprofiles.NoProfile {
+			// The directory itself, not a profile in it -- so this is not one
+			// straggler but an unknown number of clusters, and counting it as
+			// "1 profile skipped" would understate it to whoever alerts on that
+			// number. The error already says which directory and what it means.
+			log.Printf("%s: %v", commandName, err)
+			return
+		}
+		skipped++
+		log.Printf("%s: skipping profile %s, its cluster will NOT be joined: %v", commandName, profile, err)
+	}
+
+	// A copy, so setting OnSkip does not write to the package-level seam.
+	d := profilesDiscovery
+	d.OnSkip = skip
+	discovered, err := d.Discover(ctx, dir)
+	if err != nil {
+		return nil, skipped, err
+	}
+
+	clusters := make([]profileCluster, 0, len(discovered))
+	for _, c := range discovered {
+		identity := identityFromProfile(c.Identity)
+		if identity.Project != project {
+			skipped++
+			log.Printf("%s: skipping profile %s: cluster %s is outside --project=%s, and this subscription carries no records from it",
+				commandName, c.Profile, identity, project)
+			continue
+		}
+
+		applyJoinThrottle(c.Config)
+		client, err := dynamic.NewForConfig(c.Config)
+		if err != nil {
+			skip(c.Profile, fmt.Errorf("dynamic client: %w", err))
+			continue
+		}
+		clusters = append(clusters, profileCluster{
+			Identity: identity,
+			Profile:  c.Profile,
+			Getter:   dynamicGetter{client: client},
+			Config:   c.Config,
+		})
+	}
+	return clusters, skipped, nil
+}
+
+// buildClusterSet merges the two credential sources into the join's routing
+// table, and reports which profiles it dropped as duplicates of the direct
+// cluster.
+//
+// Additive, like k8s-event-watcher's watch set: --profiles-dir contributes the
+// fleet and --in-cluster/--kubeconfig contributes one more. They overlap on the
+// cluster the pod runs in, because reconcile gives the management cluster a
+// profile like any other, and the direct entry is the one kept -- newObjectGetter's
+// comment has the argument for which credential is the safer of the two.
+//
+// The duplicate matters less here than it does in the watcher, where two
+// entries meant two dedup caches and two alerts for one event. A second getter
+// for one cluster would just be a second way to read the same object. It is
+// still dropped rather than allowed to win, because which one a map ends up
+// holding would otherwise depend on insertion order, and that is not a thing to
+// leave to the order a directory happened to be read in.
+//
+// direct is nil when neither credential flag is set, which is legal: a
+// profiles-only detector is the fleet-wide mode, and a set with nothing in it
+// at all is the no-credentials mode the join has supported since T1.
+func buildClusterSet(direct objectGetter, directIdentity clusterIdentity, profiles []profileCluster) (map[clusterIdentity]objectGetter, []string) {
+	set := make(map[clusterIdentity]objectGetter, len(profiles)+1)
+	if direct != nil {
+		set[directIdentity] = direct
+	}
+
+	var absorbed []string
+	for _, p := range profiles {
+		if _, dup := set[p.Identity]; dup {
+			absorbed = append(absorbed, p.Profile)
+			continue
+		}
+		set[p.Identity] = p.Getter
+	}
+	return set, absorbed
 }
 
 // verifyClusterIdentity checks the declared cluster identity against the one
