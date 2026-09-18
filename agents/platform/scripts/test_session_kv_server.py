@@ -128,9 +128,9 @@ class TestSessionKvServerUtils(unittest.TestCase):
 
         The grader briefly carried a second list of reasons whose `Event.Type`
         it ignored. It was removed because the watcher's deployed `--reason`
-        flag forwards only one of them, so the exception could not fire; this
-        pins the simpler rule that replaced it, including for the node-level
-        reasons that list named. A `Normal`-typed node event is graded Info and
+        flag forwarded almost none of them, so the exception could not fire for
+        the node-level reasons it was written for; this pins the simpler rule
+        that replaced it, including for those reasons. A `Normal`-typed node event is graded Info and
         the suppression gate drops it — deliberate, and the reason
         `deploy/shared/start-services.sh` must stay the place that decides what
         reaches the daemon at all.

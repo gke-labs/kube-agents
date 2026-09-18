@@ -146,6 +146,22 @@ type watcher struct {
 	// transitions reach the callback in the order they happened; a gauge set
 	// from them must end on the latest state, and an atomic flag alone would
 	// not order the calls.
+	// dispatchMu serializes entry into the dispatcher, which holds no lock of
+	// its own on the strength of being entered by one goroutine per cluster.
+	// That was true while every event came through the informer's handler; the
+	// initial-list replay below is flushed from Run's goroutine while the
+	// handler may already be delivering live events, and this keeps the
+	// promise the dispatcher was built on. Uncontended outside that moment.
+	dispatchMu sync.Mutex
+	// replay holds the FailedScheduling events of the informer's initial list
+	// until the list has completed. The list arrives in name order, which for
+	// one pod is creation order, so a pod's FailedScheduling precedes the
+	// TriggeredScaleUp or NotTriggerScaleUp cluster-autoscaler recorded against
+	// it; dispatched as they arrive, the gate that reads the autoscaler's mark
+	// would decide before the mark was on record and open a card for a pod
+	// that scheduled while the watcher was down. Guarded by dispatchMu.
+	replay []*corev1.Event
+
 	stateMu  sync.Mutex
 	synced   bool
 	held     bool
@@ -187,11 +203,15 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	}
 	eventInformer := cache.NewSharedIndexInformer(w.newListWatch(), &corev1.Event{}, w.resyncPeriod, cache.Indexers{})
 
-	handler, err := eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
+	handler, err := eventInformer.AddEventHandler(cache.ResourceEventHandlerDetailedFuncs{
+		AddFunc: func(obj any, isInInitialList bool) {
 			ev, ok := obj.(*corev1.Event)
 			if !ok {
 				log.Printf("watcher: unexpected object type on Add: %T", obj)
+				return
+			}
+			if isInInitialList && ev.Reason == reasonFailedScheduling {
+				w.deferReplay(ev)
 				return
 			}
 			w.dispatch(ctx, ev)
@@ -247,6 +267,11 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	if !cache.WaitForCacheSync(ctx.Done(), handler.HasSynced) {
 		return fmt.Errorf("watcher: cache sync failed (informer stopped before initial list completed)")
 	}
+	// Every initial-list Add has returned by now — the handler's HasSynced
+	// waits for that, not just for the list — so every autoscaler mark the
+	// list carried is recorded and the deferred FailedScheduling events can be
+	// judged against them.
+	w.flushReplay(ctx)
 	// Only now is this cluster actually being watched. Everything before here
 	// is a cluster we are *trying* to watch: WaitForCacheSync has no timeout
 	// and the reflector retries a failed initial list forever, so an
@@ -545,8 +570,34 @@ func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err 
 // is stamped onto the event here, at the point where the source is
 // unambiguous.
 func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
-	triage := toTriageEvent(ev, w.cluster)
-	w.dispatcher.Dispatch(ctx, triage)
+	w.dispatchMu.Lock()
+	defer w.dispatchMu.Unlock()
+	w.dispatcher.Dispatch(ctx, toTriageEvent(ev, w.cluster))
+}
+
+// deferReplay parks an initial-list FailedScheduling until flushReplay; see
+// the replay field. Everything else in the list is dispatched as it arrives,
+// which is what puts the autoscaler's marks on record first.
+func (w *watcher) deferReplay(ev *corev1.Event) {
+	w.dispatchMu.Lock()
+	defer w.dispatchMu.Unlock()
+	w.replay = append(w.replay, ev)
+}
+
+// flushReplay dispatches the deferred FailedScheduling events in the order the
+// list delivered them, under the same lock as live dispatch so the dispatcher
+// is still entered one event at a time.
+func (w *watcher) flushReplay(ctx context.Context) {
+	w.dispatchMu.Lock()
+	defer w.dispatchMu.Unlock()
+	if len(w.replay) > 0 {
+		log.Printf("watcher: [%s] initial list complete, dispatching %d deferred %s event(s) against the autoscaler marks it carried",
+			w.cluster.Name, len(w.replay), reasonFailedScheduling)
+	}
+	for _, ev := range w.replay {
+		w.dispatcher.Dispatch(ctx, toTriageEvent(ev, w.cluster))
+	}
+	w.replay = nil
 }
 
 // toTriageEvent flattens a *corev1.Event to the internal payload
@@ -567,9 +618,14 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 	// but upstream kube-scheduler records through the new API, on which the
 	// first occurrence is EventTime and every repeat lands on Series. Read
 	// through to the core/v1 shape the informer lists, that is a Count of
-	// zero and a LastTimestamp of zero with the live values on Series. Without
-	// these fallbacks the FailedScheduling gate would fail open on the first
-	// event and then read every later one as stale.
+	// zero and a LastTimestamp of zero with the live values on Series, and no
+	// Series at all until the first repeat. Without these fallbacks every
+	// event of a series would read as count zero — which the count debounces
+	// pass through as "this emitter does not count" — and, once it had
+	// repeated, as last seen at its first occurrence. An event with EventTime
+	// set and no Series is that first occurrence, one sighting, and is counted
+	// as one rather than left at the fail-open zero; the debounce that would
+	// hold a legacy emitter's first event holds this one too.
 	last := ev.LastTimestamp.Time
 	if last.IsZero() && ev.Series != nil {
 		last = ev.Series.LastObservedTime.Time
@@ -583,6 +639,9 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 	count := int(ev.Count)
 	if count == 0 && ev.Series != nil {
 		count = int(ev.Series.Count)
+	}
+	if count == 0 && !ev.EventTime.IsZero() {
+		count = 1
 	}
 
 	// The event references its target via InvolvedObject.

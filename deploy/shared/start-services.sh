@@ -122,13 +122,14 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
 
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
-# verdict on the pod. The scheduler re-emits the event for a pod it cannot
-# place about every 30 seconds, so five is about two minutes, past a normal
-# GKE Standard scale-up; three would fire inside one. The autoscaler's own
-# events take precedence over the count: a NotTriggerScaleUp on the pod fires
-# at any count, a TriggeredScaleUp holds at any count for WATCHER_SCALEUP_HOLD.
-# Both are in the --reason list below so the watcher reads them; neither is
-# forwarded. Set to 1 to fire on the first event when no verdict is on record.
+# verdict on the pod: five failed scheduling attempts, a count rather than a
+# time, since the scheduler retries on every cluster change and at least
+# every five minutes. The autoscaler's own events take precedence over it: a
+# NotTriggerScaleUp on the pod fires at any count, a TriggeredScaleUp holds at
+# any count for WATCHER_SCALEUP_HOLD, and on a cluster with an autoscaler one
+# or the other arrives seconds after the pod's first attempt. Both are in the
+# --reason list below so the watcher reads them; neither is forwarded. Set to
+# 1 to fire on the first event when no verdict is on record.
 WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 
 # How long a TriggeredScaleUp on a pod holds its FailedScheduling events,

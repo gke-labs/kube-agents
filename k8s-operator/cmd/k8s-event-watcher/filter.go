@@ -74,11 +74,12 @@ type filterConfig struct {
 	imagePullTransientMinCount int
 	// failedSchedulingMinCount is the backstop for FailedScheduling when
 	// cluster-autoscaler has said nothing about the pod (no autoscaler, or one
-	// that has not evaluated it yet). The scheduler re-emits FailedScheduling
-	// for a pod it cannot place on roughly a 30-second cadence, and on every
-	// cluster change while nodes join, so a scale-up that resolves can climb
-	// the count fast; the count alone is a delay, not a discriminator, which
-	// is why the autoscaler's own verdicts take precedence over it below.
+	// that has not evaluated it yet). The scheduler retries a pod it cannot
+	// place on every cluster change and at least every five minutes, so the
+	// count is a number of failed attempts, not a duration: it climbs within
+	// seconds while nodes join and every few minutes on a quiet cluster. The
+	// count alone is a delay, not a discriminator, which is why the
+	// autoscaler's own verdicts take precedence over it below.
 	failedSchedulingMinCount int
 	// scaleUpHold is how long a TriggeredScaleUp mark holds the pod's
 	// FailedScheduling events, measured from the mark's event time. A ceiling
@@ -108,11 +109,15 @@ const (
 	// count at which kubelet's retry schedule has visibly failed to resolve something
 	// on its own, and is the value --unhealthy-min-count has always used.
 	defaultMinCount = 3
-	// defaultFailedSchedulingMinCount is higher than the others on purpose.
-	// At the scheduler's roughly 30-second re-emit cadence five sightings is
-	// about two minutes, past a normal GKE Standard scale-up; three would fire
-	// inside one. It is the backstop when no autoscaler verdict is on record,
-	// not the primary signal.
+	// defaultFailedSchedulingMinCount is five failed scheduling attempts, and
+	// deliberately not a time. On a cluster with cluster-autoscaler the
+	// verdict on a new pod arrives seconds after its first attempt (measured
+	// on Autopilot: TriggeredScaleUp two seconds after the pod, the count at
+	// five fourteen seconds after), so the backstop covers the gap before the
+	// verdict and the pods the autoscaler never rules on; on a cluster without
+	// one, a pod that has failed five attempts is stuck unless capacity frees
+	// on its own. The value is the issue's decision, chosen over three
+	// (defaultMinCount) to sit past a normal scale-up's first attempts.
 	defaultFailedSchedulingMinCount = 5
 	// defaultScaleUpHold is cluster-autoscaler's default max-node-provision-time.
 	// A scale-up the autoscaler has not delivered by then is one it has given
@@ -125,11 +130,13 @@ const (
 	// retry bumping the event's count and LastTimestamp, so a pod still stuck
 	// always has a sighting fresher than this. The check exists for the
 	// informer's initial list: after a restart it replays every event still
-	// inside the API server's TTL, in name order, which for one pod is
-	// creation order, so a FailedScheduling that the TriggeredScaleUp mark
-	// held at count five or more arrives before the mark that held it. Without
-	// this, every scale-up of the last hour would open a card on each restart.
-	// Three flush intervals, so a slow retry is not mistaken for a stale event.
+	// inside the API server's TTL, and a FailedScheduling whose pod scheduled
+	// while the watcher was down arrives with a count past the backstop and a
+	// TriggeredScaleUp mark that may by then be older than scaleUpHold. The
+	// watcher defers the list's FailedScheduling events until the marks are
+	// recorded (watcher.go); this check is the other half, for the events
+	// whose mark has aged out of the hold. Three flush intervals, so a slow
+	// retry is not mistaken for a stale event.
 	failedSchedulingStaleAfter = 15 * time.Minute
 )
 

@@ -102,13 +102,12 @@ type scaleUpMark struct {
 // Latest is by event time, not arrival order, so a replayed older mark cannot
 // overwrite a newer one. A later TriggeredScaleUp supersedes a NotTriggerScaleUp
 // (the autoscaler changed its mind, a node group was resized) and the reverse
-// supersedes too (the scale-up it started did not help). Bounded by ttl and by
-// max the way pullClassMemo is, with expired entries dropped first.
+// supersedes too (the scale-up it started did not help). The map, the expiry
+// and the eviction are boundedEntries (memo.go), shared with pullClassMemo;
+// an entry here is dated by the event, so both age from the mark's At.
 type scaleUpMemo struct {
 	mu      sync.Mutex
-	entries map[string]scaleUpMark
-	ttl     time.Duration
-	max     int
+	entries boundedEntries[scaleUpVerdict]
 	now     func() time.Time
 }
 
@@ -119,11 +118,7 @@ func newScaleUpMemo(ttl time.Duration, max int) *scaleUpMemo {
 	if max <= 0 {
 		max = defaultScaleUpEntries
 	}
-	return &scaleUpMemo{
-		entries: make(map[string]scaleUpMark),
-		ttl:     ttl,
-		max:     max,
-	}
+	return &scaleUpMemo{entries: newBoundedEntries[scaleUpVerdict](ttl, max)}
 }
 
 func (m *scaleUpMemo) clock() time.Time {
@@ -147,18 +142,10 @@ func (m *scaleUpMemo) Record(uid string, verdict scaleUpVerdict, at time.Time) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	prev, ok := m.entries[uid]
-	if ok && now.Sub(prev.At) > m.ttl {
-		delete(m.entries, uid)
-		ok = false
-	}
-	if ok && prev.At.After(at) {
+	if _, prevAt, ok := m.entries.lookup(uid, now); ok && prevAt.After(at) {
 		return
 	}
-	if !ok {
-		m.evictIfFull(now)
-	}
-	m.entries[uid] = scaleUpMark{Verdict: verdict, At: at}
+	m.entries.store(uid, verdict, at, now)
 }
 
 // Lookup returns the live mark for uid, or the zero mark when none is held or
@@ -170,45 +157,16 @@ func (m *scaleUpMemo) Lookup(uid string) scaleUpMark {
 	now := m.clock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	mark, ok := m.entries[uid]
+	verdict, at, ok := m.entries.lookup(uid, now)
 	if !ok {
 		return scaleUpMark{}
 	}
-	if now.Sub(mark.At) > m.ttl {
-		delete(m.entries, uid)
-		return scaleUpMark{}
-	}
-	return mark
-}
-
-// evictIfFull is called under lock. Expired entries go first; only if that
-// frees nothing is the oldest mark evicted.
-func (m *scaleUpMemo) evictIfFull(now time.Time) {
-	if len(m.entries) < m.max {
-		return
-	}
-	for uid, e := range m.entries {
-		if now.Sub(e.At) > m.ttl {
-			delete(m.entries, uid)
-		}
-	}
-	if len(m.entries) < m.max {
-		return
-	}
-	var oldestUID string
-	var oldest time.Time
-	first := true
-	for uid, e := range m.entries {
-		if first || e.At.Before(oldest) {
-			oldestUID, oldest, first = uid, e.At, false
-		}
-	}
-	delete(m.entries, oldestUID)
+	return scaleUpMark{Verdict: verdict, At: at}
 }
 
 // Len reports the current entry count. Test helper.
 func (m *scaleUpMemo) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.entries)
+	return m.entries.len()
 }
