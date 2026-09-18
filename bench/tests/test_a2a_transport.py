@@ -518,6 +518,8 @@ def test_a_permissions_violation_is_not_retried() -> None:
     with pytest.raises(a2a.BusUnavailable) as info:
         asyncio.run(session.submit(ids, _PROMPT))
     assert not info.value.retryable
+    # Refused is the one flush failure that says the frame was not taken.
+    assert not info.value.submitted
     assert "refused for 'eval'" in str(info.value)
 
 
@@ -577,6 +579,8 @@ class _FakeBus:
     ) -> a2a.Exchange:
         self.calls.append(_Call(ids, prompt, accept_timeout, deadline, tuple(cancel_first)))
         step = _FakeBus.script.pop(0) if _FakeBus.script else _lifecycle(ids.task_id)
+        if callable(step):
+            step = step()
         if isinstance(step, BaseException):
             if isinstance(step, a2a.BusUnavailable) and step.submitted:
                 # The connection was open long enough to submit, so the stale
@@ -596,6 +600,7 @@ class _FakeBus:
             outcome=_FakeBus.outcome,
             events=events,
             cancelled=tuple(t.task_id for t in cancel_first),
+            cancel_taken=_FakeBus.outcome != a2a.OUTCOME_TERMINAL,
         )
 
     def cancel(self, tasks: Sequence[a2a.TaskIds], why: str) -> tuple[str, ...]:
@@ -914,6 +919,26 @@ def test_the_deadline_is_the_http_timeout(fake_bus, monkeypatch: pytest.MonkeyPa
     assert before + 41 < call.deadline <= before + 43
 
 
+def test_a_retry_after_a_drop_gets_the_full_budget_again(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The api path gives each re-POST the whole timeout; so does this retry,
+    or the fault it absorbs becomes a graded timeout on the new task."""
+    monkeypatch.setenv("AGENT_HTTP_TIMEOUT", "42")
+
+    def _drop_after_a_while() -> a2a.BusUnavailable:
+        time.sleep(0.05)
+        return a2a.BusUnavailable("closed while awaiting", submitted=True)
+
+    fake_bus.script = [_drop_after_a_while]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert not result.has_errors(), result.errors
+    first, second = fake_bus.instances[0].calls
+    assert second.deadline - first.deadline >= 0.04
+    assert second.deadline <= time.monotonic() + 42
+
+
 def test_an_unknown_transport_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_TRANSPORT", "carrier-pigeon")
     result = KubeAgentsHarness().run(_PROMPT)
@@ -1131,10 +1156,6 @@ def test_a_missing_creds_secret_names_itself(monkeypatch: pytest.MonkeyPatch) ->
 # --------------------------------------------------------------------------
 
 
-def test_the_scorer_and_the_transport_agree_on_the_status_event_name() -> None:
-    assert scoring.A2A_STATUS_EVENT == a2a.EVENT_ENTRY_STATUS
-
-
 def test_an_a2a_record_passes_rung_3_without_tokens(kanban_task, make_run) -> None:
     """Null tokens plus a terminal a2a event is a real run, not a skeleton."""
 
@@ -1153,13 +1174,32 @@ def test_an_a2a_record_passes_rung_3_without_tokens(kanban_task, make_run) -> No
     assert verdict.reps[0].outcome == "pass"
 
 
-def test_an_a2a_record_without_a_terminal_is_still_not_a_run(kanban_task, make_run) -> None:
-    """A submitted-but-never-finished task carries no evidence a model ran."""
+def test_a_working_a2a_record_cancelled_at_the_budget_is_a_run(kanban_task, make_run) -> None:
+    """The executor took the task and started; the run was cancelled at its
+    budget before the terminal landed. One repetition's result, not a
+    record that blocks the job as never having run."""
+
+    def cancelled_working(rec: dict[str, Any]) -> None:
+        fold = a2a.Fold("task-1")
+        fold.apply(_status("task-1", "submitted"))
+        fold.apply(_status("task-1", "working"))
+        rec["trajectory"] = list(fold.trajectory)
+        rec["tokens"] = dict.fromkeys(
+            ("input", "cached", "cache_write", "reasoning", "output", "total")
+        )
+
+    verdict = grade_case(
+        load_case(kanban_task), [make_run(mutate=cancelled_working)], admitted=False
+    )
+    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+
+
+def test_a_submitted_only_a2a_record_is_still_not_a_run(kanban_task, make_run) -> None:
+    """The bridge queued the task and nothing ran: no evidence of a model."""
 
     def unfinished(rec: dict[str, Any]) -> None:
         fold = a2a.Fold("task-1")
         fold.apply(_status("task-1", "submitted"))
-        fold.apply(_status("task-1", "working"))
         rec["trajectory"] = list(fold.trajectory)
         rec["tokens"] = dict.fromkeys(
             ("input", "cached", "cache_write", "reasoning", "output", "total")

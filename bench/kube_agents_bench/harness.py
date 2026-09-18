@@ -73,7 +73,9 @@ Environment:
         (default ``24222``). The remote side is always the client port 4222.
     AGENT_A2A_NATS_SERVICE: The NATS Service to port-forward to (default
         ``<AGENT_SERVICE_NAME>-a2a-nats``); the credentials Secret is
-        ``<service>-creds`` in ``AGENT_NAMESPACE``, key ``eval-password``.
+        ``<service>-creds`` in ``AGENT_NAMESPACE``, key ``eval-password``,
+        which exists only where the operator runs with
+        ``A2A_EVAL_PRINCIPAL=true``.
     AGENT_A2A_NATS_URL: A bus URL to use instead of spawning a port-forward.
     AGENT_A2A_NATS_PASSWORD: The ``eval`` principal's password, instead of
         reading the Secret.
@@ -161,6 +163,9 @@ _A2A_NATS_CLIENT_PORT = 4222
 _A2A_DEFAULT_LOCAL_PORT = 24222
 # The tunnel's near end: where a port-forward the harness spawned listens.
 _A2A_LOOPBACK_URL = "nats://127.0.0.1"
+# What a bounded a2a wait reports about the cancel it published for its task.
+_CANCEL_TAKEN_NOTE = "cancel published"
+_CANCEL_UNCONFIRMED_NOTE = "cancel not confirmed"
 # How long a submitted task may sit with no event at all before the run is
 # classified as infrastructure: nothing consumed it. The bridge publishes
 # ``submitted`` on accept before queueing, so a busy executor still answers
@@ -871,6 +876,11 @@ def _post_turn(
     return parse_response(payload), session_id
 
 
+def _cancel_note(exchange: a2a.Exchange) -> str:
+    """Whether the server took the cancel the bounded wait published."""
+    return _CANCEL_TAKEN_NOTE if exchange.cancel_taken else _CANCEL_UNCONFIRMED_NOTE
+
+
 def _nothing_accepted(exchange: a2a.Exchange) -> bool:
     """True when no executor consumed the submission before the wait ended.
 
@@ -1287,7 +1297,6 @@ class KubeAgentsHarness(AgentHarness):
             return _infra_failure(str(exc))
 
         client = a2a.BusClient(url=url, password=password, addressee=addressee)
-        deadline = time.monotonic() + timeout
         # Every task an attempt submitted and then lost, the status turns'
         # included. One list for the whole run, so it reaches the record
         # whether the run ends in an answer or in infrastructure.
@@ -1296,7 +1305,7 @@ class KubeAgentsHarness(AgentHarness):
         def _submit(
             text: str,
             *,
-            until: float,
+            budget: float,
             context_id: str | None = None,
             correlation_id: str | None = None,
             max_attempts: int = _MAX_TRANSPORT_FAILURES,
@@ -1307,13 +1316,17 @@ class KubeAgentsHarness(AgentHarness):
             an attempt whose connection dropped cannot resume the task it
             submitted. Such a task is cancelled by the next attempt, or on
             the way out when there is none, and its id is added to
-            ``abandoned`` either way.
+            ``abandoned`` either way. Every attempt also gets the full
+            ``budget``, as each re-POST on the api path does: the fault the
+            retry absorbs must not turn the time it consumed into a graded
+            timeout on the new task.
             """
             attempts = 0
             uncancelled: list[a2a.TaskIds] = []
             while True:
                 ids = a2a.mint_ids(context_id=context_id, correlation_id=correlation_id)
                 attempts += 1
+                until = time.monotonic() + budget
                 try:
                     exchange = client.submit_and_await(
                         ids,
@@ -1373,7 +1386,7 @@ class KubeAgentsHarness(AgentHarness):
                 )
 
         try:
-            ids, exchange = _submit(prompt, until=deadline)
+            ids, exchange = _submit(prompt, budget=timeout)
         except a2a.BusUnavailable as exc:
             failure = _infra_failure(f"the bus exchange failed: {exc}")
             failure.metadata["abandoned_tasks"] = abandoned
@@ -1392,7 +1405,8 @@ class KubeAgentsHarness(AgentHarness):
             )
             failure = _infra_failure(
                 f"no executor accepted task {ids.task_id} on "
-                f"{a2a.task_in_subject(addressee, ids.task_id)} {bound}; cancel published"
+                f"{a2a.task_in_subject(addressee, ids.task_id)} {bound}; "
+                f"{_cancel_note(exchange)}"
             )
             failure.metadata["abandoned_tasks"] = abandoned
             return failure
@@ -1403,7 +1417,7 @@ class KubeAgentsHarness(AgentHarness):
         if exchange.outcome == a2a.OUTCOME_DEADLINE:
             result.errors.append(
                 f"task {ids.task_id} did not reach a terminal state within {timeout:.0f}s "
-                f"(last state {exchange.fold.state or 'none'!r}); cancel published"
+                f"(last state {exchange.fold.state or 'none'!r}); {_cancel_note(exchange)}"
             )
         elif exchange.fold.state != a2a.STATE_COMPLETED:
             detail = f": {exchange.fold.status_message}" if exchange.fold.status_message else ""
@@ -1423,7 +1437,7 @@ class KubeAgentsHarness(AgentHarness):
                 try:
                     turn_ids, turn_exchange = _submit(
                         poll,
-                        until=time.monotonic() + turn_timeout,
+                        budget=turn_timeout,
                         context_id=ids.context_id,
                         correlation_id=ids.correlation_id,
                         max_attempts=1,

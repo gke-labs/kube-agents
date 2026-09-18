@@ -220,6 +220,8 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 // diff.
 func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 	agent := a2aTestAgent()
+	// With the opt-in eval principal rendered, so its row is checked too.
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
 
 	// Asserted against the principal list, which spans both renders: gateway
 	// and bridge are static entries in nats.conf, while the agent and session
@@ -536,7 +538,7 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 	if string(got.Data[a2aBridgePasswordKey]) == injected {
 		t.Error("a malformed key survived repair; its value reaches nats.conf inside quotes")
 	}
-	for _, key := range a2aCredsKeys {
+	for _, key := range a2aCredsKeys() {
 		if !a2aCredsValueRe.Match(got.Data[key]) {
 			t.Errorf("key %q was not repaired to the generated shape: %q", key, got.Data[key])
 		}
@@ -2453,7 +2455,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 // one appears nowhere in the render.
 func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 	data := map[string][]byte{}
-	for i, key := range a2aCredsKeys {
+	for i, key := range a2aCredsKeys() {
 		data[key] = []byte(strings.Repeat(nibble, 31) + fmt.Sprintf("%x", i))
 	}
 	return &corev1.Secret{
@@ -2580,7 +2582,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 		t.Fatalf("creds Secret missing after reconcile: %v", err)
 	}
 	forbidden := map[string]string{}
-	for _, key := range a2aCredsKeys {
+	for _, key := range a2aCredsKeys() {
 		password := string(stored.Data[key])
 		if !a2aCredsValueRe.MatchString(password) {
 			t.Fatalf("seeded creds key %q was re-rolled into an unexpected shape: %q", key, password)
@@ -3754,6 +3756,9 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 // widening gets.
 func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	agent := a2aTestAgent()
+	// With the opt-in eval principal rendered: the table covers every
+	// principal an install can carry, and the default render is a subset.
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
 	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
 	const (

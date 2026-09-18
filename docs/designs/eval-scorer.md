@@ -86,9 +86,11 @@ through to a judged score is the silent-green path this gate exists to close.
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
 a record the harness's a2a transport produced carries no usage at all (the bus reports none), so
-its liveness signal is the executor's terminal instead — a trajectory entry named
-`a2a.status-update` whose `args.final` is true stands in for a null total and nothing else; a null
-total with no such entry still fails the rung, and so does a total of zero. There is no `metadata`
+its liveness signal is the executor's own events instead — a trajectory entry named
+`a2a.status-update` whose `args.final` is true, or whose `args.state` is `working`, stands in for
+a null total (the executor took the task and ended it, or took it and was cancelled at the budget
+before its terminal landed); a `submitted` entry alone, a null total with no such entry, and a
+total of zero still fail the rung. There is no `metadata`
 block on a
 devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a

@@ -66,9 +66,10 @@ of the finding: the mode does not change what the cases see, because the cases n
 
 The gateway is in the path, and the presubmit's transport holds no bus credential (decided
 2026-09-17). The
-direct-bus transport the first draft of this document proposed proves the bus, the callout, the
-streams and the executor, but it leaves out the gateway's routing, its session registry and the
-relay back, and it hands a second process the one credential that may publish on `.in`. Stage 1
+direct-bus transport the first draft of this document proposed proves the bus, the streams and
+the executor (not the callout: both principals on that path are static users), but it leaves
+out the gateway's routing, its session registry and the relay back, and it hands a second
+process the one credential that may publish on `.in`. Stage 1
 is therefore the next-stack analogue of the door the harness uses today: an **inject adapter in
 the gateway**, a third backend beside Discord and Google Chat, HTTP on localhost or a ClusterIP
 Service, off by default, rendered by the operator only under the eval flag. Its design text goes
@@ -360,21 +361,23 @@ and the terminal the gateway writes as supervisor when an executor dies without 
 that took the supervisor split inside the last retention window still holds older supervisor
 terminals on `.events`), publish one `message` envelope on `a2a.tasks.{addressee}.{taskId}.in`
 (`AGENT_A2A_ADDRESSEE` selects the addressee, default `platform`; the `eval` grant below reaches
-`platform` alone, so any other value is refused at the callout until the grant widens), fold the
+`platform` alone, so any other value is refused by the static grant until it widens), fold the
 events as `tasks/get`
 folds them, and publish `cancel` on the way out of a timeout. The forward enters from the node,
 which the NATS ingress NetworkPolicy does not govern, so the fence that admits only enumerated bus
-clients in-cluster does not have to name the harness. It proves the bus, the callout, the streams
-and the executor with the gateway out of the path, which is what makes it the tool for showing
-that the gateway itself is the thing that is down. It is not the presubmit's transport.
+clients in-cluster does not have to name the harness. It proves the bus, the streams and the
+executor with the gateway out of the path (not the callout, which never sees a static user),
+which is what makes it the tool for showing that the gateway itself is the thing that is down.
+It is not the presubmit's transport.
 
-Two conditions on it (decided 2026-09-17). It authenticates as its own `eval` principal in the
-identity map the callout reads ([`spec-nats-deployment.md`](spec-nats-deployment.md), "Accounts
-and connection-time authorization"): publish on `a2a.tasks.platform.*.in`, subscribe on the
-matching `.events` and `.supervisor`, nothing else. It never holds the gateway's credential, in
-any case, and until
-that row is rendered the transport has no credential it may use. And it leaves `authority` null
-and says so: the block is populate-by-gateway-only and advisory until publisher identity arms
+Two conditions on it (decided 2026-09-17). It authenticates as its own `eval` principal, a
+static user in the operator's render ([`spec-nats-deployment.md`](spec-nats-deployment.md),
+"Accounts and connection-time authorization"), which the operator renders only under
+`A2A_EVAL_PRINCIPAL=true`: publish on `a2a.tasks.platform.*.in`, subscribe on the matching
+`.events` and `.supervisor`, nothing else. It never holds the gateway's credential, in any case,
+and on an install without that flag the transport has no credential it may use. And it leaves
+`authority` null and says so: the block is populate-by-gateway-only and advisory until publisher
+identity arms
 ([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "Requester identity on the bus"), so a
 harness-invented shape would be a second writer of a field consumers may not decide on.
 

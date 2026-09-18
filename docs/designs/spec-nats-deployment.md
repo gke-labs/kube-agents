@@ -252,7 +252,8 @@ lands separately from this render; `web`, because a browser never can; `seed`, b
 the hand-applied seed tooling is applied rather than rendered and dropping its user
 would refuse an object already running; `sys`, a human at a port-forward; `eval`, the
 bench harness's diagnostic bus transport, a process outside the cluster with no
-ServiceAccount to present; and `bridge`, the Hermes bridge sidecar.
+ServiceAccount to present, rendered only when the operator runs with
+`A2A_EVAL_PRINCIPAL=true`; and `bridge`, the Hermes bridge sidecar.
 
 The shared `worker` user is gone. It was one credential held by two workloads that
 happen to share a pod — the bridge sidecar, which drives the task plane, and the `a2a`

@@ -194,10 +194,12 @@ func a2aServiceAccountName(namespace, name string) string {
 //
 // Ordering is stable and meaningful: it is the order the map and the config are
 // rendered in, so a diff of either is a diff of intent rather than of map
-// iteration.
+// iteration. The eval principal is the one conditional entry: it sits between
+// web and sys when the controller runs with A2A_EVAL_PRINCIPAL=true and is
+// absent otherwise, so the two renders differ by exactly that block.
 func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	ns := agent.Namespace
-	return []a2aIdentity{
+	ids := []a2aIdentity{
 		gatewayIdentity(agent, ns),
 		provisionIdentity(agent, ns),
 		sessionIdentity(agent, ns),
@@ -205,9 +207,11 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		bridgeIdentity(),
 		seedIdentity(),
 		webIdentity(),
-		evalIdentity(),
-		sysIdentity(),
 	}
+	if a2aEvalPrincipalEnabled() {
+		ids = append(ids, evalIdentity())
+	}
+	return append(ids, sysIdentity())
 }
 
 // gateway: task requester, chat-session supervisor, session-registry owner.
@@ -679,11 +683,13 @@ func webIdentity() a2aIdentity {
 // the bridge cannot tell one requester from another (`from` is display-only).
 // A static NATS grant cannot name one task, so whoever holds `eval-password`
 // can cancel a task they did not start; the key is held like the gateway's,
-// and every `mode: next` install renders it whether or not it runs an eval. No
-// JetStream API at all: the harness subscribes with a core subscription taken
-// before it publishes, so it needs no consumer, and a CONSUMER.CREATE on TASKS
-// would let it deliver any addressee's task plane into its own inbox
-// (a2aJetStreamSurfaceRationale). A core subscription has no replay, so the
+// and it exists only where an operator asked for it: the user and the key are
+// rendered under A2A_EVAL_PRINCIPAL=true (a2aEvalPrincipalEnabled) and on no
+// other install. No JetStream API at all: the harness subscribes with a core
+// subscription taken before it publishes, so it needs no consumer, and a
+// CONSUMER.CREATE on TASKS would let it deliver any addressee's task plane
+// into its own inbox (a2aJetStreamSurfaceRationale). A core subscription has
+// no replay, so the
 // harness treats a dropped connection as a failed attempt and resubmits, which
 // is the trade a diagnostic can make. The inbox pair is what makes a reply to
 // this principal deliverable: a publish that carries a reply subject gets the
@@ -703,7 +709,8 @@ func evalIdentity() a2aIdentity {
 			"core subscription needs no consumer, and CONSUMER.CREATE on TASKS would read\n" +
 			"every addressee's task plane). The wildcards reach every platform task, the\n" +
 			"gateway's included: a holder can cancel one it did not start, so the key is\n" +
-			"held like the gateway's.",
+			"held like the gateway's, and this block is rendered only while the operator\n" +
+			"runs with A2A_EVAL_PRINCIPAL=true.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aEvalPasswordKey,
 		publish: []string{

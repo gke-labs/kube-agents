@@ -182,16 +182,85 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 // connect on every install; seed is applied rather than rendered, so dropping
 // its user would break an object already running on installs today; and eval
 // is the bench harness outside the cluster, over a port-forward, with no
-// ServiceAccount here to present. A seventh name here means someone added a
-// principal without asking whether it could have an identity.
+// ServiceAccount here to present, and rendered only when an operator opts in.
+// A name beyond these means someone added a principal without asking whether
+// it could have an identity.
 func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
-	var got []string
-	for _, id := range staticIdentities(identityTestAgent()) {
-		got = append(got, id.user)
+	statics := func() []string {
+		var got []string
+		for _, id := range staticIdentities(identityTestAgent()) {
+			got = append(got, id.user)
+		}
+		return got
 	}
-	want := []string{"gateway", a2aBridgeUser, "seed", "web", "eval", "sys"}
-	if !slices.Equal(got, want) {
+	t.Setenv(a2aEvalPrincipalEnvVar, "")
+	want := []string{"gateway", a2aBridgeUser, "seed", "web", "sys"}
+	if got := statics(); !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
+	}
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
+	want = []string{"gateway", a2aBridgeUser, "seed", "web", "eval", "sys"}
+	if got := statics(); !slices.Equal(got, want) {
+		t.Errorf("static principals with the eval flag = %v, want %v", got, want)
+	}
+}
+
+// The eval principal is opt-in. Its static grants reach every platform task,
+// the gateway's included (a holder of eval-password can cancel or steer one it
+// did not start), so an install that runs no eval must carry neither the user
+// nor the key. Asserted at every layer the flag governs: the identity list,
+// the creds keys the Secret is repaired to, the rendered nats.conf user block
+// and the auth_users exemption; and against the near-miss, which must fall on
+// the side of no credential.
+func TestTheEvalPrincipalRendersOnlyUnderItsFlag(t *testing.T) {
+	agent := identityTestAgent()
+	render := func() (users []string, keys []string, conf string) {
+		t.Helper()
+		for _, id := range a2aIdentities(agent) {
+			users = append(users, id.user)
+		}
+		conf = string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+		return users, a2aCredsKeys(), conf
+	}
+	authUsers := func(conf string) string {
+		t.Helper()
+		i := strings.Index(conf, "auth_users:")
+		if i < 0 {
+			t.Fatal("rendered nats.conf has no auth_users line")
+		}
+		return conf[i : i+strings.Index(conf[i:], "\n")]
+	}
+
+	for _, off := range []string{"", "TRUE", "1", "yes"} {
+		t.Setenv(a2aEvalPrincipalEnvVar, off)
+		users, keys, conf := render()
+		if slices.Contains(users, "eval") {
+			t.Errorf("%s=%q renders the eval identity; the principal is opt-in", a2aEvalPrincipalEnvVar, off)
+		}
+		if slices.Contains(keys, a2aEvalPasswordKey) {
+			t.Errorf("%s=%q mints %s into the creds Secret", a2aEvalPrincipalEnvVar, off, a2aEvalPasswordKey)
+		}
+		if strings.Contains(conf, "user: eval") {
+			t.Errorf("%s=%q renders a `user: eval` block into nats.conf", a2aEvalPrincipalEnvVar, off)
+		}
+		if strings.Contains(authUsers(conf), "eval") {
+			t.Errorf("%s=%q lists eval in auth_users with no user block behind it", a2aEvalPrincipalEnvVar, off)
+		}
+	}
+
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
+	users, keys, conf := render()
+	if !slices.Contains(users, "eval") {
+		t.Error("the flag set renders no eval identity")
+	}
+	if !slices.Contains(keys, a2aEvalPasswordKey) {
+		t.Errorf("the flag set mints no %s key", a2aEvalPasswordKey)
+	}
+	if !strings.Contains(conf, "user: eval") {
+		t.Error("the flag set renders no `user: eval` block")
+	}
+	if !strings.Contains(authUsers(conf), "eval") {
+		t.Error("the flag set renders the eval user but leaves it out of auth_users, so the callout would refuse it at connect")
 	}
 }
 
@@ -451,7 +520,7 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 			t.Errorf("%s reads worker-password; that key is retired", id.user)
 		}
 	}
-	if slices.Contains(a2aCredsKeys, "worker-password") {
+	if slices.Contains(a2aCredsKeys(), "worker-password") {
 		t.Error("worker-password is back in a2aCredsKeys; the operator would mint a password nothing authenticates with")
 	}
 

@@ -129,6 +129,7 @@ KIND_STATUS_UPDATE = "status-update"
 KIND_ARTIFACT_UPDATE = "artifact-update"
 
 STATE_COMPLETED = "completed"
+STATE_WORKING = "working"
 TERMINAL_STATES = frozenset({STATE_COMPLETED, "failed", "canceled", "rejected"})
 
 # The reserved artifact names (``a2a/lib/payload.go``).
@@ -435,6 +436,9 @@ class Exchange:
     events: list[dict[str, Any]]
     #: The ``cancel_first`` task ids whose cancel the server took on the way in.
     cancelled: tuple[str, ...] = ()
+    # Whether the server took the cancel a wait that ended on a bound
+    # published for its own task; None when no such cancel was owed.
+    cancel_taken: bool | None = None
 
 
 class _Session:
@@ -554,8 +558,10 @@ class _Session:
         except BusUnavailable as exc:
             # The frame left this side before the round trip failed, so the
             # server may have taken it. A submission it took is the caller's
-            # to cancel and record; a cancel it took twice costs nothing.
-            exc.submitted = True
+            # to cancel and record; a cancel it took twice costs nothing. A
+            # refusal is the one flush failure that says it was not taken.
+            if exc.retryable:
+                exc.submitted = True
             raise
 
     async def submit(self, ids: TaskIds, prompt: str) -> None:
@@ -708,7 +714,7 @@ class BusClient:
                     ids.task_id, accept_timeout=accept_timeout, deadline=deadline
                 )
                 if exchange.outcome != OUTCOME_TERMINAL:
-                    await session.cancel(ids, exchange.outcome)
+                    exchange.cancel_taken = await session.cancel(ids, exchange.outcome)
                 exchange.cancelled = tuple(cancelled)
                 return exchange
             except BusUnavailable as exc:
