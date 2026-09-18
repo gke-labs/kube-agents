@@ -8,10 +8,11 @@ The hindsight-api container's resources are written twice: once as
 `hindsight.api.resources` in the chart's values, which the chart template
 renders verbatim, and once inline in the operator's kustomize manifest, which
 the dev path deploys. The template says it mirrors the kustomize directory, but
-`make chart-check` compares only the CRD, RBAC and webhook copies, so nothing
-kept the two resource blocks in step. These tests do, and they pin the shape
-the numbers have to keep: a request small enough to schedule beside the agent
-pod, below a limit the reranker can burst into during recall.
+`make chart-check` compares only the CRD, RBAC, admission-policy and webhook
+copies, so nothing kept the two resource blocks in step. These tests do, and
+they pin the shape the numbers have to keep: a request small enough to
+schedule beside the agent pod, below a limit the reranker can burst into
+during recall.
 """
 
 import pathlib
@@ -92,14 +93,15 @@ class HindsightApiResourcesTest(unittest.TestCase):
 
     def test_the_cpu_request_is_steady_state_sized(self):
         # One core is the ceiling for a request that still co-schedules with the
-        # agent pod on a small node; measured steady state is about 9m.
+        # agent pod on a small node; steady state is a few millicores
+        # (docs/designs/memory.md, the hindsight-api component entry).
         request = _cpu_millis(self.chart["requests"]["cpu"])
         self.assertLessEqual(
             request,
             _MILLIS_PER_CORE,
             f"hindsight-api requests {request}m CPU; the request reserves capacity "
             "the scheduler and Autopilot billing count continuously, and the "
-            "process idles near 9m",
+            "process idles at a few millicores",
         )
 
 
