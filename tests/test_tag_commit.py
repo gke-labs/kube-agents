@@ -1,4 +1,4 @@
-"""Unit tests for scripts/release/tag_commit.sh and the four wrappers over it.
+"""Unit tests for scripts/release/tag_commit.sh and the five wrappers over it.
 
 tag_commit.sh replaced a body that had been copied into each tagger on the
 release ladder. The point of the cases below is not that the shared script works
@@ -7,6 +7,13 @@ the consolidation is demonstrably behaviour-preserving for the three callers
 that already worked. tag_ga_release.sh keeps its own suite
 (tests/test_tag_ga_release.py); the GA case here only pins that it still routes
 through the shared tagger.
+
+tag_eval_candidate.sh is the one wrapper that was never a copy: it was written
+against this shape when the release-candidate eval became a gate. Its cases
+mirror the staging ones deliberately, because the guards are the same guards —
+what differs is the cost of getting past them. A bad staging tag deploys the
+wrong thing; a bad eval-candidate tag spends hours of a project pool shared with
+the merge-blocking presubmit measuring something nobody can promote.
 """
 
 import pathlib
@@ -200,6 +207,93 @@ class TagCommitTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("carries no rc_*_validated tag", proc.stderr)
         self.assertEqual(git("tag", "-l", "staging_*").stdout.strip(), "")
+
+    # ─── the eval-candidate wrapper ───────────────────────────────────────────
+
+    def test_tag_eval_candidate_wrapper_derives_the_tag(self):
+        repo_dir, git = self._repo()
+        head = self._commit_staging_trigger(repo_dir, git, "staging_*")
+        git("tag", "-a", "rc_2608241820_b35543c_validated", "-m", "Validated")
+
+        proc = self._run("tag_eval_candidate.sh", [head, "rc_2608241820_b35543c_validated"], repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(git("rev-parse", "evalcand_2608241820_b35543c^{commit}").stdout.strip(), head)
+
+    def test_tag_eval_candidate_shares_a_core_with_the_staging_tag(self):
+        """The two tags name the same candidate, and the poller relies on it.
+
+        The verdict is recorded against the commit, and the promotion reads it
+        back by that commit. Two tags whose cores disagreed would still both be
+        pushed; what would break is a reader trying to pair them up.
+        """
+        repo_dir, git = self._repo()
+        head = self._commit_staging_trigger(repo_dir, git, "staging_*")
+        git("tag", "-a", "rc_2608241820_b35543c_validated", "-m", "Validated")
+
+        self.assertEqual(
+            self._run("tag_eval_candidate.sh", [head, "rc_2608241820_b35543c_validated"], repo_dir).returncode,
+            0,
+        )
+        self.assertEqual(
+            self._run("tag_staging_promotion.sh", [head, "rc_2608241820_b35543c_validated"], repo_dir).returncode,
+            0,
+        )
+        tags = git("tag", "-l", "evalcand_*", "staging_*").stdout.split()
+        cores = {tag.split("_", 1)[1] for tag in tags}
+        self.assertEqual(cores, {"2608241820_b35543c"})
+
+    def test_tag_eval_candidate_refuses_an_unvalidated_commit(self):
+        """Nominating an unvalidated commit spends a leased project on nothing."""
+        repo_dir, git = self._repo()
+        head = git("rev-parse", "HEAD").stdout.strip()
+        (pathlib.Path(repo_dir) / "second.txt").write_text("second\n")
+        git("add", "second.txt")
+        git("commit", "-m", "chore: second commit")
+        git("tag", "-a", "rc_2608241820_b35543c_validated", "-m", "Validated elsewhere")
+
+        proc = self._run("tag_eval_candidate.sh", [head, "rc_2608241820_b35543c_validated"], repo_dir)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("carries no rc_*_validated tag", proc.stderr)
+        self.assertEqual(git("tag", "-l", "evalcand_*").stdout.strip(), "")
+
+    def test_tag_eval_candidate_refuses_a_mismatched_explicit_tag(self):
+        repo_dir, git = self._repo()
+        head = git("rev-parse", "HEAD").stdout.strip()
+        git("tag", "-a", "rc_2608241820_b35543c_validated", "-m", "Validated")
+
+        proc = self._run(
+            "tag_eval_candidate.sh",
+            [head, "rc_2608241820_b35543c_validated", "evalcand_9999999999_deadbee"],
+            repo_dir,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does not match the tag derived from", proc.stderr)
+        self.assertEqual(git("tag", "-l", "evalcand_*").stdout.strip(), "")
+
+    def test_tag_eval_candidate_guards_the_namespace(self):
+        repo_dir, git = self._repo()
+        head = git("rev-parse", "HEAD").stdout.strip()
+
+        proc = self._run("tag_eval_candidate.sh", [head, "0.2.0"], repo_dir)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not an rc_* candidate tag", proc.stderr)
+        self.assertEqual(git("tag", "-l").stdout.strip(), "")
+
+    def test_tag_eval_candidate_refuses_a_candidate_that_could_never_be_promoted(self):
+        """The staging-trigger check, moved forward to before the eval is spent.
+
+        tag_staging_promotion.sh would refuse this candidate at the end of the
+        chain regardless. Refusing it here too is what stops the pipeline paying
+        five hours of eval for a verdict it could not act on.
+        """
+        repo_dir, git = self._repo()
+        head = self._commit_staging_trigger(repo_dir, git, "staging/**")
+        git("tag", "-a", "rc_2608241820_b35543c_validated", "-m", "Validated")
+
+        proc = self._run("tag_eval_candidate.sh", [head, "rc_2608241820_b35543c_validated"], repo_dir)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does not match", proc.stderr)
+        self.assertEqual(git("tag", "-l", "evalcand_*").stdout.strip(), "")
 
     def test_tag_ga_release_still_routes_through_the_shared_tagger(self):
         repo_dir, git = self._repo()

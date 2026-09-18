@@ -1,21 +1,39 @@
 name: "Nightly: Pipeline"
 
-# Builds a nightly environment from nothing, runs the full E2E matrix on it,
-# and — if the matrix passes — promotes the candidate to staging by creating
-# and pushing a staging tag (`staging_<ts>_<sha>`), before destroying the
-# nightly environment again.
+# Builds a nightly environment from nothing, runs the full E2E matrix on it, and
+# — if the matrix passes — promotes the candidate to staging. Promotion is two
+# rungs with an eval between them, and the eval is a gate:
 #
-# Pushing the staging tag triggers `Staging: Deploy` (staging-deploy.yml), which
-# atomically reconciles the Terraform composition, Helm release, and container
-# images together from that single validated commit. Autopush is similarly
-# kept current through atomic deploys in autopush-deploy.yml when images are
-# published to GHCR.
+#   step 4  pushes `evalcand_<ts>_<sha>`, which nominates the candidate. Nothing
+#           in this repository reacts to that tag. What does react is the Prow
+#           postsubmit post-kube-agents-eval-rc, in GoogleCloudPlatform/oss-test-
+#           infra, which runs the full eval catalog against the candidate's
+#           published images.
+#   step 5  waits for that eval's verdict by polling its GCS artifacts, for up to
+#           five and a half hours, and fails if it is red or never arrives.
+#   step 5b deletes the tag step 4 pushed, but only when no verdict arrived at
+#           all. A red verdict is an answer and the tag stays, which is what
+#           keeps a rejected candidate from being re-measured every night; a
+#           broken lane is not, and leaving the tag behind would strand the
+#           candidate for good.
+#   step 6  pushes `staging_<ts>_<sha>` — and only then. That tag is the one
+#           `Staging: Deploy` (staging-deploy.yml) reacts to, atomically
+#           reconciling the Terraform composition, Helm release, and container
+#           images together from that single validated commit.
+#
+# The split exists because both tags would otherwise be the same tag, and a
+# single tag cannot both start an eval and wait for it: staging-deploy.yml would
+# reach the cluster in minutes while the eval was still hours from a verdict.
+# Autopush is separately kept current through atomic deploys in
+# autopush-deploy.yml when images are published to GHCR.
 #
 # Nothing in it touches the RC environment. The three jobs that touch the
 # nightly cluster — deploy, the matrix, teardown — bind `nightly` and take the
 # `nightly-environment` lock, so none of them queues behind or races the
 # three-hourly RC pipeline. Step 1 binds `nightly` for its variables without
-# taking the lock; the promotion only pushes a Git tag, so it does neither.
+# taking the lock; steps 4 to 6 push and delete Git tags and read a GCS bucket,
+# so they do neither. Teardown runs concurrently with them for that reason — see
+# its own comment for why waiting on the eval would strand a cluster for hours.
 #
 # Dispatch-only on purpose: scheduled execution is owned by nightly-scheduler.yml
 # so that a daily tick with nothing to promote produces no pipeline run at all.
@@ -40,9 +58,25 @@ on:
 # workflow pointed at the `nightly` environment can interleave in a gap. This
 # group is held for the whole run, and it is what keeps the only thing that
 # drives the environment end to end, another nightly, out of those gaps.
+#
+# The eval wait makes a run last up to roughly eight hours rather than three, so
+# this group is now held for most of a working day. That is still well inside the
+# scheduler's daily tick, and the environment itself is released much earlier:
+# teardown does not wait on the eval.
 concurrency:
   group: nightly-pipeline
   cancel-in-progress: false
+
+# Step 5's only inputs, and the same two values ci-health.yml declares for the
+# same purpose: the eval's artifacts land in a bucket owned by kube-agents-prow,
+# and github-actions@kube-agents-prow is the read-only identity that project
+# exposes for reading them from GitHub Actions. Literals rather than repository
+# variables, matching ci-health.yml — an unset variable resolves to empty in
+# silence, and an empty provider fails with an authentication error that says
+# nothing about which value went missing.
+env:
+  PROW_ARCHIVE_WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+  PROW_ARCHIVE_READER_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
 
 jobs:
   step-1-resolve-candidate:
@@ -68,6 +102,7 @@ jobs:
     outputs:
       commit_sha: ${{ steps.resolve.outputs.commit_sha }}
       rc_tag: ${{ steps.resolve.outputs.rc_tag }}
+      evalcand_tag: ${{ steps.resolve.outputs.evalcand_tag }}
       staging_tag: ${{ steps.resolve.outputs.staging_tag }}
       skip_pipeline: ${{ steps.resolve.outputs.skip_pipeline }}
       skip_promotion: ${{ steps.resolve.outputs.skip_promotion }}
@@ -102,6 +137,7 @@ jobs:
         env:
           COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
           RC_TAG: ${{ steps.resolve.outputs.rc_tag }}
+          EVALCAND_TAG: ${{ steps.resolve.outputs.evalcand_tag }}
           STAGING_TAG: ${{ steps.resolve.outputs.staging_tag }}
           SKIP_PIPELINE: ${{ steps.resolve.outputs.skip_pipeline }}
           SKIP_PROMOTION: ${{ steps.resolve.outputs.skip_promotion }}
@@ -159,11 +195,11 @@ jobs:
       timeout_minutes: 120
     secrets: inherit
 
-  step-4-create-staging-tag:
-    name: Step 4 - Create Staging Tag
+  step-4-nominate-candidate:
+    name: Step 4 - Nominate Candidate for Eval
     needs: [step-1-resolve-candidate, step-3-run-e2e-matrix]
-    # The implicit success() on `needs` is the gate: a red matrix promotes
-    # nothing and leaves staging where it is.
+    # The implicit success() on `needs` is the first gate: a red matrix nominates
+    # nothing, spends no eval capacity, and leaves staging where it is.
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
@@ -171,11 +207,23 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+    # The second the nomination was pushed, read by step 5. The poller needs a
+    # floor on which build may answer for it: the tag name is stable across
+    # attempts, so a candidate nominated a second time has a finished build from
+    # the first sitting at the same commit, and for the minute or two before Prow
+    # uploads tonight's started.json that older build is the newest one matching.
+    # Without the floor the poll answers in seconds with the previous attempt's
+    # verdict, withdraws the nomination again, and tonight's eval runs for hours
+    # with nobody reading it — so the retry never retries.
+    outputs:
+      nominated_at: ${{ steps.nominate.outputs.nominated_at }}
     steps:
       # Dedicated GitHub App token (kube-agents-release-bot), not GITHUB_TOKEN.
-      # A tag pushed with the default token triggers no workflow, so staging-deploy.yml
-      # would never start and the promotion would go green having deployed nothing.
-      # The App token also bypasses repository tag-protection rulesets.
+      # The eval is started by a Prow webhook rather than by Actions, so the
+      # "tags pushed with GITHUB_TOKEN trigger no workflow" rule would not by
+      # itself stop this one — but the App token also bypasses the repository's
+      # tag-protection rulesets, which does apply, and step 6 needs the same
+      # token for the reason that rule states outright.
       - name: Generate Release Bot Token
         if: needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
         id: release-token
@@ -193,35 +241,255 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.release-token.outputs.token }}
 
-      - name: Tag the candidate for staging
+      - name: Nominate the candidate for the release-candidate eval
         if: needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
+        id: nominate
+        env:
+          COMMIT_SHA: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
+          RC_TAG: ${{ needs.step-1-resolve-candidate.outputs.rc_tag }}
+          EVALCAND_TAG: ${{ needs.step-1-resolve-candidate.outputs.evalcand_tag }}
+        run: |
+          # Stamped BEFORE the push, so the floor can only ever be early. A stamp
+          # taken afterwards could land after Prow had already written
+          # started.json for the build it is meant to admit, and the poller would
+          # then skip tonight's build as well as last night's and report that no
+          # eval ever ran.
+          echo "nominated_at=$(date -u +%s)" >> "${GITHUB_OUTPUT}"
+          ./scripts/release/tag_eval_candidate.sh
+
+      - name: Record that nothing was nominated
+        if: needs.step-1-resolve-candidate.outputs.skip_promotion == 'true'
+        env:
+          RC_TAG: ${{ needs.step-1-resolve-candidate.outputs.rc_tag }}
+        run: |
+          echo "Candidate ${RC_TAG} has already been through the promotion path; the matrix ran, nothing was pushed." \
+            >> "${GITHUB_STEP_SUMMARY}"
+
+  step-5-await-eval-verdict:
+    name: Step 5 - Await Release-Candidate Eval
+    needs: [step-1-resolve-candidate, step-4-nominate-candidate]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true' &&
+      needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
+    runs-on: ubuntu-latest
+    # Above the poller's own 330-minute deadline, so the poller is the thing that
+    # decides — it writes a verdict and a job summary on the way out, and a job
+    # killed at its timeout writes neither. The headroom covers checkout and the
+    # gcloud auth dance. It cannot be raised much further: GitHub caps a job at
+    # 360 minutes, and the Prow job's own budget (360m plus 5m grace plus up to
+    # 10m waiting for a Boskos lease) can legitimately exceed what fits here. A
+    # build that outlasts the poller reports `timeout`, which fails closed and
+    # says in the summary that it is not a verdict on the release.
+    timeout-minutes: 345
+    permissions:
+      contents: read
+      # For the Workload Identity Federation exchange below. No `contents: write`
+      # — this job reads a bucket and pushes nothing. Step 5b holds the write
+      # scope for the one thing this job's result can lead to.
+      id-token: write
+    # Read by step 5b, on the runs where this job fails. A failed step still
+    # publishes the outputs it wrote, and the poller writes these before it
+    # chooses its exit code for exactly that reason. Both are empty when the job
+    # never got that far — killed at its timeout, or failed in checkout or auth —
+    # and step 5b treats an empty `settled` as unsettled, which is what it is.
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      settled: ${{ steps.verdict.outputs.settled }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # The Prow archive lives in kube-agents-prow, a project this repository does
+      # not own; github-actions@kube-agents-prow is the read-only identity it
+      # exposes for exactly this. ci-health.yml reaches the same bucket the same
+      # way.
+      - name: Authenticate to the Prow archive project
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.PROW_ARCHIVE_WIF_PROVIDER }}
+          service_account: ${{ env.PROW_ARCHIVE_READER_SA }}
+
+      # Mandatory, and the reason is not obvious: the auth step exports
+      # GOOGLE_GHA_CREDS_PATH, which the gcloud CLI honours and gsutil does not.
+      # Without this line the poller's every `gsutil ls` fails on anonymous
+      # credentials, the build never appears, and the job reports `never_ran` —
+      # which reads as a broken eval lane rather than a missing login. This cost
+      # ci-health.yml forty failed ticks on 2026-09-10.
+      - name: Make the Prow-archive reader credential active for gsutil
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
+      - name: Wait for the release-candidate eval verdict
+        id: verdict
+        env:
+          COMMIT_SHA: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
+          EVALCAND_TAG: ${{ needs.step-1-resolve-candidate.outputs.evalcand_tag }}
+          NOMINATED_AT: ${{ needs.step-4-nominate-candidate.outputs.nominated_at }}
+        run: |
+          # `:?` rather than a default. Step 4 always sets it on the path that
+          # reaches here, so an empty value is a wiring fault — and the poller
+          # accepts the flag being omitted, which would turn that fault into a
+          # night of reading the previous attempt's verdict instead of a red job
+          # naming the cause.
+          python3 scripts/release/poll_rc_eval_verdict.py \
+            --commit "${COMMIT_SHA}" \
+            --evalcand-tag "${EVALCAND_TAG}" \
+            --not-before "${NOMINATED_AT:?step 4 recorded no nomination timestamp}"
+
+  step-5b-withdraw-nomination:
+    name: Step 5b - Withdraw an Unsettled Nomination
+    needs:
+      [
+        step-1-resolve-candidate,
+        step-4-nominate-candidate,
+        step-5-await-eval-verdict,
+      ]
+    # The retry, and the only job here that deliberately overrides the implicit
+    # success() on `needs` — it exists precisely for the runs where step 5 failed.
+    #
+    # `settled` is what makes that safe. The poller reports it true only when the
+    # eval actually answered, green or red, and a red answer must stay on the
+    # record: re-measuring a rejected candidate every night costs hours of a
+    # project shared with the merge-blocking presubmit to reach the same verdict.
+    # Everything else — a Boskos lease that never came, a killed pod, a deploy
+    # that failed, a tag whose push fired nothing — says nothing about the
+    # candidate, and the tag left behind is what makes the commit permanently
+    # ineligible. Deleting it is the whole retry: tomorrow's nightly resolves the
+    # same candidate, finds no tag, and nominates it again.
+    #
+    # `result != 'success'` rather than `failure()`, so a step 5 cancelled or
+    # killed at its 345-minute timeout is withdrawn too; both leave `settled`
+    # unset, which is not a verdict.
+    #
+    # What this deliberately does NOT catch, because the key is the eval's
+    # answer and not the night's outcome: step 5 GREEN followed by a step 6 that
+    # failed to push the staging_ tag. The nomination tag stays, so the resolver
+    # skips that commit from then on and a candidate the eval approved is never
+    # promoted. Withdrawing here instead would send it back for a fresh
+    # 1.5-to-3.5-hour eval on a leased project shared with the merge-blocking
+    # presubmit, to recover from what is usually a credential fault -- worse than
+    # the thing it fixes, given the RC pipeline produces a newer candidate within
+    # hours and that one promotes normally. Recovering the stuck one without
+    # re-measuring it needs a marker for "green but unpromoted" that the tag
+    # namespace does not have: #1767. And the two skip guards are repeated rather
+    # than inherited, for the reason step 1 records: the always() above removes
+    # the cascade that would otherwise carry them. Without the skip_promotion one
+    # this job would fire on a run that nominated nothing because the candidate
+    # was already answered about, and delete the tag carrying that answer.
+    if: |
+      always() &&
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true' &&
+      needs.step-1-resolve-candidate.outputs.skip_promotion != 'true' &&
+      needs.step-4-nominate-candidate.result == 'success' &&
+      needs.step-5-await-eval-verdict.result != 'success' &&
+      needs.step-5-await-eval-verdict.outputs.settled != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # Minted here and not carried from step 4, for the reason step 6 gives: an
+      # installation token lasts an hour and step 5 can sit on the eval for five
+      # and a half. Deleting a tag needs the App token for the tag-protection
+      # rulesets, the same half of the rule the nomination needs it for.
+      - name: Generate Release Bot Token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.release-token.outputs.token }}
+
+      - name: Withdraw the eval nomination
+        env:
+          COMMIT_SHA: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
+          EVALCAND_TAG: ${{ needs.step-1-resolve-candidate.outputs.evalcand_tag }}
+          VERDICT: ${{ needs.step-5-await-eval-verdict.outputs.verdict }}
+        # The summary is written after the script, not before it, and says what
+        # happened rather than what is about to. A delete that fails now reds
+        # this step, and a summary claiming the tag "is being deleted" would be
+        # the only thing a reader sees in the run's overview — stating as done
+        # the one thing that did not happen, on the run where the candidate is
+        # stranded and needs a hand.
+        run: |
+          ./scripts/release/drop_eval_candidate.sh
+          {
+            echo "### Eval nomination withdrawn"
+            echo
+            echo "The release-candidate eval returned \`${VERDICT:-no verdict at all}\` for \`${EVALCAND_TAG}\`, which is not an answer about the candidate. Its nomination tag has been deleted, so the next nightly can measure this candidate again."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  step-6-create-staging-tag:
+    name: Step 6 - Create Staging Tag
+    needs: [step-1-resolve-candidate, step-5-await-eval-verdict]
+    # The implicit success() on `needs` is the eval gate. A red, timed-out or
+    # never-started eval leaves the candidate nominated and unpromoted, and
+    # staging stays on the build it is already running.
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true' &&
+      needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # A second token rather than one carried down from step 4. A GitHub App
+      # installation token lasts an hour and step 5 can sit on the eval for five
+      # and a half, so a token minted before the wait is reliably expired by the
+      # time the push needs it. Minting it here is also why the wait is its own
+      # job: a single job cannot refresh the credential it started with.
+      - name: Generate Release Bot Token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.release-token.outputs.token }}
+
+      - name: Tag the candidate for staging
         env:
           COMMIT_SHA: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
           RC_TAG: ${{ needs.step-1-resolve-candidate.outputs.rc_tag }}
           STAGING_TAG: ${{ needs.step-1-resolve-candidate.outputs.staging_tag }}
         run: ./scripts/release/tag_staging_promotion.sh
 
-      - name: Record that nothing was promoted
-        if: needs.step-1-resolve-candidate.outputs.skip_promotion == 'true'
-        env:
-          RC_TAG: ${{ needs.step-1-resolve-candidate.outputs.rc_tag }}
-        run: |
-          echo "Candidate ${RC_TAG} already carries a staging tag; the matrix ran, nothing was pushed." \
-            >> "${GITHUB_STEP_SUMMARY}"
-
-  step-5-teardown-env:
-    name: Step 5 - Tear Down Nightly Environment
+  step-7-teardown-env:
+    name: Step 7 - Tear Down Nightly Environment
     # The implicit success() on `needs` is the gate: a failure in resolve, deploy
     # or the matrix leaves the environment standing to be examined live. The `if:`
     # below adds to that check rather than replacing it — an `always()` here would
     # remove it and start destroying the environments this exists to preserve.
     #
-    # `step-4-create-staging-tag` is deliberately absent from the list. Its only
-    # failure modes are credential ones — an invalid GitHub App key or ID, a rejected
-    # push — which leave nothing on the cluster worth looking at, and depending on
-    # it would needlessly strand a GKE cluster until the next run reclaims it:
-    # running the two concurrently is safe, because step 4 touches no GCP resource
-    # and this job holds the nightly-environment lock.
+    # Steps 4 to 6 are deliberately absent from the list, and step 5 makes that
+    # load-bearing rather than merely tidy. Waiting on the eval would hold a GKE
+    # cluster for the five and a half hours the poller is allowed, every night,
+    # for a verdict about container images already in GHCR that the cluster has
+    # no part in producing. The nomination, its withdrawal and the promotion have
+    # only credential failure modes — an invalid GitHub App key or ID, a rejected
+    # push — which leave nothing on the cluster worth looking at either. Running
+    # them all concurrently is safe, because none of steps 4 to 6 touches a GCP
+    # resource and this job holds the nightly-environment lock.
     needs: [step-1-resolve-candidate, step-2-deploy-env, step-3-run-e2e-matrix]
     if: |
       github.repository == 'gke-labs/kube-agents' &&

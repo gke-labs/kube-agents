@@ -27,8 +27,11 @@ documentation and governance playbooks around them.
    avoiding a separate module-registry backend.
 3. **The staging rung feeds SemVer promotion.** Pre-release validation keeps using RC tags
    (`rc_YYMMDDHHMM_<short_sha>`, `*_validated` on success), and the nightly pipeline promotes a
-   validated candidate that passes the full E2E matrix to `staging_YYMMDDHHMM_<short_sha>`. That
-   staging tag is what a GA release is gated on — see `scripts/release/README.md`.
+   validated candidate that passes the full E2E matrix to `staging_YYMMDDHHMM_<short_sha>`. The
+   promotion has a second gate in front of it: the nightly first pushes
+   `evalcand_YYMMDDHHMM_<short_sha>`, which triggers the release-candidate eval on Prow, and only a
+   GREEN verdict there produces the staging tag. That staging tag is what a GA release is gated on —
+   see `scripts/release/README.md`.
 4. **GA release pipeline creates stamped release child commit.** When promoting a staging-promoted
    candidate, `release-publish.yml` creates a single-parent child commit on detached HEAD
    (baking `BAKED_RELEASE_VERSION` into installer scripts, and stamping SemVer release versions into Helm `Chart.yaml` and Terraform defaults), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`),
@@ -57,7 +60,8 @@ documentation and governance playbooks around them.
 
 ```mermaid
 graph TD
-    A["RC pipeline: rc_YYMMDDHHMM_sha → *_validated"] --> A2["Nightly pipeline: full E2E matrix → staging_YYMMDDHHMM_sha"]
+    A["RC pipeline: rc_YYMMDDHHMM_sha → *_validated"] --> A1["Nightly pipeline: full E2E matrix → evalcand_YYMMDDHHMM_sha"]
+    A1 --> A2["Release-candidate eval on Prow: GREEN → staging_YYMMDDHHMM_sha"]
     A2 --> B["Release Publish Workflow (release-publish.yml)"]
     B --> C["Clean Image Promotion: retags :sha to :X.Y.Z in GHCR"]
     B --> D["CI publishes + signs OCI chart (version = appVersion = X.Y.Z)"]

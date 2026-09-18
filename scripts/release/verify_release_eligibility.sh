@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Verifies that a target commit is eligible for official GA release (has been promoted to staging by
-# the nightly pipeline, meaning the full E2E matrix passed on it) and performs an idempotent skip if
-# the commit has already been released under the EXACT SAME tag.
+# the nightly pipeline, meaning the full E2E matrix passed on it and the release-candidate eval that
+# followed came back green) and performs an idempotent skip if the commit has already been released
+# under the EXACT SAME tag.
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
 #
 # The gate is the staging_<ts>_<sha> tag and nothing beside it. An rc_*_validated tag is not checked
