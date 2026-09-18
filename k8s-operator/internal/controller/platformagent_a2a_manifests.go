@@ -2766,6 +2766,15 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		state.gatewayHeld = true
 		logf.FromContext(ctx).Info("holding the A2A gateway until the auth callout serves",
 			"deployment", dep.Name, "condition", busCredentialsReadyCondition)
+		// The flag-off removal below is ordered after the gateway apply so
+		// the fence outlives the listener. Held, there is no gateway pod
+		// at all (the hold is creation-only), so nothing is listening and
+		// the removal is safe to run now; skipping it would leave a flag
+		// that went off during the hold with the door's objects rendered
+		// until the callout serves.
+		if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+			return state, err
+		}
 		return state, nil
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {

@@ -259,7 +259,7 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-102 mutations: 79 KILLED, 21 NOISY, two `must_survive` controls (one on the
+106 mutations: 83 KILLED, 21 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
 handling), zero genuine survivors, zero stale — measured 2026-09-17 against
 this branch merged with `main`; re-run the harness rather than trusting

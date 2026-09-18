@@ -1823,6 +1823,11 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	// never created and the "it is gone after cleanup" row below asserts the
 	// absence of an object the render never made.
 	busCredentialsAreReady(agent)
+	// The teardown list carries the inject door's four objects, which render
+	// only under the operator's flag; set it, so the precondition below
+	// covers them rather than failing on objects the render was told not to
+	// make.
+	t.Setenv(a2aInjectBackendEnvVar, "true")
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
@@ -4080,8 +4085,12 @@ func TestCheckA2AUserGrants(t *testing.T) {
 // gateway pod is fenced against every pod on the network.
 
 // a2aInjectAgentState reconciles a next-mode agent twice (finalizer pass,
-// then the real one) and hands back the client, so each inject test states
-// only what it is asserting.
+// then the real one), reports the auth callout serving and reconciles past
+// the gateway gate, and hands back the client, so each inject test states
+// only what it is asserting. The gate matters here: the door's env rides on
+// the gateway Deployment, and the flag-off removal is ordered after its
+// apply, so a test that never let the gateway through would assert against
+// a Deployment the render withheld.
 func a2aInjectAgentState(t *testing.T) (client.Client, *agentv1alpha1.PlatformAgent, *PlatformAgentReconciler, ctrl.Request) {
 	t.Helper()
 	scheme := setupScheme()
@@ -4100,6 +4109,7 @@ func a2aInjectAgentState(t *testing.T) (client.Client, *agentv1alpha1.PlatformAg
 			t.Fatalf("Reconcile %d failed: %v", i+1, err)
 		}
 	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	return cl, agent, r, req
 }
 
