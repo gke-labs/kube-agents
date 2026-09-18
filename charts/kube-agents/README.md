@@ -45,9 +45,9 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   by hand. Given the public half, the chart
   also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
   Secret the sandbox mounts — the sandbox never mounts the credential Secret
-  itself. Without the pair nothing breaks on an install that leaves
-  `harness.experimental.shellSandbox` off, which is the default; with it on, the
-  agent has no key to dial the sandbox with. See
+  itself. The sandbox is always on — `harness.experimental.shellSandbox.enabled`
+  is not a toggle, the operator refuses `false`, and this chart fails at template
+  time — so without the pair the agent has no key to dial the sandbox with. See
   [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
 
   Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
@@ -516,9 +516,11 @@ Four knobs need context beyond the chart:
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
   them: the three `gcloud` commands are in
   [`designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md#setting-up-the-pool).
-  Set it with `harness.experimental.shellSandbox.enabled` — the chart fails the
-  render if you set one without the other, since federation only takes effect
-  when the credential proxy runs beside the sandbox.
+  Set `audience` and `serviceAccountEmail` together — the chart fails the
+  render on one without the other, because the operator reads a half-filled
+  block as absent and leaves the credential proxy on the metadata server
+  without saying so. Federation takes effect wherever that proxy runs beside
+  the sandbox, which is every install: `shellSandbox.enabled: false` is refused.
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
@@ -576,6 +578,91 @@ so that case is inside the supported range and has to work.
 Set `admissionPolicy.enabled=false` for a second kube-agents release in a cluster
 that already has them: the objects are cluster singletons with fixed names, so
 Helm refuses the second install on ownership rather than duplicating them.
+
+### Quota preflight
+
+`quotaPreflight.enabled` (default `true`) checks the namespace's `ResourceQuota`
+objects before anything is applied, and fails the render with a diagnosis and a
+ready-to-run `kubectl patch` rather than letting the install stall later on pod
+creation. `--set quotaPreflight.enabled=false` skips it.
+
+What it sums: the chart's own workloads from `values.yaml` — the operator, LiteLLM and
+the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, which
+have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
+`platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
+sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
+pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
+credential proxy and the PersistentVolumeClaims are not, because they do not scale with
+it. A replica count of `0` costs nothing, and a `resources` key you have pruned
+(`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
+though note that if a namespace ResourceQuota restricts that compute resource (such as
+`limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
+declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
+The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
+`null`, a claim sized from it would be counted as zero, so an empty one fails the check
+by name.
+
+How it decides. For each quota it compares `hard` against what the release needs, on
+install and upgrade alike; on install it also compares `hard - used`. It reads
+CPU, memory and ephemeral-storage (requests and limits), `pods` (`count/pods`),
+`persistentvolumeclaims` (`count/persistentvolumeclaims`) and `requests.storage`; other
+keys, including `services`, `secrets` and other `count/<resource>` entries, are not
+modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
+a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
+identify, so comparing the whole release against it would be wrong either way. Every quota
+that falls short is reported in one failure, so a namespace with two of them takes one
+patch rather than two rounds.
+
+Two carve-outs in that comparison, both to stop it refusing an install that would have
+worked:
+
+- **`hard - used` is not applied on upgrade**, because the release's own pods are already
+  counted in `used` and subtracting them again refuses every upgrade of a release that
+  exactly fits. The cost is that a neighbouring workload's usage is in `used` too and
+  cannot be told apart from the release's own, so in a shared namespace an upgrade is
+  checked against `hard` alone.
+- **`hard - used` is not applied to claims** — `persistentvolumeclaims` and
+  `requests.storage` — on install either. The shell sandbox's StatefulSet sets
+  `persistentVolumeClaimRetentionPolicy` to `Retain`, so its claims outlive
+  `helm uninstall` and show up in `used` on the next install, to be reused by name rather
+  than created again. `hard` still has to fit the release, which is what catches a quota
+  genuinely too small for it.
+
+The patch it prints raises `hard` to what the release needs plus one rollout surge Pod —
+adding `used` on install for compute and pod quotas, where `used` is somebody else's, and
+not on upgrade or for claim-shaped keys, where `used` already holds the release's own
+running pods or retained PVCs. Claim counts and `requests.storage` get no surge allowance,
+because a surge Pod mounts the existing claim rather than creating one. The surge Pod it
+sizes for is the largest one in the release that a rollout actually creates: rollouts are
+per-workload, so room for one at a time is enough. The shell sandbox's StatefulSet and the
+pre-delete cleanup Job never surge, and neither does the agent pod at the default
+`platformAgent.deployment.availability.replicas` of one, where the operator rolls the
+gateway Deployment with `strategy: Recreate` — it counts only from two replicas up, where
+the strategy becomes `RollingUpdate`.
+
+**Where it is silent, and where it is not.** The check needs a cluster to query, so it
+does nothing under `helm template` and nothing in a namespace with no ResourceQuota — a
+clean render in either case is not evidence that a quota fits.
+
+It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
+to it. A LimitRange with a per-container `max`, or a `default` that rewrites what the pods
+request, rejects or resizes them at admission no matter how much quota is free — the same
+stall, from an object this check never looks at. Check it separately with
+`kubectl describe limitrange -n <release-namespace>`.
+
+Conversely, a ResourceQuota that restricts compute resources (`requests.cpu`, `limits.cpu`,
+`requests.memory`, `limits.memory`, `requests.ephemeral-storage`, `limits.ephemeral-storage`)
+requires every container in the namespace to declare that request or limit unless a
+`LimitRange` provides a default. Several operator containers (such as the shell sandbox and
+dashboard) set no ephemeral storage, and pruning a workload's limits leaves it without them;
+the preflight checks total headroom against what is declared, not whether every individual
+container declares every resource the quota constrains.
+
+It does need `get`/`list` on `resourcequotas` in the release namespace. Helm's `lookup`
+returns nothing for a NotFound and raises a template error for everything else, so an
+identity without that permission gets `error calling lookup: resourcequotas is
+forbidden` and no install rather than a quiet pass. Grant the permission, or install with
+`--set quotaPreflight.enabled=false`.
 
 ## Uninstalling
 
@@ -687,5 +774,15 @@ helm uninstall kube-agents -n kubeagents-system
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+- `files/footprint.yaml` is generated too, but from a different source: it is summed from
+  the operator's **golden manifest**
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`),
+  not from `k8s-operator/config/` and not from a live render. Changing the operator's
+  resources therefore takes two steps in order — re-bless the goldens
+  (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.
+  Running `chart-sync` first regenerates the old numbers from the stale golden. The
+  package matters: the goldens are written by `internal/testing/golden_test.go`, and
+  `./internal/controller/...` has an unrelated `-update` flag of its own, so pointing the
+  command there exits 0 without touching them.
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.

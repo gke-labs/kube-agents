@@ -11,7 +11,8 @@ caBundle, failurePolicy, rule ordering) do not.
 The one end-to-end case renders the real chart with `helm` and skips where the binary is
 absent; `make chart-check` in the `validate` job, which sets helm up, is where that render
 runs on every pull request. The sync script's exit-code plumbing is exercised with a
-`python3` shim on PATH, so it needs neither helm nor PyYAML.
+`python3` shim on PATH to stand in for the webhook check, so that step needs
+neither helm nor PyYAML.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import io
 import pathlib
 import os
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -309,9 +311,11 @@ class WiringTest(unittest.TestCase):
 class SyncScriptExitCodeTest(unittest.TestCase):
     """`sync-chart-manifests.sh --check` runs the check and tells drift from tooling failure.
 
-    A `python3` shim on PATH stands in for the check, so this covers the bash branch (which
-    exit code gets the hand-edit hint, which is passed through) without helm or PyYAML. The
-    CRD, RBAC and admission-policy steps before it run for real against the checkout.
+    A `python3` shim on PATH stands in for the webhook check, so this covers the bash branch
+    (which exit code gets the hand-edit hint, which is passed through) without helm.
+    Every other `python3` the script runs — the footprint check among them — is forwarded to
+    the real interpreter, so those steps run for real against the checkout, as the CRD, RBAC
+    and admission-policy steps before them do.
     """
 
     SHIM_STDERR = "shim: check output"
@@ -321,7 +325,7 @@ class SyncScriptExitCodeTest(unittest.TestCase):
             shim = pathlib.Path(shim_dir) / "python3"
             shim.write_text(
                 "#!/bin/sh\n"
-                f'[ "$(basename "$1")" = "check_chart_webhooks.py" ] || {{ echo "unexpected: $*" >&2; exit 99; }}\n'
+                f'[ "$(basename "$1")" = "check_chart_webhooks.py" ] || exec {shlex.quote(sys.executable)} "$@"\n'
                 f"echo '{self.SHIM_STDERR}' >&2\n"
                 f"exit {exit_code}\n"
             )

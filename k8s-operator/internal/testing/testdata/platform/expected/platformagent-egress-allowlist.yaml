@@ -1505,7 +1505,7 @@ spec:
             timeoutSeconds: 3
           resources:
             limits:
-              cpu: "2"
+              cpu: "1"
               ephemeral-storage: 2Gi
               memory: 2Gi
             requests:

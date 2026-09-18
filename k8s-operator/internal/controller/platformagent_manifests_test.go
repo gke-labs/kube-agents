@@ -613,6 +613,12 @@ func TestBuildDeployment(t *testing.T) {
 		if !watcherToken {
 			t.Errorf("expected the default-audience token mounted where InClusterConfig reads it, got %#v", authC.VolumeMounts)
 		}
+		if authC.Resources.Requests.Cpu().String() != "150m" || authC.Resources.Requests.Memory().String() != "384Mi" {
+			t.Errorf("expected CPU 150m and Mem 384Mi requests on auth sidecar container, got %v", authC.Resources.Requests)
+		}
+		if authC.Resources.Limits.Cpu().String() != "1" || authC.Resources.Limits.Memory().String() != "2Gi" || authC.Resources.Limits.StorageEphemeral().String() != "2Gi" {
+			t.Errorf("expected CPU 1, Mem 2Gi, and Eph 2Gi limits on auth sidecar container, got %v", authC.Resources.Limits)
+		}
 
 		sidecarC := containerByName(t, dep.Spec.Template.Spec.Containers, "my-sidecar")
 		if sidecarC.Image != "sidecar-image:latest" {

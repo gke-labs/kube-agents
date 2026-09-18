@@ -121,6 +121,25 @@ const (
 	// error strings gVisor never raises, so the operator, which knows the runtime
 	// for certain, pins the mode instead.
 	sqliteJournalModeDelete = "delete"
+
+	// agentAPIAuthCPULimit and agentAPIAuthMemoryLimit size the agent-api-auth native sidecar's
+	// resource limits. The CPU limit is 1, down from 2 (#749).
+	//
+	// The 22m measured across 19 watched Cluster Agent profiles is the container's total,
+	// so one core is roughly 45x the observed use rather than a budget for the watcher alone.
+	//
+	// GOMAXPROCS has been cgroup-aware since Go 1.25 and k8s-operator builds with 1.27
+	// (k8s-operator/go.mod), so dropping this limit from 2 to 1 sets the
+	// k8s-event-watcher's GOMAXPROCS to 1. Go rounds up, so choosing 1 rather than 500m
+	// keeps GOMAXPROCS=1 while preserving a full core of burst.
+	//
+	// Memory limit must stay at 2Gi: the event watcher reads this limit via Downward API
+	// (EVENT_WATCHER_MEMORY_LIMIT_BYTES) to set GOMEMLIMIT to half of it.
+	agentAPIAuthCPULimit              = "1"
+	agentAPIAuthMemoryLimit           = "2Gi"
+	agentAPIAuthEphemeralStorageLimit = "2Gi"
+	agentAPIAuthCPURequest            = "150m"
+	agentAPIAuthMemoryRequest         = "384Mi"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -3193,9 +3212,16 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Resources: corev1.ResourceRequirements{
 			// Memory request covers the watcher's informer and dedup caches, which
 			// scale with the number of watched clusters.
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("150m"), corev1.ResourceMemory: resource.MustParse("384Mi")},
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
+				corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
+			},
+			// Why these values are what they are: see the agentAPIAuth* constant
+			// declarations at the top of this file.
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+				corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
+				corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
+				corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
@@ -4069,6 +4095,10 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				},
 			},
 			Env: dashboardEnvVars,
+			// Limits remain 1 CPU / 2Gi pending live working-set measurement (#1635):
+			// lowering limits.memory without measurement risks OOMKilling the container,
+			// and Pod readiness is the AND of every container, so an OOM-looping dashboard
+			// withdraws the agent API on :8642 and drives the CR to Ready=False.
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("256m"),
