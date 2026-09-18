@@ -493,12 +493,12 @@ It adds exactly two workloads to `kubeagents-system`.
   because LiteLLM honours it in a model entry's `litellm_params` rather than
   globally. Per-model it would work, at the price of editing a config every
   agent request passes through in order to accommodate one caller.
-- Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root under a `RuntimeDefault` seccomp
-  profile, no privilege escalation, all capabilities dropped; its root filesystem stays
-  writable, and what the API writes under `/` has not been enumerated. The CPU numbers
-  are sized for model inference rather than for
-  serving HTTP, though measurement says the headroom goes unused —
-  see [What a recall costs](#what-a-recall-costs).
+- Requests 250m CPU/1Gi, limits 4 CPU/4Gi. The request covers steady state, which a
+  live install measures at about 9m; the limit covers the reranker's bursts during
+  recall, and raising it buys nothing — see [What a recall costs](#what-a-recall-costs).
+  Runs non-root under a `RuntimeDefault` seccomp profile, no privilege escalation, all
+  capabilities dropped; its root filesystem stays writable, and what the API writes
+  under `/` has not been enumerated.
 
 **2. `hindsight-postgresql` — a `StatefulSet`, one replica** (`postgresql.yaml`).
 
@@ -731,9 +731,11 @@ and startup migrations take a `pg_advisory_lock`, so replicas neither double-run
 consolidation nor race Alembic.
 
 [`api.yaml`](../../k8s-operator/config/integrations/hindsight/api.yaml) still ships
-`replicas: 1`, and `kage-management` runs two by hand. Two replicas double an
-install's baseline CPU request to four cores and need two schedulable nodes, which a
-small cluster will not have. Read the 82% as the size of the effect rather than as a
+`replicas: 1`, and `kage-management` runs two by hand. Two replicas add a second
+250m request, which fits almost anywhere, but the gain above came from the pods
+sitting on different nodes: two replicas sharing one `e2-standard-4` share the two
+physical cores the single-pod result already saturates, and a small cluster has no
+second node to offer. Read the 82% as the size of the effect rather than as a
 figure to three digits: it is one run per configuration, and only the concurrency-4
 row is outside the noise the random load-balancing introduces.
 

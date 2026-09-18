@@ -441,14 +441,17 @@ hindsight:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-    # Recall is CPU-bound on the in-process cross-encoder reranker; see the
-    # template before raising these — more CPU has been measured to buy
-    # nothing on e2-standard-4, and a request of 4 CPUs never schedules there.
-    # Steady-state usage is ~9m against the 2-CPU request; right-sizing
-    # requests.cpu is tracked in #1637.
+    # The request covers steady state and the limit covers recall. At rest the
+    # API sits near 9m of CPU, and the request is what the scheduler places,
+    # what Autopilot bills and what a ResourceQuota counts, so it stays small.
+    # Recall is CPU-bound on the in-process cross-encoder reranker and bursts
+    # up to the limit; see the template before raising it — more CPU has been
+    # measured to buy nothing on e2-standard-4, and a request of 4 CPUs never
+    # schedules there. An Autopilot cluster without Pod bursting resets the
+    # limit to the request, so raise the request there if recall is slow.
     resources:
       requests:
-        cpu: "2"
+        cpu: 250m
         memory: 1Gi
       limits:
         cpu: "4"
