@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2557,5 +2558,133 @@ func TestInjectCancelRefusesWhenItsConversationWasEvictedUnderTheWait(t *testing
 	}
 	if !strings.Contains(reply.Note, "evicted this conversation") {
 		t.Fatalf("note = %q, want it to name the eviction", reply.Note)
+	}
+}
+
+// TestInjectRefusesAnUnboundedKeyOnTheReadAndCancelRoutes: the POST route
+// bounds a caller's key and refuses control characters because the key
+// becomes a session record's key and an ingress log line. The cancel route
+// hands its key to the same handleInbound, and the read route logs it, so a
+// key that the POST would refuse must not get in by the path.
+func TestInjectRefusesAnUnboundedKeyOnTheReadAndCancelRoutes(t *testing.T) {
+	r := startInjectRig(t)
+	long := strings.Repeat("k", injectMaxKeyRunes+1)
+	for _, tc := range []struct{ name, key string }{
+		{"too long", long},
+		{"control character", "case%0Aone"},
+		{"bare colon", "not:ours"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := r.do(t, http.MethodGet, r.base+conversationsPath+tc.key+"?probe=1", nil, injectTestToken)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("GET with a %s key: status %d, want 400", tc.name, resp.StatusCode)
+			}
+			body, _ := json.Marshal(cancelRequest{Author: injectTestAuthor})
+			resp, err = r.do(t, http.MethodPost, r.base+conversationsPath+tc.key+cancelSuffix, body, injectTestToken)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("cancel with a %s key: status %d, want 400", tc.name, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestInjectProbeDescribesTheInstantTheWaitEnded: a blocking poll's probe
+// used to be taken before the wait, so the reply paired entries that had
+// just landed with a probe up to `wait` seconds old. A caller classifying
+// "nothing on the stream past the grace" from that probe would call a task
+// whose first event arrived during the wait -- the relay's edit is what wakes
+// the wait -- one that nobody took, and cancel it. The probe is taken again
+// after a wait that blocked.
+func TestInjectProbeDescribesTheInstantTheWaitEnded(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-probe-instant", injectTestAuthor, "answer me")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	first := r.conversation(t, reply.Conversation, 0, reply.TaskID, 0)
+
+	type answer struct {
+		resp *http.Response
+		err  error
+	}
+	got := make(chan answer, 1)
+	go func() {
+		target := r.base + conversationsPath + reply.Conversation +
+			fmt.Sprintf("?after=%d&task=%s&wait=20&probe=1", first.LastSeq, reply.TaskID)
+		req, _ := http.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set(authorizationHeader, "Bearer "+injectTestToken)
+		resp, err := http.DefaultClient.Do(req)
+		got <- answer{resp, err}
+	}()
+	// Let the poll take its first probe and settle into the wait.
+	time.Sleep(4 * injectPollInterval)
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	a := <-got
+	if a.err != nil {
+		t.Fatal(a.err)
+	}
+	defer a.resp.Body.Close()
+	var out conversationResponse
+	if err := json.NewDecoder(a.resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) == 0 {
+		t.Fatalf("the wait ended with no entries; the relay's edit should have woken it: %+v", out)
+	}
+	if out.Probe == nil || out.Probe.ExecutorState != string(lib.StateWorking) {
+		t.Fatalf("probe = %+v, want executorState working: the probe predates the entry beside it", out.Probe)
+	}
+}
+
+// TestInjectASecondPostWaitsForTheEarlierTurnToEnd: a POST is answered at
+// the accept, before its turn has ended (the end-of-turn record write and the
+// turn signal come after). A second POST on the same key inside that gap
+// used to read counts one turn short and classify from the first turn's
+// work: `no-answer` for a message the worker had not yet run, while that
+// message's own task then ran with nobody waiting on it. The door now hands
+// a message over only once the earlier turn has ended.
+func TestInjectASecondPostWaitsForTheEarlierTurnToEnd(t *testing.T) {
+	var f *fakeDoor
+	ready := make(chan struct{})
+	var turnMu sync.Mutex
+	var turn atomic.Int32
+	handler := func(msg InboundMessage) {
+		<-ready
+		// Queued and serialised per conversation, as the inbox worker does.
+		go func() {
+			turnMu.Lock()
+			defer turnMu.Unlock()
+			id := fmt.Sprintf("task-%d", turn.Add(1))
+			f.door.TaskStarted(msg.Conversation, id)
+			if _, err := f.door.Post(msg.Conversation, "⏳ submitted…"); err != nil {
+				t.Error(err)
+			}
+			f.door.TaskAccepted(msg.Conversation, id)
+			if id == "task-1" {
+				// The gap: the record write and whatever else the turn does
+				// after the publish.
+				time.Sleep(4 * injectPollInterval)
+			}
+			f.door.TurnFinished(msg.Conversation)
+		}()
+	}
+	f = startFakeDoor(t, handler)
+	close(ready)
+
+	if first := f.inject(t, "second-post", "go"); first.TaskID != "task-1" {
+		t.Fatalf("first POST: reply = %+v, want task-1", first)
+	}
+	second := f.inject(t, "second-post", "and again")
+	if second.TaskID != "task-2" || second.Refusal != "" {
+		t.Fatalf("second POST: reply = %+v, want task-2 with no refusal: it classified from the first turn", second)
 	}
 }

@@ -1535,9 +1535,10 @@ class KubeAgentsHarness(AgentHarness):
             # there is nothing to grade; the cancel above asked the bridge
             # to drop it from the queue (it answers canceled-before-start).
             ended = exchange.fold.terminal or "no terminal inside the settle"
+            bounded = "a stop was already pending" if stop_pending else "cancelled"
             return _infra_failure(
                 f"task {exchange.task_id} on {exchange.conversation} sat queued (submitted, "
-                f"never working) for the whole {timeout:.0f}s budget; cancelled, {ended}. The "
+                f"never working) for the whole {timeout:.0f}s budget; {bounded}, {ended}. The "
                 "bridge's BRIDGE_CONCURRENCY is below the run's parallelism, or its slots are "
                 "held by earlier tasks"
             )

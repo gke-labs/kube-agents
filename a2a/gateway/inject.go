@@ -460,11 +460,16 @@ type injectConversation struct {
 	// transcript is what the conversation received, and a drop the gateway
 	// chose not to post a second notice for is not something it received.
 	drops int
-	// turns counts the inbound turns that have finished here. The inbox
-	// worker runs a conversation's turns one at a time, so a waiter that
-	// read this before handing its message over knows its own turn is over
-	// when the count moves.
-	turns int
+	// turns counts the inbound turns that have finished here, and handed the
+	// messages this door has handed to the gateway. The inbox worker runs a
+	// conversation's turns one at a time, so a waiter that read the counts
+	// with no earlier turn still running knows its own turn is over when
+	// turns moves; claimTurn is what guarantees "no earlier turn still
+	// running", because a POST is answered at the accept, before its turn
+	// has ended, and a second POST arriving in that gap would otherwise
+	// read counts one turn short and classify from the first turn's work.
+	turns  int
+	handed int
 	// gen is which minting of this key the state belongs to. The door evicts
 	// a conversation wholesale at its cap and mints it again on the next
 	// touch with every counter at zero, so a waiter that read its counts
@@ -1026,6 +1031,47 @@ func (a *InjectAdapter) turnSince(key string, prior injectCounts) injectTurn {
 	return turn
 }
 
+// claimTurn counts a message as handed to the gateway and returns the
+// conversation's counts as they stand, once no earlier turn this door handed
+// over is still running. The two happen under one lock, so two POSTs cannot
+// both find the conversation quiet. False when the earlier turn did not end
+// inside the submit bound or the caller went away.
+func (a *InjectAdapter) claimTurn(ctx context.Context, key string) (injectCounts, bool) {
+	deadline := time.Now().Add(injectSubmitWait)
+	for {
+		a.mu.Lock()
+		conv := a.conversationLocked(key)
+		if conv.handed <= conv.turns {
+			conv.handed++
+			prior := countsOf(conv)
+			a.mu.Unlock()
+			return prior, true
+		}
+		woken := a.notify
+		a.mu.Unlock()
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return injectCounts{}, false
+		}
+		timer := time.NewTimer(min(remaining, injectPollInterval))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return injectCounts{}, false
+		case <-woken:
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+}
+
+// earlierTurnNote is the refusal note for a message the door did not hand
+// over because the conversation's previous turn never ended.
+func earlierTurnNote() string {
+	return fmt.Sprintf("an earlier turn on this conversation did not finish within %s, so this "+
+		"message was not handed to the gateway", injectSubmitWait)
+}
+
 // remadeNote is the refusal note for a conversation evicted under a waiter.
 func remadeNote() string {
 	return fmt.Sprintf("the door evicted this conversation while its turn ran (more than %d "+
@@ -1119,9 +1165,25 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	// conversation that exists, they carry its generation, and the wait can
 	// tell an eviction under it from a turn that did nothing.
 	a.noteRequester(key, req.Author)
-	// Read the counters BEFORE handing the message over, so the wait below
-	// cannot mistake a previous turn's task or reply for this one's.
-	prior := a.counts(key)
+	// Read the counters BEFORE handing the message over, and only once no
+	// earlier turn is still running, so the wait below cannot mistake a
+	// previous turn's task or reply for this one's.
+	prior, ok := a.claimTurn(turnCtx, key)
+	if !ok {
+		note := earlierTurnNote()
+		if sub != nil {
+			a.completeSubmission(sub, "", note, injectRefusalNoAnswer)
+		}
+		a.log.Warn("inject: a POST was not handed over", "conversation", key, "messageId", messageID, "note", note)
+		writeJSON(w, http.StatusOK, injectResponse{
+			Conversation:           key,
+			MessageID:              messageID,
+			Note:                   note,
+			Refusal:                injectRefusalNoAnswer,
+			FirstEventGraceSeconds: int(a.firstEventGrace / time.Second),
+		})
+		return
+	}
 
 	handler(InboundMessage{
 		Conversation: key,
@@ -1208,9 +1270,18 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	if messageID == "" {
 		messageID = injectInboundIDPrefix + randHex(messageIDHexWidth)
 	}
-	// Requester first, then counts, for the reason handleInject gives.
+	// Requester first, then the claim, for the reasons handleInject gives.
 	a.noteRequester(key, req.Author)
-	prior := a.counts(key)
+	prior, ok := a.claimTurn(r.Context(), key)
+	if !ok {
+		writeJSON(w, http.StatusOK, injectResponse{
+			Conversation:           key,
+			MessageID:              messageID,
+			Note:                   earlierTurnNote(),
+			FirstEventGraceSeconds: int(a.firstEventGrace / time.Second),
+		})
+		return
+	}
 	handler(InboundMessage{
 		Conversation: key,
 		Kind:         injectConversationKind,
@@ -1398,7 +1469,12 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 // whether any executor has touched its task, whether the task has sat queued
 // (submitted) or run (working), and how old it is against the gateway's
 // grace -- and classifies for itself. The probe runs before the wait, so a
-// caller that reads a terminal on the stream can stop waiting on the relay.
+// caller that reads a terminal on the stream does not wait on the relay for
+// it, and again after any wait that blocked, so the probe in the reply
+// describes the same instant as the entries beside it: a caller classifying
+// "nothing on the stream past the grace" off a probe taken thirty seconds
+// before the entry that woke the wait would call a task that has just started
+// one that nobody took.
 func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Request) {
 	if !a.authorized(w, r) {
 		return
@@ -1416,10 +1492,15 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 	// The path may carry the whole key, prefix included: it is the key the
 	// POST reply handed back, and asking a caller to strip and re-add the
-	// prefix is how the two ends come to disagree about what a key is.
-	key := raw
-	if !strings.HasPrefix(key, injectKeyPrefix) {
-		key = injectKeyPrefix + key
+	// prefix is how the two ends come to disagree about what a key is. The
+	// same bound and character check as the POST, because the cancel route
+	// hands the key to handleInbound, where it becomes a session record's
+	// key and an ingress log line exactly as a POST's does; the path is
+	// percent-decoded by the time it is read, so a newline arrives as one.
+	key, err := injectConversationKey(raw)
+	if err != nil {
+		injectError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if cancel {
 		a.handleCancel(w, r, key)
@@ -1453,12 +1534,25 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	if probeAsked != 0 {
 		probed = a.runProbe(r.Context(), key)
 		probed.LastPost = a.lastPost(key)
+		if probed.Final {
+			// A terminal on the stream is the answer; nothing the relay
+			// posts after it changes the classification, so the wait is
+			// not owed.
+			wait = 0
+		}
 	}
 
 	deadline := time.Now().Add(wait)
+	waited := false
 	for {
 		entries, lastSeq, terminal := a.snapshot(key, after, taskID)
 		if len(entries) > 0 || terminal != "" || !time.Now().Before(deadline) {
+			if probeAsked != 0 && waited {
+				// Time moved on under the wait; the probe has to describe
+				// where the stream is now, beside the entries that are.
+				probed = a.runProbe(r.Context(), key)
+				probed.LastPost = a.lastPost(key)
+			}
 			writeJSON(w, http.StatusOK, conversationResponse{
 				Conversation: key,
 				Entries:      entries,
@@ -1468,6 +1562,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 			})
 			return
 		}
+		waited = true
 		woken := a.waitCh()
 		timer := time.NewTimer(min(time.Until(deadline), injectPollInterval))
 		select {

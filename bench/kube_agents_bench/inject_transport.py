@@ -1087,7 +1087,10 @@ class InjectTask:
         One read, and one of five answers. A terminal the fold now has, or
         the stream shows: finished. Nothing on the stream past the grace: no
         executor took it. Only ``submitted`` ever: queued behind the bridge's
-        cap for the whole budget. ``working`` (or detached): a graded timeout.
+        cap for the whole budget, whether or not a cancel is already pending
+        on the record -- nothing ran either way, and grading it would put a
+        record with no run on it in front of the scorer. ``working``,
+        detached or not: a graded timeout.
         Anything else -- the gateway could not look, or the record no longer
         holds the task and this side never saw a terminal -- cannot be
         classified.
@@ -1112,7 +1115,7 @@ class InjectTask:
             # floor, which check_budget refuses, so this is a gateway whose
             # reported grace changed under the run. Not classifiable.
             return Exchange(fold, OUTCOME_UNCLASSIFIED, self.conversation, task_id, probe)
-        if fold.queued_only and not probe.detached:
+        if fold.queued_only:
             return Exchange(fold, OUTCOME_QUEUED, self.conversation, task_id, probe)
         return Exchange(fold, OUTCOME_DEADLINE, self.conversation, task_id, probe)
 

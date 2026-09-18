@@ -973,6 +973,27 @@ def test_a_queued_task_at_the_deadline_is_infrastructure(
     assert stub_gateway.calls.index("probe") < stub_gateway.calls.index("cancel")
 
 
+def test_a_queued_task_already_detached_is_infrastructure_not_graded(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task that only ever reached submitted never ran, whether or not
+    someone else's cancel is already pending on its record. Graded, its
+    record would carry a lone submitted entry and be blocked at rung 3 as a
+    run that never happened -- which is the truth, said as infrastructure
+    rather than as a verdict. No second cancel is sent."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
+    stub_gateway.executor_states = ["submitted"]
+    stub_gateway.probe_detached = True
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("wait in line")
+
+    assert infra(result)
+    assert "sat queued" in result.errors[0]
+    assert "a stop was already pending" in result.errors[0]
+    assert not stub_gateway.cancels
+
+
 def test_the_cancel_goes_through_the_route_not_the_stop_text(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
