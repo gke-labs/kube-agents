@@ -286,6 +286,7 @@ class _StubConn:
         self.is_closed = False
         self.close_after_publish = False
         self.refuse_publish = False
+        self.lose_pong_after_publish = False
 
     async def subscribe(self, subject: str, cb: Any) -> _StubSub:
         self.log.append(("subscribe", subject))
@@ -305,6 +306,8 @@ class _StubConn:
         if task_id is None:
             return
         self._pending = None
+        if self.lose_pong_after_publish:
+            raise TimeoutError("no PONG")
         if self.close_after_publish:
             self.is_closed = True
             return
@@ -473,6 +476,30 @@ def test_a_connection_that_closes_after_the_submission_says_so() -> None:
     assert info.value.retryable
     assert info.value.submitted
     assert "closed while awaiting" in str(info.value)
+
+
+def test_a_flush_that_fails_after_the_submission_frame_says_submitted() -> None:
+    """The PUB left this side and the PONG never came back: the server may
+    have taken the task, so the attempt owes it a cancel and a record."""
+    stub = _StubConn(_lifecycle("t"))
+    stub.lose_pong_after_publish = True
+    client = a2a.BusClient(url="nats://stub", password="pw", addressee=_ADDRESSEE)
+
+    async def _open(self: a2a._Session) -> None:
+        self.nc = stub
+
+    original = a2a._Session.open
+    a2a._Session.open = _open  # type: ignore[method-assign]
+    try:
+        with pytest.raises(a2a.BusUnavailable) as info:
+            client.submit_and_await(
+                a2a.mint_ids(), _PROMPT, accept_timeout=5, deadline=time.monotonic() + 5
+            )
+    finally:
+        a2a._Session.open = original  # type: ignore[method-assign]
+    assert info.value.retryable
+    assert info.value.submitted
+    assert "was not taken" in str(info.value)
 
 
 def test_a_permissions_violation_is_not_retried() -> None:
@@ -692,6 +719,83 @@ def test_a_task_still_running_at_the_deadline_is_graded_with_the_error(
     assert result.metadata["terminal_state"] is None
 
 
+def test_no_executor_before_the_deadline_is_infrastructure_too(fake_bus) -> None:
+    """The run's deadline fell before the accept bound, on a fold nothing
+    accepted: the same absent executor, and not a graded empty record."""
+    fake_bus.script = [[]]
+    fake_bus.outcome = a2a.OUTCOME_DEADLINE
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "no executor accepted" in result.errors[0]
+    assert "deadline" in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+
+
+def test_a_task_cancelled_at_the_deadline_skips_the_delegation_wait(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    fake_bus.script = [_card_filed()]
+    fake_bus.outcome = a2a.OUTCOME_DEADLINE
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    (client,) = fake_bus.instances
+    assert len(client.calls) == 1
+    assert "did not reach a terminal state" in result.errors[0]
+
+
+def test_the_cancel_on_the_way_out_goes_through_a_fresh_tunnel(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attempt that abandoned the task is the one whose tunnel dropped;
+    the cancel dials the same URL, so the forward is respawned first."""
+    order: list[str] = []
+    monkeypatch.delenv("AGENT_A2A_NATS_URL")
+    monkeypatch.setenv("AGENT_A2A_LOCAL_PORT", "24999")
+    monkeypatch.setattr(harness, "_ensure_port_forward", lambda *a, **k: None)
+    monkeypatch.setattr(harness, "_reset_port_forward", lambda *a, **k: order.append("reset"))
+
+    def _cancel(self, tasks, why):
+        order.append("cancel")
+        return tuple(t.task_id for t in tasks)
+
+    monkeypatch.setattr(fake_bus, "cancel", _cancel)
+    fake_bus.script = [
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+        a2a.BusUnavailable("closed while awaiting", submitted=True),
+    ]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    # Two respawns between the three attempts, and one more before the
+    # cancel the exhausted retry publishes on its way out.
+    assert order == ["reset", "reset", "reset", "cancel"]
+
+
+def test_an_exhausted_delegation_wait_records_the_abandoned_tasks(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    fake_bus.script = [_card_filed()] + [
+        a2a.BusUnavailable("closed while awaiting", submitted=True)
+        for _ in range(harness._MAX_TRANSPORT_FAILURES)
+    ]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    (client,) = fake_bus.instances
+    dropped = [c.ids.task_id for c in client.calls[1:]]
+    assert len(dropped) == harness._MAX_TRANSPORT_FAILURES
+    assert result.metadata["abandoned_tasks"] == dropped
+
+
 def test_an_unreachable_bus_is_retried_through_a_fresh_tunnel_then_infrastructure(
     fake_bus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -721,8 +825,10 @@ def test_an_unreachable_bus_is_retried_through_a_fresh_tunnel_then_infrastructur
     assert client.calls[2].cancel_first == (client.calls[1].ids,)
     assert client.cancels == [((client.calls[1].ids,), "abandoned by an exhausted retry")]
     assert result.metadata["abandoned_tasks"] == [client.calls[1].ids.task_id]
-    # The respawn targets the NATS Service on its client port, not the agent.
-    assert len(resets) == harness._MAX_TRANSPORT_FAILURES - 1
+    # The respawn targets the NATS Service on its client port, not the agent:
+    # one between each pair of attempts, and one before the cancel on the
+    # way out, whose dial would otherwise go down the listener that dropped.
+    assert len(resets) == harness._MAX_TRANSPORT_FAILURES
     assert all(r == {"service": "platform-agent-a2a-nats", "remote_port": 4222} for r in resets)
     assert client.url == "nats://127.0.0.1:24999"
 

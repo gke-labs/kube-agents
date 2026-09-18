@@ -13,7 +13,11 @@ adapter, planned and not yet built, which goes through the gateway's inbound
 path and carries the only credential that may publish on every addressee's
 ``in`` subject; this transport authenticates as its own ``eval`` principal,
 whose grants are publish on ``platform``'s ``in`` and subscribe on
-``platform``'s ``events`` and ``supervisor`` and nothing else.
+``platform``'s ``events`` and ``supervisor`` and nothing else. Those wildcards
+reach every ``platform`` task, the gateway's included: the events show each
+task's id, the ``in`` publish takes a cancel or a message for any of them, and
+the bridge cannot tell requesters apart. A static NATS grant cannot name one
+task, so the key is held like the gateway's.
 
 Envelope, subject and payload shapes are ``docs/designs/spec-a2a-payloads.md``;
 the fold mirrors ``a2a/lib/fold.go``; the ids are minted the way
@@ -136,9 +140,9 @@ ARTIFACT_PROGRESS = "progress"
 # Trajectory entry names for the task's own lifecycle events. The bus carries
 # no tool calls until an executor publishes ``activity`` artifacts, so the
 # events are what this transport can truthfully record as the run's
-# trajectory; ``scoring.py`` reads the terminal one as the record's liveness
-# signal and duplicates the first literal for that (importing this module
-# would drag ``nats`` into the scorer). Change it in both files or in neither.
+# trajectory; ``scoring.py`` imports the first as the record's liveness
+# signal (``nats`` is imported inside the session, so the scorer does not
+# load it).
 EVENT_ENTRY_STATUS = "a2a.status-update"
 EVENT_ENTRY_ARTIFACT = "a2a.artifact-update"
 # The ``status`` a trajectory entry carries once its call is over; every entry
@@ -398,10 +402,12 @@ class BusUnavailable(RuntimeError):
 
     ``retryable`` says whether a fresh attempt through a fresh tunnel could
     plausibly succeed; a refused credential or a refused subject cannot.
-    ``submitted`` says whether the submission had already been taken by the
-    server when the attempt failed, in which case an executor may be working
-    on a task nobody is awaiting and someone owes it a cancel: the next
-    attempt, or the caller on its way out when there is none. ``cancelled``
+    ``submitted`` says whether the submission's frame had left for the server
+    when the attempt failed -- taken, or possibly taken, since a flush that
+    fails after the frame was written cannot tell -- in which case an executor
+    may be working on a task nobody is awaiting and someone owes it a cancel:
+    the next attempt, or the caller on its way out when there is none.
+    ``cancelled``
     names the tasks this attempt did publish a cancel for before it failed,
     so the caller does not cancel them again.
     """
@@ -543,7 +549,14 @@ class _Session:
             )
         except (TimeoutError, nats.errors.Error) as exc:
             raise BusUnavailable(f"publish on {subject} failed: {exc}") from exc
-        await self._flush(f"{envelope['kind']} on {subject}")
+        try:
+            await self._flush(f"{envelope['kind']} on {subject}")
+        except BusUnavailable as exc:
+            # The frame left this side before the round trip failed, so the
+            # server may have taken it. A submission it took is the caller's
+            # to cancel and record; a cancel it took twice costs nothing.
+            exc.submitted = True
+            raise
 
     async def submit(self, ids: TaskIds, prompt: str) -> None:
         await self.publish(
@@ -699,7 +712,7 @@ class BusClient:
                 exchange.cancelled = tuple(cancelled)
                 return exchange
             except BusUnavailable as exc:
-                exc.submitted = submitted
+                exc.submitted = submitted or exc.submitted
                 exc.cancelled = tuple(cancelled)
                 raise
             finally:

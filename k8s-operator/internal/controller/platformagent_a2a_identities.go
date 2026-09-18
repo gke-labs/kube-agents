@@ -672,7 +672,14 @@ func webIdentity() a2aIdentity {
 // updates, including the terminal) and on its `supervisor`, where a task's
 // supervisor writes the synthesized terminal when the executor dies without
 // one - the pair lib.TaskReplaySubjects folds. The harness reads both and
-// never publishes on `supervisor`: it is not the task's supervisor. No
+// never publishes on `supervisor`: it is not the task's supervisor. Be exact
+// about what the wildcards reach, because "a requester's subjects" understates
+// it: the events subscription shows every `platform` task's id, the gateway's
+// included, and the `in` publish takes a cancel or a message for any of them -
+// the bridge cannot tell one requester from another (`from` is display-only).
+// A static NATS grant cannot name one task, so whoever holds `eval-password`
+// can cancel a task they did not start; the key is held like the gateway's,
+// and every `mode: next` install renders it whether or not it runs an eval. No
 // JetStream API at all: the harness subscribes with a core subscription taken
 // before it publishes, so it needs no consumer, and a CONSUMER.CREATE on TASKS
 // would let it deliver any addressee's task plane into its own inbox
@@ -694,7 +701,9 @@ func evalIdentity() a2aIdentity {
 			"Publish on platform's in subject and subscribe on its events and supervisor\n" +
 			"(the pair a task's terminal may land on), nothing else: no JetStream API (a\n" +
 			"core subscription needs no consumer, and CONSUMER.CREATE on TASKS would read\n" +
-			"every addressee's task plane).",
+			"every addressee's task plane). The wildcards reach every platform task, the\n" +
+			"gateway's included: a holder can cancel one it did not start, so the key is\n" +
+			"held like the gateway's.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aEvalPasswordKey,
 		publish: []string{

@@ -871,6 +871,18 @@ def _post_turn(
     return parse_response(payload), session_id
 
 
+def _nothing_accepted(exchange: a2a.Exchange) -> bool:
+    """True when no executor consumed the submission before the wait ended.
+
+    The accept bound says so outright; a deadline that fell first says the
+    same thing when the fold is still empty. Either way there was no
+    executor, and the empty record is the run class, not an answer.
+    """
+    return exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED or (
+        exchange.outcome == a2a.OUTCOME_DEADLINE and not exchange.fold.accepted
+    )
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run whose transport died under it, recorded as infrastructure.
 
@@ -1326,7 +1338,7 @@ class KubeAgentsHarness(AgentHarness):
                         # No next attempt will carry these cancels: publish
                         # them now, so an executor is not left working on a
                         # task nobody awaits after the run has moved on.
-                        _cancel_outstanding(uncancelled)
+                        _cancel_outstanding(uncancelled, respawn=True)
                         raise
                     try:
                         _tunnel(reset=True)
@@ -1335,13 +1347,23 @@ class KubeAgentsHarness(AgentHarness):
                         _log.warning("a2a: port-forward respawn failed before retry: %s", pf_exc)
                 else:
                     _cancel_outstanding(
-                        [t for t in uncancelled if t.task_id not in exchange.cancelled]
+                        [t for t in uncancelled if t.task_id not in exchange.cancelled],
+                        respawn=False,
                     )
                     return ids, exchange
 
-        def _cancel_outstanding(tasks: list[a2a.TaskIds]) -> None:
+        def _cancel_outstanding(tasks: list[a2a.TaskIds], *, respawn: bool) -> None:
             if not tasks:
                 return
+            if respawn:
+                # The attempt that abandoned these is the one whose tunnel
+                # just dropped, and the cancel dials the same URL: stand the
+                # forward up again first, or the cancel goes down the dead
+                # listener and the task runs on for nobody.
+                try:
+                    _tunnel(reset=True)
+                except RuntimeError as pf_exc:
+                    _log.warning("a2a: port-forward respawn failed before the cancel: %s", pf_exc)
             taken = client.cancel(tasks, "abandoned by an exhausted retry")
             left = [t.task_id for t in tasks if t.task_id not in taken]
             if left:
@@ -1357,14 +1379,20 @@ class KubeAgentsHarness(AgentHarness):
             failure.metadata["abandoned_tasks"] = abandoned
             return failure
 
-        if exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED:
+        if _nothing_accepted(exchange):
             # Nothing consumed the submission: no executor for the addressee
             # is running. Not an answer, and no judge should see the empty
-            # record as one.
+            # record as one. The run's deadline can fall before the accept
+            # bound does -- a short AGENT_HTTP_TIMEOUT, or a retry late in the
+            # budget -- and an empty fold at the deadline is the same fact.
+            bound = (
+                f"within {accept_timeout:.0f}s"
+                if exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED
+                else f"before the run's {timeout:.0f}s deadline"
+            )
             failure = _infra_failure(
                 f"no executor accepted task {ids.task_id} on "
-                f"{a2a.task_in_subject(addressee, ids.task_id)} within "
-                f"{accept_timeout:.0f}s; cancel published"
+                f"{a2a.task_in_subject(addressee, ids.task_id)} {bound}; cancel published"
             )
             failure.metadata["abandoned_tasks"] = abandoned
             return failure
@@ -1381,7 +1409,10 @@ class KubeAgentsHarness(AgentHarness):
             detail = f": {exchange.fold.status_message}" if exchange.fold.status_message else ""
             result.errors.append(f"task {ids.task_id} ended {exchange.fold.state}{detail}")
 
-        if delegation_timeout > 0:
+        # A task cancelled at the run's deadline has spent the budget the
+        # wait would draw on, and its record already carries the error; the
+        # api path never reaches its wait after a timeout either.
+        if delegation_timeout > 0 and exchange.outcome != a2a.OUTCOME_DEADLINE:
 
             def _follow_up(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
                 """A status turn: a follow-up task on the same context and
@@ -1399,7 +1430,7 @@ class KubeAgentsHarness(AgentHarness):
                     )
                 except a2a.BusUnavailable as exc:
                     raise _TransportError(str(exc), retryable=exc.retryable) from exc
-                if turn_exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED:
+                if _nothing_accepted(turn_exchange):
                     raise _TransportError(
                         f"no executor accepted status turn {turn_ids.task_id}",
                         retryable=True,
@@ -1419,7 +1450,9 @@ class KubeAgentsHarness(AgentHarness):
                     poll_interval=poll_interval,
                 )
             except _DelegationTransportExhausted as exc:
-                return _infra_failure(str(exc))
+                failure = _infra_failure(str(exc))
+                failure.metadata["abandoned_tasks"] = abandoned
+                return failure
         return result
 
     def _a2a_delegation_wait(
