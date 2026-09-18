@@ -221,9 +221,15 @@ the cancel's answer: a cancel sent to a task nobody consumed gets "cancel sent" 
 terminal follows, so the answer is not evidence, and the cancel is sent anyway because the
 submission is durable on the task's `in` subject under the bridge's durable consumer, so a bridge
 that first binds inside the stream's retention window would otherwise be handed the stale case
-prompt and run it with the install's credentials; with the cancel behind it in stream order the
-bridge answers `canceled-before-start` and runs nothing, and a task at `submitted` gets the same
-terminal. The release still happens on the next real inbound message, as today, which matters
+prompt and run it with the install's credentials. What the cancel buys on the bridge as it stands
+is a bound, not a clean refusal: the durable consumer delivers serially and acks after the
+handler, so the cancel is read only after the submission's accept returns, and by then an idle
+worker, which a freshly bound bridge has by construction, has taken the run, published `working`
+and spawned the stale prompt; the cancel then kills it within the bridge's kill grace and the
+terminal is `canceled-by-request`, which is the record. `canceled-before-start` is what a task
+still queued gets, the `submitted` outcome above. The stage-1 bridge work below therefore
+includes a look-ahead that makes the refusal clean. The release still happens on the next real
+inbound message, as today, which matters
 only if the key is reused, and the harness uses a fresh key per run, case and repetition. That is
 how the harness and the gateway agree on what "nobody took it" means, one grace read from the
 gateway rather than configured twice, and nothing the harness does at the deadline can mint a
@@ -304,8 +310,12 @@ the same step the CI flag section gives the A2A images and tagged per pull reque
 project's registry, CI-only and not in `images.json`, consistent with that statement; and
 `hack/ci-deploy.sh` under the flag declares the sidecar on the CR through
 `spec.deployment.sidecars` with that image, the bus URL and credentials the bridge doc lists as
-its env, and `BRIDGE_CONCURRENCY` at or above `EVAL_TASK_PARALLELISM`. Whether the bridge image
-build lands in this repository is the A2A owner's call, and is the open question below.
+its env, and `BRIDGE_CONCURRENCY` at or above `EVAL_TASK_PARALLELISM`; and a look-ahead in the
+bridge's worker, which before it spawns replays the task's `in` subject for a trailing `cancel`,
+the one-subject read `tasks/get` already does on events, and finalizes `canceled-before-start`
+when it finds one, so a cancel already in the stream is honoured without a spawn. Whether the
+bridge image build lands in this repository, and the look-ahead with it, are the A2A owner's
+call, and the open question below.
 
 ### The direct-bus transport, kept as a diagnostic
 
@@ -476,7 +486,9 @@ owner's:
 - **Which reply stage 2 grades,** the bus events of the task the gateway opened or the Chat
   thread. The principle prefers the thread; the bus events grade one hop short and need no Chat
   read credential. The eval crew decides when the stage is built.
-- **Whether the bridge image build lands in this repository.** Stage 1 needs a bridge image the
-  presubmit can pull, and the bridge doc says no build config for it ships here. The proposal in
-  stage 1 is a CI-only Dockerfile beside the A2A ones, outside `images.json`; the A2A owner
-  decides.
+- **Whether the bridge image build lands in this repository, and the bridge look-ahead with it.**
+  Stage 1 needs a bridge image the presubmit can pull, and the bridge doc says no build config
+  for it ships here. The proposal in stage 1 is a CI-only Dockerfile beside the A2A ones, outside
+  `images.json`, and a pre-spawn look-ahead for a trailing cancel in the bridge's worker, without
+  which a late-binding bridge spawns a cancelled submission before killing it; the A2A owner
+  decides both.
