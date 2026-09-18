@@ -435,6 +435,51 @@ def test_a_cat_that_fails_inside_a_worker_is_still_unreachable(gcloud, monkeypat
         GcsBackend("gs://b/e").sources()
 
 
+def test_a_failing_read_waits_for_the_ones_still_in_flight(gcloud, monkeypatch):
+    """Raising must not leave workers behind it still running.
+
+    Abandoning them does not save the time: Python joins the pool's threads at
+    interpreter exit, so ``bench-gate case`` returns, prints its degraded
+    banner, grades the case -- and then hangs for up to ``timeout`` seconds
+    with nothing left to report. The gate runs once per task, so that is paid
+    per task. Joining here moves the same wait to where the caller can see it.
+
+    The test above fails every ``cat`` at once, so nothing is ever in flight
+    to abandon. This one fails only the first.
+    """
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    done: list[str] = []
+    running = threading.Semaphore(0)
+    inner = evidence_store.subprocess.run
+
+    def the_first_cat_fails_and_the_rest_linger(argv, **kwargs):
+        if argv[2] != "cat":
+            return inner(argv, **kwargs)
+        if "case-a" in argv[3]:  # submitted first, so it is what raises
+            # Not until the other two are inside their read. A read still
+            # queued gets cancelled on the way out, and cancelled is not
+            # abandoned -- it is only a started one that can be left running.
+            assert running.acquire(timeout=10)
+            assert running.acquire(timeout=10)
+            return subprocess.CompletedProcess(argv, 1, "", "ERROR: 403 forbidden")
+        running.release()
+        time.sleep(0.05)
+        done.append(argv[3])
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_store.subprocess, "run", the_first_cat_fails_and_the_rest_linger
+    )
+
+    with pytest.raises(StoreUnreachable, match="403"):
+        GcsBackend("gs://b/e", cat_workers=4).sources()
+
+    assert len(done) == 2, "the slow reads were abandoned, not joined"
+
+
 def test_one_worker_reads_the_same_thing_as_many(gcloud):
     """The concurrency is a speed-up, not a behaviour change."""
     for name in ("case-a", "case-b", "case-c"):
