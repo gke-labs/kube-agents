@@ -124,6 +124,12 @@ readonly DEPLOY_SCRIPT="ci-deploy.sh"
 readonly EVAL_SCRIPT="ci-eval-pr.sh"
 readonly RESOLVE_SCRIPT="resolve-rc-target.sh"
 
+# What ci-eval-pr.sh exits when `bench-gate suite` could not evaluate the run:
+# an admitted case lost every repetition to infrastructure, or every case did.
+# Its EVAL_SUITE_NOT_EVALUATED_STATUS; kept in step by hand, as the marker
+# strings above are. Any other non-zero status from the eval is a red.
+readonly EVAL_NOT_EVALUATED_STATUS=2
+
 # ─── Everything below runs inside main() ────────────────────────────────────
 # See the header: the checkout in step 2 rewrites this file, so the body has to
 # be in memory before it happens, and control must never return to the file.
@@ -270,6 +276,13 @@ main() {
     "${script_dir}/${EVAL_SCRIPT}" || eval_status=$?
     if [ "${eval_status}" -eq 0 ]; then
       verdict="GREEN"
+    elif [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ]; then
+      # The same reading as the failed deploy above, one step later: the eval
+      # ran but lost an admitted case entirely to infrastructure, so it formed
+      # no judgement on the candidate. RED would send someone to look for a
+      # regression in a build this run never measured.
+      verdict="NOT RUN"
+      echo "NOTE: evaluating ${rc_tag} (${rc_commit_sha:0:7}) could not certify a verdict (status ${eval_status}): an admitted case lost every repetition to infrastructure. This is not a verdict on the candidate; rerun when the environment is healthy." >&2
     else
       verdict="RED"
     fi
@@ -311,6 +324,13 @@ main() {
       echo "does not hold a release, and the non-inferiority comparison stays"
       echo "advisory while the baseline store is maturing."
       echo
+      if [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ]; then
+        echo "The run could not certify a verdict: an admitted case lost every"
+        echo "repetition to infrastructure, so the candidate was not measured"
+        echo "on it. Nothing here is a judgement on the candidate; rerun when"
+        echo "the environment is healthy."
+        echo
+      fi
       if [ -f "${verdict_path}" ]; then
         echo "Per-case detail is in \`${RC_VERDICT_FILE}\` alongside this file."
       elif [ "${deploy_status}" -ne 0 ]; then

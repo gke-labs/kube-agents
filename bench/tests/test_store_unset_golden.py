@@ -57,8 +57,17 @@ GOLDEN = Path(__file__).parent / "fixtures" / "golden" / "store-unset"
 SHIPPED_VERSIONS = {"fleet": 1, "verifiers": 1}
 JUDGE = "gemini-3.1-pro-preview"
 PATH_TOKEN = "<FIXTURE_RUNS>"
-#: Additive since the golden was captured; popped before comparing.
-ADDITIVE_KEYS = ("admission_source", "admission_mode", "record_verdict")
+#: Additive since the golden was captured; popped before comparing. The last
+#: two are the suite verdict's: ``outcome`` restates ``green`` as one of three
+#: words, and ``not_evaluated`` is empty on every replay here, so neither
+#: changes what the golden pins.
+ADDITIVE_KEYS = (
+    "admission_source",
+    "admission_mode",
+    "record_verdict",
+    "outcome",
+    "not_evaluated",
+)
 UPDATE_ENV = "BENCH_UPDATE_GOLDEN"
 
 

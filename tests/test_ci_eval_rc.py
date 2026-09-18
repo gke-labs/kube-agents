@@ -432,6 +432,24 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertIn("| Verdict | RED |", summary)
         self.assertIn("does not hold a release", summary)
 
+    def test_a_not_evaluated_eval_is_not_run_rather_than_red(self):
+        """ci-eval-pr.sh exits 2 when `bench-gate suite` could not evaluate the
+        run (an admitted case lost every repetition to infrastructure). That
+        formed no judgement on the candidate, so it is the failed deploy's
+        NOT RUN and not a RED somebody then investigates; the status itself
+        still survives, as every other one does.
+        """
+        root, _ = self.build_repo(eval_exit_code=2)
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(self.steps(), ["resolve", "deploy", "eval"])
+        self.assertIn("NOT RUN", result.stdout)
+        self.assertNotIn("RED", result.stdout)
+        self.assertIn("could not certify a verdict", result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | NOT RUN |", summary)
+        self.assertIn("Nothing here is a judgement on the candidate", summary)
+
     def test_writes_the_target_and_summary_artifacts(self):
         root, candidate = self.build_repo()
         result = self.run_driver(root)

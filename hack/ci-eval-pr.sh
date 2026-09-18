@@ -32,6 +32,15 @@ readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 
+# What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
+# when the run could not be evaluated: an admitted case lost every repetition
+# to infrastructure, or every case did. Both are bench/kube_agents_bench/
+# gate.py's (SUITE_EXIT_NOT_EVALUATED) and scoring.py's
+# (SUITE_OUTCOME_NOT_EVALUATED); the verdict step below reads the two
+# together, because 2 alone is also what argparse exits on a bad flag.
+readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
+readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
+
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
 # run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
@@ -1943,18 +1952,45 @@ else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi
 
-# The suite roll-up: blocking cases, the admitted-case aggregate, and the
-# all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is not passed:
-# the rate is computed from the store, per admitted case at its own version
-# key. While the store holds nothing, and until EVAL_AGGREGATE_ARMED is set
-# to 1, the aggregate stays advisory and the markdown says so, rather than implying
-# a comparison that did not happen or a rule that was armed.
+# The suite roll-up: blocking cases, the admitted-case aggregate, the
+# per-admitted-case coverage floor and the all-infrastructure check. Exit 0
+# green, 1 red, 2 not evaluated -- an admitted case lost every repetition to
+# infrastructure (or every case did), so the run cannot certify green and has
+# nothing against the change to debug either. Prow reds 2 as it reds 1, which
+# is right: a run that proved nothing does not merge. The distinct status and
+# the `outcome` in eval-verdict.json are for the artifact, the dashboards and
+# the release-candidate lane, which map it to "rerun when healthy" rather
+# than "the change is bad". --baseline-rate is not passed: the rate is
+# computed from the store, per admitted case at its own version key. While
+# the store holds nothing, and until EVAL_AGGREGATE_ARMED is set to 1, the
+# aggregate stays advisory and the markdown says so, rather than implying a
+# comparison that did not happen or a rule that was armed.
 TOTAL_DURATION=$((SECONDS - START_TIME))
-if (cd "${BENCH_DIR}" && uv run bench-gate suite \
+SUITE_STATUS=0
+(cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
-  --json-out "${ARTIFACT_DIR}/eval-verdict.json"); then
+  --json-out "${ARTIFACT_DIR}/eval-verdict.json") || SUITE_STATUS=$?
+# The status alone does not prove a not-evaluated verdict: argparse exits 2 on
+# a bad flag, and `uv run` can exit 2 without ever reaching bench-gate. Only a
+# verdict file that says so is announced as one; anything else that is not 0
+# is the plain failure it always was, so a broken invocation cannot dress
+# itself as weather.
+SUITE_NOT_EVALUATED="false"
+if [ "${SUITE_STATUS}" -eq "${EVAL_SUITE_NOT_EVALUATED_STATUS}" ] && \
+  python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("outcome") == sys.argv[2] else 1)' \
+    "${ARTIFACT_DIR}/eval-verdict.json" "${EVAL_VERDICT_OUTCOME_NOT_EVALUATED}" 2>/dev/null; then
+  SUITE_NOT_EVALUATED="true"
+fi
+# The final line keeps the `PR Smoke Test Evaluation Failed` and
+# `(Total Duration: Ns)` anchors that scripts/eval_dashboard/collect.py
+# matches, so a not-evaluated run does not lose its final line on the
+# dashboard; the classification words sit between them.
+if [ "${SUITE_STATUS}" -eq 0 ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="
+elif [ "${SUITE_NOT_EVALUATED}" = "true" ]; then
+  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See ${ARTIFACT_DIR}/eval-verdict.md (Total Duration: ${TOTAL_DURATION}s)"
+  exit "${EVAL_SUITE_NOT_EVALUATED_STATUS}"
 else
   echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- see ${ARTIFACT_DIR}/eval-verdict.md (Total Duration: ${TOTAL_DURATION}s)"
   exit 1

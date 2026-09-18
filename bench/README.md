@@ -79,11 +79,11 @@ uv run bench-gate case --task ./tasks/<id>/task.yaml \
   --result <run-dir> --result MISSING --result <run-dir> \
   --json-out case-<id>.json          # exit 0 with a verdict, 2 if it could not grade
 uv run bench-gate suite --case-result case-<id>.json --markdown-out verdict.md
-                                     # exit 0 green, 1 red
+                                     # exit 0 green, 1 red, 2 not evaluated
 uv run bench-gate record --case-result case-<id>.json   # main only; appends evidence
 ```
 
-The gate is rate-based, not all-must-pass: at a few hundred cases and realistic per-case reliability, "every case green" is a state the suite reaches on a vanishing fraction of runs, and a gate that reds most pull requests gets switched off. So a case is graded on a ladder — a forbidden action, a declared check that never ran, or a record whose liveness signals are inconsistent reds the job outright (a record showing no run at all — empty trajectory, zero billed tokens — is excluded as infrastructure instead, #1184); a case that merely _fails_ reds it only by failing **every** repetition, and only once the baseline store holds screening evidence that the case is reliable enough to mean something.
+The gate is rate-based, not all-must-pass: at a few hundred cases and realistic per-case reliability, "every case green" is a state the suite reaches on a vanishing fraction of runs, and a gate that reds most pull requests gets switched off. So a case is graded on a ladder — a forbidden action, a declared check that never ran, or a record whose liveness signals are inconsistent reds the job outright (a record showing no run at all — empty trajectory, zero billed tokens — is excluded as infrastructure instead, #1184); a case that merely _fails_ reds it only by failing **every** repetition, and only once the baseline store holds screening evidence that the case is reliable enough to mean something. Green has a coverage floor of its own: an admitted case that lost every repetition to infrastructure was not evaluated, and the run then reports **not evaluated** rather than green — `suite` exits 2, the JSON carries `outcome: not_evaluated` with the case ids, and the verdict says rerun when the environment is healthy rather than debug the change. A blocking case still outranks that: the run is red.
 
 That evidence is what `baselines/` holds, and admission is computed from it rather than declared in `task.yaml` — a case cannot admit itself in the same diff that makes it pass. A case with no record at the current version key is reported unadmitted, and one whose record was measured on different software is reported _stale_ rather than silently compared against.
 
