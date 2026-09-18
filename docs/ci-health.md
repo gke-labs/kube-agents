@@ -259,12 +259,14 @@ for a week, so a pool that filled on Monday and drained by Tuesday would
 otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The
 two ⚪ messages below are exempt; neither advises anything.
 
-After the queue drains the dashboard and the digest keep reporting the episode,
-in the past tense. `runs not starting` needs the queue read too: it means the
-pool looked fine so Prow must be at fault, which holds only while something is
-queued. Unread, the message gives the free count and apportions no blame, and
-`pool full` drops "and runs are queuing" — the leased count is this hour's, the
-queue is not.
+Once nothing has waited past the p50 limit the dashboard and the digest keep
+reporting the episode, in the past tense, and say there is no backlog — not
+that the queue is empty, which they do not measure. `runs not starting` needs the
+queue read too: it means the pool looked fine so Prow must be at fault, which
+holds only while something is queued. Unread, the message gives the free count
+and apportions no blame. `pool full` keeps its remedy either way and drops "and
+runs are queuing" whenever Deck did not see a backlog — the leased count is this
+hour's, the queue is Deck's.
 
 `concurrency cap` (raise it), `runs not starting` (projects were free, so the
 delay is Prow's; the message names the build cluster) and `queue backed up`

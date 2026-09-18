@@ -708,9 +708,10 @@ def pool_cause_text(pool: dict) -> str:
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
         # The full pool is this hour's Boskos reading and carries the remedy on
-        # its own; the queue is Deck's, and on an unread one the clause would
-        # assert a backlog from a verdict up to a week old.
-        queuing = "" if pool.get("waiting_now") is None else " and runs are queuing"
+        # its own. The clause needs a backlog Deck actually saw: unread, it would
+        # assert one from a verdict up to a week old, and under the limit there
+        # may be no run queued at all.
+        queuing = " and runs are queuing" if pool.get("waiting_now") else ""
         return (
             f"*Smoke gate: pool full* — all {figure(pool.get('total'))} projects are leased"
             f"{queuing}. Consider onboarding a project."
@@ -901,7 +902,10 @@ def pool_digest_line(pool: dict) -> str:
     # was and has cleared, it was and the queue went unread.
     live = pool.get("waiting_now")
     headline = "⏳ Queue backed up" if live else "⏳ Queue was backed up"
-    cleared = "" if live is not False else " Nothing waiting right now."
+    # False is "no run has waited past the limit", not "the queue is empty":
+    # a busy weekday has runs queued under it all day, and saying nothing is
+    # waiting would be wrong on most mornings of most episodes.
+    cleared = "" if live is not False else " No backlog right now."
     span = pool_span(pool)
     if not span:
         waiting = pool.get("over_threshold") or 0

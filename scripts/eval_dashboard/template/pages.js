@@ -308,7 +308,8 @@ function poolSentence(h) {
   // a reader looking for a jam that ended on Monday. Null is Deck unread: past
   // tense, but no claim that it cleared either.
   const live = p.waiting_now;
-  const cleared = live === false ? " Nothing is queued right now." : "";
+  // False is "nothing has waited past the limit", not "the queue is empty".
+  const cleared = live === false ? " No backlog right now." : "";
   return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
 }
 

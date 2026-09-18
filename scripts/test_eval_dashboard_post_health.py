@@ -636,9 +636,9 @@ class Digest(RunHarness):
             " p95 61 min against 45.",
         )
 
-    def test_the_digest_drops_the_present_tense_once_the_queue_drains(self):
-        # The verdict lasts a week, so most mornings of an episode find nothing
-        # queued. "Queue backed up" then sends a reader after a jam that ended
+    def test_the_digest_drops_the_present_tense_once_the_backlog_clears(self):
+        # The verdict lasts a week, so most mornings of an episode find no
+        # backlog. "Queue backed up" then sends a reader after a jam that ended
         # days ago; the numbers still stand, and the tense is what has to move.
         drained = {"waiting_longest_s": 0, "over_threshold": 0}
         self.tick(pooled(wait_s=22 * 60, **drained), T0.replace(hour=7))
@@ -646,8 +646,19 @@ class Digest(RunHarness):
         self.assertEqual(
             self.opener.texts[-1].split("\n")[1],
             "⏳ Queue was backed up — last 3h: median wait 22 min against a 15 min limit;"
-            " p95 61 min against 45. Nothing waiting right now.",
+            " p95 61 min against 45. No backlog right now.",
         )
+
+    def test_the_digest_claims_an_empty_queue_it_did_not_measure(self):
+        # Runs queued under the limit are the ordinary state of a busy weekday,
+        # and the gate reads them as no backlog -- which is not the same as
+        # nothing waiting. The line says only what was measured.
+        under = {"waiting_longest_s": 14 * 60, "over_threshold": 0}
+        self.tick(pooled(wait_s=22 * 60, **under), T0.replace(hour=7))
+        self.tick(pooled(wait_s=22 * 60, **under), self.at(DIGEST_UTC, 5))
+        line = self.opener.texts[-1].split("\n")[1]
+        self.assertTrue(line.endswith("No backlog right now."), line)
+        self.assertNotIn("Nothing", line)
 
     def test_the_digest_claims_no_all_clear_when_the_queue_was_not_read(self):
         # Deck unread is not the same as an empty queue: past tense, because
@@ -657,7 +668,7 @@ class Digest(RunHarness):
         self.tick(pooled(wait_s=22 * 60, **unread), self.at(DIGEST_UTC, 5))
         line = self.opener.texts[-1].split("\n")[1]
         self.assertTrue(line.startswith("⏳ Queue was backed up — last 3h:"), line)
-        self.assertNotIn("Nothing waiting", line)
+        self.assertNotIn("No backlog", line)
 
     def test_the_digest_falls_back_to_the_worst_day_when_the_recent_stretch_is_too_thin(self):
         thin = {"day": "2026-09-03", "window_hours": None}
@@ -968,6 +979,18 @@ class PoolNote(RunHarness):
         )
         # The measured wording is pinned by
         # test_the_full_pool_message_asks_for_a_project_and_pairs_each_number_with_its_limit.
+
+    def test_a_full_pool_under_the_limit_claims_no_queue_either(self):
+        # decide() withholds this message while nothing has waited past the
+        # limit, so the sentence is reached only through the gate. It carries
+        # its own condition anyway: under the limit there may be no run queued
+        # at all, and the clause is the one part Deck has to have seen.
+        note = pool_note(waiting_longest_s=9 * 60)
+        self.assertIs(note["waiting_now"], False)
+        self.assertEqual(
+            post_health.pool_cause_text(note),
+            "*Smoke gate: pool full* — all 30 projects are leased. Consider onboarding a project.",
+        )
 
     def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):
         # The other order. Once the reader has the build cluster, "cannot say
