@@ -85,20 +85,28 @@ the presubmit exports nothing new until it chooses to. The exchange:
    plus repetition as the backend message id. The gateway takes the message through
    `handleInbound` like a message from any backend: routing, the session record, `startTask`,
    and the relay back, with `taskId`, `contextId`, `correlationId` and the `authority` block
-   minted by the gateway. The response names the task id. The gateway's `ingress` log joins
-   the backend message id to the `correlationId`, so with the case and repetition as that id
-   the audit chain reaches the eval record with nothing added.
+   minted by the gateway. The response names the task id. The adapter dedupes on the backend
+   message id, bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an
+   id it has already accepted returns the same task id and starts nothing. That is what makes
+   the harness's retry classes safe on this path: the opening request is retried with the same
+   body on a gateway status or a dropped connection, and `startTask` writes the session record
+   before it answers, so without the dedupe the retry would reach `handleInbound` with an active
+   task and be routed as a steer, no new task and no `ingress` line; and a fresh key per attempt
+   is ruled out because it would start a second persona task doing the same mutations. The
+   gateway's `ingress` log joins the backend message id to the `correlationId`, so with the case
+   and repetition as that id the audit chain reaches the eval record with nothing added.
 3. Await the terminal of that task id, as [Completion signals](#completion-signals) says.
    Replies arrive the way the relay would post them to a conversation, over SSE or a `GET` on
    the conversation key, and the harness returns when the terminal lands or its deadline passes.
-   The deadline on this path is the gateway's first-event grace plus a margin (below), never
-   `AGENT_HTTP_TIMEOUT` alone, and it bounds the whole task, not one request as that variable
-   does on the api transport. A timeout reads the conversation's state first, through the
-   adapter's read route (below), and cancels only once that state shows an executor took the
-   task; the cancel goes through an explicit cancel route on the conversation, which lands on the
-   bus as `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the
-   stop text. The harness sends no message at the deadline, so nothing it does there can mint a
-   task or spend a model turn.
+   The deadline on this path is the harness's own budget for the whole task,
+   `AGENT_INJECT_TIMEOUT` (default 1800 s), not one request as `AGENT_HTTP_TIMEOUT` bounds on
+   the api transport; it is floored at the gateway's first-event grace plus a margin (below),
+   and the harness refuses to start below the floor. A timeout reads the conversation's state
+   first, through the adapter's read route (below), and cancels only once that state shows an
+   executor accepted the task; the cancel goes through an explicit cancel route on the
+   conversation, which lands on the bus as `kind: cancel` exactly as the text route's `stop`
+   does, and the harness never sends the stop text. The harness sends no message at the
+   deadline, so nothing it does there can mint a task or spend a model turn.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
    executor publishes them. Token counts are not on the bus; the record says so rather than
@@ -118,8 +126,9 @@ the gateway mints for a synthetic principal, past the allowed-users gate.
 section keeps Discord structurally incapable of asserting a real principal through its mapping
 table, and the inject door takes its principal from a request body, so it needs the same
 property or it becomes an identity-minting door the day publisher identity arms. Three things
-give it that property. The adapter resolves the principal through its own prefixed section of
-the principal map, whose entries map to eval-only identities and never to a cloud principal. It
+give it that property. The adapter resolves the principal through its own section of the
+principal map, found by its prefix; the property is the section's entries, eval identities the
+gateway cannot map to a cloud principal, and the prefix is only how the section is found. It
 stamps its own `verifiedBy`, `inject-bearer`, so nothing downstream can mistake the block for one
 `chat-event-topic-iam` verified. And an unmapped principal is dropped at ingress with the same
 notice the Discord path gives (drop, log, no task); nothing is defaulted.
@@ -133,9 +142,10 @@ identity, roster read, post-to-conversation, and `openDirect`, and the inject ad
 all five rather than a subset the session record has to special-case. One more route sits on
 the adapter's side of the door and is not a sixth backend operation: a pure read of the
 conversation's state that mutates nothing. It returns what the session record holds for the key,
-the active task with its `SubmittedAt` and `Detached`, whether any executor event exists on the
-stream, and the last posted message, plus the gateway's configured grace and the backend the
-gateway armed; the infrastructure paragraph below says what the harness does with it.
+the active task with its `SubmittedAt` and `Detached`, the highest executor state on the task's
+stream (none, `submitted` or `working`), and the last posted message, plus the gateway's
+configured grace and the backend the gateway armed; the infrastructure paragraph below says what
+the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
@@ -156,36 +166,42 @@ run as infrastructure when Chat is not the one, before any case grades; the oper
 the relay URL is covered by its golden tests, which is where a failed render is caught.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
-for a dead tunnel: the adapter unreachable, the gateway refusing the injection, or no executor
-taking the task. The window for that last one is the gateway's, not the harness's:
-`A2A_FIRST_EVENT_GRACE` bounds how long an active task with nothing on its events subject may
-hold a conversation, and the never-started heal in `handleInbound` releases the conversation on
-its next message with a notice naming the task. The harness runs no second clock, and it does
-not read the answer off its own. Its deadline on this path is the grace plus a margin, a constant
-the adapter's change owns (60 s is the proposal), and never `AGENT_HTTP_TIMEOUT` alone: the api
-default of that variable and the grace default are both ten minutes, and the heal compares
-strictly against a clock `startTask` stamps after the harness's own started, so a deadline at the
-grace sends a cancel to a task nobody consumes, gets "cancel sent" back, and no terminal ever
-follows. The heal is not a clock either: it runs at the top of `handleInbound`, before routing,
-on the next inbound message, and once it has released the conversation that same message is
-routed as a new turn, so a status phrase sent to trigger it would start a task that reads
-"status". The harness therefore sends no message at the deadline. It reads the conversation's
-state through the adapter's read route, a pure read that mutates nothing: the heal is a write
-under the per-conversation lock, and a route that performed it from outside `handleInbound` would
-be a second writer racing the next inbound message for the record. The harness classifies from
-one of four outcomes: no active task and a terminal posted, the run finished as the deadline
-fired, so it is graded like any other; an active task with no executor event and an age inside
-the grace the route returns, the gateway's clock has not reached the grace yet, so wait the
-margin and read once more; an active task with executor events, a graded timeout, and only now
-does the cancel go out; an active task with no executor event and an age past the grace, nobody
-took it, infrastructure, whether or not the gateway has released the conversation yet. The
-release still happens on the next real inbound message, as today, which matters only if the key
-is reused, and the harness uses a fresh key per case and repetition. The cancel follows the read
-rather than preceding it, because the read is what says whether an executor holds the task: a
-cancel sent to a task nobody consumed gets "cancel sent" back and no terminal ever follows. That
-is how the harness and the gateway agree on what "nobody took it" means, one grace read from the
-gateway rather than configured twice, and nothing the harness does at the deadline can mint a
-task. A task an executor took and finished with a `failed` terminal is a graded failure.
+for a dead tunnel: the adapter unreachable, the gateway refusing the injection, no executor
+taking the task, or an executor that accepted the task and never started it. The window for a
+task nobody took is the gateway's, not the harness's: `A2A_FIRST_EVENT_GRACE` bounds how long an
+active task with nothing on its events subject may hold a conversation, and the never-started
+heal in `handleInbound` releases the conversation on its next message with a notice naming the
+task. The harness runs no second clock for that, and it does not read the answer off its own.
+Its deadline on this path is its own budget for the whole task, `AGENT_INJECT_TIMEOUT`, default
+1800 s, floored at the grace plus a margin (a constant the adapter's change owns; 60 s is the
+proposal), and the harness refuses to start below the floor. The two clocks measure different
+things: the grace says whether anybody took the task, the budget says how long a case may run,
+and a deadline set at the grace, as an earlier draft had it, would grade a task's runtime with a
+constant that exists to detect an idle bus. The floor is what makes the read at the deadline
+unambiguous: the heal compares strictly against a clock `startTask` stamps after the harness's
+own started, so a deadline under the grace could read an active task with nothing on its stream
+that the gateway has not yet given up on, and a cancel sent to it gets "cancel sent" back with no
+terminal ever following. The heal is not a clock either: it runs at the top of `handleInbound`,
+before routing, on the next inbound message, and once it has released the conversation that
+same message is routed as a new turn, so a status phrase sent to trigger it would start a task
+that reads "status". The harness therefore sends no message at the deadline. It reads the
+conversation's state through the adapter's read route, a pure read that mutates nothing: the
+heal is a write under the per-conversation lock, and a route that performed it from outside
+`handleInbound` would be a second writer racing the next inbound message for the record. The
+harness classifies from one of four outcomes, by the highest executor state the route returns:
+no active task and a terminal posted, the run finished as the deadline fired, so it is graded
+like any other; an active task with no executor event, nobody took it, infrastructure, whether
+or not the gateway has released the conversation yet; an active task at `submitted` and never
+`working`, an executor accepted it and queued it for the whole budget, infrastructure, and the
+cancel goes out, which the bridge answers with a `canceled-before-start` terminal; an active task
+at `working`, a graded timeout, and the cancel goes out. The release still happens on the next
+real inbound message, as today, which matters only if the key is reused, and the harness uses a
+fresh key per case and repetition. The cancel follows the read rather than preceding it, because
+the read is what says whether an executor holds the task: a cancel sent to a task nobody consumed
+gets "cancel sent" back and no terminal ever follows. That is how the harness and the gateway
+agree on what "nobody took it" means, one grace read from the gateway rather than configured
+twice, and nothing the harness does at the deadline can mint a task. A task an executor took and
+finished with a `failed` terminal is a graded failure.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
@@ -226,7 +242,16 @@ case addresses `platform` and does not care who answers; when the persona moves 
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
 with no sidecar declared has a bus with nobody consuming `platform` tasks, and every case on the
 inject transport ends as infrastructure. That is the correct reading of that install, and it is
-why a task nobody took is infrastructure rather than a failed case.
+why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
+publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
+publishes `working` only when a worker spawns the subprocess; the presubmit fans units out at
+`EVAL_TASK_PARALLELISM`, default 4, the nightly at 6. At those defaults two of every four
+concurrent units wait in the bridge's queue carrying an executor event and no subprocess, for as
+long as the two ahead of them run. The eval install's sidecar therefore sets
+`BRIDGE_CONCURRENCY` to at least `EVAL_TASK_PARALLELISM`, declared with the sidecar on the CR,
+and the `submitted`-only classification above is the backstop rather than the fix: a queued
+repetition that reaches the deadline is infrastructure, not a failed case, but it has still
+spent its budget waiting.
 
 ### The direct-bus transport, kept as a diagnostic
 
