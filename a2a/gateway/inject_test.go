@@ -272,17 +272,46 @@ func (r *injectRig) probe(t *testing.T, key, taskID string) conversationResponse
 	return out
 }
 
-// awaitRecordedTask blocks until the session record carries an active task.
-// startTask announces the id to the adapter BEFORE it writes the record (so
-// a caller never has to guess which post belongs to its submission), so a
-// POST can return before there is an ActiveTask to read or age.
+// awaitTurnEnd blocks until no turn this door handed to the gateway is still
+// running on the conversation. A POST is answered at the accept, and the
+// gateway's end-of-turn record write lands after that and before the turn
+// signal; a test that reads and rewrites the record on the strength of the
+// POST's reply alone races that write, and Registry.Put has no revision
+// guard, so whichever Put lands second wins.
+func (r *injectRig) awaitTurnEnd(t *testing.T, key string) {
+	t.Helper()
+	waitFor(t, "the turn on "+key+" to end", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		conv, ok := r.adapter.conversations[key]
+		return ok && conv.handed <= conv.turns
+	})
+}
+
+// awaitRecordedTask blocks until the session record carries an active task
+// AND the turn that wrote it has ended, for the reason awaitTurnEnd gives.
 func (r *injectRig) awaitRecordedTask(t *testing.T, key string) {
 	t.Helper()
+	r.awaitTurnEnd(t, key)
 	waitFor(t, "the session record to carry the active task", func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		rec, err := r.g.reg.Get(ctx, key)
 		return err == nil && rec != nil && rec.ActiveTask != nil
+	})
+}
+
+// awaitRecordRelease blocks until the record no longer holds an active task:
+// the relay hands the door the terminal from inside relayTerminal and writes
+// the release afterwards, so a test restoring ActiveTask on the strength of
+// the door's terminal entry alone races that write.
+func (r *injectRig) awaitRecordRelease(t *testing.T, key string) {
+	t.Helper()
+	waitFor(t, "the relay to release the record for "+key, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		rec, err := r.g.reg.Get(ctx, key)
+		return err == nil && rec != nil && rec.ActiveTask == nil
 	})
 }
 
@@ -1348,7 +1377,7 @@ func TestInjectReadRouteIsAPureRead(t *testing.T) {
 	r.awaitRecordedTask(t, reply.Conversation)
 	// Age the submission past the grace rather than waiting it out: a test
 	// that slept would be a 90-second test.
-	ageActiveTask(t, r.g, reply.Conversation, -2*injectTestGrace)
+	ageActiveTask(t, r, reply.Conversation, -2*injectTestGrace)
 
 	page := r.probe(t, reply.Conversation, reply.TaskID)
 	probe := page.Probe
@@ -1809,8 +1838,10 @@ func TestInjectTerminalCarriesTheExecutorsReason(t *testing.T) {
 
 // ageActiveTask backdates a conversation's active task, so a test can reach
 // the never-started heal without waiting out the grace.
-func ageActiveTask(t *testing.T, g *Gateway, conversation string, by time.Duration) {
+func ageActiveTask(t *testing.T, r *injectRig, conversation string, by time.Duration) {
 	t.Helper()
+	g := r.g
+	r.awaitTurnEnd(t, conversation)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	rec, err := g.reg.Get(ctx, conversation)
@@ -1839,6 +1870,12 @@ func terminalEntries(entries []InjectEntry) []InjectEntry {
 // then lost the record write (or the pod restarted between the two).
 func (r *injectRig) restoreActiveTask(t *testing.T, key string, origin *lib.Envelope, age time.Duration) {
 	t.Helper()
+	r.awaitTurnEnd(t, key)
+	if _, _, terminal := r.adapter.snapshot(key, 0, origin.TaskID); terminal != "" {
+		// The door has the terminal, so the relay's release of the record
+		// is in flight behind it; a task nobody took has no release coming.
+		r.awaitRecordRelease(t, key)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	rec, err := r.g.reg.Get(ctx, key)
@@ -2686,5 +2723,52 @@ func TestInjectASecondPostWaitsForTheEarlierTurnToEnd(t *testing.T) {
 	second := f.inject(t, "second-post", "and again")
 	if second.TaskID != "task-2" || second.Refusal != "" {
 		t.Fatalf("second POST: reply = %+v, want task-2 with no refusal: it classified from the first turn", second)
+	}
+}
+
+// TestInjectOneBoundCoversTheClaimAndTheWait: a duplicate POST waits one
+// submit bound from its own arrival for the first POST's answer. Were the
+// claim (waiting for an earlier turn to end) and the wait each given a whole
+// bound, the first POST could answer up to two bounds after it arrived, the
+// duplicate would have given up and told its caller nothing started, and the
+// turn would then accept with nobody watching. So the request sets one
+// deadline at its arrival and both take it. Pinned at the seam, with a short
+// deadline: the bound itself is seventy seconds.
+func TestInjectOneBoundCoversTheClaimAndTheWait(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+	door, err := NewInjectAdapter(ln.Addr().String(), injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = injectKeyPrefix + "one-bound"
+	ctx := context.Background()
+	// A turn handed over and never ended.
+	if _, ok := door.claimTurn(ctx, key, time.Now().Add(time.Second)); !ok {
+		t.Fatal("the first claim on a quiet conversation must succeed")
+	}
+	deadline := time.Now().Add(4 * injectPollInterval)
+	started := time.Now()
+	if _, ok := door.claimTurn(ctx, key, deadline); ok {
+		t.Fatal("a claim behind an unfinished turn must fail at the deadline, not succeed")
+	}
+	if elapsed := time.Since(started); elapsed > injectSubmitWait/4 {
+		t.Fatalf("the claim held for %s past a %s deadline; it took a bound of its own", elapsed, 4*injectPollInterval)
+	}
+	// The wait takes the same deadline rather than minting its own.
+	prior := door.counts(key)
+	started = time.Now()
+	_, _, refusal := door.awaitTurn(ctx, key, prior, time.Now().Add(4*injectPollInterval))
+	if refusal != injectRefusalNoAnswer {
+		t.Fatalf("refusal = %q, want %s at the passed deadline", refusal, injectRefusalNoAnswer)
+	}
+	if elapsed := time.Since(started); elapsed > injectSubmitWait/4 {
+		t.Fatalf("the wait held for %s past its deadline; it took a bound of its own", elapsed)
+	}
+	if note := door.awaitEntry(ctx, key, prior, time.Now().Add(4*injectPollInterval)); note == "" {
+		t.Fatal("awaitEntry answered nothing at the passed deadline")
 	}
 }

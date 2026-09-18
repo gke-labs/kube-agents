@@ -1035,9 +1035,17 @@ func (a *InjectAdapter) turnSince(key string, prior injectCounts) injectTurn {
 // conversation's counts as they stand, once no earlier turn this door handed
 // over is still running. The two happen under one lock, so two POSTs cannot
 // both find the conversation quiet. False when the earlier turn did not end
-// inside the submit bound or the caller went away.
-func (a *InjectAdapter) claimTurn(ctx context.Context, key string) (injectCounts, bool) {
-	deadline := time.Now().Add(injectSubmitWait)
+// by the deadline or the caller went away.
+//
+// The deadline is the caller's, shared with the wait that follows, so a
+// request answers within one submit bound of its arrival however the bound
+// is split between waiting for the earlier turn and waiting for its own. A
+// duplicate of the request (answerDuplicate) waits one bound from its own,
+// later, arrival for the first request's answer; were the claim and the wait
+// each given a whole bound, the first request could answer after the
+// duplicate had given up, and the duplicate's caller would have been told
+// nothing started for a submission that then reached the bus.
+func (a *InjectAdapter) claimTurn(ctx context.Context, key string, deadline time.Time) (injectCounts, bool) {
 	for {
 		a.mu.Lock()
 		conv := a.conversationLocked(key)
@@ -1168,7 +1176,8 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	// Read the counters BEFORE handing the message over, and only once no
 	// earlier turn is still running, so the wait below cannot mistake a
 	// previous turn's task or reply for this one's.
-	prior, ok := a.claimTurn(turnCtx, key)
+	deadline := time.Now().Add(injectSubmitWait)
+	prior, ok := a.claimTurn(turnCtx, key, deadline)
 	if !ok {
 		note := earlierTurnNote()
 		if sub != nil {
@@ -1198,7 +1207,7 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		Backend: injectBackend,
 	})
 
-	taskID, note, refusal := a.awaitTurn(turnCtx, key, prior)
+	taskID, note, refusal := a.awaitTurn(turnCtx, key, prior, deadline)
 	if sub != nil {
 		a.completeSubmission(sub, taskID, note, refusal)
 	}
@@ -1272,7 +1281,8 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	}
 	// Requester first, then the claim, for the reasons handleInject gives.
 	a.noteRequester(key, req.Author)
-	prior, ok := a.claimTurn(r.Context(), key)
+	deadline := time.Now().Add(injectSubmitWait)
+	prior, ok := a.claimTurn(r.Context(), key, deadline)
 	if !ok {
 		writeJSON(w, http.StatusOK, injectResponse{
 			Conversation:           key,
@@ -1296,7 +1306,7 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	// acknowledgement, the nothing-is-running reply, or the never-started
 	// notice when the heal fires on the way past -- so waiting for one entry
 	// is waiting for the turn, not for the executor.
-	note := a.awaitEntry(r.Context(), key, prior)
+	note := a.awaitEntry(r.Context(), key, prior, deadline)
 	entries, _, _ := a.snapshot(key, prior.entries, "")
 	writeJSON(w, http.StatusOK, injectResponse{
 		Conversation:           key,
@@ -1314,8 +1324,7 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 // unverifiable sender is posted once per sender, so the second cancel from an
 // author already told they are unknown produces no entry at all and would
 // otherwise hold the connection for the whole bound.
-func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior injectCounts) string {
-	deadline := time.Now().Add(injectSubmitWait)
+func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior injectCounts, deadline time.Time) string {
 	for {
 		now := a.counts(key)
 		if now.gen != prior.gen {
@@ -1373,9 +1382,10 @@ func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior inject
 //
 // Each look is one reading under the lock (injectTurn), and a conversation
 // evicted and minted again under the wait is refused as such rather than
-// classified from the new incarnation's counters.
-func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectCounts) (string, string, string) {
-	deadline := time.Now().Add(injectSubmitWait)
+// classified from the new incarnation's counters. The deadline is the
+// request's, set at its arrival and already partly spent by claimTurn; see
+// there for why the two do not each get a whole bound.
+func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectCounts, deadline time.Time) (string, string, string) {
 	for {
 		// Everything below is classified from this one reading; see
 		// injectTurn for why it is not several.
