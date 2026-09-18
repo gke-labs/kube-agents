@@ -131,10 +131,11 @@ conversation; its `Kind` is `dm`; its roster is the requester alone with `comple
 test-backend section names, inbound message with verified sender, conversation and thread
 identity, roster read, post-to-conversation, and `openDirect`, and the inject adapter implements
 all five rather than a subset the session record has to special-case. One more route sits on
-the adapter's side of the door and is not a sixth backend operation: a read of the conversation's
-state, which returns what the session record holds for the key and runs the never-started heal
-check itself without routing anything; the infrastructure paragraph below says what the harness
-does with it.
+the adapter's side of the door and is not a sixth backend operation: a pure read of the
+conversation's state that mutates nothing. It returns what the session record holds for the key,
+the active task with its `SubmittedAt` and `Detached`, whether any executor event exists on the
+stream, and the last posted message, plus the gateway's configured grace and the backend the
+gateway armed; the infrastructure paragraph below says what the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
@@ -145,7 +146,13 @@ against one install and compare them, and the Slack adapter in flight agrees on 
 The door alone is also enough for the gateway to start (decided 2026-09-17 by the A2A owner,
 whose reason is that this is what makes the adapter the answer for an eval install with no real
 backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
-the guard say so in code and in the gateway spec's test-backend section.
+the guard say so in code and in the gateway spec's test-backend section. What that trades away is
+the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
+install that wants no real backend from one whose relay URL failed to render; the two-backend
+refusal stays. So the door-alone start is not silent: the gateway logs it and the read route
+reports the armed backend as inject-only, a stage-2 install whose relay URL failed to render reds
+its Chat transport on no reply rather than passing on the door, and the operator's render of the
+relay URL is covered by its golden tests, which is where a failed render is caught.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
 for a dead tunnel: the adapter unreachable, the gateway refusing the injection, or no executor
@@ -162,18 +169,22 @@ follows. The heal is not a clock either: it runs at the top of `handleInbound`, 
 on the next inbound message, and once it has released the conversation that same message is
 routed as a new turn, so a status phrase sent to trigger it would start a task that reads
 "status". The harness therefore sends no message at the deadline. It reads the conversation's
-state through the adapter's read route, which returns what the session record holds and runs the
-heal check itself without routing anything, and classifies from one of four outcomes: no active
-task and a terminal posted, the run finished as the deadline fired, so it is graded like any
-other; an active task with no executor event and an age inside the grace, the gateway's clock has
-not reached the grace yet, so wait the margin and read once more; an active task with executor
-events, a graded timeout, and only now does the cancel go out; the heal fired on this read and
-released the conversation, infrastructure, with nothing started. The cancel is never sent before
-that read: `cancelTask` detaches the task and the heal is guarded on the task not being detached,
-so a cancel sent first puts the never-started notice out of reach for that task. That is how the
-harness and the gateway agree on what "nobody took it" means, and nothing the harness does at the
-deadline can mint a task. A task an executor took and finished with a `failed` terminal is a
-graded failure.
+state through the adapter's read route, a pure read that mutates nothing: the heal is a write
+under the per-conversation lock, and a route that performed it from outside `handleInbound` would
+be a second writer racing the next inbound message for the record. The harness classifies from
+one of four outcomes: no active task and a terminal posted, the run finished as the deadline
+fired, so it is graded like any other; an active task with no executor event and an age inside
+the grace the route returns, the gateway's clock has not reached the grace yet, so wait the
+margin and read once more; an active task with executor events, a graded timeout, and only now
+does the cancel go out; an active task with no executor event and an age past the grace, nobody
+took it, infrastructure, whether or not the gateway has released the conversation yet. The
+release still happens on the next real inbound message, as today, which matters only if the key
+is reused, and the harness uses a fresh key per case and repetition. The cancel follows the read
+rather than preceding it, because the read is what says whether an executor holds the task: a
+cancel sent to a task nobody consumed gets "cancel sent" back and no terminal ever follows. That
+is how the harness and the gateway agree on what "nobody took it" means, one grace read from the
+gateway rather than configured twice, and nothing the harness does at the deadline can mint a
+task. A task an executor took and finished with a `failed` terminal is a graded failure.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
@@ -279,10 +290,12 @@ Chat adapter" section has them: the gate is the operator-pinned allowed-users se
 environment, and the `verifiedBy` value names a project-IAM boundary, not a per-request proof. It
 lands in the same change that gives the gateway rendered under `next` the credential proxy's chat
 relay URL as its backend, so an install with Google Chat configured has a gateway that starts
-without a Discord Secret; the relay URL is the backend the gateway refuses to start without. And
-it settles the one-backend guard with the Slack adapter in flight, so the relay URL beside a
-Slack credential is still a refusal and never a collision, while the inject door beside the relay
-URL is not one (stage 1, above), so the install this stage wires runs both transports.
+without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
+which the read route reports as inject-only and the Chat transport reds on no reply, the guard
+paragraph in stage 1 saying why the guard no longer catches it. And it settles the one-backend
+guard with the Slack adapter in flight, so the relay URL beside a Slack credential is still a
+refusal and never a collision, while the inject door beside the relay URL is not one (stage 1,
+above), so the install this stage wires runs both transports.
 
 Two decisions sit beside that list. The legacy Chat consumer still runs under `next`, and a topic
 fans out to every subscription, so an install that arms the A2A subscription beside it answers
