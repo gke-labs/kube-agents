@@ -4,9 +4,9 @@ The harness hands a case's prompt to the executor the way a task reaches it on
 the bus under ``spec.mode: next``: one ``message`` envelope on
 ``a2a.tasks.{addressee}.{taskId}.in``, then the task's ``events`` folded until
 a terminal ``status-update`` lands. It proves the bus, the stream and the
-executor, not the auth callout: the ``eval`` principal and the bridge's
-``worker`` are both static users listed in ``auth_users``, so a green run says
-nothing about the callout. It skips the gateway -- its routing, its session
+executor, not the auth callout: the ``eval`` principal and the bridge's own
+``bridge`` principal are both static users listed in ``auth_users``, so a green
+run says nothing about the callout. It skips the gateway -- its routing, its session
 registry, the relay back -- which is why it is a diagnostic rather than the
 next-mode transport the evals will run on. That one is the gateway's inject
 adapter, planned and not yet built, which goes through the gateway's inbound
