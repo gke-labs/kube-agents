@@ -124,3 +124,28 @@ func TestScaleUpMemoNilAndEmptyUIDAreInert(t *testing.T) {
 		t.Errorf("empty uid or none verdict recorded %d entries; want 0", got)
 	}
 }
+
+// TestScaleUpMemoTTL: the memo outlives the dedup window whenever the window
+// is shorter than the hold plus the staleness check, since a mark can be
+// consulted for that long after it was recorded. Bounded by the window alone,
+// the binary's own defaults would cut a 15m hold to 5m with nothing logged.
+func TestScaleUpMemoTTL(t *testing.T) {
+	tests := []struct {
+		name        string
+		dedupWindow time.Duration
+		hold        time.Duration
+		want        time.Duration
+	}{
+		{name: "binary defaults: 5m window, 15m hold", dedupWindow: 5 * time.Minute, hold: defaultScaleUpHold, want: defaultScaleUpHold + failedSchedulingStaleAfter},
+		{name: "deployed install: 24h window keeps its window", dedupWindow: 24 * time.Hour, hold: defaultScaleUpHold, want: 24 * time.Hour},
+		{name: "a longer hold raises the floor", dedupWindow: 24 * time.Hour, hold: 24 * time.Hour, want: 24*time.Hour + failedSchedulingStaleAfter},
+		{name: "window equal to the floor keeps the floor", dedupWindow: defaultScaleUpHold + failedSchedulingStaleAfter, hold: defaultScaleUpHold, want: defaultScaleUpHold + failedSchedulingStaleAfter},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scaleUpMemoTTL(tc.dedupWindow, tc.hold); got != tc.want {
+				t.Errorf("scaleUpMemoTTL(%v, %v) = %v; want %v", tc.dedupWindow, tc.hold, got, tc.want)
+			}
+		})
+	}
+}

@@ -82,7 +82,9 @@ type filterConfig struct {
 	// autoscaler's own verdicts take precedence over it below.
 	failedSchedulingMinCount int
 	// scaleUpHold is how long a TriggeredScaleUp mark holds the pod's
-	// FailedScheduling events, measured from the mark's event time. A ceiling
+	// FailedScheduling events, measured from the mark's event time to the
+	// event's own last sighting rather than to the wall clock (see
+	// failedSchedulingGate for why the two differ after a restart). A ceiling
 	// on the hold, not a floor on the alert: it is cluster-autoscaler's own
 	// node-provision timeout, past which a pod still pending is stuck whatever
 	// the autoscaler last said, and the count backstop applies again.
@@ -312,12 +314,26 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //   - A NotTriggerScaleUp mark passes the event at any count. The autoscaler
 //     has ruled it cannot help, so waiting for more repeats only delays the
 //     incident.
-//   - A TriggeredScaleUp mark younger than scaleUpHold holds the event at
-//     any count. A node is on its way; the scheduler retries the pod on every
-//     cluster change while it joins, and the count reaches any threshold
-//     before the node is Ready.
+//   - A TriggeredScaleUp mark holds the event at any count while the event's
+//     last sighting is within scaleUpHold of the mark. A node is on its way;
+//     the scheduler retries the pod on every cluster change while it joins,
+//     and the count reaches any threshold before the node is Ready. The mark
+//     is aged against the sighting and not against the clock because the two
+//     differ after a restart: the scheduler stops re-emitting the event when
+//     the pod schedules, so a replayed event's sighting is fixed at the end
+//     of its scale-up while the clock keeps moving. Aged against the clock,
+//     the mark would expire fifteen minutes after the scale-up triggered
+//     while the sighting stayed under the staleness check for as long again
+//     as the scale-up took, and a restart in that window would open a card
+//     for a pod that had been Running for up to fifteen minutes. For a live
+//     event the sighting is the present, so the two readings are the same;
+//     a pod still pending past the hold is sighted again with a fresh
+//     timestamp and falls through to the count as before.
 //   - Otherwise the count backstop applies, with the same fail-open on zero
-//     as the other debounces.
+//     as the other debounces. The count it reads is the pod's attempts summed
+//     across its event objects when the dispatcher has that tally (Attempts),
+//     since the recorder starts a new object with count 1 every time the
+//     scheduler's message changes, and the object's own count otherwise.
 //
 // Not a settle timer: a live event is never delayed by wall-clock time, only
 // by what the autoscaler said or by how often the scheduler has repeated it.
@@ -329,23 +345,34 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.LastSeen).Round(time.Second))
 		return gateFailedSchedulingStale
 	}
+	count := ev.Count
+	if ev.Attempts > count {
+		count = ev.Attempts
+	}
 	switch ev.ScaleUp.Verdict {
 	case scaleUpDeclined:
 		log.Printf("pass %s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, short-circuiting the count backstop",
-			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second))
+			ev.Key.Reason, ev.Namespace, ev.Name, count, now.Sub(ev.ScaleUp.At).Round(time.Second))
 		return gateAccepted
 	case scaleUpTriggered:
-		if age := now.Sub(ev.ScaleUp.At); age <= f.cfg.scaleUpHold {
-			log.Printf("held %s pod=%s/%s (count=%d): cluster-autoscaler triggered a scale-up %s ago, holding up to %s",
-				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, age.Round(time.Second), f.cfg.scaleUpHold)
+		// An event with no timestamp is aged as a live one, as the staleness
+		// check treats it: the present is the only sighting it can claim.
+		sighting := ev.LastSeen
+		if sighting.IsZero() {
+			sighting = now
+		}
+		sinceMark := sighting.Sub(ev.ScaleUp.At)
+		if sinceMark <= f.cfg.scaleUpHold {
+			log.Printf("held %s pod=%s/%s (count=%d): cluster-autoscaler triggered a scale-up %s ago, %s before this sighting, holding up to %s",
+				ev.Key.Reason, ev.Namespace, ev.Name, count, now.Sub(ev.ScaleUp.At).Round(time.Second), max(sinceMark, 0).Round(time.Second), f.cfg.scaleUpHold)
 			return gateScaleUpHold
 		}
-		log.Printf("%s pod=%s/%s (count=%d): the scale-up triggered %s ago has passed the %s hold, falling back to the count backstop",
-			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), f.cfg.scaleUpHold)
+		log.Printf("%s pod=%s/%s (count=%d): the scale-up triggered %s ago was %s old at this sighting, past the %s hold; falling back to the count backstop",
+			ev.Key.Reason, ev.Namespace, ev.Name, count, now.Sub(ev.ScaleUp.At).Round(time.Second), sinceMark.Round(time.Second), f.cfg.scaleUpHold)
 	}
-	if belowMinCount(ev.Count, f.cfg.failedSchedulingMinCount) {
+	if belowMinCount(count, f.cfg.failedSchedulingMinCount) {
 		log.Printf("held %s pod=%s/%s (count=%d < %d, no autoscaler verdict on record)",
-			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, f.cfg.failedSchedulingMinCount)
+			ev.Key.Reason, ev.Namespace, ev.Name, count, f.cfg.failedSchedulingMinCount)
 		return gateFailedSchedulingMinCount
 	}
 	return gateAccepted

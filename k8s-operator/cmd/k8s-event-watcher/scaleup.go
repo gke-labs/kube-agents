@@ -35,16 +35,34 @@ const (
 	reasonNotTriggerScaleUp = "NotTriggerScaleUp"
 
 	// defaultScaleUpTTL bounds how long a verdict is remembered when the
-	// caller passes none. The deployed install passes its dedup window, which
-	// is the horizon after which a pod's next FailedScheduling is a new
-	// incident anyway; a verdict older than that describes a scale-up nobody
-	// is still waiting on.
+	// caller passes none. The dispatcher passes scaleUpMemoTTL, the dedup
+	// window with a floor; this is what a caller that passes nothing gets,
+	// and the deployed install's dedup window.
 	defaultScaleUpTTL = 24 * time.Hour
 	// defaultScaleUpEntries caps the memo per cluster. The same bound as
 	// pullClassMemo: pending pods are a small fraction of a cluster's pods,
 	// and a cluster churning through them must not grow the map without limit.
 	defaultScaleUpEntries = 4096
 )
+
+// scaleUpMemoTTL is how long a dispatcher remembers a pod's marks and its
+// attempt tally: the dedup window, past which the pod's next FailedScheduling
+// is a new incident anyway, but never less than the hold plus the staleness
+// check. The floor is what the hold needs. A TriggeredScaleUp holds any
+// FailedScheduling sighted within scaleUpHold of it, and such an event is
+// still judged rather than held as stale for failedSchedulingStaleAfter after
+// that sighting, so a mark can be consulted up to the sum of the two after it
+// was recorded. Bounded by the dedup window alone, the binary's own defaults
+// (a 5m window, a 15m hold) would drop a mark five minutes after the
+// scale-up triggered and the next FailedScheduling would read as having no
+// verdict at all, with nothing in the log saying the hold had been cut short.
+func scaleUpMemoTTL(dedupWindow, scaleUpHold time.Duration) time.Duration {
+	floor := scaleUpHold + failedSchedulingStaleAfter
+	if dedupWindow > floor {
+		return dedupWindow
+	}
+	return floor
+}
 
 // scaleUpVerdict is cluster-autoscaler's most recent ruling on a pod, read off
 // the events it records against the pod itself.

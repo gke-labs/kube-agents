@@ -124,7 +124,8 @@ WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
 # verdict on the pod: five failed scheduling attempts, a count rather than a
 # time, since the scheduler retries on every cluster change and at least
-# every five minutes. The autoscaler's own events take precedence over it: a
+# every five minutes. Counted across the event objects the scheduler's
+# changing message spreads a pod's attempts over, not on one object. The autoscaler's own events take precedence over it: a
 # NotTriggerScaleUp on the pod fires at any count, a TriggeredScaleUp holds at
 # any count for WATCHER_SCALEUP_HOLD, and on a cluster with an autoscaler one
 # or the other arrives seconds after the pod's first attempt. Both are in the
@@ -133,7 +134,8 @@ WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-
 WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 
 # How long a TriggeredScaleUp on a pod holds its FailedScheduling events,
-# measured from the autoscaler's event. A ceiling on the hold, not a delay on
+# measured from the autoscaler's event to the FailedScheduling's own last
+# sighting. A ceiling on the hold, not a delay on
 # the alert: 15m is cluster-autoscaler's default node-provision timeout, and
 # a pod still pending past it is reported on the count whatever the autoscaler
 # last said. Raise it on a cluster whose node pools take longer to provision.

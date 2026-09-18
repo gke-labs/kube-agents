@@ -79,6 +79,17 @@ type TriageEvent struct {
 	// recorded off the pod's TriggeredScaleUp and NotTriggerScaleUp events.
 	// The zero mark means the autoscaler has said nothing. See scaleup.go.
 	ScaleUp scaleUpMark
+	// EventUID is the Event object's own UID, distinct from Key.UID, which is
+	// the pod's. The recorder keys an object on its message, so one pod's
+	// FailedScheduling is spread over as many objects as the scheduler's text
+	// has had forms, each with its own Count; this is what lets the dispatcher
+	// tell the objects apart when it adds their counts up (attempts.go).
+	EventUID string
+	// Attempts is the pod's FailedScheduling count summed across every event
+	// object the dispatcher has seen for it, stamped on FailedScheduling
+	// events only; zero when the dispatcher has no tally, and never less than
+	// Count otherwise. The count backstop reads it in place of Count.
+	Attempts int
 }
 
 // InjectPayload is the JSON body POSTed to
