@@ -369,6 +369,7 @@ silently running the check with defaults.
 | `report_contains`         | `required_phrases` (all must appear), `any_of_phrases` (at least one must), `forbidden_phrases` (none may), `scope` (`final` \| `full`, default `final`)                                                      | Case-insensitive substring checks against the agent's answer, not the cluster. `final` is what the user ultimately receives: the delegating turn's closing message plus, when work was delegated, the delivered card results and artifacts — poll-turn recitals excluded. `full` is the accumulated output (every settled closer on top of that), which passes a phrase merely quoted in progress chatter and false-fails a forbidden phrase in quoted material; use it only for genuinely whole-transcript checks. Registered from this repository's `kube_agents_bench.verifiers` via the `devops_bench.verifiers` entry point. |
 | `tool_called`             | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false)                                                                                                                       | Counts the **delegating turn's** calls only — poll turns are excluded by design and a delegated worker's calls never reach the trajectory, so this asserts what the router did, never what a worker did on a cluster; use cluster-state checks (`resource_property`) for mutation safeguards. `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in router-level safeguards, where an attempt should trip the check.                                                                                                                |
 | `ledger_issue_contains`   | `audit` (required, one of the eight fleet-audit stream ids), `required_phrases`, `any_of_phrases`, `forbidden_phrases`, `scope` (`body` \| `finding_ids`, default `body`), `max_clock_skew_sec` (default 120) | The same phrase semantics as `report_contains`, but against the **GitHub ledger issue this run published** rather than the chat reply — the surface a fleet audit actually writes its findings to. See [Grading a fleet audit](#grading-a-fleet-audit) below, which you must read before using it: it needs a credential, and its freshness binding is what stops it passing forever.                                                                                                                                                                                                                                             |
+| `pull_request_opened`     | `owner` (the organisation the PR must sit under, `""` for any), `max_clock_skew_sec` (default 120)                                                                                             | Resolves every `github.com/<owner>/<repo>/pull/<n>` URL in the agent's reply through the GitHub API and passes when one of them is a pull request under `owner` created after this run started. What a remediation case grades on, in place of `report_contains` over `/pull/`. See [Grading a remediation pull request](#grading-a-remediation-pull-request).                                                                                                                                                                                                                                                                                                       |
 | `fleet_resource_property` | every `resource_property` field except `kubeconfig`, plus `fixture_role` (**required**)                                                                                                                       | `resource_property` against the **standing seeded fleet**, addressed by the ROLE a fixture plays rather than by cluster name. Also splits "the fixture is gone" (a fail) from "the cluster was unreachable" (an error), which upstream cannot. See [Addressing a seeded-fleet fixture by role](#addressing-a-seeded-fleet-fixture-by-role).                                                                                                                                                                                                                                                                                       |
 
 The three transcript verifiers read the run's stash (`kube_agents_bench/transcript.py`), so unlike
@@ -482,6 +483,31 @@ invisible drop-out. `none` requires that no element resolves a satisfying value.
     op: exists
     across_matches: every
 ```
+
+##### Grading a remediation pull request
+
+A remediation case asks the agent to propose a fix as a pull request against the eval GitOps
+repository, and the URL comes back in the final answer: `submit_suggestion.py` runs through
+`execute_code`, so no distinct tool name reaches the trajectory to assert on.
+
+`report_contains` over `["github.com/", "/pull/"]` was the first way to grade that, and it cannot
+work. It reads the reply as text and fetches nothing, so an invented URL passes — and nothing
+sweeps the GitOps repositories between repetitions, so the pull request rep 1 opened is still
+there for rep 2 and rep 3 to link. The repeats of a case were grading each other's leftovers
+(#1755).
+
+`pull_request_opened` resolves the URL instead and compares GitHub's `created_at` against
+`TranscriptSnapshot.started_at`, less `max_clock_skew_sec` for the gap between the Prow runner's
+clock and the agent pod's. Only a pull request this run opened passes. `owner: gke-agentic` pins
+the organisation, which is a fair exact match across every pool project and breaks loudly if the
+organisation ever moves.
+
+It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`
+mints that token for every fan-out unit, not only the audit ones. It asks `/repos/{o}/{r}/issues/{n}`
+first, because a pull request is an issue to that API and `issues: read` is what the ledger App
+carries; `/pulls/{n}` is tried only when that is denied or absent. Denied by both is
+`status: "error"` naming `pull_requests: read` as the permission to add — never a fail, since a
+credential gap is not the agent opening nothing.
 
 ##### Addressing a seeded-fleet fixture by role
 
