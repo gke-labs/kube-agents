@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +69,10 @@ DEFAULT_MAX_OBJECTS = 200
 
 #: Seconds before a `gcloud storage` call is treated as unreachable.
 DEFAULT_TIMEOUT = 60
+
+#: How many per-case `gcloud storage cat` calls run at once. Bounded well under
+#: the case count so a large store cannot fork a process per case at once.
+_CAT_WORKERS = 16
 
 
 class StoreUnreachable(RuntimeError):
@@ -289,7 +294,7 @@ class GcsBackend:
             parent = url.rsplit("/", 1)[0]
             by_case.setdefault(case_id, {}).setdefault(parent, []).append(url)
 
-        found: list[EvidenceSource] = []
+        per_case: list[tuple[str, list[str]]] = []
         for case_id, groups in sorted(by_case.items()):
             urls: list[str] = []
             for _, group in sorted(groups.items()):
@@ -299,9 +304,27 @@ class GcsBackend:
                     self.truncated[case_id] = self.truncated.get(case_id, 0) + dropped
                     group = group[-self.max_objects :]
                 urls.extend(group)
-            text = self._run(["cat", *urls])
-            found.append(EvidenceSource(case_id, f"{self.location}/{case_id}/", text))
-        return found
+            per_case.append((case_id, urls))
+
+        if not per_case:
+            return []
+
+        # Concurrently, because the cost here is one `gcloud` process startup
+        # per case and nothing else: ~1.3s each, paid serially, against objects
+        # of a few hundred bytes. At 38 cases that is 47s a read, and the gate
+        # reads the whole store once per graded case. Order is preserved: map
+        # yields in submission order, and truncated was filled above, off the
+        # pool, so no worker touches it.
+        def fetch(item: tuple[str, list[str]]) -> str:
+            return self._run(["cat", *item[1]])
+
+        with ThreadPoolExecutor(max_workers=min(_CAT_WORKERS, len(per_case))) as pool:
+            texts = list(pool.map(fetch, per_case))
+
+        return [
+            EvidenceSource(case_id, f"{self.location}/{case_id}/", text)
+            for (case_id, _), text in zip(per_case, texts)
+        ]
 
     def append(self, case_id: str, line: str) -> str:
         """Write one new object. Never overwrites, by construction and by IAM.
