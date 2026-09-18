@@ -2542,11 +2542,14 @@ def parse_declarations(
         return []
     try:
         front = yaml.safe_load(front_text)
-    except (yaml.YAMLError, ValueError) as exc:
-        # `ValueError` is PyYAML's own: an unquoted `2026-02-30` or `T25:00`
-        # is resolved as a timestamp and built with `datetime`, which raises
-        # it outside the `YAMLError` tree. Left uncaught it would cost the
-        # repository its entry, not the note its declaration.
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
+        # The other two are PyYAML's own, raised outside the `YAMLError`
+        # tree: an unquoted `2026-02-30` or `T25:00` is resolved as a
+        # timestamp and built with `datetime`, which raises `ValueError`,
+        # and the pure-Python loader composes nested flow collections
+        # recursively, so a few hundred nested `[` raise `RecursionError`.
+        # Left uncaught either would cost the repository its entry, not the
+        # note its declaration.
         log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
         return []
     if not isinstance(front, dict) or OKF_TYPE_KEY not in front:
@@ -2654,9 +2657,10 @@ def read_intent_paths(tree: Path, repo: str) -> list[str]:
         return []
     try:
         data = yaml.safe_load(intent.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError) as exc:
-        # `ValueError`: an unquoted date PyYAML resolves and `datetime` refuses,
-        # as in `parse_declarations`.
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError, RecursionError) as exc:
+        # `ValueError`: an unquoted date PyYAML resolves and `datetime` refuses;
+        # `RecursionError`: a flow collection nested past the recursion limit.
+        # Both as in `parse_declarations`.
         log(f"WARNING: {where}: unreadable ({exc}); searching the whole tree.")
         return []
     paths = data.get(INTENT_PATHS_KEY) if isinstance(data, dict) else None

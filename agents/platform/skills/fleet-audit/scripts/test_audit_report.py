@@ -5123,6 +5123,11 @@ def declaration(check="no-pdb", namespace="payments", obj="Deployment/checkout-g
 DECLARABLE = audit_report.audit_declarable_checks(DECLARING_AUDIT)
 
 
+# Deep enough that PyYAML's recursive composer overruns Python's default
+# recursion limit of 1000 while composing the frontmatter's flow collection.
+NESTED_FRONTMATTER_DEPTH = 500
+
+
 def parse(text, path="knowledge/checkout.md", repo="acme/fleet"):
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
@@ -5286,6 +5291,22 @@ class TestDeclarationParsing(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual([e["check"] for e in entries], ["no-pdb"])
 
+    def test_a_pathologically_nested_frontmatter_costs_the_note_only(self):
+        # PyYAML composes nested flow collections recursively, so a note whose
+        # frontmatter nests a few hundred `[` raises RecursionError, a
+        # RuntimeError rather than a YAMLError or ValueError; uncaught, it
+        # would leave `parse_declarations` and cost the whole repository its
+        # `searched` entry without naming the note that did it.
+        nested = "[" * NESTED_FRONTMATTER_DEPTH + "]" * NESTED_FRONTMATTER_DEPTH
+        entries, err = parse(
+            f"---\ntype: {nested}\ndeclares:\n"
+            "  - check: no-pdb\n    namespace: payments\n"
+            "    object: Deployment/checkout-gateway\n---\n"
+        )
+        self.assertEqual(entries, [])
+        self.assertIn("WARNING: acme/fleet:knowledge/checkout.md: frontmatter is not valid YAML", err)
+        self.assertIn("recursion", err)
+
     def test_an_unclosed_frontmatter_block_is_not_frontmatter(self):
         self.assertIsNone(audit_report.split_frontmatter("---\ntype: x\n"))
         self.assertEqual(audit_report.split_frontmatter("---\ntype: x\n...\n"), "type: x")
@@ -5382,6 +5403,12 @@ class TestIntentPaths(unittest.TestCase):
             # An unquoted date `datetime` refuses: PyYAML raises ValueError,
             # not YAMLError, and it must still be the whole tree, not a crash.
             "an impossible date": "updated: 2026-02-30\npaths:\n  - knowledge/\n",
+            # A flow collection nested past the recursion limit: PyYAML raises
+            # RecursionError, a RuntimeError, and it is still the whole tree.
+            "a pathologically nested value": (
+                "updated: " + "[" * NESTED_FRONTMATTER_DEPTH + "]" * NESTED_FRONTMATTER_DEPTH
+                + "\npaths:\n  - knowledge/\n"
+            ),
         }
         for label, text in cases.items():
             with self.subTest(label):
