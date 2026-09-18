@@ -252,6 +252,15 @@ is skipped on the same grounds. Every skip is logged by profile name and counted
 reported at startup — a fan-in that silently reached six of seven clusters otherwise looks exactly
 like a fleet of six.
 
+The unreadable directory is the exception to that counting, and it is carried separately rather than
+added to the total: the number of clusters behind a directory nobody can open is unknown, so calling
+it one skipped profile would understate it. It is tracked at all so that the line naming why the
+join has no clusters can tell it from an empty directory: both end the scan with no clusters and
+nothing skipped, and reporting the first as the second sends an operator whose mount is broken, or
+whose `fsGroup` is wrong, to wait on `cluster-agent-reconcile` for profiles it has already written.
+Discovery runs once, so that line is the whole account of why the fan-in is off for the life of the
+pod.
+
 **Startup checks the direct cluster's triple against the cluster its credentials actually reach, and
 refuses to run if they disagree.** The triple decides which records that cluster serves; the
 credentials decide where it reads them from, and nothing else connects the two. A Pod in `us-east4`

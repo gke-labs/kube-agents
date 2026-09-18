@@ -192,6 +192,35 @@ type profileCluster struct {
 	Config *rest.Config
 }
 
+// profileScan is what one pass over the profiles directory came back with.
+//
+// A struct rather than a third and fourth return value because the last field
+// is not a count or a cluster: it says the scan never got as far as looking at
+// profiles, and a caller reading only the other two cannot tell that from a
+// directory with nothing in it yet.
+type profileScan struct {
+	// Clusters is one entry per profile whose cluster this process can read.
+	Clusters []profileCluster
+
+	// Skipped counts the profiles naming a cluster this run will not reach --
+	// one per straggler, so it can be compared against the size of the fleet.
+	Skipped int
+
+	// DirUnreadable says the profiles directory itself could not be read:
+	// EACCES from a bad mount or the wrong fsGroup, ENOTDIR when the path names
+	// a file. Not folded into Skipped, because the number of clusters behind an
+	// unreadable directory is unknown and calling it one would understate it;
+	// not an error, because internal/clusterprofiles degrades here rather than
+	// returning one, a restart being no fix for permissions.
+	//
+	// It is carried out of the scan at all because of what the caller does with
+	// nought clusters. Clusters is nil and Skipped is 0 for an empty directory
+	// too, so without this the startup line tells an operator whose mount is
+	// broken that their profiles have not been created yet, and sends them to
+	// wait on cluster-agent-reconcile for a directory it has already written.
+	DirUnreadable bool
+}
+
 // identityFromProfile converts a discovered identity into the form an audit
 // record is matched against.
 //
@@ -239,29 +268,35 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 //
 // Every skip is logged and counted. The count is what the startup line reports,
 // because a fan-in that silently reached six of seven clusters looks exactly
-// like a fleet with six clusters in it.
+// like a fleet with six clusters in it. The unreadable directory is the one
+// failure that is reported as a flag instead of a count -- see
+// profileScan.DirUnreadable -- and it is reported rather than left to the log
+// because it otherwise reaches the startup line as an empty fleet.
 //
 // An empty dir is --profiles-dir unset, and returns nothing without scanning.
 // The check is here rather than at the call site because it is the same
 // mistake, not a caller's convenience: Discover calls os.ReadDir, "" is ENOENT,
 // and ENOENT is the one condition the package treats as fatal -- so a detector
 // that simply did not ask for the fan-in would refuse to start.
-func discoverProfileClusters(ctx context.Context, dir, project string) ([]profileCluster, int, error) {
+func discoverProfileClusters(ctx context.Context, dir, project string) (profileScan, error) {
 	if dir == "" {
-		return nil, 0, nil
+		return profileScan{}, nil
 	}
 
-	skipped := 0
+	scan := profileScan{}
 	skip := func(profile string, err error) {
 		if profile == clusterprofiles.NoProfile {
 			// The directory itself, not a profile in it -- so this is not one
 			// straggler but an unknown number of clusters, and counting it as
 			// "1 profile skipped" would understate it to whoever alerts on that
 			// number. The error already says which directory and what it means.
+			// Recorded rather than only logged so the startup line does not go
+			// on to call the directory empty; DirUnreadable has the argument.
+			scan.DirUnreadable = true
 			log.Printf("%s: %v", commandName, err)
 			return
 		}
-		skipped++
+		scan.Skipped++
 		log.Printf("%s: skipping profile %s, its cluster will NOT be joined: %v", commandName, profile, err)
 	}
 
@@ -275,7 +310,7 @@ func discoverProfileClusters(ctx context.Context, dir, project string) ([]profil
 		if id.Project == project {
 			return true
 		}
-		skipped++
+		scan.Skipped++
 		log.Printf("%s: skipping the profile for cluster %s: it is outside --project=%s, and this subscription carries no records from it",
 			commandName, identityFromProfile(id), project)
 		return false
@@ -287,7 +322,7 @@ func discoverProfileClusters(ctx context.Context, dir, project string) ([]profil
 	d.Want = want
 	discovered, err := d.Discover(ctx, dir)
 	if err != nil {
-		return nil, skipped, err
+		return scan, err
 	}
 
 	clusters := make([]profileCluster, 0, len(discovered))
@@ -306,7 +341,8 @@ func discoverProfileClusters(ctx context.Context, dir, project string) ([]profil
 			Config:   c.Config,
 		})
 	}
-	return clusters, skipped, nil
+	scan.Clusters = clusters
+	return scan, nil
 }
 
 // buildClusterSet merges the two credential sources into the join's routing

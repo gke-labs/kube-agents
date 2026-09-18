@@ -217,27 +217,40 @@ func directClusterIdentity(f *flags) clusterIdentity {
 }
 
 // joinDisabledReason says why the live-object join has no clusters, in the one
-// line an operator gets. Three ways to reach nought clusters, and they call for
+// line an operator gets. Four ways to reach nought clusters, and they call for
 // different action, so they are not reported alike: naming --profiles-dir as
 // un-set to someone who set it sends them to check the one thing that is
 // already right, and calling a directory empty when every profile in it failed
 // sends them to cluster-agent-reconcile when the cause is IAM, a mistyped
 // --project, or a GKE API that was down for the seconds this process spent
-// starting.
+// starting. The unreadable directory is the same mistake once more: it reaches
+// this function looking exactly like an empty one, no clusters and nothing
+// skipped, and only profileScan.DirUnreadable tells the two apart.
 //
 // It matters more than a log line usually would: discovery runs once, nothing
 // here retries and nothing exits, so this sentence is the whole account of why
 // the fan-in is off for the life of the pod.
 //
-// A function rather than a switch at the call site so the three branches can be
+// A function rather than a switch at the call site so the four branches can be
 // asserted without standing up a subscription.
-func joinDisabledReason(profilesDir string, skipped int) string {
+func joinDisabledReason(profilesDir string, scan profileScan) string {
 	switch {
-	case skipped > 0:
+	case scan.DirUnreadable:
+		// Before the skip count rather than after, though the two cannot both
+		// be set today -- nothing is skipped per-profile until the directory has
+		// been read. Ordered on which would matter more if that changed: a
+		// directory nobody could open is the cause, and stragglers inside it
+		// would be a consequence.
+		//
+		// The error itself was logged as it happened and is not repeated here;
+		// what this adds is that it accounts for the whole fan-in being off,
+		// which the skip line on its own does not say.
+		return fmt.Sprintf("the Cluster Agent profiles in %s could not be read at all (the error is above, and a restart will not clear it), and no --in-cluster or --kubeconfig", profilesDir)
+	case scan.Skipped > 0:
 		// Reached only with a profiles dir: discoverProfileClusters returns
-		// before scanning when it is unset, so skipped cannot be positive here
+		// before scanning when it is unset, so Skipped cannot be positive here
 		// without one to name.
-		return fmt.Sprintf("all %d Cluster Agent profile(s) in %s were skipped for the reasons above, and no --in-cluster or --kubeconfig", skipped, profilesDir)
+		return fmt.Sprintf("all %d Cluster Agent profile(s) in %s were skipped for the reasons above, and no --in-cluster or --kubeconfig", scan.Skipped, profilesDir)
 	case profilesDir != "":
 		// Normal before a fresh install's first cluster-agent-reconcile tick,
 		// which is why this degrades rather than refusing to start: the detector
@@ -373,13 +386,13 @@ func realMain(argv []string) error {
 	// Fatal error propagated rather than degraded: internal/clusterprofiles
 	// returns one only for a --profiles-dir that is not there, which discovery
 	// runs once against and a restart fixes. Everything survivable has already
-	// been logged and counted into skipped by this point.
-	profiles, skipped, err := discoverProfileClusters(ctx, f.profilesDir, f.project)
+	// been logged and recorded in the scan by this point.
+	scan, err := discoverProfileClusters(ctx, f.profilesDir, f.project)
 	if err != nil {
 		return err
 	}
 
-	clusters, absorbed := buildClusterSet(getter, direct, profiles)
+	clusters, absorbed := buildClusterSet(getter, direct, scan.Clusters)
 	filter, join := newFilterFromFlags(f, clusters)
 
 	// Say which mode the join is in at startup rather than leaving it to be
@@ -387,7 +400,7 @@ func realMain(argv []string) error {
 	// credential flags otherwise sees DRIFT lines with no ownership on them and
 	// no statement anywhere that the join never ran.
 	if join.Clusters() == 0 {
-		reason := joinDisabledReason(f.profilesDir, skipped)
+		reason := joinDisabledReason(f.profilesDir, scan)
 		// Not "every record": a delete, and any record naming no object, is
 		// counted no_object before the join reaches the cluster lookup, so those
 		// two do not move the unreachable counter even with the join off.
@@ -401,15 +414,15 @@ func realMain(argv []string) error {
 		}
 	} else {
 		log.Printf("%s: live-object join enabled for %d cluster(s) (direct=%t profiles=%d gitops-managers=%q)",
-			commandName, join.Clusters(), getter != nil, len(profiles), f.gitopsManagers)
+			commandName, join.Clusters(), getter != nil, len(scan.Clusters), f.gitopsManagers)
 	}
 
 	// Reported whether or not the join ended up with clusters, and separately
 	// from the count above, because a skip is the difference between a fleet of
 	// six and a fleet of seven this run reached six of. The count alone reads
 	// identically either way.
-	if skipped > 0 {
-		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable", commandName, skipped)
+	if scan.Skipped > 0 {
+		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable", commandName, scan.Skipped)
 	}
 	// Not a skip: the cluster is joined, through the direct credentials instead.
 	// Logged so that a profile count that does not match the cluster count has

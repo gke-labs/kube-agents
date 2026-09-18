@@ -167,10 +167,11 @@ func TestIdentityFromProfileDoesNotTransposeLocationAndCluster(t *testing.T) {
 // treats as fatal. Without the guard a detector that simply did not ask for the
 // fan-in would refuse to start.
 func TestDiscoverProfileClustersWithNoDirectoryConfigured(t *testing.T) {
-	clusters, skipped, err := discoverProfileClusters(context.Background(), "", "example-project")
+	scan, err := discoverProfileClusters(context.Background(), "", "example-project")
 	if err != nil {
 		t.Fatalf("discoverProfileClusters(\"\") returned error: %v -- an unset --profiles-dir is not a missing directory", err)
 	}
+	clusters, skipped := scan.Clusters, scan.Skipped
 	if len(clusters) != 0 || skipped != 0 {
 		t.Errorf("clusters = %d skipped = %d, want 0 and 0", len(clusters), skipped)
 	}
@@ -183,7 +184,7 @@ func TestDiscoverProfileClustersFatalOnAMissingDirectory(t *testing.T) {
 	stubGKE(t)
 	missing := filepath.Join(t.TempDir(), "not-created-yet")
 
-	_, _, err := discoverProfileClusters(context.Background(), missing, "example-project")
+	_, err := discoverProfileClusters(context.Background(), missing, "example-project")
 	if err == nil {
 		t.Fatal("discoverProfileClusters returned no error for a missing --profiles-dir")
 	}
@@ -198,12 +199,19 @@ func TestDiscoverProfileClustersBuildsOneReaderPerProfile(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "cluster-example-project-prod-b-europe-west1", "example-project", "prod-b", "europe-west1")
 
-	clusters, skipped, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
+	clusters, skipped := scan.Clusters, scan.Skipped
 	if skipped != 0 {
 		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	// The other side of the unreadable-directory case: a flag that were always
+	// set would send a healthy scan down the same branch, and this is the only
+	// test where the directory was read without trouble.
+	if scan.DirUnreadable {
+		t.Error("DirUnreadable = true after a directory that read fine")
 	}
 	if len(clusters) != 2 {
 		t.Fatalf("discovered %d clusters, want 2", len(clusters))
@@ -236,10 +244,11 @@ func TestDiscoverProfileClustersLiftsTheClientSideThrottle(t *testing.T) {
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 
-	clusters, _, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
+	clusters := scan.Clusters
 	if len(clusters) != 1 {
 		t.Fatalf("discovered %d clusters, want 1", len(clusters))
 	}
@@ -279,10 +288,11 @@ func TestDiscoverProfileClustersDropsClustersOutsideTheProject(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "cluster-other-project-prod-b-us-central1", "other-project", "prod-b", "us-central1")
 
-	clusters, skipped, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
+	clusters, skipped := scan.Clusters, scan.Skipped
 	if len(clusters) != 1 {
 		t.Fatalf("discovered %d clusters, want 1 -- the other project's profile was registered", len(clusters))
 	}
@@ -327,10 +337,11 @@ func TestDiscoverProfileClustersSkipsAProfileWhoseClientWillNotBuild(t *testing.
 	writeClusterProfile(t, dir, "good", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "bad", "example-project", "prod-b", "europe-west1")
 
-	clusters, skipped, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v -- one bad profile is a skip, not a fatal", err)
 	}
+	clusters, skipped := scan.Clusters, scan.Skipped
 	if len(clusters) != 1 {
 		t.Fatalf("discovered %d clusters, want 1", len(clusters))
 	}
@@ -366,10 +377,11 @@ func TestDiscoverProfileClustersDegradesOnAnUnreadableDirectory(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-	clusters, skipped, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v -- an unreadable dir degrades, it is not fatal", err)
 	}
+	clusters, skipped := scan.Clusters, scan.Skipped
 	if len(clusters) != 0 {
 		t.Errorf("discovered %d clusters from an unreadable directory", len(clusters))
 	}
@@ -378,6 +390,13 @@ func TestDiscoverProfileClustersDegradesOnAnUnreadableDirectory(t *testing.T) {
 	// would otherwise read as "everything but one profile came up".
 	if skipped != 0 {
 		t.Errorf("skipped = %d, want 0", skipped)
+	}
+	// And the flag is how the caller tells this from an empty directory, which
+	// also comes back with no clusters and nothing skipped. Without it the two
+	// assertions above are satisfied by the case that reports "no profiles yet"
+	// to an operator whose mount is broken.
+	if !scan.DirUnreadable {
+		t.Error("DirUnreadable = false; an unreadable directory is indistinguishable from an empty one without it")
 	}
 	// No profile name in the line, because no profile was read -- and nothing
 	// of the form "skipping profile -", which is what a NoProfile skip rendered
