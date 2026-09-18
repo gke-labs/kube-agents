@@ -403,6 +403,34 @@ def test_cases_keep_their_order_when_their_reads_finish_out_of_order(
         assert json.loads(source.text)["case"] == source.case_id
 
 
+def test_a_cat_that_fails_inside_a_worker_is_still_unreachable(gcloud, monkeypatch):
+    """The exception has to cross the thread boundary as itself.
+
+    ``gate._load_store`` catches :class:`StoreUnreachable` and degrades the gate
+    to advisory; any other type crashes ``bench-gate case`` with exit 2 and
+    stops the job. A pool sits between those two now, so what this pins is the
+    type that arrives, not merely that something was raised.
+
+    The outage tests above all fail every verb, so they stop at the ``ls`` in
+    ``_list()`` and never build the pool. This one lets ``ls`` through.
+    """
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    inner = evidence_store.subprocess.run
+
+    def only_cat_fails(argv, **kwargs):
+        if argv[2] == "cat":
+            return subprocess.CompletedProcess(argv, 1, "", "ERROR: 403 forbidden")
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(evidence_store.subprocess, "run", only_cat_fails)
+
+    with pytest.raises(StoreUnreachable, match="403"):
+        GcsBackend("gs://b/e").sources()
+
+
 def test_one_worker_reads_the_same_thing_as_many(gcloud):
     """The concurrency is a speed-up, not a behaviour change."""
     for name in ("case-a", "case-b", "case-c"):
