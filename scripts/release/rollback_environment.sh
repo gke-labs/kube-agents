@@ -41,6 +41,7 @@ readonly DEFAULT_NAMESPACE="kubeagents-system"
 readonly HELM_RELEASE="kube-agents"
 readonly PLATFORM_AGENT_RESOURCE="platform-agent"
 readonly GATEWAY_DEPLOYMENT="platform-agent-gateway"
+readonly GATEWAY_CONTAINER="platform-agent"
 readonly OPERATOR_DEPLOYMENT="kube-agents-controller-manager"
 readonly OPERATOR_CONTAINER="manager"
 readonly OPERATOR_POD_SELECTOR="app.kubernetes.io/name=kube-agents-operator"
@@ -188,7 +189,7 @@ record() {
 
 agent_image() {
   kubectl get deployment "${GATEWAY_DEPLOYMENT}" -n "${NAMESPACE}" \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="platform-agent")].image}' 2>/dev/null || true
+    -o jsonpath="{.spec.template.spec.containers[?(@.name==\"${GATEWAY_CONTAINER}\")].image}" 2>/dev/null || true
 }
 
 operator_image() {
@@ -345,8 +346,15 @@ handoff_litellm_policy_if_needed() {
   # From here the operator is down, so from here a failure has to restore it.
   HANDOFF_DONE="true"
   LITELLM_POLICY_HANDED_OFF="true"
+  # `wait --for=delete` exits non-zero on some versions when nothing matched,
+  # so the check that matters is done explicitly: an operator pod still here
+  # would re-stamp the label between the relabel and the upgrade.
   kubectl wait --for=delete pod -l "${OPERATOR_POD_SELECTOR}" -n "${NAMESPACE}" \
     --timeout="${OPERATOR_SCALE_TIMEOUT_SECONDS}s" || true
+  if [ -n "$(kubectl get pods -l "${OPERATOR_POD_SELECTOR}" -n "${NAMESPACE}" -o name 2>/dev/null)" ]; then
+    echo "::error title=Operator still running::${OPERATOR_DEPLOYMENT} pods are still present ${OPERATOR_SCALE_TIMEOUT_SECONDS}s after scaling to zero; not relabelling ${LITELLM_POLICY} under a live operator."
+    return 1
+  fi
   kubectl label networkpolicy "${LITELLM_POLICY}" -n "${NAMESPACE}" \
     "app.kubernetes.io/managed-by=${HELM_MANAGED_BY_LABEL}" --overwrite
   kubectl annotate networkpolicy "${LITELLM_POLICY}" -n "${NAMESPACE}" \
