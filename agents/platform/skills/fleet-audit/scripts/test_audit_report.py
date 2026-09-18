@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -5126,6 +5127,11 @@ DECLARABLE = audit_report.audit_declarable_checks(DECLARING_AUDIT)
 # Deep enough that PyYAML's recursive composer overruns Python's default
 # recursion limit of 1000 while composing the frontmatter's flow collection.
 NESTED_FRONTMATTER_DEPTH = 500
+# A heading line of this many ` #` pairs (a hundred kilobytes, under the
+# broker's per-file ceiling) took the quadratic heading scan the better part
+# of a minute; the linear one reads it in milliseconds, so the bound is loose.
+LONG_HEADING_PAIRS = 50_000
+LONG_HEADING_SECONDS = 5.0
 
 
 def parse(text, path="knowledge/checkout.md", repo="acme/fleet"):
@@ -5328,6 +5334,36 @@ class TestDeclarationParsing(unittest.TestCase):
         # A heading inside a fence is code, not a heading.
         fenced, _ = parse(note([declaration()], title=None, body="```\n# not a heading\n```\n"))
         self.assertEqual(fenced[0]["excerpt"], "knowledge/checkout.md")
+
+    def test_a_heading_line_of_any_length_is_read_in_linear_time(self):
+        # A heading whose tail is a long run of blanks and hashes before one
+        # other character is what a lazy `.*?` followed by `[ \t#]*$` reads in
+        # the square of its length; one such line in one note held `start`,
+        # which has no timeout. The scan is linear now, and the excerpt is
+        # the heading's text clipped as any long title is.
+        line = "# x" + " #" * LONG_HEADING_PAIRS + "y"
+        started = time.monotonic()
+        entries, _ = parse(note([declaration()], title=None, body=f"\n{line}\n"))
+        self.assertLess(time.monotonic() - started, LONG_HEADING_SECONDS)
+        self.assertTrue(entries[0]["excerpt"].startswith("x # #"))
+        self.assertTrue(entries[0]["excerpt"].endswith("…(truncated)"))
+        # A closing sequence is still trimmed, and a heading that is nothing
+        # but one is no excerpt: the next heading, then the path, stand in.
+        trimmed, _ = parse(note([declaration()], title=None, body="\n# Budget ##\n"))
+        self.assertEqual(trimmed[0]["excerpt"], "Budget")
+        empty, _ = parse(note([declaration()], title=None, body="\n# ###\n\n## Real\n"))
+        self.assertEqual(empty[0]["excerpt"], "Real")
+        only, _ = parse(note([declaration()], title=None, body="\n# ###\n"))
+        self.assertEqual(only[0]["excerpt"], "knowledge/checkout.md")
+
+    def test_the_excerpt_is_redacted_and_clipped(self):
+        token = "ghp_" + "a" * 36
+        entries, _ = parse(note([declaration()], title=f"pinned with token {token}"))
+        self.assertNotIn(token, entries[0]["excerpt"])
+        long, _ = parse(note([declaration()], title="x" * 1000))
+        self.assertLess(len(long[0]["excerpt"]), 1000)
+        self.assertTrue(long[0]["excerpt"].endswith("…(truncated)"))
+
 
     def test_the_excerpt_is_redacted_and_clipped(self):
         token = "ghp_" + "a" * 36

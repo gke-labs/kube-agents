@@ -646,7 +646,14 @@ DECLARES_KEY = "declares"
 DECLARATION_ITEM_FIELDS = ("check", "namespace", "object")
 DECLARATION_CLUSTER_FIELD = "cluster"
 NOTE_SUFFIX = ".md"
-HEADING_RE = re.compile(r"^#{1,6}[ \t]+(?P<text>\S.*?)[ \t#]*$", re.M)
+# Linear on purpose: `text` runs to the end of the line and the closing
+# sequence (blanks and `#`) is trimmed afterwards. Giving the tail up lazily
+# and letting a trailing `[ \t#]*` take it back costs the square of the
+# line's length, and one heading line of a hundred thousand characters in one
+# note held `start`, which has no timeout, for most of a minute; the notes
+# come from repositories anyone with write access there can change.
+HEADING_RE = re.compile(r"^#{1,6}[ \t]+(?P<text>\S.*)$", re.M)
+HEADING_TRAILER_CHARS = " \t#"
 # The per-repository search bound: one key, `paths`, a list of repo-relative
 # prefixes held to the remediation-path rules (a trailing `/` allowed, because
 # they are prefixes). Absent or invalid reads as the whole tree, said on
@@ -2517,9 +2524,12 @@ def _note_excerpt(front: dict, text: str, path: str) -> str:
         return clip_text(title, MAX_TITLE_CHARS)
     split = _split_note(text)
     body = split[1] if split is not None else text
-    heading = HEADING_RE.search(strip_fenced_blocks(body))
-    if heading:
-        return clip_text(heading.group("text"), MAX_TITLE_CHARS)
+    for heading in HEADING_RE.finditer(strip_fenced_blocks(body)):
+        # A heading that is nothing but its closing sequence (`# ###`) is
+        # empty once trimmed, and an empty excerpt names nothing.
+        text = heading.group("text").rstrip(HEADING_TRAILER_CHARS)
+        if text:
+            return clip_text(text, MAX_TITLE_CHARS)
     return clip_text(path, MAX_TITLE_CHARS)
 
 
