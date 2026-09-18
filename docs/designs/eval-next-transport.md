@@ -200,8 +200,18 @@ fresh key per case and repetition. The cancel follows the read rather than prece
 the read is what says whether an executor holds the task: a cancel sent to a task nobody consumed
 gets "cancel sent" back and no terminal ever follows. That is how the harness and the gateway
 agree on what "nobody took it" means, one grace read from the gateway rather than configured
-twice, and nothing the harness does at the deadline can mint a task. A task an executor took and
-finished with a `failed` terminal is a graded failure.
+twice, and nothing the harness does at the deadline can mint a task. A `failed` terminal is not
+graded on its state alone: the harness reads the reason token, the part of the terminal's reason
+before the first space, because the bridge publishes `failed` for its own faults as well as the
+persona's. The bridge's own reasons, `bridge-shutdown`, `bridge-queue-overflow`,
+`bus-publish-failed`, `spawn-failed` and `bridge-died-without-terminal-event`, are
+infrastructure, the class the api transport gives an exhausted transport retry, because they say
+the executor lost the task rather than the persona failing it, the same line the profiles spec
+draws with `worker-evicted`; the persona's reasons, `hermes-exited-nonzero`, `deadline-exceeded`
+and `no-text-parts`, and any reason the harness does not know, are graded failures. A `canceled`
+terminal after the harness's own cancel is the graded timeout above, and `canceled-before-start`
+the infrastructure outcome above. The rule is the same on both transports: the diagnostic
+transport below folds the same terminals and classifies them the same way.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
@@ -251,7 +261,18 @@ long as the two ahead of them run. The eval install's sidecar therefore sets
 `BRIDGE_CONCURRENCY` to at least `EVAL_TASK_PARALLELISM`, declared with the sidecar on the CR,
 and the `submitted`-only classification above is the backstop rather than the fix: a queued
 repetition that reaches the deadline is infrastructure, not a failed case, but it has still
-spent its budget waiting.
+spent its budget waiting. Two pieces of stage-1 work follow from building against the bridge,
+neither of which exists today: nothing in this repository or the presubmit produces the bridge
+image, and nothing declares the sidecar. The bridge doc says the image is fork-built for the
+playground, the platform-agent image plus the bridge binary, in neither `images.json` nor the
+release pipeline, and that it joins the release surface at stage-2 graduation or dies before it.
+Stage 1 therefore adds a bridge Dockerfile beside the three A2A Dockerfiles in `a2a/`, built in
+the same step the CI flag section gives the A2A images and tagged per pull request into the pool
+project's registry, CI-only and not in `images.json`, consistent with that statement; and
+`hack/ci-deploy.sh` under the flag declares the sidecar on the CR through
+`spec.deployment.sidecars` with that image, the bus URL and credentials the bridge doc lists as
+its env, and `BRIDGE_CONCURRENCY` at or above `EVAL_TASK_PARALLELISM`. Whether the bridge image
+build lands in this repository is the A2A owner's call, and is the open question below.
 
 ### The direct-bus transport, kept as a diagnostic
 
@@ -393,13 +414,17 @@ body-supplied principal, and nothing a customer can set on a `PlatformAgent` may
 rendered object set with the flag unset carries no inject Service, env or NetworkPolicy, and that
 is a property for the conformance suite to check rather than a comment to trust. The A2A images
 the flip needs are built in the same Cloud Build step as the other images and set on the
-operator, because the defaults point at a registry the pool projects cannot pull from. The eval
-matrix in `hack/ci-eval-pr.sh` is unchanged.
+operator, because the defaults point at a registry the pool projects cannot pull from; the bridge
+image is built in that step too, and the flip declares the bridge sidecar on the CR with it (the
+executor paragraph in stage 1 says what the sidecar carries), because a flip without the sidecar
+leaves a bus on which nobody consumes `platform` tasks. The eval matrix in `hack/ci-eval-pr.sh`
+is unchanged.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
 The next stack still has holes independent of any case (no resource requests on the NATS,
-gateway or provisioning pods, a gateway with no backend until the adapter lands, images in a
+gateway or provisioning pods, a gateway with no backend until the adapter lands, no executor
+until the sidecar is declared, images in a
 private registry), and a default-on flip would red every pull request for reasons none of them
 caused. And until a case sends through the gateway, a run under `next` measures nothing a run
 under `today` does not; the flag exists so the matrix can be run against `next` on demand while
@@ -410,8 +435,13 @@ stage 1 lands.
 Marked open on purpose; this document does not pick. The first draft's two questions for the A2A
 owner, which executor answers `platform` and whether delegation becomes a child task on the bus,
 were answered on 2026-09-17 and are recorded above as decisions, as was how the eval flag
-reaches the operator (The CI flag). What remains is the eval crew's:
+reaches the operator (The CI flag). What remains is the eval crew's, and one item the A2A
+owner's:
 
 - **Which reply stage 2 grades,** the bus events of the task the gateway opened or the Chat
   thread. The principle prefers the thread; the bus events grade one hop short and need no Chat
   read credential. The eval crew decides when the stage is built.
+- **Whether the bridge image build lands in this repository.** Stage 1 needs a bridge image the
+  presubmit can pull, and the bridge doc says no build config for it ships here. The proposal in
+  stage 1 is a CI-only Dockerfile beside the A2A ones, outside `images.json`; the A2A owner
+  decides.
