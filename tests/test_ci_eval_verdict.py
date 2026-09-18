@@ -12,6 +12,13 @@ This runs the real function out of the real file, with the script's own two
 constants, rather than grepping for the branch: it fails if the confirmation is
 removed, if the key or the word it checks drifts from what `scoring.py` writes,
 or if the final line loses an anchor the dashboard collector matches.
+
+`hack/ci-eval-rc.sh` carries a second hand-synced copy of the status and the
+outcome word, read when it maps the presubmit's exit 2 to its `NOT RUN`. The
+drift check here covers that copy too: `tests/test_ci_eval_rc.py` pins the RC
+driver through a stub that emits the literals, so a Python-side rename that the
+presubmit copy is forced to follow would otherwise leave the RC driver green and
+comparing against the old value.
 """
 
 import json
@@ -23,10 +30,12 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
+RC_SCRIPT = REPO_ROOT / "hack" / "ci-eval-rc.sh"
 SCORING = REPO_ROOT / "bench" / "kube_agents_bench" / "scoring.py"
 GATE = REPO_ROOT / "bench" / "kube_agents_bench" / "gate.py"
 FUNCTION = "announce_suite_verdict"
 CONSTANTS = ("EVAL_SUITE_NOT_EVALUATED_STATUS", "EVAL_VERDICT_OUTCOME_NOT_EVALUATED")
+RC_CONSTANTS = ("EVAL_NOT_EVALUATED_STATUS", "EVAL_NOT_EVALUATED_OUTCOME")
 
 # What scripts/eval_dashboard/collect.py's `_FINAL_VERDICT` needs from the
 # final line: the verdict word, then the duration in this exact shape. Held
@@ -38,11 +47,11 @@ FINAL_LINE = re.compile(
 )
 
 
-def _lifted(pattern: str, what: str, flags: int = re.M) -> str:
-    src = SCRIPT.read_text(encoding="utf-8")
+def _lifted(pattern: str, what: str, flags: int = re.M, path: pathlib.Path = SCRIPT) -> str:
+    src = path.read_text(encoding="utf-8")
     match = re.search(pattern, src, flags)
     if match is None:  # pragma: no cover - a rename should say so loudly
-        raise AssertionError(f"{what} not found in {SCRIPT}")
+        raise AssertionError(f"{what} not found in {path}")
     return match.group(0)
 
 
@@ -52,6 +61,14 @@ def function_body() -> str:
 
 def constants() -> list[str]:
     return [_lifted(rf"^readonly {name}=.*$", name) for name in CONSTANTS]
+
+
+def rc_constants() -> list[str]:
+    return [_lifted(rf"^readonly {name}=.*$", name, path=RC_SCRIPT) for name in RC_CONSTANTS]
+
+
+def _shell_value(line: str) -> str:
+    return line.split("=", 1)[1].strip('"')
 
 
 def _python_constant(path: pathlib.Path, name: str) -> str:
@@ -136,11 +153,24 @@ class AnnounceSuiteVerdictTestCase(unittest.TestCase):
         nothing at runtime checks they agree, so this does."""
         status_line, outcome_line = constants()
         self.assertEqual(
-            status_line.split("=", 1)[1].strip('"'),
+            _shell_value(status_line),
             _python_constant(GATE, "SUITE_EXIT_NOT_EVALUATED"),
         )
         self.assertEqual(
-            outcome_line.split("=", 1)[1].strip('"'),
+            _shell_value(outcome_line),
+            _python_constant(SCORING, "SUITE_OUTCOME_NOT_EVALUATED").strip('"'),
+        )
+
+    def test_the_rc_driver_constants_match_the_scorer_and_the_gate(self):
+        """The RC driver's own copy, one hand-off further down: it reads the
+        presubmit's status and the JSON's word, and its tests stub both."""
+        status_line, outcome_line = rc_constants()
+        self.assertEqual(
+            _shell_value(status_line),
+            _python_constant(GATE, "SUITE_EXIT_NOT_EVALUATED"),
+        )
+        self.assertEqual(
+            _shell_value(outcome_line),
             _python_constant(SCORING, "SUITE_OUTCOME_NOT_EVALUATED").strip('"'),
         )
 

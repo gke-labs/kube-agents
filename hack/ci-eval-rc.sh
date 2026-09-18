@@ -337,7 +337,10 @@ main() {
       echo "does not hold a release, and the non-inferiority comparison stays"
       echo "advisory while the baseline store is maturing."
       echo
-      if [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ]; then
+      # The verdict, not the status: a 2 the JSON did not confirm is RED
+      # above, and this paragraph would tell the reader the opposite of the
+      # row three lines up. The status keeps the failed deploy's NOT RUN out.
+      if [ "${verdict}" = "NOT RUN" ] && [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ]; then
         echo "The run could not certify a verdict: an admitted case lost every"
         echo "repetition to infrastructure, so the candidate was not measured"
         echo "on it. Nothing here is a judgement on the candidate; rerun when"

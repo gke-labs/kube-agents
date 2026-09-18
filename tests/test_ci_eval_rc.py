@@ -472,6 +472,11 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertNotIn("NOT RUN", result.stdout)
         summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
         self.assertIn("| Verdict | RED |", summary)
+        # The summary keys its "not measured" paragraph on the verdict, not on
+        # the status: a RED row followed by "rerun when the environment is
+        # healthy" would tell the reader the opposite of the row.
+        self.assertNotIn("could not certify", summary)
+        self.assertNotIn("rerun when the environment is healthy", summary)
 
     def test_an_exit_2_whose_verdict_json_says_red_is_red(self):
         root, _ = self.build_repo(
@@ -480,7 +485,10 @@ class RcEvalDriverTestCase(unittest.TestCase):
         )
         result = self.run_driver(root)
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("| Verdict | RED |", (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8"))
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | RED |", summary)
+        self.assertNotIn("could not certify", summary)
+        self.assertNotIn("rerun when the environment is healthy", summary)
 
     def test_writes_the_target_and_summary_artifacts(self):
         root, candidate = self.build_repo()
