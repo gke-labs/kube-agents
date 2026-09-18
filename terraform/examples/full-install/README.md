@@ -63,9 +63,10 @@ install without the interview.
   (`stockout_pubsub_sink`), and publisher IAM binding.
 - Optionally (`enable_drift_pubsub = true`) the drift detector's audit-log
   ingress ([`drift-pubsub`](../../modules/drift-pubsub) module): a Log Router
-  sink exporting GKE audit logs, the drift-audit Pub/Sub topic and pull
-  subscription, and the sink-writer and agent-GSA IAM on them. See
-  [Drift audit-log ingress](#drift-audit-log-ingress).
+  sink exporting GKE audit logs (`drift_pubsub_sink`), the drift-audit Pub/Sub
+  topic (`drift_pubsub_topic`) and pull subscription
+  (`drift_pubsub_subscription`), and the sink-writer and agent-GSA IAM on
+  them. See [Drift audit-log ingress](#drift-audit-log-ingress).
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -196,6 +197,18 @@ KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
 `variables.tf` carries the limits to read before relying on any of this.
+The drift audit-log ingress has the same one-default-per-project shape, with
+adoption in place of a collision: with `enable_drift_pubsub` on,
+`drift_pubsub_topic`, `drift_pubsub_subscription` and `drift_pubsub_sink` each
+default to one name, and `lifecycle.sh apply` imports a resource of that name
+that exists but is not in its state, which it cannot tell from one the other
+live install owns. A second install that turns the flag on names all three
+(through the front doors, `TF_VAR_drift_pubsub_topic=...` and the other two as
+lines in `install.env`, since the generator writes none of them) or leaves the
+flag off; otherwise its apply adopts the first install's topic, subscription
+and sink into its own state, and its teardown removes them, retained messages
+included. The stockout trio (`stockout_pubsub_*`) is adopted the same way and
+carries the same requirement.
 Versioning is the recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
@@ -570,14 +583,17 @@ uninstall its standalone release before setting these variables (`helm uninstall
 
 `enable_drift_pubsub = true` (default `false`) instantiates the
 [`drift-pubsub`](../../modules/drift-pubsub) module: a Log Router sink that
-exports mutating GKE audit-log calls, the `platform-agent-drift-audit` topic,
-the `platform-agent-drift-audit-sub` pull subscription, `roles/pubsub.publisher`
-on the topic for the sink's writer identity, and `roles/pubsub.subscriber` plus
+exports mutating GKE audit-log calls (`drift_pubsub_sink`, default
+`platform-agent-drift-audit-sink`), the topic it publishes to
+(`drift_pubsub_topic`, default `platform-agent-drift-audit`), the pull
+subscription (`drift_pubsub_subscription`, default
+`platform-agent-drift-audit-sub`), `roles/pubsub.publisher` on the topic for
+the sink's writer identity, and `roles/pubsub.subscriber` plus
 `roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
-`pubsub.googleapis.com` to the enabled APIs. Only the module's two required
-inputs are passed, so its defaults decide the names, the 31-day retention and
-the cluster scope, which is every GKE cluster in the project; a caller that
-needs the module's other knobs instantiates it directly.
+`pubsub.googleapis.com` to the enabled APIs. Beyond the three names, only the
+module's two required inputs are passed, so its defaults decide the 31-day
+retention and the cluster scope, which is every GKE cluster in the project; a
+caller that needs the module's other knobs instantiates it directly.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the
@@ -594,7 +610,10 @@ module's lease filter, per its README) into a subscription that retains them
 for 31 days and never expires: Pub/Sub storage cost and a backlog, not a
 running feature. `lifecycle.sh apply` adopts a topic, subscription or sink of
 those names left behind by an earlier install before applying, the way it
-adopts the stockout trio, so a re-install does not 409 on them.
+adopts the stockout trio, so a re-install does not 409 on them. That adoption
+is by name and cannot tell a leftover from another install's live trio, so a
+second install in the same project that turns the flag on sets its own three
+names first ([Remote state](#remote-state)).
 
 The variable is for a hand-driven apply. The installer front doors
 (`install.sh`, `upgrade.sh`) have no `install.env` key for it and regenerate

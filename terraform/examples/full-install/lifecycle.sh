@@ -136,19 +136,13 @@ readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 # The drift-pubsub module's three importable resources, adopted by adopt_kms
-# the way the stockout trio is. Their names are constants rather than tfvar
-# reads: the composition passes the module no names, so they are the defaults
-# of topic_name, subscription_name and sink_name in
-# terraform/modules/drift-pubsub/variables.tf, and a default that moves there
-# must move here too. A stale name costs an unadopted resource and a 409 on
-# re-install, never a wrong import, because each address is paired with the
-# one name it can hold.
+# the way the stockout trio is. Their names are read from the composition's
+# drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink
+# variables, which main.tf passes to the module, so the name adopted is always
+# the name this state would create.
 readonly DRIFT_TOPIC_ADDRESS="module.drift_pubsub[0].google_pubsub_topic.drift_audit"
 readonly DRIFT_SUBSCRIPTION_ADDRESS="module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
 readonly DRIFT_SINK_ADDRESS="module.drift_pubsub[0].google_logging_project_sink.drift_audit"
-readonly DRIFT_TOPIC_NAME="platform-agent-drift-audit"
-readonly DRIFT_SUBSCRIPTION_NAME="platform-agent-drift-audit-sub"
-readonly DRIFT_SINK_NAME="platform-agent-drift-audit-sink"
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -388,10 +382,20 @@ adopt_kms() {
   fi
 
   if [[ "$(tfvar enable_drift_pubsub)" == "true" ]]; then
+    # Adoption is by name, and the names are one fixed default per project,
+    # so an install that shares a project with another one names its own trio
+    # (the README's second-install section); this block cannot tell a
+    # resource an earlier install left behind from one another live install
+    # owns. As with the stockout trio, each variable has a default, so tfvar
+    # never returns empty here.
+    local drift_topic drift_sub drift_sink
+    drift_topic=$(tfvar drift_pubsub_topic)
+    drift_sub=$(tfvar drift_pubsub_subscription)
+    drift_sink=$(tfvar drift_pubsub_sink)
     targets+=(
-      "$DRIFT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$DRIFT_TOPIC_NAME"
-      "$DRIFT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$DRIFT_SUBSCRIPTION_NAME"
-      "$DRIFT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$DRIFT_SINK_NAME"
+      "$DRIFT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$drift_topic"
+      "$DRIFT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$drift_sub"
+      "$DRIFT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$drift_sink"
     )
   fi
 

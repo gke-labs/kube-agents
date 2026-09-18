@@ -133,7 +133,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # README before turning it on. Hand-driven applies only: the installer front
 # doors regenerate this file without the key and would remove the trio on
 # their next apply; through them, put TF_VAR_enable_drift_pubsub=true in
-# install.env instead.
+# install.env instead. A second install in the same project names its own
+# trio (drift_pubsub_topic, drift_pubsub_subscription, drift_pubsub_sink):
+# lifecycle.sh adopts them by name, and would adopt the first install's.
 # enable_drift_pubsub = true
 
 # IAM. "read-only" (default) selects the bundle the composition grants;

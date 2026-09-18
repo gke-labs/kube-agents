@@ -345,18 +345,23 @@ module "chat_pubsub" {
 }
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
-# and pull subscription, and the sink-writer and detector IAM. Only the two
-# required inputs are passed, so the module's defaults decide the names, the
-# retention and the cluster scope (every GKE cluster in the project). The
-# detector that consumes the subscription, k8s-operator/cmd/drift-detector, is
-# not yet built into any image or launched by any install
-# (docs/designs/drift-detection.md), so nothing reads it.
+# and pull subscription, and the sink-writer and detector IAM. The three names
+# are composition variables, as the stockout trio's are, because lifecycle.sh
+# adopts them by name and a second install in the project has to be able to
+# name its own; the module's defaults decide the rest (retention, backoff, and
+# the cluster scope, every GKE cluster in the project). The detector that
+# consumes the subscription, k8s-operator/cmd/drift-detector, is not yet built
+# into any image or launched by any install (docs/designs/drift-detection.md),
+# so nothing reads it.
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
 
   project_id                     = var.project_id
   detector_service_account_email = module.kube_agents_iam.service_account_email
+  topic_name                     = var.drift_pubsub_topic
+  subscription_name              = var.drift_pubsub_subscription
+  sink_name                      = var.drift_pubsub_sink
 
   depends_on = [google_project_service.required]
 }
