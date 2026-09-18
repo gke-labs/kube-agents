@@ -79,6 +79,10 @@ ROLLBACK_TAG="${ROLLBACK_TAG:-}"
 HANDOFF_DONE="false"
 LITELLM_POLICY_HANDED_OFF="false"
 OPERATOR_REPLICAS_BEFORE_HANDOFF=""
+# True from the GA's operator step (which applies the GA's CRDs first) until
+# the candidate's operator step has applied the candidate's again; the EXIT
+# trap puts the candidate's back when a failure lands in between.
+TARGET_CRDS_MAY_BE_APPLIED="false"
 
 summary() {
   [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
@@ -223,6 +227,18 @@ collect_diagnostics() {
     # otherwise leave the operator at zero replicas: on the nightly the
     # teardown erases that, on a workstation it is an outage.
     restart_operator_after_handoff || true
+    # The runbook's first repair after a refused operator step: put the
+    # candidate's CRDs back, so the candidate's operator is not left running
+    # against the GA's schema with the fields it added pruned.
+    if [ "${TARGET_CRDS_MAY_BE_APPLIED:-false}" = "true" ]; then
+      echo "==> Re-applying the candidate's CRDs from ${CANDIDATE_SHA:0:7}."
+      if { [ -d "${CANDIDATE_CHECKOUT}/charts/kube-agents/crds" ] || checkout_at "${CANDIDATE_SHA}" "${CANDIDATE_CHECKOUT}"; } &&
+        kubectl apply --server-side --force-conflicts -f "${CANDIDATE_CHECKOUT}/charts/kube-agents/crds/"; then
+        record "restore candidate CRDs" "✅" "re-applied from ${CANDIDATE_SHA:0:7} after the failure"
+      else
+        record "restore candidate CRDs" "❌ failed" "re-apply them by hand from the candidate checkout"
+      fi
+    fi
     # Pod listings and events rather than `describe` or the CR's spec: those
     # carry the rendered environment (allowlists, channel ids, the project),
     # and the artifact is downloadable from a public repository.
@@ -284,12 +300,16 @@ run_upgrade() {
 # Refusing here is what keeps a missing tag from being discovered as an
 # ImagePullBackOff after the CRDs and the operator have already moved.
 release_image_names() {
-  local checkout="$1"
+  local checkout="$1" names=""
   if [ -f "${checkout}/images.json" ]; then
-    jq -r '.images[] | select(.origin == "first-party" and .tagPolicy == "release") | .name' "${checkout}/images.json"
-  else
-    echo "${RETAGGED_IMAGE_NAMES}"
+    names="$(jq -r '.images[] | select(.origin == "first-party" and .tagPolicy == "release") | .name' "${checkout}/images.json")"
   fi
+  # An inventory that names nothing (older fields, another spelling) must not
+  # turn the check into a pass that probed nothing.
+  if [ -z "${names}" ]; then
+    names="${RETAGGED_IMAGE_NAMES}"
+  fi
+  echo "${names}"
 }
 
 check_images_exist() {
@@ -426,6 +446,10 @@ else
 fi
 
 CURRENT_STEP="rollback operator ${ROLLBACK_TAG}"
+# The GA's operator step applies the GA's CRDs before its helm upgrade, so
+# from here a failure leaves the target schema on the cluster until the
+# candidate's operator step puts the candidate's back.
+TARGET_CRDS_MAY_BE_APPLIED="true"
 run_upgrade "${ROLLBACK_CHECKOUT}" "${ROLLBACK_TAG}" operator
 restart_operator_after_handoff
 record "rollback operator" "✅" "helm revision $(helm history "${HELM_RELEASE}" -n "${NAMESPACE}" -o json 2>/dev/null | jq -r '.[-1].revision // "?"')"
@@ -461,6 +485,7 @@ if [ "${ROLL_FORWARD}" = "true" ]; then
 
   CURRENT_STEP="roll forward operator"
   run_upgrade "${CANDIDATE_CHECKOUT}" "${CANDIDATE_SHA}" operator
+  TARGET_CRDS_MAY_BE_APPLIED="false"
   record "roll forward operator" "✅" ""
 
   CURRENT_STEP="roll forward harness"

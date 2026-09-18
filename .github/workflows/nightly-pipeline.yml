@@ -222,10 +222,11 @@ jobs:
           version: "579.0.0"
           install_components: "beta,gke-gcloud-auth-plugin"
 
-      # The install settings reconcile-environment.yml renders, less the two
-      # allowlist switches only the strict render reads. The operator and
-      # harness modes take the cluster, project and namespace from the file
-      # and re-tag the release; they apply nothing else from it.
+      # The install settings reconcile-environment.yml renders, less the
+      # secrets and the two allowlist switches: the operator and harness
+      # modes take the cluster, project and namespace from the file and
+      # re-tag the release, recovering what else they need from the live
+      # Secrets, so no credential has a reason to reach this job.
       - name: Roll back to the previous GA, check, and roll forward
         id: rollback
         env:
@@ -266,12 +267,6 @@ jobs:
           KMS_KEY: ${{ vars.KMS_KEY }}
           GITOPS_ORG: ${{ vars.GITOPS_ORG }}
           GITOPS_REPO: ${{ vars.GITOPS_REPO }}
-          GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
         run: ./scripts/release/rollback_environment.sh
 
       - name: Upload the rollback leg's logs and diagnostics
