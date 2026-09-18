@@ -917,26 +917,30 @@ def test_an_exhausted_delegation_wait_records_the_abandoned_tasks(
     assert result.metadata["abandoned_tasks"] == dropped
 
 
-def test_with_no_port_pinned_each_run_forwards_on_its_own_free_port(
+def test_with_no_port_pinned_a_process_forwards_once_on_its_own_free_port(
     fake_bus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No ``AGENT_A2A_LOCAL_PORT``: the harness picks a free port per process
-    and owns the forward on it, so an owner's teardown reaches no sibling (the
-    api path's reason for a per-unit port in ``hack/ci-eval-pr.sh``). A pinned
-    port is used as given, for a forward the operator runs."""
+    """No ``AGENT_A2A_LOCAL_PORT``: the harness picks a free port once per
+    process and owns the forward on it, so an owner's teardown reaches no
+    sibling (the api path's reason for a per-unit port in
+    ``hack/ci-eval-pr.sh``), and a second run in the process rides the first
+    run's forward rather than leaving it idle on a port nothing dials again.
+    A pinned port is used as given, for a forward the operator runs."""
     forwards: list[int] = []
     monkeypatch.delenv("AGENT_A2A_NATS_URL")
     monkeypatch.delenv("AGENT_A2A_LOCAL_PORT", raising=False)
+    monkeypatch.setattr(harness, "_A2A_PICKED_PORT", None)
     monkeypatch.setattr(harness, "_ensure_port_forward", lambda port, **k: forwards.append(port))
     picked = iter([31001, 31002])
     monkeypatch.setattr(harness, "_free_local_port", lambda: next(picked))
 
     KubeAgentsHarness().run(_PROMPT)
     KubeAgentsHarness().run(_PROMPT)
-    assert forwards == [31001, 31002]
+    assert forwards == [31001, 31001]
+    assert next(picked) == 31002  # the second run picked nothing
     assert [client.url for client in fake_bus.instances] == [
         "nats://127.0.0.1:31001",
-        "nats://127.0.0.1:31002",
+        "nats://127.0.0.1:31001",
     ]
 
     monkeypatch.setenv("AGENT_A2A_LOCAL_PORT", "24999")

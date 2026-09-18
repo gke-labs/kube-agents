@@ -70,9 +70,10 @@ Environment:
     AGENT_A2A_ADDRESSEE: The executor the task is addressed to (default
         ``platform``, the only addressee the ``eval`` grants reach).
     AGENT_A2A_LOCAL_PORT: Local side of the port-forward to the NATS Service.
-        Unset, the harness picks a free port per process and owns the forward
-        on it, so parallel units never share a tunnel; set it to reuse a
-        forward you run yourself. The remote side is always the client port
+        Unset, the harness picks a free port once per process and owns the one
+        forward on it, which every run in the process rides, so parallel units
+        never share a tunnel and a run leaves no idle forward; set it to reuse
+        a forward you run yourself. The remote side is always the client port
         4222.
     AGENT_A2A_NATS_SERVICE: The NATS Service to port-forward to (default
         ``<AGENT_SERVICE_NAME>-a2a-nats``); the credentials Secret is
@@ -229,10 +230,11 @@ _MAX_ARTIFACTS = 8
 # callers would rather give up than hold the run open.
 _EXEC_TIMEOUT = 60.0
 
-_PF_LOCK = threading.Lock()  # guards the three registries below
+_PF_LOCK = threading.Lock()  # guards the four registries below
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 _PF_PORT_LOCKS: dict[int, threading.Lock] = {}
 _PF_LOG_DIR: Path | None = None
+_A2A_PICKED_PORT: int | None = None  # the a2a door's port, picked free once per process
 
 
 def _port_establishment_lock(port: int) -> threading.Lock:
@@ -290,6 +292,21 @@ def _free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((_LOOPBACK_HOST, 0))
         return int(sock.getsockname()[1])
+
+
+def _a2a_local_port() -> int:
+    """The process's own a2a port: picked free on the first call, then reused.
+
+    One port per process, not per run: the forward on it is established once
+    and ridden by every later run in the process (``_ensure_port_forward`` is
+    a no-op while the port is open), and it is torn down by atexit or by a
+    retry's reset, never left idle behind a run that moved to a fresh port.
+    """
+    global _A2A_PICKED_PORT
+    with _PF_LOCK:
+        if _A2A_PICKED_PORT is None:
+            _A2A_PICKED_PORT = _free_local_port()
+        return _A2A_PICKED_PORT
 
 
 @atexit.register
@@ -1330,7 +1347,9 @@ class KubeAgentsHarness(AgentHarness):
         # A URL given outright is somebody else's tunnel (or a bus on the
         # network): nothing to establish and nothing to respawn between retries.
         own_tunnel = not url
-        # No port pinned: a free one, picked here and owned by this process. A
+        # No port pinned: a free one, picked once per process and owned by it,
+        # so every run in the process rides the one forward and a new run
+        # leaves no idle kubectl behind on a port nothing dials again. A
         # shared default would put every parallel unit through whichever
         # process forwarded first, and that owner's atexit teardown, or its
         # retry's respawn, drops the listener under its siblings mid-task;
@@ -1339,7 +1358,7 @@ class KubeAgentsHarness(AgentHarness):
         # operator runs is left alone, and _ensure_port_forward rides it.
         local_port = pinned_port
         if local_port is None and own_tunnel:
-            local_port = _free_local_port()
+            local_port = _a2a_local_port()
 
         def _tunnel(reset: bool) -> None:
             if not own_tunnel:
