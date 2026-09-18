@@ -82,9 +82,11 @@ the presubmit exports nothing new until it chooses to. The exchange:
    forward machinery and its retry classes.
 2. `POST /inject` with a synthetic conversation key, a principal the gateway resolves through
    the inject section of its principal map (below), the prompt as the text, and the run id, case
-   id and repetition, `<run>/<case>/<rep>`, as the backend message id; the run id is minted once
-   per harness invocation from the variable the api transport honours for its conversation id,
-   `AGENT_CONVERSATION_ID`, or fresh when it is unset. The gateway takes the message through
+   id and repetition, `<run>/<case>/<rep>`, as the backend message id; the run id is minted fresh
+   on every harness invocation, and the pin the api transport honours for its conversation id,
+   `AGENT_CONVERSATION_ID`, is not honoured here, because on the api path a pinned id only
+   shares a conversation while on this path it would replay an earlier run's result through
+   the dedupe below. The gateway takes the message through
    `handleInbound` like a message from any backend: routing, the session record, `startTask`,
    and the relay back, with `taskId`, `contextId`, `correlationId` and the `authority` block
    minted by the gateway. The response names the task id. The adapter dedupes on the backend
@@ -109,11 +111,13 @@ the presubmit exports nothing new until it chooses to. The exchange:
    `AGENT_INJECT_TIMEOUT` (default 1800 s), not one request as `AGENT_HTTP_TIMEOUT` bounds on
    the api transport; it is floored at the gateway's first-event grace plus a margin (below),
    and the harness refuses to start below the floor. A timeout reads the conversation's state
-   first, through the adapter's read route (below), and cancels only once that state shows an
-   executor accepted the task; the cancel goes through an explicit cancel route on the
-   conversation, which lands on the bus as `kind: cancel` exactly as the text route's `stop`
-   does, and the harness never sends the stop text. The harness sends no message at the
-   deadline, so nothing it does there can mint a task or spend a model turn.
+   first, through the adapter's read route (below), classifies from what it reads, and then
+   cancels whenever that state still holds an active task, whether or not an executor has
+   touched it; the cancel goes through an explicit cancel route that takes the task id the
+   opening response named, whether or not the record still holds it, and lands on the bus as
+   `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the stop
+   text. The harness sends no message at the deadline, so nothing it does there can mint a
+   task or spend a model turn.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
    executor publishes them. Token counts are not on the bus, and the scorer's liveness rule
@@ -178,8 +182,9 @@ install that wants no real backend from one whose relay URL failed to render. Th
 guard change drops only that refusal, only when the door is rendered, and keeps the two-backend
 refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
 the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
-run as infrastructure when Chat is not the one, before any case grades; the operator's render of
-the relay URL is covered by its golden tests, which is where a failed render is caught.
+run as infrastructure when Chat is not the one, before any case grades. The stage-2 change that
+renders the gateway's relay URL adds it to the operator's golden set, which is where a failed
+render is caught from then on; until then the eval install has no real backend to lose.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
 for a dead tunnel: the adapter unreachable, the gateway refusing the injection, no executor
@@ -208,15 +213,21 @@ harness classifies from one of four outcomes, by the highest executor state the 
 no active task and a terminal posted, the run finished as the deadline fired, so it is graded
 like any other; an active task with no executor event, nobody took it, infrastructure, whether
 or not the gateway has released the conversation yet; an active task at `submitted` and never
-`working`, an executor accepted it and queued it for the whole budget, infrastructure, and the
-cancel goes out, which the bridge answers with a `canceled-before-start` terminal; an active task
-at `working`, a graded timeout, and the cancel goes out. The release still happens on the next
-real inbound message, as today, which matters only if the key is reused, and the harness uses a
-fresh key per run, case and repetition. The cancel follows the read rather than preceding it,
-because the read is what says whether an executor holds the task: a cancel sent to a task nobody
-consumed gets "cancel sent" back and no terminal ever follows. That is how the harness and the
-gateway agree on what "nobody took it" means, one grace read from the gateway rather than
-configured twice, and nothing the harness does at the deadline can mint a task. A `failed`
+`working`, an executor accepted it and queued it for the whole budget, infrastructure; an active
+task at `working`, a graded timeout. In every outcome that leaves an active task, the
+no-executor one included, the cancel then goes out for the task id the opening response named,
+whether or not the record still holds it. The classification comes from the read and never from
+the cancel's answer: a cancel sent to a task nobody consumed gets "cancel sent" back and no
+terminal follows, so the answer is not evidence, and the cancel is sent anyway because the
+submission is durable on the task's `in` subject under the bridge's durable consumer, so a bridge
+that first binds inside the stream's retention window would otherwise be handed the stale case
+prompt and run it with the install's credentials; with the cancel behind it in stream order the
+bridge answers `canceled-before-start` and runs nothing, and a task at `submitted` gets the same
+terminal. The release still happens on the next real inbound message, as today, which matters
+only if the key is reused, and the harness uses a fresh key per run, case and repetition. That is
+how the harness and the gateway agree on what "nobody took it" means, one grace read from the
+gateway rather than configured twice, and nothing the harness does at the deadline can mint a
+task. A `failed`
 terminal is not graded on its state alone, because the bridge publishes `failed` for its own
 faults as well as the persona's. The reason rides as the terminal's status message, written
 `reason: <token>` or `reason: <token> - <detail>`; the harness strips the `reason:` prefix and
@@ -248,8 +259,8 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
-transport. `tool_called` reads the trajectory, which on this path
-has data only when the executor publishes `activity` artifacts; the Hermes bridge publishes
+transport. `tool_called` reads the trajectory, which on this path has tool-call data only when
+the executor publishes `activity` artifacts; the Hermes bridge publishes
 status updates and a `result` artifact and no `activity` or `progress` artifacts, while the
 worker adapter publishes `activity` and `progress` beside the result, so a case
 that gates on `tool_called` has no data on stage 1 until the bridge publishes activity or the
@@ -408,8 +419,9 @@ that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results 
 `kanban_show` payloads in the trajectory, and gives up after three turns that report nothing, and
 on this path the trajectory holds no tool calls, only the lifecycle entries of step 4. Stage 1
 writes the wait again for the inject path: card ids and statuses read from the `result` text, the
-status question sent as a new turn on the same conversation key, the delivered card results
-appended to the graded answer as
+status question sent as a new turn on the same conversation key with its own backend message
+id, `<run>/<case>/<rep>/status-<n>`, so the dedupe does not answer it with the opening task,
+the delivered card results appended to the graded answer as
 today's wait appends them, so `ledger_issue_contains` and `report_contains` see what the worker
 returned, and the worker logs read by those ids for `worker_commands`. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
