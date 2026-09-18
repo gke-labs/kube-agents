@@ -1,8 +1,10 @@
 """Unit tests for install.sh validation and execution routines.
 
 Tests pure numeric SemVer (X.Y.Z) references, 40-character commit SHAs,
-piped stdin (curl | bash) execution, local script path resolution, and the
-NetworkPolicy enablement sequence install.sh runs against adopted clusters.
+piped stdin (curl | bash) execution, local script path resolution, the
+NetworkPolicy enablement sequence install.sh runs against adopted clusters,
+and that the helpers driving install.sh here detach from the controlling
+terminal, so a prompt auto-selects its default instead of blocking the suite.
 """
 
 import json
@@ -14,10 +16,12 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from tests.testing.common import (
     INSTALLER_HELP_BANNER,
@@ -42,11 +46,39 @@ _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 # KUBE_AGENTS_SOURCE_ONLY source. Prepend this to reach it.
 _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 
-# Bound on a sourced install.sh function run by the helpers that pass it.
-# Each is a stub-backed call that finishes in well under a second, so a run
-# that reaches this is stuck -- on a prompt, if the terminal detach ever
-# slips -- and the bound turns that into a failure with output, not a hang.
+# Bound on a sourced install.sh function run through _run_installer_bash.
+# Each is a stub-backed call that takes a few seconds at most (the slowest
+# measured, a run_menu_system save, takes about two), so a run that reaches
+# this is stuck -- on a prompt, if the terminal detach ever slips -- and the
+# bound turns that into a failure with output, not a hang.
 _INSTALLER_RUN_TIMEOUT_SECONDS = 60
+
+
+def _run_installer_bash(body, env, cwd=_REPO_ROOT):
+    """Run a bash body that sources install.sh, detached from any terminal.
+
+    install.sh's prompts read /dev/tty whenever has_controlling_tty finds one,
+    and /dev/tty resolves through the controlling terminal rather than stdin,
+    so a child that only had stdin redirected still blocks a developer's run
+    on the first prompt it reaches, forever, with the prompt captured and
+    nothing on screen. start_new_session puts the child in a session with no
+    controlling terminal, the branch CI's terminal-less runners already take,
+    so every prompt auto-selects its default; stdin is closed for the same
+    reason, and the timeout bounds whatever is left. The helpers whose runs
+    the hang was traced to go through here, and
+    InstallerHelpersDetachFromTheTerminalTest pins both that set and the
+    detach itself; a new helper for a function that prompts belongs here too.
+    """
+    return subprocess.run(
+        ["bash", "-c", body],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+        env=env,
+        cwd=str(cwd),
+    )
 
 
 class InstallScriptValidationTest(unittest.TestCase):
@@ -76,20 +108,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
         overrides.update(env or {})
         full_env = get_isolated_test_env(overrides=overrides, bin_dir=bin_dir)
-        # start_new_session detaches the child from the controlling terminal a
-        # developer's shell has, so has_controlling_tty finds no /dev/tty and
-        # every prompt auto-selects its default as it does in CI; stdin is
-        # closed for the same reason, and the timeout bounds what is left.
-        return subprocess.run(
-            ["bash", "-c", setup],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
-            env=full_env,
-            cwd=str(cwd or _REPO_ROOT),
-        )
+        return _run_installer_bash(setup, full_env, cwd=cwd or _REPO_ROOT)
 
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
@@ -2280,15 +2299,9 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
                 "ensure_existing_cluster_network_policy proj cluster region\n"
                 'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
             )
-            proc = subprocess.run(
-                ["bash", "-c", body],
-                capture_output=True,
-                text=True,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
-                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
-                cwd=str(_REPO_ROOT),
+            proc = _run_installer_bash(
+                body,
+                get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
@@ -2413,16 +2426,7 @@ class EnsureExistingClusterWorkloadIdentityTest(unittest.TestCase):
                 f"{opt_in_line}"
                 "ensure_existing_cluster_workload_identity proj cluster region\n"
             )
-            proc = subprocess.run(
-                ["bash", "-c", body],
-                capture_output=True,
-                text=True,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
-                cwd=str(_REPO_ROOT),
-            )
+            proc = _run_installer_bash(body, get_isolated_test_env(bin_dir=str(bin_dir)))
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
 
@@ -5405,42 +5409,22 @@ echo "DERIVED_SUB=$chat_sub_name"
         self.assertIn("DERIVED_SUB=legacy-managed-sub", proc.stdout)
 
 
-@unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")
-class SpinnerTerminalBranchTest(unittest.TestCase):
-    """run_with_spinner on a real terminal, the branch no piped test reaches.
+class PtyChildTestMixin:
+    """Shared plumbing for a test that forks a child under a controlling terminal.
 
-    Every other test in this file runs under a subprocess pipe, so `[ ! -t 1 ]`
-    diverts it to the fallback and the spinner loop, the cursor calls, the
-    background job and the interrupt traps never execute at all. On a terminal
-    -- where an operator actually meets them -- they all do, so these drive one.
+    The parent drains the pty for the child's life (a child that writes more
+    than the pty buffers blocks otherwise), kills the child's whole group and
+    reaps it on cleanup, and reads the child's outcome from a file it writes,
+    since the pty carries the child's screen, not its result.
     """
 
     _READY_TIMEOUT_SECS = 30
     _POLL_INTERVAL_SECS = 0.1
 
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self._tmp_path = pathlib.Path(tmp.name)
-
-    def _spawn_on_pty(self, script):
-        """Run script under bash with a controlling terminal. Returns its pid."""
-        env = get_isolated_test_env(
-            overrides={"KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json")}
-        )
-        pid, fd = pty.fork()
-        if pid == 0:
-            try:
-                os.chdir(str(_REPO_ROOT))
-                os.execvpe("bash", ["bash", "-c", script], env)
-            finally:  # pragma: no cover - only on execvpe failure
-                os._exit(127)
-        # The spinner redraws continuously, so the pty buffer fills and the child
-        # blocks on write unless someone is reading. Drain it for the run's life.
+    def _watch_pty_child(self, pid, fd):
         drain = threading.Thread(target=self._drain, args=(fd,), daemon=True)
         drain.start()
         self.addCleanup(self._cleanup_pty, pid, fd)
-        return pid
 
     @staticmethod
     def _drain(fd):
@@ -5474,6 +5458,39 @@ class SpinnerTerminalBranchTest(unittest.TestCase):
                 return path.read_text().strip()
             time.sleep(self._POLL_INTERVAL_SECS)
         self.fail(f"timed out after {self._READY_TIMEOUT_SECS}s waiting for {what} at {path}")
+
+
+@unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")
+class SpinnerTerminalBranchTest(PtyChildTestMixin, unittest.TestCase):
+    """run_with_spinner on a real terminal, the branch no piped test reaches.
+
+    Every other test in this file runs under a subprocess pipe, so `[ ! -t 1 ]`
+    diverts it to the fallback and the spinner loop, the cursor calls, the
+    background job and the interrupt traps never execute at all. On a terminal
+    -- where an operator actually meets them -- they all do, so these drive one.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp_path = pathlib.Path(tmp.name)
+
+    def _spawn_on_pty(self, script):
+        """Run script under bash with a controlling terminal. Returns its pid."""
+        env = get_isolated_test_env(
+            overrides={"KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json")}
+        )
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(str(_REPO_ROOT))
+                os.execvpe("bash", ["bash", "-c", script], env)
+            finally:  # pragma: no cover - only on execvpe failure
+                os._exit(127)
+        # The spinner redraws continuously, so the pty buffer fills and the child
+        # blocks on write unless someone is reading.
+        self._watch_pty_child(pid, fd)
+        return pid
 
     def test_the_spinner_loop_keeps_errexit_out_of_its_interruptible_commands(self):
         """The loop's forked children must not be able to fire the ERR trap.
@@ -5529,70 +5546,89 @@ echo "$rc" > "{rc_file}"
         self.assertIn("the wrapped output", log_file.read_text())
 
 
-class InstallerHelpersDetachFromTheTerminalTest(unittest.TestCase):
+class InstallerHelpersDetachFromTheTerminalTest(PtyChildTestMixin, unittest.TestCase):
     """The helpers that run install.sh functions must not hand them a terminal.
 
-    install.sh's prompts read /dev/tty whenever has_controlling_tty says there
-    is one, and /dev/tty resolves through the controlling terminal rather than
-    through stdin, so a helper that only redirects stdin still blocks a
-    developer's run on the first prompt it reaches -- forever, with the prompt
-    captured and nothing on screen -- while CI, whose runners have no terminal,
-    never sees it. pty.fork gives this process the terminal a developer's shell
-    has; a helper run under it must still report none, and the same predicate
-    run without the helper must see it, or the check proves nothing.
+    _run_installer_bash's docstring says why: a prompt reads /dev/tty whenever
+    has_controlling_tty finds one, so an attached child hangs a developer's run
+    while CI, whose runners have no terminal, stays green. Two halves pin it.
+    The runner is proved under pty.fork, which gives this process the terminal
+    a developer's shell has: the predicate run bare must see it, or the check
+    proves nothing, and run through the runner it must not. Then each helper
+    the hang was traced to is shown to call that runner, so dropping the
+    detach from one of them fails here, in CI, at once.
     """
 
-    _RESULT_TIMEOUT_SECS = 30
-    _POLL_INTERVAL_SECS = 0.1
+    # The pty child runs two bounded bash calls; waiting longer than both lets
+    # the child's TimeoutExpired, which names the command and carries its
+    # output, reach the report instead of a bare "timed out" from the parent.
+    _CHILD_OVERHEAD_SECS = 10
+    _READY_TIMEOUT_SECS = 2 * _INSTALLER_RUN_TIMEOUT_SECONDS + _CHILD_OVERHEAD_SECS
     _PROBE = "has_controlling_tty && echo TTY=yes || echo TTY=no"
 
-    def test_run_install_func_hides_the_controlling_terminal(self):
+    def test_the_runner_hides_the_controlling_terminal(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         result_path = pathlib.Path(tmp.name) / "result.json"
         pid, fd = pty.fork()
         if pid == 0:  # pragma: no cover - runs in the forked child
             self._probe_in_child(result_path)
-        drain = threading.Thread(target=self._drain, args=(fd,), daemon=True)
-        drain.start()
-        self.addCleanup(self._cleanup_pty, pid, fd)
-        result = self._await_result(result_path)
+        self._watch_pty_child(pid, fd)
+        result = json.loads(self._await_file(result_path, "the pty child's result"))
         self.assertNotIn("error", result, result.get("error"))
         self.assertEqual(
             "TTY=yes",
-            result["control"],
+            result["bare"],
             f"the forked test process has no controlling terminal, so nothing is checked: {result}",
         )
         self.assertEqual(
             "TTY=no",
-            result["helper"],
-            f"_run_install_func handed install.sh the controlling terminal: {result}",
+            result["runner"],
+            f"_run_installer_bash handed install.sh the controlling terminal: {result}",
         )
+
+    def test_every_helper_that_can_prompt_uses_the_runner(self):
+        """The three helpers the terminal hang was traced to; the set the fix covers."""
+        validation = InstallScriptValidationTest()
+        validation.setUp()
+        self.addCleanup(validation.doCleanups)
+        helpers = {
+            "InstallScriptValidationTest._run_install_func": lambda: validation._run_install_func("true"),
+            "EnsureExistingClusterNetworkPolicyTest._run": lambda: EnsureExistingClusterNetworkPolicyTest()._run(),
+            "EnsureExistingClusterWorkloadIdentityTest._run": lambda: EnsureExistingClusterWorkloadIdentityTest()._run(),
+        }
+        for name, call in helpers.items():
+            with self.subTest(helper=name):
+                with mock.patch.object(sys.modules[__name__], "_run_installer_bash") as runner:
+                    call()
+                self.assertEqual(runner.call_count, 1, f"{name} did not go through _run_installer_bash")
+                body = runner.call_args.args[0]
+                self.assertIn(f'source "{_INSTALL_SH}"', body, f"{name} handed the runner a body that does not source install.sh")
 
     @classmethod
     def _probe_in_child(cls, result_path):
-        """In the pty child: run the probe bare, then through the helper; record both; exit."""
+        """In the pty child: run the probe bare, then through the runner; record both; exit."""
         result = {}
         try:
             os.chdir(str(_REPO_ROOT))
-            case = InstallScriptValidationTest()
-            case.setUp()
-            try:
+            with tempfile.TemporaryDirectory() as tmp:
+                empty_env = pathlib.Path(tmp) / "install.env"
+                empty_env.write_text("")
+                env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)})
+                body = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{cls._PROBE}'
                 bare = subprocess.run(
-                    ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{cls._PROBE}'],
+                    ["bash", "-c", body],
                     capture_output=True,
                     text=True,
                     timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
-                    env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(case._empty_install_env)}),
+                    env=env,
                     cwd=str(_REPO_ROOT),
                 )
-                helper = case._run_install_func(cls._PROBE)
-            finally:
-                case.doCleanups()
+                runner = _run_installer_bash(body, env)
             result = {
-                "control": bare.stdout.strip(),
-                "helper": helper.stdout.strip(),
-                "helper_stderr": helper.stderr,
+                "bare": bare.stdout.strip(),
+                "runner": runner.stdout.strip(),
+                "runner_stderr": runner.stderr,
             }
         except BaseException as exc:  # the parent reports it
             result = {"error": repr(exc)}
@@ -5605,39 +5641,6 @@ class InstallerHelpersDetachFromTheTerminalTest(unittest.TestCase):
                 os.replace(staging, result_path)
             finally:
                 os._exit(0)
-
-    def _await_result(self, path):
-        deadline = time.monotonic() + self._RESULT_TIMEOUT_SECS
-        while time.monotonic() < deadline:
-            if path.exists() and path.read_text().strip():
-                return json.loads(path.read_text())
-            time.sleep(self._POLL_INTERVAL_SECS)
-        self.fail(f"timed out after {self._RESULT_TIMEOUT_SECS}s waiting for the pty child's result at {path}")
-
-    @staticmethod
-    def _drain(fd):
-        while True:
-            try:
-                if not os.read(fd, 4096):
-                    return
-            except OSError:
-                return
-
-    @staticmethod
-    def _cleanup_pty(pid, fd):
-        for killer in (lambda: os.killpg(os.getpgid(pid), signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
-            try:
-                killer()
-            except OSError:
-                pass
-        try:
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
 
 
 if __name__ == "__main__":
