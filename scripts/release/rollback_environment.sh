@@ -17,14 +17,12 @@
 #   ROLL_FORWARD             `false` to stop after the rollback. Default true.
 #   KUBE_AGENTS_INSTALL_ENV  The install's install.env. When unset, one is
 #                            rendered from the environment with
-#                            render_install_env.sh --strict, as the reconcile
-#                            path does.
+#                            render_install_env.sh (not --strict; see below).
 #   ROLLBACK_MODE            `resolve` prints the tag it would roll back to and
 #                            exits without touching anything.
 #
-# Outputs: a Markdown table in GITHUB_STEP_SUMMARY, `rollback_tag` and
-# `diagnostics_dir` in GITHUB_OUTPUT. Exit 0 only when every step and every
-# check passed.
+# Outputs: a Markdown table in GITHUB_STEP_SUMMARY and `diagnostics_dir` in
+# GITHUB_OUTPUT. Exit 0 only when every step and every check passed.
 
 set -euo pipefail
 
@@ -49,6 +47,7 @@ readonly OPERATOR_POD_SELECTOR="app.kubernetes.io/name=kube-agents-operator"
 readonly LITELLM_POLICY="litellm-policy"
 readonly OPERATOR_MANAGED_BY_LABEL="platformagent-controller"
 readonly HELM_MANAGED_BY_LABEL="Helm"
+readonly HELM_KEEP_ANNOTATION="helm.sh/resource-policy=keep"
 readonly OPERATOR_SCALE_TIMEOUT_SECONDS=120
 # The last GA whose chart renders litellm-policy itself; from the next one on
 # the operator creates and owns it (#1195, #1488). The chart text is no guide:
@@ -73,8 +72,11 @@ ROLLBACK_MODE="${ROLLBACK_MODE:-run}"
 ROLL_FORWARD="${ROLL_FORWARD:-true}"
 CANDIDATE_SHA="${CANDIDATE_SHA:-}"
 ROLLBACK_TAG="${ROLLBACK_TAG:-}"
-# Set by the litellm-policy handoff, read by the restart and the EXIT trap.
+# Set by the litellm-policy handoff. HANDOFF_DONE means the operator is down
+# and is cleared by the restart; LITELLM_POLICY_HANDED_OFF stays set, for the
+# roll-forward to know the object is now the release's.
 HANDOFF_DONE="false"
+LITELLM_POLICY_HANDED_OFF="false"
 OPERATOR_REPLICAS_BEFORE_HANDOFF=""
 
 summary() {
@@ -116,7 +118,6 @@ if git -C "${REPO_ROOT}" merge-base --is-ancestor "${CANDIDATE_SHA}" "${ROLLBACK
   fail "The ${ROLLBACK_TAG} release was cut from the candidate ${CANDIDATE_SHA:0:7} or from a commit after it; there is no older release to roll back to from here."
 fi
 
-output "rollback_tag" "${ROLLBACK_TAG}"
 echo "======================================================================"
 echo "🔁 ROLLBACK LEG"
 echo "Candidate (N):    ${CANDIDATE_SHA}"
@@ -164,7 +165,7 @@ if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
   release_connect_kubectl
 else
   kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1 ||
-    fail "kubectl does not reach namespace '${NAMESPACE}' on the current context; connect it to ${CLUSTER_NAME} first (gcloud container clusters get-credentials)."
+    fail "kubectl does not reach namespace '${NAMESPACE}' on the current context; connect it to ${CLUSTER_NAME:-the cluster named in install.env} first (gcloud container clusters get-credentials)."
   echo "==> Using the current kubectl context: $(kubectl config current-context)"
 fi
 
@@ -334,6 +335,7 @@ handoff_litellm_policy_if_needed() {
   kubectl scale deployment "${OPERATOR_DEPLOYMENT}" -n "${NAMESPACE}" --replicas=0
   # From here the operator is down, so from here a failure has to restore it.
   HANDOFF_DONE="true"
+  LITELLM_POLICY_HANDED_OFF="true"
   kubectl wait --for=delete pod -l "${OPERATOR_POD_SELECTOR}" -n "${NAMESPACE}" \
     --timeout="${OPERATOR_SCALE_TIMEOUT_SECONDS}s" || true
   kubectl label networkpolicy "${LITELLM_POLICY}" -n "${NAMESPACE}" \
@@ -422,6 +424,17 @@ record "check ${ROLLBACK_TAG}" "✅" "both images :${ROLLBACK_TAG}, Ready=True"
 # Roll forward: N-1 → N, the same pair from the candidate's checkout.
 # ---------------------------------------------------------------------------
 if [ "${ROLL_FORWARD}" = "true" ]; then
+  # After a handoff the GA's release owns litellm-policy, and the candidate's
+  # chart does not render it, so the roll-forward's helm upgrade would prune
+  # it and LiteLLM would run unselected until the candidate's operator
+  # recreates it. The chart README's answer for that upgrade is the keep
+  # annotation: Helm leaves the object, the operator adopts it.
+  if [ "${LITELLM_POLICY_HANDED_OFF}" = "true" ]; then
+    CURRENT_STEP="keep ${LITELLM_POLICY} across the roll-forward"
+    kubectl annotate networkpolicy "${LITELLM_POLICY}" -n "${NAMESPACE}" "${HELM_KEEP_ANNOTATION}" --overwrite
+    record "keep ${LITELLM_POLICY}" "✅" "helm.sh/resource-policy=keep, so the roll-forward does not prune it"
+  fi
+
   CURRENT_STEP="checkout candidate"
   checkout_at "${CANDIDATE_SHA}" "${CANDIDATE_CHECKOUT}"
   check_images_exist "${CANDIDATE_SHA}" "${CANDIDATE_CHECKOUT}"
