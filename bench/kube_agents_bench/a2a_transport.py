@@ -83,6 +83,7 @@ __all__ = [
     "cancel_payload",
     "message_payload",
     "mint_ids",
+    "shows_a_run",
     "task_events_subject",
     "task_in_subject",
     "task_supervisor_subject",
@@ -136,6 +137,20 @@ STATE_FAILED = "failed"
 STATE_CANCELED = "canceled"
 STATE_REJECTED = "rejected"
 TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
+
+
+def shows_a_run(state: str | None, final: bool) -> bool:
+    """Whether one status event is an executor's evidence that a model ran.
+
+    A final event, or ``working``, and nothing else. ``submitted`` is the
+    bridge queueing the task; ``input-required`` and ``auth-required`` with
+    no ``working`` before them are an executor parking it. ``Fold.started``
+    and the scorer's liveness rung are both this function, so the harness
+    never grades a deadline fold the rung would then refuse as not a run.
+    """
+    return final is True or state == STATE_WORKING
+
+
 # How an executor says why it ended a task: the terminal's status message
 # reads ``reason: <token>`` or ``reason: <token> - <detail>``
 # (docs/designs/eval-next-transport.md, stage 1).
@@ -305,17 +320,18 @@ class Fold:
 
     @property
     def started(self) -> bool:
-        """Whether an executor moved the task past ``submitted``.
+        """Whether an executor brought the task to ``working`` or a terminal.
 
         The bridge publishes ``submitted`` on accept and queues the task
         behind its workers; ``working`` is the first event a subprocess
-        produces. A fold that never left ``submitted`` is a task an executor
-        took and nobody ran. An artifact alone does not start it: the
-        scorer's liveness rung counts a ``working`` or final status entry and
-        nothing else, and this predicate is the same rule applied first, so a
-        deadline fold it grades is one the rung will grade too.
+        produces. A fold that never got there is a task an executor took and
+        nobody ran, whether it sat at ``submitted`` or was parked at
+        ``input-required`` or ``auth-required`` first, and an artifact alone
+        does not start it either. The rule is ``shows_a_run``, the one the
+        scorer's liveness rung applies, so a deadline fold this grades is one
+        the rung will grade too.
         """
-        return self.final or any(state != STATE_SUBMITTED for state in self.history)
+        return self.final or any(shows_a_run(state, False) for state in self.history)
 
     @property
     def reason(self) -> str:

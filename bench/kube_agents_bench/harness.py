@@ -945,11 +945,14 @@ def _nothing_ran(exchange: a2a.Exchange) -> bool:
     """True when no executor ran the submission before the wait ended.
 
     The accept bound says so outright. A deadline that fell first says the
-    same thing when the fold is still empty, and when the fold never left
-    ``submitted``: the bridge publishes that on accept and queues the task
-    behind its workers, so a task still there at the deadline waited out the
-    budget with no model running (docs/designs/eval-next-transport.md, stage
-    1, the same rule on both transports). Either way the record is the run
+    same thing when the fold is still empty, and when the fold never reached
+    ``working`` or a terminal: the bridge publishes ``submitted`` on accept
+    and queues the task behind its workers, and an executor that parks a task
+    at ``input-required`` has not run it either, so a task still short of
+    ``working`` at the deadline waited out the budget with no model running
+    (docs/designs/eval-next-transport.md, stage 1, the same rule on both
+    transports). ``Fold.started`` is the scorer's liveness rule, so a fold
+    graded here is a record rung 3 accepts. Either way the record is the run
     class, not an answer.
     """
     return exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED or (
@@ -1308,8 +1311,9 @@ class KubeAgentsHarness(AgentHarness):
         lands in ``metadata["abandoned_tasks"]`` on every record this method
         returns, the infrastructure one included. Exhaustion, a refused
         credential or a refused subject, a missing creds Secret, a task no
-        executor accepted inside ``AGENT_A2A_ACCEPT_TIMEOUT``, and one the
-        bridge accepted and left queued at ``submitted`` until the deadline
+        executor accepted inside ``AGENT_A2A_ACCEPT_TIMEOUT``, and one an
+        executor accepted and never brought to ``working`` or a terminal by
+        the deadline, queued at ``submitted`` or parked at ``input-required``
         (a cancel is published either way) are infrastructure.
         A task an executor took and ended ``failed`` or ``canceled`` is the
         agent's own outcome and stays in front of the judge with the terminal
@@ -1513,9 +1517,11 @@ class KubeAgentsHarness(AgentHarness):
                     f"before the run's {timeout:.0f}s deadline"
                 )
             else:
+                stopped = exchange.fold.state or "no status event"
                 what = (
-                    f"an executor accepted task {ids.task_id} and left it queued at "
-                    f"{a2a.STATE_SUBMITTED!r} for the run's whole {timeout:.0f}s budget"
+                    f"an executor accepted task {ids.task_id} and never brought it to "
+                    f"{a2a.STATE_WORKING!r} or a terminal: it sat at {stopped!r} "
+                    f"for the run's whole {timeout:.0f}s budget"
                 )
             failure = _infra_failure(f"{what}; {_cancel_note(exchange)}")
             failure.metadata["abandoned_tasks"] = abandoned

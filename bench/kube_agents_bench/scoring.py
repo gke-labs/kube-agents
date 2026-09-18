@@ -50,7 +50,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
-from kube_agents_bench.a2a_transport import EVENT_ENTRY_STATUS, STATE_WORKING
+from kube_agents_bench.a2a_transport import EVENT_ENTRY_STATUS, shows_a_run
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
@@ -408,9 +408,12 @@ def _a2a_liveness_event(trajectory: list[Any]) -> bool:
     started, which is all a graded timeout carries when the run was cancelled
     at its budget before the terminal landed. ``submitted`` alone is the
     bridge queueing the task, not a model running, and does not count
-    (docs/designs/eval-next-transport.md, stage 1); the harness records that
-    repetition as infrastructure before it gets here, so this is the
-    backstop for a record that arrives another way. The names are imported
+    (docs/designs/eval-next-transport.md, stage 1), nor does
+    ``input-required`` or ``auth-required`` with no ``working`` before it.
+    The predicate is the transport's ``shows_a_run``, which ``Fold.started``
+    applies first, so the harness records such a repetition as
+    infrastructure before it gets here and this is the backstop for a record
+    that arrives another way. The names are imported
     where the marker above is duplicated because the transport module brings
     in neither ``devops_bench`` nor ``nats`` at import time.
     """
@@ -420,7 +423,7 @@ def _a2a_liveness_event(trajectory: list[Any]) -> bool:
         args = entry.get("args")
         if not isinstance(args, dict):
             continue
-        if args.get("final") is True or args.get("state") == STATE_WORKING:
+        if shows_a_run(args.get("state"), args.get("final") is True):
             return True
     return False
 

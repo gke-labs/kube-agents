@@ -90,8 +90,8 @@ its liveness signal is the executor's own events instead — a trajectory entry 
 `a2a.status-update` whose `args.final` is true, or whose `args.state` is `working`, stands in for
 a null total (the executor took the task and ended it, or took it and was cancelled at the budget
 before its terminal landed); a `submitted` entry alone, a null total with no such entry, and a
-total of zero still fail the rung. The harness itself records a task that never left `submitted`
-at its deadline, and a terminal the executor wrote for its own fault (the bridge's and the worker
+total of zero still fail the rung. The harness itself records a task that reached neither `working` nor a terminal
+by its deadline (`Fold.started` is this rung's predicate, so the two cannot disagree), and a terminal the executor wrote for its own fault (the bridge's and the worker
 adapter's `reason:` tokens, or a `rejected` submission), as infrastructure before a record exists,
 so those entries reaching the rung is the backstop. There is no `metadata` block on a
 devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake

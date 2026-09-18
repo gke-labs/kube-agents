@@ -196,9 +196,10 @@ def test_fold_drops_events_after_the_terminal_one() -> None:
 
 def test_a_fold_at_submitted_is_accepted_but_not_started() -> None:
     """The bridge's accept event alone: an executor took the task and no
-    subprocess has run. ``working`` or a terminal starts it; an artifact alone
-    does not, the same rule the scorer's liveness rung applies, so the two
-    predicates cannot disagree on a deadline fold."""
+    subprocess has run. ``working`` or a terminal starts it; an artifact
+    alone does not, nor does ``input-required`` or ``auth-required`` with no
+    ``working`` before it: ``shows_a_run``, the rule the scorer's liveness
+    rung applies, so the two predicates cannot disagree on a deadline fold."""
     fold = a2a.Fold("task-1")
     fold.apply(_status("task-1", "submitted"))
     assert fold.accepted and not fold.started
@@ -210,10 +211,44 @@ def test_a_fold_at_submitted_is_accepted_but_not_started() -> None:
     by_artifact.apply(_artifact("task-1", "progress", [{"kind": "text", "text": "x"}]))
     assert by_artifact.accepted and not by_artifact.started
 
+    for parked in ("input-required", "auth-required"):
+        by_parking = a2a.Fold("task-1")
+        by_parking.apply(_status("task-1", "submitted"))
+        by_parking.apply(_status("task-1", parked))
+        assert by_parking.accepted and not by_parking.started, parked
+        by_parking.apply(_status("task-1", "working"))
+        assert by_parking.started, parked
+
     by_terminal = a2a.Fold("task-1")
     by_terminal.apply(_status("task-1", "submitted"))
     by_terminal.apply(_status("task-1", "canceled", final=True))
     assert by_terminal.started
+
+
+@pytest.mark.parametrize(
+    "states",
+    [
+        ["submitted"],
+        ["submitted", "input-required"],
+        ["submitted", "auth-required"],
+        ["submitted", "working"],
+        ["submitted", "input-required", "working"],
+        ["working", "input-required"],
+        ["submitted", "canceled"],
+        ["submitted", "auth-required", "completed"],
+        ["submitted", "input-required", "rejected"],
+    ],
+)
+def test_the_fold_and_the_liveness_rung_agree_on_every_history(states: list[str]) -> None:
+    """``Fold.started`` decides whether the harness grades a deadline fold;
+    the scorer's rung 3 decides whether the graded record is a run. Both are
+    ``shows_a_run`` over the same status entries, so a fold the harness grades
+    is never a record the rung then blocks the job over."""
+    fold = a2a.Fold("task-1")
+    for state in states:
+        fold.apply(_status("task-1", state, final=state in a2a.TERMINAL_STATES))
+    assert fold.started == scoring._a2a_liveness_event(fold.trajectory)
+    assert fold.started == any(a2a.shows_a_run(s, s in a2a.TERMINAL_STATES) for s in states)
 
 
 def test_fold_skips_what_does_not_parse_and_counts_it() -> None:
@@ -847,8 +882,28 @@ def test_a_task_queued_at_submitted_for_the_whole_budget_is_infrastructure(fake_
     result = KubeAgentsHarness().run(_PROMPT)
 
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "queued at 'submitted'" in result.errors[0]
+    assert "sat at 'submitted'" in result.errors[0]
     assert "no executor accepted" not in result.errors[0]
+    assert "cancel published" in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+
+
+@pytest.mark.parametrize("parked", ["input-required", "auth-required"])
+def test_a_task_parked_short_of_working_for_the_whole_budget_is_infrastructure(
+    fake_bus, parked: str
+) -> None:
+    """An executor that moved the task to ``input-required`` or
+    ``auth-required`` with no ``working`` before it ran no model either;
+    graded, the record would carry no liveness entry and rung 3 would block
+    the job. No executor in the tree publishes these states; the rule is the
+    rung's, applied first."""
+    fake_bus.script = [[_status("t", "submitted"), _status("t", parked)]]
+    fake_bus.outcome = a2a.OUTCOME_DEADLINE
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert f"sat at {parked!r}" in result.errors[0]
     assert "cancel published" in result.errors[0]
     assert result.output == ""
     assert result.trajectory == []
