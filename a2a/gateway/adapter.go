@@ -131,6 +131,40 @@ type TaskObserver interface {
 	// executor's own (bridge-shutdown, spawn-failed) is the caller's
 	// classification, made against the executor's definitions.
 	TaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string)
+
+	// TaskAccepted says the submission for a task this conversation started
+	// is on the task's `in` subject. Called after the publish returns and
+	// before the session pod, if any, is created.
+	//
+	// It exists because TaskStarted is announced before the placeholder and
+	// before the publish, so the id alone does not mean an executor can ever
+	// see the ask: startTask's publish may fail, and then it edits the
+	// placeholder, clears ActiveTask and returns, leaving nothing on any
+	// subject. A program that took the id as the answer would wait out its
+	// whole budget for a terminal no executor can publish. A caller that
+	// wants the two ends of a task still watches TaskStarted and
+	// TaskTerminal; a caller that wants to know whether its submission was
+	// taken watches this.
+	TaskAccepted(conversation, taskID string)
+}
+
+// DropObserver is the optional extension an Adapter implements when it has to
+// know that a message of its own was dropped at the door rather than routed.
+//
+// The gateway drops a message whose sender it cannot verify, and tells the
+// sender once per sender rather than once per message: a person who has been
+// told they are unknown does not need the same line under every attempt. For
+// a person that is right, and for a program it is a silence that looks
+// exactly like a turn still running -- a second drop posts nothing, and a
+// caller waiting for the gateway to do something visible waits out its bound
+// for an answer that has already been given. This hands the adapter the fact
+// itself, on every drop, so the door can refuse at once and name the reason.
+// The notice's own dedupe stays the gateway's.
+//
+// Called on the conversation's inbox worker, like TaskStarted: record and
+// return.
+type DropObserver interface {
+	MessageDropped(conversation, authorID string)
 }
 
 // TerminalSource says whose word a terminal is. It exists because "the task
@@ -151,6 +185,15 @@ const (
 	// published for it: it is the gateway telling its own adapter, not a
 	// claim on a stream that has never heard of the task.
 	TerminalFromGateway TerminalSource = "gateway"
+	// TerminalFromSupervisor is a terminal that arrived on the task's
+	// supervisor subject -- the gateway's own word about an executor that
+	// died or never ran, rather than the executor's account of the work.
+	// Only the read route's fold reports it: it is the one place that has
+	// the subject a terminal arrived on (probeConversation). It is not an
+	// answer either, and it is not TerminalFromGateway, which says something
+	// narrower and more useful -- that this gateway could not put the task
+	// on the bus at all.
+	TerminalFromSupervisor TerminalSource = "supervisor"
 	// TerminalNeverStarted is the never-started heal: a task that reached the
 	// bus and produced nothing on its events subject inside
 	// A2A_FIRST_EVENT_GRACE, which handleInbound releases on the

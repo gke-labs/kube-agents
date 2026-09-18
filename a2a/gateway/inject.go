@@ -197,6 +197,33 @@ const (
 	InjectEntryTerminal = "terminal"
 )
 
+// Why a POST was answered with no task id. The note beside it is prose for a
+// log; these are what a caller branches on, because a program classifying a
+// run must not have to match on a sentence this file is free to rewrite. A
+// refusal is the whole answer to that POST: nothing was started, nothing is
+// on any subject, and a repeat of the same backend message id is answered
+// with the same code.
+const (
+	// injectRefusalUnverifiedAuthor: the door's principal map does not carry
+	// the author, so the gateway dropped the message. The notice naming the
+	// author is in the entries on the first drop and nowhere on a later one
+	// (it is posted once per sender), which is why this code rather than the
+	// transcript is the answer.
+	injectRefusalUnverifiedAuthor = "unverified-author"
+	// injectRefusalPublishFailed: the gateway minted the task and could not
+	// put it on the bus. It has already edited the placeholder to say so and
+	// released the conversation; no executor can ever see the ask.
+	injectRefusalPublishFailed = "publish-failed"
+	// injectRefusalNoTask: the turn was answered without minting a task -- a
+	// steer onto a running task, a status answer, a stop. The reply the
+	// conversation received is in the entries.
+	injectRefusalNoTask = "no-task"
+	// injectRefusalNoAnswer: the bound expired with the gateway having done
+	// nothing this door could see. Distinct from the three above because it
+	// is the absence of an answer rather than one.
+	injectRefusalNoAnswer = "no-answer"
+)
+
 // InjectEntry is one line of a conversation's transcript.
 //
 // Seq is per conversation and starts at 1, so a reader polls with the last
@@ -274,9 +301,13 @@ type injectResponse struct {
 	// deadline above it, and reads the window off the read route
 	// (probeReport) rather than off a clock of its own.
 	FirstEventGraceSeconds int `json:"firstEventGraceSeconds"`
+	// Refusal is why no task id is in this reply, as one of the codes above
+	// (injectRefusalUnverifiedAuthor and the rest). Empty when TaskID is
+	// set. A caller branches on it rather than on Note, which is prose.
+	Refusal string `json:"refusal,omitempty"`
 	// Deduplicated is true when this POST's message id had already been
-	// accepted: TaskID and Note are the first POST's, and nothing was
-	// started or routed for this one.
+	// accepted: TaskID, Note and Refusal are the first POST's, and nothing
+	// was started or routed for this one.
 	Deduplicated bool `json:"deduplicated,omitempty"`
 }
 
@@ -365,6 +396,42 @@ type injectSubmission struct {
 	completed    bool
 	taskID       string
 	note         string
+	refusal      string
+}
+
+// injectIDLog is an append-only log of task ids that a waiting request
+// indexes by absolute position: it records the counts before its message is
+// routed and then asks what appeared after them. Bounded like everything
+// else on this door, and the total is kept because the slice is not the
+// history -- without it, an eviction would shift every index and a waiter
+// would be handed the wrong task's id.
+type injectIDLog struct {
+	ids []string
+	// total is how many ids have ever been added, evictions included.
+	total int
+}
+
+func (l *injectIDLog) add(id string) {
+	l.ids = append(l.ids, id)
+	l.total++
+	if len(l.ids) > injectMaxEntries {
+		l.ids = l.ids[len(l.ids)-injectMaxEntries:]
+	}
+}
+
+// at answers what a waiter sitting at position prior should be told: the id
+// that landed there, whether the log has not reached it yet, and whether it
+// has been evicted past -- which is not "nothing happened" and must not be
+// answered as though it were.
+func (l *injectIDLog) at(prior int) (id string, evicted bool) {
+	if l.total <= prior {
+		return "", false
+	}
+	idx := prior - (l.total - len(l.ids))
+	if idx < 0 {
+		return "", true
+	}
+	return l.ids[idx], false
 }
 
 // injectConversation is one synthetic conversation's state.
@@ -379,8 +446,20 @@ type injectConversation struct {
 	// learns the answer rather than waiting for one that has been and gone.
 	terminals map[string]string
 	// started records the tasks handleInbound minted on this conversation,
-	// which is what POST /inject waits for.
-	started []string
+	// and accepted the ones whose submission then reached the bus, which is
+	// what POST /inject waits for. Two logs rather than one: a task is
+	// announced before the publish, and a publish that fails leaves an id
+	// that never reached an executor (TaskObserver.TaskAccepted).
+	started  injectIDLog
+	accepted injectIDLog
+	// publishFailed records the tasks the gateway declared a terminal for
+	// without ever reaching the bus -- the other end of the wait above.
+	publishFailed injectIDLog
+	// drops counts the messages the gateway dropped here for an
+	// unverifiable sender. A counter rather than a transcript entry: the
+	// transcript is what the conversation received, and a drop the gateway
+	// chose not to post a second notice for is not something it received.
+	drops int
 	// requester is the author of the last message injected here, which is
 	// the whole membership of a synthetic conversation. Roster returns it.
 	requester string
@@ -616,10 +695,7 @@ func (a *InjectAdapter) TaskStarted(conversation, taskID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	conv := a.conversationLocked(conversation)
-	conv.started = append(conv.started, taskID)
-	if len(conv.started) > injectMaxEntries {
-		conv.started = conv.started[len(conv.started)-injectMaxEntries:]
-	}
+	conv.started.add(taskID)
 	a.appendLocked(conv, InjectEntry{Kind: InjectEntryTask, TaskID: taskID})
 }
 
@@ -638,10 +714,47 @@ func (a *InjectAdapter) TaskTerminal(conversation, taskID string, state lib.Task
 		conv.terminals = map[string]string{}
 	}
 	conv.terminals[taskID] = string(state)
+	if source == TerminalFromGateway {
+		// The gateway's own word about a task that never reached the bus,
+		// which is startTask's publish failure and nothing else on this
+		// path: the relay reports executors, and the heal reports
+		// TerminalNeverStarted. A POST still waiting on this task is
+		// answered with the publish-failed refusal.
+		conv.publishFailed.add(taskID)
+	}
 	a.appendLocked(conv, InjectEntry{
 		Kind: InjectEntryTerminal, TaskID: taskID, State: string(state), Source: string(source),
 		Reason: truncateRunes(reason, injectMaxEntryBytes),
 	})
+}
+
+// TaskAccepted records that a task's submission reached the bus, which is
+// what POST /inject answers with a task id. See TaskObserver.TaskAccepted for
+// why the start alone is not that answer.
+func (a *InjectAdapter) TaskAccepted(conversation, taskID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	conv.accepted.add(taskID)
+	// No transcript entry: the placeholder the relay posted is what the
+	// conversation received, and this is the door's own bookkeeping. The
+	// wake-up is what a waiting POST needs.
+	close(a.notify)
+	a.notify = make(chan struct{})
+}
+
+// MessageDropped records that the gateway dropped a message here for a sender
+// it could not verify. See DropObserver: the notice is posted once per
+// sender, so on a second drop this counter is the only thing that moves.
+func (a *InjectAdapter) MessageDropped(conversation, authorID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	conv.drops++
+	a.log.Warn("inject: the gateway dropped a message from an author its principal map does not carry",
+		"conversation", conversation, "author", authorID)
+	close(a.notify)
+	a.notify = make(chan struct{})
 }
 
 // lastPost is the newest post entry on a conversation, or nil.
@@ -685,7 +798,7 @@ func (a *InjectAdapter) claimSubmission(messageID, conversation string) (*inject
 
 // completeSubmission publishes what a claimed POST's turn produced to any
 // duplicate waiting on it.
-func (a *InjectAdapter) completeSubmission(sub *injectSubmission, taskID, note string) {
+func (a *InjectAdapter) completeSubmission(sub *injectSubmission, taskID, note, refusal string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if sub.completed {
@@ -694,6 +807,7 @@ func (a *InjectAdapter) completeSubmission(sub *injectSubmission, taskID, note s
 	sub.completed = true
 	sub.taskID = taskID
 	sub.note = note
+	sub.refusal = refusal
 	close(sub.done)
 }
 
@@ -709,19 +823,23 @@ func (a *InjectAdapter) answerDuplicate(ctx context.Context, w http.ResponseWrit
 	}
 	timer := time.NewTimer(injectSubmitWait)
 	defer timer.Stop()
-	note := ""
 	select {
 	case <-sub.done:
 	case <-timer.C:
-		note = fmt.Sprintf("the first POST with this message id has not been answered within %s; nothing was started for this one", injectSubmitWait)
 	case <-ctx.Done():
 		return
 	}
+	// Read the first submission's answer under the lock and prefer it
+	// whichever arm fired: the timer and the completion can be ready
+	// together, and answering "the first POST has not been answered" beside
+	// the task id it just answered with would contradict the Refusal
+	// contract and tell the caller nothing was started when something was.
 	a.mu.Lock()
-	taskID, first := sub.taskID, sub.note
+	completed, taskID, note, refusal := sub.completed, sub.taskID, sub.note, sub.refusal
 	a.mu.Unlock()
-	if note == "" {
-		note = first
+	if !completed {
+		taskID, refusal = "", injectRefusalNoAnswer
+		note = fmt.Sprintf("the first POST with this message id has not been answered within %s; nothing was started for this one", injectSubmitWait)
 	}
 	entries, _, _ := a.snapshot(key, 0, "")
 	a.log.Info("inject: duplicate message id answered from the first submission",
@@ -733,6 +851,7 @@ func (a *InjectAdapter) answerDuplicate(ctx context.Context, w http.ResponseWrit
 		MessageID:              messageID,
 		Entries:                entries,
 		Note:                   note,
+		Refusal:                refusal,
 		FirstEventGraceSeconds: int(a.firstEventGrace / time.Second),
 		Deduplicated:           true,
 	})
@@ -800,30 +919,57 @@ func (a *InjectAdapter) snapshot(key string, after int, taskID string) ([]Inject
 }
 
 // startedSince reports the first task started on a conversation past the
-// given count of prior starts.
-func (a *InjectAdapter) startedSince(key string, priorStarts int) string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	conv, ok := a.conversations[key]
-	if !ok {
-		return ""
-	}
-	if len(conv.started) > priorStarts {
-		return conv.started[priorStarts]
-	}
-	return ""
+// given count of prior starts, acceptedSince the first whose submission
+// reached the bus, and publishFailedSince the first that could not. Each also
+// reports whether the position has been evicted, which is a different answer
+// from "nothing yet" -- see injectIDLog.at.
+func (a *InjectAdapter) startedSince(key string, prior int) (string, bool) {
+	return a.sinceLocked(key, prior, func(conv *injectConversation) *injectIDLog { return &conv.started })
 }
 
-// counts returns how many tasks have started and how many entries exist on a
-// conversation -- the two things POST /inject watches for a change in.
-func (a *InjectAdapter) counts(key string) (starts, entries int) {
+func (a *InjectAdapter) acceptedSince(key string, prior int) (string, bool) {
+	return a.sinceLocked(key, prior, func(conv *injectConversation) *injectIDLog { return &conv.accepted })
+}
+
+func (a *InjectAdapter) publishFailedSince(key string, prior int) (string, bool) {
+	return a.sinceLocked(key, prior, func(conv *injectConversation) *injectIDLog { return &conv.publishFailed })
+}
+
+func (a *InjectAdapter) sinceLocked(key string, prior int, pick func(*injectConversation) *injectIDLog) (string, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	conv, ok := a.conversations[key]
 	if !ok {
-		return 0, 0
+		return "", false
 	}
-	return len(conv.started), conv.nextSeq - 1
+	return pick(conv).at(prior)
+}
+
+// injectCounts is what a waiting request records before handing a message
+// over, so it can tell this turn's work from the last one's.
+type injectCounts struct {
+	starts        int
+	accepted      int
+	publishFailed int
+	entries       int
+	drops         int
+}
+
+// counts is the conversation's state as a waiting request sees it.
+func (a *InjectAdapter) counts(key string) injectCounts {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv, ok := a.conversations[key]
+	if !ok {
+		return injectCounts{}
+	}
+	return injectCounts{
+		starts:        conv.started.total,
+		accepted:      conv.accepted.total,
+		publishFailed: conv.publishFailed.total,
+		entries:       conv.nextSeq - 1,
+		drops:         conv.drops,
+	}
 }
 
 // waitCh returns the channel closed on the next change to any conversation.
@@ -903,11 +1049,12 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		// is idempotent, so the normal completion wins and this is a no-op):
 		// a submission whose done channel never closes would hold every
 		// duplicate for the full wait and then answer it with nothing.
-		defer a.completeSubmission(sub, "", "the first POST with this message id aborted before its turn answered")
+		defer a.completeSubmission(sub, "",
+			"the first POST with this message id aborted before its turn answered", injectRefusalNoAnswer)
 	}
 	// Read the counters BEFORE handing the message over, so the wait below
 	// cannot mistake a previous turn's task or reply for this one's.
-	priorStarts, priorEntries := a.counts(key)
+	prior := a.counts(key)
 
 	// Recorded before the turn, so Roster answers for this conversation even
 	// if the gateway reads it inside handleInbound.
@@ -926,11 +1073,15 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		Backend: injectBackend,
 	})
 
-	taskID, note := a.awaitTurn(turnCtx, key, priorStarts, priorEntries)
+	taskID, note, refusal := a.awaitTurn(turnCtx, key, prior)
 	if sub != nil {
-		a.completeSubmission(sub, taskID, note)
+		a.completeSubmission(sub, taskID, note, refusal)
 	}
-	entries, _, _ := a.snapshot(key, priorEntries, "")
+	if refusal != "" {
+		a.log.Info("inject: the door started nothing for a POST",
+			"conversation", key, "messageId", messageID, "refusal", refusal, "note", note)
+	}
+	entries, _, _ := a.snapshot(key, prior.entries, "")
 	writeJSON(w, http.StatusOK, injectResponse{
 		Conversation:           key,
 		TaskID:                 taskID,
@@ -938,6 +1089,7 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		MessageID:              messageID,
 		Entries:                entries,
 		Note:                   note,
+		Refusal:                refusal,
 		FirstEventGraceSeconds: int(a.firstEventGrace / time.Second),
 	})
 }
@@ -993,7 +1145,7 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	if messageID == "" {
 		messageID = injectInboundIDPrefix + randHex(messageIDHexWidth)
 	}
-	_, priorEntries := a.counts(key)
+	prior := a.counts(key)
 	a.noteRequester(key, req.Author)
 	handler(InboundMessage{
 		Conversation: key,
@@ -1009,8 +1161,8 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	// acknowledgement, the nothing-is-running reply, or the never-started
 	// notice when the heal fires on the way past -- so waiting for one entry
 	// is waiting for the turn, not for the executor.
-	note := a.awaitEntry(r.Context(), key, priorEntries)
-	entries, _, _ := a.snapshot(key, priorEntries, "")
+	note := a.awaitEntry(r.Context(), key, prior)
+	entries, _, _ := a.snapshot(key, prior.entries, "")
 	writeJSON(w, http.StatusOK, injectResponse{
 		Conversation:           key,
 		MessageID:              messageID,
@@ -1022,11 +1174,20 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 
 // awaitEntry waits for one new entry on a conversation, returning a note when
 // the turn produced none inside the submit bound.
-func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, priorEntries int) string {
+//
+// A drop ends it too, for the reason awaitTurn gives: the notice for an
+// unverifiable sender is posted once per sender, so the second cancel from an
+// author already told they are unknown produces no entry at all and would
+// otherwise hold the connection for the whole bound.
+func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior injectCounts) string {
 	deadline := time.Now().Add(injectSubmitWait)
 	for {
-		if _, entries := a.counts(key); entries > priorEntries {
+		now := a.counts(key)
+		if now.entries > prior.entries {
 			return ""
+		}
+		if now.drops > prior.drops {
+			return "the gateway dropped this cancel: its principal map does not carry the author"
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -1045,21 +1206,27 @@ func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, priorEntries
 	}
 }
 
-// awaitTurn waits for the gateway to say what it did with a message: a task
-// it started, or a reply it posted without starting one.
+// awaitTurn waits for the gateway to say what it did with a message, and
+// returns the task id it started, or a note and one of the refusal codes.
 //
-// A turn produces one of three things and the wait ends on the first of them.
-// A new task announces itself before the placeholder post (startTask mints,
-// announces, then posts), so a task id always wins the race against its own
-// placeholder rather than the answer depending on timing. A steer, a status
-// answer, a stop, or the once-per-sender notice for an unverifiable author
-// posts without starting anything, and the caller reads what happened in the
-// entries. Anything else -- a second message from an author already told they
-// are unknown, a turn whose bus publish failed before the placeholder --
-// produces neither, and the wait ends at its deadline with a note saying so,
-// because the honest answer there is that the gateway did not visibly do
-// anything with this message.
-func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, priorStarts, priorEntries int) (string, string) {
+// The answer is a task whose submission reached the bus, and not merely one
+// the gateway minted. startTask announces the id, posts the placeholder,
+// writes the record and then publishes; if the publish fails it edits the
+// placeholder to say so, clears the active task and returns, and nothing is
+// on any subject. Answering at the announcement would hand a caller an id
+// for a task no executor can ever see, and it would wait out its whole
+// budget for a terminal that cannot come. So the wait ends on the accept
+// (TaskObserver.TaskAccepted) or on the gateway's own terminal for the same
+// task, which is the publish-failed refusal.
+//
+// The other two ends are a turn that answered without minting anything -- a
+// steer onto a running task, a status answer, a stop -- and a drop of an
+// unverifiable sender. The drop is a signal rather than a post
+// (DropObserver), because the gateway's notice is posted once per sender and
+// the second drop from the same author posts nothing at all; a wait watching
+// only the transcript would sit there until its bound for an answer that had
+// already been given.
+func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectCounts) (string, string, string) {
 	deadline := time.Now().Add(injectSubmitWait)
 	// A post is not proof the turn started nothing: handleInbound posts
 	// BEFORE startTask on the heal paths (a stale task's status card, the
@@ -1070,26 +1237,57 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, priorStarts, 
 	// anything pays one extra poll interval for that.
 	postedWithoutTask := false
 	for {
-		if taskID := a.startedSince(key, priorStarts); taskID != "" {
-			return taskID, ""
+		accepted, acceptedGone := a.acceptedSince(key, prior.accepted)
+		if accepted != "" {
+			return accepted, "", ""
 		}
-		if _, entries := a.counts(key); entries > priorEntries {
+		failed, failedGone := a.publishFailedSince(key, prior.publishFailed)
+		if failed != "" {
+			return "", fmt.Sprintf("the gateway minted task %s and could not put it on the bus; "+
+				"it has released the conversation and nothing is running", failed), injectRefusalPublishFailed
+		}
+		if acceptedGone || failedGone {
+			// More than this door retains has happened on the conversation
+			// since the message was handed over, so the answer to this POST
+			// has scrolled off. Said rather than guessed: the id at the
+			// nearest position it still holds would be another task's.
+			return "", fmt.Sprintf("more than %d tasks have started on this conversation since "+
+				"this message was routed, so what became of it is no longer retained",
+				injectMaxEntries), injectRefusalNoAnswer
+		}
+		now := a.counts(key)
+		switch {
+		case now.starts > prior.starts:
+			// A task is in flight between its announcement and its publish.
+			// Only the two lines above end this wait now: the placeholder
+			// post is an entry, and reading it as "answered without starting
+			// a task" would refuse a submission that is about to succeed.
+		case now.drops > prior.drops:
+			return "", "the gateway dropped this message: its principal map does not carry the author, " +
+				"so nothing was started (the notice naming the author is posted once per sender, so it " +
+				"may not be in the entries)", injectRefusalUnverifiedAuthor
+		case now.entries > prior.entries:
 			if postedWithoutTask {
 				return "", "the gateway answered this turn without starting a task (a steer, a status " +
-					"answer, a stop, or an author the principal map does not know); the reply is in entries"
+					"answer, or a stop); the reply is in entries", injectRefusalNoTask
 			}
 			postedWithoutTask = true
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return "", fmt.Sprintf("the gateway neither started a task nor posted a reply within %s", injectSubmitWait)
+			if started, _ := a.startedSince(key, prior.starts); started != "" {
+				return "", fmt.Sprintf("the gateway minted task %s and within %s neither put it on the "+
+					"bus nor said it could not", started, injectSubmitWait), injectRefusalNoAnswer
+			}
+			return "", fmt.Sprintf("the gateway neither started a task nor posted a reply within %s",
+				injectSubmitWait), injectRefusalNoAnswer
 		}
 		woken := a.waitCh()
 		timer := time.NewTimer(min(remaining, injectPollInterval))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return "", "the caller went away before the gateway answered"
+			return "", "the caller went away before the gateway answered", injectRefusalNoAnswer
 		case <-woken:
 		case <-timer.C:
 		}

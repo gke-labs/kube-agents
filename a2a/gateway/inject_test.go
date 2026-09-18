@@ -30,6 +30,7 @@ import (
 var (
 	_ Adapter      = (*InjectAdapter)(nil)
 	_ TaskObserver = (*InjectAdapter)(nil)
+	_ DropObserver = (*InjectAdapter)(nil)
 )
 
 const (
@@ -547,6 +548,9 @@ func TestInjectDropsAnUnmappedAuthor(t *testing.T) {
 	if reply.Note == "" {
 		t.Fatal("the reply carries no note saying why nothing started")
 	}
+	if reply.Refusal != injectRefusalUnverifiedAuthor {
+		t.Fatalf("refusal = %q, want %q", reply.Refusal, injectRefusalUnverifiedAuthor)
+	}
 	posts := strings.Join(entryTexts(reply.Entries, InjectEntryPost), "\n")
 	if !strings.Contains(posts, "can't verify") {
 		t.Fatalf("the drop notice is not in the reply: %q", posts)
@@ -836,9 +840,18 @@ func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
 	if _, ok := any(gchat).(TaskObserver); ok {
 		t.Error("the Google Chat adapter implements TaskObserver; the gateway now calls into it untested")
 	}
+	if _, ok := any(discord).(DropObserver); ok {
+		t.Error("the Discord adapter implements DropObserver; the gateway now calls into it untested")
+	}
+	if _, ok := any(gchat).(DropObserver); ok {
+		t.Error("the Google Chat adapter implements DropObserver; the gateway now calls into it untested")
+	}
 	inject := &InjectAdapter{}
 	if _, ok := any(inject).(TaskObserver); !ok {
 		t.Error("the inject adapter does not implement TaskObserver, so POST /inject can never return a task id")
+	}
+	if _, ok := any(inject).(DropObserver); !ok {
+		t.Error("the inject adapter does not implement DropObserver, so a second drop from one author is a silence")
 	}
 }
 
@@ -1362,7 +1375,7 @@ func TestInjectReadRouteIsAPureRead(t *testing.T) {
 	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 1 {
 		t.Fatalf("%d envelopes on the in subject after a read, want the one submission", n)
 	}
-	if starts, _ := r.adapter.counts(reply.Conversation); starts != 1 {
+	if starts := r.adapter.counts(reply.Conversation).starts; starts != 1 {
 		t.Fatalf("%d tasks started on the conversation after a read, want 1", starts)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1457,7 +1470,7 @@ func TestInjectReadRouteReportsTheExecutorsState(t *testing.T) {
 			t.Fatalf("a read published a %s envelope", env.Kind)
 		}
 	}
-	if starts, _ := r.adapter.counts(reply.Conversation); starts != 1 {
+	if starts := r.adapter.counts(reply.Conversation).starts; starts != 1 {
 		t.Fatalf("%d tasks started, want 1: a read minted a task", starts)
 	}
 }
@@ -1562,7 +1575,7 @@ func TestInjectDedupesAPostOnItsMessageID(t *testing.T) {
 	if retry.TaskID != first.TaskID || !retry.Accepted || !retry.Deduplicated {
 		t.Fatalf("retry = %+v, want the first task id %s marked deduplicated", retry, first.TaskID)
 	}
-	if starts, _ := r.adapter.counts(first.Conversation); starts != 1 {
+	if starts := r.adapter.counts(first.Conversation).starts; starts != 1 {
 		t.Fatalf("%d tasks started, want 1", starts)
 	}
 	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 1 {
@@ -1614,6 +1627,7 @@ func TestInjectDedupesAPostStillInFlight(t *testing.T) {
 		close(entered)
 		<-release
 		door.TaskStarted(msg.Conversation, "task-first")
+		door.TaskAccepted(msg.Conversation, "task-first")
 	}
 	go func() { _ = door.Run(ctx, handler) }()
 	waitFor(t, "the door to accept messages", func() bool {
@@ -1690,6 +1704,7 @@ func TestInjectDedupesAPostWhoseCallerDisconnected(t *testing.T) {
 		go func() {
 			<-release
 			door.TaskStarted(msg.Conversation, "task-first")
+			door.TaskAccepted(msg.Conversation, "task-first")
 		}()
 	}
 	go func() { _ = door.Run(ctx, handler) }()
@@ -1883,7 +1898,7 @@ func TestInjectReadRouteCarriesTheFoldOfAFinishedTask(t *testing.T) {
 // the supervisor subject is the gateway's word about an executor that died or
 // never ran, not an executor's answer. The fold says so, so a caller grading
 // off the read does not score an outage as the agent's failure.
-func TestInjectReadRouteNamesTheSupervisorsTerminalAsTheGateways(t *testing.T) {
+func TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn(t *testing.T) {
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-supervised", injectTestAuthor, "answer me")
 	origin := r.awaitTask(t, "platform")
@@ -1917,8 +1932,8 @@ func TestInjectReadRouteNamesTheSupervisorsTerminalAsTheGateways(t *testing.T) {
 	if !probe.Final || probe.ExecutorState != string(lib.StateFailed) {
 		t.Fatalf("probe = %+v, want the failed terminal", probe)
 	}
-	if probe.TerminalSource != string(TerminalFromGateway) {
-		t.Fatalf("terminalSource = %q, want the gateway's for a supervisor terminal", probe.TerminalSource)
+	if probe.TerminalSource != string(TerminalFromSupervisor) {
+		t.Fatalf("terminalSource = %q, want the supervisor's own source", probe.TerminalSource)
 	}
 	if probe.Reason != reason {
 		t.Fatalf("probe.Reason = %q, want the terminal's message verbatim", probe.Reason)
@@ -2001,5 +2016,211 @@ func TestInjectCancelRefusesATaskTheConversationNeverHeld(t *testing.T) {
 	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
 	if !probe.Active || probe.Detached || probe.TaskID != reply.TaskID {
 		t.Fatalf("probe = %+v, want the original task active and not detached", probe)
+	}
+}
+
+// TestInjectRefusesAPostWhoseSubmissionCannotReachTheBus: the POST answers a
+// task id only for a task that is on the bus. startTask announces the id,
+// posts the placeholder and writes the record BEFORE it publishes, so a
+// caller answered at the announcement would hold an id for a task no
+// executor can ever see -- and would wait out its whole budget for a
+// terminal that cannot come. The stream is taken away here so the publish
+// fails for real.
+func TestInjectRefusesAPostWhoseSubmissionCannotReachTheBus(t *testing.T) {
+	r := startInjectRig(t)
+	deleteTasksStream(t, r.url)
+
+	reply := r.inject(t, "case-no-bus", injectTestAuthor, "how is the fleet?")
+
+	if reply.TaskID != "" || reply.Accepted {
+		t.Fatalf("a task that never reached the bus was answered as accepted: %+v", reply)
+	}
+	if reply.Refusal != injectRefusalPublishFailed {
+		t.Fatalf("refusal = %q, want %q", reply.Refusal, injectRefusalPublishFailed)
+	}
+	if !strings.Contains(reply.Note, "could not put it on the bus") {
+		t.Fatalf("note = %q, want it to say the submission never reached the bus", reply.Note)
+	}
+	// What a human would read for the same failure, which is the gateway's
+	// and not this door's: the placeholder edited in place.
+	edits := strings.Join(entryTexts(reply.Entries, InjectEntryEdit), "\n")
+	if !strings.Contains(edits, "could not reach the bus") {
+		t.Fatalf("edits = %q, want the gateway's failure edit", edits)
+	}
+	// And the structural half a program reads: the gateway's own terminal
+	// for the task, which is what makes the refusal knowable without
+	// matching on that sentence.
+	terminals := terminalEntries(reply.Entries)
+	if len(terminals) != 1 || terminals[0].Source != string(TerminalFromGateway) {
+		t.Fatalf("terminal entries = %+v, want one the gateway declared", terminals)
+	}
+	// The conversation is released, so nothing is wedged behind a task that
+	// cannot end. Waited for rather than read once: startTask writes the
+	// record with the active task before it publishes and clears it in
+	// memory on the failure, and the write that persists the clear is
+	// handleInbound's at the end of the turn -- which lands AFTER this POST
+	// has been answered. That ordering is why the refusal, and not a read of
+	// the record, is what tells a caller its submission never reached the
+	// bus: for a moment the record names a task that is nowhere.
+	waitFor(t, "the conversation to be released", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rec, err := r.g.reg.Get(ctx, reply.Conversation)
+		return err == nil && (rec == nil || rec.ActiveTask == nil)
+	})
+}
+
+// TestInjectAnswersARetriedPostWithTheSameRefusal: the dedupe answers a retry
+// with what the first POST got, and a refusal is an answer. Without this a
+// retry of a POST the gateway could not publish would be routed as a fresh
+// message and mint a second doomed task.
+func TestInjectAnswersARetriedPostWithTheSameRefusal(t *testing.T) {
+	r := startInjectRig(t)
+	deleteTasksStream(t, r.url)
+	const messageID = "run-1/case-no-bus/1"
+
+	first := r.injectWithID(t, "case-no-bus", injectTestAuthor, "how is the fleet?", messageID)
+	if first.Refusal != injectRefusalPublishFailed || first.Deduplicated {
+		t.Fatalf("first POST = %+v, want the publish-failed refusal", first)
+	}
+	retry := r.injectWithID(t, "case-no-bus", injectTestAuthor, "how is the fleet?", messageID)
+	if retry.Refusal != first.Refusal || retry.Note != first.Note || !retry.Deduplicated {
+		t.Fatalf("retry = %+v, want the first refusal marked deduplicated", retry)
+	}
+	if starts := r.adapter.counts(first.Conversation).starts; starts != 1 {
+		t.Fatalf("%d tasks minted, want 1: the retry was routed", starts)
+	}
+}
+
+// TestInjectRefusesASecondDropWithoutWaitingForTheBound: the gateway tells an
+// unverifiable sender once per sender, so the second message from that author
+// posts nothing at all. A door watching only the transcript would hold that
+// POST until its accept bound and then answer "nothing visible happened",
+// which reads as a stuck gateway rather than as the answer it already gave.
+func TestInjectRefusesASecondDropWithoutWaitingForTheBound(t *testing.T) {
+	r := startInjectRig(t)
+
+	first := r.inject(t, "case-twice-unmapped", injectTestUnknownAuthor, "let me in")
+	if first.Refusal != injectRefusalUnverifiedAuthor {
+		t.Fatalf("first drop = %+v, want the unverified-author refusal", first)
+	}
+	entriesBefore := r.adapter.counts(first.Conversation).entries
+
+	started := time.Now()
+	second := r.inject(t, "case-twice-unmapped", injectTestUnknownAuthor, "let me in again")
+	elapsed := time.Since(started)
+
+	if second.Refusal != injectRefusalUnverifiedAuthor {
+		t.Fatalf("second drop = %+v, want the same refusal", second)
+	}
+	if elapsed > injectSubmitWait/2 {
+		t.Fatalf("the second drop took %s, want an answer well inside the %s bound", elapsed, injectSubmitWait)
+	}
+	if entries := r.adapter.counts(first.Conversation).entries; entries != entriesBefore {
+		t.Fatalf("the conversation gained %d entries on the second drop; the notice is once per sender",
+			entries-entriesBefore)
+	}
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
+		t.Fatalf("an unverified sender reached the bus: %d envelopes", len(envs))
+	}
+}
+
+// TestInjectWaitsThroughThePlaceholderForTheAccept: the placeholder post now
+// lands between a task's announcement and its publish, and the rule that a
+// post without a task means "the turn answered without starting one" must not
+// fire on it. Without the in-flight guard a gateway whose record write and
+// publish take longer than a poll interval -- a loaded KV, a bus retry --
+// would have its submissions refused as `no-task`, and the harness would call
+// a healthy run infrastructure. The handler here is deliberately slow between
+// the two halves; the real one is fast, which is why nothing else catches it.
+func TestInjectWaitsThroughThePlaceholderForTheAccept(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	door, err := NewInjectAdapter(ln.Addr().String(), injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.listener = ln
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	handler := func(msg InboundMessage) {
+		go func() {
+			// startTask's order: announce, post the placeholder, write the
+			// record, publish, accept.
+			door.TaskStarted(msg.Conversation, "task-slow")
+			if _, err := door.Post(msg.Conversation, "⏳ submitted…"); err != nil {
+				t.Error(err)
+			}
+			time.Sleep(4 * injectPollInterval)
+			door.TaskAccepted(msg.Conversation, "task-slow")
+		}()
+	}
+	go func() { _ = door.Run(ctx, handler) }()
+	waitFor(t, "the door to accept messages", func() bool {
+		door.handlerMu.RLock()
+		defer door.handlerMu.RUnlock()
+		return door.handler != nil
+	})
+
+	body, _ := json.Marshal(injectRequest{Conversation: "slow-publish", Author: injectTestAuthor, Text: "go"})
+	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+injectPath, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(authorizationHeader, "Bearer "+injectTestToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var reply injectResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.TaskID != "task-slow" || reply.Refusal != "" {
+		t.Fatalf("reply = %+v, want task-slow with no refusal: the placeholder was read as an answer", reply)
+	}
+}
+
+// TestInjectIDLogSurvivesItsOwnEviction: the wait indexes these logs by
+// absolute position, and they evict oldest-first. Without the total the
+// indices shift under an eviction and a waiter is handed a later task's id --
+// which it would then await forever. Evicted past is its own answer, not
+// "nothing happened".
+func TestInjectIDLogSurvivesItsOwnEviction(t *testing.T) {
+	var log injectIDLog
+	for i := range injectMaxEntries + 2 {
+		log.add(fmt.Sprintf("task-%d", i))
+	}
+	if id, evicted := log.at(injectMaxEntries + 1); evicted || id != fmt.Sprintf("task-%d", injectMaxEntries+1) {
+		t.Fatalf("at(last) = %q, evicted=%v; want the newest id", id, evicted)
+	}
+	if id, evicted := log.at(injectMaxEntries + 2); evicted || id != "" {
+		t.Fatalf("at(past the end) = %q, evicted=%v; want nothing yet", id, evicted)
+	}
+	if id, evicted := log.at(0); !evicted || id != "" {
+		t.Fatalf("at(0) = %q, evicted=%v; want the evicted answer rather than a later task's id", id, evicted)
+	}
+}
+
+// TestInjectCancelFromAnUnknownAuthorDoesNotHoldTheConnection: the cancel
+// route's wait has the same once-per-sender problem the POST's does. A second
+// cancel from an author the map does not carry posts nothing, and a wait
+// watching only the transcript would hold it for the whole bound.
+func TestInjectCancelFromAnUnknownAuthorDoesNotHoldTheConnection(t *testing.T) {
+	r := startInjectRig(t)
+	// The first drop posts the notice; the second is the silent one.
+	r.inject(t, "case-cancel-unmapped", injectTestUnknownAuthor, "let me in")
+
+	started := time.Now()
+	reply := r.cancel(t, injectKeyPrefix+"case-cancel-unmapped", injectTestUnknownAuthor)
+	elapsed := time.Since(started)
+
+	if elapsed > injectSubmitWait/2 {
+		t.Fatalf("the cancel took %s, want an answer well inside the %s bound", elapsed, injectSubmitWait)
+	}
+	if !strings.Contains(reply.Note, "dropped this cancel") {
+		t.Fatalf("note = %q, want it to say the cancel was dropped", reply.Note)
 	}
 }

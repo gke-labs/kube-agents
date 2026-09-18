@@ -1251,7 +1251,9 @@ class KubeAgentsHarness(AgentHarness):
         ``submitted`` by ``AGENT_INJECT_TIMEOUT`` (queued behind the bridge's
         cap for the whole budget); a terminal the gateway declared -- about
         a task it could not put on the bus, or, on the read's fold, the
-        supervisor's word about an executor that died or never ran; a failed
+        supervisor's word about an executor that died or never ran; a
+        submission the door refused, because the principal map does not carry
+        the author or because the gateway could not publish it; a failed
         terminal carrying one of the executors' own reasons (bridge-shutdown,
         spawn-failed and the rest of :data:`inject.INFRASTRUCTURE_REASONS`),
         a rejected one, or a canceled-before-start; and a deadline the read
@@ -1384,13 +1386,31 @@ class KubeAgentsHarness(AgentHarness):
                     if deadline is None:
                         deadline = time.monotonic() + budget
                     if not task_id:
-                        # The gateway answered the turn and started nothing.
-                        # No agent saw the prompt, so this is the run class
-                        # rather than an answer -- most often an author the
-                        # principal map does not carry, which is a
-                        # misconfigured install.
+                        # The door started nothing and said why. No agent saw
+                        # the prompt, so this is the run class rather than an
+                        # answer: an author the principal map does not carry
+                        # or a submission the gateway could not publish, both
+                        # of them a broken install.
+                        if not opening:
+                            # A status turn hands the refusal back as an
+                            # outcome rather than raising, because the
+                            # delegation wait's own retry is what has to see
+                            # it: each of its turns carries a fresh message
+                            # id, so the door's dedupe is not answering, and
+                            # an exhausted wait must end as infrastructure
+                            # rather than as an appended error the judge
+                            # grades (_DelegationTransportExhausted).
+                            return inject.Exchange(
+                                inject.Fold(""),
+                                inject.OUTCOME_NOT_ACCEPTED,
+                                task.conversation,
+                                "",
+                            )
+                        # The opening turn is not retried at all: the door
+                        # answers a repeat of the same message id with the
+                        # same refusal, so a retry cannot change it.
                         raise _TransportError(
-                            f"the gateway started no task for the prompt on "
+                            f"{inject.refusal_detail(task.refusal)}, on "
                             f"{task.conversation}: {task.note}",
                             retryable=False,
                         )
@@ -1509,17 +1529,22 @@ class KubeAgentsHarness(AgentHarness):
             )
 
         if exchange.fold.gateway_declared:
-            # The gateway declared this terminal: about a task it could not
-            # put on the bus, or -- on the read's fold -- the supervisor's
-            # word about an executor that died or never ran. Same state on
-            # the wire as an executor's failure and the opposite meaning:
-            # grading it would score an outage as the agent answering badly.
+            # The gateway declared this terminal rather than an executor:
+            # about a task it could not put on the bus, or -- on the read's
+            # fold -- the supervisor's word about an executor that died or
+            # never ran. Same state on the wire as an executor's failure and
+            # the opposite meaning: grading it would score an outage as the
+            # agent answering badly. Which of the two it was is worth saying,
+            # because they name different broken things.
             reason = exchange.fold.terminal_reason or "no reason given"
+            if exchange.fold.terminal_source == inject.TERMINAL_SOURCE_SUPERVISOR:
+                whose = "the supervisor ended it, so its executor died or never ran"
+            else:
+                whose = "the gateway failed to publish the submission, so it never reached the bus"
             return _infra_failure(
                 f"task {exchange.task_id} was ended by the gateway rather than by an executor "
                 f"(state {exchange.fold.terminal}, source {exchange.fold.terminal_source}, "
-                f"reason: {reason}): it never reached the bus or its executor died before "
-                "answering, so nothing the agent said is on the record"
+                f"reason: {reason}): {whose}, so nothing the agent said is on the record"
             )
 
         infrastructure = exchange.fold.infrastructure_terminal
@@ -1580,8 +1605,14 @@ class KubeAgentsHarness(AgentHarness):
                 except inject.InjectUnavailable as exc:
                     raise _TransportError(str(exc), retryable=exc.retryable) from exc
                 if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
+                    # Retryable, and therefore infrastructure once the wait's
+                    # retries are spent: nothing executed this turn, so there
+                    # is no answer to grade. The next attempt carries the
+                    # next status turn's own message id.
                     raise _TransportError(
-                        f"nothing executed status turn {turn_exchange.task_id}", retryable=True
+                        f"{inject.refusal_detail(follow.refusal)}, on status turn {turns} of "
+                        f"{follow.conversation}: {follow.note}",
+                        retryable=True,
                     )
                 return _inject_result(turn_exchange, identity), ""
 

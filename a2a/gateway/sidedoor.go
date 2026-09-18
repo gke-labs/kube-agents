@@ -140,6 +140,21 @@ func (s *sideDoorAdapter) TaskTerminal(conversation, taskID string, state lib.Ta
 	}
 }
 
+func (s *sideDoorAdapter) TaskAccepted(conversation, taskID string) {
+	if forDoor(conversation) {
+		s.door.TaskAccepted(conversation, taskID)
+	}
+}
+
+// MessageDropped reaches the door alone, for the same reason: a chat user was
+// told in their own conversation, and the door's caller is the one that would
+// otherwise wait out its bound for a notice it will not be sent twice.
+func (s *sideDoorAdapter) MessageDropped(conversation, authorID string) {
+	if forDoor(conversation) {
+		s.door.MessageDropped(conversation, authorID)
+	}
+}
+
 // SetProbe hands the gateway's probe to the door, which is the only half
 // whose caller is a program (ProbeSink). The composite implements it
 // unconditionally for the same reason it implements TaskObserver: the

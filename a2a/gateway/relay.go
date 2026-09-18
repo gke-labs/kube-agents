@@ -255,7 +255,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// applyEvent, which is worth doing when session routing is armed
 	// somewhere that grades the answer. Until then the two views of one
 	// supervisor terminal disagree: the read route's fold (probeConversation)
-	// attributes it by subject and says gateway, this path says executor.
+	// attributes it by subject and says supervisor, this path says executor.
 	//
 	// The reason is the terminal's status message, verbatim: the bridge and
 	// the worker adapter write `reason: <token>[ - detail]` there, and a

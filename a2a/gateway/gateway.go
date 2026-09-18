@@ -362,6 +362,13 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
 				unverifiedRemedyFor(backend)+".")
 		}
+		// After the notice, and whether or not one was posted: an adapter
+		// whose caller is a program has to learn about the drop it is not
+		// being told about a second time (DropObserver). Ordered after,
+		// because this wakes a waiting request, and a waiter that answered
+		// between the signal and the post would hand its caller a reply with
+		// the notice missing from the transcript.
+		g.observeMessageDropped(msg.Conversation, msg.AuthorID)
 		return
 	}
 
@@ -718,12 +725,12 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 		if task.Final {
 			// The fold's terminal, with whose word it is: the events
 			// subject is the executor's, the supervisor subject the
-			// gateway's. A caller grading an answer off this read takes
+			// supervisor's. A caller grading an answer off this read takes
 			// only the executor's; a supervisor terminal says an executor
 			// died or never ran, which is the install's.
 			state.TerminalSource = TerminalFromExecutor
 			if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
-				state.TerminalSource = TerminalFromGateway
+				state.TerminalSource = TerminalFromSupervisor
 			}
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
 				state.Result = joinTextParts(art.Parts)
@@ -758,6 +765,24 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(conversation, taskID, state, source, reason)
+	}
+}
+
+// observeTaskAccepted tells a TaskObserver that a task's submission reached
+// the bus. Separate from observeTaskStarted because the two answer different
+// questions and only the second is evidence an executor can ever see the ask.
+func (g *Gateway) observeTaskAccepted(conversation, taskID string) {
+	if observer, ok := g.adapter.(TaskObserver); ok {
+		observer.TaskAccepted(conversation, taskID)
+	}
+}
+
+// observeMessageDropped tells a DropObserver that a message was dropped for
+// an unverifiable sender. Called on every drop, not only on the ones the
+// gateway posts a notice for. See DropObserver.
+func (g *Gateway) observeMessageDropped(conversation, authorID string) {
+	if observer, ok := g.adapter.(DropObserver); ok {
+		observer.MessageDropped(conversation, authorID)
 	}
 }
 
@@ -894,6 +919,12 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
 		return
 	}
+
+	// The submission is on the subject now, which is the first moment
+	// anything can be said to have been handed to an executor. An observer
+	// told only about the start above would have to treat a task that never
+	// reached the bus as one that did. See TaskObserver.TaskAccepted.
+	g.observeTaskAccepted(rec.Key, taskID)
 
 	// Session-addressed routes get an incarnation; fixed addressees (the
 	// Hermes-first "platform") have their own executor and spawn nothing.

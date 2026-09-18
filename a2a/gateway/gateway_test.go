@@ -72,6 +72,28 @@ func provision(t *testing.T, url string) {
 	}
 }
 
+// deleteTasksStream takes the task stream away, which is how a test makes the
+// gateway's submission publish fail for real rather than through a fake. The
+// session-state bucket stays, so everything up to the publish still works:
+// the session is minted, the task is announced and the placeholder posted.
+func deleteTasksStream(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
+		t.Fatalf("delete TASKS: %v", err)
+	}
+}
+
 type fakePost struct {
 	Conversation string
 	MessageID    string

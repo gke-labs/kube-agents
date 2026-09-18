@@ -72,12 +72,17 @@ __all__ = [
     "OUTCOME_NEVER_STARTED",
     "OUTCOME_NOT_ACCEPTED",
     "OUTCOME_QUEUED",
+    "OUTCOME_STREAM_TERMINAL",
     "OUTCOME_TERMINAL",
     "OUTCOME_UNCLASSIFIED",
     "PERSONA_REASONS",
     "PROBE_PARAM",
     "REASON_CANCELED_BEFORE_START",
     "REASON_PREFIX",
+    "REFUSAL_NO_ANSWER",
+    "REFUSAL_NO_TASK",
+    "REFUSAL_PUBLISH_FAILED",
+    "REFUSAL_UNVERIFIED_AUTHOR",
     "RETRYABLE_STATUSES",
     "STATE_COMPLETED",
     "STATE_SUBMITTED",
@@ -85,6 +90,7 @@ __all__ = [
     "TERMINAL_SOURCE_EXECUTOR",
     "TERMINAL_SOURCE_GATEWAY",
     "TERMINAL_SOURCE_NEVER_STARTED",
+    "TERMINAL_SOURCE_SUPERVISOR",
     "TERMINAL_STATES",
     "BudgetBelowFloor",
     "Exchange",
@@ -97,6 +103,7 @@ __all__ = [
     "conversation_key",
     "message_id",
     "parse_reason",
+    "refusal_detail",
 ]
 
 _log = logging.getLogger("kube_agents_bench.inject_transport")
@@ -178,12 +185,15 @@ TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STAT
 
 # Who declared a terminal (``TerminalSource`` in a2a/gateway/adapter.go).
 # Only the first is the agent's own outcome. A gateway-declared one is a task
-# that never reached the bus; a never-started one is the gateway's
-# never-started heal, a task that reached the bus and that no executor ever
-# touched. Neither is an answer, and grading either scores an install fault
-# against the agent.
+# the gateway could not put on the bus; a supervisor one is the gateway's word
+# about an executor that died or never ran, which the read route's fold reads
+# off the subject the terminal arrived on; a never-started one is the
+# gateway's never-started heal, a task that reached the bus and that no
+# executor ever touched. None of the three is an answer, and grading any of
+# them scores an install fault against the agent.
 TERMINAL_SOURCE_EXECUTOR = "executor"
 TERMINAL_SOURCE_GATEWAY = "gateway"
+TERMINAL_SOURCE_SUPERVISOR = "supervisor"
 TERMINAL_SOURCE_NEVER_STARTED = "gateway-never-started"
 
 # How an executor says why a task ended: the terminal status event's message,
@@ -229,6 +239,44 @@ PERSONA_REASONS = frozenset({REASON_HERMES_EXITED_NONZERO, REASON_DEADLINE_EXCEE
 # canceled-before-start, which is infrastructure -- nothing ran.
 REASON_CANCELED_BEFORE_START = "canceled-before-start"
 REASON_CANCELED_BY_REQUEST = "canceled-by-request"
+
+# Why the door answered a ``POST`` with no task id (``refusal`` on the reply,
+# ``a2a/gateway/inject.go``). Branched on rather than matched in the note,
+# which is prose the gateway is free to rewrite. All four are infrastructure:
+# in none of them did an agent see the prompt.
+REFUSAL_UNVERIFIED_AUTHOR = "unverified-author"
+REFUSAL_PUBLISH_FAILED = "publish-failed"
+REFUSAL_NO_TASK = "no-task"
+REFUSAL_NO_ANSWER = "no-answer"
+# What each one means, in the words the run's record carries. The publish
+# failure is its own class rather than part of the refusal above because it
+# says something different about the install: the door and the principal map
+# are fine and the bus is not.
+_REFUSAL_DETAIL = {
+    REFUSAL_UNVERIFIED_AUTHOR: (
+        "the gateway refused the injection: its principal map does not carry the author"
+    ),
+    REFUSAL_PUBLISH_FAILED: (
+        "the gateway failed to publish the submission: it minted the task and could not put it "
+        "on the bus, so no executor can ever see the prompt"
+    ),
+    REFUSAL_NO_TASK: (
+        "the gateway answered the turn without starting a task (a steer, a status answer, or a stop)"
+    ),
+    REFUSAL_NO_ANSWER: "the gateway did not say what it did with the prompt inside its own bound",
+}
+_REFUSAL_UNKNOWN = "the gateway started no task for the prompt"
+
+
+def refusal_detail(refusal: str) -> str:
+    """The infrastructure reason behind a refusal code, or the generic one.
+
+    An unknown code is a gateway newer than this harness; it reads as the
+    generic reason rather than as an error of its own, because the fact that
+    matters -- nothing ran -- is the same either way.
+    """
+    return _REFUSAL_DETAIL.get(refusal, _REFUSAL_UNKNOWN)
+
 
 # Outcomes of one exchange.
 #
@@ -492,9 +540,16 @@ class Fold:
         "The task failed" and "the gateway could not start the task" are the
         same state and mean opposite things: the first is what the executor
         did with the ask, the second is that no executor ever saw it. Grading
-        the second as an answer scores a bus outage against the agent.
+        the second as an answer scores a bus outage against the agent. Three
+        sources say the second in different ways -- the gateway could not
+        publish it, the supervisor ended an executor that died or never ran,
+        and the never-started heal released one nobody took.
         """
-        return self.terminal_source in (TERMINAL_SOURCE_GATEWAY, TERMINAL_SOURCE_NEVER_STARTED)
+        return self.terminal_source in (
+            TERMINAL_SOURCE_GATEWAY,
+            TERMINAL_SOURCE_SUPERVISOR,
+            TERMINAL_SOURCE_NEVER_STARTED,
+        )
 
     @property
     def never_started(self) -> bool:
@@ -819,6 +874,9 @@ class InjectTask:
         self.message_id = message_id
         self.task_id = ""
         self.note = ""
+        # Why the door started nothing, when it started nothing: one of the
+        # REFUSAL_* codes. The note beside it is the gateway's prose.
+        self.refusal = ""
         # The gateway's own first-event grace, learned from the preflight
         # read or the submission, and whether the gateway runs on the inject
         # door alone. Neither is a deadline: the grace is the floor under
@@ -859,12 +917,18 @@ class InjectTask:
     def submit(self) -> str:
         """POST the prompt and return the task id the gateway started.
 
-        Returns ``""`` when the gateway answered the turn without starting a
-        task: an author the principal map does not know, or a message that
-        landed as a steer, a status query or a stop. ``note`` then carries the
-        gateway's own explanation, and the caller decides what it means -- for
-        a case's opening turn it is infrastructure, because no agent ever saw
-        the prompt.
+        Returns ``""`` when the door started nothing: an author the principal
+        map does not know, a submission the gateway could not publish, or a
+        message that landed as a steer, a status query or a stop.
+        :attr:`refusal` then carries which of those it was and ``note`` the
+        gateway's own prose, and the caller decides what it means -- for a
+        case's opening turn all of them are infrastructure, because no agent
+        ever saw the prompt.
+
+        A task id means the submission is on the bus, not merely that the
+        gateway minted one: the door waits for the publish before it answers
+        (``TaskObserver.TaskAccepted``), because a task that never reached a
+        subject has no terminal to await and would burn the whole budget.
 
         Raises:
             InjectUnavailable: The gateway could not be reached.
@@ -889,6 +953,7 @@ class InjectTask:
         # spelling the prefix here too.
         self.conversation = str(body.get("conversation") or self.conversation)
         self.note = str(body.get("note") or "")
+        self.refusal = str(body.get("refusal") or "")
         self.task_id = str(body.get("taskId") or "")
         if self.task_id:
             self.submitted_at = time.monotonic()
@@ -905,7 +970,10 @@ class InjectTask:
                 )
         else:
             _log.warning(
-                "inject: the gateway started no task on %s: %s", self.conversation, self.note
+                "inject: the gateway started no task on %s (%s): %s",
+                self.conversation,
+                self.refusal or "no refusal code",
+                self.note,
             )
         return self.task_id
 

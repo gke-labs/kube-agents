@@ -119,12 +119,20 @@ func TestSideDoorObservesOnlyItsOwnTasks(t *testing.T) {
 	if !ok {
 		t.Fatal("the composite does not implement TaskObserver, so POST /inject can never return a task id")
 	}
+	dropped, ok := composite.(DropObserver)
+	if !ok {
+		t.Fatal("the composite does not implement DropObserver, so a second drop at the door is a silence")
+	}
 
 	doorKey := injectKeyPrefix + "case-observe"
 	observer.TaskStarted(doorKey, "task-mine")
+	observer.TaskAccepted(doorKey, "task-mine")
 	observer.TaskTerminal(doorKey, "task-mine", lib.StateCompleted, TerminalFromExecutor, "")
+	dropped.MessageDropped(doorKey, "9999")
 	observer.TaskStarted("discord:g1/thread-1", "task-theirs")
+	observer.TaskAccepted("discord:g1/thread-1", "task-theirs")
 	observer.TaskTerminal("discord:g1/thread-1", "task-theirs", lib.StateFailed, TerminalFromExecutor, "")
+	dropped.MessageDropped("discord:g1/thread-1", "9999")
 
 	entries, _, terminal := door.snapshot(doorKey, 0, "task-mine")
 	if terminal != string(lib.StateCompleted) {
@@ -137,6 +145,12 @@ func TestSideDoorObservesOnlyItsOwnTasks(t *testing.T) {
 	}
 	if chatEntries, _, _ := door.snapshot("discord:g1/thread-1", 0, ""); len(chatEntries) != 0 {
 		t.Fatalf("the door minted a transcript for a chat conversation: %d entries", len(chatEntries))
+	}
+	if counts := door.counts(doorKey); counts.accepted != 1 || counts.drops != 1 {
+		t.Fatalf("the door recorded %+v for its own conversation, want one accept and one drop", counts)
+	}
+	if counts := door.counts("discord:g1/thread-1"); counts.accepted != 0 || counts.drops != 0 {
+		t.Fatalf("a chat conversation's accept or drop reached the door: %+v", counts)
 	}
 }
 

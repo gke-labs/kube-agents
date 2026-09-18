@@ -159,6 +159,7 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
                     "conversation": conversation,
                     "accepted": False,
                     "note": self.server.refusal_note,
+                    "refusal": self.server.refusal_code,
                     "entries": self.server.refusal_entries,
                     "firstEventGraceSeconds": self.server.grace_seconds,
                 },
@@ -262,6 +263,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     grace_seconds: int = GRACE_SECONDS
     accept_submissions: bool = True
     refusal_note: str = "the gateway answered without starting a task"
+    # The machine-readable half of a refusal, which is what the harness
+    # branches on; "" is a door too old to send one.
+    refusal_code: str = ""
     refusal_entries: list[dict[str, Any]]
     # Non-None makes a POST (or every GET) answer with that status instead;
     # submit_failures bounds how many leading POSTs do (-1: all of them).
@@ -740,11 +744,13 @@ def test_a_submission_the_gateway_refuses_is_infrastructure(
     than a bad answer -- and it must not be retried, because the answer cannot
     change."""
     stub_gateway.accept_submissions = False
+    stub_gateway.refusal_code = inject.REFUSAL_UNVERIFIED_AUTHOR
     stub_gateway.refusal_note = "an author the principal map does not know"
 
     result = KubeAgentsHarness().run("who am I?")
 
     assert infra(result)
+    assert "the gateway refused the injection" in result.errors[0]
     assert "principal map" in result.errors[0]
     assert result.output == ""
     assert len(stub_gateway.submissions) == 1
@@ -768,8 +774,41 @@ def test_a_gateway_declared_terminal_is_infrastructure(
     result = KubeAgentsHarness().run("go")
 
     assert infra(result)
+    assert "failed to publish the submission" in result.errors[0]
     assert "never reached the bus" in result.errors[0]
     assert result.output == ""
+
+
+@pytest.mark.parametrize(
+    ("refusal", "phrase"),
+    [
+        (inject.REFUSAL_UNVERIFIED_AUTHOR, "refused the injection"),
+        (inject.REFUSAL_PUBLISH_FAILED, "failed to publish the submission"),
+        (inject.REFUSAL_NO_TASK, "answered the turn without starting a task"),
+        (inject.REFUSAL_NO_ANSWER, "did not say what it did with the prompt"),
+        ("", "started no task for the prompt"),
+    ],
+)
+def test_each_refusal_says_which_thing_is_broken(
+    stub_gateway: _StubGatewayServer, refusal: str, phrase: str
+) -> None:
+    """Every refusal is infrastructure, and each names a different broken
+    thing: an author the map does not carry, a bus the gateway could not
+    reach, a message that landed as a steer, a gateway that said nothing. The
+    code is what the harness branches on -- the note beside it is the
+    gateway's prose and is free to change -- and an unknown code still reads
+    as "nothing ran". None of them is retried: the door answers a repeat of
+    the same message id with the same refusal."""
+    stub_gateway.accept_submissions = False
+    stub_gateway.refusal_code = refusal
+
+    result = KubeAgentsHarness().run("go")
+
+    assert infra(result)
+    assert phrase in result.errors[0]
+    assert result.output == ""
+    assert len(stub_gateway.submissions) == 1
+    assert not stub_gateway.cancels
 
 
 # --------------------------------------------------------------------------
@@ -1076,13 +1115,14 @@ def test_a_supervisor_terminal_on_the_fold_is_infrastructure(
     stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
     stub_gateway.executor_states = ["failed"]
     stub_gateway.probe_final = True
-    stub_gateway.probe_terminal_source = inject.TERMINAL_SOURCE_GATEWAY
+    stub_gateway.probe_terminal_source = inject.TERMINAL_SOURCE_SUPERVISOR
     stub_gateway.probe_reason = "reason: worker-evicted"
 
     result = KubeAgentsHarness().run("go")
 
     assert infra(result)
     assert "ended by the gateway rather than by an executor" in result.errors[0]
+    assert "the supervisor ended it" in result.errors[0]
     assert "worker-evicted" in result.errors[0]
     assert result.output == ""
     assert not stub_gateway.cancels

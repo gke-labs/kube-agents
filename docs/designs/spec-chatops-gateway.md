@@ -549,11 +549,32 @@ not be silent about it.
 
 - `POST /inject` takes a conversation key, an author and the text. The adapter prefixes the key
   with `inject:` and delivers an `InboundMessage`; from there the turn is indistinguishable from
-  a Discord message. The reply carries the task id, so the caller can await a named task rather
+  a Discord message - the text is routed the way any text is, the gateway's literal affordances
+  included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
+  the persona. The harness sends none of them, and a case whose prompt opens with one is the
+  case's defect. The reply carries the task id, so the caller can await a named task rather
   than guessing which post belongs to its submission, and the gateway's first-event grace, so the
-  caller can set its own deadline above the window the gateway already owns. A turn the gateway
-  answers without minting a task - a steer, a status query, an author the map does not know -
-  says so, and the reply the conversation received is in the same payload.
+  caller can set its own deadline above the window the gateway already owns.
+
+  A task id in the reply means the submission is on the task's `in` subject, not merely that the
+  gateway minted one. `startTask` announces the id, posts the placeholder and writes the record
+  before it publishes; if the publish fails it edits the placeholder to say so, releases the
+  conversation and returns, and nothing is on any subject. So the door waits for the publish
+  (`TaskObserver.TaskAccepted`) before it answers, and a caller is never handed an id whose
+  terminal cannot come. Everything else is a refusal, carried as a code the caller branches on
+  rather than as prose it would have to match: `unverified-author` (the door's principal map does
+  not carry the author, so the gateway dropped the message), `publish-failed`, `no-task` (a steer,
+  a status answer or a stop) and `no-answer` (the bound expired with the gateway visibly doing
+  nothing). A repeat of the same backend message id is answered with the same refusal, and the
+  reply the conversation received is in the same payload. All four are infrastructure to the
+  harness: in none of them did an agent see the prompt.
+
+  The drop is a signal to the adapter (`DropObserver`) rather than something the door reads out
+  of the transcript, because the gateway posts its unverified-sender notice once per sender: the
+  second message from the same author posts nothing at all, and a door watching only the
+  transcript would hold that POST until its bound and then answer that nothing visible happened.
+  The notice's own dedupe stays the gateway's.
+
 - `GET /conversations/{key}` returns what the relay posted, as a sequence a caller pages through
   with `after`, plus `wait` to block for something new and `task` to name the task whose terminal
   the answer should carry. Those three are the whole of "await terminal of task id X". Replies
@@ -565,7 +586,8 @@ not be silent about it.
   `submittedAt`, age and `detached` flag, the highest executor state the stream shows (none,
   `submitted`, `working`, or a terminal, with `final`) and, when the stream is terminal, the
   fold of it: whose word the terminal is (`terminalSource`, the executor's for a terminal on the
-  task's events subject and the gateway's for one on its supervisor subject), the result
+  task's events subject and the supervisor's for one on its supervisor subject - distinct from
+  the gateway's own source, which says it could not publish the task at all), the result
   artifact's text and the terminal's status message; plus the conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
@@ -583,8 +605,8 @@ not be silent about it.
   record whose stream already folds to a terminal, which is the relay's lost record write (the
   relay acks a terminal before it clears `ActiveTask` and writes the record, and on a key never
   reused no heal arrives) - graded like a finished run from the fold's result text when the
-  terminal is the executor's, infrastructure when it is the gateway's (the supervisor ended an
-  executor that died or never ran), and never cancelled. The budget is the harness's own
+  terminal is the executor's, infrastructure when it is the supervisor's (an executor that died
+  or never ran), and never cancelled. The budget is the harness's own
   (`AGENT_INJECT_TIMEOUT`, 1800 s by default), floored at the grace plus a margin and refused
   below it before anything is started, not the grace itself: the grace stays the gateway's
   nobody-took-it detector, and a presubmit that runs more units in parallel than the bridge has
@@ -628,13 +650,15 @@ arrives while the first turn is still in flight. The id is unique per invocation
 never mistaken for a retry, and each status turn of the harness's delegation wait carries its own,
 `<run>/<case>/<rep>/status-<n>`, so the dedupe does not fold it into the opening task.
 
-The gateway tells the adapter a task's two ends through an optional `TaskObserver` interface the
+The gateway tells the adapter a task's ends through an optional `TaskObserver` interface the
 chat backends do not implement: a human reads the chat, so rendered text is their whole
 interface, while a program must not have to parse `✅ **completed**` to know a task is over. The
-terminal says who declared it, which is the difference between an executor that failed, a task
-that never reached the bus, and one the never-started heal released past
-`A2A_FIRST_EVENT_GRACE` - three states that look alike to a caller and mean the agent's fault,
-an outage, and an install with no executor. It also carries the executor's reason verbatim - the
+start and the accept are separate calls because the id and the submission are different facts,
+as the refusal above turns on. The terminal says who declared it, which is the difference between
+an executor that failed, a task that never reached the bus, the supervisor's word about an
+executor that died, and one the never-started heal released past `A2A_FIRST_EVENT_GRACE` - four
+states that look alike to a caller and mean the agent's fault, an outage, a dead executor, and an
+install with no executor. It also carries the executor's reason verbatim - the
 terminal status message the bridge and the worker adapter write as `reason: <token>[ - detail]` -
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
