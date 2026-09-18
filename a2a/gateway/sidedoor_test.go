@@ -119,9 +119,9 @@ func TestSideDoorObservesOnlyItsOwnTasks(t *testing.T) {
 	if !ok {
 		t.Fatal("the composite does not implement TaskObserver, so POST /inject can never return a task id")
 	}
-	dropped, ok := composite.(DropObserver)
+	dropped, ok := composite.(InboundObserver)
 	if !ok {
-		t.Fatal("the composite does not implement DropObserver, so a second drop at the door is a silence")
+		t.Fatal("the composite does not implement InboundObserver, so a second drop at the door is a silence")
 	}
 
 	doorKey := injectKeyPrefix + "case-observe"

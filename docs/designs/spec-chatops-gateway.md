@@ -569,11 +569,13 @@ not be silent about it.
   reply the conversation received is in the same payload. All four are infrastructure to the
   harness: in none of them did an agent see the prompt.
 
-  The drop is a signal to the adapter (`DropObserver`) rather than something the door reads out
-  of the transcript, because the gateway posts its unverified-sender notice once per sender: the
-  second message from the same author posts nothing at all, and a door watching only the
-  transcript would hold that POST until its bound and then answer that nothing visible happened.
-  The notice's own dedupe stays the gateway's.
+  A refusal is read off the end of the turn rather than guessed from the transcript. The gateway
+  tells the adapter when an inbound turn finishes and when it drops a message
+  (`InboundObserver`), because neither is knowable from what the conversation received: the heal
+  posts twice before `startTask` announces, so a door concluding "answered without a task" from
+  posts alone can tell its caller nothing started while the turn goes on to mint a task that then
+  runs unobserved; and the unverified-sender notice is posted once per sender, so a second
+  message from the same author posts nothing at all. The notice's own dedupe stays the gateway's.
 
 - `GET /conversations/{key}` returns what the relay posted, as a sequence a caller pages through
   with `after`, plus `wait` to block for something new and `task` to name the task whose terminal

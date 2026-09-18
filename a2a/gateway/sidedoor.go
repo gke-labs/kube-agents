@@ -146,12 +146,18 @@ func (s *sideDoorAdapter) TaskAccepted(conversation, taskID string) {
 	}
 }
 
-// MessageDropped reaches the door alone, for the same reason: a chat user was
-// told in their own conversation, and the door's caller is the one that would
-// otherwise wait out its bound for a notice it will not be sent twice.
+// MessageDropped and TurnFinished reach the door alone, for the same reason:
+// a chat user reads their own conversation, and the door's caller is the one
+// that would otherwise have to guess what became of its message.
 func (s *sideDoorAdapter) MessageDropped(conversation, authorID string) {
 	if forDoor(conversation) {
 		s.door.MessageDropped(conversation, authorID)
+	}
+}
+
+func (s *sideDoorAdapter) TurnFinished(conversation string) {
+	if forDoor(conversation) {
+		s.door.TurnFinished(conversation)
 	}
 }
 

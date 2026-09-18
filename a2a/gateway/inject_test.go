@@ -28,9 +28,9 @@ import (
 // assertions are in TestOnlyTheInjectBackendObservesTasks below, which a
 // compile-time var cannot express.
 var (
-	_ Adapter      = (*InjectAdapter)(nil)
-	_ TaskObserver = (*InjectAdapter)(nil)
-	_ DropObserver = (*InjectAdapter)(nil)
+	_ Adapter         = (*InjectAdapter)(nil)
+	_ TaskObserver    = (*InjectAdapter)(nil)
+	_ InboundObserver = (*InjectAdapter)(nil)
 )
 
 const (
@@ -840,18 +840,18 @@ func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
 	if _, ok := any(gchat).(TaskObserver); ok {
 		t.Error("the Google Chat adapter implements TaskObserver; the gateway now calls into it untested")
 	}
-	if _, ok := any(discord).(DropObserver); ok {
-		t.Error("the Discord adapter implements DropObserver; the gateway now calls into it untested")
+	if _, ok := any(discord).(InboundObserver); ok {
+		t.Error("the Discord adapter implements InboundObserver; the gateway now calls into it untested")
 	}
-	if _, ok := any(gchat).(DropObserver); ok {
-		t.Error("the Google Chat adapter implements DropObserver; the gateway now calls into it untested")
+	if _, ok := any(gchat).(InboundObserver); ok {
+		t.Error("the Google Chat adapter implements InboundObserver; the gateway now calls into it untested")
 	}
 	inject := &InjectAdapter{}
 	if _, ok := any(inject).(TaskObserver); !ok {
 		t.Error("the inject adapter does not implement TaskObserver, so POST /inject can never return a task id")
 	}
-	if _, ok := any(inject).(DropObserver); !ok {
-		t.Error("the inject adapter does not implement DropObserver, so a second drop from one author is a silence")
+	if _, ok := any(inject).(InboundObserver); !ok {
+		t.Error("the inject adapter does not implement InboundObserver, so a second drop from one author is a silence")
 	}
 }
 
@@ -2222,5 +2222,104 @@ func TestInjectCancelFromAnUnknownAuthorDoesNotHoldTheConnection(t *testing.T) {
 	}
 	if !strings.Contains(reply.Note, "dropped this cancel") {
 		t.Fatalf("note = %q, want it to say the cancel was dropped", reply.Note)
+	}
+}
+
+// TestInjectNamedCancelOfTheActiveTaskDetachesTheRecord: the shape every
+// cancel the harness sends actually takes. It always names the task, and the
+// commonest case -- working at the budget -- names the one the record still
+// holds as active, which must route to the ordinary cancel and detach the
+// record. A regression that sent it to the named-cancel path instead would
+// still publish `kind: cancel` and mark the history entry, so the bus-side
+// assertions elsewhere would pass while the record stayed attached: the read
+// route would report `detached:false`, the harness would grade the timeout
+// off an undetached record, and the next message would steer a cancelled
+// task.
+func TestInjectNamedCancelOfTheActiveTaskDetachesTheRecord(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-named-active", injectTestAuthor, "long job")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+
+	r.cancelTask(t, reply.Conversation, injectTestAuthor, reply.TaskID)
+	r.waitForPost(t, reply.Conversation, "cancel sent")
+
+	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !probe.Active || !probe.Detached || probe.TaskID != reply.TaskID {
+		t.Fatalf("after a named cancel of the active task: probe = %+v, want it active and detached", probe)
+	}
+	// And the named-cancel path's own refusal did not fire: the conversation
+	// holds this task, so the cancel is the ordinary one.
+	posts := strings.Join(entryTexts(reply.Entries, InjectEntryPost), "\n")
+	if strings.Contains(posts, "no longer holds") {
+		t.Fatalf("the active task took the released-task path: %q", posts)
+	}
+	cancels := 0
+	for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+		if env.Kind == lib.KindCancel {
+			cancels++
+		}
+	}
+	if cancels != 1 {
+		t.Fatalf("%d cancel envelopes on the in subject, want 1", cancels)
+	}
+}
+
+// TestInjectHealedTerminalCarriesTheExecutorsReason: the heal hands the door
+// the terminal the relay should have delivered, and its copy must carry the
+// same reason. A caller tells an executor's own failure from the persona's by
+// that token, so an empty one on the heal's copy grades an install fault as
+// the agent's answer -- and the heal's copy is the one a caller sees when the
+// terminal lands in the window between its last read and the turn it sends
+// next.
+func TestInjectHealedTerminalCarriesTheExecutorsReason(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-healed-reason", injectTestAuthor, "long job")
+	origin := r.awaitTask(t, "platform")
+	ctx := context.Background()
+	const reason = "reason: bridge-shutdown - draining"
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateFailed, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-healed", TaskID: origin.TaskID, ContextID: origin.ContextID,
+			Parts: []lib.Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: "platform", AgentType: "test-executor"},
+		origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskEventsSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+
+	// The shape the heal exists for: the relay's record write was lost, so
+	// the conversation still holds a task whose stream is already terminal,
+	// and the next turn is what discovers it.
+	r.restoreActiveTask(t, reply.Conversation, origin, time.Minute)
+	before, _, _ := r.adapter.snapshot(reply.Conversation, 0, "")
+	r.inject(t, "case-healed-reason", injectTestAuthor, "anything")
+
+	entries, _, _ := r.adapter.snapshot(reply.Conversation, len(before), "")
+	healed := terminalEntries(entries)
+	if len(healed) == 0 {
+		t.Fatalf("the heal handed the door no terminal; entries = %+v", entries)
+	}
+	for _, entry := range healed {
+		if entry.TaskID != reply.TaskID {
+			continue
+		}
+		if entry.Reason != reason {
+			t.Fatalf("the healed terminal's reason = %q, want the executor's %q", entry.Reason, reason)
+		}
 	}
 }

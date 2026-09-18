@@ -333,6 +333,14 @@ func (g *Gateway) lockSession(key string) *sync.Mutex {
 // and route the message — status query by replay, stop, steer, or a new
 // task. Runs on the conversation's inbox worker, in arrival order.
 func (g *Gateway) handleInbound(msg InboundMessage) {
+	// First, and before the verification below, which returns early for a
+	// sender it cannot place: whatever this turn does and however it
+	// returns, the adapter is told it is over. See
+	// InboundObserver.TurnFinished -- it is what lets a door whose caller is
+	// a program say "the gateway answered without starting a task" as a fact
+	// rather than as a guess about timing.
+	defer g.observeTurnFinished(msg.Conversation)
+
 	// Verify against the backend's identity mechanism — the mapping table
 	// on Discord, the Google-asserted email gated by the allowlist on gchat
 	// — and drop the message if we can't (gateway design, turns-and-tasks
@@ -653,9 +661,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// adapter now: the stream's word, so it is the executor's. A chat
 		// backend is told nothing (TaskObserver); the inject door records
 		// it, and a program awaiting the task ends its wait on it rather
-		// than on a status card it would have to parse. The fold carries
-		// no status message, so no reason rides with it.
-		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, TerminalFromExecutor, "")
+		// than on a status card it would have to parse. With the reason the
+		// fold carries, because the two deliveries of one terminal must not
+		// disagree: a caller classifying a bridge's own failure by its
+		// reason token would grade it as the persona's for the one that
+		// came this way.
+		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, TerminalFromExecutor,
+			finalMessageText(task))
 		healed = true
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
@@ -768,6 +780,16 @@ func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.Tas
 	}
 }
 
+// finalMessageText is the text of a folded task's terminal status message,
+// which is where an executor writes `reason: <token>[ - detail]`. Empty when
+// the terminal carried no message.
+func finalMessageText(task *lib.Task) string {
+	if task == nil || task.FinalMessage == nil {
+		return ""
+	}
+	return joinTextParts(task.FinalMessage.Parts)
+}
+
 // observeTaskAccepted tells a TaskObserver that a task's submission reached
 // the bus. Separate from observeTaskStarted because the two answer different
 // questions and only the second is evidence an executor can ever see the ask.
@@ -777,12 +799,20 @@ func (g *Gateway) observeTaskAccepted(conversation, taskID string) {
 	}
 }
 
-// observeMessageDropped tells a DropObserver that a message was dropped for
-// an unverifiable sender. Called on every drop, not only on the ones the
-// gateway posts a notice for. See DropObserver.
+// observeMessageDropped tells an InboundObserver that a message was dropped
+// for an unverifiable sender. Called on every drop, not only on the ones the
+// gateway posts a notice for. See InboundObserver.
 func (g *Gateway) observeMessageDropped(conversation, authorID string) {
-	if observer, ok := g.adapter.(DropObserver); ok {
+	if observer, ok := g.adapter.(InboundObserver); ok {
 		observer.MessageDropped(conversation, authorID)
+	}
+}
+
+// observeTurnFinished tells an InboundObserver that a turn on a conversation
+// has ended. Deferred in handleInbound, so an early return announces it too.
+func (g *Gateway) observeTurnFinished(conversation string) {
+	if observer, ok := g.adapter.(InboundObserver); ok {
+		observer.TurnFinished(conversation)
 	}
 }
 

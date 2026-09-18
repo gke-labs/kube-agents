@@ -148,23 +148,33 @@ type TaskObserver interface {
 	TaskAccepted(conversation, taskID string)
 }
 
-// DropObserver is the optional extension an Adapter implements when it has to
-// know that a message of its own was dropped at the door rather than routed.
+// InboundObserver is the optional extension an Adapter implements when it has
+// to know what became of a message it handed over, rather than only what the
+// conversation received. Every chat backend ignores both: a human reads the
+// room and knows whether they were answered.
+//
+// A program cannot. It needs the two facts the transcript does not carry.
 //
 // The gateway drops a message whose sender it cannot verify, and tells the
 // sender once per sender rather than once per message: a person who has been
 // told they are unknown does not need the same line under every attempt. For
 // a person that is right, and for a program it is a silence that looks
-// exactly like a turn still running -- a second drop posts nothing, and a
-// caller waiting for the gateway to do something visible waits out its bound
-// for an answer that has already been given. This hands the adapter the fact
-// itself, on every drop, so the door can refuse at once and name the reason.
-// The notice's own dedupe stays the gateway's.
+// exactly like a turn still running. MessageDropped hands the adapter the
+// fact itself, on every drop; the notice's own dedupe stays the gateway's.
 //
-// Called on the conversation's inbox worker, like TaskStarted: record and
-// return.
-type DropObserver interface {
+// TurnFinished says the turn is over, which is the only thing that makes "the
+// gateway answered without starting a task" knowable rather than guessed. A
+// door watching the transcript alone cannot tell a turn that answered and
+// stopped from one that has posted something on its way to minting a task --
+// the heal posts twice before startTask announces - and a guess that lands
+// the wrong way answers the caller "nothing started" while the task it did
+// start runs unobserved.
+//
+// Both are called on the conversation's inbox worker, like TaskStarted:
+// record and return.
+type InboundObserver interface {
 	MessageDropped(conversation, authorID string)
+	TurnFinished(conversation string)
 }
 
 // TerminalSource says whose word a terminal is. It exists because "the task

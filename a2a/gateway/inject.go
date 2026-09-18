@@ -460,6 +460,11 @@ type injectConversation struct {
 	// transcript is what the conversation received, and a drop the gateway
 	// chose not to post a second notice for is not something it received.
 	drops int
+	// turns counts the inbound turns that have finished here. The inbox
+	// worker runs a conversation's turns one at a time, so a waiter that
+	// read this before handing its message over knows its own turn is over
+	// when the count moves.
+	turns int
 	// requester is the author of the last message injected here, which is
 	// the whole membership of a synthetic conversation. Roster returns it.
 	requester string
@@ -744,7 +749,7 @@ func (a *InjectAdapter) TaskAccepted(conversation, taskID string) {
 }
 
 // MessageDropped records that the gateway dropped a message here for a sender
-// it could not verify. See DropObserver: the notice is posted once per
+// it could not verify. See InboundObserver: the notice is posted once per
 // sender, so on a second drop this counter is the only thing that moves.
 func (a *InjectAdapter) MessageDropped(conversation, authorID string) {
 	a.mu.Lock()
@@ -753,6 +758,18 @@ func (a *InjectAdapter) MessageDropped(conversation, authorID string) {
 	conv.drops++
 	a.log.Warn("inject: the gateway dropped a message from an author its principal map does not carry",
 		"conversation", conversation, "author", authorID)
+	close(a.notify)
+	a.notify = make(chan struct{})
+}
+
+// TurnFinished records that a turn on this conversation has ended, which is
+// what tells a waiting POST that what it can see is all there is going to be.
+// See InboundObserver.
+func (a *InjectAdapter) TurnFinished(conversation string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	conv.turns++
 	close(a.notify)
 	a.notify = make(chan struct{})
 }
@@ -953,6 +970,7 @@ type injectCounts struct {
 	publishFailed int
 	entries       int
 	drops         int
+	turns         int
 }
 
 // counts is the conversation's state as a waiting request sees it.
@@ -969,6 +987,7 @@ func (a *InjectAdapter) counts(key string) injectCounts {
 		publishFailed: conv.publishFailed.total,
 		entries:       conv.nextSeq - 1,
 		drops:         conv.drops,
+		turns:         conv.turns,
 	}
 }
 
@@ -1219,23 +1238,21 @@ func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior inject
 // (TaskObserver.TaskAccepted) or on the gateway's own terminal for the same
 // task, which is the publish-failed refusal.
 //
-// The other two ends are a turn that answered without minting anything -- a
-// steer onto a running task, a status answer, a stop -- and a drop of an
-// unverifiable sender. The drop is a signal rather than a post
-// (DropObserver), because the gateway's notice is posted once per sender and
-// the second drop from the same author posts nothing at all; a wait watching
-// only the transcript would sit there until its bound for an answer that had
-// already been given.
+// The other endings are read off the end of the turn rather than guessed
+// from the transcript (InboundObserver.TurnFinished). A post is not proof the
+// turn started nothing: handleInbound posts BEFORE startTask on the heal
+// paths (a stale task's status card, the never-started notice), so a door
+// concluding "answered without a task" from entries alone can answer a caller
+// that nothing started while the turn goes on to mint a task -- which then
+// runs with nobody watching it and nobody to cancel it. Once the turn is
+// over, what the door can see is all there is, and the refusal is a fact: a
+// drop, a reply with no task, or nothing at all.
+//
+// The drop is a signal rather than a post for a related reason: the gateway's
+// notice is posted once per sender, so the second drop from the same author
+// posts nothing at all.
 func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectCounts) (string, string, string) {
 	deadline := time.Now().Add(injectSubmitWait)
-	// A post is not proof the turn started nothing: handleInbound posts
-	// BEFORE startTask on the heal paths (a stale task's status card, the
-	// never-started notice), and then goes on to mint a task. So a turn that
-	// has posted without starting anything is only concluded after a second
-	// look one poll apart, by which time a task the same turn is about to
-	// mint has been announced. A turn that really answered without starting
-	// anything pays one extra poll interval for that.
-	postedWithoutTask := false
 	for {
 		accepted, acceptedGone := a.acceptedSince(key, prior.accepted)
 		if accepted != "" {
@@ -1256,30 +1273,39 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 				injectMaxEntries), injectRefusalNoAnswer
 		}
 		now := a.counts(key)
-		switch {
-		case now.starts > prior.starts:
-			// A task is in flight between its announcement and its publish.
-			// Only the two lines above end this wait now: the placeholder
-			// post is an entry, and reading it as "answered without starting
-			// a task" would refuse a submission that is about to succeed.
-		case now.drops > prior.drops:
-			return "", "the gateway dropped this message: its principal map does not carry the author, " +
-				"so nothing was started (the notice naming the author is posted once per sender, so it " +
-				"may not be in the entries)", injectRefusalUnverifiedAuthor
-		case now.entries > prior.entries:
-			if postedWithoutTask {
+		if now.turns > prior.turns {
+			// The turn is over and no task of it reached the bus. Which
+			// refusal it is follows from what the turn did, in the order the
+			// gateway could have done them.
+			switch {
+			case now.drops > prior.drops:
+				return "", "the gateway dropped this message: its principal map does not carry the " +
+					"author, so nothing was started (the notice naming the author is posted once per " +
+					"sender, so it may not be in the entries)", injectRefusalUnverifiedAuthor
+			case now.starts > prior.starts:
+				// Announced, and the turn ended without the publish either
+				// succeeding or failing: the gateway went away mid-turn.
+				started, _ := a.startedSince(key, prior.starts)
+				return "", fmt.Sprintf("the gateway minted task %s and the turn ended without putting "+
+					"it on the bus or saying it could not", started), injectRefusalNoAnswer
+			case now.entries > prior.entries:
 				return "", "the gateway answered this turn without starting a task (a steer, a status " +
 					"answer, or a stop); the reply is in entries", injectRefusalNoTask
+			default:
+				return "", "the turn ended with the gateway neither starting a task nor posting a reply",
+					injectRefusalNoAnswer
 			}
-			postedWithoutTask = true
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
+			// The turn never ended, which is the gateway itself being stuck:
+			// handleInbound runs under its own turn timeout, below this
+			// bound, so reaching here means it has not returned at all.
 			if started, _ := a.startedSince(key, prior.starts); started != "" {
 				return "", fmt.Sprintf("the gateway minted task %s and within %s neither put it on the "+
 					"bus nor said it could not", started, injectSubmitWait), injectRefusalNoAnswer
 			}
-			return "", fmt.Sprintf("the gateway neither started a task nor posted a reply within %s",
+			return "", fmt.Sprintf("the gateway did not finish this turn within %s",
 				injectSubmitWait), injectRefusalNoAnswer
 		}
 		woken := a.waitCh()

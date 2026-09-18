@@ -1105,6 +1105,27 @@ def test_a_failed_terminal_on_the_fold_carries_its_reason(
     assert not stub_gateway.cancels
 
 
+def test_an_adopted_fold_grades_the_result_text_over_the_placeholder(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """On the lost-record-write path the relay posted nothing but the
+    gateway's own "submitted" placeholder, and nothing ever edited it, so it
+    survives the rewrite filter and would be graded as the agent's answer.
+    The result artifact the read carries off the stream is the answer."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
+    stub_gateway.executor_states = [inject.STATE_COMPLETED]
+    stub_gateway.probe_final = True
+    stub_gateway.probe_terminal_source = inject.TERMINAL_SOURCE_EXECUTOR
+    stub_gateway.probe_result = "the PodDisruptionBudget allows zero disruptions"
+
+    result = KubeAgentsHarness().run("why is the drain stuck?")
+
+    assert not infra(result)
+    assert result.output == "the PodDisruptionBudget allows zero disruptions"
+    assert PLACEHOLDER not in result.output
+    assert result.metadata["final_message"] == result.output
+
+
 def test_a_supervisor_terminal_on_the_fold_is_infrastructure(
     stub_gateway: _StubGatewayServer,
 ) -> None:
