@@ -881,15 +881,19 @@ def _cancel_note(exchange: a2a.Exchange) -> str:
     return _CANCEL_TAKEN_NOTE if exchange.cancel_taken else _CANCEL_UNCONFIRMED_NOTE
 
 
-def _nothing_accepted(exchange: a2a.Exchange) -> bool:
-    """True when no executor consumed the submission before the wait ended.
+def _nothing_ran(exchange: a2a.Exchange) -> bool:
+    """True when no executor ran the submission before the wait ended.
 
-    The accept bound says so outright; a deadline that fell first says the
-    same thing when the fold is still empty. Either way there was no
-    executor, and the empty record is the run class, not an answer.
+    The accept bound says so outright. A deadline that fell first says the
+    same thing when the fold is still empty, and when the fold never left
+    ``submitted``: the bridge publishes that on accept and queues the task
+    behind its workers, so a task still there at the deadline waited out the
+    budget with no model running (docs/designs/eval-next-transport.md, stage
+    1, the same rule on both transports). Either way the record is the run
+    class, not an answer.
     """
     return exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED or (
-        exchange.outcome == a2a.OUTCOME_DEADLINE and not exchange.fold.accepted
+        exchange.outcome == a2a.OUTCOME_DEADLINE and not exchange.fold.started
     )
 
 
@@ -1392,22 +1396,31 @@ class KubeAgentsHarness(AgentHarness):
             failure.metadata["abandoned_tasks"] = abandoned
             return failure
 
-        if _nothing_accepted(exchange):
-            # Nothing consumed the submission: no executor for the addressee
-            # is running. Not an answer, and no judge should see the empty
-            # record as one. The run's deadline can fall before the accept
-            # bound does -- a short AGENT_HTTP_TIMEOUT, or a retry late in the
-            # budget -- and an empty fold at the deadline is the same fact.
-            bound = (
-                f"within {accept_timeout:.0f}s"
-                if exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED
-                else f"before the run's {timeout:.0f}s deadline"
-            )
-            failure = _infra_failure(
-                f"no executor accepted task {ids.task_id} on "
-                f"{a2a.task_in_subject(addressee, ids.task_id)} {bound}; "
-                f"{_cancel_note(exchange)}"
-            )
+        if _nothing_ran(exchange):
+            # Nothing ran the submission: no executor for the addressee is
+            # running, or the bridge accepted the task and left it queued
+            # behind its workers for the whole budget. Neither is an answer,
+            # and no judge should see the record as one. The run's deadline
+            # can fall before the accept bound does -- a short
+            # AGENT_HTTP_TIMEOUT, or a retry late in the budget -- and an
+            # empty fold at the deadline is the same fact.
+            if exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED:
+                what = (
+                    f"no executor accepted task {ids.task_id} on "
+                    f"{a2a.task_in_subject(addressee, ids.task_id)} within {accept_timeout:.0f}s"
+                )
+            elif not exchange.fold.accepted:
+                what = (
+                    f"no executor accepted task {ids.task_id} on "
+                    f"{a2a.task_in_subject(addressee, ids.task_id)} "
+                    f"before the run's {timeout:.0f}s deadline"
+                )
+            else:
+                what = (
+                    f"an executor accepted task {ids.task_id} and left it queued at "
+                    f"{a2a.STATE_SUBMITTED!r} for the run's whole {timeout:.0f}s budget"
+                )
+            failure = _infra_failure(f"{what}; {_cancel_note(exchange)}")
             failure.metadata["abandoned_tasks"] = abandoned
             return failure
 
@@ -1444,9 +1457,9 @@ class KubeAgentsHarness(AgentHarness):
                     )
                 except a2a.BusUnavailable as exc:
                     raise _TransportError(str(exc), retryable=exc.retryable) from exc
-                if _nothing_accepted(turn_exchange):
+                if _nothing_ran(turn_exchange):
                     raise _TransportError(
-                        f"no executor accepted status turn {turn_ids.task_id}",
+                        f"no executor ran status turn {turn_ids.task_id}",
                         retryable=True,
                     )
                 return _a2a_result(turn_exchange, turn_ids, addressee), ""

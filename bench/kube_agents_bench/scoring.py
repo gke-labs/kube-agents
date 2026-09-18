@@ -406,7 +406,9 @@ def _a2a_liveness_event(trajectory: list[Any]) -> bool:
     started, which is all a graded timeout carries when the run was cancelled
     at its budget before the terminal landed. ``submitted`` alone is the
     bridge queueing the task, not a model running, and does not count
-    (docs/designs/eval-next-transport.md, stage 1). The names are imported
+    (docs/designs/eval-next-transport.md, stage 1); the harness records that
+    repetition as infrastructure before it gets here, so this is the
+    backstop for a record that arrives another way. The names are imported
     where the marker above is duplicated because the transport module brings
     in neither ``devops_bench`` nor ``nats`` at import time.
     """

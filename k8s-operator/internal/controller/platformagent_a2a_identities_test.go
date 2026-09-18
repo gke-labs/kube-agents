@@ -246,6 +246,13 @@ func TestTheEvalPrincipalRendersOnlyUnderItsFlag(t *testing.T) {
 		if strings.Contains(authUsers(conf), "eval") {
 			t.Errorf("%s=%q lists eval in auth_users with no user block behind it", a2aEvalPrincipalEnvVar, off)
 		}
+		// Not the user block and the auth_users entry alone: no byte of the
+		// render may mention the principal. a2aConfigRolloutHash digests the
+		// whole placeholder render, so a comment that changed with the flag
+		// off would roll the bus on every install that never opted in.
+		if strings.Contains(conf, "eval") {
+			t.Errorf("%s=%q leaves the word eval in nats.conf; the flag-off render must not change for an install that never opted in", a2aEvalPrincipalEnvVar, off)
+		}
 	}
 
 	t.Setenv(a2aEvalPrincipalEnvVar, "true")

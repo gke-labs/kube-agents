@@ -371,6 +371,19 @@ func a2aEvalPrincipalEnabled() bool {
 	return os.Getenv(a2aEvalPrincipalEnvVar) == "true"
 }
 
+// renderA2AEvalAuthUsersNote is the eval principal's clause in the auth_users
+// comment of nats.conf, rendered only when the principal is. The flag-off
+// render has to stay byte-identical to the render before the principal
+// existed: a2aConfigRolloutHash covers every non-secret byte of nats.conf, so
+// a comment naming a user the install does not carry would roll the bus once
+// on every next-mode install that never opted in.
+func renderA2AEvalAuthUsersNote() string {
+	if !a2aEvalPrincipalEnabled() {
+		return ""
+	}
+	return ", the bench harness's eval principal running\n    # outside the cluster"
+}
+
 // a2aNATSName and a2aCredsSecretName are spelled in the API package, because
 // the validating webhook recognises the credentials Secret by name and must
 // agree with the render on what that name is.
@@ -975,9 +988,7 @@ authorization {
     # A name is here for one of three reasons, and each identity's own comment
     # above says which. It can hold no projected token at all — the browser
     # read user, the $SYS login held by a person, the seed tooling that is
-    # applied rather than run, the bench harness's eval principal (rendered
-    # only under A2A_EVAL_PRINCIPAL=true) running outside the cluster. Or it
-    # is a sidecar, which a ServiceAccount
+    # applied rather than run` + renderA2AEvalAuthUsersNote() + `. Or it is a sidecar, which a ServiceAccount
     # token cannot name apart from the container beside it — the bridge, whose
     # own comment above says what a callout entry there would merge. Or it
     # could move and has not: gateway, which is the remaining migration. The

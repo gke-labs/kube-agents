@@ -130,6 +130,7 @@ KIND_ARTIFACT_UPDATE = "artifact-update"
 
 STATE_COMPLETED = "completed"
 STATE_WORKING = "working"
+STATE_SUBMITTED = "submitted"
 TERMINAL_STATES = frozenset({STATE_COMPLETED, "failed", "canceled", "rejected"})
 
 # The reserved artifact names (``a2a/lib/payload.go``).
@@ -293,6 +294,21 @@ class Fold:
     def accepted(self) -> bool:
         """Whether any executor has published an event for the task."""
         return bool(self.history) or bool(self.artifacts)
+
+    @property
+    def started(self) -> bool:
+        """Whether an executor moved the task past ``submitted``.
+
+        The bridge publishes ``submitted`` on accept and queues the task
+        behind its workers; ``working`` is the first event a subprocess
+        produces. A fold that never left ``submitted`` is a task an executor
+        took and nobody ran.
+        """
+        return (
+            self.final
+            or bool(self.artifacts)
+            or any(state != STATE_SUBMITTED for state in self.history)
+        )
 
     def artifact_text(self, name: str) -> str:
         """The concatenated text parts of the artifact called ``name``."""

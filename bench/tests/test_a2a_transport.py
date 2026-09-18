@@ -194,6 +194,26 @@ def test_fold_drops_events_after_the_terminal_one() -> None:
     assert fold.post_final_dropped == 2
 
 
+def test_a_fold_at_submitted_is_accepted_but_not_started() -> None:
+    """The bridge's accept event alone: an executor took the task and no
+    subprocess has run. ``working``, an artifact or a terminal each start it."""
+    fold = a2a.Fold("task-1")
+    fold.apply(_status("task-1", "submitted"))
+    assert fold.accepted and not fold.started
+    fold.apply(_status("task-1", "working"))
+    assert fold.started
+
+    by_artifact = a2a.Fold("task-1")
+    by_artifact.apply(_status("task-1", "submitted"))
+    by_artifact.apply(_artifact("task-1", "progress", [{"kind": "text", "text": "x"}]))
+    assert by_artifact.started
+
+    by_terminal = a2a.Fold("task-1")
+    by_terminal.apply(_status("task-1", "submitted"))
+    by_terminal.apply(_status("task-1", "canceled", final=True))
+    assert by_terminal.started
+
+
 def test_fold_skips_what_does_not_parse_and_counts_it() -> None:
     fold = a2a.Fold("task-1")
     fold.apply("not an envelope")
@@ -738,6 +758,23 @@ def test_no_executor_before_the_deadline_is_infrastructure_too(fake_bus) -> None
     assert result.trajectory == []
 
 
+def test_a_task_queued_at_submitted_for_the_whole_budget_is_infrastructure(fake_bus) -> None:
+    """The bridge accepted the task and left it behind its workers until the
+    deadline: an executor event and no model. The design of record classifies
+    that as infrastructure on both transports, and the scorer's rung-3 rule
+    for a ``submitted``-only record is the backstop, not the path."""
+    fake_bus.script = [[_status("t", "submitted")]]
+    fake_bus.outcome = a2a.OUTCOME_DEADLINE
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "queued at 'submitted'" in result.errors[0]
+    assert "no executor accepted" not in result.errors[0]
+    assert "cancel published" in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+
+
 def test_a_task_cancelled_at_the_deadline_skips_the_delegation_wait(
     fake_bus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1195,7 +1232,12 @@ def test_a_working_a2a_record_cancelled_at_the_budget_is_a_run(kanban_task, make
 
 
 def test_a_submitted_only_a2a_record_is_still_not_a_run(kanban_task, make_run) -> None:
-    """The bridge queued the task and nothing ran: no evidence of a model."""
+    """The bridge queued the task and nothing ran: no evidence of a model.
+
+    The harness records that repetition as infrastructure itself
+    (``test_a_task_queued_at_submitted_for_the_whole_budget_is_infrastructure``);
+    this is the backstop for a record that reaches the scorer another way.
+    """
 
     def unfinished(rec: dict[str, Any]) -> None:
         fold = a2a.Fold("task-1")
