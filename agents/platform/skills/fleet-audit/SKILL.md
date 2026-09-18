@@ -225,8 +225,8 @@ frontmatter in OKF notes, within the paths each repository's `.kube-agents/inten
 (`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree
 was read). In content mode the copy is bounded the same way: `.kube-agents/` first, then only the
 named paths, so the sibling script's file and byte caps count notes rather than manifests; a
-repository with no usable intent file, or whose file names a path with nothing behind it, is copied
-whole under those caps. `start` files what it found
+repository with no usable intent file (one naming a path the broker refuses included), or whose
+file names a path with nothing behind it, is copied whole under those caps. `start` files what it found
 at `declarations_path` and lists each repository it read completely — every note under the
 searched paths arrived and was read; one the broker withheld or the harness could not decode costs
 the repository its entry, a symlink there being no note in either mode — as `owner/name@sha`. `finish` unions that list into the document's and

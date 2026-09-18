@@ -12,6 +12,7 @@ commands that do touch the network are driven through a single recorded seam
 
 import contextlib
 import copy
+import importlib.util
 import io
 import json
 import os
@@ -40,6 +41,7 @@ import content_workspace  # noqa: E402
 import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import workspace_paths  # noqa: E402
 
 
 @dataclass
@@ -5448,6 +5450,30 @@ class TestIntentPaths(unittest.TestCase):
                 self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
                 self.assertIn("searching the whole tree", err)
 
+    def test_a_path_the_broker_refuses_is_the_whole_tree_with_a_warning(self):
+        # The remediation-path rules accept each of these; the broker's
+        # validator, which a content-mode `clone --prefix` runs the prefix
+        # through, refuses each. Refused here, the bound falls to the whole
+        # tree in both modes rather than failing closed in one.
+        cases = {
+            "trailing whitespace": 'paths:\n  - "knowledge/ "\n',
+            "leading whitespace": 'paths:\n  - " knowledge"\n',
+            "a control character": 'paths:\n  - "know\\tledge"\n',
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.write(".kube-agents/intent.yaml", text)
+                paths, err = self.read()
+                self.assertEqual(paths, [], err)
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml: paths[0]", err)
+                self.assertIn("searching the whole tree", err)
+        # A name the broker accepts stays a bound, a leading `-` included; the
+        # copy is what has to pass it as a value.
+        self.write(".kube-agents/intent.yaml", 'paths:\n  - "-notes/"\n')
+        paths, err = self.read()
+        self.assertEqual(paths, ["-notes"])
+        self.assertEqual(err, "")
+
     def test_a_symlinked_intent_file_or_directory_is_never_followed(self):
         # git materialises a committed symlink in a directory-mode clone, and
         # `is_file` and `read_text` both follow one. The bound must come from
@@ -5505,6 +5531,14 @@ class TestIntentPaths(unittest.TestCase):
         )
 
 
+def _broker_parser():
+    """The sibling script's own argument parser, loaded from where the harness runs it."""
+    spec = importlib.util.spec_from_file_location("inspect_repository", audit_report.CLONE_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_parser()
+
+
 class DiscoveryTestCase(HarnessTestCase):
     """The declaring stream's `start`, with a workspace the harness can read."""
 
@@ -5547,6 +5581,23 @@ class DiscoveryTestCase(HarnessTestCase):
 
     def clone_calls(self):
         return [c for c in self.harness.calls if "clone" in c and str(audit_report.CLONE_SCRIPT) in c]
+
+    def broker_prefix(self, cmd):
+        """The `--prefix` the sibling script reads from `cmd`, or None when it carries none.
+
+        Through the script's own parser and the broker's path validator, so a
+        prefix the harness passes is one the copy accepts: argparse reads
+        `--prefix -notes` as a flag with no value and exits before the broker
+        is asked, and the broker refuses every spelling `validate_path` does.
+        """
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = _broker_parser().parse_args(cmd[2:])
+        except SystemExit:
+            self.fail(f"the sibling script's parser refused {cmd[2:]}")
+        if args.prefix is not None:
+            workspace_paths.validate_path(args.prefix)
+        return args.prefix
 
     def filed(self):
         return audit_report.read_declarations(DECLARING_AUDIT)
@@ -5692,9 +5743,9 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
             self.assertIn("--lease", cmd)
             self.assertEqual(cmd[cmd.index("--lease") + 1], f"{DECLARING_AUDIT}-declared-intent")
             self.assertNotIn("--ref", cmd)
-        self.assertEqual(calls[0][calls[0].index("--prefix") + 1], ".kube-agents")
+        self.assertEqual(self.broker_prefix(calls[0]), ".kube-agents")
         self.assertNotIn("--force", calls[0])
-        self.assertNotIn("--prefix", calls[1])
+        self.assertIsNone(self.broker_prefix(calls[1]))
         self.assertIn("--force", calls[1])
         self.assertEqual(calls[0][calls[0].index("--into") + 1], calls[1][calls[1].index("--into") + 1])
         self.assertEqual([c for c in self.harness.calls if c[:2] == ["git", "rev-parse"]], [])
@@ -5749,7 +5800,7 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         calls = self.clone_calls()
         self.assertEqual([c[c.index("--ref") + 1] for c in calls], ["release-2026"] * 2)
         # The bound is read from the first copy and the second fetches only it.
-        self.assertEqual([c[c.index("--prefix") + 1] for c in calls], [".kube-agents", "intent"])
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", "intent"])
         self.assertEqual(
             [(e["repo"], e["path"]) for e in self.filed()],
             [("acme/terraform-live", "intent/api.md")],
@@ -5773,13 +5824,58 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["intent", "docs/intent.md"])
         calls = self.clone_calls()
         self.assertEqual(
-            [c[c.index("--prefix") + 1] for c in calls], [".kube-agents", "intent", "docs/intent.md"]
+            [self.broker_prefix(c) for c in calls], [".kube-agents", "intent", "docs/intent.md"]
         )
         self.assertEqual([("--force" in c) for c in calls], [False, True, True])
         self.assertEqual(len({c[c.index("--into") + 1] for c in calls}), 1)
         self.assertEqual(
             [e["path"] for e in self.filed()], ["docs/intent.md", "intent/api.md"]
         )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_named_path_beginning_with_a_dash_reaches_the_copy_as_a_value(self):
+        # `--prefix -notes` reads to argparse as a flag with no value, so the
+        # copy exits 2 before the broker sees the path and the repository is
+        # never searched; the harness passes the prefix in the one form
+        # argparse reads as a value, and the broker, which accepts the name,
+        # copies it.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", 'paths:\n  - "-notes/"\n')
+        self.write(copy, "-notes/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["-notes"])
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", "-notes"])
+        self.assertEqual([e["path"] for e in self.filed()], ["-notes/api.md"])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_named_path_the_broker_refuses_is_the_whole_tree_in_content_mode(self):
+        # A trailing space inside a quoted scalar passes the remediation-path
+        # rules and fails the broker's: handed to `clone --prefix`, the copy
+        # exits non-zero and the repository is left unsearched every run with
+        # the clone blamed, where directory mode reads the whole tree with the
+        # intent-file warning. The bound is refused before any copy is asked
+        # for, in both modes, and the whole tree is fetched with the reason.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", 'paths:\n  - "knowledge/ "\n')
+        self.write(copy, "knowledge/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", None])
+        self.assertIn("--force", calls[1])
+        self.assertIn("acme/terraform-live:.kube-agents/intent.yaml: paths[0]", self.err)
+        self.assertIn("leading or trailing whitespace", self.err)
+        self.assertIn("searching the whole tree", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/api.md"])
         self.assertEqual(self.temp_dirs(), [])
 
     def test_a_repository_that_moved_between_copies_is_not_searched(self):
@@ -5792,7 +5888,7 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         # The recorder answers with the first key that matches, so the
         # specific one goes first.
         self.harness.replies = {
-            "--prefix .kube-agents": self.copy_reply(copy),
+            "--prefix=.kube-agents": self.copy_reply(copy),
             "--repo acme/terraform-live": self.copy_reply(copy, sha=moved),
             **self.harness.replies,
         }
@@ -6020,7 +6116,7 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertIn("`intent` names nothing in the repository at this commit; searching the whole tree", self.err)
         calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
         self.assertEqual(
-            [c[c.index("--prefix") + 1] if "--prefix" in c else None for c in calls],
+            [self.broker_prefix(c) for c in calls],
             [".kube-agents", "intent", None],
         )
         self.assertIn("--force", calls[2])

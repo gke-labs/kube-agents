@@ -656,9 +656,10 @@ HEADING_RE = re.compile(r"^#{1,6}[ \t]+(?P<text>\S.*)$", re.M)
 HEADING_TRAILER_CHARS = " \t#"
 # The per-repository search bound: one key, `paths`, a list of repo-relative
 # prefixes held to the remediation-path rules (a trailing `/` allowed, because
-# they are prefixes). Absent or invalid reads as the whole tree, said on
-# stderr, because a bound that fails closed would let a typo hide every
-# declaration in the repository. A prefix with nothing behind it at the
+# they are prefixes) and to the broker's own path validator, which a
+# content-mode `clone --prefix` applies to each one. Absent or invalid reads
+# as the whole tree, said on stderr, because a bound that fails closed would
+# let a typo hide every declaration in the repository. A prefix with nothing behind it at the
 # commit read — `knowlege/` for a tree whose notes live under `knowledge/`,
 # or a directory renamed since the file was written — is the same typo in a
 # well-formed path, and is treated the same way rather than credited as a
@@ -2660,11 +2661,15 @@ def read_intent_paths(tree: Path, repo: str) -> list[str]:
 
     An empty list means the whole tree, and stderr says why: the file (or its
     directory) is a symlink, is absent, is not YAML, has no `paths` list, or
-    names a path the remediation-path rules refuse. Any one bad path discards
-    the whole bound rather than the one path, because a bound that silently
-    narrowed itself would read as the owner's choice.
+    names a path the remediation-path rules or the broker's path validator
+    refuse. Any one bad path discards the whole bound rather than the one
+    path, because a bound that silently narrowed itself would read as the
+    owner's choice.
     """
     import yaml
+
+    # Lazy, as `gitops_workspace` is (the module comment on `sys.path`).
+    import workspace_paths
 
     intent = tree / INTENT_FILE
     where = f"{repo}:{INTENT_FILE}"
@@ -2699,10 +2704,24 @@ def read_intent_paths(tree: Path, repo: str) -> list[str]:
         return []
     out: list[str] = []
     for index, raw in enumerate(paths):
+        item = f"{INTENT_PATHS_KEY}[{index}]"
         try:
             if not isinstance(raw, str):
-                raise ValidationError(f"{INTENT_PATHS_KEY}[{index}]: expected a string")
-            out.append(_require_repo_relative(raw.rstrip("/"), f"{INTENT_PATHS_KEY}[{index}]"))
+                raise ValidationError(f"{item}: expected a string")
+            prefix = _require_repo_relative(raw.rstrip("/"), item)
+            # The broker's validator, on the spelling the copy is asked for.
+            # The remediation-path rules let surrounding whitespace (a quoted
+            # `"knowledge/ "`) and a control character through; a content-mode
+            # `clone --prefix` runs the prefix through `validate_path` and
+            # exits non-zero on them, which would leave the repository
+            # unsearched every run with the clone blamed, while directory
+            # mode read the whole tree. Refused here, in both modes, the
+            # bound falls to the whole tree with the reason named.
+            try:
+                workspace_paths.validate_path(prefix)
+            except workspace_paths.WorkspaceError as exc:
+                raise ValidationError(f"{item}: {exc}") from exc
+            out.append(prefix)
         except ValidationError as exc:
             log(f"WARNING: {where}: {exc}; searching the whole tree.")
             return []
@@ -7344,7 +7363,11 @@ def _clone_step(
     if ref:
         cmd += ["--ref", ref]
     if prefix:
-        cmd += ["--prefix", prefix]
+        # One argument, not two: argparse reads `--prefix -notes` as the flag
+        # with no value and exits 2 before the broker, which accepts the name,
+        # is asked. A `ref` cannot begin with `-` (`_REF_SHAPE_RE`), so it
+        # needs no such care.
+        cmd.append(f"--prefix={prefix}")
     if force:
         cmd.append("--force")
     env = {k: v for k, v in os.environ.items() if k not in BASE_BRANCH_OVERRIDE_VARS}
