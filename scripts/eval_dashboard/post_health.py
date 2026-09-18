@@ -1155,12 +1155,16 @@ def run(
         pool_breached = pool_breached or (health.get("pool") or {}).get("verdict") == POOL_BREACH
     if KIND_POOL_CLEAR in sent:
         pool_breached = False
-    # The causes this episode has named. Appended only on a send, so a failed
-    # one is retried; emptied when a reading shows the episode over.
+    # The causes this backlog has named. Appended only on a send, so a failed
+    # one is retried; emptied by a reading that shows the queue drained, note
+    # gone or verdict still standing on a bad day up to a week old. Kept per
+    # backlog rather than per episode because the pool refills: a capacity jam
+    # announced on Monday would otherwise be silent every afternoon until the
+    # window rolls off it, and those are the afternoons people /retest into.
     pool_causes = list(before.get("pool_causes") or [])
     if KIND_POOL in sent:
         pool_causes += [key for key in pool_told_keys(health.get("pool") or {}) if key not in pool_causes]
-    if not health.get("pool") and pool_was_read(health):
+    if pool_was_read(health) and (not health.get("pool") or withheld):
         pool_causes = []
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,

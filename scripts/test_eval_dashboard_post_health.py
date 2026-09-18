@@ -1129,7 +1129,9 @@ class PoolNote(RunHarness):
         self.tick(pooled(), self.at(10))
         self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=0, over_threshold=0), self.at(11))
         self.assertEqual(len(self.opener.requests), 1)
-        self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY"])
+        # The drained queue also ends what Monday's jam said, so the next real
+        # one is news whichever cause it comes back under.
+        self.assertEqual(self.recorded()["pool_causes"], [])
 
     def test_a_queue_that_has_only_just_formed_says_nothing(self):
         # A run triggered a minute ago is not a backlog. Accepting it would let
@@ -1170,6 +1172,26 @@ class PoolNote(RunHarness):
         self.assertEqual(self.recorded()["pool_verdict"], "STALE", "nothing was said at 10:30")
         self.tick(pooled(), self.at(10, 45))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪", "⏳"])
+
+    def test_the_second_jam_of_an_episode_is_told_without_a_stale_tick(self):
+        # The ordinary shape, and the one the test above misses: the pool fills
+        # Monday, drains that evening, and fills again Thursday under the same
+        # cause. The verdict never moves -- Monday is inside the seven-day
+        # window all week -- so the cause is the only trigger left, and it has
+        # to be forgotten when the queue drains or the second jam is silent for
+        # as long as the window holds the first.
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(waiting_longest_s=0, over_threshold=0), self.at(10, 15))
+        self.assertEqual(self.recorded()["pool_causes"], [], "a drained queue ends what the jam said")
+        self.tick(pooled(), self.at(10, 30))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳"])
+
+    def test_a_jam_that_never_drains_is_told_once(self):
+        # The other side of it: forgetting on any tick, rather than on a
+        # reading that shows the queue drained, would re-post hourly all week.
+        for minute in (0, 15, 30, 45):
+            self.tick(pooled(), self.at(10, minute))
+        self.assertEqual(len(self.opener.requests), 1)
 
     def test_a_breach_nobody_was_told_about_is_not_owed_a_clear(self):
         # pool_breached is set on the send, not on the reading. Set it on the

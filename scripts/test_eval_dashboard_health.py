@@ -938,6 +938,7 @@ class PoolNote(unittest.TestCase):
                 "p95_s": 9438,
                 "waiting_longest_s": 0,
                 "waiting_now": False,
+                "waiting_since": None,
                 "over_threshold": 0,
                 "threshold_p50_s": 900,
                 "threshold_p95_s": 2700,
@@ -1078,6 +1079,21 @@ class PoolNote(unittest.TestCase):
         artifact["queue"]["waiting_runs"] = [{"minutes": limit + 99, "pull": 1}]
         artifact["thresholds"].pop("p50_minutes")
         self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_now"])
+
+    def test_a_backlog_is_dated_from_the_oldest_run_in_it(self):
+        # The episode's `since` spans the verdict, which lasts a week, so under
+        # a Thursday jam it can read Monday -- three days the queue was not
+        # measured waiting. The oldest queued run dates the jam itself.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        artifact["queue"]["waiting_runs"] = [{"minutes": 40, "pull": 1}, {"minutes": 9, "pull": 2}]
+        note = health.pool_note(artifact, T0, None)
+        measured = health.parse_iso(note["measured_at"])
+        self.assertEqual(health.parse_iso(note["waiting_since"]), measured - timedelta(minutes=40))
+        # Nothing to date: no backlog, and no reading of the queue at all.
+        artifact["queue"]["waiting_runs"] = [{"minutes": 9, "pull": 2}]
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_since"])
+        artifact["queue"]["read"] = False
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_since"])
 
     def test_a_malformed_waiting_queue_costs_the_figure_not_the_tick(self):
         # Same filter as the rest of the artifact reader: the adjudicate step

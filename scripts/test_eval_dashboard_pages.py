@@ -214,8 +214,12 @@ class HealthInputsTest(unittest.TestCase):
             render.normalize_health(health_doc("GREEN", pool=note))["pool"],
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
              "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
-             "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
+             "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
         )
+        # Dated like every other timestamp the page renders: a string that is
+        # not one drops rather than reaching `new Date`.
+        self.assertEqual("2026-09-08T16:45:00+00:00", render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"}))["pool"]["waiting_since"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "this afternoon"}))["pool"]["waiting_since"])
         # Tri-state: the page reads null as "Deck was not read", so a field that
         # is not a real bool has to arrive as null rather than as a truthy string.
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"waiting_now": "yes"}))["pool"]["waiting_now"])
@@ -745,6 +749,16 @@ class BrowserTest(unittest.TestCase):
                                     health=health_doc("GREEN", pool=note | {"waiting_now": None})) / "index.html")
         self.assertIn("Runs were waiting to start since Tue 8:00 AM ET", unread)
         self.assertNotIn("No backlog", unread)
+        # A jam is dated from its own oldest queued run, not from the episode:
+        # the verdict spans a week, so "since Tue 8:00 AM" can sit over a jam
+        # that formed this afternoon and claim hours nothing measured.
+        dated = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooldated", self.data,
+                                   health=health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 12:45 PM ET", dated)
+        self.assertNotIn("since Tue 8:00 AM ET", dated)
+        # Once it has drained there is no backlog to date, so the episode is
+        # what the past tense is about.
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET", drained)
         # A stopped periodic says so instead of quoting a reading hours old.
         stale = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolstale", self.data,
                                    health=health_doc("GREEN", pool={"verdict": "STALE", "measured_at": "2026-09-08T13:23:00+00:00"})) / "index.html")

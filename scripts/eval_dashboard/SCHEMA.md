@@ -793,7 +793,7 @@ it is set.
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
-window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, over_threshold,
+window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
 threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
 `verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue
@@ -802,7 +802,9 @@ the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
 live backlog — and `null` when Deck was unread or no limit was given. A verdict
 lasts a week, so every present-tense reader asks it: the alert is withheld on
 `false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
-Brief go past tense on either.
+Brief go past tense on either. `waiting_since` dates the backlog from its
+oldest queued run, and is `null` when there is none; the Brief's present-tense
+sentence prefers it to `since`, which can be days older.
 `breach_seen` says whether the open episode has ever measured a breach, and
 `since` is the episode's start except that a `BREACH` does not inherit one from
 a stretch that only ever said the queue could not be read. `metrics` carries

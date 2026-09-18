@@ -26,10 +26,21 @@ ARTIFACT = "work/pool-pressure.json"
 LOGS = "gs://fake-prow/logs/ci-kube-agents-pool-pressure"
 BUILD = "2099957253191766016"
 EARLIER = "2099957253191766015"
-# What the periodic publishes, cut to the fields health.py reads. Two of them,
-# so a test can say which build was read.
+OLDEST = "2099957253191766014"
+# What the periodic publishes, cut to the fields health.py reads. One per
+# build, so a test can say which one was read.
 READING = {"verdict": "OK", "window_end": "2026-09-15T20:23:27Z"}
 EARLIER_READING = {"verdict": "OK", "window_end": "2026-09-15T19:22:11Z"}
+OLDEST_READING = {"verdict": "OK", "window_end": "2026-09-15T18:21:04Z"}
+# gsutil's own wording for the two failures the step has to tell apart.
+NOT_FOUND = "CommandException: No URLs matched: " + LOGS + "/latest-build.txt"
+DENIED = "AccessDeniedException: 403 does not have storage.objects.get access"
+
+
+def workflow_env(name: str) -> str:
+    """A workflow-level env value, so the step runs here under the number it
+    runs under in CI."""
+    return str(yaml.safe_load(WORKFLOW.read_text())["env"][name])
 
 
 def step_script() -> str:
@@ -42,29 +53,37 @@ def step_script() -> str:
 
 
 class PoolFetchStepTest(unittest.TestCase):
-    def run_step(self, pointer=BUILD, artifact=READING, raw=None, finished=True, builds=(EARLIER, BUILD)):
+    def run_step(self, pointer=BUILD, artifact=READING, raw=None, finished=True, builds=(EARLIER, BUILD), aborted=(), pointer_error=NOT_FOUND):
         """The step against a stub gsutil. `pointer` None means latest-build.txt
-        is unreadable, `artifact` None means the copy fails, `raw` is bytes
-        copied verbatim -- what a crashed periodic leaves behind, `finished`
-        False is a build still running, and `builds` is what the log prefix
-        holds, which is how far back the fallback can reach."""
+        is unreadable and `pointer_error` is what gsutil says about it,
+        `artifact` None means the copy fails, `raw` is bytes copied verbatim --
+        what a crashed periodic leaves behind, `finished` False is a build
+        still running, `builds` is what the log prefix holds, which is how far
+        back the fallback can reach, and `aborted` are the builds in it that
+        published no finished.json."""
         box = tempfile.TemporaryDirectory()
         self.addCleanup(box.cleanup)
         tmp = pathlib.Path(box.name)
         bin_dir = tmp / "bin"
         bin_dir.mkdir()
-        cat = f'printf "%s\\n" {pointer}' if pointer is not None else "exit 1"
+        cat = f'printf "%s\\n" {pointer}' if pointer is not None else f'echo "{pointer_error}" >&2; exit 1'
         if artifact is None and raw is None:
             copy = "exit 1"
         else:
             payload = tmp / "payload.json"
             payload.write_text(json.dumps(artifact) if raw is None else raw)
             copy = f'cat "{payload}" > "${{@: -1}}"'
-        earlier = tmp / "earlier.json"
-        earlier.write_text(json.dumps(EARLIER_READING))
         # `gsutil ls` on the prefix, the way the fallback reads it: the build
         # directories plus the pointer object, which the step has to skip.
         listing = "".join(f"{LOGS}/{b}/\\n" for b in builds)
+        # One stat and one cp per prior build, so the walk past an aborted one
+        # is answered rather than falling through to exit 2.
+        priors = ""
+        for build, reading in ((EARLIER, EARLIER_READING), (OLDEST, OLDEST_READING)):
+            published = tmp / f"{build}.json"
+            published.write_text(json.dumps(reading))
+            priors += f'  "stat {LOGS}/{build}/finished.json") exit {1 if build in aborted else 0} ;;\n'
+            priors += f'  "cp {LOGS}/{build}/artifacts/pool-pressure.json") cat "{published}" > "${{@: -1}}" ;;\n'
         # Matched on the verb and the object it names, so the step asking for
         # the wrong path falls through to exit 2 rather than being answered.
         (bin_dir / "gsutil").write_text(
@@ -75,7 +94,7 @@ class PoolFetchStepTest(unittest.TestCase):
             f'  "ls {LOGS}/") printf "{LOGS}/latest-build.txt\\n{listing}" ;;\n'
             f'  "stat {LOGS}/{BUILD}/finished.json") exit {0 if finished else 1} ;;\n'
             f'  "cp {LOGS}/{BUILD}/artifacts/pool-pressure.json") {copy} ;;\n'
-            f'  "cp {LOGS}/{EARLIER}/artifacts/pool-pressure.json") cat "{earlier}" > "${{@: -1}}" ;;\n'
+            f"{priors}"
             '  *) echo "unexpected gsutil call: $*" >&2; exit 2 ;;\n'
             "esac\n"
         )
@@ -83,12 +102,13 @@ class PoolFetchStepTest(unittest.TestCase):
         result = subprocess.run(
             ["bash", "-c", step_script()],
             cwd=tmp,
-            env={"PATH": f"{bin_dir}:/usr/bin:/bin", "POOL_PRESSURE_LOGS": LOGS},
+            env={"PATH": f"{bin_dir}:/usr/bin:/bin", "POOL_PRESSURE_LOGS": LOGS, "POOL_FALLBACK_BUILDS": workflow_env("POOL_FALLBACK_BUILDS")},
             capture_output=True,
             text=True,
             check=False,
         )
         self.assertEqual(0, result.returncode, result.stderr)
+        self.said = result.stdout
         written = tmp / ARTIFACT
         return json.loads(written.read_text()) if written.exists() else None
 
@@ -111,6 +131,31 @@ class PoolFetchStepTest(unittest.TestCase):
             self.run_step(finished=False),
             "a running build must fall back to the last finished one",
         )
+
+    def test_the_fallback_walks_past_a_build_that_was_aborted(self):
+        """An aborted build -- evicted pod, lost node -- publishes neither
+        finished.json nor an artifact. Reading it would write the sentinel and
+        announce that the periodic had stopped, while it is minutes from
+        publishing. The build before that one holds a real reading."""
+        self.assertEqual(
+            OLDEST_READING,
+            self.run_step(finished=False, builds=(OLDEST, EARLIER, BUILD), aborted=(EARLIER,)),
+        )
+
+    def test_nothing_finished_behind_a_running_build_is_silence(self):
+        """Not the sentinel: the periodic is publishing, this tick just has
+        nothing to read. `⚪ pool check stopped` would be false."""
+        self.assertIsNone(self.run_step(finished=False, builds=(EARLIER, BUILD), aborted=(EARLIER,)))
+
+    def test_a_pointer_that_cannot_be_read_warns_unless_it_is_missing(self):
+        """A denied read and a periodic that never ran both leave no artifact,
+        and only one of them is "not wired up". Unwarned, a missing IAM grant
+        ships the whole feature dark: no note, no digest figure, and no ⚪
+        either, because the dead-man's switch ages only an artifact it read."""
+        self.assertIsNone(self.run_step(pointer=None, pointer_error=DENIED))
+        self.assertIn("::warning::", self.said)
+        self.assertIsNone(self.run_step(pointer=None, pointer_error=NOT_FOUND))
+        self.assertNotIn("::warning::", self.said)
 
     def test_a_first_build_still_running_writes_nothing(self):
         """Nothing to fall back to, which is the same silence as no pointer:

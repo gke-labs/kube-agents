@@ -144,6 +144,10 @@ env:
   # Rule 8's input: where the hourly pool-pressure periodic (#1069) archives
   # its runs. `latest-build.txt` beside them names the newest.
   POOL_PRESSURE_LOGS: gs://kube-agents-prow/logs/ci-kube-agents-pool-pressure
+  # How far back the fetch step looks for a build that finished, when the
+  # newest one is still running. Three covers a run of aborted builds without
+  # turning one tick into a walk down the whole archive.
+  POOL_FALLBACK_BUILDS: "3"
   WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   # Step A's identity: the Prow-archive reader (see the header).
   COLLECT_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
@@ -327,7 +331,19 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p work
-          build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt") || exit 0
+          # A NotFound is "the periodic has never run", which is what no note
+          # is meant to look like. Anything else -- a denied read above all --
+          # would otherwise ship the whole feature dark: no note, no digest
+          # figure, and no ⚪ either, because the dead-man's switch only ages
+          # an artifact it managed to read. The two sibling reads below tell
+          # the same two apart the same way.
+          if ! build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt" 2>gsutil.err); then
+            grep -Eq "NotFound|No URLs matched|404" gsutil.err \
+              || echo "::warning::could not read the pool-pressure build pointer (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
+            rm -f gsutil.err
+            exit 0
+          fi
+          rm -f gsutil.err
           [ -n "$build" ] || exit 0
           # The pointer moves at job start, so for the ~8 minutes the periodic
           # runs it names a build with no artifact. finished.json lands with
@@ -338,8 +354,20 @@ jobs:
           if ! gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json"; then
             # Compared as Python ints, not by sort or awk: a build id is 19
             # digits, which a float rounds until neighbouring builds collide.
-            build=$(gsutil -q ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; prior=[i for i in ids if i < int(sys.argv[1])]; print(max(prior) if prior else "")' "$build")
-            # Nothing before it: the periodic's first build is still running.
+            # The one before it has to have finished too. An aborted build --
+            # evicted pod, lost node -- publishes neither finished.json nor an
+            # artifact, and reading it would write the sentinel and announce
+            # that the periodic had stopped while it was minutes from
+            # publishing. Walking back costs one stat a build and lands on a
+            # real reading, which ages on its own window_end if it is old.
+            newest=$build
+            build=""
+            while read -r prior; do
+              if gsutil -q stat "$POOL_PRESSURE_LOGS/$prior/finished.json"; then build=$prior; break; fi
+            done < <(gsutil -q ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; print("\n".join(str(i) for i in sorted((i for i in ids if i < int(sys.argv[1])), reverse=True)[: int(sys.argv[2])]))' "$newest" "$POOL_FALLBACK_BUILDS")
+            # Nothing finished behind it: the periodic's first build is still
+            # running, or every build in reach was aborted. Neither is the
+            # periodic publishing nothing, so say nothing.
             [ -n "$build" ] || exit 0
           fi
           # The periodic opens the file with a shell redirect before it runs,

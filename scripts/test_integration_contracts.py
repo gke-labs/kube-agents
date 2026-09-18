@@ -35,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -529,8 +529,12 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 # The captured queue's longest wait: 150 minutes, the run that
                 # also makes over_threshold non-zero.
                 "waiting_longest_s": int(max(r["minutes"] for r in doc["queue"]["waiting_runs"]) * 60),
-                # That 150 minutes against the captured 15 minute p50 limit.
+                # That 150 minutes against the captured 15 minute p50 limit,
+                # and the same 150 minutes back from the reading dates the jam.
                 "waiting_now": True,
+                "waiting_since": health.iso(
+                    health.parse_iso(doc["window_end"]) - timedelta(minutes=max(r["minutes"] for r in doc["queue"]["waiting_runs"]))
+                ),
                 "over_threshold": doc["queue"]["over_threshold"],
                 "threshold_p50_s": int(doc["thresholds"]["p50_minutes"] * 60),
                 "threshold_p95_s": int(doc["thresholds"]["p95_minutes"] * 60),

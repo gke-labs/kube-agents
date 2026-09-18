@@ -1174,6 +1174,7 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     source = recent if quotable else day
     longest = _longest_wait_s(_section(artifact, "queue"))
     limit_p50 = _as_seconds(thresholds.get("p50_minutes"))
+    backlog = None if longest is None or limit_p50 is None else longest > limit_p50
     return note | {
         "day": day.get("day"),
         "window_hours": recent.get("hours") if quotable else None,
@@ -1186,7 +1187,11 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         # subset already past p95, misses a pool full all afternoon at half an
         # hour a run. None when nothing can answer: Deck unread, or no limit.
         "waiting_longest_s": longest,
-        "waiting_now": None if longest is None or limit_p50 is None else longest > limit_p50,
+        "waiting_now": backlog,
+        # When this backlog began, not when the episode did: the verdict spans
+        # a week, so "waiting since Monday" can stand over a Thursday jam. The
+        # oldest queued run dates it, and only while there is one.
+        "waiting_since": iso(measured - timedelta(seconds=longest)) if backlog else None,
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": limit_p50,
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),

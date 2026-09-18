@@ -575,6 +575,10 @@ def normalize_health(raw) -> dict | None:
             # the page reads null as "Deck was not read" and must not get that
             # answer from a malformed field.
             "waiting_now": pool.get("waiting_now") if isinstance(pool.get("waiting_now"), bool) else None,
+            # The backlog's own start, set only while there is one; the
+            # sentence dates a present-tense jam from this and the episode
+            # from `since`.
+            "waiting_since": pool.get("waiting_since") if iso_ms(pool.get("waiting_since")) is not None else None,
             "over_threshold": pool.get("over_threshold") if is_count(pool.get("over_threshold")) else None,
             "threshold_p50_s": pool.get("threshold_p50_s") if is_count(pool.get("threshold_p50_s")) else None,
             "threshold_p95_s": pool.get("threshold_p95_s") if is_count(pool.get("threshold_p95_s")) else None,

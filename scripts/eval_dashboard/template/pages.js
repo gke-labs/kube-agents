@@ -250,6 +250,7 @@ function normalizeHealth(raw) {
       // Tri-state, so only a real bool passes: null is "Deck was not read",
       // and the sentence must not reach it through a malformed field.
       waiting_now: typeof pool.waiting_now === "boolean" ? pool.waiting_now : null,
+      waiting_since: parseIso(pool.waiting_since) != null ? pool.waiting_since : null,
       over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
       threshold_p95_s: count(pool.threshold_p95_s),
@@ -285,7 +286,11 @@ function poolSentence(h) {
   if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read how long recent runs waited.";
   // What tripped the verdict, which is a single day's row or the live queue --
   // never the seven-day window, which one bad day leaves inside its own limit.
-  const since = p.since ? ` since ${esc(et(parseIso(p.since)))}` : "";
+  // The backlog's start while there is one, the episode's otherwise: the
+  // verdict spans a week, so the episode can have opened days before the jam
+  // the present tense below is describing.
+  const began = p.waiting_since || p.since;
+  const since = began ? ` since ${esc(et(parseIso(began)))}` : "";
   // Both halves, like post_health.pool_numbers: a day can breach on p95 with a
   // compliant median, and quoting the median alone puts a passing number
   // forward as the evidence.
