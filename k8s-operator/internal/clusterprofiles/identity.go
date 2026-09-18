@@ -23,10 +23,12 @@
 // and returns a rest.Config per cluster with this process's own Google
 // credential attached.
 //
-// It builds no Kubernetes client. The caller picks the client type — an
-// informer-backed kubernetes.Interface for the event watcher, a
-// dynamic.Interface for the drift detector — and this package stops at the
-// configuration both are built from.
+// It builds no Kubernetes client. The caller picks the client type, and this
+// package stops at the configuration every client type is built from. Today
+// the only caller is the event watcher, which wants an informer-backed
+// kubernetes.Interface; the drift detector wants a dynamic.Interface from the
+// same scan, and that is the seam this package exists for, but its fan-in is
+// not wired yet (cmd/drift-detector/cluster.go).
 package clusterprofiles
 
 import (

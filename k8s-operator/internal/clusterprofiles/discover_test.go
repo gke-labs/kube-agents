@@ -275,14 +275,17 @@ func TestDiscoverDuplicateClusterIsSkipped(t *testing.T) {
 	if clusters[0].Profile != "profile-one" {
 		t.Errorf("expected the first profile to win, got %q", clusters[0].Profile)
 	}
-	if err := s.skips["profile-two"]; err == nil {
-		t.Errorf("expected the duplicate to be reported, skips = %v", s.skips)
-	} else if !strings.Contains(err.Error(), "already claimed by profile-one") &&
-		!strings.Contains(err.Error(), "already claimed by profile one") {
-		// The message has to name the profile that won, or an operator reading
-		// it cannot tell which of the two is being watched.
-		if !strings.Contains(err.Error(), "profile-one") {
-			t.Errorf("skip reason %q does not name the profile that won", err)
+	// The message has to name both the profile that won and the cluster they
+	// are fighting over: without the winner an operator cannot tell which of
+	// the two is being watched, and without the cluster they cannot tell which
+	// cluster the losing profile was pointed at.
+	err = s.skips["profile-two"]
+	if err == nil {
+		t.Fatalf("expected the duplicate to be reported, skips = %v", s.skips)
+	}
+	for _, want := range []string{"profile-one", "projA/us-central1/prod"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("skip reason %q does not mention %q", err, want)
 		}
 	}
 }

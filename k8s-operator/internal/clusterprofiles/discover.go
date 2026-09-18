@@ -30,9 +30,14 @@ import (
 const (
 	// NoProfile is the profile name reported to OnSkip when the failure is
 	// reading the profiles directory itself rather than one profile in it. A
-	// caller labelling a metric by profile needs some value, and a name no
-	// directory can have keeps the directory-level failures countable without
-	// being mistaken for a cluster.
+	// caller labelling a metric by profile needs some value for it, and this is
+	// the one to compare against rather than writing "-" at the call site.
+	//
+	// It is distinct from every real profile name because of where those names
+	// come from, not because the filesystem forbids it: a directory may be
+	// called "-", but the Platform Agent derives profile names from the
+	// project/location/cluster triple, so it never generates one. A caller that
+	// discriminates on this value is trusting that generator.
 	NoProfile = "-"
 
 	// hiddenPrefix marks a directory entry this scan ignores, so an editor's

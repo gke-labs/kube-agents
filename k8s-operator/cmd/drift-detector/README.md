@@ -24,8 +24,9 @@ nor `--kubeconfig` set it reaches none, and every record naming a live object co
 credentials the rest still come out `unreachable`. The fan-in is the next task: read the
 `cluster_identity` block out of each Cluster Agent profile, ask the GKE API where that cluster's
 control plane is, and reach all of them as the pod's own Google identity — one shared token source,
-not a credential per cluster. `internal/clusterprofiles` already does that and hands back a
-`rest.Config` per cluster; `newObjectGetter` in `cluster.go` is what it replaces here.
+not a credential per cluster. [`internal/clusterprofiles`](../../internal/clusterprofiles/) already
+does that and hands back a `rest.Config` per cluster; `newObjectGetter` in `cluster.go` is what it
+replaces here.
 
 ## Running it
 

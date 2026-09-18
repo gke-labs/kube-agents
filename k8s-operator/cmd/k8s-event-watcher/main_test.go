@@ -246,6 +246,41 @@ func TestDiscoverClusterProfiles_SkippedProfileIsCounted(t *testing.T) {
 	}
 }
 
+func TestDiscoverClusterProfiles_UnusableConfigIsSkippedNotWatchedWithANilClient(t *testing.T) {
+	// The one branch in this function that is not field copying: a config the
+	// package was willing to build and kubernetes.NewForConfig then rejects.
+	// Reachable because the two disagree about the cluster CA —
+	// ClientConfigForIdentity only base64-decodes it, NewForConfig parses it as
+	// PEM — so a certificate that is valid base64 and not a PEM block gets
+	// through the first and fails the second. Without this, dropping the
+	// `continue` below would append a targetCluster with a nil Client and ship
+	// green, and run would hand that nil to newWatcher.
+	stubGKE(t)
+	discovery.Describe = func(_ context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
+		return &container.Cluster{
+			Endpoint:   id.String() + ".example.invalid",
+			MasterAuth: &container.MasterAuth{ClusterCaCertificate: base64.StdEncoding.EncodeToString([]byte("not-a-pem-block"))},
+		}, nil
+	}
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-p-prod-us-central1", "p", "prod", "us-central1")
+
+	m := newMetrics()
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
+	if err != nil {
+		t.Fatalf("a cluster whose client will not build is a skip, not a failure: %v", err)
+	}
+	if len(clusters) != 0 {
+		t.Fatalf("got %d clusters (%v), want none: a cluster with no client is worse than no cluster",
+			len(clusters), clusterNames(clusters))
+	}
+	// Counted under the profile, not the cluster name: the profile is what an
+	// operator has to go and look at.
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-p-prod-us-central1")); got != 1 {
+		t.Errorf("expected the unusable config to be counted once under its profile, got %v", got)
+	}
+}
+
 func TestDiscoverClusterProfiles_MissingDirIsFatal(t *testing.T) {
 	// The package returns this as an error rather than a skip, and the watcher
 	// has to propagate it: discovery runs only once, so starting successfully

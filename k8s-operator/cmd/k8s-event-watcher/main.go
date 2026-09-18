@@ -263,17 +263,20 @@ type targetCluster struct {
 	Client  kubernetes.Interface
 }
 
-// identity is what makes this cluster distinct from every other watched
-// cluster. A GKE cluster name is unique only within a project and location, so
-// a fleet can legitimately run "prod" in us-central1 and "prod" in
-// europe-west1 — the Platform Agent creates a profile for each, keyed on the
-// full triple. Keying on the bare name here would treat the second as a
-// duplicate of the first and silently leave it unmonitored.
+// identity names this cluster in logs and in the startup line, in the form
+// that tells two clusters apart. A GKE cluster name is unique only within a
+// project and location, so a fleet can legitimately run "prod" in us-central1
+// and "prod" in europe-west1, and a line naming only "prod" says nothing about
+// which one it means.
 //
-// Empty for the direct --in-cluster/--kubeconfig cluster, which has no
-// cluster_identity to read. That is safe: there is only ever one of it, so it
-// cannot collide with itself, and its name still distinguishes it from the
-// profile clusters.
+// Not the deduplication key, despite the matching format: profile clusters are
+// deduplicated inside clusterprofiles.Discover, on Identity.String(), before
+// they ever become a targetCluster. Changing the format here changes what the
+// logs say and nothing else.
+//
+// ProjectID and Location are empty for the direct --in-cluster/--kubeconfig
+// cluster, which has no cluster_identity to read; the bare name still
+// distinguishes it from the profile clusters.
 func (tc targetCluster) identity() string {
 	return tc.ProjectID + "/" + tc.Location + "/" + tc.Name
 }
