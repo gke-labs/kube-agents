@@ -319,6 +319,26 @@ def ran(check, cluster="prod-us-east"):
     }
 
 
+def resolved_for(previous_body):
+    """A `resolved_because` entry for every finding a previous body carries.
+
+    A clean run over a ledger that carried findings has to account for each
+    one (#1683): the fixture's full-roster `checks_run` says every check ran
+    again, so without these the close is held. Tests about the close itself
+    use this; tests about the hold build the silence on purpose.
+    """
+    return [
+        {
+            "check": fid.split(".", 1)[0],
+            "cluster": where["cluster"],
+            "namespace": where["namespace"],
+            "object": where["object"],
+            "reason": "Re-ran the check on this cluster; the object is gone from the listing.",
+        }
+        for fid, where in audit_report.parse_finding_locations(previous_body).items()
+    ]
+
+
 def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
     if clusters is None:
         clusters = [
@@ -1777,6 +1797,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "kanban-board-health",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
+                "feedback-prompt",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
@@ -2468,10 +2489,31 @@ class TestAuditCatalogue(unittest.TestCase):
 
 class TestProtectedBranches(unittest.TestCase):
     def test_refuses_to_push_protected_branch(self):
-        for branch in ("main", "master", "production", "MAIN", " main "):
+        for branch in (
+            "main", "master", "production", "MAIN", " main ",
+            "refs/heads/main", "heads/main", "refs/heads/master",
+        ):
             with self.subTest(branch=branch):
                 with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
                     audit_report.assert_pushable(branch)
+
+        # Run branches are refused unconditionally without env overrides (#1498)
+        for branch in (
+            "run/test-cluster/fix-task",
+            "refs/heads/run/test-cluster/fix-task",
+            "heads/run/test-cluster/fix-task",
+        ):
+            with self.subTest(branch=branch):
+                with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                    audit_report.assert_pushable(branch)
+
+        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
+            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                audit_report.assert_pushable("custom-gitops-base")
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
+            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                audit_report.assert_pushable("custom-broker-base")
 
     def test_remediation_branch_is_pushable(self):
         # The audit report branch is gone; the only branch the harness ever
@@ -2681,6 +2723,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -2741,6 +2784,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -2885,7 +2929,9 @@ class TestPublishedBodies(HarnessTestCase):
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": previous_body}),
         }
-        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
 
         comments = self.harness.bodies_for("issue", "comment")
         self.assertEqual(len(comments), 1)
@@ -2995,7 +3041,9 @@ class TestFinishClean(HarnessTestCase):
             "--json body": json.dumps({"body": previous_body}),
         }
 
-        rc = self.run_finish(make_doc(findings=[]))
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc)
         self.assertEqual(rc, 0)
 
         self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
@@ -3023,6 +3071,7 @@ class TestFinishClean(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -3056,6 +3105,7 @@ class TestFinishClean(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -3103,6 +3153,458 @@ class TestFinishClean(HarnessTestCase):
         self.assertIn("Autopilot: node-level checks did not run", comment)
 
 
+class TestCleanCommentEvidence(BaseTestCase):
+    """The clean comment carries the commands behind the all-clear.
+
+    A clean run closes the ledger without rewriting it, so the comment used to
+    be the only durable trace of the run — and it named the date and the
+    clusters, nothing else. On 2026-09-16 evals-6 ledger #29 was closed as
+    clean over a live cluster-admin binding, and nothing on the issue said
+    what the run had asked the fleet (#1683).
+    """
+
+    def test_the_closing_comment_carries_the_evidence_table(self):
+        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW)
+        self.assertIn("closed as completed", comment)
+        self.assertIn("How this run checked the fleet", comment)
+        for cluster in ("prod-us-east", "stage-eu"):
+            self.assertIn(ran("netpol-missing", cluster)["command"], comment)
+
+    def test_the_gap_comment_carries_it_too(self):
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "prod-eu-1", "reason": "API server unreachable"}],
+        )
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        self.assertIn("the ledger stays open", comment.lower())
+        self.assertIn("How this run checked the fleet", comment)
+
+    def test_the_table_is_dropped_whole_rather_than_clipped(self):
+        # 900 clusters times the full roster does not fit under the limit. The
+        # comment still posts, and carries no table rather than half of one.
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": f"c-{i:04d}", "location": "us-east1", "project": "acme"}
+                for i in range(900)
+            ],
+        )
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        self.assertLess(len(comment), GITHUB_BODY_LIMIT)
+        self.assertNotIn("How this run checked the fleet", comment)
+        self.assertNotIn("truncated by audit_report.py", comment)
+
+
+# The finding the 2026-09-16 false clean was about: a cluster-scoped binding,
+# named by the command that would show it.
+HELD_CHECK = "cluster-admin-binding"
+HELD_OBJECT = "ClusterRoleBinding/debug-binding"
+NAMING_COMMAND = (
+    "kubectl --context prod-us-east get clusterrolebinding debug-binding -o yaml"
+)
+
+
+def held_finding():
+    return make_finding(
+        fid="debug",
+        check=HELD_CHECK,
+        namespace="",
+        obj=HELD_OBJECT,
+        title="debug-binding grants cluster-admin to a default service account",
+        command=NAMING_COMMAND,
+        remediation={"kind": "manual", "note": "Delete the binding."},
+    )
+
+
+def held_id():
+    return derived_id(check=HELD_CHECK, namespace="", obj=HELD_OBJECT)
+
+
+def naming_doc(findings=None, command=NAMING_COMMAND, **kwargs):
+    """A document whose prod-us-east `cluster-admin-binding` command names the binding."""
+    doc = make_doc(findings=findings if findings is not None else [], **kwargs)
+    for cluster in doc["scope"]["clusters"]:
+        if cluster["name"] != "prod-us-east":
+            continue
+        for entry in cluster["checks_run"]:
+            if entry["check"] == HELD_CHECK:
+                entry["command"] = command
+    return doc
+
+
+def without_held_check(**kwargs):
+    """A clean document whose prod-us-east did not run `cluster-admin-binding`.
+
+    Declared not applicable there rather than left out, so coverage stays
+    complete and the clean path is the one exercised, not the gap.
+    """
+    doc = make_doc(findings=[], **kwargs)
+    for cluster in doc["scope"]["clusters"]:
+        if cluster["name"] != "prod-us-east":
+            continue
+        cluster["checks_run"] = [e for e in cluster["checks_run"] if e["check"] != HELD_CHECK]
+        cluster["checks_not_applicable"] = [
+            {
+                "check": HELD_CHECK,
+                "reason": "GKE Autopilot: user ClusterRoleBindings to cluster-admin are rejected by admission.",
+            }
+        ]
+    return doc
+
+
+def resolved_entry(**overrides):
+    entry = {
+        "check": HELD_CHECK,
+        "cluster": "prod-us-east",
+        "object": HELD_OBJECT,
+        "reason": (
+            "kubectl get clusterrolebinding debug-binding returned NotFound; "
+            "the binding was deleted on 2026-09-16."
+        ),
+    }
+    entry.update(overrides)
+    return entry
+
+
+class TestUnaccountedJoin(unittest.TestCase):
+    """The pure half of the held close: reading the body and joining on the check."""
+
+    def test_locations_are_read_back_off_the_body(self):
+        body = published_body(
+            make_doc(findings=[make_finding(fid="a"), held_finding()]), generated_at=NOW
+        )
+        locations = audit_report.parse_finding_locations(body)
+        self.assertEqual(
+            locations[derived_id(fid="a")],
+            {
+                "title": "Namespace has no NetworkPolicy",
+                "cluster": "prod-us-east",
+                "namespace": "payments",
+                "object": "Namespace/a",
+            },
+        )
+        scoped = locations[held_id()]
+        self.assertEqual(scoped["namespace"], "")
+        self.assertEqual(scoped["object"], HELD_OBJECT)
+
+    def test_an_empty_or_unreadable_body_has_no_locations(self):
+        self.assertEqual(audit_report.parse_finding_locations(""), {})
+        self.assertEqual(audit_report.parse_finding_locations(None), {})
+
+    def test_the_join_holds_what_was_checked_again_and_left_unexplained(self):
+        body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
+
+        # The SOP's own fleet-wide listing counts as having checked the
+        # binding: the join is on the check, not on the command naming the
+        # object (compliance_audit_sop.md's command for this check is
+        # `kubectl get clusterrolebindings -o json | jq …`, which names none).
+        listing = make_doc(findings=[])
+        held = audit_report.unaccounted_previous_findings(body, listing)
+        self.assertEqual([entry["id"] for entry in held], [held_id()])
+        self.assertEqual(held[0]["object"], HELD_OBJECT)
+        self.assertEqual(held[0]["check"], HELD_CHECK)
+        self.assertEqual(
+            held[0]["commands"],
+            [
+                entry["command"]
+                for cluster in listing["scope"]["clusters"]
+                if cluster["name"] == "prod-us-east"
+                for entry in cluster["checks_run"]
+                if entry["check"] == HELD_CHECK
+            ],
+        )
+        # A targeted command holds the same way.
+        held = audit_report.unaccounted_previous_findings(body, naming_doc())
+        self.assertEqual(held[0]["commands"], [NAMING_COMMAND])
+
+        # Reported again: not held.
+        self.assertEqual(
+            audit_report.unaccounted_previous_findings(
+                body, naming_doc(findings=[held_finding()])
+            ),
+            [],
+        )
+        # Explained: not held.
+        explained = naming_doc()
+        explained["resolved_because"] = [resolved_entry()]
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, explained), [])
+        # The check did not run on that cluster this run: not held — the
+        # harness cannot say the run looked.
+        self.assertEqual(
+            audit_report.unaccounted_previous_findings(body, without_held_check()), []
+        )
+        # The cluster was not read this run: not held.
+        elsewhere = naming_doc(
+            clusters=[{"name": "stage-eu", "location": "europe-west1", "project": "acme"}]
+        )
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, elsewhere), [])
+        # No body to join against: nothing held.
+        self.assertEqual(audit_report.unaccounted_previous_findings(None, naming_doc()), [])
+
+    def test_a_carried_posture_that_moved_under_declared_is_accounted_for(self):
+        # The designed retirement path for a posture finding: a declaration
+        # appears in a linked repository and the next run moves the object
+        # under `declared`. Present and accounted for, not "not written down".
+        body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
+        doc = make_doc(findings=[])
+        doc["declared"] = [make_declared(check=HELD_CHECK, namespace="", obj=HELD_OBJECT)]
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, doc), [])
+
+    def test_the_held_comment_carries_the_declared_and_resolved_entries(self):
+        # A held run is not rewritten either, so the comment is where a
+        # declaration's pointer and a resolved reason get published.
+        doc = make_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        doc["resolved_because"] = [resolved_entry(object="ClusterRoleBinding/other")]
+        held = [
+            {
+                "id": held_id(),
+                "title": "t",
+                "check": HELD_CHECK,
+                "cluster": "prod-us-east",
+                "namespace": "",
+                "object": HELD_OBJECT,
+                "commands": ["kubectl get clusterrolebindings -o json"],
+            }
+        ]
+        comment = audit_report.render_held_comment(AUDIT, doc, held, NOW)
+        self.assertIn("declared at `acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
+        self.assertIn("confirmed gone, in its own words", comment)
+        self.assertIn(resolved_entry()["reason"], comment)
+        self.assertLess(comment.index("stays open"), comment.index("confirmed gone"))
+
+    def test_the_check_must_have_run_on_the_previous_cluster(self):
+        # The check ran on stage-eu only; the finding was on prod-us-east. A
+        # different cluster's check says nothing about it.
+        body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
+        doc = without_held_check()
+        self.assertTrue(
+            any(
+                entry["check"] == HELD_CHECK
+                for cluster in doc["scope"]["clusters"]
+                if cluster["name"] == "stage-eu"
+                for entry in cluster["checks_run"]
+            )
+        )
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, doc), [])
+
+
+class TestResolvedBecauseValidation(unittest.TestCase):
+    def doc(self, *entries, findings=()):
+        doc = make_doc(findings=list(findings))
+        doc["resolved_because"] = list(entries)
+        return doc
+
+    def rejects(self, doc, *needles):
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        for needle in needles:
+            self.assertIn(needle, str(exc.exception))
+
+    def test_a_well_formed_entry_validates(self):
+        audit_report.validate_findings(self.doc(resolved_entry()), AUDIT)
+        audit_report.validate_findings(
+            self.doc(resolved_entry(namespace="payments", object="Namespace/payments")),
+            AUDIT,
+        )
+
+    def test_an_empty_list_and_an_absent_key_are_the_same(self):
+        audit_report.validate_findings(self.doc(), AUDIT)
+        audit_report.validate_findings(make_doc(findings=[]), AUDIT)
+
+    def test_not_a_list_is_rejected(self):
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_entry()
+        self.rejects(doc, "resolved_because: must be a list")
+
+    def test_an_unknown_check_is_rejected_without_the_roster(self):
+        doc = self.doc(resolved_entry(check="rbac-2.4"))
+        self.rejects(doc, "resolved_because[0].check", "rbac-2.4")
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertNotIn("privileged-container", str(exc.exception))
+
+    def test_a_cluster_this_run_did_not_read_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(cluster="dr-west")),
+            "resolved_because[0].cluster",
+            "not in scope.clusters",
+        )
+
+    def test_a_short_reason_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(reason="gone")),
+            "resolved_because[0].reason",
+            "too short",
+        )
+
+    def test_an_object_that_names_nothing_is_rejected(self):
+        self.rejects(self.doc(resolved_entry(object="///")), "resolved_because[0].object")
+
+    def test_an_entry_that_is_also_a_finding_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(), findings=[held_finding()]),
+            "resolved_because[0]",
+            "same identity as findings[0]",
+        )
+
+    def test_a_duplicate_entry_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(), resolved_entry(reason="Deleted; second copy of the same line.")),
+            "resolved_because[1]",
+            "duplicate",
+        )
+
+
+class TestHeldClose(HarnessTestCase):
+    """A clean run is not closed over a finding it looked at again and did not explain.
+
+    Rep 2 of the 2026-09-16 nightly closed evals-6 ledger #29 with "0 findings
+    across 4 audited cluster(s)" while the planted binding was live. From the
+    document alone the harness cannot tell a fixed finding from an omitted
+    one, so when the previous body carried a finding and this run says the
+    same check ran on that cluster again, the run is asked to say which (#1683).
+    """
+
+    def previous_ledger(self, *findings):
+        body = published_body(
+            make_doc(findings=list(findings) or [held_finding()]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": body}),
+        }
+
+    def test_the_close_is_refused_when_the_check_ran_on_that_cluster_again(self):
+        self.previous_ledger()
+        # The fixture's default `checks_run` is the SOP's fleet-wide listing,
+        # which is exactly what rep 2 of 2026-09-16 would have written.
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        comments = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(comments), 1)
+        comment = comments[0]
+        self.assertIn("the ledger stays open", comment)
+        self.assertNotIn("closed as completed", comment)
+        self.assertIn(held_id(), comment)
+        self.assertIn("debug-binding grants cluster-admin", comment)
+        self.assertIn(f"`{HELD_OBJECT}`", comment)
+        self.assertIn("_cluster-scoped_", comment)
+        self.assertIn(f"`{HELD_CHECK}` ran there as", comment)
+        self.assertIn("resolved_because", comment)
+        self.assertIn("`carried`", comment)
+        # The evidence table travels with the refusal too.
+        self.assertIn("How this run checked the fleet", comment)
+
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["issue_url"], "https://github.com/acme/fleet/issues/42")
+        self.assertEqual(payload["resolved"], 0)
+        self.assertFalse(payload["silent_ok"])
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["coverage_gaps"], [])
+        self.assertEqual(payload["unaccounted"], [held_id()])
+        self.assertIn("UNACCOUNTED:", self.err)
+        self.assertIn("stays open", self.err)
+
+    def test_a_refused_close_retires_no_remediation_pull_request(self):
+        self.previous_ledger(held_finding(), make_finding(fid="a"))
+        self.harness.replies["pr list"] = json.dumps(
+            [
+                pr(
+                    8,
+                    "platform-agent/fix-x-gone",
+                    body=audit_report.delta_block([derived_id(fid="a")]),
+                )
+            ]
+        )
+        self.assertEqual(self.run_finish(naming_doc()), 0)
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+
+    def test_a_resolved_because_entry_lets_the_ledger_close(self):
+        self.previous_ledger()
+        doc = naming_doc()
+        doc["resolved_because"] = [resolved_entry()]
+        self.assertEqual(self.run_finish(doc), 0)
+
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        comments = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(comments), 1)
+        self.assertIn("closed as completed", comments[0])
+        # The reason that retired the finding is published with the close,
+        # next to the evidence table; validated-and-dropped would be a claim
+        # made to the harness and nobody else.
+        self.assertIn("confirmed gone, in its own words", comments[0])
+        self.assertIn(f"`{held_id()}` — {resolved_entry()['reason']}", comments[0])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["resolved"], 1)
+        self.assertFalse(payload["silent_ok"])
+        self.assertEqual(payload["unaccounted"], [])
+
+    def test_a_check_that_did_not_run_on_that_cluster_holds_nothing(self):
+        # Declared not applicable on prod-us-east: the run did not look, so
+        # the harness cannot say it saw the finding gone or left it out. The
+        # excuse is published in the evidence table for a reviewer to weigh.
+        self.previous_ledger()
+        self.assertEqual(self.run_finish(without_held_check()), 0)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["unaccounted"], [])
+
+    def test_an_unreadable_previous_body_holds_nothing(self):
+        # Same rule as the delta: nothing can be joined against a body that
+        # could not be read, so nothing is claimed either way.
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"issue view": 1}
+        self.assertEqual(self.run_finish(naming_doc()), 0)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+
+    def test_a_gap_takes_precedence_over_the_hold(self):
+        # Over a gap the ledger stays open anyway and the comment says why; the
+        # hold is not computed on top of it, so the JSON says one thing.
+        self.previous_ledger()
+        doc = naming_doc(skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
+        self.assertEqual(self.run_finish(doc), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["unaccounted"], [])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_a_standing_remediate_is_told_the_ledger_stays_open(self):
+        self.previous_ledger()
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {held_id()}")]}
+        )
+        self.assertEqual(self.run_finish(naming_doc()), 0)
+        answers = [
+            b for b in self.harness.bodies_for("issue", "comment") if "/remediate" in b
+        ]
+        self.assertEqual(len(answers), 1)
+        self.assertNotIn("closing as completed", answers[0])
+        self.assertIn("stays open", answers[0])
+        # The held reason, not the coverage one: this run read the whole fleet.
+        self.assertIn("did not account for", answers[0])
+        self.assertNotIn("could not see the whole fleet", answers[0])
+        # And not the clean one either: the target is one of the findings the
+        # run did not account for, so it has not "stopped reproducing".
+        self.assertNotIn("no longer reproduces", answers[0])
+        self.assertNotIn("nobody needs", answers[0])
+        self.assertIn(f"`{held_id()}`", answers[0])
+
+    def test_a_finding_that_stays_on_the_ledger_carries_the_field_empty(self):
+        self.previous_ledger()
+        self.assertEqual(self.run_finish(naming_doc(findings=[held_finding()])), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "UPDATED")
+        self.assertEqual(payload["unaccounted"], [])
+
+
 # --------------------------------------------------------------------------- #
 # start
 # --------------------------------------------------------------------------- #
@@ -3143,6 +3645,7 @@ class TestStart(HarnessTestCase):
                 "workspace": str(self.workspace),
                 "findings_path": str(self.tmp_path / "findings_compliance-audit.json"),
                 "pending_remediation_requests": [],
+                "carried": [],
                 "context_repos": [],
                 "declared_intent_repos": ["acme/fleet"],
                 "sop": "governance/compliance_audit_sop.md",
@@ -3161,6 +3664,46 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+
+    def test_start_hands_over_the_findings_the_ledger_carries(self):
+        # The worker cannot write `resolved_because` for a finding it was
+        # never told about; `start` is the one place it is told.
+        body = published_body(
+            make_doc(findings=[held_finding(), make_finding(fid="a")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": body}),
+        }
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        carried = json.loads(self.out.strip())["carried"]
+        self.assertEqual([entry["id"] for entry in carried], sorted([held_id(), derived_id(fid="a")]))
+        held = next(entry for entry in carried if entry["id"] == held_id())
+        self.assertEqual(
+            held,
+            {
+                "id": held_id(),
+                "check": HELD_CHECK,
+                "title": "debug-binding grants cluster-admin to a default service account",
+                "cluster": "prod-us-east",
+                "namespace": "",
+                "object": HELD_OBJECT,
+            },
+        )
+        # And the entry is what `resolved_because` takes, minus the reason.
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = [
+            {k: v for k, v in held.items() if k in ("check", "cluster", "namespace", "object")}
+            | {"reason": "kubectl get clusterrolebinding debug-binding: NotFound."}
+        ]
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_an_unreadable_body_hands_over_nothing_and_says_so(self):
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json body": 1}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(self.out.strip())["carried"], [])
+        self.assertIn("could not read issue #42", self.err)
 
     def test_start_hands_over_the_roster(self):
         """Coverage must not depend on how far into the SOP the worker read.

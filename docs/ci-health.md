@@ -10,6 +10,11 @@ decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
 the dashboard's Brief bakes that verdict and its history (`render.py --health`,
 `--health-history`; the checkout is fetched with full history for the Brief's
 "what changed right before" block).
+The Brief's "What the agent saw" also quotes the agent's own words:
+`bench-gate case` prints the first 300 characters of each failing
+repetition's final report under its grading line (`rep N report:`), the
+collector keeps it as `reps[].excerpt`, and the Brief and the run page show
+it beside the grader's reason (builds graded before 2026-09-15 carry none).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
@@ -23,6 +28,25 @@ before, and the wall clock, with a link to the dashboard's Nightly report
 since the day before yesterday, says so instead of numbers.
 `scripts/eval_dashboard/nightly.py` derives the line and the report from the
 same nightly runs.
+The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
+the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
+and incremental) and renders the dashboard's Trend page (`trend.html`,
+`scripts/eval_dashboard/trend.py`): per case and per domain, the pass rate by
+night with the admission window beside it, the judged quality by night with the
+spread the store can support, and a marker on every night the version key
+changed. The Cases page links each case to its trend and the Brief's last
+incident links to the record around the night it started. What "score" means
+there — the deterministic pass rate is the gate's number, judged quality is
+advisory and never a single point — is defined once, in
+[`docs/designs/eval-scorer.md`, "What a score is"](designs/eval-scorer.md#what-a-score-is).
+A store read that would not fit its time budget stops early, keeps what it
+fetched with a note on the page, and finishes over the next ticks. A store read
+that fails, times out or finds no wall clock left after the collect
+leaves the Trend page on its last good read, marked stale with the reason, and
+every other page unaffected; a tick that cannot download that last read at all
+(anything but a NotFound, retried three times) reads nothing, the page says the
+store was not read for that tick, and the next tick recovers. The read reaches two weeks past the page's 90-day
+window so the first drawn night's admission window is as whole as the gate's.
 The same tick comments on each pull request whose run went red or whose
 build node went away (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss or a seeded-fixture drift
@@ -411,8 +435,8 @@ per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
 grant #1238 gave the presubmit's identity — and nothing on the project itself.
 The grant lives on the service account resource, so it is per project by
 nature (the pool projects sit directly under the organisation, with no folder
-to grant on). `bench/tf/fleet`'s `fleet_reader_token_creators` defaults to both
-identities, so an apply of the fleet stack in a project grants it; for projects
+to grant on). `bench/tf/fleet`'s `fleet_reader_token_creators` defaults to the bot
+beside both runners, so an apply of the fleet stack in a project grants it; for projects
 applied before that default, the repair is one command per project:
 
 ```bash

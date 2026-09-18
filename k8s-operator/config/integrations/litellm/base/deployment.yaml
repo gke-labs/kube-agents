@@ -27,6 +27,23 @@ spec:
         # the pod template itself change, which is what triggers the rollout.
         kubeagents.x-k8s.io/model-config: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
     spec:
+      # Kept in step with charts/kube-agents/templates/_helpers.tpl's
+      # kube-agents.topologySpreadConstraints, which owns the rationale: the PDB
+      # beside this file stalls a drain that would take both replicas, but a
+      # node that fails takes whatever is on it, and nothing else keeps the two
+      # apart. ScheduleAnyway rather than DoNotSchedule so a single-node pool
+      # does not leave the second replica Pending forever. matchLabelKeys so a
+      # rollout measures the skew over the new ReplicaSet alone rather than
+      # old and new pods together, which can leave both new replicas on one node.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              app: litellm
       # Kept in step with charts/kube-agents/templates/litellm.yaml, which owns
       # the rationale, and asserted by tests/test_workload_security_context.py.
       # The image runs as root by default; this pins the gateway to uid 1000 on
@@ -54,13 +71,19 @@ spec:
             capabilities:
               drop:
                 - ALL
+          # Kept in step with charts/kube-agents/values.yaml, which owns the
+          # rationale: every install read sits at 725Mi or more p50 per
+          # replica and the busiest peaks at 1485Mi, so a 512Mi request
+          # under-booked every node it landed on and made it the first pod
+          # evicted under memory pressure. 2Gi is ceil(peak x 1.3) of the
+          # busiest install; the limit moves to 3Gi to keep burst room.
           resources:
             requests:
               cpu: "100m"
-              memory: "512Mi"
+              memory: "2Gi"
             limits:
               cpu: "500m"
-              memory: "2Gi"
+              memory: "3Gi"
           env:
             # See the pod securityContext above: the only writable directory.
             - name: HOME

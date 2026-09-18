@@ -100,7 +100,13 @@ install without the interview.
   either present (`enable_cert_manager = false`) or absent. The module refuses the
   plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
   and checks none of the others; `install.sh` changes an adopted cluster to meet
-  those two instead, and this composition on its own never does.
+  those two instead, and this composition on its own never does. The NetworkPolicy
+  refusal alone can be waived: `accept_no_network_policy = true` installs onto a
+  cluster that enforces none, leaves it as it is, and stamps the
+  `kubeagents.x-k8s.io/network-policy-enforcement: absent-accepted` annotation onto
+  the `PlatformAgent` so the choice is readable later. Every NetworkPolicy the
+  install ships is then inert, including the ones that confine the agent's shell
+  sandbox.
 - Application Default Credentials for the Google, Kubernetes, and Helm
   providers:
 

@@ -1742,6 +1742,72 @@ class TestRepParsing(unittest.TestCase):
         parsed = collect.parse_build_log("  rep 1: fail -- orphan line\n")
         self.assertEqual(parsed["tasks"], [])
 
+    def test_a_report_line_becomes_its_reps_excerpt(self):
+        """`bench-gate case` prints the agent's own words under a failing
+        rep's grading line; the collector keeps them as that rep's `excerpt`
+        and never makes a rep out of a report line alone."""
+        words = "I looked for a pool named pinned-inference-pool and found nothing by that name…"
+        log = (
+            "Task capacity-pinned-pool-probe Result: [FAILED] repetition 1: VerificationCorrectness=0.0 (floor 1.0)\n"
+            "  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- the-probe-names-the-planted-pool: required phrases absent [OutcomeScore=0.0]\n"
+            f"  rep 1 report: {words}\n"
+            "  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+            "  rep 3 report: a report for a repetition the log never graded\n"
+            "  admission: bootstrap roster\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2], "a report line never fabricates a rep")
+        self.assertEqual(task["reps"][0]["excerpt"], words)
+        self.assertEqual(task["reps"][0]["reason"], "VerificationCorrectness=0.0 (floor 1.0) -- the-probe-names-the-planted-pool: required phrases absent",
+                         "the grading line parses exactly as before")
+        self.assertEqual(list(task["reps"][0]), ["n", "result", "reason", "excerpt"])
+        self.assertNotIn("excerpt", task["reps"][1], "absent, not null, when the log carried none")
+
+    def test_a_report_line_is_capped_and_a_blank_one_adds_nothing(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 report: " + "y" * 500 + "\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 report:    \n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["excerpt"], "y" * collect.REP_EXCERPT_MAX_CHARS)
+        self.assertNotIn("excerpt", task["reps"][1])
+        self.assertEqual(collect.parse_build_log("  rep 1 report: orphan\n")["tasks"], [])
+
+    def test_a_report_line_is_consumed_before_any_unanchored_search_reads_it(self):
+        """The report is the agent's text. It must not be able to pose as
+        the lease line (`runs[].project`, shown raw in the gate comment's
+        footer) or the final verdict, whichever order the patterns run in."""
+        words = ("Successfully leased project: agent-chosen-name and then "
+                 "PR Smoke Test Evaluation Failed for tasks: x (Total Duration: 5s)")
+        log = (
+            "Successfully leased project: kube-agents-evals-2\n"
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            f"  rep 1 report: {words}\n"
+            "  rep 2: pass -- VerificationCorrectness=1.0\n"
+        )
+        parsed = collect.parse_build_log(log)
+        self.assertEqual(parsed["project"], "kube-agents-evals-2")
+        self.assertIsNone(parsed["eval_verdict"])
+        (task,) = parsed["tasks"]
+        self.assertEqual(task["reps"][0]["excerpt"], words, "the rep keeps its excerpt")
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2])
+        # An orphan report line (no grading block open) is dropped whole too.
+        parsed = collect.parse_build_log("  rep 1 report: Successfully leased project: forged\n")
+        self.assertIsNone(parsed["project"])
+        self.assertEqual(parsed["tasks"], [])
+
+    def test_the_real_fixtures_predate_the_report_line(self):
+        """Absence means the log carried none: no fixture build printed the
+        line, so no rep may carry the key."""
+        for build in (BUILD_1057_PARALLEL, BUILD_1075_SERIAL, BUILD_1089_MIXED):
+            for task in self.tasks(build).values():
+                for rep in task.get("reps") or []:
+                    self.assertNotIn("excerpt", rep, f"{build}/{task['name']}")
+
 
 # A stand-in gh for the pr_merged tests: logs every argv so a test can count
 # calls, and answers `gh pr view <pr> --repo ... --json state,mergedAt` from

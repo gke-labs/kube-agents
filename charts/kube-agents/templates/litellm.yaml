@@ -185,6 +185,9 @@ spec:
         # the subPath mount below means nothing else will deliver it.
         checksum/config: {{ $checksumInput | sha256sum }}
     spec:
+      {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.litellm.topologySpread | default dict).enabled "replicas" .Values.litellm.replicaCount "selectorLabels" "app: litellm")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}
       {{- end }}

@@ -125,6 +125,75 @@ class QueueOrderTest(unittest.TestCase):
             self.assertGreaterEqual(pair[0][1], pair[1][1])
 
 
+class DelegationCeilingTest(unittest.TestCase):
+    """The full-audit units wait longer for their delegated worker (#1683).
+
+    The nightly of 2026-09-16 cut three audits at the global 2700s ceiling
+    after their ledgers were written. The ceiling is per unit, decided by
+    name beside the cost hint, and exported inside the unit's own subshell.
+    It stops at 3000s because the ledger read token minted before the bench
+    lives one hour and the verifier reads GitHub with it last.
+    """
+
+    def ceiling(self, name: str, inherited: str | None) -> str:
+        env = "" if inherited is None else f'export AGENT_DELEGATION_TIMEOUT="{inherited}"'
+        body = "\n".join([lifted("unit_delegation_timeout"), env, f'unit_delegation_timeout "{name}"'])
+        return run_bash(body).stdout.strip()
+
+    def test_the_audit_units_get_3000s_inside_the_tokens_hour(self):
+        for name in (
+            "compliance-rbac-overgrant",
+            "obtainability-planted-pdb",
+            "stockout-pinned-pool",
+            "upgrade-readiness-lagging-cluster",
+            "consistency-drift-outlier",
+            "fleet-cost-idle-pool",
+        ):
+            with self.subTest(unit=name):
+                self.assertEqual(self.ceiling(name, "2700"), "3000")
+                # The one-hour ledger token bounds it: leave at least 600s of
+                # the hour for startup, the opening turn, settle and the read.
+                self.assertLessEqual(int(self.ceiling(name, "2700")), 3600 - 600)
+
+    def test_every_other_unit_inherits_the_global_ceiling(self):
+        self.assertEqual(self.ceiling("capacity-pinned-pool-probe", "2700"), "2700")
+        # And the harness's own default when nothing was exported at all.
+        self.assertEqual(self.ceiling("capacity-pinned-pool-probe", None), "1800")
+
+    def test_the_unit_exports_its_own_ceiling_before_launching_the_bench(self):
+        unit = lifted("run_one_unit")
+        # Assigned, then exported (SC2155: an `export X="$(...)"` masks the
+        # command's exit status).
+        export = (
+            'AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"\n'
+            "  export AGENT_DELEGATION_TIMEOUT"
+        )
+        self.assertIn(export, unit)
+        # Exported before the bench runs, not after it: the position is the
+        # whole point of the line.
+        self.assertLess(unit.index(export), unit.index("uv run devops-bench"))
+
+    def test_the_task_lock_wait_outlasts_the_units_ceiling(self):
+        # A same-task repetition waits on the task lock for the holder's whole
+        # unit. With a 3000s ceiling, a fixed 1800s wait would make it give
+        # up while the holder was still legitimately running.
+        unit = lifted("run_one_unit")
+        wait = (
+            'lock_acquire "${STATE_DIR}/lock-task-${name}" \\\n'
+            '    "$(($(unit_delegation_timeout "${name}") + 600))"'
+        )
+        self.assertIn(wait, unit)
+        body = "\n".join(
+            [
+                lifted("unit_delegation_timeout"),
+                'export AGENT_DELEGATION_TIMEOUT="2700"',
+                'name=compliance-rbac-overgrant; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
+                'name=capacity-pinned-pool-probe; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
+            ]
+        )
+        self.assertEqual(run_bash(body).stdout.split(), ["3600", "3300"])
+
+
 class RunDirRecoveryTest(unittest.TestCase):
     def test_the_results_line_regex_recovers_the_run_directory(self):
         src = SCRIPT.read_text(encoding="utf-8")

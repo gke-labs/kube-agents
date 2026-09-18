@@ -120,7 +120,10 @@ that lost Issues: write (422 minting the token), and a GitHub outage.
   guide and the root `README.md`. The agents hand the short link out too, and none of that
   is reached by editing the site: drop the "Reporting a Problem with kube-agents Itself"
   bullet from `agents/platform/SOUL.md` and `agents/cluster/SOUL.md` and the routing row
-  from `agents/chat/SOUL.md`, and delete `tests/test_feedback_reference.py`, which fails
-  until the rest of that is done. Running installs keep answering with the link until they
-  take an image built after the change. If this directory goes too, drop its row from
+  from `agents/chat/SOUL.md`; ship the `feedback-prompt` cron job with `enabled: false`
+  (the retirement path in `agents/platform/cron/README.md`), since
+  `agents/platform/scripts/feedback_prompt.py` posts the link once to every install, and
+  remove `FORM_URL` from that script; then delete `tests/test_feedback_reference.py`, which
+  fails until the rest of that is done. Running installs keep answering with the link until
+  they take an image built after the change. If this directory goes too, drop its row from
   `docs/README.md` and its mention in the tree at the top of that file.

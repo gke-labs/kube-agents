@@ -53,6 +53,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -100,9 +101,9 @@ const (
 	// a2aDNSPort is name resolution, granted on both protocols.
 	a2aDNSPort = int32(53)
 
-	// The streams the worker's JetStream API grant names, spelled as the
-	// provision script creates them. A KV bucket is a stream called
-	// KV_<bucket>, so the bucket name and the prefix are held apart.
+	// The streams the bridge's and the agent's JetStream API grants name,
+	// spelled as the provision script creates them. A KV bucket is a stream
+	// called KV_<bucket>, so the bucket name and the prefix are held apart.
 	a2aTasksStream         = "TASKS"
 	a2aTopicsStateStream   = "TOPICS-STATE"
 	a2aTopicsJournalStream = "TOPICS-JOURNAL"
@@ -210,7 +211,7 @@ const (
 	// `password: ""` or mounts nothing, so they are named rather than spelled
 	// out at each site.
 	a2aGatewayPasswordKey = "gateway-password" // #nosec G101 -- Secret key name, not a credential
-	a2aWorkerPasswordKey  = "worker-password"  // #nosec G101 -- Secret key name, not a credential
+	a2aBridgePasswordKey  = "bridge-password"  // #nosec G101 -- Secret key name, not a credential
 	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
 	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
@@ -249,6 +250,69 @@ const (
 # itself. The rest have a ServiceAccount and could move tomorrow, but no client
 # that sends a token yet - moving the identity before the program that uses it
 # would refuse the workload at connect.`
+
+	// The TASKS consumer budget, derived from maxSessions rather than fixed.
+	//
+	// Every session pod creates a2aSessionConsumersPerSession named consumers on
+	// TASKS, so a stream whose max_consumers does not scale with the session cap
+	// is a configuration the install cannot honour: above roughly twenty
+	// concurrent sessions a legitimate session's consumer create is refused, and
+	// it surfaces to the user as a task failure rather than as the capacity error
+	// it is. The cap and the stream now come off the same number.
+	//
+	// The floor is why a default install sees no change. max_consumers was 64
+	// before this derived it, and 64 is also what stops the `web` user - which
+	// holds $JS.API.CONSUMER.CREATE.TASKS.> and no DELETE, because durability is
+	// a request-body field no subject list can see - from growing the file store
+	// with an unreapable durable per page load. Deriving downward would quietly
+	// tighten that on every existing install for a reason that has nothing to do
+	// with web, so the derivation only ever widens: max(64, budget).
+	//
+	// Widening has a cost and it is the same one, stated plainly: an install that
+	// configures 10000 sessions also raises web's ceiling to ~30000. That is the
+	// install's own choice of concurrency made explicit. The ceiling still
+	// exists, and it still converts to a refused create rather than to silent
+	// disk growth.
+
+	// a2aSessionConsumersPerSession mirrors lib.SessionConsumerRoles in the
+	// a2a module - origin, in, events - which worker-adapter creates on
+	// TASKS per session. The two modules cannot import each other;
+	// TestSessionConsumerCountMatchesTheA2AModule reads that slice and
+	// fails if this number stops matching it.
+	a2aSessionConsumersPerSession = 3
+
+	// a2aTasksReservedConsumers is the part of the budget that is nobody's
+	// session. What follows itemizes the STANDING consumers only: the
+	// gateway's `gateway-relay` durable and the Hermes bridge's
+	// `bridge-<profile>` durable (2), headroom for the audit durable the
+	// accountability rail needs (1), one session's worth of overlap while
+	// the gateway retires an incarnation and mints its replacement and the
+	// old consumers have not yet reached their 5s inactive threshold (3),
+	// and ten for the web rail's concurrent readers.
+	//
+	// It is not an accounting of everything that sits on TASKS, and reading
+	// it as one is the mistake to avoid: `tasks/get` replay ephemerals are
+	// outside this number and are not counted anywhere. lib.TasksGet opens an
+	// ordered consumer and its cleanup stops the local subscription only --
+	// the consumer itself waits out its InactiveThreshold, which TasksGet
+	// leaves unset, so nats.go's five-minute default applies. Every call
+	// therefore leaves one consumer on the stream for five minutes after it
+	// returns. That makes the missing term a call RATE over a rolling
+	// five-minute window rather than a concurrency, and the callers are not
+	// just the web rail: the gateway's sweep, reap and relay paths replay
+	// too. gke-labs#1739 owns the term and the number; this constant
+	// deliberately does not move for it here.
+	a2aTasksReservedConsumers = 16
+
+	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
+	// default install still gets. Never render below it.
+	a2aTasksMaxConsumersFloor = 64
+
+	// a2aTasksMaxMsgsPerSubject bounds one task's own history so a runaway
+	// on one task cannot evict every other session's. The provision
+	// script's TASKS block argues the number, what it bounds, and what it
+	// deliberately does not.
+	a2aTasksMaxMsgsPerSubject = 4096
 )
 
 func a2aNATSImage() string {
@@ -357,7 +421,7 @@ func randomA2APassword() (string, error) {
 // valid Secret shape through the upgrade, and so the hand-applied seed tooling
 // still has a credential.
 var a2aCredsKeys = []string{
-	a2aGatewayPasswordKey, a2aWorkerPasswordKey, a2aSeedPasswordKey,
+	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
 	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 }
 
@@ -438,43 +502,37 @@ func a2aSeedJetStreamGrants() []string {
 	return grants
 }
 
-// a2aWorkerJetStreamGrants is the worker's publish allow-list for the
-// JetStream API, replacing the `$JS.API.>` wildcard this user shipped with
-// (gke-labs/kube-agents#1316).
+// a2aBridgeJetStreamGrants is the bridge's publish allow-list for the
+// JetStream API. It is the task-plane half of the list `worker` held: that
+// user's `$JS.API.>` wildcard was enumerated by gke-labs/kube-agents#1316, and
+// A5 split the enumeration between the two workloads that were sharing it (the
+// topic-stream half is a2aAgentJetStreamGrants below).
 //
-// worker is the least-trusted principal in the deployment: it is the identity
-// a session pod runs as, executing model output against untrusted input. The
-// wildcard covered STREAM.PURGE, STREAM.UPDATE, STREAM.DELETE and
+// The wildcard covered STREAM.PURGE, STREAM.UPDATE, STREAM.DELETE and
 // STREAM.MSG.DELETE on every stream, DIRECTORY included. One PURGE empties the
 // directory for every profile and nothing repopulates it; DELETE leaves only a
 // re-run of the provision Job to bring the stream back.
 //
-// The list is what the worker-side binaries emit, read out of nats.go and then
-// measured against a real server running this render
-// (TestWorkerJetStreamGrantOnARealServer). Per stream:
+// The list is what the bridge emits, read out of nats.go and then measured
+// against a real server running this render
+// (TestBridgeJetStreamGrantOnARealServer). Per stream:
 //
-//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet and the bridge's sweep),
-//     CONSUMER.CREATE (the bridge's durable through CreateOrUpdateConsumer, and
+//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet and the sweep),
+//     CONSUMER.CREATE (the durable through CreateOrUpdateConsumer, and
 //     the replay's ordered consumer; nats.go puts the filter subject in the API
 //     subject, so the grant ends in `>`), CONSUMER.MSG.NEXT (every pull), and
 //     DIRECT.GET (GetLastMsgForSubject: the replay horizon and the sweep's CAS
 //     baseline). Acks are $JS.ACK.TASKS.>, granted beside this list.
-//   - KV_runtime-state, the bridge's in-flight registry: STREAM.INFO
+//   - KV_runtime-state, the in-flight registry: STREAM.INFO
 //     (js.KeyValue binds a bucket by reading its stream), and CONSUMER.CREATE
 //     with CONSUMER.DELETE (kv.Keys is a push ordered consumer that nats.go
 //     creates and then deletes on Unsubscribe, and the sweep runs it at every
 //     bridge start). Put and Delete are publishes on $KV.runtime-state.>,
 //     granted beside this list. No DIRECT.GET: nothing on the path calls
 //     kv.Get -- the bridge puts, deletes and lists, and the worker adapter
-//     touches no bucket -- and when a caller appears the grant is
+//     touches no bucket at all -- and when a caller appears the grant is
 //     DIRECT.GET.KV_runtime-state.>, with the server test as the place its
 //     absence shows.
-//   - TOPICS-STATE and TOPICS-JOURNAL: STREAM.INFO and DIRECT.GET, reads only.
-//     `a2a topics read` and `list` are js.Stream, Stream.Info and
-//     GetLastMsgForSubject on these two streams (lib.ReadTopicLatest,
-//     lib.TopicRegistry), and the CLI dials with whatever NATS_USER its pod
-//     carries; the worker credential is what a gateway-spawned session pod
-//     gets. The writes are the three exact topic subjects above this list.
 //
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
@@ -483,7 +541,7 @@ func a2aSeedJetStreamGrants() []string {
 // shows it on all seven. nats.go picks the route from the stream's own config,
 // so the fallback is never emitted and is not granted.
 //
-// What the wildcard granted that nothing on the worker path uses, and this
+// What the wildcard granted that nothing on the bridge path uses, and this
 // list now refuses: every verb on DIRECTORY (no STREAM.INFO, no consumer, no
 // DIRECT.GET -- the gateway keeps subscribe on the cards, which is the read
 // discovery needs), every verb on KV_session-state and KV_cap, PURGE / UPDATE /
@@ -492,7 +550,7 @@ func a2aSeedJetStreamGrants() []string {
 // account INFO (jetstream.New never asks for it), and CONSUMER.INFO (nothing
 // on the path binds to an existing consumer by name, and on nats.go v1.53.1
 // no consumer re-verifies itself with it after a reconnect either --
-// TestWorkerConsumersSurviveABusRestart holds that across a server restart).
+// TestBridgeConsumersSurviveABusRestart holds that across a server restart).
 //
 // CONSUMER.DELETE on TASKS is withheld, and it is the one subject nats.go
 // does emit here without a grant. The only emitter is the ordered consumer's
@@ -504,8 +562,8 @@ func a2aSeedJetStreamGrants() []string {
 // does not close the route, which is the correction to what this comment said
 // first. CONSUMER.CREATE is create-OR-UPDATE by name -- the request's `action`
 // field is empty for both, and the server has no ownership concept for a
-// consumer name -- so within a stream the worker may create consumers on,
-// every consumer on that stream is the worker's to reconfigure. Measured
+// consumer name -- so within a stream the bridge may create consumers on,
+// every consumer on that stream is the bridge's to reconfigure. Measured
 // against this render, on the gateway's relay durable: one permitted
 // $JS.API.CONSUMER.CREATE.TASKS.gateway-relay carrying the durable's own
 // config with filter_subject changed retunes it, and the gateway stops seeing
@@ -519,15 +577,15 @@ func a2aSeedJetStreamGrants() []string {
 // NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
 // literally named that. What closes it is the auth callout giving each
 // principal its own user. DELETE stays out as the one destructive verb here
-// that nothing on the worker path needs.
+// that nothing on the bridge path needs.
 //
 // One route this list narrows but cannot close, because it lives in a request
 // body: a push consumer's deliver_subject. CONSUMER.CREATE on TASKS (or on the
-// KV bucket) lets the worker ask the server to deliver that stream's messages
+// KV bucket) lets the bridge ask the server to deliver that stream's messages
 // onto any subject, and a stream whose subjects cover the deliver subject
 // stores them -- under their ORIGINAL subjects, so this is not forgery (a
 // topic or card read by subject never sees them) but it is a persisted write
-// into a stream the worker has no publish grant for, and with discard=old an
+// into a stream the bridge has no publish grant for, and with discard=old an
 // eviction lever against it. The server delivers only once a subscription
 // exists whose subject is EXACTLY the deliver subject: a push consumer
 // registers through Sublist.registerNotification, which takes interest only
@@ -546,11 +604,11 @@ func a2aSeedJetStreamGrants() []string {
 // `a2a.>` subscribe grants permit that but do not supply it: a subscription
 // on either wildcard leaves DIRECTORY empty, measured. Nothing in the tree
 // opens a literal card subscription today. The wildcard this replaces had the
-// same route with every stream as a source; what closes it is the worker not
+// same route with every stream as a source; what closes it is the bridge not
 // holding CONSUMER.CREATE at all, which is a pre-created consumer per task
 // (the stage-3 dispatcher), not a grant. The server test measures all four
 // cases.
-func a2aWorkerJetStreamGrants() []string {
+func a2aBridgeJetStreamGrants() []string {
 	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
@@ -560,6 +618,27 @@ func a2aWorkerJetStreamGrants() []string {
 		"$JS.API.STREAM.INFO." + kvRuntimeState,
 		"$JS.API.CONSUMER.CREATE." + kvRuntimeState + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvRuntimeState + ".*",
+	}
+}
+
+// a2aAgentJetStreamGrants is the platform agent container's publish allow-list
+// for the JetStream API: the topic-stream half of what `worker` held.
+//
+// Reads only, on the two topic streams and nothing else. `a2a topics read` and
+// `a2a topics list` are js.Stream, Stream.Info and GetLastMsgForSubject on
+// TOPICS-STATE and TOPICS-JOURNAL (lib.ReadTopicLatest, lib.TopicRegistry), and
+// the three writes are ordinary publishes on the exact topic subjects, granted
+// beside this list rather than in it.
+//
+// No CONSUMER verb of any kind, which is the difference that matters between
+// this list and the bridge's above. The deliver_subject residue the bridge
+// comment ends on is a consequence of holding CONSUMER.CREATE; an identity
+// without it cannot ask the server to deliver a stream anywhere. The platform
+// agent container is the widest-reach workload in the namespace and it runs
+// model output, so it is the one principal that should hold no route into the
+// task plane at all -- not a narrow one.
+func a2aAgentJetStreamGrants() []string {
+	return []string{
 		"$JS.API.STREAM.INFO." + a2aTopicsStateStream,
 		"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".>",
 		"$JS.API.STREAM.INFO." + a2aTopicsJournalStream,
@@ -666,9 +745,10 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // decides who may say what before a message is read. Deny-by-default — a
 // permissions block with allow lists denies everything else — with per-user
 // _INBOX prefixes so the reply path cannot leak what the subject grants
-// withheld. Seed's JetStream API grant is scoped to the streams it provisions
-// and the worker's to the streams it uses, both by name and by verb
-// (a2aSeedJetStreamGrants, a2aWorkerJetStreamGrants), and provision has moved
+// withheld. Seed's JetStream API grant is scoped to the streams it provisions,
+// the bridge's and the agent's to the streams each one uses, all by name and by
+// verb (a2aSeedJetStreamGrants, a2aBridgeJetStreamGrants,
+// a2aAgentJetStreamGrants), and provision has moved
 // to the callout and holds the enumerated subjects too (its identity entry
 // spells them). Gateway alone still holds a bare $JS.API.>, which is playground
 // posture; narrowing it is the same change again with its own table of what it
@@ -847,15 +927,16 @@ authorization {
     # itself, plus every identity marked STATIC above. The session entry is
     # absent exactly because it is not one: a session pod presents a
     # pod-bound ServiceAccount token and the callout scopes it to its own
-    # task, so worker is no longer the credential a session holds. Do not
-    # read this list as the session path.
+    # task. Do not read this list as the session path.
     #
-    # A name is here for one of two reasons, and each identity's own comment
+    # A name is here for one of three reasons, and each identity's own comment
     # above says which. It can hold no projected token at all — the browser
     # read user, the $SYS login held by a person, the seed tooling that is
-    # applied rather than run. Or it could and has not moved yet: the
-    # agent-side workloads still on worker, and gateway. The first group is
-    # permanent; the second is the remaining migration.
+    # applied rather than run. Or it is a sidecar, which a ServiceAccount
+    # token cannot name apart from the container beside it — the bridge, whose
+    # own comment above says what a callout entry there would merge. Or it
+    # could move and has not: gateway, which is the remaining migration. The
+    # first two reasons are permanent; only the third is a migration.
     auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
   }
 }
@@ -902,10 +983,14 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // accepted write to the creds Secret, so labelling it by hand, a policy
 // controller stamping the namespace, or a restore that renumbers the namespace
 // rolls the single-replica bus once with nothing the server reads having
-// changed — clients reconnect, and JetStream state lives on the PV. The
-// alternative that ignores metadata churn is a digest of the password bytes,
-// which is the alert this function exists to close, so the spurious roll is
-// the price of not hashing the credential.
+// changed — clients reconnect, and JetStream state lives on the PV. An unkeyed
+// digest of the password bytes would ignore metadata churn but is the alert
+// this function exists to close, so the spurious roll is the price of not
+// hashing the credential. secretEnvHash (platformagent_secret_hash.go) has
+// since shown a third way — an HMAC over the values keyed by the Secret's UID,
+// which ignores metadata churn without an unkeyed digest — and moving this
+// function onto it is a separate change: it alters when the bus rolls under
+// mode: next and needs its own live test.
 //
 // And the rotation it notices rolls the bus, not the bus's clients. This hash
 // rides the NATS pod template alone; the gateway Deployment and the provision
@@ -1271,7 +1356,7 @@ BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
 # every call would time out.
 NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
 
-# max_consumers caps each stream at 64. Consumer durability is a request-body
+# max_consumers caps each stream. Consumer durability is a request-body
 # field, so no permission list can hold web to ephemeral ones (see the web user
 # in nats.conf); the cap is what stops an unreapable durable per page-load from
 # growing the file store without bound. The failure it converts to is loud — a
@@ -1279,6 +1364,11 @@ NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --
 # burns the cap can also deny a legitimate consumer, which is the right way
 # round for a playground and the wrong one for production, where the callout
 # mints per-identity users and this becomes a per-user limit instead.
+#
+# Three streams keep the flat 64. TASKS does not: it is the one stream session
+# pods create consumers on, three apiece, so its cap is derived from this CR's
+# maxSessions (a2aTasksMaxConsumers) and a stream that cannot hold the
+# configured concurrency is a refusal below rather than a task failure at load.
 
 # Retention rule (deployment spec): acknowledgement must not delete — all
 # message streams are limits-based with an age window; replay is a read.
@@ -1286,14 +1376,66 @@ NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --
 # replay oldest-first instead of filling the PV and stalling JetStream.
 #
 # --allow-direct is stated on every stream even though it is the CLI's
-# default: the worker's JetStream API grant is written for the direct-get
+# default: the bus grants are written for the direct-get
 # route (nats.go picks DIRECT.GET or STREAM.MSG.GET from the stream's own
 # config), so the bit the grant rests on is set here, not inherited.
 
 # TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.
+#
+# max_msgs_per_subject bounds ONE SUBJECT, which on this stream is one class of
+# one task: a2a.tasks.{addressee}.{taskId}.{in,events,supervisor}. Read what it
+# does and does not buy, because the two are easy to swap.
+#
+# It buys: a runaway executor - a loop, a harness streaming forever - can no
+# longer push 20GiB through the stream on one task and, with discard=old, evict
+# every other session's history on the way. The runaway now pays for its own
+# runaway and nobody else's.
+#
+# It does NOT buy containment of a session that means it. A session's publish
+# grant is a2a.tasks.<pod>.*.events (authcallout/session.go, sessionGrants: the
+# task id is not in the attested claim, so the grant cannot name one), so a
+# session can mint unbounded distinct subjects by inventing task ids. A
+# per-subject cap is not a per-publisher budget, and JetStream has no per-
+# publisher budget to reach for. Closing that means putting the task id in the
+# claim, which is a change to the callout's narrowing and not to a stream flag.
+#
+# 4096, sized against the publisher that means it rather than the well-behaved
+# one: the render sets no max_payload, so NATS' 1MiB default is the per-message
+# ceiling and 4096 messages is a ~4GiB worst case on one subject, a fifth of the
+# stream. The worker adapter's own result chunks are resultChunkSize (256 KiB),
+# so a task built out of those reaches nearer 1GiB at the same count - but that
+# is a property of one publisher and not a bound the bus enforces. A chat-driven
+# task emits single digits to low hundreds of events; reaching 4096 is already a
+# loop or a gigabyte of streamed artifact text.
+#
+# What happens at the limit, because discard=old evicts the OLDEST message on
+# the subject first: the oldest event on a task's ...events subject is its
+# 'submitted' status-update, which assertion 9 requires and which FoldTask
+# folds into StatusHistory[0]. A truncated task therefore replays without its
+# head. That is only acceptable because the fold now SAYS so - lib.Task's
+# SubmittedMissing is the assertion-9 observation, the sibling of
+# PostFinalDropped for assertion 10 - so the eviction is a degradation a reader
+# can see rather than a short history it cannot distinguish from a real one.
+#
+# The same eviction on the ...in class is quieter and worse, and this flag
+# does not ship without the check that answers it. That subject's oldest
+# message is the task's originating kind:message, which the worker re-reads on
+# every start. Steers are kind:message too and nothing on the envelope marks
+# the submission, so a scan past the cap returns the oldest surviving steer and
+# the worker executes that as the request - with no SubmittedMissing to show
+# for it, because nothing folds ...in. No stream flag closes that: per-subject
+# discard:new would refuse the steer instead of the submission, which breaks
+# steering, and there is no 'keep the head' policy. It is closed on the client
+# side instead. The gateway publishes the submission before it spawns the pod,
+# so the ack names the sequence; it passes that to the pod as A2A_ORIGIN_SEQ
+# and the adapter opens its origin consumer there and refuses to run if the
+# message it gets back is a different sequence. See a2a/worker-adapter
+# fetchOriginAtSeq and docs/designs/spec-nats-deployment.md.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \
+  --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
+  --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
@@ -1339,6 +1481,134 @@ $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --hist
 $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 
+# TASKS older than this render: the limits the create above could not apply.
+#
+# Provisioning is create-only convergence - the info-then-add guards never
+# edit an existing stream, which buildA2AProvisionJob says in terms - so an
+# install whose TASKS predates a limit keeps the stream it was created with
+# and gains nothing from a re-run. Both limits this render puts on TASKS are
+# in exactly that position on every install that already has the stream, and
+# the two gaps are not the same kind:
+#
+#   max_consumers short is a capacity shortfall with a load-time failure
+#   attached. A legitimate session's consumer create is refused, surfaced as
+#   a task failure, with nothing in it pointing at the stream. Worth
+#   refusing over here, where the number that caused it is in hand.
+#
+#   max_msgs_per_subject absent is a missing bound, not a broken one: the
+#   install behaves exactly as it did before this render carried the flag.
+#   Applying it would be a TIGHTENING, and a tightening evicts: a
+#   stream edit that lowers max_msgs_per_subject drops every message over
+#   the new limit on every subject the moment it lands. Truncating a running
+#   install's task history as an automatic side effect of an operator
+#   upgrade is not a decision this script takes on an operator's behalf. It
+#   reports, names the edit and what the edit costs, and moves on.
+#
+# This runs LAST, after every other stream and bucket, so the refusal below
+# leaves a fully provisioned bus short one limit rather than a bus missing
+# DIRECTORY, the topic streams and the KV buckets. The refusal is reached on
+# an operator upgrade alone, with no CR edit involved - an install already
+# running maxSessions above what its stream holds has been under-provisioned
+# the whole time, and this is the first thing that says so.
+#
+# Parsed with grep rather than jq: nats-box is the image, and grep is in
+# busybox for certain. An unparseable answer FAILS - a check that silently
+# skips when its extractor stops matching is not a check.
+tasks_json="$($NATS stream info TASKS --json | tr -d ' \t\r\n')"
+
+live_subject_cap="$(printf '%s' "${tasks_json}" \
+  | grep -o '"max_msgs_per_subject":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_subject_cap}" ]; then
+  echo "could not read max_msgs_per_subject off the TASKS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+#
+# Unbounded and merely different are not the same report. An unbounded stream
+# is the gap: nothing stops one task evicting another session's history, which
+# is the whole reason the render carries the flag. A stream carrying some other
+# finite cap is bounded already, and telling the operator who chose it that
+# their stream "predates the limit" is telling them something false about their
+# own install.
+if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
+  echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
+  echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
+  echo "  an operator applies it one task's events can still evict another session's history." >&2
+  echo "  Applying it evicts, on every subject already over the limit, oldest first - and a task's" >&2
+  echo "  oldest event is its 'submitted' one, so those tasks replay opening mid-history. Readers" >&2
+  echo "  report that rather than hiding it. With that understood:" >&2
+  echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
+elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" ]; then
+  echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
+  echo "  Bounded either way, so no task can evict another session's history - this is drift between" >&2
+  echo "  the stream and the render, not the unbounded gap. Provisioning does not edit an existing" >&2
+  echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
+  echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
+  echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
+fi
+
+required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
+live_consumers="$(printf '%s' "${tasks_json}" \
+  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_consumers}" ]; then
+  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
+  echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
+  echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
+  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
+  echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
+  echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
+  echo "  \"stream configuration update can not change MaxConsumers\"" >&2
+  echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
+  fits=$(( (live_consumers - ` + strconv.Itoa(a2aTasksReservedConsumers) + `) / ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` ))
+  if [ "${fits}" -ge 1 ]; then
+    echo "So either lower spec.harness.tuning.maxSessions to at most ${fits} - the most a" >&2
+    echo "  stream holding ${live_consumers} consumers has room for, with ` + strconv.Itoa(a2aTasksReservedConsumers) + ` of them reserved and" >&2
+    echo "  the rest going ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` to a session - or delete the TASKS stream and provision again." >&2
+  else
+    echo "Lowering spec.harness.tuning.maxSessions will not fit it either: the field's" >&2
+    echo "  minimum is 1, and one session still needs ` + strconv.Itoa(a2aSessionConsumersPerSession+a2aTasksReservedConsumers) + `, more than this stream holds." >&2
+    echo "  That leaves deleting the TASKS stream and provisioning again." >&2
+  fi
+  echo "This script creates every stream it does not find, and it does that before these" >&2
+  echo "  checks, so the next run recreates TASKS at ` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + `. Deleting the stream discards the" >&2
+  echo "  tasks it is holding - the 72h task history the design treats as the audit" >&2
+  echo "  substrate - which is why provisioning will not do it on an operator's behalf." >&2
+  if [ "${fits}" -ge 1 ]; then
+    echo "The two ways out do not finish the same way. Lowering spec.harness.tuning.maxSessions" >&2
+    echo "  finishes on its own: this Job's name carries a digest of the rendered spec, the" >&2
+    echo "  consumer count is part of that render, so the edit produces a new Job that runs by" >&2
+    echo "  itself. Nothing below applies to it - there is nothing else to delete or restart." >&2
+  fi
+  echo "Deleting TASKS does not finish on its own. It takes three steps, in this order:" >&2
+  echo "  1. delete the stream." >&2
+  echo "  2. get provisioning to run again - that is what recreates it, and nothing re-reads" >&2
+  echo "     the bus until this Job runs. Delete the Job to re-run it now, or leave it and the" >&2
+  echo "     24h TTL will." >&2
+  echo "  3. once TASKS is back, restart the clients holding a durable consumer on it:" >&2
+  echo "       kubectl rollout restart deployment/` + a2aGatewayName(agent) + ` -n ` + agent.Namespace + `" >&2
+  echo "     and, where a Hermes bridge sidecar runs, the agent workload ` + agent.Name + `-gateway" >&2
+  echo "     (a Deployment or a StatefulSet, depending on the spec) with it." >&2
+  echo "     Deleting a stream deletes every consumer on it, and neither client re-creates" >&2
+  echo "     one: the consume underneath them carries no error handler, so a deleted consumer" >&2
+  echo "     ends the subscription with nothing logged. Skip this and the gateway goes on" >&2
+  echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
+  echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
+  echo "     recover by themselves, which hides it rather than helping." >&2
+  echo "     Restarting before TASKS is back only fails the subscribe, so the order holds." >&2
+  # Exit 2, and the convention it establishes: 2 means "this will fail the
+  # same way next time", anything else is worth retrying. The Job's
+  # podFailurePolicy matches on 2 and fails the Job from the first pod
+  # (buildA2AProvisionJob), so a refusal nothing about a re-run can change
+  # does not spend the backoffLimit before it is heard. This refusal is in
+  # that class: both numbers are fixed until an operator lowers maxSessions
+  # or recreates the stream, and provisioning does neither. Note that
+  # set -euo pipefail exits with the failing command's own status, which is
+  # not 2, so an unexpected failure stays on the retry budget.
+  exit 2
+fi
+
 echo "a2a provisioning complete"
 `
 }
@@ -1347,16 +1617,22 @@ echo "a2a provisioning complete"
 // The name carries a digest of the rendered spec (a2aProvisionJobName) so a
 // changed render is a new Job — Jobs are immutable — and completed runs clean
 // themselves up via TTL. The TTL has a known cost, chosen not overlooked: once
-// it removes the completed Job, the next reconcile's create-if-absent re-runs
-// the (idempotent) script under the same name, so a standing next install
-// re-proves its provisioning roughly daily. That churn is one short-lived pod
-// a day; the alternative — a completed Job kept forever as the done-marker —
-// trades it for permanent clutter and a stale-looking object in every kubectl
-// listing.
+// it removes the Job, the next reconcile's create-if-absent re-runs the
+// (idempotent) script under the same name, so a standing next install
+// re-proves its provisioning roughly daily. Re-proving is not all it does.
+// The TTL removes a FAILED Job on the same clock, and the closing block's
+// max_consumers refusal is deterministic and now fails the Job from its
+// first pod (the podFailurePolicy below), so the daily re-create is the only
+// thing that ever re-checks that refusal — against a stream an operator has
+// since recreated, or a maxSessions that has come down to fit the stream that
+// is there. That churn is one short-lived pod a day; the alternative —
+// a Job kept forever as the done-marker — trades it for permanent clutter, a
+// stale-looking object in every kubectl listing, and a refusal that never
+// looks again.
 //
 // The digest covers everything this function renders into the spec: the
 // script, the image, the uid and security contexts, env, volumes, mounts,
-// backoffLimit and the TTL. What becomes of the generation the render has
+// backoffLimit, the restart and pod failure policies, and the TTL. What becomes of the generation the render has
 // moved past depends on how far that generation got, and one case is why the
 // rename on its own is not enough. A completed one leaves by TTL; one whose
 // pod ran and failed runs out its backoffLimit and then leaves by TTL; one
@@ -1389,10 +1665,47 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To(int32(20)),
 			TTLSecondsAfterFinished: ptr.To(int32(86400)),
+			// Exit 2 is the script saying "this will fail the same way next
+			// time" (its closing block), and this is what makes the Job
+			// believe it. The refusal it can reach there — a TASKS stream
+			// whose max_consumers is below this CR's budget — depends on two
+			// numbers neither the script nor a retry can move, so the
+			// backoffLimit below would spend twenty pods and roughly ninety
+			// minutes on it, during which the CR still reads Ready while the
+			// bus is known too short for the concurrency it advertises. This
+			// fails the Job on the first pod instead, so the phase says so
+			// immediately.
+			//
+			// The backoffLimit stays 20 and still means what it meant: any
+			// other status — NATS unreachable, a dial timeout, whatever
+			// `set -euo pipefail` hands back from an unexpected command
+			// failure — matches no rule here and is retried.
+			//
+			// The TTL is deliberately left on this path: once it removes the
+			// Failed Job, create-if-absent builds the identical Job again,
+			// which is how an install whose TASKS an operator has since
+			// deleted provisions itself without anyone touching the CR.
+			//
+			// restartPolicy has to be Never for the API server to accept a
+			// podFailurePolicy at all ("This field cannot be used in
+			// combination with restartPolicy=OnFailure"), which changes what
+			// a retry looks like: each one is a fresh pod rather than a
+			// container restart inside the same one, so a transient failure
+			// leaves its pod behind, logs and all, until the Job is cleaned
+			// up.
+			PodFailurePolicy: &batchv1.PodFailurePolicy{
+				Rules: []batchv1.PodFailurePolicyRule{{
+					Action: batchv1.PodFailurePolicyActionFailJob,
+					OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
+						Operator: batchv1.PodFailurePolicyOnExitCodesOpIn,
+						Values:   []int32{2},
+					},
+				}},
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "provision")},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					// Its own ServiceAccount, holding no RBAC at all: the
 					// token exists to authenticate to the bus, not to talk to
 					// the API server. Automount stays off and the bus token is
@@ -1515,6 +1828,23 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxSessions
 	}
 	return defaultA2AMaxSessions
+}
+
+// a2aTasksConsumerBudget is what this CR's configuration needs TASKS to hold.
+// It is the number the provision script checks a live stream against, which is
+// deliberately the budget and not the rendered max_consumers: an existing
+// stream sized at the floor holds a default install fine, and failing it for
+// being below a floor it was never going to be below is a false alarm.
+func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
+	return resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession + a2aTasksReservedConsumers
+}
+
+// a2aTasksMaxConsumers is what a fresh TASKS stream is created with.
+func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
+	if budget := a2aTasksConsumerBudget(agent); budget > a2aTasksMaxConsumersFloor {
+		return budget
+	}
+	return a2aTasksMaxConsumersFloor
 }
 
 func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
@@ -1785,6 +2115,14 @@ type a2aProvisionState struct {
 	// BusCredentialsReady is the callout confirming it is serving this
 	// value, so it has to travel out of the render to the status write.
 	AuthMapVersion string
+
+	// gatewayHeld reports that the gateway Deployment was withheld this
+	// pass because BusCredentialsReady is not yet true. It exists to make
+	// the reconcile poll: the callout Deployment is owned, so its readiness
+	// change does trigger a pass, but the condition this gate reads is
+	// written on the way OUT of the previous one, and nothing else is
+	// guaranteed to wake the reconcile that finally sees it.
+	gatewayHeld bool
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -1947,9 +2285,88 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				state.done = true
 			case batchv1.JobFailed:
 				state.failed = true
+				// This is the only place a provision refusal reaches
+				// `kubectl describe`, so the first half has to be true
+				// of every refusal rather than of the one that came
+				// first. "The bus has no streams" and "deleting the
+				// Job retries" were both true while the script could
+				// only fail on the way to creating something. They are
+				// not true of the closing block, which runs after
+				// every stream and bucket and refuses an install that
+				// is fully provisioned and one limit short: there the
+				// bus is complete, and a re-run reaches the same
+				// refusal.
+				//
+				// The remedy is the second half, and it is conditional
+				// because the reason distinguishes the two causes. The
+				// podFailurePolicy matches the script's exit 2 and
+				// nothing else — the closing block's refusal, the one
+				// a re-run cannot clear — and the Job controller
+				// stamps a Job it fails that way with reason
+				// PodFailurePolicy; a transient failure that spends
+				// the backoffLimit instead arrives as
+				// BackoffLimitExceeded. Naming the consumer remedy on
+				// that one would tell an operator whose NATS is simply
+				// down to lower their concurrency or delete a stream,
+				// so it goes out only on the refusal it fixes; the pod
+				// log still says what happened either way.
+				//
+				// Neither way out it names is a stream edit, because
+				// max_consumers is the one limit nats-server will not
+				// change on a stream that exists — an update carrying
+				// a different MaxConsumers comes back "stream
+				// configuration update can not change MaxConsumers",
+				// and the bus this operator renders is pinned to
+				// nats:2.10, where that holds. What is left is
+				// lowering maxSessions until the budget fits the
+				// stream, or deleting TASKS and letting the script
+				// recreate it — the create-only guards create every
+				// stream they do not find, ahead of these checks — at
+				// the cost of the task history the stream is holding.
+				//
+				// The two do not finish the same way, and the message
+				// says so rather than making one claim about both.
+				// Lowering maxSessions edits the CR, which re-renders
+				// the provision script, which moves the digest the Job
+				// name carries (a2aProvisionJobName) — a new Job, and
+				// it runs by itself. Deleting TASKS changes nothing
+				// the operator reads, so that half needs the Job
+				// re-run, and then a restart of the two long-lived
+				// clients that held a durable consumer on the stream:
+				// deleting a stream deletes its consumers, and neither
+				// the gateway's relay nor the Hermes bridge sidecar
+				// re-creates one. Both subscribe through
+				// lib.Client.SubscribeDurable, whose Consume call
+				// passes no jetstream.ConsumeErrHandler, so nats.go
+				// treats the deleted consumer as terminal, stops the
+				// subscription and returns nothing to log — the same
+				// failure the worker adapter grew a supervisor for.
+				// An operator who recreates the stream and stops there
+				// has a gateway still accepting delegations and
+				// spawning session pods while relaying no events, a
+				// bridge dispatching nothing, and a CR reading Ready.
+				// The order is in the message because restarting
+				// before the stream is back just fails the subscribe.
+				//
+				// Of the three numbers that remedy wants, only two are
+				// in this process. The need is the budget, which is
+				// what the script's gate compares a live stream
+				// against; the recreate width is what a fresh render
+				// creates, which floors at the cap TASKS shipped with,
+				// so a default install needs 46 and recreates at 64.
+				// The third — what the live stream actually holds — is
+				// on the bus, and it is the one the maxSessions that
+				// fits is derived from, so that half of the remedy
+				// points at the pod log, which read it.
 				state.message = fmt.Sprintf(
-					"A2A provision Job %s failed (%s: %s); the bus has no streams until it succeeds. Inspect its pod logs; deleting the Job retries.",
+					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away.",
 					existing.Name, cond.Reason, cond.Message)
+				if cond.Reason == batchv1.JobReasonPodFailurePolicy {
+					state.message += fmt.Sprintf(
+						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore the maxSessions that fits. The two do not finish the same way. Lowering maxSessions finishes by itself: the CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted. Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
+						resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent),
+						a2aGatewayName(agent), agent.Namespace, agent.Name)
+				}
 			}
 		}
 	}
@@ -1986,15 +2403,82 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		}
 	}
 
+	// The gateway is what dispatches: it spawns the session pods, and a
+	// session pod's bus credential is minted by the auth callout. So this is
+	// where the deployment spec's ordering - "the operator sets
+	// BusCredentialsReady only after the callout reports serving, and nothing
+	// dispatches before that condition is true" - either holds or is a
+	// sentence. Until this gate, it was a sentence: the operator wrote the
+	// condition and nothing in the repository read it. This reads it.
+	//
+	// Creation only, and the distinction is the whole design. A callout that
+	// goes unready under a running install must not take the gateway with it:
+	// that would turn an ordering guarantee into a liveness coupling, and
+	// every in-flight session hangs off the gateway Deployment's UID. So an
+	// existing gateway is reconciled normally no matter what the condition
+	// says, and only the FIRST creation waits.
+	//
+	// It reads the published condition rather than recomputing readiness from
+	// the callout Deployment, so the gate and the signal an operator watches
+	// cannot disagree about what "ready" meant. The cost is that
+	// syncBusCredentialsReady is deferred to the way out of Reconcile, so the
+	// value read here is one pass old, and the two directions differ.
+	// Stale-false costs only a delay: the gateway is held one more pass and
+	// gatewayHeld requeues. Stale-true is a wrong answer, and worth naming as
+	// one - a first creation goes through on a callout that was serving as
+	// recently as the previous pass and is not serving now. What bounds it is
+	// that one pass, the same window the condition's own doc comment already
+	// accepts ("a stale condition for a moment is cheaper than a refused
+	// connection").
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
+	}
+	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep); err != nil {
+		return state, err
+	} else if hold {
+		state.gatewayHeld = true
+		logf.FromContext(ctx).Info("holding the A2A gateway until the auth callout serves",
+			"deployment", dep.Name, "condition", busCredentialsReadyCondition)
+		return state, nil
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
 	return state, nil
+}
+
+// a2aGatewayWaitsForCallout reports whether the gateway Deployment must be
+// withheld this pass. See the call site for why the gate is creation-only and
+// why it reads the condition rather than the Deployment.
+func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) (bool, error) {
+	if meta.IsStatusConditionTrue(agent.Status.Conditions, busCredentialsReadyCondition) {
+		return false, nil
+	}
+	// Already there: reconcile it. A gateway that exists was let through by
+	// an earlier pass, and withholding its updates now would freeze its image
+	// and env at whatever a callout outage happened to interrupt.
+	//
+	// Live through a2aReader, not the Deployment informer, even though
+	// Deployment is an Owns() kind whose cache is already running and this
+	// same Deployment takes r.Client in a2aNamespacedTeardown for exactly
+	// that reason. The teardown is reading to delete; this is reading to
+	// decide whether the gate holds, and the two directions of cache
+	// staleness are not symmetric. A stale NotFound costs one more held pass
+	// and a requeue. A stale hit — an informer that has not yet seen it gone —
+	// answers "already there" and lets the Deployment be re-created while
+	// BusCredentialsReady is false, which is the single thing this gate
+	// exists to prevent. The cost is one API call, and only while the
+	// condition is false: the check above returns first in the steady state.
+	err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+	if err == nil {
+		return false, nil
+	}
+	if !errors.IsNotFound(err) {
+		return false, err
+	}
+	return true, nil
 }
 
 // applyA2AGatewayDeployment applies the gateway Deployment and, when the API

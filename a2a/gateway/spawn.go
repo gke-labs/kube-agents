@@ -119,7 +119,9 @@ var sessionNameAnimals = []string{"otter", "badger", "heron", "lynx", "marten", 
 // a connection already open - see busTokenExpirationSeconds).
 type spawner interface {
 	// Spawn creates the session pod for a task and returns the pod name.
-	Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string) (string, error)
+	// originSeq is the TASKS sequence of the submission the pod is being
+	// spawned to execute; 0 means the caller could not determine one.
+	Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string, originSeq uint64) (string, error)
 	// Delete removes a pod (reap).
 	Delete(ctx context.Context, podName string) error
 	// TerminalOrphans lists pods in a terminal phase, with the task identity
@@ -146,6 +148,17 @@ type orphanPod struct {
 func mintSessionName(profile string) string {
 	return fmt.Sprintf("%s-%s-%s", profile,
 		sessionNameAnimals[int(time.Now().UnixNano())%len(sessionNameAnimals)], randHex(sessionNameHexWidth))
+}
+
+// originSeqValue renders the submission's stream sequence for the pod env.
+// Zero is not a legal JetStream sequence, so it means the publish told us
+// nothing; the sentinel says so out loud rather than leaving the variable off
+// and making the worker guess whether its spawner was simply older.
+func originSeqValue(seq uint64) string {
+	if seq == 0 {
+		return lib.OriginSeqUnknown
+	}
+	return strconv.FormatUint(seq, 10)
 }
 
 func activeCorrelation(rec *SessionRecord) string {
@@ -229,9 +242,11 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 // session and gets a projected token bound to itself; the callout reads the
 // pod name the API server attests and mints grants for that session's
 // subjects and no others. Two sessions running side by side hold different
-// credentials, and neither holds the static `worker` user that could speak
-// for the whole task plane.
-func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string) (string, error) {
+// credentials, and neither holds a credential that speaks for the whole task
+// plane -- the static `worker` user that did is retired, and what replaced it
+// on the agent side is two narrower principals, neither of them reachable
+// from a session pod.
+func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string, originSeq uint64) (string, error) {
 	name := rec.BusSession
 	// The gateway Deployment owns its sessions: when it goes — cleanupA2A on
 	// a mode flip, or any other deletion — Kubernetes GC reaps the pods it
@@ -313,6 +328,17 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// from the same config the pod deadline above is sized
 					// from — one number, two enforcement layers, no drift.
 					{Name: "A2A_TASK_DEADLINE_SECONDS", Value: strconv.Itoa(int(s.cfg.TaskDeadline / time.Second))},
+					// Which message on this task's `…in` subject is the
+					// submission. Always set, including when we do not know:
+					// the worker has to tell "spawned by something that never
+					// says" from "spawned by something that says it could not
+					// tell". Both of those fall back to scanning the subject,
+					// so the distinction does not change what the worker does
+					// - it changes what it can say about it. The sentinel is
+					// a spawner admitting a gap; absence is a spawner too old
+					// to have one, and only the second is unremarkable
+					// (lib.EnvOriginSeq).
+					{Name: lib.EnvOriginSeq, Value: originSeqValue(originSeq)},
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -482,12 +508,12 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 
 // ensureSessionPod spawns (or rehydrates) the session's incarnation for a
 // new task. Only called on session-addressed routes.
-func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, taskID string) {
+func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, taskID string, originSeq uint64) {
 	if rec.PodName != "" {
 		return
 	}
 	primer := g.buildRehydrationPrimer(ctx, rec)
-	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer)
+	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer, originSeq)
 	if err != nil {
 		g.log.Error("session pod spawn failed", "session", rec.Key, "err", err)
 		// The task is already on the stream and no pod will ever run it.

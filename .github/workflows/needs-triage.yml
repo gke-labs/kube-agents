@@ -1,0 +1,180 @@
+name: Needs Triage Label
+
+# Keep the `needs-triage` issue label equal to "this open issue has no
+# `priority:` label". The label is how the triage queue is found; a `priority:*`
+# label is how an issue leaves it. Both were hand-applied until now, so every
+# new issue needed a person to remember the label and every `priority:` swap
+# needed a person to remove it.
+#
+# One rule, applied to one issue on an event and to every open issue on a
+# sweep: an open issue that is not a pull request carries `needs-triage`
+# exactly when it carries no `priority:*` label. The events that can break the
+# rule are the ones that run the job -- an issue opened or reopened, a
+# `priority:*` label added or removed, and `needs-triage` itself added or
+# removed by hand. The job re-reads the issue's labels from the API rather
+# than trusting the event payload, so a `labeled` and an `unlabeled` event a
+# second apart converge on the same answer. A closed issue awaits nothing, so
+# an event on one is a no-op; `reopened` brings it back under the rule.
+#
+# The daily sweep is the guarantee, as in hold-unresolved-threads.yml: an
+# issue created with `GITHUB_TOKEN` fires no `issues` event, so the ones
+# flaky-check-notify.yml and main-broken-notify.yml open would never be queued
+# by the event path. A dispatch is the same sweep on demand, with a dry run.
+#
+# `issues` events never fire for pull requests, and the job guards against
+# `github.event.issue.pull_request` anyway; the sweep filters them out of the
+# list endpoint, which returns both.
+on:
+  issues:
+    types: [opened, reopened, labeled, unlabeled]
+  schedule:
+    - cron: "17 6 * * *" # daily; the event path handles the rest within seconds
+  #checkov:skip=CKV_GHA_7:One boolean, dry-run, which decides whether the reconcile writes; nothing is built and no input reaches a shell
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log what would change and change nothing
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  sync:
+    name: Mirror the priority family onto needs-triage
+    # The repository guard, as the notifiers carry it: this job acts with
+    # `GITHUB_TOKEN` alone, so the rule in AGENTS.md ("Pull Request Hygiene")
+    # does not demand it, but a fork syncing this file would otherwise run the
+    # sweep against its own issues every morning. The label filter keeps every
+    # other `labeled`/`unlabeled` event -- kind, area, lgtm -- off a runner;
+    # `opened` and `reopened` always run, and a sweep always runs.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      !github.event.issue.pull_request &&
+      (github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'schedule' ||
+        github.event.action == 'opened' ||
+        github.event.action == 'reopened' ||
+        github.event.label.name == 'needs-triage' ||
+        startsWith(github.event.label.name, 'priority:'))
+    # One run at a time per issue, and one sweep at a time, none cancelled, so
+    # the second of two runs reads the labels the first one left. Two sweeps
+    # share the `sweep` group because each reads every page before its first
+    # write; run together they would write from the same stale read. A sweep
+    # still overlaps event runs, which is why the writes below tolerate a
+    # label that vanished after the read. GitHub keeps one pending run per
+    # group and replaces it with a newer arrival, which is safe here because
+    # every run re-reads and applies the same rule -- but only while nothing
+    # that will do no work enters the group. At workflow level a `kind/*`
+    # label event would enter, displace a pending `priority:` run, and then
+    # skip; at job level the expectation is that a job the `if:` above skips
+    # is never queued, though GitHub does not document it. If that is wrong
+    # the cost is one missed reconcile, and the daily sweep repairs it.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.issue.number || 'sweep' }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write # add and remove the label
+    steps:
+      # No checkout: the script is inline and reads only the API, so the job
+      # holds no working tree and needs no `contents` permission.
+      - name: Reconcile needs-triage against the priority labels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Through the environment, not interpolated into the script: event
+          # fields are untrusted input. Empty on a sweep.
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -u
+          LABEL=needs-triage
+          PREFIX=priority:
+          PAGE_SIZE=100 # the list endpoint's maximum; --paginate follows the rest
+
+          # Run gh, turning an HTTP status matching $1 into exit 2 with the
+          # message swallowed; any other failure keeps gh's message and its
+          # exit 1. The window between a read and the write it decides is
+          # real: a sweep reads every page before its first write, an event
+          # run or a person can strip the label in between, and an issue can
+          # be deleted before its `opened` run starts. gh prints the status as
+          # `gh: <message> (HTTP <status>)`.
+          tolerate() {
+            local codes="$1" out
+            shift
+            if out=$("$@" 2>&1); then
+              printf '%s' "${out}"
+              return 0
+            fi
+            if grep -Eq "\(HTTP (${codes})\)" <<< "${out}"; then
+              return 2
+            fi
+            printf '%s\n' "${out}" >&2
+            return 1
+          }
+
+          # One row per open, non-PR issue: number, has a priority: label,
+          # has needs-triage. The same program filters a single issue on an
+          # event and every issue on a sweep, so the two paths cannot
+          # disagree about what the label means.
+          ROW="select(.pull_request == null and .state == \"open\")
+               | [.number, any(.labels[].name; startswith(\"${PREFIX}\")), any(.labels[].name; . == \"${LABEL}\")]
+               | @tsv"
+
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch|schedule)
+              ROWS=$(gh api --paginate "repos/${REPO}/issues?state=open&per_page=${PAGE_SIZE}" --jq ".[] | ${ROW}") ;;
+            issues)
+              status=0
+              ROWS=$(tolerate "404|410" gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq "${ROW}") || status=$?
+              if [ "${status}" -eq 2 ]; then
+                echo "issue #${ISSUE_NUMBER} no longer exists; nothing to do"
+              elif [ "${status}" -ne 0 ]; then
+                exit "${status}"
+              fi ;;
+            *)
+              echo "unexpected event ${GITHUB_EVENT_NAME}" >&2; exit 1 ;;
+          esac
+
+          changes=0
+          gone=0
+          while IFS=$'\t' read -r number has_priority has_triage; do
+            [ -n "${number}" ] || continue
+            if [ "${has_priority}" = false ] && [ "${has_triage}" = false ]; then
+              verb=add
+            elif [ "${has_priority}" = true ] && [ "${has_triage}" = true ]; then
+              verb=remove
+            else
+              continue
+            fi
+            if [ "${DRY_RUN}" = true ]; then
+              changes=$((changes + 1))
+              echo "would ${verb} ${LABEL} on #${number}"
+              continue
+            fi
+            # Either write can find its target gone since the read: the label
+            # removed by another run or a person (DELETE answers 404), or the
+            # issue itself deleted (POST answers 404, 410 if it was transferred
+            # or locked away). Both mean the rule already holds there.
+            status=0
+            case "${verb}" in
+              add)
+                tolerate "404|410" gh api --silent -X POST "repos/${REPO}/issues/${number}/labels" -f "labels[]=${LABEL}" || status=$?
+                reason="issue gone; nothing to label" ;;
+              remove)
+                tolerate "404" gh api --silent -X DELETE "repos/${REPO}/issues/${number}/labels/${LABEL}" || status=$?
+                reason="already gone; another run got there first" ;;
+            esac
+            if [ "${status}" -eq 2 ]; then
+              gone=$((gone + 1))
+              echo "${verb}: ${LABEL} on #${number} -- ${reason}"
+              continue
+            elif [ "${status}" -ne 0 ]; then
+              exit "${status}"
+            fi
+            changes=$((changes + 1))
+            echo "${verb}: ${LABEL} on #${number}"
+          done <<< "${ROWS}"
+          echo "${changes} change(s), ${gone} skipped: already gone"

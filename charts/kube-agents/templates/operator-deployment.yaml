@@ -25,6 +25,9 @@ spec:
       annotations:
         kubectl.kubernetes.io/default-container: manager
     spec:
+      {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.operator.topologySpread | default dict).enabled "replicas" .Values.operator.replicaCount "selectorLabels" (include "kube-agents.operatorSelectorLabels" .))) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       serviceAccountName: {{ .Release.Name }}-operator-sa
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}

@@ -22,6 +22,15 @@ port had a choice it copies the action, including minimatch's rule that `*` and
 not implement raises rather than guessing -- see `validate_config` and
 `glob_to_regex`.
 
+Two things the action never did. A verdict counts as "already reviewed" only
+from an `OWNERS` approver for the changed files (`applicable_approvers`), since
+only that approval can produce the `approved` label; an approval from anyone
+else used to suppress the auto-assign for good. And `/request-review`
+(`--react-to`) is a person saying "ask someone anyway", so it skips the verdict
+check, and when it still declines -- draft, closed, someone already requested --
+it says so with a 😕 reaction on the comment and a warning annotation on the run,
+where before it exited green having done nothing.
+
 Run: python3 scripts/request_reviewers.py --pr 728 --dry-run
 Test: cd scripts && python3 -m unittest test_request_reviewers
 """
@@ -29,6 +38,7 @@ Test: cd scripts && python3 -m unittest test_request_reviewers
 import argparse
 import json
 import os
+import pathlib
 import random
 import re
 import sys
@@ -52,6 +62,30 @@ DEFAULT_IGNORED_KEYWORDS = ["DO NOT REVIEW"]
 # Review states that mean a person has actually reviewed. `COMMENTED` is not one
 # of them: GitHub files a `COMMENTED` review for a reply to a review thread.
 HUMAN_VERDICT_STATES = {"APPROVED", "CHANGES_REQUESTED"}
+APPROVED_STATE = "APPROVED"
+
+# Prow's OWNERS files, read from the checkout the workflow runs in -- the
+# default branch, which is also where Prow reads them. `approvers:` covers the
+# directory's subtree; a `filters:` entry covers the paths its regex matches,
+# relative to the OWNERS file's directory; `no_parent_owners` stops the walk
+# once a file has matched something at that level. `OWNERS_ALIASES` expands
+# names in either list. Root OWNERS approvers and `hack/OWNERS`'s eval-crew
+# filter are the two shapes this repository has today.
+OWNERS_FILENAME = "OWNERS"
+OWNERS_ALIASES_FILENAME = "OWNERS_ALIASES"
+DEFAULT_OWNERS_ROOT = "."
+
+# Reactions on the `/request-review` comment: 👀 when a reviewer was requested
+# for it, 😕 when the request was declined. Without the second, a declined
+# override looked identical to the workflow never firing.
+REACTION_ACKNOWLEDGED = "eyes"
+REACTION_DECLINED = "confused"
+
+# A declined override is written where the person who typed it will see it:
+# a warning annotation on the workflow run (the `::warning::` command goes to
+# stdout) and the job's step summary, when Actions provides one.
+WORKFLOW_WARNING_PREFIX = "::warning::"
+STEP_SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
 
 # Config keys the action supports and this port does not. Silently ignoring one
 # would hand the reviewer selection a rule nobody applied, so they are refused.
@@ -98,6 +132,110 @@ def validate_config(config):
 
     for pattern in (config.get("files") or {}):
         glob_to_regex(pattern)
+
+
+# --------------------------------------------------------------------------- #
+# OWNERS -- who can produce the `approved` label for the changed files
+# --------------------------------------------------------------------------- #
+
+
+def _read_yaml(path):
+    """The mapping in `path`, or an empty one when the file is absent or empty."""
+    if not path.is_file():
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} does not parse to a mapping")
+    return loaded
+
+
+def load_owners_aliases(root):
+    """`OWNERS_ALIASES` as {alias: [logins]}, lower-cased like GitHub logins."""
+    aliases = _read_yaml(pathlib.Path(root) / OWNERS_ALIASES_FILENAME).get("aliases") or {}
+    return {
+        str(name).lower(): [str(login).lower() for login in (members or [])]
+        for name, members in aliases.items()
+    }
+
+
+def _expand_aliases(names, aliases):
+    expanded = set()
+    for name in names or []:
+        name = str(name).lower()
+        expanded.update(aliases.get(name, [name]))
+    return expanded
+
+
+def _owners_entries(owners_file, aliases):
+    """The approver rules one OWNERS file declares.
+
+    Returns `(entries, no_parent_owners)`, each entry a `(regex, approvers)`
+    pair where a `None` regex applies to every path under the directory. As in
+    Prow, a file with `filters:` is read as a filtered file and a top-level
+    `approvers:` beside them is ignored. `reviewers`, `labels` and the rest of
+    Prow's schema are ignored too: only an approver's verdict can move the pull
+    request, so only approvers matter here.
+    """
+    owners = _read_yaml(owners_file)
+    entries = []
+
+    filters = owners.get("filters") or {}
+    if filters:
+        for pattern, rules in filters.items():
+            approvers = _expand_aliases((rules or {}).get("approvers"), aliases)
+            if approvers:
+                entries.append((re.compile(str(pattern)), approvers))
+    else:
+        approvers = _expand_aliases(owners.get("approvers"), aliases)
+        if approvers:
+            entries.append((None, approvers))
+
+    no_parent_owners = bool((owners.get("options") or {}).get("no_parent_owners"))
+    return entries, no_parent_owners
+
+
+def applicable_approvers(changed_files, root=DEFAULT_OWNERS_ROOT):
+    """Every login whose approval clears some part of this change, lower-cased.
+
+    Prow's `approvers` walk (`entriesForFile` in its `repoowners` package), per
+    changed file: from the file's directory up to the repository root,
+    collecting the approvers of each OWNERS file whose rules cover the path,
+    and stopping at a level that sets `no_parent_owners` once the file has
+    collected any approver at that level or below -- so
+    `hack/eval/presubmit-cases.txt` gets eval-crew alone while
+    `hack/eval/nightly-cases.txt`, which matches nothing under `hack/`, falls
+    through to the root. The union across files is the set whose verdict can
+    produce the `approved` label on this pull request; nobody else's approval
+    can, however real their review was.
+    """
+    root = pathlib.Path(root)
+    aliases = load_owners_aliases(root)
+    cache = {}
+    approvers = set()
+
+    for changed in changed_files:
+        path = pathlib.PurePosixPath(changed)
+        directory = path.parent
+        collected = set()
+        while True:
+            if directory not in cache:
+                cache[directory] = _owners_entries(root / directory / OWNERS_FILENAME, aliases)
+            entries, no_parent_owners = cache[directory]
+
+            relative = str(path.relative_to(directory))
+            for regex, names in entries:
+                if regex is None or regex.search(relative):
+                    collected.update(names)
+
+            if (collected and no_parent_owners) or directory == pathlib.PurePosixPath("."):
+                break
+            directory = directory.parent
+        approvers.update(collected)
+
+    return approvers
 
 
 # --------------------------------------------------------------------------- #
@@ -236,12 +374,15 @@ def split_teams(reviewers):
 # --------------------------------------------------------------------------- #
 
 
-def skip_reason(pull_request, reviews, config):
-    """Why this pull request should not have a reviewer requested, or None.
+def skip_reason(pull_request, config):
+    """Why this pull request can take no reviewer request at all, or None.
 
     Every branch here is a *skip*, not a failure: the workflow fires on each
     completed `AI Review` check, so re-running on a pull request that has
-    already been handed to a human is the normal case, not an error.
+    already been handed to a human is the normal case, not an error. These
+    hold for `/request-review` too -- re-asking when someone is already
+    requested is wrong however the run was started -- which is why the
+    verdict check is a separate function that path leaves out.
     """
     options = config.get("options") or {}
 
@@ -261,21 +402,49 @@ def skip_reason(pull_request, reviews, config):
     if requested:
         return f"review is already requested from {', '.join(requested)}"
 
-    # Only a verdict from another person counts. Replying to a review thread
-    # files a `COMMENTED` review under the replier's name, and AGENTS.md tells
-    # authors to answer every finding before running `/review` -- so counting
-    # those would mean the pull requests that follow the process are exactly the
-    # ones that never get a reviewer.
-    author = (pull_request.get("user") or {}).get("login")
-    humans = _dedupe(
-        [
-            review["user"]["login"]
-            for review in reviews
-            if (review.get("user") or {}).get("type") != "Bot"
-            and review.get("state") in HUMAN_VERDICT_STATES
-        ],
-        exclude=author,
-    )
+    return None
+
+
+def already_reviewed_reason(pull_request, reviews, approvers):
+    """Why a verdict already on the pull request makes a request redundant, or None.
+
+    Only a verdict from another person counts. Replying to a review thread
+    files a `COMMENTED` review under the replier's name, and AGENTS.md tells
+    authors to answer every finding before running `/review` -- so counting
+    those would mean the pull requests that follow the process are exactly the
+    ones that never get a reviewer.
+
+    Each person's *latest* verdict is the one that counts, as GitHub itself
+    reads them: the reviews list keeps every review ever filed, so someone who
+    requested changes and later approved has both on record, and only the
+    approval still means anything. A dismissed review comes back `DISMISSED`
+    and so drops out on its own.
+
+    An `APPROVED` counts only from one of `approvers`, the OWNERS approvers for
+    the changed files: theirs is the approval that produces the `approved`
+    label, and anyone else's leaves the pull request unable to merge with
+    nobody asked -- three open pull requests sat that way behind one
+    colleague's approvals. A `CHANGES_REQUESTED` counts from anyone: whoever
+    filed it, the author owes them a reply, and requesting a fresh reviewer
+    over an open objection is noise rather than progress. Bot reviews never
+    count either way.
+    """
+    author = ((pull_request.get("user") or {}).get("login") or "").lower()
+    approvers = {login.lower() for login in approvers}
+
+    latest = {}
+    for review in sorted(reviews, key=lambda review: review.get("submitted_at") or ""):
+        user = review.get("user") or {}
+        login = (user.get("login") or "").lower()
+        if user.get("type") == "Bot" or login == author or review.get("state") not in HUMAN_VERDICT_STATES:
+            continue
+        latest[login] = review
+
+    humans = [
+        review["user"]["login"]
+        for login, review in latest.items()
+        if review["state"] != APPROVED_STATE or login in approvers
+    ]
     if humans:
         return f"{', '.join(humans)} already reviewed it"
 
@@ -425,10 +594,54 @@ def parse_args(argv):
         action="store_true",
         help="only request a reviewer if the AI Review check passed",
     )
-    parser.add_argument("--react-to", type=int, help="issue comment id to acknowledge with 👀")
+    parser.add_argument(
+        "--owners-root",
+        default=DEFAULT_OWNERS_ROOT,
+        help="checkout whose OWNERS files decide who counts as a reviewer (default: the working directory)",
+    )
+    parser.add_argument(
+        "--react-to",
+        type=int,
+        help=(
+            "issue comment id of the /request-review that asked for this: a person overriding, "
+            "so a verdict already on the pull request does not stop the request; "
+            f"reacts {REACTION_ACKNOWLEDGED} when one is made and {REACTION_DECLINED} when it is declined"
+        ),
+    )
     parser.add_argument("--seed", type=int, help="seed the reviewer sampling, for reproducible runs")
-    parser.add_argument("--dry-run", action="store_true", help="print what would be requested")
+    parser.add_argument("--dry-run", action="store_true", help="print what would be requested or reacted")
     return parser.parse_args(argv)
+
+
+def react(api, args, content):
+    """Put `content` on the `/request-review` comment, if this run has one."""
+    if not args.react_to:
+        return
+    if args.dry_run:
+        log(f"--dry-run: would react {content} to comment {args.react_to}")
+        return
+    api.post(f"/repos/{args.repo}/issues/comments/{args.react_to}/reactions", {"content": content})
+
+
+def decline(api, args, reason):
+    """Record that no reviewer was requested, and why.
+
+    On the check-run trigger that is a log line and nothing more: it is the
+    common case, dozens of times a day. On `/request-review` it is a person
+    being told no, so it also goes on the run as a warning annotation and in
+    the step summary, and the comment gets a 😕 -- an override that exits
+    green with no trace is indistinguishable from one that never ran.
+    """
+    message = f"Not requesting a reviewer: {reason}"
+    log(message)
+    if not args.react_to:
+        return
+    print(f"{WORKFLOW_WARNING_PREFIX}{message}", flush=True)
+    summary_path = os.environ.get(STEP_SUMMARY_ENV)
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{message}\n")
+    react(api, args, REACTION_DECLINED)
 
 
 def main(argv=None):
@@ -459,11 +672,25 @@ def main(argv=None):
     author = pull_request["user"]["login"]
     log(f"#{number} by {author}: {pull_request['title']}")
 
-    reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
-    reason = skip_reason(pull_request, reviews, config)
+    reason = skip_reason(pull_request, config)
     if reason:
-        log(f"Not requesting a reviewer: {reason}")
+        decline(api, args, reason)
         return 0
+
+    changed_files = [
+        entry["filename"] for entry in api.get_all(f"/repos/{args.repo}/pulls/{number}/files")
+    ]
+
+    # `/request-review` is a person who has read the pull request saying "ask
+    # someone anyway", so a verdict already on it does not decide for them.
+    if not args.react_to:
+        approvers = applicable_approvers(changed_files, args.owners_root)
+        log(f"OWNERS approvers for the changed files: {', '.join(sorted(approvers)) or 'none'}")
+        reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
+        reason = already_reviewed_reason(pull_request, reviews, approvers)
+        if reason:
+            decline(api, args, reason)
+            return 0
 
     if args.require_ai_review_pass:
         reason = ai_review_block_reason(
@@ -471,17 +698,14 @@ def main(argv=None):
             pull_request["user"].get("type") == "Bot",
         )
         if reason:
-            log(f"Not requesting a reviewer: {reason}")
+            decline(api, args, reason)
             return 0
 
-    changed_files = [
-        entry["filename"] for entry in api.get_all(f"/repos/{args.repo}/pulls/{number}/files")
-    ]
     rng = random.Random(args.seed) if args.seed is not None else random
     reviewers = select_reviewers(config, changed_files, author, rng=rng)
 
     if not reviewers:
-        log("No reviewer matched; nothing to request")
+        decline(api, args, "no reviewer matched")
         return 0
 
     users, teams = split_teams(reviewers)
@@ -489,15 +713,14 @@ def main(argv=None):
 
     if args.dry_run:
         log(f"--dry-run: would POST reviewers={users} team_reviewers={teams} to #{number}")
+        react(api, args, REACTION_ACKNOWLEDGED)
         return 0
 
     api.post(
         f"/repos/{args.repo}/pulls/{number}/requested_reviewers",
         {"reviewers": users, "team_reviewers": teams},
     )
-
-    if args.react_to:
-        api.post(f"/repos/{args.repo}/issues/comments/{args.react_to}/reactions", {"content": "eyes"})
+    react(api, args, REACTION_ACKNOWLEDGED)
 
     return 0
 

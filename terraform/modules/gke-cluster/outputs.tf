@@ -40,3 +40,8 @@ output "workload_identity_pool" {
     data.google_container_cluster.existing[*].workload_identity_config[0].workload_pool,
   )), "")
 }
+
+output "network_policy_enforced" {
+  description = "Whether the cluster enforces NetworkPolicy (Dataplane V2 or the legacy Calico addon). Always true for a cluster this module creates; false only for an adopted cluster admitted by accept_no_network_policy, where every NetworkPolicy kube-agents installs is inert."
+  value       = local.network_policy_enforced
+}

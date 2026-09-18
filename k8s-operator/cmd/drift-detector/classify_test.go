@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -189,8 +190,8 @@ func TestClassifyCapturedFixtures(t *testing.T) {
 			}
 
 			var forwarded []AuditRecord
-			filter := newDriftFilter(classifier, func(r AuditRecord) { forwarded = append(forwarded, r) }, false)
-			filter.Handle(record)
+			filter := newDriftFilter(classifier, func(_ context.Context, r AuditRecord) { forwarded = append(forwarded, r) }, false)
+			filter.Handle(context.Background(), record)
 			if gotActioned := len(forwarded) == 1; gotActioned != tc.wantActioned {
 				t.Errorf("forwarded = %v, want %v -- %s", gotActioned, tc.wantActioned, tc.why)
 			}
@@ -333,9 +334,9 @@ func TestDriftFilterCounts(t *testing.T) {
 	}
 
 	var forwarded []AuditRecord
-	filter := newDriftFilter(NewClassifier("", ""), func(r AuditRecord) { forwarded = append(forwarded, r) }, false)
+	filter := newDriftFilter(NewClassifier("", ""), func(_ context.Context, r AuditRecord) { forwarded = append(forwarded, r) }, false)
 	for _, r := range records {
-		filter.Handle(r)
+		filter.Handle(context.Background(), r)
 	}
 
 	counts := filter.Counts()
@@ -361,10 +362,10 @@ func TestDriftFilterCounts(t *testing.T) {
 // counted as human traffic and not forwarded. A cluster where every human
 // change is being denied must not look like a cluster with no human changes.
 func TestDriftFilterCountsFailedHumanInItsTier(t *testing.T) {
-	filter := newDriftFilter(NewClassifier("", ""), func(AuditRecord) {
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) {
 		t.Error("a failed call must not be forwarded")
 	}, false)
-	filter.Handle(AuditRecord{Principal: "ada@example.com", StatusCode: 7, StatusMessage: "PERMISSION_DENIED"})
+	filter.Handle(context.Background(), AuditRecord{Principal: "ada@example.com", StatusCode: 7, StatusMessage: "PERMISSION_DENIED"})
 
 	counts := filter.Counts()
 	if counts.ByTier[TierHuman] != 1 {
@@ -381,11 +382,11 @@ func TestDriftFilterCountsFailedHumanInItsTier(t *testing.T) {
 // TestUnattributedPrincipalsSorted checks the operator-facing half: the names
 // come back most-frequent-first, because that is the order you write rules in.
 func TestUnattributedPrincipalsSorted(t *testing.T) {
-	filter := newDriftFilter(NewClassifier("", ""), func(AuditRecord) {}, false)
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) {}, false)
 	for i := 0; i < 3; i++ {
-		filter.Handle(AuditRecord{Principal: "kubelet-nodepool-bootstrap"})
+		filter.Handle(context.Background(), AuditRecord{Principal: "kubelet-nodepool-bootstrap"})
 	}
-	filter.Handle(AuditRecord{Principal: "other-identity"})
+	filter.Handle(context.Background(), AuditRecord{Principal: "other-identity"})
 
 	// Quoted: Sorted renders the principal with %q, matching every other site
 	// that prints one, so that a name carrying a newline cannot forge a line.
@@ -405,9 +406,9 @@ func TestUnattributedPrincipalsSorted(t *testing.T) {
 // common entry in this list on a live cluster. Without the substitution the
 // shutdown line reads "=120", which names nothing an operator can act on.
 func TestUnattributedPrincipalsLabelsTheEmptyPrincipal(t *testing.T) {
-	filter := newDriftFilter(NewClassifier("", ""), func(AuditRecord) {}, false)
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) {}, false)
 	for i := 0; i < 2; i++ {
-		filter.Handle(AuditRecord{Principal: ""})
+		filter.Handle(context.Background(), AuditRecord{Principal: ""})
 	}
 
 	got := filter.Unattributed()
@@ -425,18 +426,18 @@ func TestUnattributedPrincipalsLabelsTheEmptyPrincipal(t *testing.T) {
 // principal already named keeps its own tally, and only new names collapse
 // into the overflow bucket.
 func TestUnattributedPrincipalsCapsTheNameSet(t *testing.T) {
-	filter := newDriftFilter(NewClassifier("", ""), func(AuditRecord) {}, false)
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) {}, false)
 
 	// Fill the set, then re-sight the first principal so it outranks the rest.
 	for i := 0; i < maxUnattributedPrincipals; i++ {
-		filter.Handle(AuditRecord{Principal: fmt.Sprintf("identity-%03d", i)})
+		filter.Handle(context.Background(), AuditRecord{Principal: fmt.Sprintf("identity-%03d", i)})
 	}
-	filter.Handle(AuditRecord{Principal: "identity-000"})
+	filter.Handle(context.Background(), AuditRecord{Principal: "identity-000"})
 
 	// Every one of these is new, so all of them land in the overflow bucket.
 	const overflowSightings = 5
 	for i := 0; i < overflowSightings; i++ {
-		filter.Handle(AuditRecord{Principal: fmt.Sprintf("late-identity-%d", i)})
+		filter.Handle(context.Background(), AuditRecord{Principal: fmt.Sprintf("late-identity-%d", i)})
 	}
 
 	got := filter.Unattributed()
@@ -495,20 +496,20 @@ func TestDriftFilterDropsNonDeclarativeSubresources(t *testing.T) {
 	}
 
 	var forwarded []AuditRecord
-	filter := newDriftFilter(NewClassifier("", ""), func(r AuditRecord) { forwarded = append(forwarded, r) }, false)
+	filter := newDriftFilter(NewClassifier("", ""), func(_ context.Context, r AuditRecord) { forwarded = append(forwarded, r) }, false)
 	for _, sub := range []string{"exec", "attach", "portforward", "proxy", "ephemeralcontainers"} {
-		filter.Handle(pod(sub))
+		filter.Handle(context.Background(), pod(sub))
 	}
 	// Not a pod subresource, but it reaches here by the same route: `kubectl
 	// create token` is audited as serviceaccounts.token.create.
-	filter.Handle(AuditRecord{
+	filter.Handle(context.Background(), AuditRecord{
 		Principal: human,
 		Resource:  ResourceRef{Version: "v1", Namespace: "prod", Resource: "serviceaccounts", Name: "deployer", Subresource: "token"},
 	})
 	// A real declarative write by the same principal on the same resource, to
 	// show the rule keys on the subresource rather than on pods or on exec-like
 	// traffic in general.
-	filter.Handle(pod("status"))
+	filter.Handle(context.Background(), pod("status"))
 
 	counts := filter.Counts()
 	if counts.NonDeclarative != 6 {
@@ -586,7 +587,7 @@ func TestDriftFilterLogDroppedDoesNotPanic(t *testing.T) {
 	log.SetOutput(io.Discard)
 	t.Cleanup(func() { log.SetOutput(prev) })
 
-	filter := newDriftFilter(NewClassifier("", ""), func(AuditRecord) {}, true)
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) {}, true)
 	records := []AuditRecord{
 		{Principal: "system:kube-scheduler"},
 		{Principal: "bob@example.com", StatusCode: 7, StatusMessage: "PERMISSION_DENIED"},
@@ -594,7 +595,7 @@ func TestDriftFilterLogDroppedDoesNotPanic(t *testing.T) {
 		{Principal: "ada@example.com", Resource: ResourceRef{Version: "v1", Resource: "pods", Name: "api-0"}},
 	}
 	for _, r := range records {
-		filter.Handle(r)
+		filter.Handle(context.Background(), r)
 	}
 
 	counts := filter.Counts()
@@ -617,7 +618,7 @@ func TestDriftFilterProgressLineIsTimeBounded(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(prev) })
 
 	now := time.Now()
-	filter := newDriftFilter(NewClassifier("", ""), func(AuditRecord) {}, false)
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) {}, false)
 	filter.now = func() time.Time { return now }
 	filter.lastCountsLog = now
 
@@ -625,7 +626,7 @@ func TestDriftFilterProgressLineIsTimeBounded(t *testing.T) {
 
 	// Far short of countsLogInterval with no time elapsed: nothing is owed.
 	for i := 0; i < 5; i++ {
-		filter.Handle(record)
+		filter.Handle(context.Background(), record)
 	}
 	if strings.Contains(buf.String(), "progress") {
 		t.Fatalf("progress line before either bound was reached: %q", buf.String())
@@ -633,14 +634,14 @@ func TestDriftFilterProgressLineIsTimeBounded(t *testing.T) {
 
 	// Once the time bound passes, the next record reports the running tally.
 	now = now.Add(countsLogMaxInterval)
-	filter.Handle(record)
+	filter.Handle(context.Background(), record)
 	if !strings.Contains(buf.String(), "progress handled=6") {
 		t.Errorf("no progress line after %s elapsed; log = %q", countsLogMaxInterval, buf.String())
 	}
 
 	// The clock resets when it fires, so it does not then print every record.
 	buf.Reset()
-	filter.Handle(record)
+	filter.Handle(context.Background(), record)
 	if buf.Len() != 0 {
 		t.Errorf("progress line repeated on the very next record: %q", buf.String())
 	}
@@ -657,14 +658,14 @@ func TestDriftFilterProgressLineStillFiresOnRecordCount(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(prev) })
 
 	now := time.Now()
-	filter := newDriftFilter(NewClassifier("", ""), func(AuditRecord) {}, false)
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) {}, false)
 	filter.now = func() time.Time { return now }
 	filter.lastCountsLog = now
 
 	// The clock never advances, so only the record count can trip this.
 	record := AuditRecord{Principal: "system:kube-scheduler"}
 	for i := 0; i < countsLogInterval; i++ {
-		filter.Handle(record)
+		filter.Handle(context.Background(), record)
 	}
 	if !strings.Contains(buf.String(), fmt.Sprintf("progress handled=%d", countsLogInterval)) {
 		t.Errorf("no progress line at %d records with the clock frozen; log = %q", countsLogInterval, buf.String())

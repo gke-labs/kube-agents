@@ -38,11 +38,15 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # that can carry the gVisor node pool. Set create_cluster = false to install
 # onto an existing cluster (it must already have Workload Identity and enforce
 # NetworkPolicy, or the plan is refused; CMEK on it stays a gcloud step outside
-# Terraform).
-# cluster_mode            = "standard"
-# create_cluster          = false
-# enable_gvisor_node_pool = true
-# gvisor_pool_name        = "gvisor-pool"
+# Terraform). accept_no_network_policy = true admits a cluster with no
+# enforcement and leaves it as it is: every NetworkPolicy the install ships is
+# then inert, and the PlatformAgent carries the
+# kubeagents.x-k8s.io/network-policy-enforcement annotation to say so.
+# cluster_mode             = "standard"
+# create_cluster           = false
+# accept_no_network_policy = false
+# enable_gvisor_node_pool  = true
+# gvisor_pool_name         = "gvisor-pool"
 
 # Sandboxing on Autopilot, which has the gvisor RuntimeClass built in and no
 # node pool to provision. enable_gvisor_node_pool must stay false there.

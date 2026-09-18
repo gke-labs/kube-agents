@@ -66,8 +66,9 @@ misconfigurations:
   #   - `get`: stampSecretEnvHash digests the Secret material the agent pods read
   #     as environment onto their pod templates, so a rotated key rolls the pod
   #     instead of being ignored until something else restarts it. This one does
-  #     read values; only their SHA-256 digest leaves the controller, and the
-  #     digest goes on an object the operator already writes.
+  #     read values; only their HMAC-SHA256 digest, keyed by the UIDs of the
+  #     Secrets read, leaves the controller, and the digest goes on an object
+  #     the operator already writes.
   #   - create/update/patch/delete: under `mode: next` the operator generates
   #     and repairs the A2A NATS credential and config Secrets, owner-referenced
   #     to the PlatformAgent. Deliberately no `list`/`watch`: every read is by

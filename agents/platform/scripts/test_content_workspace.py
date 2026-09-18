@@ -355,6 +355,31 @@ class CheckBranchTest(unittest.TestCase):
                 with self.assertRaises(ContentWorkspaceError):
                     check_branch(protected)
 
+        # Ref-prefix normalisation: refs/heads/ and heads/ are stripped before checking
+        for prefixed in (
+            "refs/heads/main",
+            "heads/main",
+            "refs/heads/master",
+            "heads/production",
+            "refs/heads/run/test-cluster/fix-task",
+            "heads/run/test-cluster/fix-task",
+        ):
+            with self.subTest(prefixed=prefixed):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_branch(prefixed)
+
+        # Run branches are refused without needing env overrides (#1498)
+        with self.assertRaises(ContentWorkspaceError):
+            check_branch("run/test-cluster/fix-task")
+
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
+            with self.assertRaises(ContentWorkspaceError):
+                check_branch("custom-gitops-base")
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
+            with self.assertRaises(ContentWorkspaceError):
+                check_branch("custom-broker-base")
+
         # Paired ordinary use: the branch names the product actually authors.
         self.assertEqual(
             "platform-agent/provision-mercury-09",
@@ -1093,6 +1118,65 @@ class RealGitTest(unittest.TestCase):
             self.workspace.handle, "platform-agent/change", "feat: a change", changes, **kwargs
         )
 
+    def test_commit_and_push_to_workspace_base_branch_are_refused(self):
+        # When a workspace is opened with a non-default base branch (e.g. release/2026-08),
+        # both commit and push directly onto that base branch must be refused by the store.
+        handle = "b" * 32
+        tree = self.base / "trees" / "release_work" / "repo"
+        tree.parent.mkdir(parents=True)
+        real_git_runner(["git", "clone", str(self.remote), str(tree)], self.base)
+        ws = Workspace(
+            handle=handle,
+            repo="acme/fleet",
+            tree=tree,
+            base="release/2026-08",
+            base_sha=self.workspace.base_sha,
+        )
+        self.store._workspaces[handle] = ws
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.commit(
+                handle,
+                "release/2026-08",
+                "feat: direct to base",
+                [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+            )
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.push(handle, "release/2026-08")
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
+
+        # Even when client opened with a custom base, commit/push directly to remote default branch is refused (#1498)
+        ws.base = "feature/agent-custom-base"
+        ws.default_branch = "release-trunk"
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.commit(
+                handle,
+                "release-trunk",
+                "feat: direct to remote default",
+                [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+            )
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.push(handle, "release-trunk")
+        self.assertIn("is the workspace base, remote default, or run branch", str(ctx.exception))
+
+        # Commit and push directly to run branches are refused by check_branch
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.commit(
+                handle,
+                "run/test-cluster/b-0011",
+                "feat: direct to run branch",
+                [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+            )
+        self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
+
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.push(handle, "run/test-cluster/b-0011")
+        self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
+
     def test_a_commit_lands_the_bytes_and_nothing_else(self):
         result = self.commit(
             [
@@ -1734,6 +1818,154 @@ class GrepTest(unittest.TestCase):
         self.assertNotIn("truncated", answer["matches"][0])
         self.assertEqual("replicas: 2", answer["matches"][0]["text"])
 
+
+class FakeCredential:
+    """A credential whose `git_config` is whatever the test says it is."""
+
+    def __init__(self, config=()):
+        self.config = tuple(config)
+        self.ensured = []
+
+    def ensure(self, repo):
+        self.ensured.append(repo)
+
+    def headers(self, repo):
+        return {}
+
+    def git_config(self, repo):
+        return self.config
+
+
+class ConfigRecordingRunner(RecordingRunner):
+    """A runner that also records the config layer each invocation carried."""
+
+    def __init__(self, responses=None):
+        super().__init__(responses)
+        self.configs = []
+
+    def __call__(self, argv, cwd, config=()):
+        self.configs.append(tuple(config))
+        return super().__call__(argv, cwd)
+
+
+class CloneCredentialTest(unittest.TestCase):
+    """What a clone presents is decided per repository, applied to the remote verbs only."""
+
+    HEADER = (
+        ("http.https://github.com/.extraheader", "AUTHORIZATION: basic eDp5"),
+        ("credential.helper", ""),
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, runner, credential_for):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner, credential_for=credential_for
+        )
+
+    def test_a_context_repository_s_clone_carries_its_credential_and_nothing_else_does(self):
+        credential = FakeCredential(self.HEADER)
+        asked = []
+
+        def credential_for(repo):
+            asked.append(repo)
+            return credential if repo == "acme/tf-live" else None
+
+        runner = ConfigRecordingRunner({"diff --cached": FakeResult(1)})
+        store = self.store(runner, credential_for)
+
+        workspace = store.open("acme/tf-live")
+        self.assertEqual(["acme/tf-live"], asked)
+        self.assertEqual(["acme/tf-live"], credential.ensured, "made current before the clone")
+        clone = runner.subcommands.index("clone")
+        self.assertEqual(self.HEADER, runner.configs[clone])
+        self.assertEqual(
+            {()},
+            {config for index, config in enumerate(runner.configs) if index != clone},
+            "every local git in the open ran with no credential layer",
+        )
+        self.assertIs(credential, workspace.credential)
+
+        # The fetch in `commit` presents what the clone did.
+        runner.calls.clear()
+        runner.configs.clear()
+        store.commit(
+            workspace.handle,
+            "platform-agent/change",
+            "feat: a change",
+            [Change(repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+        )
+        fetch = runner.subcommands.index("fetch")
+        self.assertEqual(self.HEADER, runner.configs[fetch])
+        self.assertEqual(
+            ["acme/tf-live", "acme/tf-live"],
+            credential.ensured,
+            "made current again before the fetch, not replayed from the clone",
+        )
+        self.assertEqual(
+            {()},
+            {config for index, config in enumerate(runner.configs) if index != fetch},
+        )
+
+        # Paired: a repository the selector answers nothing for -- a managed
+        # one on the ambient credential, a public one on none -- clones with
+        # no layer at all, and the workspace records that.
+        runner.calls.clear()
+        runner.configs.clear()
+        other = store.open("acme/gitops")
+        self.assertEqual({()}, set(runner.configs))
+        self.assertIsNone(other.credential)
+
+    def test_a_credential_that_could_not_be_minted_leaves_the_clone_credential_less(self):
+        # The real credential, not a fake: `MintedReadCredential.ensure`
+        # swallows a failed mint, and the layer it then hands the clone holds
+        # no token and clears `credential.helper`, so the clone runs with no
+        # credential at all rather than on whatever helper the sidecar's
+        # global config installed for the write token.
+        from providers.credentials import MintedReadCredential
+
+        def mint(provider, repo):
+            raise RuntimeError("the minter is down")
+
+        credential = MintedReadCredential("github", mint, "github.com")
+        runner = ConfigRecordingRunner()
+        store = self.store(runner, lambda repo: credential)
+        with self.assertLogs("credential-proxy.vcs", level="WARNING"):
+            workspace = store.open("acme/tf-live")
+        clone = runner.subcommands.index("clone")
+        self.assertEqual(["git", "clone", "--quiet"], runner.calls[clone][0][:3])
+        self.assertEqual((("credential.helper", ""),), runner.configs[clone])
+        self.assertEqual(
+            {()},
+            {config for index, config in enumerate(runner.configs) if index != clone},
+            "every local git in the open ran with no layer",
+        )
+        self.assertIs(credential, workspace.credential)
+
+    def test_a_store_without_a_selector_hands_its_runner_no_config_at_all(self):
+        # The executor before it learned `config`, and every recorded runner in
+        # this file: `(argv, cwd)` keeps working because the keyword is only
+        # passed when there is something in it.
+        class StrictRunner(RecordingRunner):
+            def __call__(self, argv, cwd):
+                return super().__call__(argv, cwd)
+
+        runner = StrictRunner()
+        ContentWorkspaceStore(self.base / "trees", self.agent, runner).open("acme/fleet")
+        self.assertIn("clone", runner.subcommands)
+
+    def test_a_clone_that_fails_with_a_credential_still_leaves_no_tree_behind(self):
+        credential = FakeCredential(self.HEADER)
+        runner = ConfigRecordingRunner({"clone": FakeResult(128, stderr="fatal: Authentication failed")})
+        store = self.store(runner, lambda repo: credential)
+        with self.assertRaises(ContentWorkspaceError):
+            store.open("acme/tf-live")
+        self.assertEqual([], list(store.tree_root.iterdir()))
 
 if __name__ == "__main__":
     unittest.main()

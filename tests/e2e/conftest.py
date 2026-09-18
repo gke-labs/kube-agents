@@ -387,10 +387,12 @@ def platform_agent_api_key(agent_namespace: str) -> Optional[str]:
 # Reaching the Platform Agent API from the test runner
 #
 # The transport is a `kubectl exec` relay, not `kubectl port-forward`, because
-# the RC environment runs the agent pod on a GKE Sandbox (gVisor) node pool
-# (`ENABLE_GVISOR=true`, against install.sh's `false` default) and port-forward
-# cannot see a listener inside a sandbox. scripts/exec_tunnel.py is canonical on
-# that constraint and owns the relay; it is shared with
+# the RC environment runs the agent pod on a GKE Sandbox (gVisor) node pool --
+# `ENABLE_GVISOR=true`, set for that environment, and also what a fresh install
+# defaults to, so this is the stock shape rather than an RC-only one -- and
+# port-forward cannot see a listener inside a sandbox.
+# docs/site/src/content/docs/operator/platformagent-crd.md is canonical on that
+# constraint; scripts/exec_tunnel.py owns the relay, and is shared with
 # scripts/hermes-dashboard-tunnel.py rather than written twice.
 #
 # It is used unconditionally rather than behind a gVisor detector: it works on

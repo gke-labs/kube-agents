@@ -764,3 +764,7 @@ Everything above is in use in this directory: `kube_agents_bench/harness.py` and
 `kube_agents_bench/parsing.py` are a harness that talks to an in-cluster agent over a port-forward,
 `tasks/` holds both a no-infrastructure smoke task and provisioned ones, and `tf/prebuilt/` holds
 their stacks.
+
+That port-forward cannot reach an agent running under GKE Sandbox, so the harness needs either a
+standard-runtime install or a relay pre-opened on its local port ([README](README.md#sandboxed-installs)).
+If you model your own transport on it, `scripts/exec_tunnel.py` is the relay this repository uses.

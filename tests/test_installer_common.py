@@ -685,6 +685,28 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_gvisor_node_pool    = true", content)
             self.assertIn('agent_runtime_class        = "gvisor"', content)
 
+    def test_tfvars_carry_accept_no_network_policy(self):
+        # The module's postcondition reads the variable, not install.sh's flag,
+        # so the generator has to emit it -- false by default, true when the
+        # install accepted a cluster without enforcement (#1682).
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("accept_no_network_policy   = false", dest.read_text())
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ACCEPT_NO_NETWORK_POLICY": "true"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("accept_no_network_policy   = true", dest.read_text())
+
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
         # gvisor RuntimeClass natively. Passing ENABLE_GVISOR straight through

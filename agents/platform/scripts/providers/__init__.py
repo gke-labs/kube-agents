@@ -22,7 +22,12 @@ from .base import (
     WorkspaceError,
     listing,
 )
-from .credentials import BrokeredCredential, Credential, NoCredential
+from .credentials import (
+    BrokeredCredential,
+    Credential,
+    MintedReadCredential,
+    NoCredential,
+)
 from .errors import GUIDANCE, Guidance, forge_error
 from .registry import AVAILABLE, Registry, build_forges
 from .transport import CliTransport, Transport
@@ -55,6 +60,7 @@ __all__ = [
     "GUIDANCE",
     "Guidance",
     "MAX_PAGE_SIZE",
+    "MintedReadCredential",
     "NoCredential",
     "Registry",
     "SHA_RE",
