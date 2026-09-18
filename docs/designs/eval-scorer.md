@@ -91,8 +91,9 @@ its liveness signal is the executor's own events instead — a trajectory entry 
 a null total (the executor took the task and ended it, or took it and was cancelled at the budget
 before its terminal landed); a `submitted` entry alone, a null total with no such entry, and a
 total of zero still fail the rung. The harness itself records a task that never left `submitted`
-at its deadline as infrastructure, so that entry reaching the rung is the backstop. There is no
-`metadata` block on a
+at its deadline, and a terminal the executor wrote for its own fault (the bridge's and the worker
+adapter's `reason:` tokens, or a `rejected` submission), as infrastructure before a record exists,
+so those entries reaching the rung is the backstop. There is no `metadata` block on a
 devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a

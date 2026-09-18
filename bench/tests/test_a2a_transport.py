@@ -710,6 +710,83 @@ def test_a_failed_terminal_is_graded_not_infrastructure(fake_bus) -> None:
     assert result.metadata["terminal_state"] == "failed"
 
 
+@pytest.mark.parametrize(
+    ("state", "message"),
+    [
+        (
+            "failed",
+            "reason: bridge-shutdown - the bridge was terminated while this task was in flight",
+        ),
+        ("failed", "reason: bridge-queue-overflow"),
+        ("failed", "reason: bus-publish-failed at working"),
+        ("failed", "reason: spawn-failed - exec: hermes: not found"),
+        ("failed", "reason: bridge-died-without-terminal-event"),
+        (
+            "failed",
+            "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished",
+        ),
+        ("failed", "reason: bus-subscribe-failed - nats: timeout"),
+        ("canceled", "reason: canceled-before-start"),
+        ("rejected", "reason: no-text-parts - the submission message carries nothing"),
+    ],
+)
+def test_an_executor_that_lost_the_task_is_infrastructure(
+    fake_bus, state: str, message: str
+) -> None:
+    """The bridge's and the worker adapter's own reasons, and a rejected
+    submission, say the executor lost the task rather than the persona failing
+    it (eval-next-transport.md, stage 1): the run class, never a graded 0.0."""
+    fake_bus.script = [[_status("t", "submitted"), _status("t", state, final=True, text=message)]]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "executor lost task" in result.errors[0]
+    assert message.split(" - ")[0] in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+
+
+@pytest.mark.parametrize(
+    ("state", "message"),
+    [
+        ("failed", "reason: hermes-exited-nonzero - exit status 1; stderr tail: boom"),
+        ("failed", "reason: deadline-exceeded - killed after 10m0s"),
+        ("failed", "reason: something-the-harness-does-not-know"),
+        ("failed", "exit 1: model refused"),
+        ("canceled", "reason: canceled-by-request"),
+    ],
+)
+def test_a_persona_or_unknown_reason_stays_graded(fake_bus, state: str, message: str) -> None:
+    """The persona's own reasons, a reason the harness does not know and a
+    message with no reason at all are the agent's outcome, graded as before."""
+    fake_bus.script = [
+        [
+            _status("t", "submitted"),
+            _status("t", "working"),
+            _status("t", state, final=True, text=message),
+        ]
+    ]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.has_errors()
+    assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.metadata["terminal_state"] == state
+
+
+def test_the_reason_token_runs_to_the_next_space() -> None:
+    fold = a2a.Fold("task-1")
+    fold.apply(
+        _status("task-1", "failed", final=True, text="reason: bus-publish-failed at working")
+    )
+    assert fold.reason == "bus-publish-failed"
+    plain = a2a.Fold("task-1")
+    plain.apply(_status("task-1", "failed", final=True, text="exit 1: model refused"))
+    assert plain.reason == ""
+    bare = a2a.Fold("task-1")
+    bare.apply(_status("task-1", "failed", final=True, text="reason:"))
+    assert bare.reason == ""
+
+
 def test_no_executor_is_infrastructure(fake_bus) -> None:
     """Nothing consumed the submission: the run class, not an empty answer."""
     fake_bus.script = [[]]
@@ -1107,6 +1184,40 @@ def test_a_status_turn_that_drops_is_one_attempt_and_its_task_is_recorded(
     assert result.metadata["abandoned_tasks"] == [dropped.ids.task_id]
     assert result.metadata["task_id"] == opening.ids.task_id
     assert "RCA: OOMKilled" in result.output
+
+
+def test_a_bus_refusal_during_the_wait_is_infrastructure_not_an_answer(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bus refusing the eval user between the opening turn and a poll
+    (an operator reconciled without ``A2A_EVAL_PRINCIPAL`` and rolled the bus
+    while the key stayed in the Secret) is never an executor's answer. The
+    api path reads a non-retryable turn failure as "a handler answered" and
+    grades; here it is the run class, at once, with no doomed retries, and
+    the card's on-disk state is purged as on an exhausted retry.
+    """
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1800")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    shells: list[str] = []
+    monkeypatch.setattr(
+        harness, "_agent_shell", lambda script, timeout: shells.append(script) or ""
+    )
+    fake_bus.script = [
+        _card_filed(),
+        a2a.BusUnavailable("Authorization Violation", retryable=False),
+    ]
+    result = KubeAgentsHarness().run(_PROMPT)
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "refused in transport" in result.errors[0]
+    assert "Authorization Violation" in result.errors[0]
+    assert "card-7" in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+    (client,) = fake_bus.instances
+    assert len(client.calls) == 2, "the opening turn and one status turn, no retries"
+    assert any("rm -rf" in s and "card-7" in s for s in shells)
 
 
 # --------------------------------------------------------------------------

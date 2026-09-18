@@ -402,7 +402,9 @@ def _a2a_liveness_event(trajectory: list[Any]) -> bool:
     The bus carries no token usage, so an a2a record's ``tokens`` are all
     null and the task's lifecycle events, recorded as trajectory entries
     under ``EVENT_ENTRY_STATUS``, stand in. A final one means an executor
-    took the task and ended it; a ``working`` one means it took the task and
+    took the task and ended it (a terminal the executor wrote for its own
+    fault never reaches a record: the harness classifies those by reason
+    token as infrastructure first); a ``working`` one means it took the task and
     started, which is all a graded timeout carries when the run was cancelled
     at its budget before the terminal landed. ``submitted`` alone is the
     bridge queueing the task, not a model running, and does not count

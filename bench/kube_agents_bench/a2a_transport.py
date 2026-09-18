@@ -131,7 +131,14 @@ KIND_ARTIFACT_UPDATE = "artifact-update"
 STATE_COMPLETED = "completed"
 STATE_WORKING = "working"
 STATE_SUBMITTED = "submitted"
-TERMINAL_STATES = frozenset({STATE_COMPLETED, "failed", "canceled", "rejected"})
+STATE_FAILED = "failed"
+STATE_CANCELED = "canceled"
+STATE_REJECTED = "rejected"
+TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
+# How an executor says why it ended a task: the terminal's status message
+# reads ``reason: <token>`` or ``reason: <token> - <detail>``
+# (docs/designs/eval-next-transport.md, stage 1).
+REASON_PREFIX = "reason:"
 
 # The reserved artifact names (``a2a/lib/payload.go``).
 ARTIFACT_RESULT = "result"
@@ -309,6 +316,20 @@ class Fold:
             or bool(self.artifacts)
             or any(state != STATE_SUBMITTED for state in self.history)
         )
+
+    @property
+    def reason(self) -> str:
+        """The terminal's reason token, or ``""`` when its message carries none.
+
+        The ``reason:`` prefix is stripped and the token runs to the next
+        space, so ``bus-publish-failed at working`` reads as
+        ``bus-publish-failed``; a message without the prefix is no reason.
+        """
+        message = self.status_message.strip()
+        if not message.startswith(REASON_PREFIX):
+            return ""
+        rest = message[len(REASON_PREFIX) :].strip()
+        return rest.split(" ", 1)[0] if rest else ""
 
     def artifact_text(self, name: str) -> str:
         """The concatenated text parts of the artifact called ``name``."""

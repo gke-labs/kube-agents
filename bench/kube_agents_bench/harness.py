@@ -173,6 +173,25 @@ _CANCEL_UNCONFIRMED_NOTE = "cancel not confirmed"
 _A2A_DEFAULT_ACCEPT_TIMEOUT = "120"
 # Ceiling on one ``kubectl get secret`` for the bus credential.
 _A2A_SECRET_READ_TIMEOUT = 30.0
+# Terminal reasons that say the executor lost the task rather than the persona
+# failing it (docs/designs/eval-next-transport.md, stage 1): the bridge's, from
+# a2a/hermes-bridge/bridge.go and sweep.go, and the worker adapter's, from
+# a2a/worker-adapter/adapter.go. A run ending on one is infrastructure, the
+# class the api transport gives an exhausted retry. The persona's own reasons
+# (``hermes-exited-nonzero``, ``deadline-exceeded``, ``canceled-by-request``)
+# and any the harness does not know stay graded.
+_A2A_INFRA_REASONS = frozenset(
+    {
+        "bridge-shutdown",
+        "bridge-queue-overflow",
+        "bus-publish-failed",
+        "spawn-failed",
+        "bridge-died-without-terminal-event",
+        "worker-evicted",
+        "bus-subscribe-failed",
+        "canceled-before-start",
+    }
+)
 # What ``tokens`` say on an a2a record: the bus carries no usage, and a null
 # bucket is the truthful value rather than a zero (``scoring.py`` reads the
 # terminal event in the trajectory as the liveness signal instead).
@@ -801,11 +820,18 @@ class _TransportError(RuntimeError):
 
     ``retryable`` says whether issuing the same request again could plausibly
     succeed. It is False by default so a new raise site has to opt in.
+
+    ``fatal`` says the transport refused the harness outright -- on the a2a
+    path, a credential or a subject the bus will not take -- so neither a
+    retry nor grading is right, and the delegation wait ends the run as
+    infrastructure at once. On the api path a non-retryable failure is a
+    handler's own answer and stays graded; only the a2a status turn sets it.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(self, message: str, *, retryable: bool = False, fatal: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.fatal = fatal
 
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
@@ -895,6 +921,25 @@ def _nothing_ran(exchange: a2a.Exchange) -> bool:
     return exchange.outcome == a2a.OUTCOME_NOT_ACCEPTED or (
         exchange.outcome == a2a.OUTCOME_DEADLINE and not exchange.fold.started
     )
+
+
+def _executor_lost(exchange: a2a.Exchange) -> str:
+    """Why the executor lost the task, or ``""`` when the terminal is the persona's.
+
+    A ``rejected`` terminal is the harness's own defect (a submission with no
+    text parts) and is never graded. A ``failed`` or ``canceled`` one is
+    infrastructure when its reason token is in ``_A2A_INFRA_REASONS``. A
+    terminal with no reason, or one the harness does not know, is the
+    persona's outcome and stays graded.
+    """
+    fold = exchange.fold
+    if not fold.final:
+        return ""
+    if fold.state == a2a.STATE_REJECTED:
+        return f"rejected: {fold.status_message or 'no reason given'}"
+    if fold.state in (a2a.STATE_FAILED, a2a.STATE_CANCELED) and fold.reason in _A2A_INFRA_REASONS:
+        return fold.status_message
+    return ""
 
 
 def _infra_failure(detail: str) -> AgentResult:
@@ -1228,13 +1273,17 @@ class KubeAgentsHarness(AgentHarness):
         the next attempt, or on the way out when there is none, and its id
         lands in ``metadata["abandoned_tasks"]`` on every record this method
         returns, the infrastructure one included. Exhaustion, a refused
-        credential or a refused subject, a missing creds Secret, and a task no
-        executor accepted inside ``AGENT_A2A_ACCEPT_TIMEOUT`` (a cancel is
-        published) are infrastructure.
-        A task an executor took and ended ``failed``, ``rejected`` or
-        ``canceled`` is the agent's own outcome and stays in front of the judge
-        with the terminal on ``errors``; so does a task still running at
-        ``AGENT_HTTP_TIMEOUT``, after a cancel.
+        credential or a refused subject, a missing creds Secret, a task no
+        executor accepted inside ``AGENT_A2A_ACCEPT_TIMEOUT``, and one the
+        bridge accepted and left queued at ``submitted`` until the deadline
+        (a cancel is published either way) are infrastructure.
+        A task an executor took and ended ``failed`` or ``canceled`` is the
+        agent's own outcome and stays in front of the judge with the terminal
+        on ``errors``, unless the terminal's reason token is one the bridge or
+        the worker adapter writes for its own fault (``_A2A_INFRA_REASONS``);
+        those, and a ``rejected`` terminal, which is the harness's own defect,
+        are infrastructure too. A task still running at ``AGENT_HTTP_TIMEOUT``
+        is graded, after a cancel.
 
         This method submits and awaits and nothing more. The kanban poll for
         delegated cases behind the bridge is :meth:`_a2a_delegation_wait`,
@@ -1424,6 +1473,18 @@ class KubeAgentsHarness(AgentHarness):
             failure.metadata["abandoned_tasks"] = abandoned
             return failure
 
+        lost = _executor_lost(exchange)
+        if lost:
+            # The executor lost the task rather than the persona failing it:
+            # the bridge's or the worker adapter's own reason on the
+            # terminal, or a rejected submission, which is the harness's
+            # defect. The design of record classifies these as infrastructure
+            # on both transports; a record here would grade a broken executor
+            # as a 0.0 for the agent.
+            failure = _infra_failure(f"executor lost task {ids.task_id}: {lost}")
+            failure.metadata["abandoned_tasks"] = abandoned
+            return failure
+
         result = _a2a_result(exchange, ids, addressee)
         # The same list the status turns append to: the record sees theirs too.
         result.metadata["abandoned_tasks"] = abandoned
@@ -1456,10 +1517,24 @@ class KubeAgentsHarness(AgentHarness):
                         max_attempts=1,
                     )
                 except a2a.BusUnavailable as exc:
-                    raise _TransportError(str(exc), retryable=exc.retryable) from exc
+                    # A refused credential or subject is never an executor's
+                    # answer, and no fresh tunnel mends it; left as a plain
+                    # non-retryable error the wait would read it as the api
+                    # path's "a handler answered" and grade the receipt.
+                    raise _TransportError(
+                        str(exc), retryable=exc.retryable, fatal=not exc.retryable
+                    ) from exc
                 if _nothing_ran(turn_exchange):
                     raise _TransportError(
                         f"no executor ran status turn {turn_ids.task_id}",
+                        retryable=True,
+                    )
+                lost = _executor_lost(turn_exchange)
+                if lost:
+                    # The wait's retry asks again; the ceiling ends it as
+                    # infrastructure, the same as a turn nobody ran.
+                    raise _TransportError(
+                        f"executor lost status turn {turn_ids.task_id}: {lost}",
                         retryable=True,
                     )
                 return _a2a_result(turn_exchange, turn_ids, addressee), ""
@@ -1554,8 +1629,9 @@ class KubeAgentsHarness(AgentHarness):
         Raises:
             _DelegationTransportExhausted: Every retry died without reaching
                 an agent -- no HTTP answer at all, or a 429 refused at the
-                admission door; the run is infrastructure, not a gradable
-                result.
+                admission door -- or the transport refused the harness
+                outright (a2a: the bus rejected the credential or the
+                subject); the run is infrastructure, not a gradable result.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.
@@ -1616,6 +1692,18 @@ class KubeAgentsHarness(AgentHarness):
                     _MAX_TRANSPORT_FAILURES,
                     exc,
                 )
+                if exc.fatal:
+                    # The transport refused the harness outright (a2a: the
+                    # bus rejected the credential or the subject, as it does
+                    # once an operator reconciles without the eval flag and
+                    # rolls the bus under a run). Not the agent's answer and
+                    # not mended by a retry: the exhausted retry's road below,
+                    # purge included, taken at once.
+                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    raise _DelegationTransportExhausted(
+                        f"status turn refused in transport: {exc}; "
+                        "still waiting on: " + ", ".join(outstanding)
+                    ) from exc
                 if transport_failures < _MAX_TRANSPORT_FAILURES:
                     # Back off one poll interval and ask again: the loop top
                     # re-checks the deadline, so retries cannot outlive it.
