@@ -100,14 +100,17 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         )
 
     def test_teardown_keeps_the_success_gate_on_the_jobs_it_does_depend_on(self):
-        """A failed matrix must leave its cluster standing to be examined live."""
+        """A failed matrix must leave its cluster standing to be examined live.
+
+        The gate is written out in the condition (deploy and matrix results
+        equal to success) rather than left to the implicit success() on
+        `needs`; an `always()` would drop it and destroy the environments a
+        failed run leaves standing for diagnosis.
+        """
         teardown = self.jobs["step-5-teardown-env"]
-        self.assertNotIn(
-            "always()",
-            teardown.get("if", ""),
-            "always() removes the implicit success() and destroys the environments "
-            "a failed run leaves standing for diagnosis",
-        )
+        cond = teardown.get("if", "")
+        self.assertNotIn("always()", cond)
+        self.assertIn("needs.step-3-run-e2e-matrix.result == 'success'", cond)
         self.assertIn("step-3-run-e2e-matrix", teardown["needs"])
 
     def test_the_rollback_leg_runs_on_the_nightly_cluster_after_the_matrix(self):

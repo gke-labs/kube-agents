@@ -351,8 +351,10 @@ restart_operator_after_handoff() {
   [ "${HANDOFF_DONE:-false}" = "true" ] || return 0
   local replicas="${OPERATOR_REPLICAS_BEFORE_HANDOFF:-1}"
   echo "==> Scaling ${OPERATOR_DEPLOYMENT} back to ${replicas} after the handoff."
-  HANDOFF_DONE="false"
   kubectl scale deployment "${OPERATOR_DEPLOYMENT}" -n "${NAMESPACE}" --replicas="${replicas}"
+  # Cleared only once the scale has succeeded, so a failed scale leaves the
+  # trap armed to try again.
+  HANDOFF_DONE="false"
   kubectl rollout status "deployment/${OPERATOR_DEPLOYMENT}" -n "${NAMESPACE}" --timeout="${OPERATOR_SCALE_TIMEOUT_SECONDS}s"
 }
 
