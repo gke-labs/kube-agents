@@ -91,22 +91,31 @@ A watchdog therefore fires through the same execute → deliver → record path 
 
 Each job in `jobs.json` follows this schema:
 
+<!-- BEGIN GENERATED: cron-job-example -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
 ```json
 {
   "id": "compliance-audit",
   "name": "Security & RBAC Posture Audit",
-  "risk": "low",
   "schedule": {
     "kind": "cron",
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
   "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 414 lines of it, before you run anything. Its eleven checks are section 2, lines 107-320, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
-  "skills": ["fleet-audit"],
+  "skills": [
+    "fleet-audit"
+  ],
+  "risk": "low",
   "enabled": true,
   "deliver": "chat"
 }
 ```
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: cron-job-example -->
 
 - **`id`** — stable identifier, referenced in observability and disable/enable ops. It outlives renames: `obtainability-audit` is now the Workload Reliability Audit, but the id stays put.
 - **`risk`** — declared risk tier (`"low"` or `"high"`). For agentic (prompt-driven) jobs, `"high"` applies a fail-closed read-only command policy requiring every command segment to be an allowlisted inspection command (`kubectl get/describe/logs/top`, `gcloud … list/describe`, read-only text utilities, `--dry-run` validations) and refusing mutations while the run continues. `"low"` retains the profile's configured `cron_mode` (typically `approve`). Runtime-created jobs default to `"low"`, legacy volume entries backfill to `"low"`, and unannotated in-flight dispatches default fail-closed to `"high"`. For `no_agent: true` jobs like `github-repo-watcher`, there is no agent loop and therefore no tool-approval surface to gate; `"high"` is an input-threat classification of untrusted repository events; today the tier is metadata only for those jobs, and nothing isolates the subprocess at runtime.
