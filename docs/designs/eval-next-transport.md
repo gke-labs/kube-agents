@@ -48,8 +48,8 @@ The reply it grades is the Responses payload. When the agent delegates by filing
 the harness re-prompts the same conversation every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30
 by default) with an instruction to call `kanban_show` on the outstanding ids, until every card
 reads done, blocked or archived or `AGENT_DELEGATION_TIMEOUT` elapses (1800 s by default, 2700 s
-in the presubmit). The delivered card results are appended to the answer, and the worker's
-report and terminal commands are read back with `kubectl exec` from
+in the presubmit, 3000 s for its six full-audit units). The delivered card results are appended
+to the answer, and the worker's report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
 deleted. A customer sees the card result relayed to their thread; they never see the files, and
 the poll turns are model calls the customer never made.
@@ -86,12 +86,19 @@ the presubmit exports nothing new until it chooses to. The exchange:
    on every harness invocation, and the pin the api transport honours for its conversation id,
    `AGENT_CONVERSATION_ID`, is not honoured here, because on the api path a pinned id only
    shares a conversation while on this path it would replay an earlier run's result through
-   the dedupe below. The gateway takes the message through
-   `handleInbound` like a message from any backend: routing, the session record, `startTask`,
-   and the relay back, with `taskId`, `contextId`, `correlationId` and the `authority` block
-   minted by the gateway. The response names the task id. The adapter dedupes on the backend
-   message id, bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an
-   id it has already accepted returns the same task id and starts nothing. Because the id
+   the dedupe below. The gateway takes the message through `handleInbound` like a message from
+   any backend: routing, the session record, `startTask`, and the relay back, with `taskId`,
+   `contextId`, `correlationId` and the `authority` block minted by the gateway. The gateway
+   hands the adapter no task id: its inbound handler only enqueues, and `startTask` mints the id
+   and posts the submitted notice back through the adapter's `Post`. So the `POST` enqueues and
+   then waits, inside the adapter, on the session record for its key until `ActiveTask`
+   appears, bounded by a short accept bound, and answers with the task id it finds there. Two
+   things end the wait as a refusal instead: the unverified-principal notice, which the drop
+   path posts to the key through the same `Post` and writes no record behind, and the bound
+   expiring with neither a record nor a notice. The harness classifies a refusal as the gateway
+   refusing the injection, infrastructure. The adapter dedupes on the backend message id,
+   bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
+   already accepted answers with the record's task id and starts nothing. Because the id
    carries the run id, the dedupe is idempotence within one invocation's retries and never
    across invocations: a rerun of the same case and repetition mints a new run id, so a new key
    and a fresh session record, and the seen set never answers it with an earlier run's task.
@@ -114,7 +121,7 @@ the presubmit exports nothing new until it chooses to. The exchange:
    first, through the adapter's read route (below), classifies from what it reads, and then
    cancels whenever that state still holds an active task, whether or not an executor has
    touched it; the cancel goes through an explicit cancel route that takes the task id the
-   opening response named, whether or not the record still holds it, and lands on the bus as
+   adapter answered with, whether or not the record still holds it, and lands on the bus as
    `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the stop
    text. The harness sends no message at the deadline, so nothing it does there can mint a
    task or spend a model turn.
@@ -161,10 +168,10 @@ identity, roster read, post-to-conversation, and `openDirect`, and the inject ad
 all five rather than a subset the session record has to special-case. One more route sits on
 the adapter's side of the door and is not a sixth backend operation: a pure read of the
 conversation's state that mutates nothing. It returns what the session record holds for the key,
-the active task with its `SubmittedAt` and `Detached`, the highest executor state on the task's
-stream (none, `submitted` or `working`), and the last posted message, plus the gateway's
-configured grace and the backend the gateway armed; the infrastructure paragraph below says what
-the harness does with it.
+the active task with its `SubmittedAt` and `Detached`, the fold of the task's stream, its state
+none, `submitted`, `working` or a terminal with the result text, and the last posted message,
+plus the gateway's configured grace and the backend the gateway armed; the infrastructure
+paragraph below says what the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
@@ -209,14 +216,20 @@ that reads "status". The harness therefore sends no message at the deadline. It 
 conversation's state through the adapter's read route, a pure read that mutates nothing: the
 heal is a write under the per-conversation lock, and a route that performed it from outside
 `handleInbound` would be a second writer racing the next inbound message for the record. The
-harness classifies from one of four outcomes, by the highest executor state the route returns:
-no active task and a terminal posted, the run finished as the deadline fired, so it is graded
-like any other; an active task with no executor event, nobody took it, infrastructure, whether
-or not the gateway has released the conversation yet; an active task at `submitted` and never
-`working`, an executor accepted it and queued it for the whole budget, infrastructure; an active
-task at `working`, a graded timeout. In every outcome that leaves an active task, the
-no-executor one included, the cancel then goes out for the task id the opening response named,
-whether or not the record still holds it. The classification comes from the read and never from
+harness classifies from one of five outcomes, by the state the route's fold returns: no active
+task and a terminal posted, the run finished as the deadline fired, so it is graded like any
+other; an active task with no executor event, nobody took it, infrastructure, whether or not the
+gateway has released the conversation yet; an active task at `submitted` and never `working`, an
+executor accepted it and queued it for the whole budget, infrastructure; an active task at
+`working`, a graded timeout; and an active task whose stream already folds to a terminal, which
+is the relay's lost record write, the event acked when the relay enqueued it, before the queued
+write cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
+like the first, with the answer read from the fold rather than the posted message, and gets no
+cancel, because there is nothing left to cancel; the record then holds a finished task until
+something releases it, which on a key never reused is nothing and costs nothing. In every other
+outcome that leaves an active task, the no-executor one included, the cancel then goes out for
+the task id the adapter answered with, whether or not the record still holds it. The
+classification comes from the read and never from
 the cancel's answer: a cancel sent to a task nobody consumed gets "cancel sent" back and no
 terminal follows, so the answer is not evidence, and the cancel is sent anyway because the
 submission is durable on the task's `in` subject under the bridge's durable consumer, so a bridge
@@ -224,9 +237,10 @@ that first binds inside the stream's retention window would otherwise be handed 
 prompt and run it with the install's credentials. What the cancel buys on the bridge as it stands
 is a bound, not a clean refusal: the durable consumer delivers serially and acks after the
 handler, so the cancel is read only after the submission's accept returns, and by then an idle
-worker, which a freshly bound bridge has by construction, has taken the run, published `working`
-and spawned the stale prompt; the cancel then kills it within the bridge's kill grace and the
-terminal is `canceled-by-request`, which is the record. `canceled-before-start` is what a task
+worker, which a freshly bound bridge ordinarily has, has taken the run, published `working` and
+spawned the stale prompt, so spawn-before-cancel is the common case and `canceled-before-start`
+the exception; the cancel then kills it within the bridge's kill grace and the terminal is
+`canceled-by-request`, which is the record. `canceled-before-start` is what a task
 still queued gets, the `submitted` outcome above. The stage-1 bridge work below therefore
 includes a look-ahead that makes the refusal clean. The release still happens on the next real
 inbound message, as today, which matters
