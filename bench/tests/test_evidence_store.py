@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 
 import pytest
@@ -62,6 +63,9 @@ class FakeGcloud:
 
     def __init__(self, objects: dict[str, str] | None = None):
         self.objects = dict(objects or {})
+        # Cats run on a pool, so the order of `cat` entries here is whichever
+        # worker arrived first. Filter this per case; do not read it as a
+        # sequence across cases.
         self.calls: list[list[str]] = []
         self.fail: str | None = None
 
@@ -443,6 +447,47 @@ def test_one_worker_reads_the_same_thing_as_many(gcloud):
     # A junk worker count bounds a read; it must not be why a run cannot be
     # graded, so it falls back rather than raising out of ThreadPoolExecutor.
     assert GcsBackend("gs://b/e", cat_workers=0).sources() == serial
+
+
+def test_the_per_case_reads_are_in_flight_at_the_same_time(gcloud, monkeypatch):
+    """The overlap itself, which is the only reason any of this is here.
+
+    Pinned with a barrier rather than a stopwatch, so it asserts concurrency
+    and not the speed of the machine. A serial read never reaches the fourth
+    party, the barrier breaks, and the test fails -- which is what the other
+    tests here miss: every one of them passes against the old serial read.
+    """
+    for name in ("case-a", "case-b", "case-c", "case-d"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    barrier = threading.Barrier(4)
+    inner = evidence_store.subprocess.run
+
+    def wait_for_the_others(argv, **kwargs):
+        if argv[2] == "cat":
+            barrier.wait(timeout=10)
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(evidence_store.subprocess, "run", wait_for_the_others)
+
+    sources = GcsBackend("gs://b/e", cat_workers=4).sources()
+    assert [s.case_id for s in sources] == ["case-a", "case-b", "case-c", "case-d"]
+
+
+def test_the_worker_count_is_an_env_knob_that_cannot_break_a_read(monkeypatch):
+    """An operator can turn the fan-out down without a code change.
+
+    It exists because sixteen concurrent ``gcloud`` processes are the one part
+    of this that a small pod might not have the memory for, and a code change
+    is a poor mitigation for an outage. Junk falls back, like its sibling.
+    """
+    monkeypatch.setenv("EVAL_BASELINE_CAT_WORKERS", "2")
+    assert open_backend("gs://b/e").cat_workers == 2
+
+    for junk in ("", "lots", "0", "-4"):
+        monkeypatch.setenv("EVAL_BASELINE_CAT_WORKERS", junk)
+        assert open_backend("gs://b/e").cat_workers == evidence_store.DEFAULT_CAT_WORKERS
 
 
 def test_a_flat_object_still_reads(gcloud):

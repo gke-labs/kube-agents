@@ -42,7 +42,8 @@ future writer could get wrong.
 ``gcloud storage`` is shelled out to rather than importing
 ``google-cloud-storage``. The bench package has no GCP dependency today and
 this is not worth acquiring one for; ``gcloud`` is already present wherever
-this runs.
+this runs. The price is process startup per case, which is why ``sources()``
+fans its per-case reads out across a bounded pool.
 """
 
 from __future__ import annotations
@@ -71,7 +72,8 @@ DEFAULT_MAX_OBJECTS = 200
 DEFAULT_TIMEOUT = 60
 
 #: How many per-case `gcloud storage cat` calls run at once. Bounded so a large
-#: store cannot fork one process per case at the same moment.
+#: store cannot fork one `gcloud` process per case at the same moment; each is
+#: a Python CLI and costs upwards of 100 MB.
 DEFAULT_CAT_WORKERS = 16
 
 
@@ -147,10 +149,29 @@ def max_objects_from_env() -> int:
     return value if value > 0 else DEFAULT_MAX_OBJECTS
 
 
+def cat_workers_from_env() -> int:
+    """``EVAL_BASELINE_CAT_WORKERS``, or the default.
+
+    Falls back like ``max_objects_from_env`` and for the same reason. It is a
+    knob rather than a constant so that a pod too small for sixteen concurrent
+    ``gcloud`` processes can be turned down without a code change.
+    """
+    raw = os.environ.get("EVAL_BASELINE_CAT_WORKERS", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_CAT_WORKERS
+    return value if value > 0 else DEFAULT_CAT_WORKERS
+
+
 def open_backend(location: str | Path) -> LocalBackend | GcsBackend:
     """Pick a backend from the location string. ``gs://`` means GCS."""
     if is_gcs(location):
-        return GcsBackend(str(location), max_objects=max_objects_from_env())
+        return GcsBackend(
+            str(location),
+            max_objects=max_objects_from_env(),
+            cat_workers=cat_workers_from_env(),
+        )
     return LocalBackend(location)
 
 
@@ -311,27 +332,25 @@ class GcsBackend:
         if not per_case:
             return []
 
-        # Concurrently, because the cost here is one `gcloud` process startup
-        # per case and nothing else: ~1.3s each, paid serially, against objects
-        # of a few hundred bytes. At 38 cases that is 47s a read, and the gate
-        # reads the whole store once per graded case. Order is preserved: map
-        # yields in submission order, and truncated was filled above, off the
-        # pool, so no worker touches it.
+        # Concurrently, because the cost of a read is one `gcloud` process
+        # startup per case (~1.3s) against objects of a few hundred bytes, and
+        # the gate reads the whole store once per graded case. Order survives:
+        # map yields in submission order, and truncated was filled above, off
+        # the pool, so no worker touches it.
         def fetch(item: tuple[str, list[str]]) -> str:
             return self._run(["cat", *item[1]])
 
-        # Clamped low as well as high, for the reason DEFAULT_MAX_OBJECTS gives:
-        # this bounds a read, and a junk value for it must not be why a run
+        # Clamped because a zero or negative would raise out of
+        # ThreadPoolExecutor, and a worker count must never be why a run
         # cannot be graded.
         workers = max(1, min(self.cat_workers, len(per_case)))
-        pool = ThreadPoolExecutor(max_workers=workers)
-        try:
+
+        # Waited on rather than abandoned. A `cat` that fails while others are
+        # still in flight raises out of map, and threads left running would be
+        # joined at interpreter exit instead -- hanging the process for up to
+        # the timeout after it had already reported.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             texts = list(pool.map(fetch, per_case))
-        finally:
-            # cancel_futures, because map submits every case up front: an
-            # unreachable store would otherwise pay one timeout per wave
-            # before it could report, where the serial read paid exactly one.
-            pool.shutdown(wait=False, cancel_futures=True)
 
         return [
             EvidenceSource(case_id, f"{self.location}/{case_id}/", text)
