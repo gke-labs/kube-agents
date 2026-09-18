@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 
 import pytest
 
@@ -369,6 +370,51 @@ def test_the_case_is_the_first_segment_whatever_the_depth(gcloud):
         [nested("case-a", KEY_DIR, 1), nested("case-b", KEY_DIR, 1)]
     )
     assert [s.case_id for s in GcsBackend("gs://b/e").sources()] == ["case-a", "case-b"]
+
+
+def test_cases_keep_their_order_when_their_reads_finish_out_of_order(
+    gcloud, monkeypatch
+):
+    """Cases are read concurrently, and the result is still ordered by case id.
+
+    The order is load-bearing twice over: ``_parse_source`` reports a bad line
+    by its position within a case, and a reader that shuffled cases would make
+    the gate's output depend on which ``gcloud`` returned first.
+    """
+    for name in ("case-a", "case-b", "case-c", "case-d"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    inner = evidence_store.subprocess.run
+
+    def slow_on_the_first_case(argv, **kwargs):
+        # case-a is submitted first and returns last, so completion order and
+        # submission order disagree for certain rather than by luck.
+        if argv[2] == "cat" and "case-a" in argv[3]:
+            time.sleep(0.05)
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(evidence_store.subprocess, "run", slow_on_the_first_case)
+
+    sources = GcsBackend("gs://b/e").sources()
+    assert [s.case_id for s in sources] == ["case-a", "case-b", "case-c", "case-d"]
+    # Each case got its own text, not a neighbour's.
+    for source in sources:
+        assert json.loads(source.text)["case"] == source.case_id
+
+
+def test_one_worker_reads_the_same_thing_as_many(gcloud):
+    """The concurrency is a speed-up, not a behaviour change."""
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    serial = GcsBackend("gs://b/e", cat_workers=1).sources()
+    parallel = GcsBackend("gs://b/e", cat_workers=8).sources()
+    assert serial == parallel
+    # A junk worker count bounds a read; it must not be why a run cannot be
+    # graded, so it falls back rather than raising out of ThreadPoolExecutor.
+    assert GcsBackend("gs://b/e", cat_workers=0).sources() == serial
 
 
 def test_a_flat_object_still_reads(gcloud):

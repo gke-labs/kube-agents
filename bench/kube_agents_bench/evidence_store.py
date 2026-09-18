@@ -70,9 +70,9 @@ DEFAULT_MAX_OBJECTS = 200
 #: Seconds before a `gcloud storage` call is treated as unreachable.
 DEFAULT_TIMEOUT = 60
 
-#: How many per-case `gcloud storage cat` calls run at once. Bounded well under
-#: the case count so a large store cannot fork a process per case at once.
-_CAT_WORKERS = 16
+#: How many per-case `gcloud storage cat` calls run at once. Bounded so a large
+#: store cannot fork one process per case at the same moment.
+DEFAULT_CAT_WORKERS = 16
 
 
 class StoreUnreachable(RuntimeError):
@@ -220,10 +220,12 @@ class GcsBackend:
         *,
         max_objects: int = DEFAULT_MAX_OBJECTS,
         timeout: int = DEFAULT_TIMEOUT,
+        cat_workers: int = DEFAULT_CAT_WORKERS,
     ):
         self.location = location.rstrip("/")
         self.max_objects = max_objects
         self.timeout = timeout
+        self.cat_workers = cat_workers
         self.truncated: dict[str, int] = {}
 
     def describe(self) -> str:
@@ -318,8 +320,18 @@ class GcsBackend:
         def fetch(item: tuple[str, list[str]]) -> str:
             return self._run(["cat", *item[1]])
 
-        with ThreadPoolExecutor(max_workers=min(_CAT_WORKERS, len(per_case))) as pool:
+        # Clamped low as well as high, for the reason DEFAULT_MAX_OBJECTS gives:
+        # this bounds a read, and a junk value for it must not be why a run
+        # cannot be graded.
+        workers = max(1, min(self.cat_workers, len(per_case)))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             texts = list(pool.map(fetch, per_case))
+        finally:
+            # cancel_futures, because map submits every case up front: an
+            # unreachable store would otherwise pay one timeout per wave
+            # before it could report, where the serial read paid exactly one.
+            pool.shutdown(wait=False, cancel_futures=True)
 
         return [
             EvidenceSource(case_id, f"{self.location}/{case_id}/", text)
