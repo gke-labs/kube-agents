@@ -1694,6 +1694,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
+  # Which case and which repetition this unit is, for any transport that can
+  # carry an id into the agent's own records. The inject transport sends the
+  # pair as the backend message id, which the gateway's ingress log joins to
+  # the correlationId -- so the audit chain runs from this run directory to
+  # every hop the task took, with nothing else added.
+  export EVAL_CASE_ID="${name}" EVAL_REPETITION="${rep}"
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0

@@ -231,6 +231,25 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
     ),
+    # The eval-only inject door. Two files, two modules: the operator decides
+    # whether the door is rendered at all (Go module k8s-operator) and the
+    # gateway decides what it does once it is (Go module a2a). A1's darkness
+    # assertion reads the first and A3's identity assertion the second, and
+    # neither module's own test suite can see the other.
+    "a2a_inject_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        (
+            "func a2aInjectBackendEnabled",
+            "func buildA2AGatewayDeployment",
+            ") applyA2AInjectBackend(",
+            ") reconcileA2ANetworkFences(",
+            "a2aInjectBackendEnvVar =",
+        ),
+    ),
+    "a2a_inject_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
+    ),
     # labelPartOf lives here rather than beside the fence, so resolving the
     # operator's side of the pair needs both files.
     "operator_labels": Source(

@@ -1033,6 +1033,58 @@ Mutation(
         "entering it costs an argument",
     ),
     Mutation(
+        "A3-inject-door-always-rendered",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("\tif a2aInjectBackendEnabled() {\n\t\tinjectEnv = []corev1.EnvVar{",
+         "\tif true {\n\t\tinjectEnv = []corev1.EnvVar{"),
+        "test_A3_the_inject_door_renders_only_under_the_operator_flag",
+        "render the eval door's env, port and principal-map mount on every "
+        "mode: next gateway rather than only under the operator's flag. The "
+        "door has no customer-facing purpose and maps a principal out of a "
+        "request body, so an install that never asked for it must not carry "
+        "it -- and the operator's own render tests pass a flag in, so they "
+        "assert what happens when it is set rather than that anything "
+        "consults it",
+    ),
+    Mutation(
+        "A3-inject-flag-fails-open",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('\treturn os.Getenv(a2aInjectBackendEnvVar) == "true"',
+         "\treturn os.Getenv(a2aInjectBackendEnvVar) != \"\""),
+        "test_A3_the_inject_flag_is_not_a_field_a_customer_can_set",
+        "make the eval flag true for any non-empty value. A typo, a stray "
+        "\"false\" or a templating artifact would then render a door that "
+        "maps a body-supplied principal, on an install that never asked for "
+        "one, instead of leaving it shut, which is the direction a flag "
+        "guarding this must never relax in",
+    ),
+    Mutation(
+        "A3-inject-principal-unchecked",
+        "a2a/gateway/gchat.go",
+        ("\tif !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {",
+         "\tif false {"),
+        "test_A3_the_inject_door_cannot_assert_a_cloud_principal",
+        "let the eval door's principal map resolve to any principal at all. "
+        "The door takes its author from a request body, so the map is the "
+        "only thing between a token holder and a principal of their "
+        "choosing; without this refusal an entry naming a cloud identity "
+        "would be honoured, which is an identity-minting door the day "
+        "publisher identity arms",
+    ),
+    Mutation(
+        "A3-inject-principal-defaulted",
+        "a2a/gateway/gchat.go",
+        ('\t\t\t"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n\t\treturn ""\n\t}',
+         '\t\t\t"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n'
+         "\t\tprincipal = injectEvalPrincipalPrefix + principal\n\t}"),
+        "test_A3_the_inject_door_cannot_assert_a_cloud_principal",
+        "keep the refusal's condition and log line but repair the value into "
+        "the eval namespace instead of dropping it. The check still runs, the "
+        "error is still logged, and a map entry naming a cloud identity is "
+        "still honoured -- so an assertion that only looks for the condition "
+        "passes on a resolver that defaults",
+    ),
+    Mutation(
         "C1-session-fence-selector-drift",
         "a2a/gateway/spawn.go",
         ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),

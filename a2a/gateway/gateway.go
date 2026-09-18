@@ -104,8 +104,22 @@ type Gateway struct {
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
 
-	// backend names the chat backend for authority blocks.
+	// backend names the gateway's configured chat backend, which is what a
+	// message that names none is attributed to. A message from the inject
+	// side door names its own (backendFor).
 	backend string
+	// injectAudience is injectPM's inject: section with the prefix removed
+	// and only eval: values kept -- the shape BuildAuthority and hashRoster
+	// resolve a roster's raw author ids through. Without it the requester's
+	// roster entry hashes the raw author id while Requester.Principal
+	// hashes the resolved principal, and "is the requester in the audience"
+	// answers no on the one backend where the roster is exactly the
+	// requester.
+	injectAudience *PrincipalMap
+	// injectPM is the side door's own principal map, loaded only when the
+	// door is armed and never consulted for a message from a real backend.
+	// Separate from pm on purpose: see Config.InjectPrincipalMapPath.
+	injectPM *PrincipalMap
 	// gchatAllowed and gchatAllowAll gate the gchat backend's identity
 	// resolution (Config.GchatAllowedUsers, lowercased at build).
 	gchatAllowed  map[string]bool
@@ -155,11 +169,45 @@ func New(o Options) (*Gateway, error) {
 		// relay with principal-map resolution.
 		backend = o.Config.Backend()
 	}
+	if backend == "" && o.Config.InjectArmed() {
+		// No real backend and the door armed: the door is the whole of the
+		// ingress, so it is also the default attribution. Every message it
+		// delivers stamps this anyway; what this decides is what an empty
+		// Backend would mean, and "" in an authority block is worse than
+		// the truth.
+		backend = injectBackend
+	}
+	if backend == injectBackend {
+		// Said out loud, and repeated on the door's read route
+		// (ConversationState.InjectOnly): an eval install is meant to look
+		// like this, but a `mode: next` install whose relay URL failed to
+		// render looks exactly the same, and the difference between the
+		// two must not be silence.
+		log.Warn("the gateway is running on the inject door alone: no Discord token and no Chat relay are armed, " +
+			"so nothing but the eval door can reach this install (inject-only)")
+	}
 	// gchat resolves identity from the Google-asserted email, not from the
-	// map — an empty map is only a lockout on the backends that use one.
-	if backend != gchatBackend && pm.Len() == 0 {
+	// map — an empty map is only a lockout on the backends that use one, and
+	// a gateway whose only ingress is the side door uses the door's map
+	// below instead of this one.
+	if backend == discordBackend && pm.Len() == 0 {
 		log.Warn("principal map is empty; every inbound message will be dropped at verification",
 			"path", o.Config.PrincipalMapPath)
+	}
+	// The side door's map, which is a different file and not a section of
+	// the one above: a colon is not a legal ConfigMap key, so the prefixed
+	// entries cannot live in the directory-shaped map a chat backend mounts.
+	var injectPM, injectAudience *PrincipalMap
+	if o.Config.InjectArmed() {
+		injectPM, err = LoadPrincipalMap(o.Config.InjectPrincipalMapPath)
+		if err != nil {
+			return nil, err
+		}
+		injectAudience = injectPM.Section(injectPrincipalPrefix, injectEvalPrincipalPrefix)
+		if injectPM.Len() == 0 {
+			log.Warn("the inject door's principal map is empty; every injected message will be dropped at verification",
+				"path", o.Config.InjectPrincipalMapPath)
+		}
 	}
 	gchatAllowed := map[string]bool{}
 	for _, u := range o.Config.GchatAllowedUsers {
@@ -200,6 +248,8 @@ func New(o Options) (*Gateway, error) {
 		taskSessions:   map[string]string{},
 		relays:         map[string]*relayState{},
 		backend:        backend,
+		injectPM:       injectPM,
+		injectAudience: injectAudience,
 		gchatAllowed:   gchatAllowed,
 		gchatAllowAll:  o.Config.GchatAllowAllUsers,
 		droppedNotices: map[string]bool{},
@@ -210,6 +260,12 @@ func New(o Options) (*Gateway, error) {
 			g.handleInbound(msg)
 		}
 	})
+	// The read route's probe, for an adapter whose caller is a program (the
+	// inject door, and the side door composite in front of it). A chat
+	// backend does not implement ProbeSink and is offered nothing.
+	if sink, ok := o.Adapter.(ProbeSink); ok {
+		sink.SetProbe(g.probeConversation)
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner
@@ -285,10 +341,11 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// backend-asserted id — their own identity, in their own conversation,
 	// which is what the admin needs to add and is not an oracle over
 	// anything the sender does not already see.
-	principal := g.resolvePrincipal(msg.AuthorID)
+	backend := g.backendFor(msg)
+	principal := g.resolvePrincipal(backend, msg.AuthorID)
 	if principal == "" {
 		g.log.Warn("dropping message from unverified sender",
-			"backend", g.backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
 		// Keyed case-folded (an asserted address that varies in case is one
 		// person) and bounded the way the adapters bound their own maps:
 		// wholesale eviction at the cap, which at worst repeats a notice.
@@ -301,9 +358,9 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		g.droppedNotices[key] = true
 		g.mu.Unlock()
 		if !notified {
-			g.post(msg.Conversation, "⛔ I can't verify who you are on "+g.backend+
+			g.post(msg.Conversation, "⛔ I can't verify who you are on "+backend+
 				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
-				unverifiedRemedyFor(g.backend)+".")
+				unverifiedRemedyFor(backend)+".")
 		}
 		return
 	}
@@ -341,9 +398,9 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if !slices.Contains(rosterIDs, msg.AuthorID) {
 		rosterIDs = append(rosterIDs, msg.AuthorID)
 	}
-	authority := BuildAuthority(g.ps, g.pm, principal, g.backend, msg.AuthorID,
-		verifiedByFor(g.backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
-	rec.Roster = hashRoster(g.ps, g.pm, rosterIDs)
+	authority := BuildAuthority(g.ps, g.principalMapFor(backend), principal, backend, msg.AuthorID,
+		verifiedByFor(backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
+	rec.Roster = hashRoster(g.ps, g.principalMapFor(backend), rosterIDs)
 
 	// Heal a stale ActiveTask before routing: if the task is already
 	// terminal on the stream (the relay's ack raced a transient failure, or
@@ -372,33 +429,12 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// residue Session lifecycle names. The task index stays, as in the
 	// terminal case, so a late start still renders; its key is retired
 	// only if the task ever terminates.
-	if active := rec.ActiveTask; active != nil && !active.Detached {
-		task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
-		healed := false
-		switch {
-		case err == nil && task.Final:
-			g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
-			g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
-			healed = true
-		case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
-			time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
-			g.log.Info("healing an active task with no first event inside the grace",
-				"conversation", rec.Key, "taskId", active.TaskID, "addressee", rec.Addressee,
-				"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
-			g.post(rec.Key, fmt.Sprintf(neverStartedNotice, active.TaskID, g.cfg.FirstEventGrace))
-			healed = true
-		}
-		if healed {
-			rec.ActiveTask = nil
-			// Write the release now, not at the end of the turn: a turn that
-			// returns early — a cap refusal, on exactly the Delegate that
-			// follows a wedge — would otherwise announce a release it never
-			// wrote and announce it again on the next turn.
-			if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
-				g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
-			}
-		}
-	}
+	//
+	// This is the heal's only caller. The inject door's read route
+	// (probeConversation) reports the same facts and heals nothing: the
+	// heal writes the record under this conversation's lock, and a read
+	// that also wrote would be a second writer racing the next turn.
+	g.healActiveTask(ctx, rec)
 
 	active := rec.ActiveTask
 	// The status matcher's wide interrogative rule is only safe where a
@@ -409,12 +445,20 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// reading of "any update on the rollout" would steal a NEW task to
 	// replay a dead one, so the cost argument inverts there too.
 	wideStatus := !rec.AddressedToOwnSession() && !(active != nil && active.Detached)
+	// An explicit cancel from a backend that can express one is read before
+	// the text is read at all: it is not an ask, and a program must never
+	// have to spell "stop" to reach a control path.
+	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
 	switch {
-	case active != nil && isStatusQuery(msg.Text, wideStatus):
+	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
-	case active != nil && !active.Detached && isStop(msg.Text):
+	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
+		// A cancel that names a task the conversation no longer holds as
+		// active -- the heal a few lines up may just have released it.
+		g.cancelNamedTask(ctx, rec, msg.TaskID, authority)
+	case active != nil && !active.Detached && stopping:
 		g.cancelTask(ctx, rec, authority)
-	case isStop(msg.Text):
+	case stopping:
 		// A stop with nothing to stop must not fall through and become a
 		// task that literally reads "stop": the impatient second "stop"
 		// (cancel sent, terminal pending) and a bare "stop" with nothing
@@ -554,6 +598,153 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	}
 }
 
+// backendFor names the ingress one message arrived through. A message that
+// names none is the configured backend's, which is every chat backend's
+// case; the inject door stamps its own, because it can be armed beside a
+// real backend and the authority block must say which door a task came in
+// through rather than which backend the process was configured with.
+func (g *Gateway) backendFor(msg InboundMessage) string {
+	if msg.Backend != "" {
+		return msg.Backend
+	}
+	return g.backend
+}
+
+// principalMapFor is the map that backend's identities live in. The side
+// door's is its own and is never a fallback to the chat map, nor the chat
+// map's a fallback to it: an id that resolves in the wrong map would be an
+// identity asserted by a door that is not allowed to assert it.
+func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
+	if backend == injectBackend && g.injectAudience != nil {
+		return g.injectAudience
+	}
+	return g.pm
+}
+
+// healActiveTask is the stale-task heal handleInbound runs before routing,
+// and it runs nowhere else: it writes the record, so it belongs under the
+// per-conversation lock inside the keyed queue with the rest of a turn. It
+// looks at the active task's stream once and, when the task is already
+// terminal or has produced nothing past FirstEventGrace, releases the
+// conversation and writes the record.
+//
+// A record with no active task, or a detached one, is left alone: there is
+// nothing to heal and, for a detached task, the cancel already published is
+// the answer the conversation is waiting on.
+func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
+	active := rec.ActiveTask
+	if active == nil || active.Detached {
+		return
+	}
+	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
+	healed := false
+	switch {
+	case err == nil && task.Final:
+		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
+		g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
+		// The terminal the relay should have delivered, delivered to the
+		// adapter now: the stream's word, so it is the executor's. A chat
+		// backend is told nothing (TaskObserver); the inject door records
+		// it, and a program awaiting the task ends its wait on it rather
+		// than on a status card it would have to parse. The fold carries
+		// no status message, so no reason rides with it.
+		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, TerminalFromExecutor, "")
+		healed = true
+	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
+		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
+		g.log.Info("healing an active task with no first event inside the grace",
+			"conversation", rec.Key, "taskId", active.TaskID, "addressee", rec.Addressee,
+			"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
+		g.post(rec.Key, fmt.Sprintf(neverStartedNotice, active.TaskID, g.cfg.FirstEventGrace))
+		// And tell the adapter, for the caller that is a program. The
+		// notice above is the answer for a human; a program reading the
+		// conversation would have to match its prose to learn that its
+		// task was never taken, and the difference between that and a
+		// failed answer decides whether a run is the agent's fault or
+		// the install's. Nothing is published: as handleInbound's comment
+		// says, age is not evidence.
+		g.observeTaskTerminal(rec.Key, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
+		healed = true
+	}
+	if healed {
+		rec.ActiveTask = nil
+		// Write the release now, not at the end of the turn: a turn that
+		// returns early — a cap refusal, on exactly the Delegate that
+		// follows a wedge — would otherwise announce a release it never
+		// wrote and announce it again on the next turn.
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
+		}
+	}
+}
+
+// probeConversation is the ConversationProbe the gateway offers a ProbeSink:
+// the session record for one conversation and the state of its active
+// task's stream, as they stand. A pure read, as ConversationProbe requires:
+// no lock, no heal, no post, no publish, no write. It does not take the
+// session lock because it needs nothing the lock protects -- the KV read is
+// atomic and the stream replay is its own snapshot -- and holding it would
+// let a slow read delay the turn the caller is waiting on.
+func (g *Gateway) probeConversation(ctx context.Context, key string) (ConversationState, error) {
+	state := ConversationState{
+		Backend:    g.backend,
+		InjectOnly: g.backend == injectBackend,
+		Grace:      g.cfg.FirstEventGrace,
+	}
+	rec, err := g.reg.Get(ctx, key)
+	if err != nil {
+		return state, fmt.Errorf("session lookup: %w", err)
+	}
+	if rec == nil || rec.ActiveTask == nil {
+		return state, nil
+	}
+	active := rec.ActiveTask
+	state.Active = true
+	state.TaskID = active.TaskID
+	state.SubmittedAt = active.SubmittedAt
+	state.Detached = active.Detached
+	if !active.SubmittedAt.IsZero() {
+		state.Age = time.Since(active.SubmittedAt)
+	}
+	// Against the addressee the task's own subjects carried: after a
+	// Delegate re-home rec.Addressee is not it (the relay's terminal replay
+	// makes the same choice).
+	addressee := rec.AddresseeFor(active.TaskID)
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
+	switch {
+	case terr == nil:
+		state.ExecutorState = task.State
+		state.Final = task.Final
+		if task.Final {
+			// The fold's terminal, with whose word it is: the events
+			// subject is the executor's, the supervisor subject the
+			// gateway's. A caller grading an answer off this read takes
+			// only the executor's; a supervisor terminal says an executor
+			// died or never ran, which is the install's.
+			state.TerminalSource = TerminalFromExecutor
+			if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
+				state.TerminalSource = TerminalFromGateway
+			}
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				state.Result = joinTextParts(art.Parts)
+			}
+			if task.FinalMessage != nil {
+				state.Reason = joinTextParts(task.FinalMessage.Parts)
+			}
+		}
+	case isTaskNotFound(terr):
+		// No events at all: no executor has touched the task. Reported as
+		// the empty state, which is the fact; whether the task's age makes
+		// that "nobody took it" is the caller's to decide against Grace.
+	default:
+		// A transport failure cannot rule out events, so it is not "no
+		// executor": the caller learns that the gateway could not look,
+		// never that nothing is there.
+		return state, fmt.Errorf("reading task %s on %s: %w", active.TaskID, addressee, terr)
+	}
+	return state, nil
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
 // TaskObserver about a task's two ends. Both are no-ops for every chat
 // backend, which does not implement the interface: a human reads the chat, so
@@ -564,9 +755,9 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	}
 }
 
-func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource) {
+func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
-		observer.TaskTerminal(conversation, taskID, state, source)
+		observer.TaskTerminal(conversation, taskID, state, source, reason)
 	}
 }
 
@@ -660,7 +851,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
 		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now()}
-	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee})
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID})
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 	}
@@ -693,7 +884,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		// is the gateway telling its own adapter, not a terminal on the
 		// stream, which would be a claim about a task the stream has never
 		// heard of.
-		g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway)
+		g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
 		return
 	}
 
@@ -773,6 +964,57 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	// close if it ever bites.
 	rec.MarkCanceled(active.TaskID)
 	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+}
+
+// cancelNamedTask publishes kind:cancel for a task this conversation has
+// held but no longer holds as active. Only a backend that was answered with
+// a task id can ask for it (InboundMessage.TaskID), and the case it exists
+// for is the inject door's: a submission no executor took is released by the
+// never-started heal on the conversation's next turn, which is the cancel
+// turn itself, so a cancel routed on the active task alone would find
+// nothing to stop -- while the submission is still on the in subject, and the
+// bridge's durable consumer delivers from the start of the stream, so a
+// bridge that binds later within retention would run the stale prompt. The
+// cancel bounds that run. It rides the task's own chain (the history entry
+// keeps the correlation id and the addressee), is recorded on the history
+// entry like any published cancel, and detaches nothing, because nothing is
+// active. A task this conversation never held is refused: the gateway does
+// not publish cancels for tasks it did not start.
+func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskID string, authority []byte) {
+	ref, held := rec.TaskRefFor(taskID)
+	if !held {
+		g.post(rec.Key, fmt.Sprintf("🤷 this conversation never held task `%s`; nothing sent", taskID))
+		return
+	}
+	if ref.Canceled {
+		g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
+		return
+	}
+	if ref.CorrelationID == "" {
+		// A history entry written before the correlation id was recorded on
+		// it. The envelope needs one, and inventing a fresh chain for a
+		// cancel would break the audit join; say so rather than fail the
+		// build silently and leave the caller waiting on an entry.
+		g.post(rec.Key, fmt.Sprintf("🤷 task `%s` predates this record's correlation ids; nothing sent", taskID))
+		return
+	}
+	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, rec.ContextID, ref.CorrelationID,
+		lib.WithTo(lib.Party{Session: ref.Addressee}),
+		lib.WithAuthority(authority))
+	if err != nil {
+		g.log.Error("cancel envelope build failed", "taskId", taskID, "err", err)
+		return
+	}
+	if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, taskID), env); err != nil {
+		g.log.Error("cancel publish failed", "taskId", taskID, "err", err)
+		g.post(rec.Key, "⚠️ could not send the stop; try again")
+		return
+	}
+	rec.MarkCanceled(taskID)
+	g.log.Info("cancel published for a task the conversation no longer holds",
+		"conversation", rec.Key, "taskId", taskID, "addressee", ref.Addressee)
+	g.post(rec.Key, fmt.Sprintf("🛑 cancel sent for task `%s`, which this conversation no longer holds — "+
+		"it ends when an executor confirms, if one ever took it", taskID))
 }
 
 // answerStatusByReplay answers "what is it doing" from the stream, not from

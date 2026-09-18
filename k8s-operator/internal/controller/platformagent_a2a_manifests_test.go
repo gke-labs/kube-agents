@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -3634,10 +3635,11 @@ func TestCheckA2AUserGrants(t *testing.T) {
 
 // ---- the inject backend (#1704) ------------------------------------------
 //
-// The gateway's inject backend is an unauthenticated HTTP door into
-// handleInbound, for the eval harness. Everything below is about the two
-// properties that keep it from being a hole: it is rendered only when the
-// operator itself was deployed with the flag, and while it is rendered the
+// The gateway's inject door is an HTTP door into handleInbound, for the eval
+// harness. Everything below is about the properties that keep it from being a
+// hole: it is rendered only when the operator itself was deployed with the
+// flag, every request to it carries a bearer token this operator mints, the
+// only identity it admits is an eval one, and while it is rendered the
 // gateway pod is fenced against every pod on the network.
 
 // a2aInjectAgentState reconciles a next-mode agent twice (finalizer pass,
@@ -3734,8 +3736,32 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	// default path is the hand-made Discord map, which carries no eval
 	// author, and a gateway reading it drops every injected message at
 	// verification with nothing in the render looking wrong.
-	if got := env["A2A_PRINCIPAL_MAP"].Value; got != a2aInjectPrincipalMapPath {
-		t.Errorf("A2A_PRINCIPAL_MAP = %q, want the operator's own map at %q", got, a2aInjectPrincipalMapPath)
+	if got := env[a2aInjectPrincipalMapEnv].Value; got != a2aInjectPrincipalMapPath {
+		t.Errorf("%s = %q, want the operator's own map at %q",
+			a2aInjectPrincipalMapEnv, got, a2aInjectPrincipalMapPath)
+	}
+	// Beside the chat map rather than over it. The door may be armed next to
+	// a real backend now, and repointing the one variable would take that
+	// backend's identities away with it.
+	if got := env["A2A_PRINCIPAL_MAP"].Value; got == a2aInjectPrincipalMapPath {
+		t.Error("the door repointed A2A_PRINCIPAL_MAP, which is the chat backends' map")
+	}
+	// The token, from the Secret this operator mints, and NOT optional: a
+	// missing Secret must crash-loop the pod rather than leave the gateway
+	// to arm a door with no token -- which it would refuse to do anyway.
+	tokenRef := env[a2aInjectTokenEnvVar].ValueFrom
+	if tokenRef == nil || tokenRef.SecretKeyRef == nil {
+		t.Fatalf("%s is not read from a Secret: %+v", a2aInjectTokenEnvVar, env[a2aInjectTokenEnvVar])
+	}
+	if tokenRef.SecretKeyRef.Name != a2aInjectName(agent) || tokenRef.SecretKeyRef.Key != a2aInjectTokenKey {
+		t.Errorf("the token comes from %s/%s, want %s/%s", tokenRef.SecretKeyRef.Name,
+			tokenRef.SecretKeyRef.Key, a2aInjectName(agent), a2aInjectTokenKey)
+	}
+	if tokenRef.SecretKeyRef.Optional != nil && *tokenRef.SecretKeyRef.Optional {
+		t.Error("the token reference is optional, so a pod could start with an empty token")
+	}
+	if env[a2aInjectTokenEnvVar].Value != "" {
+		t.Error("the token is rendered as a literal env value rather than a Secret reference")
 	}
 
 	dep := &appsv1.Deployment{}
@@ -3745,7 +3771,7 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	container := dep.Spec.Template.Spec.Containers[0]
 	var mounted bool
 	for _, m := range container.VolumeMounts {
-		if m.MountPath == a2aInjectPrincipalMapPath {
+		if m.MountPath == a2aInjectPrincipalMapDir {
 			mounted = true
 			if !m.ReadOnly {
 				t.Error("the inject principal map is mounted writable")
@@ -3753,7 +3779,7 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 		}
 	}
 	if !mounted {
-		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aInjectPrincipalMapPath)
+		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aInjectPrincipalMapDir)
 	}
 	// The other map stays mounted and unread: two ConfigMaps cannot share a
 	// path, and an install with this backend has no Discord one anyway.
@@ -3771,11 +3797,31 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, cm); err != nil {
 		t.Fatalf("inject principal map: %v", err)
 	}
-	if got := cm.Data[a2aInjectAuthor]; got != a2aInjectPrincipal {
-		t.Errorf("the map resolves %q to %q, want %q", a2aInjectAuthor, got, a2aInjectPrincipal)
+	// One line, "inject:<author> eval:<...>". Both halves are load-bearing:
+	// the gateway looks up the prefixed key in this map alone, and refuses
+	// any value outside the eval namespace -- which is what keeps a door
+	// taking its author from a request body unable to assert a principal a
+	// real backend's sender could hold.
+	fixture := cm.Data[a2aInjectPrincipalMapKey]
+	lines := strings.Fields(strings.TrimSpace(fixture))
+	if len(cm.Data) != 1 || len(lines) != 2 {
+		t.Fatalf("the map is %q under %d keys, want one prefixed entry", fixture, len(cm.Data))
 	}
-	if len(cm.Data) != 1 {
-		t.Errorf("the map admits %d identities, want exactly the eval author", len(cm.Data))
+	if lines[0] != a2aInjectPrincipalPrefix+a2aInjectAuthor {
+		t.Errorf("the map's key is %q, want it qualified with %q", lines[0], a2aInjectPrincipalPrefix)
+	}
+	if !strings.HasPrefix(lines[1], "eval:") {
+		t.Errorf("the map admits %q, which is not an eval identity; a synthetic door must be "+
+			"structurally incapable of asserting a cloud principal", lines[1])
+	}
+
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, secret); err != nil {
+		t.Fatalf("the door's bearer token Secret was not rendered: %v", err)
+	}
+	if len(secret.Data[a2aInjectTokenKey]) < a2aInjectTokenNumBytes {
+		t.Errorf("the token is %d bytes; it is the door's whole access control",
+			len(secret.Data[a2aInjectTokenKey]))
 	}
 
 	svc := &corev1.Service{}
@@ -3843,13 +3889,65 @@ func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile after the flag went off: %v", err)
 	}
-	for _, obj := range []client.Object{&corev1.Service{}, &corev1.ConfigMap{}, &networkingv1.NetworkPolicy{}} {
+	for _, obj := range a2aInjectRenderedKinds() {
 		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
 			t.Errorf("%T %s survived the flag going off (err=%v)", obj, key.Name, err)
 		}
 	}
 	if env := a2aGatewayEnv(t, cl, agent); env[a2aInjectListenEnvVar].Value != "" {
 		t.Errorf("the gateway still listens on %q after the flag went off", env[a2aInjectListenEnvVar].Value)
+	}
+}
+
+// TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
+// four objects before deleting them, and the fourth is a Secret. The operator
+// ships secrets with get only, so a cached Get of one starts an informer
+// whose LIST is forbidden and blocks the single reconcile worker for good --
+// the fake client cannot show that hang (its cache is the store), so this
+// test fails the cached path outright and passes only if the Secret is read
+// through the reader the other A2A Secrets use.
+func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	// The "cache": the same store, refusing a Secret read once armed. Armed
+	// only for the flag-off reconcile, so the setup reconciles that mint the
+	// Secret through the reader are not what is under test.
+	var strict atomic.Bool
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
+				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d with the flag on: %v", i+1, err)
+		}
+	}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := base.Get(ctx, key, &corev1.Secret{}); err != nil {
+		t.Fatalf("the token Secret was not minted, so this test proves nothing: %v", err)
+	}
+
+	strict.Store(true)
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flag went off read a Secret through the cache: %v", err)
+	}
+	if err := base.Get(ctx, key, &corev1.Secret{}); !errors.IsNotFound(err) {
+		t.Fatalf("the token Secret survived the flag going off (err=%v)", err)
 	}
 }
 
@@ -3877,9 +3975,95 @@ func TestA2AInjectBackendGoesAwayOnAFlipToToday(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile after the flip to today: %v", err)
 	}
-	for _, obj := range []client.Object{&corev1.Service{}, &corev1.ConfigMap{}, &networkingv1.NetworkPolicy{}} {
+	for _, obj := range a2aInjectRenderedKinds() {
 		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
 			t.Errorf("%T %s survived the flip to today (err=%v)", obj, key.Name, err)
 		}
+	}
+}
+
+// a2aInjectRenderedKinds is every kind the door renders, for the tests that
+// assert it is entirely gone. A list rather than three literals: the Secret
+// was the fourth, and the next one must not be missed the same way.
+func a2aInjectRenderedKinds() []client.Object {
+	return []client.Object{
+		&corev1.Service{},
+		&corev1.ConfigMap{},
+		&networkingv1.NetworkPolicy{},
+		&corev1.Secret{},
+	}
+}
+
+// TestA2AInjectTokenIsMintedOnceAndKept: the token is a live credential a
+// caller holds for the length of an eval run. Re-rolling it on a reconcile --
+// which happens every few seconds -- would 401 a run mid-flight, and the
+// failure would read as a broken gateway rather than as a rotated secret.
+func TestA2AInjectTokenIsMintedOnceAndKept(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+
+	first := &corev1.Secret{}
+	if err := cl.Get(ctx, key, first); err != nil {
+		t.Fatalf("the token Secret was not rendered: %v", err)
+	}
+	minted := string(first.Data[a2aInjectTokenKey])
+	if minted == "" {
+		t.Fatal("the token is empty, so the gateway would refuse to arm the door")
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i, err)
+		}
+	}
+	again := &corev1.Secret{}
+	if err := cl.Get(ctx, key, again); err != nil {
+		t.Fatal(err)
+	}
+	if string(again.Data[a2aInjectTokenKey]) != minted {
+		t.Error("the token changed across reconciles; every caller holding it is now refused")
+	}
+}
+
+// TestA2AInjectTokenIsRepairedIfEmptied: an empty key renders an empty env,
+// and the gateway refuses to arm the door without a token -- so the pod would
+// crash-loop with nothing in the object set looking wrong. Emptied is the
+// shape a hand-edit or a half-written Secret takes.
+func TestA2AInjectTokenIsRepairedIfEmptied(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data[a2aInjectTokenKey] = []byte("")
+	if err := cl.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the token was emptied: %v", err)
+	}
+	repaired := &corev1.Secret{}
+	if err := cl.Get(ctx, key, repaired); err != nil {
+		t.Fatal(err)
+	}
+	if len(repaired.Data[a2aInjectTokenKey]) == 0 {
+		t.Error("an emptied token was left empty, so the door can never arm")
+	}
+}
+
+// TestA2AInjectTokenIsNotRenderedWithoutTheFlag: the darkness property
+// applied to the credential. A Secret is the one object here whose presence
+// on an install that never asked for the door would be more than residue.
+func TestA2AInjectTokenIsNotRenderedWithoutTheFlag(t *testing.T) {
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, &corev1.Secret{}); !errors.IsNotFound(err) {
+		t.Errorf("a bearer token Secret exists without the flag (err=%v)", err)
 	}
 }

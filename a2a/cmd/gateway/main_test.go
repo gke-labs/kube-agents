@@ -40,16 +40,33 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			},
 			// The refusal names what is armed, so an operator reading it
 			// knows which variable to unset.
-			want: "more than one backend is configured",
+			want: "more than one chat backend is configured",
 		},
 		{
-			name: "inject and a chat backend together",
+			// The door is a side door: beside one real backend it is
+			// accepted, so the refusal here is the two BACKENDS, and the
+			// message must not send the reader to unset the door.
+			name: "two backends with the door open as well",
+			env: map[string]string{
+				"NATS_URL":            "nats://127.0.0.1:1",
+				"DISCORD_TOKEN":       "tok",
+				"A2A_GCHAT_RELAY_URL": "http://relay",
+				"A2A_INJECT_LISTEN":   ":8099",
+				"A2A_INJECT_TOKEN":    "s3cret",
+			},
+			want: "more than one chat backend is configured",
+		},
+		{
+			// A door with no token never arms. The fence in front of it does
+			// not govern the port-forward its caller uses, so there is no
+			// unauthenticated mode to fall back to.
+			name: "the door armed without a token",
 			env: map[string]string{
 				"NATS_URL":          "nats://127.0.0.1:1",
 				"DISCORD_TOKEN":     "tok",
 				"A2A_INJECT_LISTEN": ":8099",
 			},
-			want: "A2A_INJECT_LISTEN",
+			want: "A2A_INJECT_TOKEN",
 		},
 		{
 			name: "no backend set",
@@ -68,6 +85,7 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			t.Setenv("DISCORD_TOKEN", "")
 			t.Setenv("A2A_GCHAT_RELAY_URL", "")
 			t.Setenv("A2A_INJECT_LISTEN", "")
+			t.Setenv("A2A_INJECT_TOKEN", "")
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}

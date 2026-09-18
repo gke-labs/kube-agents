@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -33,10 +34,18 @@ var (
 
 const (
 	// The mapped and unmapped authors in the rig's principal map, matching
-	// the fixture startRig uses.
+	// the fixture startRig uses. The mapped principal is an eval identity
+	// because the door refuses anything else (resolveInjectPrincipal), which
+	// TestInjectRefusesAPrincipalOutsideTheEvalNamespace pins.
 	injectTestAuthor        = "1001"
-	injectTestPrincipal     = "test:bnaylor"
+	injectTestPrincipal     = "eval:bnaylor"
 	injectTestUnknownAuthor = "9999"
+	// injectTestToken is the door's bearer token in these tests.
+	injectTestToken = "test-inject-token"
+	// injectTestGrace is the gateway's first-event grace in the rig. Short,
+	// so a test that needs the never-started heal does not wait ten minutes
+	// for it; above the 1m floor FromEnv enforces, which this rig bypasses.
+	injectTestGrace = 90 * time.Second
 	// injectTestWait is the `wait` a polling GET asks for in these tests:
 	// long enough that a healthy relay always answers inside it, short
 	// enough that a broken one fails the test rather than hanging it.
@@ -59,8 +68,11 @@ func startInjectRig(t *testing.T) *injectRig {
 	url := s.ClientURL()
 	provision(t, url)
 
-	mapFile := filepath.Join(t.TempDir(), "principal-map")
-	fixture := fmt.Sprintf("%s %s\n", injectTestAuthor, injectTestPrincipal)
+	// The door's own map, keys prefixed: the lookup is
+	// injectPrincipalPrefix + author, so an unprefixed entry is unreachable
+	// (TestInjectResolvesOnlyThroughItsOwnPrefixedSection).
+	mapFile := filepath.Join(t.TempDir(), "inject-principal-map")
+	fixture := fmt.Sprintf("%s%s %s\n", injectPrincipalPrefix, injectTestAuthor, injectTestPrincipal)
 	if err := os.WriteFile(mapFile, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -87,19 +99,22 @@ func startInjectRig(t *testing.T) *injectRig {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	adapter, err := NewInjectAdapter(ln.Addr().String(), nil)
+	adapter, err := NewInjectAdapter(ln.Addr().String(), injectTestToken, injectTestGrace, nil)
 	if err != nil {
 		t.Fatalf("NewInjectAdapter: %v", err)
 	}
 	adapter.listener = ln
 
 	cfg := &Config{
-		NATSURL:          url,
-		PrincipalMapPath: mapFile,
-		InjectListen:     ln.Addr().String(),
-		DefaultAddressee: "platform",
-		IdleTTL:          30 * time.Minute,
-		AttributionSalt:  []byte("test-salt"),
+		NATSURL:                url,
+		PrincipalMapPath:       filepath.Join(t.TempDir(), "no-chat-principal-map"),
+		InjectListen:           ln.Addr().String(),
+		InjectToken:            injectTestToken,
+		InjectPrincipalMapPath: mapFile,
+		DefaultAddressee:       "platform",
+		IdleTTL:                30 * time.Minute,
+		FirstEventGrace:        injectTestGrace,
+		AttributionSalt:        []byte("test-salt"),
 	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: injectBackend})
 	if err != nil {
@@ -124,14 +139,74 @@ func startInjectRig(t *testing.T) *injectRig {
 	return rig
 }
 
-// inject posts one message and returns the decoded reply.
-func (r *injectRig) inject(t *testing.T, conversation, author, text string) injectResponse {
+// do issues one request to the door, with the bearer token unless token is
+// empty. Every endpoint requires it, so the helper carries it rather than
+// each caller.
+func (r *injectRig) do(t *testing.T, method, target string, body []byte, token string) (*http.Response, error) {
 	t.Helper()
-	body, err := json.Marshal(injectRequest{Conversation: conversation, Author: author, Text: text})
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, target, reader)
+	if err != nil {
+		t.Fatalf("building %s %s: %v", method, target, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set(authorizationHeader, "Bearer "+token)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// cancel calls the explicit cancel route on a conversation, for whatever it
+// is running.
+func (r *injectRig) cancel(t *testing.T, key, author string) injectResponse {
+	t.Helper()
+	return r.cancelTask(t, key, author, "")
+}
+
+// cancelTask calls the cancel route naming a task, the way the harness does
+// with the id its POST was answered with.
+func (r *injectRig) cancelTask(t *testing.T, key, author, taskID string) injectResponse {
+	t.Helper()
+	body, err := json.Marshal(cancelRequest{Author: author, TaskID: taskID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Post(r.base+injectPath, "application/json", bytes.NewReader(body))
+	target := r.base + conversationsPath + key + cancelSuffix
+	resp, err := r.do(t, http.MethodPost, target, body, injectTestToken)
+	if err != nil {
+		t.Fatalf("POST %s: %v", target, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST %s returned %d", target, resp.StatusCode)
+	}
+	var out injectResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decoding the cancel reply: %v", err)
+	}
+	return out
+}
+
+// inject posts one message and returns the decoded reply.
+func (r *injectRig) inject(t *testing.T, conversation, author, text string) injectResponse {
+	t.Helper()
+	return r.injectWithID(t, conversation, author, text, "")
+}
+
+// injectWithID is inject with the caller's own backend message id, which is
+// the dedupe key.
+func (r *injectRig) injectWithID(t *testing.T, conversation, author, text, messageID string) injectResponse {
+	t.Helper()
+	body, err := json.Marshal(injectRequest{Conversation: conversation, Author: author, Text: text, MessageID: messageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := r.do(t, http.MethodPost, r.base+injectPath, body, injectTestToken)
 	if err != nil {
 		t.Fatalf("POST %s: %v", injectPath, err)
 	}
@@ -153,7 +228,7 @@ func (r *injectRig) conversation(t *testing.T, key string, after int, taskID str
 	if taskID != "" {
 		target += "&task=" + taskID
 	}
-	resp, err := http.Get(target)
+	resp, err := r.do(t, http.MethodGet, target, nil, injectTestToken)
 	if err != nil {
 		t.Fatalf("GET %s: %v", target, err)
 	}
@@ -166,6 +241,46 @@ func (r *injectRig) conversation(t *testing.T, key string, after int, taskID str
 		t.Fatalf("decoding the conversation reply: %v", err)
 	}
 	return out
+}
+
+// probe is the read route: one GET with probe=1 and no wait, which is how a
+// caller asks what the gateway's record holds without sending a turn.
+func (r *injectRig) probe(t *testing.T, key, taskID string) conversationResponse {
+	t.Helper()
+	target := fmt.Sprintf("%s%s%s?after=0&wait=0&%s=1", r.base, conversationsPath, key, probeParam)
+	if taskID != "" {
+		target += "&task=" + taskID
+	}
+	resp, err := r.do(t, http.MethodGet, target, nil, injectTestToken)
+	if err != nil {
+		t.Fatalf("GET %s: %v", target, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s returned %d", target, resp.StatusCode)
+	}
+	var out conversationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decoding the read route's reply: %v", err)
+	}
+	if out.Probe == nil {
+		t.Fatalf("GET %s answered without a probe report", target)
+	}
+	return out
+}
+
+// awaitRecordedTask blocks until the session record carries an active task.
+// startTask announces the id to the adapter BEFORE it writes the record (so
+// a caller never has to guess which post belongs to its submission), so a
+// POST can return before there is an ActiveTask to read or age.
+func (r *injectRig) awaitRecordedTask(t *testing.T, key string) {
+	t.Helper()
+	waitFor(t, "the session record to carry the active task", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		rec, err := r.g.reg.Get(ctx, key)
+		return err == nil && rec != nil && rec.ActiveTask != nil
+	})
 }
 
 func (r *injectRig) awaitTask(t *testing.T, addressee string) *lib.Envelope {
@@ -240,12 +355,14 @@ func TestInjectSubmitsThroughHandleInbound(t *testing.T) {
 	}
 }
 
-// TestInjectAuthorityNamesTheNetworkEdge: the authority block is the audit
-// record, and on this backend it must not claim a verification that did not
-// happen. The principal map resolved WHO, and nothing authenticated that the
-// caller is that author -- so verifiedBy says the network edge, and the
-// identifiers are pseudonymized exactly as every other backend's are.
-func TestInjectAuthorityNamesTheNetworkEdge(t *testing.T) {
+// TestInjectAuthorityNamesTheBearerDoor: the authority block is the audit
+// record, and on this door it must name its own mechanism. The door's map
+// resolved WHO and its bearer token admitted the caller -- neither is the
+// authenticated websocket Discord has nor the IAM-locked topic Chat has, so
+// verifiedBy is the door's own value and nothing downstream can mistake an
+// eval submission for a Chat message. The identifiers are pseudonymized
+// exactly as every other backend's are.
+func TestInjectAuthorityNamesTheBearerDoor(t *testing.T) {
 	r := startInjectRig(t)
 	r.inject(t, "case-authority", injectTestAuthor, "audit me")
 
@@ -258,8 +375,11 @@ func TestInjectAuthorityNamesTheNetworkEdge(t *testing.T) {
 		t.Fatalf("backend = %q, want %q", authority.Requester.Backend, injectBackend)
 	}
 	if authority.Requester.VerifiedBy != injectVerifiedBy {
-		t.Fatalf("verifiedBy = %q, want %q -- the map resolved the author, nothing authenticated it",
-			authority.Requester.VerifiedBy, injectVerifiedBy)
+		t.Fatalf("verifiedBy = %q, want %q", authority.Requester.VerifiedBy, injectVerifiedBy)
+	}
+	if authority.Requester.VerifiedBy == gchatVerifiedBy || authority.Requester.VerifiedBy == "principal-map" {
+		t.Fatalf("verifiedBy = %q: the door must not borrow a real backend's mechanism",
+			authority.Requester.VerifiedBy)
 	}
 	if !strings.HasPrefix(authority.Requester.Principal, "hmac:") {
 		t.Fatalf("principal is not pseudonymized: %q", authority.Requester.Principal)
@@ -272,6 +392,11 @@ func TestInjectAuthorityNamesTheNetworkEdge(t *testing.T) {
 	}
 	// The requester is always in their own audience, and on a synthetic
 	// one-participant conversation that is the whole roster.
+	if len(authority.Audience.Roster) == 1 && authority.Audience.Roster[0] != authority.Requester.Principal {
+		t.Fatalf("the requester's roster entry %q is not their principal %q: the door's audience "+
+			"resolved the raw author id instead of the map's inject: section",
+			authority.Audience.Roster[0], authority.Requester.Principal)
+	}
 	if len(authority.Audience.Roster) != 1 || !authority.Audience.RosterComplete {
 		t.Fatalf("audience = %+v", authority.Audience)
 	}
@@ -580,7 +705,7 @@ func TestInjectRefusesMalformedRequests(t *testing.T) {
 		{"no text", `{"conversation":"c","author":"1001"}`, http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := http.Post(r.base+injectPath, "application/json", strings.NewReader(tc.body))
+			resp, err := r.do(t, http.MethodPost, r.base+injectPath, []byte(tc.body), injectTestToken)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -592,7 +717,9 @@ func TestInjectRefusesMalformedRequests(t *testing.T) {
 	}
 
 	// The method guards: neither endpoint may be driven the other way round.
-	resp, err := http.Get(r.base + injectPath)
+	// Authenticated, because the door refuses an unauthenticated caller
+	// before it looks at the method at all.
+	resp, err := r.do(t, http.MethodGet, r.base+injectPath, nil, injectTestToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +727,9 @@ func TestInjectRefusesMalformedRequests(t *testing.T) {
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /inject = %d, want 405", resp.StatusCode)
 	}
-	postResp, err := http.Post(r.base+conversationsPath+"case-1", "application/json", strings.NewReader("{}"))
+	// A POST to a conversation that is not the cancel route: reading is a
+	// GET, and the only POST under /conversations is /cancel.
+	postResp, err := r.do(t, http.MethodPost, r.base+conversationsPath+"case-1", []byte("{}"), injectTestToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,15 +745,15 @@ func TestInjectRefusesMalformedRequests(t *testing.T) {
 // source is what tells them apart, and without it an eval scores a bus outage
 // against the agent.
 func TestInjectNamesWhoDeclaredATerminal(t *testing.T) {
-	adapter, err := NewInjectAdapter("127.0.0.1:0", nil)
+	adapter, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	key := injectKeyPrefix + "sources"
 	adapter.TaskStarted(key, "task-executor")
-	adapter.TaskTerminal(key, "task-executor", lib.StateFailed, TerminalFromExecutor)
+	adapter.TaskTerminal(key, "task-executor", lib.StateFailed, TerminalFromExecutor, "")
 	adapter.TaskStarted(key, "task-gateway")
-	adapter.TaskTerminal(key, "task-gateway", lib.StateFailed, TerminalFromGateway)
+	adapter.TaskTerminal(key, "task-gateway", lib.StateFailed, TerminalFromGateway, "")
 
 	entries, _, _ := adapter.snapshot(key, 0, "")
 	sources := map[string]string{}
@@ -718,7 +847,7 @@ func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
 // reader's sequence still advances monotonically once the oldest entries have
 // been dropped.
 func TestInjectBoundsWhatItRetains(t *testing.T) {
-	adapter, err := NewInjectAdapter("127.0.0.1:0", nil)
+	adapter, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,5 +880,1126 @@ func TestInjectBoundsWhatItRetains(t *testing.T) {
 	adapter.mu.Unlock()
 	if held > injectMaxConversations {
 		t.Fatalf("holding %d conversations, want at most %d", held, injectMaxConversations)
+	}
+}
+
+// ---- the bearer token (#1704, bnaylor's review of the design doc) ---------
+
+// TestInjectRefusesEveryRequestWithoutTheToken is the door's own control.
+//
+// The NetworkPolicy in front of it does not govern the path its caller uses:
+// a port-forward enters from the node, which is exempt. So without this, the
+// population that can drive the platform persona -- with the install's
+// cluster and GitHub credentials, past the allowed-users gate -- would be
+// everyone holding pods/portforward in the namespace. Every route, because a
+// door with one unauthenticated endpoint is an unauthenticated door: the GET
+// alone would read every reply on every conversation.
+func TestInjectRefusesEveryRequestWithoutTheToken(t *testing.T) {
+	r := startInjectRig(t)
+	accepted := r.inject(t, "case-auth", injectTestAuthor, "something to read back")
+
+	body, err := json.Marshal(injectRequest{Conversation: "case-auth-2", Author: injectTestAuthor, Text: "let me in"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelBody, err := json.Marshal(cancelRequest{Author: injectTestAuthor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversationURL := r.base + conversationsPath + accepted.Conversation
+
+	cases := []struct {
+		name   string
+		method string
+		target string
+		body   []byte
+		token  string
+		header string
+	}{
+		{"submit with no token", http.MethodPost, r.base + injectPath, body, "", ""},
+		{"submit with the wrong token", http.MethodPost, r.base + injectPath, body, "not-the-token", ""},
+		{"read with no token", http.MethodGet, conversationURL, nil, "", ""},
+		{"read with the wrong token", http.MethodGet, conversationURL, nil, "hunter2", ""},
+		{"cancel with no token", http.MethodPost, conversationURL + cancelSuffix, cancelBody, "", ""},
+		{"a prefix of the token", http.MethodPost, r.base + injectPath, body, injectTestToken[:4], ""},
+		{"the token without the scheme", http.MethodPost, r.base + injectPath, body, "", injectTestToken},
+		{"another scheme", http.MethodPost, r.base + injectPath, body, "", "Basic " + injectTestToken},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var reader io.Reader
+			if tc.body != nil {
+				reader = bytes.NewReader(tc.body)
+			}
+			req, err := http.NewRequest(tc.method, tc.target, reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tc.header != "":
+				req.Header.Set(authorizationHeader, tc.header)
+			case tc.token != "":
+				req.Header.Set(authorizationHeader, "Bearer "+tc.token)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("%s %s: %v", tc.method, tc.target, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("%s %s returned %d, want 401", tc.method, tc.target, resp.StatusCode)
+			}
+			if got := resp.Header.Get("WWW-Authenticate"); got == "" {
+				t.Error("a 401 with no WWW-Authenticate header")
+			}
+		})
+	}
+
+	// And nothing the refused requests carried reached the bus or the
+	// conversation: exactly the one task the authorized submission started.
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 1 {
+		t.Fatalf("%d envelopes on the bus, want just the authorized one", len(envs))
+	}
+}
+
+// TestInjectAcceptsTheTokenCaseInsensitivelyBySchemeOnly: RFC 7235 makes the
+// scheme a case-insensitive token and the credential exact. Getting this
+// backwards either refuses a legitimate client or accepts a wrong token.
+func TestInjectAcceptsTheTokenCaseInsensitivelyBySchemeOnly(t *testing.T) {
+	r := startInjectRig(t)
+	resp, err := r.do(t, http.MethodGet, r.base+conversationsPath+"nothing-here?wait=0", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token returned %d, want 401", resp.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, r.base+conversationsPath+"nothing-here?wait=0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(authorizationHeader, "bEaReR "+injectTestToken)
+	lower, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lower.Body.Close()
+	if lower.StatusCode != http.StatusOK {
+		t.Fatalf("a lowercase scheme returned %d, want 200: the scheme is case-insensitive", lower.StatusCode)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, r.base+conversationsPath+"nothing-here?wait=0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(authorizationHeader, "Bearer "+strings.ToUpper(injectTestToken))
+	upper, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upper.Body.Close()
+	if upper.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("an upper-cased CREDENTIAL returned %d, want 401", upper.StatusCode)
+	}
+}
+
+// TestInjectRefusesToArmWithoutAToken: there is no unauthenticated mode, and
+// the constructor is the second place that says so (FromEnv is the first).
+// An embedder or a test that could build one would make "no token" a
+// configuration rather than an impossibility.
+func TestInjectRefusesToArmWithoutAToken(t *testing.T) {
+	if _, err := NewInjectAdapter("127.0.0.1:0", "", injectTestGrace, nil); err == nil {
+		t.Fatal("the door armed with no bearer token")
+	}
+	if _, err := NewInjectAdapter("127.0.0.1:0", "   ", injectTestGrace, nil); err == nil {
+		t.Fatal("whitespace passed as a bearer token")
+	}
+}
+
+// ---- identity: the door's own prefixed section ---------------------------
+
+// TestInjectResolvesOnlyThroughItsOwnPrefixedSection: the door takes its
+// author from a request body, so what stops it minting a task as anyone is
+// that the lookup is prefixed and lives in a map of its own. An entry in the
+// chat backends' map is unreachable from here, and so is an unprefixed entry
+// in the door's own.
+func TestInjectResolvesOnlyThroughItsOwnPrefixedSection(t *testing.T) {
+	dir := t.TempDir()
+
+	chatMap := filepath.Join(dir, "chat-principal-map")
+	if err := os.WriteFile(chatMap, []byte("2002 corp:real-person\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	injectMap := filepath.Join(dir, "inject-principal-map")
+	fixture := "3003 eval:unprefixed-key\n" + injectPrincipalPrefix + "4004 eval:properly-mapped\n"
+	if err := os.WriteFile(injectMap, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := New(Options{
+		Client:  &lib.Client{},
+		Adapter: newFakeAdapter(),
+		Backend: injectBackend,
+		Config: &Config{
+			NATSURL:                "nats://127.0.0.1:4222",
+			PrincipalMapPath:       chatMap,
+			InjectListen:           "127.0.0.1:0",
+			InjectToken:            injectTestToken,
+			InjectPrincipalMapPath: injectMap,
+			DefaultAddressee:       "platform",
+			AttributionSalt:        []byte("test-salt"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if got := g.resolvePrincipal(injectBackend, "4004"); got != "eval:properly-mapped" {
+		t.Fatalf("a prefixed eval entry resolved to %q", got)
+	}
+	if got := g.resolvePrincipal(injectBackend, "2002"); got != "" {
+		t.Fatalf("the door reached the chat backends' map and resolved %q: an entry written for a "+
+			"real backend's sender must be unreachable from a door that takes its author from a body", got)
+	}
+	if got := g.resolvePrincipal(injectBackend, "3003"); got != "" {
+		t.Fatalf("an unprefixed entry in the door's own map resolved to %q; the prefix is the section", got)
+	}
+	// And the chat side is unchanged: its own map still answers, and the
+	// door's entries are not a second source of identities for it.
+	if got := g.resolvePrincipal(discordBackend, "2002"); got != "corp:real-person" {
+		t.Fatalf("the chat backend's own map stopped resolving: %q", got)
+	}
+	if got := g.resolvePrincipal(discordBackend, "4004"); got != "" {
+		t.Fatalf("a chat message resolved through the door's map and got %q", got)
+	}
+}
+
+// TestInjectRefusesAPrincipalOutsideTheEvalNamespace: the second half of the
+// same property. The map is the only thing between a token holder and a
+// principal of their choosing, so an entry pointing at a cloud identity is
+// refused rather than honoured -- a mistake in the map is a lockout, never a
+// privilege.
+func TestInjectRefusesAPrincipalOutsideTheEvalNamespace(t *testing.T) {
+	injectMap := filepath.Join(t.TempDir(), "inject-principal-map")
+	fixture := injectPrincipalPrefix + "5005 serviceAccount:agent@project.iam.gserviceaccount.com\n" +
+		injectPrincipalPrefix + "6006 " + injectEvalPrincipalPrefix + "devops-bench\n"
+	if err := os.WriteFile(injectMap, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := New(Options{
+		Client:  &lib.Client{},
+		Adapter: newFakeAdapter(),
+		Backend: injectBackend,
+		Config: &Config{
+			NATSURL:                "nats://127.0.0.1:4222",
+			InjectListen:           "127.0.0.1:0",
+			InjectToken:            injectTestToken,
+			InjectPrincipalMapPath: injectMap,
+			DefaultAddressee:       "platform",
+			AttributionSalt:        []byte("test-salt"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := g.resolvePrincipal(injectBackend, "5005"); got != "" {
+		t.Fatalf("the door asserted %q: a cloud principal is exactly what a door taking its author "+
+			"from a request body must be structurally unable to claim", got)
+	}
+	if got := g.resolvePrincipal(injectBackend, "6006"); got == "" {
+		t.Fatal("a conforming eval entry was refused too, so the rule is a lockout rather than a boundary")
+	}
+}
+
+// ---- the five adapter operations -----------------------------------------
+
+// TestInjectRosterIsTheRequesterAloneAndComplete: a synthetic conversation
+// has one participant. Reporting it complete is the truth -- there is no
+// membership API here to be incomplete about -- and reporting the requester
+// rather than nothing is what makes the audience snapshot say who could have
+// read the answer.
+func TestInjectRosterIsTheRequesterAloneAndComplete(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-roster", injectTestAuthor, "who is here?")
+
+	ids, complete, err := r.adapter.Roster(reply.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !complete {
+		t.Error("the roster reports itself incomplete; there is nothing here to be incomplete about")
+	}
+	if len(ids) != 1 || ids[0] != injectTestAuthor {
+		t.Fatalf("roster = %v, want the requester alone", ids)
+	}
+}
+
+// TestInjectOpenDirectReturnsTheSameConversation: the DM switch has nowhere
+// to switch to on this door -- every conversation already has exactly one
+// participant. Minting a second key would strand a reply on a conversation
+// its caller never polls.
+func TestInjectOpenDirectReturnsTheSameConversation(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-direct", injectTestAuthor, "talk to me")
+
+	direct, err := r.adapter.OpenDirect(injectTestAuthor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct != reply.Conversation {
+		t.Fatalf("OpenDirect = %q, want the conversation the user is in (%q)", direct, reply.Conversation)
+	}
+	// A user the door has not seen still gets an answer rather than an error.
+	unseen, err := r.adapter.OpenDirect("7007")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(unseen, injectKeyPrefix) {
+		t.Fatalf("OpenDirect for an unseen user = %q, want a qualified key", unseen)
+	}
+}
+
+// TestInjectImplementsAllFiveAdapterOperations: the test-backend section
+// names five, and a door implementing four leaves the session manager to
+// special-case the fifth. A compile-time assertion for the interface, and a
+// live call to each so that a method that exists and panics is caught too.
+func TestInjectImplementsAllFiveAdapterOperations(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-five", injectTestAuthor, "one")
+
+	messageID, err := r.adapter.Post(reply.Conversation, "two")
+	if err != nil || messageID == "" {
+		t.Fatalf("Post: %q %v", messageID, err)
+	}
+	if err := r.adapter.Edit(reply.Conversation, messageID, "three"); err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if _, _, err := r.adapter.Roster(reply.Conversation); err != nil {
+		t.Fatalf("Roster: %v", err)
+	}
+	if _, err := r.adapter.OpenDirect(injectTestAuthor); err != nil {
+		t.Fatalf("OpenDirect: %v", err)
+	}
+	// Run is the fifth, and the rig is already inside it: the submission
+	// above went through the handler it installed.
+}
+
+// ---- cancel, and the window that is the gateway's -------------------------
+
+// TestInjectCancelRouteLandsAsKindCancel: the explicit route, not the stop
+// text. A program should not have to spell a phrase to reach a control path,
+// and what goes on the bus must be identical to what the text route puts
+// there -- the executor cannot tell which door the cancel came through.
+func TestInjectCancelRouteLandsAsKindCancel(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-cancel", injectTestAuthor, "long job")
+	origin := r.awaitTask(t, "platform")
+
+	// The executor says something, so the task is not a never-started one:
+	// this test is about the cancel, not about the heal.
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+
+	out := r.cancel(t, reply.Conversation, injectTestAuthor)
+	if out.TaskID != "" || out.Accepted {
+		t.Fatalf("a cancel started a task: %+v", out)
+	}
+
+	var cancelEnv *lib.Envelope
+	waitFor(t, "the cancel envelope on the in subject", func() bool {
+		for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+			if env.Kind == lib.KindCancel {
+				cancelEnv = env
+				return true
+			}
+		}
+		return false
+	})
+	if cancelEnv.TaskID != reply.TaskID {
+		t.Fatalf("the cancel names task %q, want %q", cancelEnv.TaskID, reply.TaskID)
+	}
+	if len(cancelEnv.Authority) == 0 {
+		t.Error("the cancel carries no authority block; it is an authority-bearing action like any other")
+	}
+	// The conversation is told, the way it is told when a human types stop.
+	// Read from the conversation rather than from the cancel's own reply:
+	// the reply carries what had landed when the door answered, and the
+	// relay's rolling-line edit races the acknowledgement post.
+	r.waitForPost(t, out.Conversation, "cancel sent")
+}
+
+// waitForPost blocks until some post on a conversation contains want.
+func (r *injectRig) waitForPost(t *testing.T, key, want string) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("a post containing %q on %s", want, key), func() bool {
+		entries, _, _ := r.adapter.snapshot(key, 0, "")
+		return strings.Contains(strings.Join(entryTexts(entries, InjectEntryPost), "\n"), want)
+	})
+}
+
+// waitForTerminal blocks until a task has a terminal entry, and returns it.
+func (r *injectRig) waitForTerminal(t *testing.T, key, taskID string) InjectEntry {
+	t.Helper()
+	var found InjectEntry
+	waitFor(t, "a terminal entry for "+taskID, func() bool {
+		entries, _, _ := r.adapter.snapshot(key, 0, "")
+		for _, entry := range terminalEntries(entries) {
+			if entry.TaskID == taskID {
+				found = entry
+				return true
+			}
+		}
+		return false
+	})
+	return found
+}
+
+// TestInjectCancelDoesNotGoThroughTheStopText: the same call must not depend
+// on the phrase list. If the route were implemented by sending "stop", a
+// change to stopWords would silently break the harness -- and an ask that
+// happened to be the word "stop" would be indistinguishable from a control
+// action.
+func TestInjectCancelDoesNotGoThroughTheStopText(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-cancel-text", injectTestAuthor, "long job")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+
+	r.cancel(t, reply.Conversation, injectTestAuthor)
+
+	waitFor(t, "the cancel envelope", func() bool {
+		for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+			if env.Kind == lib.KindCancel {
+				return true
+			}
+		}
+		return false
+	})
+	// No message envelope carrying the stop phrase: the route delivered an
+	// intent, and nothing was classified out of text.
+	for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+		if env.Kind != lib.KindMessage {
+			continue
+		}
+		var message lib.Message
+		if err := json.Unmarshal(env.Payload, &message); err != nil {
+			continue
+		}
+		if isStop(joinTextParts(message.Parts)) {
+			t.Fatalf("the cancel route sent the stop text as a message: %q", joinTextParts(message.Parts))
+		}
+	}
+}
+
+// TestInjectReportsTheGatewaysFirstEventGrace: the caller must not run a
+// clock of its own for "nobody took this task". The gateway owns that window
+// (A2A_FIRST_EVENT_GRACE and the never-started heal), so the submission
+// reports it and the caller sets its deadline above it. A harness that
+// guessed would cancel inside the grace, where the cancel reaches no
+// executor and is answered by nothing.
+func TestInjectReportsTheGatewaysFirstEventGrace(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-grace", injectTestAuthor, "how long have I got?")
+	if reply.FirstEventGraceSeconds != int(injectTestGrace/time.Second) {
+		t.Fatalf("firstEventGraceSeconds = %d, want %d",
+			reply.FirstEventGraceSeconds, int(injectTestGrace/time.Second))
+	}
+}
+
+// TestInjectReadRouteIsAPureRead: the read reports the facts the
+// never-started heal decides on -- an active task, nothing on its stream, an
+// age past the grace -- and changes nothing: no heal, no post, no publish, no
+// write. The heal is a write under the conversation's lock inside the keyed
+// queue, and a read that also wrote would be a second writer racing the next
+// inbound message. The classification is the caller's; the gateway's own
+// verdict still lands on the next turn, which the second half shows.
+func TestInjectReadRouteIsAPureRead(t *testing.T) {
+	r := startInjectRig(t)
+	// Nothing ever consumes this addressee, which is an install with no
+	// executor -- the state an eval install has before its bridge is
+	// declared.
+	reply := r.inject(t, "case-never", injectTestAuthor, "is anybody there?")
+	if reply.TaskID == "" {
+		t.Fatal("no task to abandon")
+	}
+	r.awaitRecordedTask(t, reply.Conversation)
+	// Age the submission past the grace rather than waiting it out: a test
+	// that slept would be a 90-second test.
+	ageActiveTask(t, r.g, reply.Conversation, -2*injectTestGrace)
+
+	page := r.probe(t, reply.Conversation, reply.TaskID)
+	probe := page.Probe
+	if !probe.Active || probe.TaskID != reply.TaskID || probe.ExecutorState != "" || probe.Final {
+		t.Fatalf("probe = %+v, want the active task %s with no executor state", probe, reply.TaskID)
+	}
+	if time.Duration(probe.AgeSeconds)*time.Second <= injectTestGrace ||
+		probe.GraceSeconds != int(injectTestGrace/time.Second) {
+		t.Fatalf("age %ds against grace %ds: the caller cannot classify from that", probe.AgeSeconds, probe.GraceSeconds)
+	}
+	if probe.SubmittedAt == "" {
+		t.Fatal("the read carries no submittedAt; the caller's own clock would have to stand in")
+	}
+	if probe.Error != "" {
+		t.Fatalf("a read that could look reported an error: %s", probe.Error)
+	}
+	// Nothing changed. No terminal in the transcript, no notice posted, no
+	// envelope beyond the submission on the in subject, one start, and the
+	// record still holds the task.
+	if len(terminalEntries(page.Entries)) != 0 || page.Terminal != "" {
+		t.Fatalf("a read produced a terminal: %+v", page)
+	}
+	if got := entryTexts(page.Entries, InjectEntryPost); len(got) != 1 {
+		t.Fatalf("posts after a read = %q, want the placeholder alone", got)
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 1 {
+		t.Fatalf("%d envelopes on the in subject after a read, want the one submission", n)
+	}
+	if starts, _ := r.adapter.counts(reply.Conversation); starts != 1 {
+		t.Fatalf("%d tasks started on the conversation after a read, want 1", starts)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := r.g.reg.Get(ctx, reply.Conversation)
+	if err != nil || rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID != reply.TaskID {
+		t.Fatalf("the read released the record (rec=%+v err=%v); the heal is the turn's, not the read's", rec, err)
+	}
+	// A second read says the same: reads are idempotent because they write
+	// nothing.
+	if again := r.probe(t, reply.Conversation, reply.TaskID).Probe; !again.Active || again.ExecutorState != "" {
+		t.Fatalf("second read = %+v, want the same active task", again)
+	}
+
+	// The heal still exists, where it always was: the next turn on the
+	// conversation releases the task and tells the door so.
+	second := r.inject(t, "case-never", injectTestAuthor, "still there?")
+	r.waitForPost(t, reply.Conversation, "produced nothing on its event stream")
+	terminal := r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	if terminal.Source != string(TerminalNeverStarted) || terminal.State != string(lib.StateFailed) {
+		t.Fatalf("the turn's heal recorded %+v, want a failed terminal from %s", terminal, TerminalNeverStarted)
+	}
+	if second.TaskID == "" || second.TaskID == reply.TaskID {
+		t.Fatalf("the turn after the heal started %q, want a fresh task", second.TaskID)
+	}
+}
+
+// TestInjectReadRouteReportsTheExecutorsState: the same read, in the order a
+// task passes through it. Before any event the stream holds nothing; once an
+// executor publishes, the read carries its latest state; at the terminal it
+// carries the state and final, and after the relay releases the record the
+// task is no longer active and the terminal sits beside the read. None of
+// the reads reaches the bus or starts anything.
+func TestInjectReadRouteReportsTheExecutorsState(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-read", injectTestAuthor, "take your time")
+	r.awaitRecordedTask(t, reply.Conversation)
+
+	waiting := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !waiting.Active || waiting.TaskID != reply.TaskID || waiting.ExecutorState != "" {
+		t.Fatalf("before any event: probe = %+v, want active with no executor state", waiting)
+	}
+	if waiting.AgeSeconds < 0 || time.Duration(waiting.AgeSeconds)*time.Second > injectTestGrace {
+		t.Fatalf("age = %ds, want inside the grace", waiting.AgeSeconds)
+	}
+	if waiting.Detached {
+		t.Fatal("a task nothing cancelled reads as detached")
+	}
+
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the read route to see the executor's submitted event", func() bool {
+		return r.probe(t, reply.Conversation, reply.TaskID).Probe.ExecutorState == string(lib.StateSubmitted)
+	})
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the read route to see the executor working", func() bool {
+		return r.probe(t, reply.Conversation, reply.TaskID).Probe.ExecutorState == string(lib.StateWorking)
+	})
+	running := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if running.Final || !running.Active {
+		t.Fatalf("running probe = %+v, want active and not final", running)
+	}
+	if running.LastPost == nil || running.LastPost.Kind != InjectEntryPost {
+		t.Fatalf("running probe carries no last post: %+v", running)
+	}
+
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	waitFor(t, "the relay to release the finished task", func() bool {
+		return !r.probe(t, reply.Conversation, reply.TaskID).Probe.Active
+	})
+	done := r.probe(t, reply.Conversation, reply.TaskID)
+	if done.Terminal != string(lib.StateCompleted) {
+		t.Fatalf("released read carries terminal %q, want completed beside it", done.Terminal)
+	}
+	if done.Probe.Backend != injectBackend || !done.Probe.InjectOnly {
+		t.Fatalf("probe names backend %q injectOnly %v; this rig runs on the door alone", done.Probe.Backend, done.Probe.InjectOnly)
+	}
+
+	// Many reads, one task: the in subject holds the submission and nothing
+	// else, and every read left the door's start count where the POST put it.
+	for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+		if env.Kind != lib.KindMessage {
+			t.Fatalf("a read published a %s envelope", env.Kind)
+		}
+	}
+	if starts, _ := r.adapter.counts(reply.Conversation); starts != 1 {
+		t.Fatalf("%d tasks started, want 1: a read minted a task", starts)
+	}
+}
+
+// TestInjectReadRouteReportsATerminalOnTheStreamBeforeTheRelay: an executor's
+// terminal reaches the stream a moment before the relay posts it, and a read
+// at that instant reports final without touching the record -- the relay is
+// the one that releases it.
+func TestInjectReadRouteReportsATerminalOnTheStreamBeforeTheRelay(t *testing.T) {
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.SetProbe(func(context.Context, string) (ConversationState, error) {
+		return ConversationState{Active: true, TaskID: "task-1", ExecutorState: lib.StateFailed, Final: true, Grace: injectTestGrace}, nil
+	})
+	report := door.runProbe(context.Background(), injectKeyPrefix+"any")
+	if !report.Active || !report.Final || report.ExecutorState != string(lib.StateFailed) {
+		t.Fatalf("report = %+v, want an active task whose stream is final", report)
+	}
+}
+
+// TestInjectReadRouteReportsADetachedTask: after the cancel route fires the
+// record is detached, and the read says so rather than leaving the caller to
+// send a second cancel.
+func TestInjectReadRouteReportsADetachedTask(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-stopping", injectTestAuthor, "long job")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	r.cancel(t, reply.Conversation, injectTestAuthor)
+	r.waitForPost(t, reply.Conversation, "cancel sent")
+
+	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !probe.Active || !probe.Detached || probe.TaskID != reply.TaskID {
+		t.Fatalf("after a cancel: probe = %+v, want the task active and detached", probe)
+	}
+	if probe.ExecutorState != string(lib.StateWorking) {
+		t.Fatalf("a detached task's stream state = %q, want working", probe.ExecutorState)
+	}
+}
+
+// TestInjectReadRouteSaysWhenItCannotLook: a door run outside a gateway has
+// no probe, and a probe whose stream read failed says so in the report's
+// error -- a caller deciding whether anything executed must not read the
+// absence of a probe, or an empty executor state beside an error, as "no
+// executor".
+func TestInjectReadRouteSaysWhenItCannotLook(t *testing.T) {
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := door.runProbe(context.Background(), injectKeyPrefix+"orphan")
+	if report.Error == "" || report.Active {
+		t.Fatalf("probe with no gateway = %+v, want an error and nothing asserted", report)
+	}
+	failing := func(context.Context, string) (ConversationState, error) {
+		return ConversationState{Active: true, TaskID: "task-1"}, fmt.Errorf("the stream is unreachable")
+	}
+	door.SetProbe(failing)
+	report = door.runProbe(context.Background(), injectKeyPrefix+"orphan")
+	if !strings.Contains(report.Error, "unreachable") || !report.Active || report.TaskID != "task-1" {
+		t.Fatalf("probe that failed to look = %+v, want the error beside what was learned", report)
+	}
+}
+
+// TestInjectReadRouteAnswersForAnUnknownConversation: a read on a key
+// nothing has been injected into is the caller's preflight -- it learns the
+// grace and whether the gateway runs on the door alone before it starts
+// anything, and starts nothing by asking.
+func TestInjectReadRouteAnswersForAnUnknownConversation(t *testing.T) {
+	r := startInjectRig(t)
+	page := r.probe(t, injectKeyPrefix+"never-used", "")
+	if page.Probe.Active || page.Probe.TaskID != "" {
+		t.Fatalf("an unknown conversation reads as active: %+v", page.Probe)
+	}
+	if page.Probe.GraceSeconds != int(injectTestGrace/time.Second) || !page.Probe.InjectOnly {
+		t.Fatalf("preflight = %+v, want the grace and inject-only", page.Probe)
+	}
+	if _, ok := r.adapter.conversations[injectKeyPrefix+"never-used"]; ok {
+		t.Fatal("a read minted a conversation")
+	}
+}
+
+// TestInjectDedupesAPostOnItsMessageID: a harness retries an opening POST
+// whose connection dropped with the same body, and by then startTask has
+// written the active task, so an undeduped retry is routed as a steer on
+// the running task and the harness awaits a task id it never learns. The
+// backend message id says it is the same message: the retry is answered with
+// the first task id, and nothing is routed for it.
+func TestInjectDedupesAPostOnItsMessageID(t *testing.T) {
+	r := startInjectRig(t)
+	const messageID = "run-1/case-dedupe/1"
+	first := r.injectWithID(t, "case-dedupe", injectTestAuthor, "how is the fleet?", messageID)
+	if first.TaskID == "" || first.Deduplicated {
+		t.Fatalf("first POST: %+v", first)
+	}
+	retry := r.injectWithID(t, "case-dedupe", injectTestAuthor, "how is the fleet?", messageID)
+	if retry.TaskID != first.TaskID || !retry.Accepted || !retry.Deduplicated {
+		t.Fatalf("retry = %+v, want the first task id %s marked deduplicated", retry, first.TaskID)
+	}
+	if starts, _ := r.adapter.counts(first.Conversation); starts != 1 {
+		t.Fatalf("%d tasks started, want 1", starts)
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 1 {
+		t.Fatalf("%d envelopes on the in subject, want the one submission: the retry was routed", n)
+	}
+	// A different id on the same conversation is a new message, and on a
+	// conversation whose task is still running it is a steer -- which is
+	// exactly what the dedupe keeps a retry from becoming.
+	other := r.injectWithID(t, "case-dedupe", injectTestAuthor, "and the nodes?", "run-1/case-dedupe/2")
+	if other.Deduplicated || other.TaskID != "" {
+		t.Fatalf("a second message = %+v, want routed (as a steer) and not deduplicated", other)
+	}
+
+	// The same id on another conversation is a caller bug, refused rather
+	// than answered with a task on a conversation it did not name.
+	body, _ := json.Marshal(injectRequest{Conversation: "case-elsewhere", Author: injectTestAuthor, Text: "x", MessageID: messageID})
+	resp, err := r.do(t, http.MethodPost, r.base+injectPath, body, injectTestToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("same id on another conversation = %d, want 409", resp.StatusCode)
+	}
+}
+
+// TestInjectDedupesAPostStillInFlight: the retry that matters most arrives
+// while the first POST's turn is still running -- the client's connection
+// dropped, the server's handler did not. The duplicate waits on the
+// original's answer instead of routing a second message.
+func TestInjectDedupesAPostStillInFlight(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	door, err := NewInjectAdapter(ln.Addr().String(), injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.listener = ln
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var turns int
+	handler := func(msg InboundMessage) {
+		turns++
+		close(entered)
+		<-release
+		door.TaskStarted(msg.Conversation, "task-first")
+	}
+	go func() { _ = door.Run(ctx, handler) }()
+	waitFor(t, "the door to accept messages", func() bool {
+		door.handlerMu.RLock()
+		defer door.handlerMu.RUnlock()
+		return door.handler != nil
+	})
+
+	post := func() injectResponse {
+		body, _ := json.Marshal(injectRequest{Conversation: "in-flight", Author: injectTestAuthor, Text: "go", MessageID: "run/in-flight/1"})
+		req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+injectPath, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(authorizationHeader, "Bearer "+injectTestToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+			return injectResponse{}
+		}
+		defer resp.Body.Close()
+		var out injectResponse
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return out
+	}
+	replies := make(chan injectResponse, 2)
+	go func() { replies <- post() }()
+	<-entered
+	go func() { replies <- post() }()
+	// The duplicate is waiting on the first turn, not running one of its own.
+	time.Sleep(100 * time.Millisecond)
+	if turns != 1 {
+		t.Fatalf("%d turns ran with the first still in flight, want 1", turns)
+	}
+	close(release)
+	got := []injectResponse{<-replies, <-replies}
+	var deduped int
+	for _, reply := range got {
+		if reply.TaskID != "task-first" {
+			t.Fatalf("reply = %+v, want task-first", reply)
+		}
+		if reply.Deduplicated {
+			deduped++
+		}
+	}
+	if deduped != 1 || turns != 1 {
+		t.Fatalf("%d replies marked deduplicated across %d turns, want exactly one of each", deduped, turns)
+	}
+}
+
+// TestInjectDedupesAPostWhoseCallerDisconnected: the case the dedupe exists
+// for. The first client's connection drops while its turn is still running;
+// the turn goes on and starts a task; the retry with the same id must be
+// answered with that task, not with "the caller went away".
+func TestInjectDedupesAPostWhoseCallerDisconnected(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	door, err := NewInjectAdapter(ln.Addr().String(), injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.listener = ln
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var turns int
+	handler := func(msg InboundMessage) {
+		turns++
+		close(entered)
+		// The gateway's handler only enqueues; the turn runs after it
+		// returns. Model that: start the task once released, off this call.
+		go func() {
+			<-release
+			door.TaskStarted(msg.Conversation, "task-first")
+		}()
+	}
+	go func() { _ = door.Run(ctx, handler) }()
+	waitFor(t, "the door to accept messages", func() bool {
+		door.handlerMu.RLock()
+		defer door.handlerMu.RUnlock()
+		return door.handler != nil
+	})
+
+	body, _ := json.Marshal(injectRequest{Conversation: "dropped", Author: injectTestAuthor, Text: "go", MessageID: "run/dropped/1"})
+	post := func(reqCtx context.Context) (injectResponse, error) {
+		req, _ := http.NewRequestWithContext(reqCtx, http.MethodPost, "http://"+ln.Addr().String()+injectPath, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(authorizationHeader, "Bearer "+injectTestToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return injectResponse{}, err
+		}
+		defer resp.Body.Close()
+		var out injectResponse
+		return out, json.NewDecoder(resp.Body).Decode(&out)
+	}
+
+	// The first client drops mid-turn.
+	firstCtx, drop := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { _, err := post(firstCtx); firstDone <- err }()
+	<-entered
+	drop()
+	if err := <-firstDone; err == nil {
+		t.Fatal("the first client was meant to drop its connection")
+	}
+	// The turn finishes after the client is gone.
+	close(release)
+
+	retry, err := post(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.TaskID != "task-first" || !retry.Deduplicated || !retry.Accepted {
+		t.Fatalf("retry after a dropped connection = %+v, want task-first, deduplicated", retry)
+	}
+	if turns != 1 {
+		t.Fatalf("%d turns ran, want 1: the retry was routed", turns)
+	}
+}
+
+// TestInjectTerminalCarriesTheExecutorsReason: the bridge and the worker
+// adapter write why a task failed as the terminal's status message
+// (`reason: <token> - detail`), and a caller classifying a failed terminal
+// -- the persona's failure, or the executor's own -- needs the token. The
+// terminal entry carries the message verbatim.
+func TestInjectTerminalCarriesTheExecutorsReason(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-reason", injectTestAuthor, "break")
+	origin := r.awaitTask(t, "platform")
+	from := lib.Party{Session: "platform", AgentType: "test-executor"}
+	const reason = "reason: hermes-exited-nonzero - exit status 1; stderr tail: boom"
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID:    origin.TaskID,
+		ContextID: origin.ContextID,
+		Status: lib.TaskStatus{
+			State: lib.StateFailed,
+			Message: &lib.Message{
+				Role: "agent", MessageID: "msg-reason", TaskID: origin.TaskID, ContextID: origin.ContextID,
+				Parts: []lib.Part{{Kind: "text", Text: reason}},
+			},
+		},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(from, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+	terminal := r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	if terminal.State != string(lib.StateFailed) || terminal.Source != string(TerminalFromExecutor) {
+		t.Fatalf("terminal = %+v", terminal)
+	}
+	if terminal.Reason != reason {
+		t.Fatalf("terminal reason = %q, want the executor's message verbatim", terminal.Reason)
+	}
+	// And a terminal that carried no message carries no reason, rather than
+	// an invented one.
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.TaskTerminal(injectKeyPrefix+"bare", "task-bare", lib.StateCompleted, TerminalFromExecutor, "")
+	entries, _, _ := door.snapshot(injectKeyPrefix+"bare", 0, "")
+	if got := terminalEntries(entries); len(got) != 1 || got[0].Reason != "" {
+		t.Fatalf("bare terminal = %+v", got)
+	}
+}
+
+// ageActiveTask backdates a conversation's active task, so a test can reach
+// the never-started heal without waiting out the grace.
+func ageActiveTask(t *testing.T, g *Gateway, conversation string, by time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := g.reg.Get(ctx, conversation)
+	if err != nil || rec == nil || rec.ActiveTask == nil {
+		t.Fatalf("no active task on %s to age (rec=%v err=%v)", conversation, rec, err)
+	}
+	rec.ActiveTask.SubmittedAt = rec.ActiveTask.SubmittedAt.Add(by)
+	if err := g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// terminalEntries is every terminal entry in a page.
+func terminalEntries(entries []InjectEntry) []InjectEntry {
+	var out []InjectEntry
+	for _, entry := range entries {
+		if entry.Kind == InjectEntryTerminal {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// restoreActiveTask rewrites the session record so it holds taskID as active
+// again: the shape the relay leaves behind when it acked the terminal and
+// then lost the record write (or the pod restarted between the two).
+func (r *injectRig) restoreActiveTask(t *testing.T, key string, origin *lib.Envelope, age time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := r.g.reg.Get(ctx, key)
+	if err != nil || rec == nil {
+		t.Fatalf("record for %s: %v", key, err)
+	}
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID,
+		SubmittedAt: time.Now().Add(-age)}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestInjectReadRouteCarriesTheFoldOfAFinishedTask: the relay acks a terminal
+// before it clears ActiveTask and writes the record, so a restart or a failed
+// write leaves an active record on a finished task -- and on a key that is
+// never reused, no heal ever arrives. The read route therefore returns the
+// fold of the task's stream: the terminal, whose word it is, the result text
+// and the reason. A caller grades from it and sends no cancel.
+func TestInjectReadRouteCarriesTheFoldOfAFinishedTask(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-lost-write", injectTestAuthor, "answer me")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "r", Name: lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: "the answer"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+
+	// The lost record write.
+	r.restoreActiveTask(t, reply.Conversation, origin, time.Minute)
+
+	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !probe.Active || probe.TaskID != reply.TaskID || !probe.Final {
+		t.Fatalf("probe = %+v, want the record active on a task whose stream is final", probe)
+	}
+	if probe.ExecutorState != string(lib.StateCompleted) || probe.TerminalSource != string(TerminalFromExecutor) {
+		t.Fatalf("probe = %+v, want the executor's completed terminal", probe)
+	}
+	if probe.Result != "the answer" {
+		t.Fatalf("probe.Result = %q, want the result artifact's text", probe.Result)
+	}
+	// Still a pure read: the record is exactly as it was left.
+	rec, err := r.g.reg.Get(ctx, reply.Conversation)
+	if err != nil || rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID != reply.TaskID {
+		t.Fatalf("the read route changed the record: %+v (err %v)", rec, err)
+	}
+}
+
+// TestInjectReadRouteNamesTheSupervisorsTerminalAsTheGateways: a terminal on
+// the supervisor subject is the gateway's word about an executor that died or
+// never ran, not an executor's answer. The fold says so, so a caller grading
+// off the read does not score an outage as the agent's failure.
+func TestInjectReadRouteNamesTheSupervisorsTerminalAsTheGateways(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-supervised", injectTestAuthor, "answer me")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	const reason = "reason: worker-evicted"
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateFailed, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-sup", Parts: []lib.Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskSupervisorSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	r.restoreActiveTask(t, reply.Conversation, origin, time.Minute)
+
+	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !probe.Final || probe.ExecutorState != string(lib.StateFailed) {
+		t.Fatalf("probe = %+v, want the failed terminal", probe)
+	}
+	if probe.TerminalSource != string(TerminalFromGateway) {
+		t.Fatalf("terminalSource = %q, want the gateway's for a supervisor terminal", probe.TerminalSource)
+	}
+	if probe.Reason != reason {
+		t.Fatalf("probe.Reason = %q, want the terminal's message verbatim", probe.Reason)
+	}
+}
+
+// TestInjectCancelNamesTheTaskAfterTheHealReleasedIt: the production sequence
+// for a task nobody took. The harness classifies it from the read, past the
+// grace, and then cancels naming the task id its POST was answered with. The
+// cancel turn runs the never-started heal first, which releases the record --
+// so a cancel routed on the active task alone would stop nothing, while the
+// submission is still on the in subject for a bridge that binds later. The
+// named cancel reaches the bus regardless, on the task's own chain.
+func TestInjectCancelNamesTheTaskAfterTheHealReleasedIt(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-nobody", injectTestAuthor, "into the void")
+	origin := r.awaitTask(t, "platform")
+	r.awaitRecordedTask(t, reply.Conversation)
+	// No executor touches it, and it ages past the grace.
+	r.restoreActiveTask(t, reply.Conversation, origin, injectTestGrace+time.Minute)
+
+	out := r.cancelTask(t, reply.Conversation, injectTestAuthor, reply.TaskID)
+	if out.TaskID != "" {
+		t.Fatalf("a cancel started a task: %+v", out)
+	}
+	var cancelEnv *lib.Envelope
+	waitFor(t, "the cancel envelope for the released task", func() bool {
+		for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+			if env.Kind == lib.KindCancel && env.TaskID == reply.TaskID {
+				cancelEnv = env
+				return true
+			}
+		}
+		return false
+	})
+	if cancelEnv.CorrelationID != origin.CorrelationID {
+		t.Fatalf("the cancel rides correlation %q, want the task's own %q", cancelEnv.CorrelationID, origin.CorrelationID)
+	}
+	if len(cancelEnv.Authority) == 0 {
+		t.Error("the cancel carries no authority block")
+	}
+	// The heal ran first and said so; the cancel then went out anyway.
+	r.waitForPost(t, reply.Conversation, "produced nothing on its event stream")
+	r.waitForPost(t, reply.Conversation, "no longer holds")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rec, err := r.g.reg.Get(ctx, reply.Conversation)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v", err)
+	}
+	if rec.ActiveTask != nil {
+		t.Fatalf("the record still holds the released task: %+v", rec.ActiveTask)
+	}
+	if !rec.TaskCanceled(reply.TaskID) {
+		t.Fatal("the published cancel is not recorded on the task's history entry")
+	}
+}
+
+// TestInjectCancelRefusesATaskTheConversationNeverHeld: naming a task is not
+// a way to publish cancels for tasks this conversation did not start.
+func TestInjectCancelRefusesATaskTheConversationNeverHeld(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-stranger", injectTestAuthor, "hello")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	out := r.cancelTask(t, reply.Conversation, injectTestAuthor, "task-someone-elses")
+	if out.TaskID != "" {
+		t.Fatalf("a cancel started a task: %+v", out)
+	}
+	r.waitForPost(t, reply.Conversation, "never held task")
+	for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+		if env.Kind == lib.KindCancel {
+			t.Fatalf("a cancel was published for a task the conversation never held: %+v", env)
+		}
+	}
+	// And the running task is untouched.
+	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !probe.Active || probe.Detached || probe.TaskID != reply.TaskID {
+		t.Fatalf("probe = %+v, want the original task active and not detached", probe)
 	}
 }

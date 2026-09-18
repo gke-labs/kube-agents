@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"context"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -32,7 +33,36 @@ type InboundMessage struct {
 	MessageID string
 	// Text is the message content.
 	Text string
+
+	// Backend names the ingress this message arrived through, and empty
+	// means the gateway's own configured backend. It exists because one
+	// gateway can now have two ingresses: the inject side door may be armed
+	// beside a real backend, and attribution is a property of the message
+	// rather than of the process. A message that says nothing is attributed
+	// to the configured backend, which is every chat backend's case.
+	Backend string
+
+	// Intent, when set, is a control action the backend expressed directly
+	// rather than a message to be understood. Empty is an ordinary message.
+	Intent string
+	// TaskID, when set beside Intent, names the task the control action is
+	// about. Empty means the conversation's active task, which is every chat
+	// backend's case. A program that was answered with a task id names it,
+	// so its cancel still reaches the bus when the record has released the
+	// task in the meantime (the never-started heal runs before routing, and
+	// a submission nobody took is still on the in subject for a bridge that
+	// binds later to run).
+	TaskID string
 }
+
+// IntentCancel is the only Intent today: stop the conversation's running
+// task. The chat backends have no way to express it -- a human types "stop"
+// and the text matcher reads it -- but a program should not have to spell a
+// phrase to reach a control path, and a phrase that changes meaning is a
+// class of bug an API does not have. The inject door has an explicit route
+// for it, and it lands on the bus as kind: cancel exactly as the text route
+// does.
+const IntentCancel = "cancel"
 
 // Adapter is the five-operation backend interface from the gateway design:
 // inbound message with verified sender, conversation and thread identity
@@ -90,11 +120,17 @@ type TaskObserver interface {
 	// post belongs to the task it just submitted.
 	TaskStarted(conversation, taskID string)
 
-	// TaskTerminal names the state a task ended in, and who says so. Called
-	// after the relay has posted the deliverable and edited the rolling line,
-	// so a caller that sees this has already seen everything the conversation
-	// received for that task.
-	TaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource)
+	// TaskTerminal names the state a task ended in, who says so, and the
+	// executor's own reason for it -- the text of the terminal status
+	// event's message, which the bridge and the worker adapter write as
+	// `reason: <token>[ - detail]`, or "" when the terminal carried none.
+	// Called after the relay has posted the deliverable and edited the
+	// rolling line, so a caller that sees this has already seen everything
+	// the conversation received for that task. The reason is passed through
+	// verbatim: whether a token names the persona's failure or the
+	// executor's own (bridge-shutdown, spawn-failed) is the caller's
+	// classification, made against the executor's definitions.
+	TaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string)
 }
 
 // TerminalSource says whose word a terminal is. It exists because "the task
@@ -115,4 +151,82 @@ const (
 	// published for it: it is the gateway telling its own adapter, not a
 	// claim on a stream that has never heard of the task.
 	TerminalFromGateway TerminalSource = "gateway"
+	// TerminalNeverStarted is the never-started heal: a task that reached the
+	// bus and produced nothing on its events subject inside
+	// A2A_FIRST_EVENT_GRACE, which handleInbound releases on the
+	// conversation's next message. Nothing is published for this one either,
+	// and age is not evidence of what happened -- but for a caller it is the
+	// difference between "the agent answered badly" and "no executor was
+	// listening". A program that sends no further message never sees this
+	// source; it reads the same window off the read route (ConversationProbe)
+	// and classifies for itself.
+	TerminalNeverStarted TerminalSource = "gateway-never-started"
 )
+
+// ConversationProbe is the read route's source: what the gateway's session
+// record holds for one conversation and what the task's stream shows, read
+// and reported with nothing changed. It is a PURE READ. It does not run the
+// stale-task heal, take the session lock, post, publish or write. The
+// never-started heal is a write under the per-conversation lock inside the
+// keyed queue, and a read that performed it would be a second writer racing
+// the next inbound message (the A2A owner's constraint on the eval
+// transport's design doc); so the heal stays handleInbound's, and the read
+// reports the same facts the heal would decide on -- the active task's age
+// against the gateway's grace, and whether the stream holds any executor
+// event -- for the caller to classify. Whether the gateway has since
+// released the conversation on some turn is immaterial to that caller: it
+// keys every case and repetition to a fresh conversation.
+//
+// Called off the adapter's own request goroutine, never from a gateway
+// worker; it costs one KV read and one replay of the task's stream, so a
+// caller bounds ctx.
+type ConversationProbe func(ctx context.Context, conversation string) (ConversationState, error)
+
+// ProbeSink is the optional extension an Adapter implements to receive the
+// gateway's ConversationProbe. The gateway type asserts for it in New, the
+// way it asserts for TaskObserver at each call site; an adapter that does
+// not implement it is never offered one.
+type ProbeSink interface {
+	SetProbe(ConversationProbe)
+}
+
+// ConversationState is one read's answer: the record as it stands, plus the
+// two gateway-wide facts a caller needs beside it.
+type ConversationState struct {
+	// Backend is the backend the gateway attributes messages to, and
+	// InjectOnly whether that is the inject door alone -- no Discord token
+	// and no Chat relay armed. Surfaced because a `mode: next` install whose
+	// relay URL failed to render starts on the door and would otherwise be
+	// silent about it; the gateway logs the same at start.
+	Backend    string
+	InjectOnly bool
+	// Grace is the gateway's FirstEventGrace: the window inside which an
+	// active task with nothing on its stream is legitimately pre-first-event.
+	Grace time.Duration
+	// Active is whether the record holds an active task; the four fields
+	// after it describe that task. Detached is one the gateway has already
+	// published a cancel for.
+	Active      bool
+	TaskID      string
+	SubmittedAt time.Time
+	Age         time.Duration
+	Detached    bool
+	// ExecutorState is the state the task's stream shows -- "" when the
+	// stream has no events for it at all (no executor has touched it),
+	// otherwise the latest status event's state, which for a stream that
+	// does not regress is also the highest: submitted, working, or a
+	// terminal. Final is whether that event was final.
+	ExecutorState lib.TaskState
+	Final         bool
+	// The terminal, when Final -- the fold of the task's stream, which is
+	// what a caller has when the record still holds a task whose relay
+	// already acked its terminal (a restart or a failed record write between
+	// the ack and the release). TerminalSource says whose word it is: the
+	// executor's when it arrived on the task's events subject, the
+	// gateway's when the supervisor wrote it. Result is the text of the
+	// result artifact, and Reason the terminal's status message, which the
+	// executors write as `reason: <token>[ - detail]`.
+	TerminalSource TerminalSource
+	Result         string
+	Reason         string
+}

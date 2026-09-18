@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
 
 ## Purpose
 
@@ -239,8 +239,8 @@ than a justification that assumes a terminal that may not come. The `ask` copy i
 cleared by the reap scan once it is older than `A2A_ASK_TTL` (24 hours by default,
 under the stream's retention, which is what the content posture below needs). A task
 with nothing on its events subject at all - no pod, or a pod that never ran - is
-released from the serialization at the conversation's next turn once it is older than
-the first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line
+released from the serialization at the conversation's next turn once it is older than the
+first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line
 in the conversation saying so. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
@@ -484,58 +484,171 @@ credential that may publish on `.in`. Going through the gateway instead means th
 that credential, mints the ids and the `authority` block itself, and the harness needs neither a
 NATS client nor a principal of its own.
 
-**The two endpoints.**
+**A side door, not a fourth backend.** The one-backend guard refuses two real backends because
+two processes on one relay durable split its event deliveries, and the symptom is a gateway that
+looks healthy and answers half the messages. A local HTTP door has no such failure mode, so it
+may sit beside exactly one real backend and the guard keeps refusing two of those - which is what
+lets one install run the eval door and the Chat relay and compare them. The door alone also
+counts as an ingress, so an eval install with neither a Discord token nor a Chat relay starts its
+gateway instead of crash-looping. That last sentence is a decision, not an assumption of this
+section: the A2A owner decided it on the eval transport's design doc (`eval-next-transport.md`,
+2026-09-17), and the guard's own comment in `config.go` records it the same way. A gateway that
+starts on the door alone says so - a warning at start, and `injectOnly` on the door's read route -
+because a `mode: next` install whose relay URL failed to render looks exactly the same and must
+not be silent about it.
+
+**The three endpoints.**
 
 - `POST /inject` takes a conversation key, an author and the text. The adapter prefixes the key
   with `inject:` and delivers an `InboundMessage`; from there the turn is indistinguishable from
   a Discord message. The reply carries the task id, so the caller can await a named task rather
-  than guessing which post belongs to its submission. A turn the gateway answers without minting
-  a task - a steer, a status query, a stop, an author the map does not know - says so, and the
-  reply the conversation received is in the same payload.
+  than guessing which post belongs to its submission, and the gateway's first-event grace, so the
+  caller can set its own deadline above the window the gateway already owns. A turn the gateway
+  answers without minting a task - a steer, a status query, an author the map does not know -
+  says so, and the reply the conversation received is in the same payload.
 - `GET /conversations/{key}` returns what the relay posted, as a sequence a caller pages through
   with `after`, plus `wait` to block for something new and `task` to name the task whose terminal
   the answer should carry. Those three are the whole of "await terminal of task id X". Replies
   come back the way the relay posts them - the placeholder, the rolling progress line's edits,
   the deliverable, the terminal - because what a verifier grades has to be what a customer would
-  have read.
+  have read. With `probe=1` the same read is also the **read route**: a pure read of the
+  conversation's session record and of the active task's stream, which mutates nothing - no
+  heal, no lock, no post, no publish, no write. It returns the record's active task with its
+  `submittedAt`, age and `detached` flag, the highest executor state the stream shows (none,
+  `submitted`, `working`, or a terminal, with `final`) and, when the stream is terminal, the
+  fold of it: whose word the terminal is (`terminalSource`, the executor's for a terminal on the
+  task's events subject and the gateway's for one on its supervisor subject), the result
+  artifact's text and the terminal's status message; plus the conversation's last post, the
+  gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
+  classifies nothing on it; the harness does. It is a pure read because the never-started heal
+  is a write under the per-conversation lock inside the keyed queue, and a read that performed
+  it would be a second writer racing the next inbound message (the A2A owner's constraint). It
+  is a read rather than a message because every message a program could send to the gateway is
+  itself a turn - a status phrase falls through to `startTask` and mints a task whose ask is the
+  phrase, and a cancel sets `Detached`. The harness asks for it on every poll, which is where the
+  task's lifecycle comes from, and reads five outcomes off it: a terminal posted, grade normally;
+  an active task with no executor event and an age past the grace, infrastructure (no executor
+  took it, whether or not the gateway has since released the conversation on some turn - the
+  harness keys every case and repetition to a fresh conversation, so release timing does not
+  matter); `submitted` only for the whole budget, infrastructure (the bridge queued it behind its
+  concurrency cap and never ran it); `working` at the budget, a graded timeout; and an active
+  record whose stream already folds to a terminal, which is the relay's lost record write (the
+  relay acks a terminal before it clears `ActiveTask` and writes the record, and on a key never
+  reused no heal arrives) - graded like a finished run from the fold's result text when the
+  terminal is the executor's, infrastructure when it is the gateway's (the supervisor ended an
+  executor that died or never ran), and never cancelled. The budget is the harness's own
+  (`AGENT_INJECT_TIMEOUT`, 1800 s by default), floored at the grace plus a margin and refused
+  below it before anything is started, not the grace itself: the grace stays the gateway's
+  nobody-took-it detector, and a presubmit that runs more units in parallel than the bridge has
+  slots would otherwise grade every queued unit as a timeout.
+- `POST /conversations/{key}/cancel` stops the conversation's running task. An explicit route
+  rather than the `stop` text the chat path matches: a program should not reach a control path
+  through a phrase list the gateway is free to change, and an ask that happens to be the word
+  "stop" is indistinguishable from an intent. It lands on the bus as the same `kind: cancel`
+  envelope the text route publishes. The body may name the task (`taskId`, the id the POST
+  answered with); named, the cancel is published whether or not the record still holds the task
+  as active, from the task's history entry (its addressee and correlation id), and refused for a
+  task the conversation never held. The harness sends it after a read has classified the task,
+  never before, and in every outcome that leaves an active task - `working` at the budget (a
+  graded timeout), queued for the whole budget, never taken by any executor, and a read that
+  could not classify - always naming the task. The classification is the read's and never the
+  cancel's answer; the cancel bounds a stray run. It has to be named because for a task nobody
+  took the cancel turn itself runs the never-started heal first, which releases the record
+  while the submission is still on the in subject, and the bridge's durable consumer delivers
+  from the start of the stream, so a bridge that binds later within retention would run the
+  stale prompt. On today's bridge the cancel does not prevent that spawn: the consumer delivers
+  serially, an idle worker spawns the stale prompt before the cancel is dispatched, and the
+  cancel kills it inside the kill grace with a `canceled-by-request` terminal;
+  `canceled-before-start` is what a task still queued behind the cap gets. A pre-spawn look-ahead
+  for a trailing cancel is bridge work, not the door's.
+
+All five adapter operations are implemented rather than a subset the session manager has to
+special-case. The session key is `inject:<key>`, `Kind` is `dm`, `Roster` is the requester alone
+with `complete: true` - a synthetic conversation has one participant and no membership API to be
+incomplete about - and `openDirect` returns that same conversation, because there is no second
+surface to switch to. The harness keys every case and repetition to a fresh conversation,
+`inject:<run>/<case>/<rep>` with a run id minted fresh per invocation and never pinned from the
+environment (a pinned id would have the dedupe below answer a rerun with a previous invocation's
+task and its terminal), and sends the same
+`<run>/<case>/<rep>` as the backend message id, so the gateway's `ingress` log joins it to the
+`correlationId` and the audit chain reaches the eval record, which stores the three beside the
+task id. The door also dedupes an accepted POST on that id, bounded like the Google Chat adapter's
+redelivery set: a retry of a POST whose connection dropped carries the same body and id - by then
+`startTask` has written the active task, so an undeduped retry would be routed as a steer on it -
+and is answered with the task the first POST started, starting nothing, including a retry that
+arrives while the first turn is still in flight. The id is unique per invocation, so a rerun is
+never mistaken for a retry, and each status turn of the harness's delegation wait carries its own,
+`<run>/<case>/<rep>/status-<n>`, so the dedupe does not fold it into the opening task.
 
 The gateway tells the adapter a task's two ends through an optional `TaskObserver` interface the
 chat backends do not implement: a human reads the chat, so rendered text is their whole
-interface, while a program must not have to parse `✅ **completed**` to know a task is over.
+interface, while a program must not have to parse `✅ **completed**` to know a task is over. The
+terminal says who declared it, which is the difference between an executor that failed, a task
+that never reached the bus, and one the never-started heal released past
+`A2A_FIRST_EVENT_GRACE` - three states that look alike to a caller and mean the agent's fault,
+an outage, and an install with no executor. It also carries the executor's reason verbatim - the
+terminal status message the bridge and the worker adapter write as `reason: <token>[ - detail]` -
+because a failed terminal is not always the persona's failure: the harness reads the token and
+classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
+`bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `worker-evicted`,
+`bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`) and any reason it does not
+know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that
+declares the bridge sidecar sets `BRIDGE_CONCURRENCY` to at least the harness's parallelism
+(`EVAL_TASK_PARALLELISM`), because the bridge publishes `submitted` when it queues a task behind
+its cap and `working` only when it spawns, and a unit queued for the whole budget is
+infrastructure, not a graded answer.
 
-**Identity.** An injected author is resolved through the principal map like any other non-gchat
-backend, so the runner needs an entry in one and gets no exemption. `verifiedBy` is
-`inject-network-edge` rather than `principal-map`, deliberately: the map decides _which_
-principal an author id stands for, and nothing authenticates that the caller is that author. The
-audit record should name the mechanism that actually ran.
+**Identity.** An injected author is resolved through the door's **own** principal map, at a
+prefixed key, and the value must be an eval identity. Three refusals follow from that, and
+together they are what keeps a door that takes its author from a request body structurally
+incapable of asserting a real principal - the property the Discord mapping table has and the
+reason this section calls that table a feature:
 
-**Posture, stated out loud: this is a dev and eval backend and the code cannot make it anything
-else.** Neither endpoint authenticates. Anything that reaches the listener can submit a task as
-any principal the map carries and read every reply on every conversation. Three things confine
-it, none of them in the adapter:
+- the lookup is `inject:<author>` in a map of the door's own, so an entry written for a real
+  backend's sender is unreachable from here;
+- a value outside the eval namespace is refused rather than honoured, so a mistake in the map is
+  a lockout and never a privilege;
+- an unmapped author is dropped with the notice the Discord path gives - logged, told once, no
+  task. Nothing is defaulted.
 
-1. It is off unless armed, by an operator-level environment variable rather than a CRD field.
-   A CRD field would put "disable every check on the chat door" in the API a cluster's owner
-   edits, and the operator would be obliged to honour it. This is a property of the install being
-   an eval install, so it is set by whoever deploys the operator - the same shape as the A2A
-   image overrides.
-2. Its Service is a ClusterIP. Not a NodePort, not a LoadBalancer.
-3. While it is armed, a NetworkPolicy fences the gateway pod against **every pod on the cluster
-   network**: ingress with no rules. The eval runner reaches the Service through `kubectl
-port-forward`, which enters from the node and is not pod-network traffic - so the
-   authentication is the Kubernetes API session the port-forward already required, borrowed from
-   the cluster. That exemption is host-local rather than port-forward-shaped, which is the honest
-   edge of the claim: a `hostNetwork` pod on the gateway's node reaches the listener by the same
-   route. Nothing here renders one, and scheduling one takes a grant the agent under test does
-   not hold.
+`verifiedBy` is `inject-bearer`, its own value and deliberately nothing a real backend stamps:
+the map decides _which_ principal an author id stands for, and what admitted the caller is the
+door's token rather than Discord's authenticated websocket or Chat's IAM-locked topic. A consumer
+that treated the three alike is what this value exists to stop.
 
-An install a user can reach with this armed has handed that user the principal map. Nothing in
-the gateway can detect that; the flag and the fence are the answer.
+**Posture: a dev and eval door.** Four things confine it.
+
+1. **Every request carries a bearer token.** The operator renders it into a Secret beside the
+   door and the gateway refuses to arm the door without one; there is no unauthenticated mode.
+   This is the control, not a second layer over the fence below: the fence governs pod-network
+   traffic, and the eval runner arrives through `kubectl port-forward`, which enters from the
+   node and is exempt. Without the token the population that can drive the platform persona -
+   with the install's cluster and GitHub credentials, past the allowed-users gate - would be
+   everyone holding `pods/portforward` in the namespace rather than the holders of the key the
+   door stands in for.
+2. **It is off unless armed**, by an operator-level environment variable rather than a CRD
+   field. A CRD field would put "render the door that maps a body-supplied principal" in the API
+   a cluster's owner edits, and the operator would be obliged to honour it. Whether an install is
+   an eval install is a property of who deployed the operator - the same shape as the A2A image
+   overrides. **The adapter renders only under that flag and never in a chart or install path a
+   customer reaches**, and that is a property tests check rather than a comment to trust: the
+   operator's own render tests assert that with the flag unset the rendered object set carries
+   no inject Service, no inject env on the gateway, no inject NetworkPolicy and no token Secret,
+   and the conformance suite (`tests/conformance/test_A_authority.py`) asserts that every render
+   site consults the flag, that the flag is an operator environment variable and not a CRD
+   field, and that the door's principal lookup cannot reach a cloud identity.
+3. **Its Service is a ClusterIP.** Not a NodePort, not a LoadBalancer.
+4. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
+   network**: ingress with no rules. This is what keeps every other pod from reaching a listener
+   it would otherwise only need a token to use. Its honest edge is the exemption above seen from
+   the other side: a `hostNetwork` pod on the gateway's node reaches the listener the way the
+   port-forward does, and the token is what that pod would still lack.
 
 **What it also settles.** The gateway refuses to start without a backend, which makes it
 crash-loop on any install with neither a Discord token nor a Chat relay - so a `mode: next`
-install never reads Ready and nothing can rollout-gate on it. An eval install with this backend
-armed has a backend, and starts.
+install never reads Ready and nothing can rollout-gate on it. An eval install with this door
+armed has an ingress the guard accepts, by the decision recorded above, and starts.
 
 ## The Google Chat adapter (added 9/5)
 

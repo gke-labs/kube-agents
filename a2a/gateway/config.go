@@ -32,6 +32,12 @@ const defaultMaxSessions = 10
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 
+// defaultInjectPrincipalMapPath is where the operator mounts the inject
+// door's own principal map when the door is armed. A file of "id principal"
+// lines rather than a directory of one file per id, because every key carries
+// the inject: prefix and a colon is not a legal ConfigMap key.
+const defaultInjectPrincipalMapPath = "/etc/a2a/inject-principal-map/principals"
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -78,14 +84,38 @@ type Config struct {
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
 
-	// InjectListen is the inject backend's HTTP listen address, and setting
-	// it selects that backend. DEV AND EVAL ONLY: the endpoints carry no
-	// authentication, so the address and the network policy in front of it
-	// are the whole of the access control (inject.go's posture note, and the
-	// test-backend section of spec-chatops-gateway.md). The operator renders
-	// it only under its eval flag; a value here on an install users can
-	// reach hands them the principal map.
+	// InjectListen is the inject side door's HTTP listen address, and setting
+	// it arms the door. DEV AND EVAL ONLY. The door is not a backend in the
+	// one-backend guard's sense (see FromEnv): it may sit beside exactly one
+	// real backend, because a local HTTP door has no silent-stop failure mode
+	// of the kind that guard exists for. The operator renders it only under
+	// its eval flag.
 	InjectListen string
+
+	// InjectToken is the bearer token the door requires on every request
+	// (A2A_INJECT_TOKEN), and there is no unauthenticated mode: FromEnv
+	// refuses a listen address without one.
+	//
+	// The NetworkPolicy edge is not a substitute, and that is why this
+	// exists. The fence governs pod-network traffic; the eval runner reaches
+	// the Service through `kubectl port-forward`, which enters from the node
+	// and is exempt -- so without a token the population that can drive the
+	// platform persona widens from the holders of the agent's own API key to
+	// anyone holding pods/portforward in the namespace.
+	InjectToken string
+
+	// InjectPrincipalMapPath is the door's OWN principal map
+	// (A2A_INJECT_PRINCIPAL_MAP), separate from PrincipalMapPath and never a
+	// fallback to it.
+	//
+	// Separate because the door takes its principal from a request body. A
+	// map of its own, whose every key carries the inject: prefix and whose
+	// every value is an eval-only identity (injectPrincipalPrefix and
+	// injectEvalPrincipalPrefix in inject.go), is what keeps the door
+	// structurally incapable of asserting a principal a real backend's
+	// sender could hold -- the property the Discord mapping table has and
+	// the reason the gateway spec calls that table a feature.
+	InjectPrincipalMapPath string
 
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
@@ -235,19 +265,36 @@ type Config struct {
 	MaxSessions int
 }
 
-// Backend names the backend this config arms: "gchat", "inject" or
-// "discord". FromEnv refuses more than one, so the order here only decides
-// what a hand-built Config means.
+// Backend names the REAL chat backend this config arms: "gchat", "discord",
+// or "" when the inject side door is the only way in. FromEnv refuses more
+// than one real backend, so the order here only decides what a hand-built
+// Config means.
+//
+// The door is deliberately not one of the answers. It can be armed beside
+// either backend, so "which backend is this gateway" and "is the door open"
+// are two questions, and collapsing them is what would make the door
+// exclusive again.
 func (c *Config) Backend() string {
 	switch {
 	case c.GchatRelayURL != "":
 		return gchatBackend
+	case c.DiscordToken != "":
+		return discordBackend
 	case c.InjectListen != "":
-		return injectBackend
+		// No real backend: the door is the whole of the ingress, and the
+		// attribution on a message that comes through it is the door's own.
+		return ""
 	default:
-		return "discord"
+		// A hand-built Config with nothing armed at all. FromEnv refuses
+		// this; a test that builds a Config directly gets the historical
+		// default rather than an empty backend string in its authority
+		// blocks.
+		return discordBackend
 	}
 }
+
+// InjectArmed reports whether the side door is open.
+func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
@@ -274,6 +321,8 @@ func FromEnv() (*Config, error) {
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
+	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
+	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -281,8 +330,8 @@ func FromEnv() (*Config, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	// One backend per gateway process, chosen by which variable is set. A
-	// silent default here would make a two-backend misconfiguration a
+	// One REAL backend per gateway process, chosen by which variable is set.
+	// A silent default here would make a two-backend misconfiguration a
 	// working Discord gateway that quietly never consumes Chat — refuse both
 	// directions instead. Counted rather than enumerated pairwise: with a
 	// third backend the pairs are the easy thing to leave a hole in, and the
@@ -292,18 +341,42 @@ func FromEnv() (*Config, error) {
 	if cfg.GchatRelayURL != "" {
 		armed = append(armed, "A2A_GCHAT_RELAY_URL")
 	}
-	if cfg.InjectListen != "" {
-		armed = append(armed, "A2A_INJECT_LISTEN")
-	}
 	if cfg.DiscordToken != "" {
 		armed = append(armed, "DISCORD_TOKEN")
 	}
+	// The inject door is NOT in that list, decided 2026-09-17 on the design
+	// doc's review. The guard exists so that arming two backends cannot leave
+	// one of them silently unconsumed: two processes on one Chat relay
+	// durable split its event deliveries, and the symptom is a gateway that
+	// looks healthy and answers half the messages. A local HTTP door has no
+	// such failure mode — it consumes nothing and competes for nothing — so
+	// counting it would buy no safety and would cost the thing stage 2 needs,
+	// which is the eval door and the Chat relay on one install so the two
+	// transports can be compared against it.
 	switch len(armed) {
 	case 1:
 	case 0:
-		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), or A2A_INJECT_LISTEN (the dev-only inject backend)")
+		// The door alone is enough to start. Decided, not assumed: the A2A
+		// owner's decision of 2026-09-17 on the eval transport's design doc
+		// (eval-next-transport.md) is that an eval install with neither a
+		// Discord token nor a Chat relay starts its gateway on the door
+		// instead of crash-looping, so a `mode: next` install reads Ready
+		// and a rollout can gate on it. The gateway logs that it is
+		// inject-only when it does, and says so on the door's read route,
+		// because a next install whose relay URL failed to render looks the
+		// same. The spec's test-backend section states the same decision.
+		if cfg.InjectListen == "" {
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), or A2A_INJECT_LISTEN (the dev-only inject side door)")
+		}
 	default:
-		return nil, fmt.Errorf("more than one backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside either", strings.Join(armed, ", "))
+	}
+	// Fail closed: a door with no token would be reachable by anything that
+	// reaches the listener, and the port-forward path the runner uses is
+	// exempt from the NetworkPolicy in front of it. There is deliberately no
+	// opt-out — see Config.InjectToken.
+	if cfg.InjectListen != "" && cfg.InjectToken == "" {
+		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, and the NetworkPolicy in front of it does not govern the port-forward path its caller uses")
 	}
 	// Only when the spawn path is armed: a gateway that spawns nothing has
 	// no session identity to name, and demanding one would break every

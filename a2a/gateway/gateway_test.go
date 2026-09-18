@@ -91,13 +91,23 @@ type fakeAdapter struct {
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
+	// stopped is closed when Run returns, so a test can assert that a
+	// backend was actually told to stop rather than left running.
+	stopped  chan struct{}
+	stopOnce sync.Once
 }
 
 func newFakeAdapter() *fakeAdapter {
-	return &fakeAdapter{inbox: make(chan InboundMessage, 16), roster: []string{"1001"}, complete: true}
+	return &fakeAdapter{
+		inbox:    make(chan InboundMessage, 16),
+		roster:   []string{"1001"},
+		complete: true,
+		stopped:  make(chan struct{}),
+	}
 }
 
 func (a *fakeAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	defer a.stopOnce.Do(func() { close(a.stopped) })
 	for {
 		select {
 		case <-ctx.Done():

@@ -133,13 +133,15 @@ should survive chart upgrades.
 
 ## One thing inside `next` has its own switch
 
-The A2A gateway's inject backend (`spec-chatops-gateway.md`, "The test backend") renders only
+The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
 when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
-second mode mechanism and does not belong in the field this document defines: the backend has no
-authentication, so a CRD field would put "disable every check on the chat door" in the API a
-cluster's owner edits, and the operator would be obliged to honour it. Whether an install is an
-eval install is a property of who deployed the operator, which is where the A2A image overrides
-are already decided.
+second mode mechanism and does not belong in the field this document defines. The door takes the
+principal it acts as out of a request body, so a CRD field would put "render the eval door" in
+the API a cluster's owner edits and the operator would be obliged to honour it. Whether an
+install is an eval install is a property of who deployed the operator, which is where the A2A
+image overrides are already decided. The operator's render tests check that the flag unset
+renders no part of the door, and the conformance suite that every render site consults the flag
+and that the flag is not a CRD field.
 
 ## Per-feature overrides - sketched, not built
 

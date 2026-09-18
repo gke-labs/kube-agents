@@ -55,22 +55,49 @@ Environment:
         ``28099``). The remote side is always the Service's 8099.
     AGENT_INJECT_URL: A gateway base URL to use instead of spawning a
         port-forward.
+    AGENT_INJECT_TOKEN: The door's bearer token, required. The operator
+        renders it into the ``<agent>-a2a-inject`` Secret under its eval
+        flag, and this is read the way the presubmit reads the agent's own
+        key out of ``platform-agent-secrets``::
+
+            AGENT_INJECT_TOKEN=$(kubectl get secret platform-agent-a2a-inject \
+              -n kubeagents-system -o jsonpath='{.data.token}' | base64 --decode)
+
     AGENT_INJECT_AUTHOR: The author id the message is sent as, resolved
-        through the gateway's principal map (default ``devops-bench``, the
+        through the door's own principal map (default ``devops-bench``, the
         entry the operator renders).
-    AGENT_INJECT_CONVERSATION: Pins the conversation key. Unset (the default)
-        mints a fresh one per invocation, so each task gets its own session
-        record rather than inheriting the previous task's.
-    AGENT_INJECT_ACCEPT_TIMEOUT: Seconds a submitted task may show nothing
-        past the gateway's own placeholder before the run is classified as
-        infrastructure -- nothing is executing on the addressee (default
-        ``120``).
-    AGENT_INJECT_TASK_TIMEOUT: Seconds one task may run before the harness
-        stops it and grades what it produced (default ``1800``). This is the
-        whole task's budget, not a request's: on the api transport
+    AGENT_INJECT_TIMEOUT: Seconds one task may run before the harness reads
+        the conversation's record and classifies it (default ``1800``). This
+        is the whole task's budget, not a request's: on the api transport
         ``AGENT_HTTP_TIMEOUT`` bounds one POST and the work's real budget is
         ``AGENT_DELEGATION_TIMEOUT``, whereas here a single await covers the
-        work, so it takes the same scale as the latter.
+        work, so it takes the same scale as the latter. Its floor is the
+        gateway's own first-event grace plus a margin, learned from a read
+        of the fresh conversation before the POST, and a budget below the
+        floor is refused before anything is started
+        (:func:`~kube_agents_bench.inject_transport.check_budget`). There is
+        no variable for "how long before I decide nobody took this": that
+        window is the gateway's, and the harness reads it off the read
+        route. At the deadline nothing is sent -- one more read classifies
+        the task, and every outcome that leaves an active task is then
+        followed by a cancel naming it, which bounds a stray run and never
+        changes the classification (see
+        :meth:`KubeAgentsHarness._execute_inject`).
+
+    The conversation key and the backend message id are not configurable.
+    Both are ``<run>/<case>/<rep>``: the run id is a ``devops-bench-<hex>``
+    id minted fresh per invocation (``AGENT_CONVERSATION_ID`` is the api
+    path's and is not honoured here: a pinned id would have the door's
+    dedupe answer a rerun with a previous invocation's task and terminal),
+    and the case and repetition are ``EVAL_CASE_ID`` and ``EVAL_REPETITION``
+    as the presubmit exports them (``adhoc`` and ``1`` outside it). The
+    gateway prefixes the key with ``inject:``. The triple is what makes the
+    key fresh per case and repetition, the message id unique per invocation
+    -- the door dedupes a retried POST on it -- and the ingress log joinable
+    to the eval record, which stores the three beside the task id. Each
+    status turn of the delegation wait carries its own id,
+    ``<run>/<case>/<rep>/status-<n>``, so the dedupe does not fold it into
+    the opening task.
 """
 
 from __future__ import annotations
@@ -141,11 +168,16 @@ _TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
 _INJECT_SERVICE_SUFFIX = "-a2a-inject"
 _INJECT_REMOTE_PORT = 8099
 _INJECT_DEFAULT_LOCAL_PORT = 28099
-# How long a submitted task may show nothing past the gateway's own
-# placeholder before the run is classified as infrastructure. The placeholder
-# is posted before the submission reaches the bus, so it proves nothing; an
-# edit to it or a second post is the first evidence an executor took the task.
-_INJECT_DEFAULT_ACCEPT_TIMEOUT = "120"
+# The Secret the operator renders the door's bearer token into, named in the
+# message a run without the token fails with. Suffix and key, so the message
+# can spell the whole kubectl read.
+_INJECT_TOKEN_SECRET_SUFFIX = "-a2a-inject"
+_INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a credential
+# Appended to the run's message id on a delegation status turn, with the
+# turn's ordinal after it, so the ingress log tells the opening ask and each
+# follow-up apart -- and so the door's dedupe on the message id cannot fold a
+# second status turn into the first one's task.
+_INJECT_STATUS_TURN_SUFFIX = "/status-"
 # The three budgets both transports share, named here rather than spelled at
 # each _numeric_env call: one default per knob, or the two doors disagree
 # about how long a case may take.
@@ -154,15 +186,40 @@ _DEFAULT_DELEGATION_TIMEOUT = "1800"
 _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
 # What ``tokens`` say on an inject record: the gateway reports no usage, and a
 # null bucket is the truthful value rather than a zero (``scoring.py`` reads
-# the task's terminal in the trajectory as the liveness signal instead).
+# the task's final ``a2a.status-update`` entry in the trajectory as the
+# liveness signal instead).
 _INJECT_TOKENS_NOTE = "the inject transport carries no token usage; every bucket is null"
-# How long one injected task may run before the harness stops it and grades
-# what it produced. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
+# The case and repetition the presubmit is running (hack/ci-eval-pr.sh exports
+# both), which with the run id become the conversation key and the backend
+# message id so the gateway's ingress log joins to the eval record. Outside
+# the presubmit neither is set; the fallbacks keep the key well-formed, and
+# the run id alone keeps two concurrent runs apart.
+_EVAL_CASE_ID_ENV = "EVAL_CASE_ID"
+_EVAL_REPETITION_ENV = "EVAL_REPETITION"
+_EVAL_CASE_FALLBACK = "adhoc"
+_EVAL_REPETITION_FALLBACK = "1"
+# The agent Service and namespace the inject path assumes when the presubmit
+# has not said otherwise: the operator's defaults, which name the inject
+# Service (<service>-a2a-inject) and the token Secret beside it.
+_DEFAULT_AGENT_SERVICE_NAME = "platform-agent"
+_DEFAULT_AGENT_NAMESPACE = "kubeagents-system"
+# The per-invocation run id: the api path's stateful ``conversation`` field
+# when AGENT_CONVERSATION_ID is unset, and always the inject path's key and
+# message id.
+_RUN_ID_PREFIX = "devops-bench-"
+_RUN_ID_HEX_WIDTH = 12
+# How long one injected task may run before the harness reads the record and
+# classifies it. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
 # there, with AGENT_DELEGATION_TIMEOUT covering the work across status turns;
 # on this path one await covers the work, so the budget has to be of the
 # second kind. Borrowing the first cut every case to 600s, which a ten-minute
-# case reached with no terminal and an empty answer.
-_INJECT_DEFAULT_TASK_TIMEOUT = "1800"
+# case reached with no terminal and an empty answer. The floor under it is
+# the gateway's grace plus a margin, and the harness refuses to start below
+# it. Its own budget, not the grace: the bridge queues a task (``submitted``)
+# behind its concurrency cap and spawns it (``working``) when a slot frees,
+# so a deadline of grace plus margin would grade every queued unit of a
+# parallel run as a timeout.
+_INJECT_DEFAULT_TIMEOUT = "1800"
 
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
@@ -883,16 +940,53 @@ def _infra_failure(detail: str) -> AgentResult:
     )
 
 
-def _inject_result(exchange: inject.Exchange) -> AgentResult:
+def _mint_run_id() -> str:
+    """A fresh per-invocation run id."""
+    return _RUN_ID_PREFIX + uuid.uuid4().hex[:_RUN_ID_HEX_WIDTH]
+
+
+def _run_id() -> str:
+    """The api path's run id: pinned by ``AGENT_CONVERSATION_ID`` or minted.
+
+    It is the stateful ``conversation`` field, fresh per invocation so no task
+    inherits the previous task's trajectory. The inject path does not use it:
+    see :func:`_inject_identity`.
+    """
+    return os.environ.get("AGENT_CONVERSATION_ID") or _mint_run_id()
+
+
+def _inject_identity() -> tuple[str, str, str]:
+    """The run id, case id and repetition the inject path keys everything on.
+
+    The run id is always minted fresh, never read from ``AGENT_CONVERSATION_ID``:
+    it is the first segment of the backend message id, which the door dedupes
+    on, and a pinned id would make the dedupe answer this invocation's POST
+    with a previous invocation's task and replay its terminal as this run's.
+    The presubmit exports the case and repetition; on a developer's machine
+    neither is set and the fallbacks keep the triple well-formed. The gateway's
+    ingress log joins the backend message id to the correlationId, so the
+    triple there reaches the eval record with nothing else added (the A2A
+    owner's ask on the design doc).
+    """
+    case = os.environ.get(_EVAL_CASE_ID_ENV, "").strip() or _EVAL_CASE_FALLBACK
+    repetition = os.environ.get(_EVAL_REPETITION_ENV, "").strip() or _EVAL_REPETITION_FALLBACK
+    return _mint_run_id(), case, repetition
+
+
+def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> AgentResult:
     """Map a folded conversation onto the canonical result.
 
     ``output`` and ``final_message`` are the deliverable -- the posts the
     conversation received for this task that the relay never rewrote, which is
     what a customer would read as the answer. The trajectory is the
-    conversation itself: the relay does not post ``activity`` artifacts, so no
-    transport reading a conversation carries tool calls. Tokens stay null --
-    the gateway reports no usage -- and ``metadata`` says so rather than
-    inventing a number.
+    conversation itself plus the task's lifecycle: the relay does not post
+    ``activity`` artifacts, so no transport reading a conversation carries
+    tool calls, and what it carries instead is every executor state the read
+    route showed and the terminal, as ``a2a.status-update`` entries. Tokens
+    stay null -- the gateway reports no usage -- and ``metadata`` says so
+    rather than inventing a number. ``identity`` is the run, case and
+    repetition the key and message id were built from, stored beside the
+    task id so the record joins to the gateway's ingress log.
     """
     fold = exchange.fold
     return AgentResult(
@@ -905,8 +999,13 @@ def _inject_result(exchange: inject.Exchange) -> AgentResult:
             "final_message": fold.deliverable,
             "task_id": exchange.task_id,
             "conversation": exchange.conversation,
+            "outcome": exchange.outcome,
+            **identity,
             "terminal_state": fold.terminal or None,
             "terminal_source": fold.terminal_source or None,
+            "terminal_reason": fold.terminal_reason or None,
+            "reason_token": fold.reason_token or None,
+            "executor_states": list(fold.executor_states),
             "posts": len(fold.posts),
             "entries": len(fold.entries),
             "malformed_entries": fold.malformed,
@@ -1039,8 +1138,7 @@ class KubeAgentsHarness(AgentHarness):
             # The endpoint is stateful and replays the whole conversation's tool
             # calls, so a shared id would make each task inherit the previous
             # task's trajectory and corrupt trajectory scoring.
-            "conversation": os.environ.get("AGENT_CONVERSATION_ID")
-            or f"devops-bench-{uuid.uuid4().hex[:12]}",
+            "conversation": _run_id(),
             "input": prompt,
         }
 
@@ -1129,24 +1227,43 @@ class KubeAgentsHarness(AgentHarness):
 
         Mirrors ``_execute``'s retry classes. The tunnel to the inject Service
         gets the same bounded establishment retry; an exchange that never
-        reaches the gateway is retried through a fresh tunnel up to
-        :data:`_MAX_TRANSPORT_FAILURES` times and then classified as
-        infrastructure; and a task whose conversation shows nothing past the
-        gateway's own placeholder inside ``AGENT_INJECT_ACCEPT_TIMEOUT`` is
-        infrastructure at once, because nothing is executing on the addressee
-        and an empty record is not an answer. A task an executor took and
-        ended ``failed``, ``rejected`` or ``canceled`` IS the agent's own
-        outcome and stays in front of the judge with the terminal on
-        ``errors``; so does a task still running at
-        ``AGENT_INJECT_TASK_TIMEOUT``, after a stop.
+        reaches the gateway is attempted up to :data:`_MAX_TRANSPORT_FAILURES`
+        times in all through a fresh tunnel each time -- the opening POST
+        with the same body and message id, which the door dedupes -- and then
+        classified as infrastructure. The task's deadline is set once, when
+        the POST is first accepted, and a retry rejoins the same wait rather
+        than restarting the budget.
+
+        How a task ended is classified from what the gateway's read route
+        reports, never from a clock of this harness's beside the gateway's
+        grace and never from a message sent to provoke it. Infrastructure,
+        never graded: a task the read shows active with nothing on its stream
+        past the grace (no executor took it); a task that only ever reached
+        ``submitted`` by ``AGENT_INJECT_TIMEOUT`` (queued behind the bridge's
+        cap for the whole budget); a terminal the gateway declared -- about
+        a task it could not put on the bus, or, on the read's fold, the
+        supervisor's word about an executor that died or never ran; a failed
+        terminal carrying one of the executors' own reasons (bridge-shutdown,
+        spawn-failed and the rest of :data:`inject.INFRASTRUCTURE_REASONS`),
+        a rejected one, or a canceled-before-start; and a deadline the read
+        cannot classify. Graded, in front of the judge with the terminal on
+        ``errors``: a task an executor took and ended ``failed`` or
+        ``canceled`` for any other reason, a task still ``working`` at the
+        budget, graded on what it produced, and a task whose record the
+        relay left active on a finished stream, graded from the fold's
+        result text.
+
+        Every outcome that leaves an active task -- working or queued at the
+        budget, never taken, unclassifiable -- is followed by a cancel that
+        names the task id the POST answered with, after the read and never
+        before it. It bounds a stray run (the submission is on the bus for
+        any bridge that binds later; see :meth:`inject.InjectTask.cancel`
+        for what today's bridge does with it) and leaves the record; the
+        classification is the read's, and only the graded timeout adopts the
+        terminal the cancel brings.
         """
         try:
-            timeout = _numeric_env(
-                "AGENT_INJECT_TASK_TIMEOUT", _INJECT_DEFAULT_TASK_TIMEOUT, float
-            )
-            accept_timeout = _numeric_env(
-                "AGENT_INJECT_ACCEPT_TIMEOUT", _INJECT_DEFAULT_ACCEPT_TIMEOUT, float
-            )
+            timeout = _numeric_env("AGENT_INJECT_TIMEOUT", _INJECT_DEFAULT_TIMEOUT, float)
             local_port = _numeric_env(
                 "AGENT_INJECT_LOCAL_PORT", str(_INJECT_DEFAULT_LOCAL_PORT), int
             )
@@ -1159,15 +1276,36 @@ class KubeAgentsHarness(AgentHarness):
         except ValueError as exc:
             return AgentResult.errored(str(exc))
 
-        service = os.environ.get("AGENT_INJECT_SERVICE") or (
-            os.environ.get("AGENT_SERVICE_NAME", "platform-agent") + _INJECT_SERVICE_SUFFIX
-        )
+        agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
+        service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
         author = os.environ.get("AGENT_INJECT_AUTHOR", inject.DEFAULT_AUTHOR)
-        # A fresh conversation per invocation unless pinned: the gateway keeps
-        # a session record per conversation, so a shared key would have each
+        token = os.environ.get("AGENT_INJECT_TOKEN", "").strip()
+        if not token:
+            # Infrastructure rather than an error: a run with no token never
+            # reaches the agent, so it is the same class as a tunnel that
+            # will not come up, and grading it would score the install's
+            # configuration as the agent's answer.
+            secret = agent_service + _INJECT_TOKEN_SECRET_SUFFIX
+            return _infra_failure(
+                "AGENT_INJECT_TOKEN is unset and the inject door authenticates every request. "
+                f"Read it from the {secret} Secret's `{_INJECT_TOKEN_SECRET_KEY}` key in "
+                f"{os.environ.get('AGENT_NAMESPACE', _DEFAULT_AGENT_NAMESPACE)}"
+            )
+        run_id, case_id, repetition = _inject_identity()
+        # A fresh conversation per case and repetition: the gateway keeps a
+        # session record per conversation, so a shared key would have each
         # task inherit the previous task's context and, worse, arrive while
-        # its task is still running and be absorbed as a steer.
-        conversation = os.environ.get("AGENT_INJECT_CONVERSATION") or inject.mint_conversation()
+        # its task is still running and be absorbed as a steer. The message
+        # id is the same triple, unique per invocation, which is what lets
+        # the door dedupe a retried POST on it.
+        conversation = inject.conversation_key(run_id, case_id, repetition)
+        message_id = inject.message_id(run_id, case_id, repetition)
+        identity: dict[str, Any] = {
+            "run_id": run_id,
+            "case_id": case_id,
+            "repetition": repetition,
+            "message_id": message_id,
+        }
         base_url = os.environ.get("AGENT_INJECT_URL")
         # A URL given outright is somebody else's tunnel (or a gateway on the
         # network): nothing to establish and nothing to respawn between
@@ -1207,14 +1345,35 @@ class KubeAgentsHarness(AgentHarness):
             # disagree about whether the tunnel is up.
             base_url = f"http://127.0.0.1:{local_port}"
 
-        deadline = time.monotonic() + timeout
+        def _exchange(task: inject.InjectTask, budget: float, *, opening: bool) -> inject.Exchange:
+            """One task to its terminal, through the transport retry.
 
-        def _exchange(task: inject.InjectTask) -> inject.Exchange:
-            """One task to its terminal, through the transport retry."""
+            ``budget`` is this exchange's own: the task timeout for the
+            case's prompt, the turn timeout for a status turn. The opening
+            exchange reads the fresh conversation first and refuses a budget
+            below the gateway's floor before anything is started; a status
+            turn's budget is raised to the floor instead, because the case
+            is already running and the floor is not the operator's to set
+            there.
+            """
             failures = 0
+            # Set once the POST is first accepted and kept across transport
+            # retries: a retry that respawned the tunnel rejoins the same
+            # wait, so two dropped polls late in a task cannot triple its
+            # budget.
+            deadline: float | None = None
             while True:
                 try:
+                    if not task.task_id:
+                        task.preflight()
+                        floor = inject.budget_floor(task.first_event_grace)
+                        if opening:
+                            inject.check_budget(budget, task.first_event_grace)
+                        elif budget < floor:
+                            budget = floor
                     task_id = task.submit()
+                    if deadline is None:
+                        deadline = time.monotonic() + budget
                     if not task_id:
                         # The gateway answered the turn and started nothing.
                         # No agent saw the prompt, so this is the run class
@@ -1226,9 +1385,7 @@ class KubeAgentsHarness(AgentHarness):
                             f"{task.conversation}: {task.note}",
                             retryable=False,
                         )
-                    return task.await_terminal(
-                        task_id, accept_timeout=accept_timeout, deadline=deadline
-                    )
+                    return task.await_terminal(task_id, deadline=deadline)
                 except inject.InjectUnavailable as exc:
                     failures += 1
                     _log.warning(
@@ -1249,45 +1406,139 @@ class KubeAgentsHarness(AgentHarness):
                         )
 
         task = inject.InjectTask(
-            base_url=base_url, conversation=conversation, prompt=prompt, author=author
+            base_url=base_url,
+            conversation=conversation,
+            prompt=prompt,
+            token=token,
+            author=author,
+            message_id=message_id,
         )
         try:
-            exchange = _exchange(task)
+            exchange = _exchange(task, timeout, opening=True)
+        except inject.BudgetBelowFloor as exc:
+            # Configuration, refused before the POST: the same class as a
+            # non-numeric budget, and nothing ran.
+            return AgentResult.errored(f"AGENT_INJECT_TIMEOUT: {exc}")
         except inject.InjectUnavailable as exc:
             return _infra_failure(f"the inject exchange on {conversation} failed: {exc}")
         except _TransportError as exc:
             return _infra_failure(str(exc))
+        identity["inject_only"] = task.inject_only
+        identity["backend"] = task.backend
 
-        if exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
-            # The gateway took the message and published the submission, and
-            # nothing on the bus has touched it since. That is an install with
-            # no executor on the addressee, not an agent that answered badly.
-            task.cancel()
+        timed_out = exchange.outcome in (inject.OUTCOME_DEADLINE, inject.OUTCOME_QUEUED)
+        leaves_active = timed_out or exchange.outcome in (
+            inject.OUTCOME_NEVER_STARTED,
+            inject.OUTCOME_UNCLASSIFIED,
+        )
+        stop_pending = leaves_active and exchange.probe is not None and exchange.probe.detached
+        if leaves_active and not stop_pending:
+            # The read has classified, and the task may still be on the bus:
+            # an executor has it (working or queued), nobody took it yet
+            # (the submission waits for a bridge that binds later), or the
+            # gateway could not say. The cancel comes only now, after the
+            # read and naming the task the POST answered with, so it reaches
+            # the bus even where the gateway's own heal has released the
+            # record on this very turn. It never changes the classification.
+            # The settle read after it contributes one thing, and only to
+            # the graded timeout: the executor's terminal, with its reason.
+            # The deliverable stays what the task produced inside its budget
+            # -- the cancel acknowledgement the gateway posts after it is
+            # not the agent's answer -- and anything else the settle says (a
+            # transient at that one read, a task that has not confirmed)
+            # must not relabel what the first, authoritative read classified.
+            settled = task.cancel(exchange.task_id, settle=None if timed_out else 0)
+            if timed_out and settled is not None and settled.outcome == inject.OUTCOME_TERMINAL:
+                exchange.fold.mark_terminal(
+                    settled.fold.terminal, settled.fold.terminal_source, settled.fold.terminal_reason
+                )
+
+        if exchange.outcome == inject.OUTCOME_UNCLASSIFIED:
+            # The read at the deadline could not say -- the gateway could not
+            # look at the stream, or the record no longer held the task and
+            # no terminal was ever seen. Nothing says whether an executor saw
+            # the prompt, so nothing is graded.
+            said = exchange.probe.describe() if exchange.probe else "no answer"
             return _infra_failure(
-                f"nothing executed task {exchange.task_id} on {exchange.conversation} within "
-                f"{accept_timeout:.0f}s: the conversation shows nothing past the gateway's "
-                "placeholder, so no executor is running on the addressee; stop sent"
+                f"task {exchange.task_id} on {exchange.conversation} could not be classified at "
+                f"the deadline: the gateway's read route said {said}"
+            )
+
+        if exchange.outcome == inject.OUTCOME_NEVER_STARTED or exchange.fold.never_started:
+            # No executor ever touched the task: the read showed it active
+            # with nothing on its stream past the gateway's first-event
+            # grace. An install with no executor on the addressee -- a
+            # `next` install whose bridge sidecar is not declared -- not an
+            # agent that answered badly. The cancel above is on the bus for
+            # whichever bridge binds next.
+            if task.cancel_sent:
+                bounded = (
+                    "; a cancel naming the task was published so a bridge that binds later "
+                    "kills the stale prompt rather than running it to completion"
+                )
+            elif stop_pending:
+                bounded = "; a stop was already pending on the record"
+            else:
+                bounded = "; the cancel naming the task could not be sent (see the log)"
+            return _infra_failure(
+                f"no executor took task {exchange.task_id} on {exchange.conversation}: nothing "
+                f"reached its event stream inside the gateway's {task.first_event_grace:.0f}s "
+                f"first-event grace, so nothing is running on the addressee{bounded}"
+            )
+
+        if exchange.outcome == inject.OUTCOME_QUEUED:
+            # The bridge queued the task (submitted) behind its concurrency
+            # cap and never spawned it inside the budget. Nothing ran, so
+            # there is nothing to grade; the cancel above asked the bridge
+            # to drop it from the queue (it answers canceled-before-start).
+            ended = exchange.fold.terminal or "no terminal inside the settle"
+            return _infra_failure(
+                f"task {exchange.task_id} on {exchange.conversation} sat queued (submitted, "
+                f"never working) for the whole {timeout:.0f}s budget; cancelled, {ended}. The "
+                "bridge's BRIDGE_CONCURRENCY is below the run's parallelism, or its slots are "
+                "held by earlier tasks"
             )
 
         if exchange.fold.gateway_declared:
-            # The gateway declared this terminal about a task it could not put
-            # on the bus, so no executor ever saw the prompt. Same state on the
-            # wire as an executor's failure and the opposite meaning: grading
-            # it would score an outage as the agent answering badly.
+            # The gateway declared this terminal: about a task it could not
+            # put on the bus, or -- on the read's fold -- the supervisor's
+            # word about an executor that died or never ran. Same state on
+            # the wire as an executor's failure and the opposite meaning:
+            # grading it would score an outage as the agent answering badly.
+            reason = exchange.fold.terminal_reason or "no reason given"
             return _infra_failure(
                 f"task {exchange.task_id} was ended by the gateway rather than by an executor "
-                f"(state {exchange.fold.terminal}): it never reached the bus, so nothing ran it"
+                f"(state {exchange.fold.terminal}, source {exchange.fold.terminal_source}, "
+                f"reason: {reason}): it never reached the bus or its executor died before "
+                "answering, so nothing the agent said is on the record"
             )
 
-        result = _inject_result(exchange)
-        if exchange.outcome == inject.OUTCOME_DEADLINE:
-            task.cancel()
+        infrastructure = exchange.fold.infrastructure_terminal
+        if infrastructure and not timed_out:
+            # The executor's own failure around the task, not the persona's:
+            # the terminal's reason names the bridge or the worker adapter
+            # breaking, or the executor refusing the submission. A canceled
+            # terminal after this harness's own cancel is excluded -- that is
+            # the graded timeout, whatever the bridge's reason says.
+            return _infra_failure(
+                f"task {exchange.task_id} ended {exchange.fold.terminal}: {infrastructure} "
+                f"(reason: {exchange.fold.terminal_reason or 'none given'})"
+            )
+
+        result = _inject_result(exchange, identity)
+        if timed_out:
+            # On the record whether or not the cancel was confirmed: a
+            # terminal of `canceled` below says how it ended, this says why.
+            how = "a stop was already pending" if stop_pending else "cancelled"
             result.errors.append(
                 f"task {exchange.task_id} did not reach a terminal state within "
-                f"{timeout:.0f}s; stop sent"
+                f"{timeout:.0f}s; {how}"
             )
-        elif exchange.fold.terminal != inject.STATE_COMPLETED:
-            result.errors.append(f"task {exchange.task_id} ended {exchange.fold.terminal}")
+        if exchange.fold.terminal and exchange.fold.terminal != inject.STATE_COMPLETED:
+            reason = exchange.fold.reason_token or "no reason given"
+            result.errors.append(
+                f"task {exchange.task_id} ended {exchange.fold.terminal} (reason: {reason})"
+            )
 
         if delegation_timeout > 0:
             # The seam for delegated work, and it is the case runner's rather
@@ -1299,25 +1550,31 @@ class KubeAgentsHarness(AgentHarness):
             # settles at once. A status turn is a further message on the same
             # conversation, the way a second message in a chat thread is --
             # and it is a new task rather than a steer, because the first
-            # task's terminal has already released the conversation.
+            # task's terminal has already released the conversation. Each
+            # turn gets its own message id, or the door's dedupe would answer
+            # the second turn with the first turn's task.
+            turns = 0
+
             def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
+                nonlocal turns
+                turns += 1
                 follow = inject.InjectTask(
                     base_url=base_url,
                     conversation=exchange.conversation,
                     prompt=poll,
+                    token=token,
                     author=author,
+                    message_id=f"{message_id}{_INJECT_STATUS_TURN_SUFFIX}{turns}",
                 )
-                nonlocal deadline
-                deadline = time.monotonic() + turn_timeout
                 try:
-                    turn_exchange = _exchange(follow)
+                    turn_exchange = _exchange(follow, turn_timeout, opening=False)
                 except inject.InjectUnavailable as exc:
                     raise _TransportError(str(exc), retryable=exc.retryable) from exc
                 if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
                     raise _TransportError(
                         f"nothing executed status turn {turn_exchange.task_id}", retryable=True
                     )
-                return _inject_result(turn_exchange), ""
+                return _inject_result(turn_exchange, identity), ""
 
             def _respawn_tunnel() -> None:
                 _tunnel(reset=True)
