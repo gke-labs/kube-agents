@@ -50,6 +50,16 @@ readonly LITELLM_POLICY="litellm-policy"
 readonly OPERATOR_MANAGED_BY_LABEL="platformagent-controller"
 readonly HELM_MANAGED_BY_LABEL="Helm"
 readonly OPERATOR_SCALE_TIMEOUT_SECONDS=120
+# The last GA whose chart renders litellm-policy itself; from the next one on
+# the operator creates and owns it (#1195, #1488). The chart text is no guide:
+# the current template still names the object under a condition that is false
+# on a default install, so a grep would say "renders it" for every release.
+readonly LAST_GA_WITH_STATIC_LITELLM_POLICY="0.5.0"
+# What a release's upgrade.sh re-tags, for a target checkout without an
+# images.json to say which first-party images it publishes.
+readonly RETAGGED_IMAGE_NAMES="k8s-operator
+platform-agent
+agent-sandbox"
 # confirm_agent_image.sh polls; this is how long a re-tagged Deployment gets to
 # show the new tag in its template, which is immediate once Helm has returned.
 readonly IMAGE_CONFIRM_TIMEOUT_SECONDS=120
@@ -63,6 +73,9 @@ ROLLBACK_MODE="${ROLLBACK_MODE:-run}"
 ROLL_FORWARD="${ROLL_FORWARD:-true}"
 CANDIDATE_SHA="${CANDIDATE_SHA:-}"
 ROLLBACK_TAG="${ROLLBACK_TAG:-}"
+# Set by the litellm-policy handoff, read by the restart and the EXIT trap.
+HANDOFF_DONE="false"
+OPERATOR_REPLICAS_BEFORE_HANDOFF=""
 
 summary() {
   [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
@@ -123,8 +136,14 @@ mkdir -p "${WORK_DIR}" "${DIAGNOSTICS_DIR}"
 output "diagnostics_dir" "${DIAGNOSTICS_DIR}"
 
 if [ -z "${KUBE_AGENTS_INSTALL_ENV:-}" ]; then
+  # Not --strict: the strict render refuses a rebuilt environment such as
+  # nightly (Chat enabled with an open allowlist by design, and settings the
+  # composition needs that a re-tag does not), and the operator and harness
+  # modes only re-tag the release with --reset-then-reuse-values; they apply
+  # nothing from install.env to the cluster. The deploy job's lease check
+  # renders the same file without --strict for the same reason.
   echo "==> Rendering the install configuration from the environment."
-  "${SCRIPT_DIR}/render_install_env.sh" "${RENDERED_INSTALL_ENV}" --strict
+  "${SCRIPT_DIR}/render_install_env.sh" "${RENDERED_INSTALL_ENV}"
   export KUBE_AGENTS_INSTALL_ENV="${RENDERED_INSTALL_ENV}"
 fi
 [ -f "${KUBE_AGENTS_INSTALL_ENV}" ] || fail "KUBE_AGENTS_INSTALL_ENV points at '${KUBE_AGENTS_INSTALL_ENV}', which does not exist."
@@ -253,10 +272,6 @@ run_upgrade() {
 # is not a reason to refuse; nor is a release image the install does not run.
 # Refusing here is what keeps a missing tag from being discovered as an
 # ImagePullBackOff after the CRDs and the operator have already moved.
-readonly RETAGGED_IMAGE_NAMES="k8s-operator
-platform-agent
-agent-sandbox"
-
 release_image_names() {
   local checkout="$1"
   if [ -f "${checkout}/images.json" ]; then
@@ -268,10 +283,6 @@ release_image_names() {
 
 check_images_exist() {
   local tag="$1" checkout="$2" names repos repo name missing=""
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "::warning title=Image pre-check skipped::docker is not available, so whether :${tag} exists for the install's images is found out by the rollout instead."
-    return 0
-  fi
   names="$(release_image_names "${checkout}")"
   repos="$( {
     kubectl get deployment,statefulset -n "${NAMESPACE}" \
@@ -281,15 +292,15 @@ check_images_exist() {
     [ -n "${repo}" ] || continue
     name="${repo##*/}"
     grep -qxF "${name}" <<<"${names}" || continue
-    if docker manifest inspect "${repo}:${tag}" >/dev/null 2>&1; then
+    if registry_image_exists "${repo}:${tag}"; then
       echo "  ✓ ${repo}:${tag}"
     else
-      echo "  ✗ ${repo}:${tag} is not in the registry"
+      echo "  ✗ ${repo}:${tag} is not in the registry, or could not be probed"
       missing="${missing} ${name}"
     fi
   done <<<"${repos}"
   if [ -n "${missing}" ]; then
-    echo "::error title=Images missing for ${tag}::The install pulls${missing} from a registry that has no :${tag} for them. The re-tag would leave those pods in ImagePullBackOff; nothing was changed."
+    echo "::error title=Images missing for ${tag}::The install pulls${missing} from a registry that has no :${tag} for them, or that could not be probed from here. The re-tag would leave those pods in ImagePullBackOff; nothing was changed."
     return 1
   fi
 }
@@ -299,37 +310,36 @@ check_images_exist() {
 # after it the operator creates and labels the object, and Helm refuses to
 # adopt an object carrying another manager's ownership labels. The way
 # through is the chart README's handoff, done here only when both halves
-# hold: the live object is the operator's, and the target chart renders it.
-# The operator is stopped first so its watch does not re-stamp the label
-# between the relabel and the upgrade, and started again after the operator
-# step, because Helm's three-way merge leaves a replica count it did not
-# change alone.
-HANDOFF_DONE="false"
-OPERATOR_REPLICAS_BEFORE_HANDOFF=""
-
-target_chart_renders_litellm_policy() {
-  grep -rqF "name: ${LITELLM_POLICY}" "$1/charts/kube-agents/templates" 2>/dev/null
+# hold: the live object is the operator's, and the target GA is one whose
+# chart renders it (LAST_GA_WITH_STATIC_LITELLM_POLICY or earlier). The
+# operator is stopped first so its watch does not re-stamp the label between
+# the relabel and the upgrade, and started again after the operator step,
+# because Helm's three-way merge leaves a replica count it did not change
+# alone.
+target_ga_renders_litellm_policy() {
+  [ "$(compare_semver "$1" "${LAST_GA_WITH_STATIC_LITELLM_POLICY}")" != "1" ]
 }
 
 handoff_litellm_policy_if_needed() {
-  local target_dir="$1" managed_by renders="no"
+  local target_tag="$1" managed_by renders="no"
   managed_by="$(kubectl get networkpolicy "${LITELLM_POLICY}" -n "${NAMESPACE}" \
     -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
-  target_chart_renders_litellm_policy "${target_dir}" && renders="yes"
+  target_ga_renders_litellm_policy "${target_tag}" && renders="yes"
   if [ "${managed_by}" != "${OPERATOR_MANAGED_BY_LABEL}" ] || [ "${renders}" != "yes" ]; then
-    echo "==> ${LITELLM_POLICY} needs no handoff (managed-by '${managed_by:-<absent>}', target chart renders it: ${renders})."
+    echo "==> ${LITELLM_POLICY} needs no handoff (managed-by '${managed_by:-<absent>}', ${target_tag}'s chart renders it: ${renders})."
     return 0
   fi
-  echo "==> ${LITELLM_POLICY} is the operator's and the target chart renders it: handing it to Helm first."
+  echo "==> ${LITELLM_POLICY} is the operator's and ${target_tag}'s chart renders it: handing it to Helm first."
   OPERATOR_REPLICAS_BEFORE_HANDOFF="$(kubectl get deployment "${OPERATOR_DEPLOYMENT}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}')"
   kubectl scale deployment "${OPERATOR_DEPLOYMENT}" -n "${NAMESPACE}" --replicas=0
+  # From here the operator is down, so from here a failure has to restore it.
+  HANDOFF_DONE="true"
   kubectl wait --for=delete pod -l "${OPERATOR_POD_SELECTOR}" -n "${NAMESPACE}" \
     --timeout="${OPERATOR_SCALE_TIMEOUT_SECONDS}s" || true
   kubectl label networkpolicy "${LITELLM_POLICY}" -n "${NAMESPACE}" \
     "app.kubernetes.io/managed-by=${HELM_MANAGED_BY_LABEL}" --overwrite
   kubectl annotate networkpolicy "${LITELLM_POLICY}" -n "${NAMESPACE}" \
     "meta.helm.sh/release-name=${HELM_RELEASE}" "meta.helm.sh/release-namespace=${NAMESPACE}" --overwrite
-  HANDOFF_DONE="true"
 }
 
 # Also called from the EXIT trap, which can fire before the variables above
@@ -387,7 +397,7 @@ CURRENT_STEP="dry run ${ROLLBACK_TAG}"
 record "dry run ${ROLLBACK_TAG}" "✅" "source check and configuration"
 
 CURRENT_STEP="handoff ${LITELLM_POLICY}"
-handoff_litellm_policy_if_needed "${ROLLBACK_CHECKOUT}"
+handoff_litellm_policy_if_needed "${ROLLBACK_TAG}"
 if [ "${HANDOFF_DONE}" = "true" ]; then
   record "handoff ${LITELLM_POLICY}" "✅" "relabelled for Helm before the operator step"
 else
