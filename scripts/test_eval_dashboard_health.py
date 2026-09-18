@@ -1098,11 +1098,23 @@ class PoolNote(unittest.TestCase):
     def test_a_malformed_waiting_queue_costs_the_figure_not_the_tick(self):
         # Same filter as the rest of the artifact reader: the adjudicate step
         # is not continue-on-error.
-        for name, runs in (("a dict", {"minutes": 9}), ("a string in the list", ["9"]), ("a figure infinite", [{"minutes": INF}])):
+        shapes = (
+            ("a dict", {"minutes": 9}),
+            ("a string in the list", ["9"]),
+            ("a figure infinite", [{"minutes": INF}]),
+            # Finite, so _as_seconds returns it, and larger than a date can be
+            # moved back by: without the cap it dates the backlog and raises.
+            ("a figure past any real wait", [{"minutes": 2e9}]),
+        )
+        for name, runs in shapes:
             with self.subTest(name):
                 artifact = pressure(verdict="BREACH", cause="CAPACITY")
                 artifact["queue"]["waiting_runs"] = runs
                 self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 0)
+        # And it costs only its own run: the jam beside it is still measured.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        artifact["queue"]["waiting_runs"] = [{"minutes": 2e9}, {"minutes": 40}]
+        self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 2400)
 
     def test_the_digest_wait_is_withheld_on_a_day_the_producer_would_not_judge(self):
         # At 13:00 UTC the newest row holds only the overnight runs. One slow

@@ -334,6 +334,10 @@ POOL_BREACH = "BREACH"
 POOL_UNMEASURED = "UNMEASURED"
 POOL_STALE = "STALE"
 SECONDS_PER_MINUTE = 60
+# Longer than a queued run can really have waited: the sweep only looks back a
+# week. Past it the figure is corrupt, and dating a backlog from it puts the
+# start outside the range a datetime can hold.
+POOL_MAX_WAIT = timedelta(days=30)
 # pool_pressure.py buckets waits by UTC calendar day and emits no row for a day
 # with no runs, so the newest row is not always the newest day. "Last 24h" from
 # window_end spans two such days; a row older than that is a different day's
@@ -1069,12 +1073,15 @@ def _longest_wait_s(queue: dict) -> int | None:
     """The longest current wait for a project, or None if Deck was not read.
 
     None and zero say different things -- "we cannot tell" against "nothing is
-    waiting" -- and the message gate treats them differently.
+    waiting" -- and the message gate treats them differently. A figure over
+    POOL_MAX_WAIT is dropped like an unparseable one: it costs its own run,
+    not the tick that would otherwise date a backlog from it and raise.
     """
     if not queue.get("read"):
         return None
+    cap = int(POOL_MAX_WAIT.total_seconds())
     waits = [_as_seconds(run.get("minutes")) for run in _rows(queue, "waiting_runs") if isinstance(run, dict)]
-    return max([w for w in waits if w is not None], default=0)
+    return max([w for w in waits if w is not None and w <= cap], default=0)
 
 
 def _over_limit(row: dict, thresholds: dict) -> bool:

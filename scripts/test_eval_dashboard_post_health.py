@@ -1193,6 +1193,30 @@ class PoolNote(RunHarness):
             self.tick(pooled(), self.at(10, minute))
         self.assertEqual(len(self.opener.requests), 1)
 
+    def test_a_deck_that_flaps_after_a_drain_says_nothing_new(self):
+        # Forgetting the cause on a drained queue leaves an unread one looking
+        # like news. Deck failing every other hour under a week-old verdict
+        # would then post the same ⏳ on every failure, with nothing measured
+        # waiting since the drain.
+        self.tick(pooled(), self.at(10))
+        for minute, longest in ((15, 0), (30, None), (45, 0)):
+            self.tick(pooled(waiting_longest_s=longest, over_threshold=0), self.at(10, minute))
+        self.tick(pooled(waiting_longest_s=None, over_threshold=0), self.at(11))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳"])
+        # ... and the jam that does come back is still told.
+        self.tick(pooled(), self.at(11, 15))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳"])
+
+    def test_a_measured_jam_ends_the_memory_of_the_drain(self):
+        # Otherwise one drained reading silences every unread tick for the rest
+        # of the run, including the opening of the next episode, which is the
+        # one case the unread-queue wording exists for.
+        self.tick(pooled(waiting_longest_s=0, over_threshold=0), self.at(10))
+        self.tick(pooled(), self.at(10, 15))
+        self.assertFalse(self.recorded()["pool_drained"], "the queue was measured jammed")
+        self.tick(pooled(cause="CONTROL_PLANE", waiting_longest_s=None), self.at(10, 30))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳"])
+
     def test_a_breach_nobody_was_told_about_is_not_owed_a_clear(self):
         # pool_breached is set on the send, not on the reading. Set it on the
         # reading and a week of withheld breaches would close with a ✅ ending

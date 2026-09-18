@@ -313,7 +313,7 @@ def pool_was_read(health: dict) -> bool:
     return bool((health.get("metrics") or {}).get("queue_wait_read"))
 
 
-def pool_advisable(pool: dict) -> bool:
+def pool_advisable(pool: dict, drained: bool = False) -> bool:
     """Whether the note is worth posting, and worth recording as told. The two
     answers have to match: a breach withheld here but written to `pool_verdict`
     reads later as already said, and the next live queue under the same cause
@@ -321,9 +321,14 @@ def pool_advisable(pool: dict) -> bool:
 
     A breach needs a live backlog, because the verdict lasts a week while the
     remedy is read fresh each hour. Unknown is not a refusal -- an unreadable
-    queue withholds nothing, and `pool_cause_text` drops the diagnosis instead.
+    queue withholds nothing, and `pool_cause_text` drops the diagnosis instead
+    -- except after the queue was last seen drained, when a Deck that fails
+    every other hour would announce a jam nothing has measured since.
     """
-    return pool.get("verdict") != POOL_BREACH or pool.get("waiting_now") is not False
+    if pool.get("verdict") != POOL_BREACH:
+        return True
+    live = pool.get("waiting_now")
+    return live is True or (live is None and not drained)
 
 
 def pool_cause_key(pool: dict) -> str | None:
@@ -396,7 +401,7 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     told = prev or {}
     if (
         pool
-        and pool_advisable(pool)
+        and pool_advisable(pool, bool(told.get("pool_drained")))
         and (
             pool.get("verdict") != told.get("pool_verdict")
             or pool_cause_key(pool) not in (told.get("pool_causes") or [])
@@ -1139,7 +1144,7 @@ def run(
     # lose the only "it is over" the space ever gets.
     # A withheld breach is not one of the "nothing was due" cases: see
     # pool_advisable.
-    withheld = bool(health.get("pool")) and not pool_advisable(health["pool"])
+    withheld = bool(health.get("pool")) and not pool_advisable(health["pool"], bool(before.get("pool_drained")))
     told_pool = (
         (KIND_POOL in sent or KIND_POOL not in kinds)
         and (KIND_POOL_CLEAR in sent or KIND_POOL_CLEAR not in kinds)
@@ -1164,8 +1169,16 @@ def run(
     pool_causes = list(before.get("pool_causes") or [])
     if KIND_POOL in sent:
         pool_causes += [key for key in pool_told_keys(health.get("pool") or {}) if key not in pool_causes]
+    # `pool_drained` is what the last reading showed, and it is what keeps an
+    # unread queue from re-opening the ⏳ every time Deck fails: the memory is
+    # empty, so the cause looks new. Dropped again by a reading with a backlog
+    # in it, which is the jam the empty memory is there to announce.
+    pool_drained = bool(before.get("pool_drained"))
     if pool_was_read(health) and (not health.get("pool") or withheld):
         pool_causes = []
+        pool_drained = True
+    elif (health.get("pool") or {}).get("waiting_now"):
+        pool_drained = False
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,
         # fresh start is not announced later as a change.
@@ -1195,6 +1208,7 @@ def run(
         ),
         "pool_breached": pool_breached,
         "pool_causes": pool_causes,
+        "pool_drained": pool_drained,
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),

@@ -271,7 +271,9 @@ hour's, the queue is Deck's.
 A drained queue also ends what the jam said. The verdict holds for a week, so a
 pool that fills every afternoon would otherwise be announced on Monday and
 silent for the rest of it; the causes already named are forgotten on a reading
-that shows nothing waiting, and the next jam is news again. The dashboard dates
+that shows nothing waiting, and the next jam is news again — a next jam that has
+to be measured, since an hour Deck could not be read has seen no queue at all.
+The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same
 reason: the episode can have opened days before the backlog being described.
 
