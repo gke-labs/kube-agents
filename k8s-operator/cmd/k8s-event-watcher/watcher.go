@@ -562,12 +562,27 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 	if first.IsZero() {
 		first = ev.CreationTimestamp.Time
 	}
+	// Series is where events.k8s.io/v1 recorders keep the repeat: kubelet and
+	// cluster-autoscaler bump LastTimestamp and Count on the core/v1 object,
+	// but upstream kube-scheduler records through the new API, on which the
+	// first occurrence is EventTime and every repeat lands on Series. Read
+	// through to the core/v1 shape the informer lists, that is a Count of
+	// zero and a LastTimestamp of zero with the live values on Series. Without
+	// these fallbacks the FailedScheduling gate would fail open on the first
+	// event and then read every later one as stale.
 	last := ev.LastTimestamp.Time
+	if last.IsZero() && ev.Series != nil {
+		last = ev.Series.LastObservedTime.Time
+	}
 	if last.IsZero() {
 		last = ev.EventTime.Time
 	}
 	if last.IsZero() {
 		last = ev.CreationTimestamp.Time
+	}
+	count := int(ev.Count)
+	if count == 0 && ev.Series != nil {
+		count = int(ev.Series.Count)
 	}
 
 	// The event references its target via InvolvedObject.
@@ -599,7 +614,7 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 		ControllerRef: controllerRef,
 		Node:          nodeFromSource(ev),
 		Labels:        labelsFromMeta(ev.ObjectMeta),
-		Count:         int(ev.Count),
+		Count:         count,
 		Type:          ev.Type,
 	}
 }

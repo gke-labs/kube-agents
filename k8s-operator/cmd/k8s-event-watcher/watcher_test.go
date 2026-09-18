@@ -245,6 +245,60 @@ var forbiddenListErr = apierrors.NewForbidden(
 // makes at least two attempts, a held informer makes exactly one and logs it
 // once; the informer stays alive, so cancelling the context still ends Run
 // promptly from inside the hold.
+// TestToTriageEvent_SeriesFallbacks covers the events.k8s.io/v1 shape read
+// through the core/v1 informer: an emitter recording through the new API
+// leaves Count and LastTimestamp at zero and keeps the repeat on Series. The
+// count debounces and the FailedScheduling staleness check both read those
+// two fields, so a series event has to surface its live values.
+func TestToTriageEvent_SeriesFallbacks(t *testing.T) {
+	first := time.Unix(1_700_000_000, 0)
+	last := first.Add(4 * time.Minute)
+
+	t.Run("series count and last observed time are used when the core fields are zero", func(t *testing.T) {
+		got := toTriageEvent(&corev1.Event{
+			InvolvedObject: corev1.ObjectReference{UID: types.UID("uid-1")},
+			Reason:         "FailedScheduling",
+			EventTime:      metav1.MicroTime{Time: first},
+			Series:         &corev1.EventSeries{Count: 7, LastObservedTime: metav1.MicroTime{Time: last}},
+		}, targetCluster{Name: "c"})
+		if got.Count != 7 {
+			t.Errorf("Count = %d; want 7 from Series", got.Count)
+		}
+		if !got.LastSeen.Equal(last) {
+			t.Errorf("LastSeen = %v; want Series.LastObservedTime %v", got.LastSeen, last)
+		}
+		if !got.FirstSeen.Equal(first) {
+			t.Errorf("FirstSeen = %v; want EventTime %v", got.FirstSeen, first)
+		}
+	})
+
+	t.Run("core fields win when both are set", func(t *testing.T) {
+		got := toTriageEvent(&corev1.Event{
+			InvolvedObject: corev1.ObjectReference{UID: types.UID("uid-1")},
+			Reason:         "FailedScheduling",
+			LastTimestamp:  metav1.Time{Time: first},
+			Count:          3,
+			Series:         &corev1.EventSeries{Count: 7, LastObservedTime: metav1.MicroTime{Time: last}},
+		}, targetCluster{Name: "c"})
+		if got.Count != 3 {
+			t.Errorf("Count = %d; want the core field's 3", got.Count)
+		}
+		if !got.LastSeen.Equal(first) {
+			t.Errorf("LastSeen = %v; want LastTimestamp %v", got.LastSeen, first)
+		}
+	})
+
+	t.Run("no series leaves the zero count alone", func(t *testing.T) {
+		got := toTriageEvent(&corev1.Event{
+			InvolvedObject: corev1.ObjectReference{UID: types.UID("uid-1")},
+			EventTime:      metav1.MicroTime{Time: first},
+		}, targetCluster{Name: "c"})
+		if got.Count != 0 {
+			t.Errorf("Count = %d; want 0", got.Count)
+		}
+	})
+}
+
 func TestRun_ForbiddenListIsHeldForTheInterval(t *testing.T) {
 	logs := captureLog(t)
 	client, attempts := listFailingClient(forbiddenListErr)

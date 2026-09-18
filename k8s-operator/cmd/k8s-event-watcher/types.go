@@ -74,6 +74,11 @@ type TriageEvent struct {
 	// See pullfailure.go.
 	PullClass pullClass
 	PullCause string
+	// ScaleUp is cluster-autoscaler's latest verdict on the pod, stamped by
+	// the dispatcher on FailedScheduling events only, from the marks it
+	// recorded off the pod's TriggeredScaleUp and NotTriggerScaleUp events.
+	// The zero mark means the autoscaler has said nothing. See scaleup.go.
+	ScaleUp scaleUpMark
 }
 
 // InjectPayload is the JSON body POSTed to

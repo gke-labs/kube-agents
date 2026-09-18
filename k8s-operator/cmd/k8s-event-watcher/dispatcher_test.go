@@ -1145,3 +1145,243 @@ func TestDispatcherPullClassIsPerObject(t *testing.T) {
 		t.Errorf("unrelated pod fired %d injects; want 1", *injectCount)
 	}
 }
+
+// scaleUpReasons is the deployed allow-list's FailedScheduling slice: the
+// reason itself plus the two autoscaler verdicts it correlates with.
+var scaleUpReasons = []string{"FailedScheduling", "TriggeredScaleUp", "NotTriggerScaleUp"}
+
+// newScaleUpDispatcher is newCountingDispatcher with the FailedScheduling
+// reasons admitted and a pinned clock shared by the filter and the memo, so
+// a test walks the sequence in event time.
+func newScaleUpDispatcher(t *testing.T, th filterThresholds, now *time.Time) (*dispatcher, *metrics, *int) {
+	t.Helper()
+	disp, m, injectCount, _ := newCountingDispatcher(t, th)
+	disp.filter = newFilter(newFilterConfig(scaleUpReasons, nil, nil, th))
+	disp.filter.now = func() time.Time { return *now }
+	disp.scaleUps = newScaleUpMemo(24*time.Hour, 0)
+	disp.scaleUps.now = func() time.Time { return *now }
+	return disp, m, injectCount
+}
+
+func failedSchedulingEvent(uid string, count int, at time.Time) TriageEvent {
+	return TriageEvent{
+		Key:       EventKey{UID: uid, Reason: "FailedScheduling"},
+		Cluster:   "test-cluster",
+		Namespace: "default",
+		Name:      "api",
+		Message:   "0/3 nodes are available: 3 Insufficient cpu.",
+		Type:      "Warning",
+		LastSeen:  at,
+		Count:     count,
+	}
+}
+
+func autoscalerEvent(uid, reason string, at time.Time) TriageEvent {
+	ev := failedSchedulingEvent(uid, 1, at)
+	ev.Key.Reason = reason
+	ev.Type = "Normal"
+	ev.Message = "pod triggered scale-up"
+	if reason == "NotTriggerScaleUp" {
+		ev.Message = "pod didn't trigger scale-up: 1 max node group size reached"
+	}
+	return ev
+}
+
+// TestDispatcherScaleUpMarksAreRecordedNotForwarded: the two autoscaler events
+// create no session, inject nothing, leave no dedup entry, and are remembered.
+func TestDispatcherScaleUpMarksAreRecordedNotForwarded(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, m, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now))
+	disp.Dispatch(ctx, autoscalerEvent("pod-2", "NotTriggerScaleUp", now))
+
+	if *injectCount != 0 {
+		t.Errorf("autoscaler events fired %d injects; want 0", *injectCount)
+	}
+	if got := disp.dedup.Len(); got != 0 {
+		t.Errorf("autoscaler events left %d dedup entries; want 0", got)
+	}
+	if got := disp.scaleUps.Len(); got != 2 {
+		t.Errorf("memo holds %d marks; want 2", got)
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateScaleUpMark))); got != 2 {
+		t.Errorf("events_filtered_total{gate=scaleup_mark} = %v; want 2", got)
+	}
+}
+
+// TestDispatcherScaleUpMarkFromExcludedNamespaceIsNotRecorded: the namespace
+// rules decide which verdicts are remembered, as they decide everything else.
+func TestDispatcherScaleUpMarkFromExcludedNamespaceIsNotRecorded(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, _, _ := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	disp.filter = newFilter(newFilterConfig(scaleUpReasons, nil, []string{"kube-system"}, filterThresholds{}))
+
+	ev := autoscalerEvent("pod-1", "NotTriggerScaleUp", now)
+	ev.Namespace = "kube-system"
+	disp.Dispatch(context.Background(), ev)
+
+	if got := disp.scaleUps.Len(); got != 0 {
+		t.Errorf("excluded namespace recorded %d marks; want 0", got)
+	}
+}
+
+// TestDispatcherFailedSchedulingDeclinedFiresOnce is the decline path as the
+// cluster delivers it: the scheduler's first FailedScheduling is held on the
+// count, cluster-autoscaler declines a second later, and the scheduler's next
+// retry, minutes later, opens the incident. Every retry after that is deduped.
+func TestDispatcherFailedSchedulingDeclinedFiresOnce(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, m, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 1, now))
+	if *injectCount != 0 {
+		t.Fatalf("first FailedScheduling fired %d injects before any verdict; want 0", *injectCount)
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateFailedSchedulingMinCount))); got != 1 {
+		t.Errorf("events_filtered_total{gate=failedscheduling_min_count} = %v; want 1", got)
+	}
+
+	now = now.Add(time.Second)
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "NotTriggerScaleUp", now))
+
+	now = now.Add(5 * time.Minute)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 2, now))
+	if *injectCount != 1 {
+		t.Fatalf("FailedScheduling after the decline fired %d injects; want 1", *injectCount)
+	}
+
+	now = now.Add(5 * time.Minute)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 3, now))
+	now = now.Add(5 * time.Minute)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 4, now))
+	if *injectCount != 1 {
+		t.Errorf("later retries fired %d injects in total; want 1", *injectCount)
+	}
+}
+
+// TestDispatcherFailedSchedulingHeldWhileScaleUpTriggered is the hold path,
+// timed as the first live attempt measured it on Autopilot: TriggeredScaleUp
+// two seconds after the pod, the count past five within fifteen seconds, the
+// node Ready at fifty. Nothing may fire.
+func TestDispatcherFailedSchedulingHeldWhileScaleUpTriggered(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, m, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 1, now))
+	now = now.Add(2 * time.Second)
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now))
+	for count := 2; count <= 9; count++ {
+		now = now.Add(2 * time.Second)
+		disp.Dispatch(ctx, failedSchedulingEvent("pod-1", count, now))
+	}
+
+	if *injectCount != 0 {
+		t.Errorf("scale-up in progress fired %d injects; want 0", *injectCount)
+	}
+	if got := disp.dedup.Len(); got != 0 {
+		t.Errorf("held events left %d dedup entries; want 0", got)
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateScaleUpHold))); got != 8 {
+		t.Errorf("events_filtered_total{gate=scaleup_hold} = %v; want 8", got)
+	}
+}
+
+// TestDispatcherFailedSchedulingHoldExpires: a scale-up the autoscaler never
+// delivers does not silence the pod. Past the hold the count backstop fires.
+func TestDispatcherFailedSchedulingHoldExpires(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now))
+	now = now.Add(defaultScaleUpHold - time.Minute)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 12, now))
+	if *injectCount != 0 {
+		t.Fatalf("fired %d injects inside the hold; want 0", *injectCount)
+	}
+
+	now = now.Add(2 * time.Minute)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 13, now))
+	if *injectCount != 1 {
+		t.Errorf("fired %d injects after the hold expired; want 1", *injectCount)
+	}
+}
+
+// TestDispatcherLatestScaleUpVerdictWins: a decline after a trigger releases
+// the hold, and a trigger after a decline reinstates it.
+func TestDispatcherLatestScaleUpVerdictWins(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now))
+	now = now.Add(30 * time.Second)
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "NotTriggerScaleUp", now))
+	now = now.Add(30 * time.Second)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 2, now))
+	if *injectCount != 1 {
+		t.Errorf("decline after trigger fired %d injects; want 1", *injectCount)
+	}
+
+	now = now.Add(time.Second)
+	disp.Dispatch(ctx, autoscalerEvent("pod-2", "NotTriggerScaleUp", now))
+	now = now.Add(30 * time.Second)
+	disp.Dispatch(ctx, autoscalerEvent("pod-2", "TriggeredScaleUp", now))
+	now = now.Add(30 * time.Second)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-2", 7, now))
+	if *injectCount != 1 {
+		t.Errorf("trigger after decline fired %d more injects; want 0", *injectCount-1)
+	}
+}
+
+// TestDispatcherScaleUpMarkIsPerPod: one pod's scale-up must not hold, and one
+// pod's decline must not release, another pod's FailedScheduling.
+func TestDispatcherScaleUpMarkIsPerPod(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now))
+	disp.Dispatch(ctx, autoscalerEvent("pod-3", "NotTriggerScaleUp", now))
+	now = now.Add(time.Minute)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-2", 5, now))
+	if *injectCount != 1 {
+		t.Errorf("pod-2 at the count threshold fired %d injects; want 1 (pod-1's scale-up is not its own)", *injectCount)
+	}
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-4", 1, now))
+	if *injectCount != 1 {
+		t.Errorf("pod-4 at count 1 fired; pod-3's decline is not its own")
+	}
+}
+
+// TestDispatcherStaleFailedSchedulingReplayDoesNotFire is the restart case.
+// The informer's initial list replays a pod's events in creation order, so the
+// FailedScheduling that a TriggeredScaleUp held at count nine arrives before
+// the mark that held it. The pod scheduled half an hour ago; the event's own
+// timestamp says so, and that is what keeps it from opening a card.
+func TestDispatcherStaleFailedSchedulingReplayDoesNotFire(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, m, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 9, now.Add(-30*time.Minute)))
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now.Add(-30*time.Minute)))
+
+	if *injectCount != 0 {
+		t.Errorf("replayed FailedScheduling of a scheduled pod fired %d injects; want 0", *injectCount)
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateFailedSchedulingStale))); got != 1 {
+		t.Errorf("events_filtered_total{gate=failedscheduling_stale} = %v; want 1", got)
+	}
+
+	// A pod still stuck is re-sighted within minutes, and that sighting fires.
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-2", 9, now.Add(-30*time.Minute)))
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-2", 10, now.Add(-time.Minute)))
+	if *injectCount != 1 {
+		t.Errorf("a stuck pod's fresh sighting fired %d injects; want 1", *injectCount)
+	}
+}
