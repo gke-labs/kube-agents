@@ -80,6 +80,7 @@ __all__ = [
     "REASON_CANCELED_BEFORE_START",
     "REASON_PREFIX",
     "REFUSAL_NO_ANSWER",
+    "REFUSAL_NO_CANCEL",
     "REFUSAL_NO_TASK",
     "REFUSAL_PUBLISH_FAILED",
     "REFUSAL_UNVERIFIED_AUTHOR",
@@ -248,6 +249,8 @@ REFUSAL_UNVERIFIED_AUTHOR = "unverified-author"
 REFUSAL_PUBLISH_FAILED = "publish-failed"
 REFUSAL_NO_TASK = "no-task"
 REFUSAL_NO_ANSWER = "no-answer"
+# The cancel route's own: the turn ended without a cancel reaching the bus.
+REFUSAL_NO_CANCEL = "cancel-not-published"
 # What each one means, in the words the run's record carries. The publish
 # failure is its own class rather than part of the refusal above because it
 # says something different about the install: the door and the principal map
@@ -264,6 +267,9 @@ _REFUSAL_DETAIL = {
         "the gateway answered the turn without starting a task (a steer, a status answer, or a stop)"
     ),
     REFUSAL_NO_ANSWER: "the gateway did not say what it did with the prompt inside its own bound",
+    REFUSAL_NO_CANCEL: (
+        "the gateway put no cancel on the bus: it refused the task or could not publish one, so whatever the task was doing it is still doing"
+    ),
 }
 _REFUSAL_UNKNOWN = "the gateway started no task for the prompt"
 
@@ -1233,12 +1239,29 @@ class InjectTask:
         if self.message_id:
             payload["messageId"] = self.message_id + CANCEL_MESSAGE_ID_SUFFIX
         try:
-            _request(url, SUBMIT_TIMEOUT_SECONDS, self.token, payload)
-            self.cancel_sent = True
-            _log.info("inject: cancelled task %s on %s", task_id, self.conversation)
+            body = _request(url, SUBMIT_TIMEOUT_SECONDS, self.token, payload)
         except InjectUnavailable as exc:
             _log.warning("inject: the cancel for task %s did not land: %s", task_id, exc)
             return None
+        # A 200 says the door answered, not that a cancel reached the bus: the
+        # gateway refuses a task the conversation never held, one whose
+        # history entry predates its correlation ids, and one whose publish
+        # failed, and answers each with a posted line. The door reports which
+        # as a code beside the flag, so this never matches on that prose --
+        # and a caller that recorded "cancel published" on the strength of
+        # the 200 would tell a reader a stray run was bounded when it is
+        # still running.
+        self.cancel_sent = bool(body.get("cancelPublished"))
+        if self.cancel_sent:
+            _log.info("inject: cancelled task %s on %s", task_id, self.conversation)
+        else:
+            _log.warning(
+                "inject: the door published no cancel for task %s on %s (%s): %s",
+                task_id,
+                self.conversation,
+                body.get("refusal") or "no code",
+                body.get("note") or "no note",
+            )
         if not task_id or settle <= 0:
             return None
         try:

@@ -1434,6 +1434,31 @@ class KubeAgentsHarness(AgentHarness):
                             "inject: port-forward respawn failed before retry: %s", pf_exc
                         )
 
+        def _abandon(task: inject.InjectTask) -> str:
+            """Cancel a task the transport gave up on, and say what happened.
+
+            The exchange raises when the gateway cannot be reached at all --
+            the retries spent, or a status the retry set does not cover --
+            and by then the POST may long since have been accepted, so a task
+            is running on the bridge with nobody watching it. It holds a
+            concurrency slot until the bridge's own deadline, and the units
+            behind it in the same run queue. Best effort, on the transport
+            that has just failed: it may fail too, and the run is
+            infrastructure either way.
+            """
+            if not task.task_id:
+                return ""
+            task.cancel(task.task_id, settle=0)
+            if task.cancel_sent:
+                return (
+                    f"; a cancel naming task {task.task_id} was published, so it does not hold a "
+                    "bridge slot for the rest of its budget"
+                )
+            return (
+                f"; task {task.task_id} was left running: the cancel could not be sent over the "
+                "same failed transport (see the log)"
+            )
+
         def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bool, bool]:
             """Cancel a task an exchange left active, after the read.
 
@@ -1488,9 +1513,11 @@ class KubeAgentsHarness(AgentHarness):
             # non-numeric budget, and nothing ran.
             return AgentResult.errored(f"AGENT_INJECT_TIMEOUT: {exc}")
         except inject.InjectUnavailable as exc:
-            return _infra_failure(f"the inject exchange on {conversation} failed: {exc}")
+            return _infra_failure(
+                f"the inject exchange on {conversation} failed: {exc}{_abandon(task)}"
+            )
         except _TransportError as exc:
-            return _infra_failure(str(exc))
+            return _infra_failure(f"{exc}{_abandon(task)}")
         identity["inject_only"] = task.inject_only
         identity["backend"] = task.backend
 
@@ -1618,7 +1645,9 @@ class KubeAgentsHarness(AgentHarness):
                 try:
                     turn_exchange = _exchange(follow, turn_timeout, opening=False)
                 except inject.InjectUnavailable as exc:
-                    raise _TransportError(str(exc), retryable=exc.retryable) from exc
+                    raise _TransportError(
+                        f"{exc}{_abandon(follow)}", retryable=exc.retryable
+                    ) from exc
                 if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
                     # Retryable, and therefore infrastructure once the wait's
                     # retries are spent: nothing executed this turn, so there

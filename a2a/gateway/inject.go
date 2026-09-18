@@ -222,6 +222,13 @@ const (
 	// nothing this door could see. Distinct from the three above because it
 	// is the absence of an answer rather than one.
 	injectRefusalNoAnswer = "no-answer"
+
+	// injectRefusalNoCancel is the cancel route's: the turn ended without
+	// the gateway putting a cancel on the bus. Its own code rather than
+	// no-answer, because the turn did answer -- the conversation carries
+	// the gateway's line saying why -- and because what it tells a caller
+	// is specific: the stray run it meant to bound is still running.
+	injectRefusalNoCancel = "cancel-not-published"
 )
 
 // InjectEntry is one line of a conversation's transcript.
@@ -305,6 +312,12 @@ type injectResponse struct {
 	// (injectRefusalUnverifiedAuthor and the rest). Empty when TaskID is
 	// set. A caller branches on it rather than on Note, which is prose.
 	Refusal string `json:"refusal,omitempty"`
+
+	// CancelPublished is the cancel route's answer: a kind:cancel envelope
+	// for the task is on the bus. False with a Refusal when the gateway
+	// refused it or could not send it; the conversation's entries carry the
+	// line it posted saying which.
+	CancelPublished bool `json:"cancelPublished,omitempty"`
 	// Deduplicated is true when this POST's message id had already been
 	// accepted: TaskID, Note and Refusal are the first POST's, and nothing
 	// was started or routed for this one.
@@ -470,6 +483,10 @@ type injectConversation struct {
 	// read counts one turn short and classify from the first turn's work.
 	turns  int
 	handed int
+	// cancelsPublished counts the cancels the gateway put on the bus here
+	// (TaskObserver.CancelPublished). Read against the end of the turn: a
+	// cancel turn that ended without this moving did not publish one.
+	cancelsPublished int
 	// gen is which minting of this key the state belongs to. The door evicts
 	// a conversation wholesale at its cap and mints it again on the next
 	// touch with every counter at zero, so a waiter that read its counts
@@ -762,6 +779,21 @@ func (a *InjectAdapter) TaskAccepted(conversation, taskID string) {
 	a.notify = make(chan struct{})
 }
 
+// CancelPublished records that a cancel for taskID reached the bus, which is
+// what the cancel route answers with. See TaskObserver.CancelPublished: the
+// refusals are not signalled, so the cancel's wait reads this against the end
+// of the turn.
+func (a *InjectAdapter) CancelPublished(conversation, taskID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	conv.cancelsPublished++
+	// No transcript entry: the gateway's own post is what the conversation
+	// received. The wake-up is what a waiting cancel needs.
+	close(a.notify)
+	a.notify = make(chan struct{})
+}
+
 // MessageDropped records that the gateway dropped a message here for a sender
 // it could not verify. See InboundObserver: the notice is posted once per
 // sender, so on a second drop this counter is the only thing that moves.
@@ -953,12 +985,13 @@ func (a *InjectAdapter) snapshot(key string, after int, taskID string) ([]Inject
 // injectCounts is what a waiting request records before handing a message
 // over, so it can tell this turn's work from the last one's.
 type injectCounts struct {
-	starts        int
-	accepted      int
-	publishFailed int
-	entries       int
-	drops         int
-	turns         int
+	starts           int
+	accepted         int
+	publishFailed    int
+	entries          int
+	drops            int
+	turns            int
+	cancelsPublished int
 	// gen is the conversation's mint generation; see injectConversation.gen.
 	// Zero when the conversation did not exist when the counts were read.
 	gen int
@@ -967,13 +1000,14 @@ type injectCounts struct {
 // countsOf reads a conversation's counts. Caller holds a.mu.
 func countsOf(conv *injectConversation) injectCounts {
 	return injectCounts{
-		starts:        conv.started.total,
-		accepted:      conv.accepted.total,
-		publishFailed: conv.publishFailed.total,
-		entries:       conv.nextSeq - 1,
-		drops:         conv.drops,
-		turns:         conv.turns,
-		gen:           conv.gen,
+		starts:           conv.started.total,
+		accepted:         conv.accepted.total,
+		publishFailed:    conv.publishFailed.total,
+		entries:          conv.nextSeq - 1,
+		drops:            conv.drops,
+		turns:            conv.turns,
+		cancelsPublished: conv.cancelsPublished,
+		gen:              conv.gen,
 	}
 }
 
@@ -1288,6 +1322,7 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 			Conversation:           key,
 			MessageID:              messageID,
 			Note:                   earlierTurnNote(),
+			Refusal:                injectRefusalNoAnswer,
 			FirstEventGraceSeconds: int(a.firstEventGrace / time.Second),
 		})
 		return
@@ -1302,50 +1337,62 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 		TaskID:       strings.TrimSpace(req.TaskID),
 	})
 
-	// A cancel always answers the conversation with something -- the cancel
-	// acknowledgement, the nothing-is-running reply, or the never-started
-	// notice when the heal fires on the way past -- so waiting for one entry
-	// is waiting for the turn, not for the executor.
-	note := a.awaitEntry(r.Context(), key, prior, deadline)
+	published, note, refusal := a.awaitCancel(r.Context(), key, prior, deadline)
+	if refusal != "" {
+		a.log.Info("inject: the door published no cancel for a cancel request",
+			"conversation", key, "messageId", messageID, "refusal", refusal, "note", note)
+	}
 	entries, _, _ := a.snapshot(key, prior.entries, "")
 	writeJSON(w, http.StatusOK, injectResponse{
 		Conversation:           key,
 		MessageID:              messageID,
 		Entries:                entries,
 		Note:                   note,
+		Refusal:                refusal,
+		CancelPublished:        published,
 		FirstEventGraceSeconds: int(a.firstEventGrace / time.Second),
 	})
 }
 
-// awaitEntry waits for one new entry on a conversation, returning a note when
-// the turn produced none inside the submit bound.
+// awaitCancel waits for the gateway to deal with a cancel and says whether a
+// cancel envelope reached the bus.
 //
-// A drop ends it too, for the reason awaitTurn gives: the notice for an
-// unverifiable sender is posted once per sender, so the second cancel from an
-// author already told they are unknown produces no entry at all and would
-// otherwise hold the connection for the whole bound.
-func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior injectCounts, deadline time.Time) string {
+// Read off the end of the turn, for the reason awaitTurn gives and one of its
+// own: every path answers the conversation with a post, so an entry is not
+// evidence the cancel went -- "🤷 this conversation never held task", "task
+// predates this record's correlation ids" and "⚠️ could not send the stop"
+// are posts too. A caller telling those from a success would be matching the
+// gateway's prose, which is what the POST route's refusal codes exist to
+// avoid. So the door watches the publish (TaskObserver.CancelPublished) and
+// reads its absence at the end of the turn as the refusal.
+func (a *InjectAdapter) awaitCancel(ctx context.Context, key string, prior injectCounts,
+	deadline time.Time) (bool, string, string) {
 	for {
 		now := a.counts(key)
-		if now.gen != prior.gen {
-			return remadeNote()
-		}
-		if now.entries > prior.entries {
-			return ""
-		}
-		if now.drops > prior.drops {
-			return "the gateway dropped this cancel: its principal map does not carry the author"
+		switch {
+		case now.gen != prior.gen:
+			return false, remadeNote(), injectRefusalNoCancel
+		case now.cancelsPublished > prior.cancelsPublished:
+			return true, "", ""
+		case now.drops > prior.drops:
+			return false, "the gateway dropped this cancel: its principal map does not carry the " +
+				"author, so nothing was cancelled", injectRefusalUnverifiedAuthor
+		case now.turns > prior.turns:
+			return false, "the turn ended without the gateway putting a cancel on the bus; its " +
+				"reply on the conversation says why, and whatever the task was doing it is still " +
+				"doing", injectRefusalNoCancel
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return fmt.Sprintf("the gateway posted no reply to this turn within %s", injectSubmitWait)
+			return false, fmt.Sprintf("the gateway did not finish this cancel's turn within %s",
+				injectSubmitWait), injectRefusalNoAnswer
 		}
 		woken := a.waitCh()
 		timer := time.NewTimer(min(remaining, injectPollInterval))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return "the caller went away before the gateway answered"
+			return false, "the caller went away before the gateway answered", injectRefusalNoAnswer
 		case <-woken:
 		case <-timer.C:
 		}

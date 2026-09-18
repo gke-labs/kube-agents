@@ -139,6 +139,8 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
                 {
                     "conversation": "inject:" + CONVERSATION,
                     "entries": [],
+                    "cancelPublished": self.server.cancel_published,
+                    "refusal": "" if self.server.cancel_published else inject.REFUSAL_NO_CANCEL,
                     "firstEventGraceSeconds": self.server.grace_seconds,
                 },
             )
@@ -272,6 +274,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # The first-event grace the stub reports.
     grace_seconds: int = GRACE_SECONDS
     accept_submissions: bool = True
+    # Whether the door reports that a cancel reached the bus. False is the
+    # gateway refusing it or failing to publish it, which is a 200 too.
+    cancel_published: bool = True
     refusal_note: str = "the gateway answered without starting a task"
     # The machine-readable half of a refusal, which is what the harness
     # branches on; "" is a door too old to send one.
@@ -654,6 +659,52 @@ def test_a_never_started_task_already_detached_is_not_cancelled_again(
     assert "a stop was already pending" in result.errors[0]
     assert "was published" not in result.errors[0]
     assert not stub_gateway.cancels
+
+
+def test_a_cancel_the_door_did_not_publish_is_not_recorded_as_published(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """A 200 from the cancel route says the door answered, not that a cancel
+    reached the bus: the gateway refuses a task the conversation never held
+    and one whose publish failed, and posts a line saying so. Recording those
+    as published would tell a reader a stray run was bounded while it runs."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
+    stub_gateway.executor_states = [""]
+    stub_gateway.probe_age_seconds = GRACE_SECONDS + 1
+    stub_gateway.cancel_published = False
+
+    result = KubeAgentsHarness().run("nobody is listening")
+
+    assert infra(result)
+    assert "no executor took task" in result.errors[0]
+    assert "could not be sent" in result.errors[0]
+    assert "was published" not in result.errors[0]
+    # It was still attempted: not sending one would leave the submission on
+    # the bus with nothing having tried to bound it.
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+
+
+def test_a_transport_that_dies_after_the_accept_still_cancels_the_task(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exchange gives up when the gateway cannot be read at all, and by
+    then the task is running on the bridge. Left alone it holds a concurrency
+    slot until the bridge's own deadline and the units behind it queue, so the
+    harness cancels on the way out -- best effort, over the transport that
+    just failed."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)
+    # Outside the retry set, so the first read after the accept raises at
+    # once. Bounded to one failure so the preflight read, which precedes the
+    # POST, still succeeds and there is a task to abandon.
+    stub_gateway.poll_status = 500
+    stub_gateway.poll_failures = 1
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert infra(result)
+    assert len(stub_gateway.submissions) == 1
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+    assert "was published" in result.errors[0]
 
 
 def test_a_task_inside_the_grace_is_still_waited_for(stub_gateway: _StubGatewayServer) -> None:

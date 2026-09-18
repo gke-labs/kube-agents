@@ -146,6 +146,19 @@ type TaskObserver interface {
 	// TaskTerminal; a caller that wants to know whether its submission was
 	// taken watches this.
 	TaskAccepted(conversation, taskID string)
+
+	// CancelPublished says a kind:cancel envelope for taskID is on the
+	// task's `in` subject. Called after the publish returns, on both cancel
+	// routes (the active task's and a named task the conversation no longer
+	// holds).
+	//
+	// Signalled on success only, like TaskAccepted, and read against the end
+	// of the turn: the gateway's answer to a cancel it did not publish is a
+	// posted line saying why -- the conversation never held the task, the
+	// task predates the record's correlation ids, the publish failed -- and
+	// a program that had to tell those from a success would be matching on
+	// that prose. Absent at the turn's end, the cancel did not go.
+	CancelPublished(conversation, taskID string)
 }
 
 // InboundObserver is the optional extension an Adapter implements when it has

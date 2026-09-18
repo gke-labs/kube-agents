@@ -1,8 +1,10 @@
 # The eval transport under `spec.mode: next`
 
-> **STATUS — draft for review; nothing here is built.** The bench harness has one transport,
-> `hack/ci-deploy.sh` has no mode flag, the gateway has no inject adapter, and the presubmit
-> install runs `today`. The measurement that motivates the document is on
+> **STATUS — design of record; stage 1 partially built.** The gateway has the inject adapter and
+> the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door only
+> under its eval flag. Still unbuilt: the bridge image the eval install needs, `hack/ci-deploy.sh`
+> has no mode flag, the presubmit install runs `today`, and stage 2 (Chat ingress) is not started.
+> The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
 > owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;
 > the answers and the review's points are folded in below as decisions, dated where each lands.
@@ -71,9 +73,9 @@ streams and the executor, but it leaves out the gateway's routing, its session r
 relay back, and it hands a second process the one credential that may publish on `.in`. Stage 1
 is therefore the next-stack analogue of the door the harness uses today: an **inject adapter in
 the gateway**, a third backend beside Discord and Google Chat, HTTP on localhost or a ClusterIP
-Service, off by default, rendered by the operator only under the eval flag. Its design text goes
-in the gateway spec's "The test backend" section, which does not carry it yet; this document
-records what the harness does with it. The direct-bus transport survives as a diagnostic, below.
+Service, off by default, rendered by the operator only under the eval flag. Its design text is
+the gateway spec's "The inject backend" section; this document records what the harness does
+with it. The direct-bus transport survives as a diagnostic, below.
 
 Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is today's transport byte for byte, and
 the presubmit exports nothing new until it chooses to. The exchange:

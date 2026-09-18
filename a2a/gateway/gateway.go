@@ -807,6 +807,15 @@ func (g *Gateway) observeTaskAccepted(conversation, taskID string) {
 	}
 }
 
+// observeCancelPublished tells a TaskObserver that a cancel reached the bus.
+// Only the publish is announced; see TaskObserver.CancelPublished for why the
+// refusals are not.
+func (g *Gateway) observeCancelPublished(conversation, taskID string) {
+	if observer, ok := g.adapter.(TaskObserver); ok {
+		observer.CancelPublished(conversation, taskID)
+	}
+}
+
 // observeMessageDropped tells an InboundObserver that a message was dropped
 // for an unverifiable sender. Called on every drop, not only on the ones the
 // gateway posts a notice for. See InboundObserver.
@@ -1045,6 +1054,7 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	// residue; replaying the in subject for the cancel envelope is the
 	// close if it ever bites.
 	rec.MarkCanceled(active.TaskID)
+	g.observeCancelPublished(rec.Key, active.TaskID)
 	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
 }
 
@@ -1093,6 +1103,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 		return
 	}
 	rec.MarkCanceled(taskID)
+	g.observeCancelPublished(rec.Key, taskID)
 	g.log.Info("cancel published for a task the conversation no longer holds",
 		"conversation", rec.Key, "taskId", taskID, "addressee", ref.Addressee)
 	g.post(rec.Key, fmt.Sprintf("🛑 cancel sent for task `%s`, which this conversation no longer holds — "+

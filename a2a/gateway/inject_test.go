@@ -1537,6 +1537,9 @@ func TestInjectReadRouteReportsADetachedTask(t *testing.T) {
 	}
 	r.cancel(t, reply.Conversation, injectTestAuthor)
 	r.waitForPost(t, reply.Conversation, "cancel sent")
+	// cancelTask detaches in memory and posts; the record is written at the
+	// end of the turn, and the probe reads Detached from the record.
+	r.awaitTurnEnd(t, reply.Conversation)
 
 	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
 	if !probe.Active || !probe.Detached || probe.TaskID != reply.TaskID {
@@ -2285,6 +2288,8 @@ func TestInjectNamedCancelOfTheActiveTaskDetachesTheRecord(t *testing.T) {
 
 	r.cancelTask(t, reply.Conversation, injectTestAuthor, reply.TaskID)
 	r.waitForPost(t, reply.Conversation, "cancel sent")
+	// The detach is persisted by the end-of-turn write, not by the post.
+	r.awaitTurnEnd(t, reply.Conversation)
 
 	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
 	if !probe.Active || !probe.Detached || probe.TaskID != reply.TaskID {
@@ -2414,6 +2419,35 @@ func TestInjectHealedTerminalNamesTheSupervisorsAsItsOwn(t *testing.T) {
 	}
 	if healed.Reason != reason {
 		t.Fatalf("the healed terminal's reason = %q, want %q", healed.Reason, reason)
+	}
+}
+
+// TestInjectCancelSaysWhetherItReachedTheBus: every cancel route answers the
+// conversation with a post -- the acknowledgement, "this conversation never
+// held task X", "task X predates this record's correlation ids", "could not
+// send the stop" -- so a 200 with an entry is not evidence a cancel went. A
+// caller that recorded one as published would tell its reader a stray run
+// was bounded while it runs. The door answers the publish itself.
+func TestInjectCancelSaysWhetherItReachedTheBus(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-cancel-code", injectTestAuthor, "long job")
+	r.awaitTask(t, "platform")
+	r.awaitRecordedTask(t, reply.Conversation)
+
+	refused := r.cancelTask(t, reply.Conversation, injectTestAuthor, "task-never-held")
+	if refused.CancelPublished {
+		t.Fatalf("a cancel for a task the conversation never held reported published: %+v", refused)
+	}
+	if refused.Refusal != injectRefusalNoCancel {
+		t.Fatalf("refusal = %q, want %s", refused.Refusal, injectRefusalNoCancel)
+	}
+	if !strings.Contains(refused.Note, "still doing") {
+		t.Fatalf("note = %q, want it to say the task is still running", refused.Note)
+	}
+
+	sent := r.cancelTask(t, reply.Conversation, injectTestAuthor, reply.TaskID)
+	if !sent.CancelPublished || sent.Refusal != "" {
+		t.Fatalf("a cancel that reached the bus answered %+v, want published with no refusal", sent)
 	}
 }
 
@@ -2768,7 +2802,13 @@ func TestInjectOneBoundCoversTheClaimAndTheWait(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > injectSubmitWait/4 {
 		t.Fatalf("the wait held for %s past its deadline; it took a bound of its own", elapsed)
 	}
-	if note := door.awaitEntry(ctx, key, prior, time.Now().Add(4*injectPollInterval)); note == "" {
-		t.Fatal("awaitEntry answered nothing at the passed deadline")
+	started = time.Now()
+	published, note, refusal := door.awaitCancel(ctx, key, prior, time.Now().Add(4*injectPollInterval))
+	if published || note == "" || refusal != injectRefusalNoAnswer {
+		t.Fatalf("awaitCancel = (%v, %q, %q) at the passed deadline, want an unpublished %s",
+			published, note, refusal, injectRefusalNoAnswer)
+	}
+	if elapsed := time.Since(started); elapsed > injectSubmitWait/4 {
+		t.Fatalf("the cancel's wait held for %s past its deadline; it took a bound of its own", elapsed)
 	}
 }

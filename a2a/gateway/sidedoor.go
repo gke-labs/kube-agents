@@ -146,6 +146,12 @@ func (s *sideDoorAdapter) TaskAccepted(conversation, taskID string) {
 	}
 }
 
+func (s *sideDoorAdapter) CancelPublished(conversation, taskID string) {
+	if forDoor(conversation) {
+		s.door.CancelPublished(conversation, taskID)
+	}
+}
+
 // MessageDropped and TurnFinished reach the door alone, for the same reason:
 // a chat user reads their own conversation, and the door's caller is the one
 // that would otherwise have to guess what became of its message.
