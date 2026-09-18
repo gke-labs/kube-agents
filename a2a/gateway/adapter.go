@@ -211,8 +211,9 @@ const (
 	// TerminalFromSupervisor is a terminal that arrived on the task's
 	// supervisor subject -- the gateway's own word about an executor that
 	// died or never ran, rather than the executor's account of the work.
-	// Only the read route's fold reports it: it is the one place that has
-	// the subject a terminal arrived on (probeConversation). It is not an
+	// The read route's fold and the heal report it: they are the two places
+	// that have the subject a terminal arrived on (probeConversation,
+	// healActiveTask). It is not an
 	// answer either, and it is not TerminalFromGateway, which says something
 	// narrower and more useful -- that this gateway could not put the task
 	// on the bus at all.
@@ -289,7 +290,7 @@ type ConversationState struct {
 	// already acked its terminal (a restart or a failed record write between
 	// the ack and the release). TerminalSource says whose word it is: the
 	// executor's when it arrived on the task's events subject, the
-	// gateway's when the supervisor wrote it. Result is the text of the
+	// supervisor's when it arrived on the supervisor subject. Result is the text of the
 	// result artifact, and Reason the terminal's status message, which the
 	// executors write as `reason: <token>[ - detail]`.
 	TerminalSource TerminalSource

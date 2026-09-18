@@ -684,6 +684,46 @@ def test_a_cancel_the_door_did_not_publish_is_not_recorded_as_published(
     assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
 
 
+def test_a_graded_timeout_whose_cancel_did_not_go_says_so(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The overrun line on a graded timeout says how the stray was bounded,
+    read from the door: a cancel the gateway refused or could not publish
+    leaves the task holding its bridge slot until the bridge's own deadline,
+    and a record that said "cancelled" would tell a reader it was bounded."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.cancel_published = False
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert result.output == "partial findings"
+    assert not infra(result)
+    overrun = next(e for e in result.errors if "did not reach a terminal state" in e)
+    assert "no cancel was published" in overrun
+    assert "cancelled" not in overrun
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+
+
+def test_a_queued_task_whose_cancel_did_not_go_says_so(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The queued record the same: the bridge was asked to drop the task from
+    its queue only if the cancel reached the bus."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
+    stub_gateway.executor_states = ["submitted"]
+    stub_gateway.cancel_published = False
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("wait in line")
+
+    assert infra(result)
+    assert "sat queued" in result.errors[0]
+    assert "no cancel was published" in result.errors[0]
+    assert "cancelled" not in result.errors[0]
+    assert stub_gateway.cancels
+
+
 def test_a_transport_that_dies_after_the_accept_still_cancels_the_task(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -953,6 +993,10 @@ def test_a_transport_failure_after_the_accept_rejoins_the_same_wait(
     assert not infra(result)
     assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
     failed_at = max(i for i, p in enumerate(stub_gateway.polls) if p["failed"])
+    # The read below indexes back past the two failures to the last poll
+    # that succeeded; a first GET that landed after the failure instant
+    # would leave nothing there and the index would wrap to the settle read.
+    assert failed_at >= 2, f"the failures came before any successful poll: {stub_gateway.polls}"
     before = stub_gateway.polls[failed_at - 2]
     resumed = stub_gateway.polls[failed_at + 1]
     # Replayed from the start, so the deliverable posted before the drop is

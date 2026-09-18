@@ -1498,6 +1498,22 @@ class KubeAgentsHarness(AgentHarness):
                     )
             return timed_out, stop_pending
 
+        def _stop_word(task: inject.InjectTask, stop_pending: bool) -> str:
+            """How the stray was bounded, for the record.
+
+            Read from what the door said, never assumed from the cancel having
+            been sent: a cancel the gateway refused or could not publish
+            leaves the task holding its bridge slot, and a record that said
+            "cancelled" would tell a reader the stray was bounded when it was
+            not. The never-started branch phrases the same three cases in its
+            own words.
+            """
+            if stop_pending:
+                return "a stop was already pending"
+            if task.cancel_sent:
+                return "cancelled"
+            return "no cancel was published (see the log), so it may still be running"
+
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
@@ -1562,7 +1578,7 @@ class KubeAgentsHarness(AgentHarness):
             # there is nothing to grade; the cancel above asked the bridge
             # to drop it from the queue (it answers canceled-before-start).
             ended = exchange.fold.terminal or "no terminal inside the settle"
-            bounded = "a stop was already pending" if stop_pending else "cancelled"
+            bounded = _stop_word(task, stop_pending)
             return _infra_failure(
                 f"task {exchange.task_id} on {exchange.conversation} sat queued (submitted, "
                 f"never working) for the whole {timeout:.0f}s budget; {bounded}, {ended}. The "
@@ -1604,8 +1620,9 @@ class KubeAgentsHarness(AgentHarness):
         result = _inject_result(exchange, identity)
         if timed_out:
             # On the record whether or not the cancel was confirmed: a
-            # terminal of `canceled` below says how it ended, this says why.
-            how = "a stop was already pending" if stop_pending else "cancelled"
+            # terminal of `canceled` below says how it ended, this says why --
+            # and whether the stop went, read from the door.
+            how = _stop_word(task, stop_pending)
             result.errors.append(
                 f"task {exchange.task_id} did not reach a terminal state within "
                 f"{timeout:.0f}s; {how}"

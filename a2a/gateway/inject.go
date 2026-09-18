@@ -380,8 +380,8 @@ type probeReport struct {
 	ExecutorState string `json:"executorState,omitempty"`
 	Final         bool   `json:"final,omitempty"`
 	// The fold's terminal, when Final: whose word it is ("executor" for a
-	// terminal on the task's events subject, "gateway" for the
-	// supervisor's), the result artifact's text, and the terminal's status
+	// terminal on the task's events subject, "supervisor" for one on the
+	// supervisor subject), the result artifact's text, and the terminal's status
 	// message. A caller that finds the record still holding a finished
 	// task -- the relay acked the terminal and lost the record write --
 	// grades from these, and only when the source is the executor's.
@@ -929,11 +929,14 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 	if len(a.order) >= injectMaxConversations {
 		oldest := a.order[0]
 		a.order = a.order[1:]
-		if evicted := a.conversations[oldest]; evicted != nil && evicted.requester != "" {
-			// Only if it still points here: the author may have spoken on a
-			// newer conversation since, and that mapping is the live one.
-			if a.directOf[evicted.requester] == oldest {
-				delete(a.directOf, evicted.requester)
+		// Every author still mapped here, not only the last to speak: earlier
+		// speakers on the same conversation map to it too, and leaving them
+		// would grow directOf past the cap by one entry per author. An author
+		// who has spoken on a newer conversation since maps there, and that
+		// mapping is the live one.
+		for author, conversation := range a.directOf {
+			if conversation == oldest {
+				delete(a.directOf, author)
 			}
 		}
 		delete(a.conversations, oldest)
@@ -1316,7 +1319,13 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	// Requester first, then the claim, for the reasons handleInject gives.
 	a.noteRequester(key, req.Author)
 	deadline := time.Now().Add(injectSubmitWait)
-	prior, ok := a.claimTurn(r.Context(), key, deadline)
+	// The claim is taken on a context the client cannot end: a caller that
+	// gives up while an earlier turn is still running has still asked for
+	// the stop, and a cancel that is never handed over leaves the stray
+	// running with nobody to stop it. The bound alone ends the claim. The
+	// wait below stays on the request's context; once the message is
+	// handed over there is nothing left to do for a client that has gone.
+	prior, ok := a.claimTurn(context.WithoutCancel(r.Context()), key, deadline)
 	if !ok {
 		writeJSON(w, http.StatusOK, injectResponse{
 			Conversation:           key,

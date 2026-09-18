@@ -665,9 +665,9 @@ func TestInjectFollowUpReachesTheSameSession(t *testing.T) {
 	// Same conversation means one session record and therefore one contextId
 	// across both tasks -- the durable name of the conversation on the bus.
 	//
-	// Waited for rather than read once: POST /inject returns as soon as the
-	// task is announced, which startTask does before it writes the record, so
-	// an immediate read races the turn's own KV write.
+	// Waited for rather than read once: POST /inject answers on the accept,
+	// and the turn's record write lands after the answer, so an immediate
+	// read races the end-of-turn KV write.
 	var rec *SessionRecord
 	waitFor(t, "both turns on the session record", func() bool {
 		var err error
@@ -1936,10 +1936,10 @@ func TestInjectReadRouteCarriesTheFoldOfAFinishedTask(t *testing.T) {
 	}
 }
 
-// TestInjectReadRouteNamesTheSupervisorsTerminalAsTheGateways: a terminal on
-// the supervisor subject is the gateway's word about an executor that died or
-// never ran, not an executor's answer. The fold says so, so a caller grading
-// off the read does not score an outage as the agent's failure.
+// TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn: a terminal on the
+// supervisor subject is the supervisor's word about an executor that died or
+// never ran, not an executor's answer. The fold says whose it is, so a caller
+// grading off the read does not score an outage as the agent's failure.
 func TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn(t *testing.T) {
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-supervised", injectTestAuthor, "answer me")
@@ -2020,6 +2020,9 @@ func TestInjectCancelNamesTheTaskAfterTheHealReleasedIt(t *testing.T) {
 	// The heal ran first and said so; the cancel then went out anyway.
 	r.waitForPost(t, reply.Conversation, "produced nothing on its event stream")
 	r.waitForPost(t, reply.Conversation, "no longer holds")
+	// MarkCanceled rides the end-of-turn record write, which lands after the
+	// post; read the record only once that write is in.
+	r.awaitTurnEnd(t, reply.Conversation)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	rec, err := r.g.reg.Get(ctx, reply.Conversation)
@@ -2757,6 +2760,84 @@ func TestInjectASecondPostWaitsForTheEarlierTurnToEnd(t *testing.T) {
 	second := f.inject(t, "second-post", "and again")
 	if second.TaskID != "task-2" || second.Refusal != "" {
 		t.Fatalf("second POST: reply = %+v, want task-2 with no refusal: it classified from the first turn", second)
+	}
+}
+
+// TestInjectACancelIsHandedOverAfterItsClientLeft: a cancel that arrives
+// while an earlier turn is still running waits for that turn to end before
+// it is handed over, and a client that gives up during that wait has still
+// asked for the stop. Were the claim taken on the request's context, the
+// client's departure would end it with the cancel never handed over, and
+// the task the client meant to stop would run on with nobody left to stop
+// it. So the claim is taken on a context the client cannot end and only the
+// bound ends it; the cancel reaches the gateway once the turn ends.
+func TestInjectACancelIsHandedOverAfterItsClientLeft(t *testing.T) {
+	var f *fakeDoor
+	ready := make(chan struct{})
+	var cancels atomic.Int32
+	handler := func(msg InboundMessage) {
+		<-ready
+		go func() {
+			if msg.Intent == IntentCancel {
+				cancels.Add(1)
+				f.door.CancelPublished(msg.Conversation, "task-1")
+				f.door.TurnFinished(msg.Conversation)
+				return
+			}
+			f.door.TaskStarted(msg.Conversation, "task-1")
+			if _, err := f.door.Post(msg.Conversation, "⏳ submitted…"); err != nil {
+				t.Error(err)
+			}
+			f.door.TaskAccepted(msg.Conversation, "task-1")
+			// The turn runs on past the accept, longer than the client
+			// below is prepared to wait.
+			time.Sleep(6 * injectPollInterval)
+			f.door.TurnFinished(msg.Conversation)
+		}()
+	}
+	f = startFakeDoor(t, handler)
+	close(ready)
+
+	const conversation = "client-left"
+	if first := f.inject(t, conversation, "go"); first.TaskID != "task-1" {
+		t.Fatalf("first POST: reply = %+v, want task-1", first)
+	}
+	// A cancel whose client waits one poll interval and then hangs up,
+	// while the first turn still has several to run.
+	ctx, cancel := context.WithTimeout(context.Background(), injectPollInterval)
+	defer cancel()
+	raw, _ := json.Marshal(cancelRequest{Author: injectTestAuthor})
+	target := "http://" + f.addr + conversationsPath + injectKeyPrefix + conversation + cancelSuffix
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(authorizationHeader, "Bearer "+injectTestToken)
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("the cancel answered inside one poll interval; the earlier turn should still have held it")
+	}
+	if got := cancels.Load(); got != 0 {
+		t.Fatalf("the cancel was handed over while the earlier turn was still running (%d)", got)
+	}
+	waitFor(t, "the cancel to be handed over once the earlier turn ended", func() bool {
+		return cancels.Load() == 1
+	})
+}
+
+// TestInjectEvictionDropsEveryAuthorsMappingToTheConversation: directOf is
+// bounded by the conversation cap only if an eviction drops every author that
+// still maps to the evicted key, not only the last one to speak on it.
+func TestInjectEvictionDropsEveryAuthorsMappingToTheConversation(t *testing.T) {
+	f := startFakeDoor(t, func(InboundMessage) {})
+	const key = injectKeyPrefix + "two-authors"
+	f.door.noteRequester(key, "author-a")
+	f.door.noteRequester(key, "author-b")
+	f.evictEverything(t, "two-authors")
+	f.door.mu.Lock()
+	defer f.door.mu.Unlock()
+	for _, author := range []string{"author-a", "author-b"} {
+		if conversation, ok := f.door.directOf[author]; ok {
+			t.Errorf("%s still maps to %q after its conversation was evicted", author, conversation)
+		}
 	}
 }
 

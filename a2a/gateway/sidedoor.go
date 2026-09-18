@@ -4,9 +4,17 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
+
+// sideDoorDrainBound is how long Run waits for the second half to stop once
+// the first has: the door drains in-flight requests for injectShutdownGrace,
+// and the chat half's own shutdown needs a moment beyond that. Bounded so a
+// half that ignores its context cannot keep a gateway that has decided to
+// exit alive.
+const sideDoorDrainBound = 3 * injectShutdownGrace
 
 // The side door beside a real backend: one gateway, two ingresses.
 //
@@ -82,14 +90,32 @@ func (s *sideDoorAdapter) Run(ctx context.Context, handler func(InboundMessage))
 		errs <- err
 	}()
 
+	stopped := 0
+	var first error
 	select {
-	case err := <-errs:
-		// Cancel through the deferred cancel above, so the other half stops
-		// too rather than being left serving into a gateway that has exited.
-		return err
+	case first = <-errs:
+		stopped++
 	case <-ctx.Done():
-		return nil
 	}
+	// Stop the other half -- both, on a parent cancel -- and wait for it, so
+	// the drain either does on its way out (the door's in-flight requests,
+	// the chat backend's own shutdown) finishes before the gateway exits on
+	// it. Returning on the first stop alone would cut that short: the
+	// process exits with Run.
+	cancel()
+	drain := time.NewTimer(sideDoorDrainBound)
+	defer drain.Stop()
+	for stopped < 2 {
+		select {
+		case <-errs:
+			stopped++
+		case <-drain.C:
+			s.log.Warn("a half of the gateway did not stop inside the drain bound; exiting without it",
+				"bound", sideDoorDrainBound)
+			return first
+		}
+	}
+	return first
 }
 
 // Post, Edit and Roster route on the conversation's key.

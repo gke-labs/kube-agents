@@ -651,7 +651,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	if active == nil || active.Detached {
 		return
 	}
-	task, terminalSubject, err := g.client.TasksGetAttributed(ctx, rec.Addressee, active.TaskID)
+	// The addressee the task's own subjects carry, as probeConversation
+	// reads it. For a non-detached active task it equals rec.Addressee
+	// today, because every write to rec.Addressee sits in the routing
+	// switch's default branch, which only a nil or detached active task
+	// reaches; reading it off the ref keeps the heal from depending on that.
+	addressee := rec.AddresseeFor(active.TaskID)
+	task, terminalSubject, err := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
 	healed := false
 	switch {
 	case err == nil && task.Final:
@@ -672,7 +678,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// caller classifying a bridge's own failure by its reason token
 		// would grade it as the persona's for the one that came this way.
 		source := TerminalFromExecutor
-		if terminalSubject == lib.TaskSupervisorSubject(rec.Addressee, active.TaskID) {
+		if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
 			source = TerminalFromSupervisor
 		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
@@ -680,7 +686,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
 		g.log.Info("healing an active task with no first event inside the grace",
-			"conversation", rec.Key, "taskId", active.TaskID, "addressee", rec.Addressee,
+			"conversation", rec.Key, "taskId", active.TaskID, "addressee", addressee,
 			"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
 		g.post(rec.Key, fmt.Sprintf(neverStartedNotice, active.TaskID, g.cfg.FirstEventGrace))
 		// And tell the adapter, for the caller that is a program. The

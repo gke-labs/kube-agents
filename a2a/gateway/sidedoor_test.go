@@ -187,6 +187,36 @@ func TestSideDoorStopsWhenEitherHalfDoes(t *testing.T) {
 	}
 }
 
+// TestSideDoorWaitsForTheOtherHalfToStop: the composite returns only once
+// both halves have, so the drain either one does on its way out -- the door's
+// in-flight requests, the chat backend's own shutdown -- finishes before the
+// gateway exits on it. The door fails to bind and stops at once; the chat
+// half takes a moment to stop once told, and Run must not return before it.
+func TestSideDoorWaitsForTheOtherHalfToStop(t *testing.T) {
+	primary, door, composite := newSideDoorRig(t)
+	door.listen = "127.0.0.1:-1"
+	primary.stopDelay = 300 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- composite.Run(ctx, func(InboundMessage) {}) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the composite reported a clean stop for a door that never came up")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the composite kept running after its inject door failed to bind")
+	}
+	select {
+	case <-primary.stopped:
+	default:
+		t.Fatal("the composite returned before the chat backend had stopped")
+	}
+}
+
 // TestSideDoorHandsTheProbeToTheDoor: the gateway offers its probe to
 // whatever adapter it was built with, and with a side door that is the
 // composite -- which has to pass it on to the one half whose caller reads

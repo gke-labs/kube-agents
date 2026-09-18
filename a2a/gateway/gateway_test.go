@@ -117,6 +117,9 @@ type fakeAdapter struct {
 	// backend was actually told to stop rather than left running.
 	stopped  chan struct{}
 	stopOnce sync.Once
+	// stopDelay is how long Run takes to return once told to stop, for
+	// pinning that a caller waits for it rather than exiting on its own.
+	stopDelay time.Duration
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -133,6 +136,7 @@ func (a *fakeAdapter) Run(ctx context.Context, handler func(InboundMessage)) err
 	for {
 		select {
 		case <-ctx.Done():
+			time.Sleep(a.stopDelay)
 			return nil
 		case msg := <-a.inbox:
 			handler(msg)

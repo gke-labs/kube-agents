@@ -4399,7 +4399,7 @@ func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
 }
 
 // TestA2AInjectBackendGoesAwayOnAFlipToToday: the darkness property. A today
-// install must carry no A2A object, and the inject backend's three are
+// install must carry no A2A object, and the inject backend's four are
 // exactly the kind that get forgotten -- they are rendered by a branch the
 // teardown path never consults.
 func TestA2AInjectBackendGoesAwayOnAFlipToToday(t *testing.T) {

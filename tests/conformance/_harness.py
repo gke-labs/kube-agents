@@ -233,8 +233,8 @@ SOURCES: dict[str, Source] = {
     ),
     # The eval-only inject door. Two files, two modules: the operator decides
     # whether the door is rendered at all (Go module k8s-operator) and the
-    # gateway decides what it does once it is (Go module a2a). A1's darkness
-    # assertion reads the first and A3's identity assertion the second, and
+    # gateway decides what it does once it is (Go module a2a). A3's darkness
+    # assertion reads the first and its identity assertion the second, and
     # neither module's own test suite can see the other.
     "a2a_inject_render": Source(
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",

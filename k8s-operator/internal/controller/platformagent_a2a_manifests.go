@@ -2474,7 +2474,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// the pod network, so that the door's token is presented only from the
 	// node path its caller uses, and a refused CR must
 	// not be a window in which deleting it sticks. Its removal when the flag
-	// goes off is reconcileA2AInjectBackend's, not this function's -- a
+	// goes off is removeA2AInjectBackend's, not this function's -- a
 	// fence left standing over a Service that is gone denies nothing and
 	// costs nothing, so the ordering hazard runs the safe way.
 	if a2aInjectBackendEnabled() {
@@ -2786,7 +2786,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// fence deleted before it lands leaves the previous pod serving the
 	// inject port with nothing selecting it, reachable on its pod IP by
 	// anything in the cluster for as long as the rollout takes. Deleting
-	// after means the window is closed before the guardrail is.
+	// after means the fence outlives the apply, not the rollout: the removal
+	// does not wait for the new pod to be ready, so the previous pod can
+	// serve the port unfenced for the rest of its termination. Narrower than
+	// the other order, not closed; closing it would mean holding the removal
+	// on the Deployment's rollout status.
 	if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
 		return state, err
 	}
