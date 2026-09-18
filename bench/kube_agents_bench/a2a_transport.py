@@ -14,10 +14,11 @@ path and carries the only credential that may publish on every addressee's
 ``in`` subject; this transport authenticates as its own ``eval`` principal,
 whose grants are publish on ``platform``'s ``in`` and subscribe on
 ``platform``'s ``events`` and ``supervisor`` and nothing else. Those wildcards
-reach every ``platform`` task, the gateway's included: the events show each
-task's id, the ``in`` publish takes a cancel or a message for any of them, and
-the bridge cannot tell requesters apart. A static NATS grant cannot name one
-task, so the key is held like the gateway's.
+reach every ``platform`` task, the gateway's included: the ``events``
+subscribe reads every task's full output (the bridge publishes the ``result``
+artifact there), the ``in`` publish takes a cancel or a message for any of
+them, and the bridge cannot tell requesters apart. A static NATS grant cannot
+name one task, so the key is held like the gateway's.
 
 Envelope, subject and payload shapes are ``docs/designs/spec-a2a-payloads.md``;
 the fold mirrors ``a2a/lib/fold.go``; the ids are minted the way
@@ -309,13 +310,12 @@ class Fold:
         The bridge publishes ``submitted`` on accept and queues the task
         behind its workers; ``working`` is the first event a subprocess
         produces. A fold that never left ``submitted`` is a task an executor
-        took and nobody ran.
+        took and nobody ran. An artifact alone does not start it: the
+        scorer's liveness rung counts a ``working`` or final status entry and
+        nothing else, and this predicate is the same rule applied first, so a
+        deadline fold it grades is one the rung will grade too.
         """
-        return (
-            self.final
-            or bool(self.artifacts)
-            or any(state != STATE_SUBMITTED for state in self.history)
-        )
+        return self.final or any(state != STATE_SUBMITTED for state in self.history)
 
     @property
     def reason(self) -> str:

@@ -196,7 +196,9 @@ def test_fold_drops_events_after_the_terminal_one() -> None:
 
 def test_a_fold_at_submitted_is_accepted_but_not_started() -> None:
     """The bridge's accept event alone: an executor took the task and no
-    subprocess has run. ``working``, an artifact or a terminal each start it."""
+    subprocess has run. ``working`` or a terminal starts it; an artifact alone
+    does not, the same rule the scorer's liveness rung applies, so the two
+    predicates cannot disagree on a deadline fold."""
     fold = a2a.Fold("task-1")
     fold.apply(_status("task-1", "submitted"))
     assert fold.accepted and not fold.started
@@ -206,7 +208,7 @@ def test_a_fold_at_submitted_is_accepted_but_not_started() -> None:
     by_artifact = a2a.Fold("task-1")
     by_artifact.apply(_status("task-1", "submitted"))
     by_artifact.apply(_artifact("task-1", "progress", [{"kind": "text", "text": "x"}]))
-    assert by_artifact.started
+    assert by_artifact.accepted and not by_artifact.started
 
     by_terminal = a2a.Fold("task-1")
     by_terminal.apply(_status("task-1", "submitted"))
@@ -913,6 +915,40 @@ def test_an_exhausted_delegation_wait_records_the_abandoned_tasks(
     dropped = [c.ids.task_id for c in client.calls[1:]]
     assert len(dropped) == harness._MAX_TRANSPORT_FAILURES
     assert result.metadata["abandoned_tasks"] == dropped
+
+
+def test_with_no_port_pinned_each_run_forwards_on_its_own_free_port(
+    fake_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``AGENT_A2A_LOCAL_PORT``: the harness picks a free port per process
+    and owns the forward on it, so an owner's teardown reaches no sibling (the
+    api path's reason for a per-unit port in ``hack/ci-eval-pr.sh``). A pinned
+    port is used as given, for a forward the operator runs."""
+    forwards: list[int] = []
+    monkeypatch.delenv("AGENT_A2A_NATS_URL")
+    monkeypatch.delenv("AGENT_A2A_LOCAL_PORT", raising=False)
+    monkeypatch.setattr(harness, "_ensure_port_forward", lambda port, **k: forwards.append(port))
+    picked = iter([31001, 31002])
+    monkeypatch.setattr(harness, "_free_local_port", lambda: next(picked))
+
+    KubeAgentsHarness().run(_PROMPT)
+    KubeAgentsHarness().run(_PROMPT)
+    assert forwards == [31001, 31002]
+    assert [client.url for client in fake_bus.instances] == [
+        "nats://127.0.0.1:31001",
+        "nats://127.0.0.1:31002",
+    ]
+
+    monkeypatch.setenv("AGENT_A2A_LOCAL_PORT", "24999")
+    KubeAgentsHarness().run(_PROMPT)
+    assert forwards[-1] == 24999
+    assert fake_bus.instances[-1].url == "nats://127.0.0.1:24999"
+
+
+def test_a_free_local_port_is_one_nobody_listens_on() -> None:
+    port = harness._free_local_port()
+    assert 1024 < port < 65536
+    assert not harness._port_open(port)
 
 
 def test_an_unreachable_bus_is_retried_through_a_fresh_tunnel_then_infrastructure(

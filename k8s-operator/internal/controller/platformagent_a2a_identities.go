@@ -708,9 +708,10 @@ func evalIdentity() a2aIdentity {
 			"(the pair a task's terminal may land on), nothing else: no JetStream API (a\n" +
 			"core subscription needs no consumer, and CONSUMER.CREATE on TASKS would read\n" +
 			"every addressee's task plane). The wildcards reach every platform task, the\n" +
-			"gateway's included: a holder can cancel one it did not start, so the key is\n" +
-			"held like the gateway's, and this block is rendered only while the operator\n" +
-			"runs with A2A_EVAL_PRINCIPAL=true.",
+			"gateway's included: a holder reads every task's result off its events and\n" +
+			"can cancel one it did not start, so the key is held like the gateway's, and\n" +
+			"this block is rendered only while the operator runs with\n" +
+			"A2A_EVAL_PRINCIPAL=true.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aEvalPasswordKey,
 		publish: []string{

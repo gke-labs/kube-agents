@@ -69,8 +69,11 @@ Environment:
         variables, and:
     AGENT_A2A_ADDRESSEE: The executor the task is addressed to (default
         ``platform``, the only addressee the ``eval`` grants reach).
-    AGENT_A2A_LOCAL_PORT: Local side of the port-forward to the NATS Service
-        (default ``24222``). The remote side is always the client port 4222.
+    AGENT_A2A_LOCAL_PORT: Local side of the port-forward to the NATS Service.
+        Unset, the harness picks a free port per process and owns the forward
+        on it, so parallel units never share a tunnel; set it to reuse a
+        forward you run yourself. The remote side is always the client port
+        4222.
     AGENT_A2A_NATS_SERVICE: The NATS Service to port-forward to (default
         ``<AGENT_SERVICE_NAME>-a2a-nats``); the credentials Secret is
         ``<service>-creds`` in ``AGENT_NAMESPACE``, key ``eval-password``,
@@ -160,7 +163,7 @@ _A2A_NATS_SERVICE_SUFFIX = "-a2a-nats"
 _A2A_CREDS_SECRET_SUFFIX = "-creds"
 _A2A_CREDS_KEY = "eval-password"
 _A2A_NATS_CLIENT_PORT = 4222
-_A2A_DEFAULT_LOCAL_PORT = 24222
+_LOOPBACK_HOST = "127.0.0.1"
 # The tunnel's near end: where a port-forward the harness spawned listens.
 _A2A_LOOPBACK_URL = "nats://127.0.0.1"
 # What a bounded a2a wait reports about the cancel it published for its task.
@@ -265,7 +268,7 @@ def _stop_process(proc: subprocess.Popen[bytes]) -> None:
         proc.wait()
 
 
-def _port_open(port: int, host: str = "127.0.0.1") -> bool:
+def _port_open(port: int, host: str = _LOOPBACK_HOST) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(1)
@@ -273,6 +276,20 @@ def _port_open(port: int, host: str = "127.0.0.1") -> bool:
             return True
     except OSError:
         return False
+
+
+def _free_local_port() -> int:
+    """A loopback port nobody listens on, for a forward this process will own.
+
+    Bound to ``127.0.0.1:0`` and released, so the kernel picks it from the
+    ephemeral range. The window between the release and kubectl's bind is the
+    one every ephemeral-port user accepts; a sibling picking the same port in
+    that instant would be ridden rather than refused, which is the shared-port
+    failure this exists to avoid, at the odds the range gives it.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((_LOOPBACK_HOST, 0))
+        return int(sock.getsockname()[1])
 
 
 @atexit.register
@@ -1294,7 +1311,9 @@ class KubeAgentsHarness(AgentHarness):
             accept_timeout = _numeric_env(
                 "AGENT_A2A_ACCEPT_TIMEOUT", _A2A_DEFAULT_ACCEPT_TIMEOUT, float
             )
-            local_port = _numeric_env("AGENT_A2A_LOCAL_PORT", str(_A2A_DEFAULT_LOCAL_PORT), int)
+            pinned_port: int | None = None
+            if os.environ.get("AGENT_A2A_LOCAL_PORT"):
+                pinned_port = _numeric_env("AGENT_A2A_LOCAL_PORT", "", int)
             delegation_timeout = _numeric_env(
                 "AGENT_DELEGATION_TIMEOUT", _DEFAULT_DELEGATION_TIMEOUT, float
             )
@@ -1311,6 +1330,16 @@ class KubeAgentsHarness(AgentHarness):
         # A URL given outright is somebody else's tunnel (or a bus on the
         # network): nothing to establish and nothing to respawn between retries.
         own_tunnel = not url
+        # No port pinned: a free one, picked here and owned by this process. A
+        # shared default would put every parallel unit through whichever
+        # process forwarded first, and that owner's atexit teardown, or its
+        # retry's respawn, drops the listener under its siblings mid-task;
+        # hack/ci-eval-pr.sh gives each api-path unit its own AGENT_LOCAL_PORT
+        # for the same reason. A pinned port keeps the reuse: a forward the
+        # operator runs is left alone, and _ensure_port_forward rides it.
+        local_port = pinned_port
+        if local_port is None and own_tunnel:
+            local_port = _free_local_port()
 
         def _tunnel(reset: bool) -> None:
             if not own_tunnel:

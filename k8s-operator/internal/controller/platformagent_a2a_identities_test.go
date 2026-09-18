@@ -33,6 +33,17 @@ func identityTestAgent() *agentv1alpha1.PlatformAgent {
 	}
 }
 
+// withEvalPrincipal puts the eval principal in the list a package-wide
+// invariant iterates. The flag-on list is a superset of the default one, so a
+// property that holds over it holds over both renders, and without this the
+// invariants below would never see eval at all: a2aIdentities appends it only
+// under A2A_EVAL_PRINCIPAL=true, and nothing else in the package sets that.
+// TestTheEvalPrincipalRendersOnlyUnderItsFlag owns the flag-off render.
+func withEvalPrincipal(t *testing.T) {
+	t.Helper()
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
+}
+
 // The inbox trap, pinned. Push delivery and every JetStream API request come
 // back on an inbox subject, each principal is granted only its own prefix, and
 // the client sets that prefix from its user name. A principal whose subscribe
@@ -41,6 +52,7 @@ func identityTestAgent() *agentv1alpha1.PlatformAgent {
 // succeed; no consumer could ever ack). This asserts the property rather than
 // the spelling of any one grant.
 func TestEveryPrincipalMaySubscribeToItsOwnInbox(t *testing.T) {
+	withEvalPrincipal(t)
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.account == a2aAccountSys {
 			// $SYS holds no application inbox grants; its user is a
@@ -78,6 +90,7 @@ func TestEveryPrincipalMaySubscribeToItsOwnInbox(t *testing.T) {
 // subscribe to another's inbox reads what that principal's subject grants
 // withheld.
 func TestNoPrincipalHoldsAnotherPrincipalsInbox(t *testing.T) {
+	withEvalPrincipal(t)
 	ids := a2aIdentities(identityTestAgent())
 	for _, id := range ids {
 		for _, other := range ids {
@@ -93,6 +106,7 @@ func TestNoPrincipalHoldsAnotherPrincipalsInbox(t *testing.T) {
 }
 
 func TestPrincipalsAreDistinct(t *testing.T) {
+	withEvalPrincipal(t)
 	seenUser := map[string]bool{}
 	seenSA := map[string]bool{}
 	for _, id := range a2aIdentities(identityTestAgent()) {
@@ -120,6 +134,7 @@ func TestPrincipalsAreDistinct(t *testing.T) {
 // cannot be resolved, and a static one with no creds key renders a password of
 // "" — a user anyone can log in as, which is W6 finding #9 in a new costume.
 func TestEachPrincipalCarriesWhatItsAuthModeNeeds(t *testing.T) {
+	withEvalPrincipal(t)
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		switch id.auth {
 		case a2aAuthCallout:
@@ -150,6 +165,7 @@ func TestEachPrincipalCarriesWhatItsAuthModeNeeds(t *testing.T) {
 // list is built from exactly this set. A static user missing from auth_users is
 // refused at connect by a callout that has never heard of it.
 func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	all := a2aIdentities(agent)
 	static := staticIdentities(agent)
@@ -302,6 +318,7 @@ func TestTheEvalPrincipalRendersOnlyUnderItsFlag(t *testing.T) {
 // and this package's RBAC together for exactly that reason. If the spawner ever
 // stops projecting the token, this test keeps passing and C1 is what fails.
 func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
+	withEvalPrincipal(t)
 	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.auth == a2aAuthCallout {
@@ -352,6 +369,7 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // principal's. That is not a list to grow without an argument in the identity's
 // own comment for why it cannot be enumerated instead.
 func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
+	withEvalPrincipal(t)
 	const bare = "$JS.API.>"
 	expected := []string{"gateway"}
 
@@ -375,6 +393,7 @@ func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
 // ServiceAccount the map is keyed on, and the narrowing the callout switches on
 // — and they are rendered from three different places.
 func TestTheSessionPrincipalIsNarrowedAndOtherwiseEmpty(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	var session *a2aIdentity
 	for _, id := range a2aIdentities(agent) {
@@ -412,6 +431,7 @@ func TestTheSessionPrincipalIsNarrowedAndOtherwiseEmpty(t *testing.T) {
 // A5 retired `worker-password`, and a test that named it would have gone
 // vacuous at that rename while still reporting a pass.
 func TestNoSessionPrincipalSharesAStaticCredential(t *testing.T) {
+	withEvalPrincipal(t)
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.user != "session" {
 			continue
@@ -443,6 +463,7 @@ func TestNoSessionPrincipalSharesAStaticCredential(t *testing.T) {
 // bridge that inherits the static half publishes `…events` for its own
 // addressee only, so it does not reach another addressee's.
 func TestTheSupervisorSubjectHasExactlyOneWriterAndItIsNotAnEventsWriter(t *testing.T) {
+	withEvalPrincipal(t)
 	const (
 		supervisorProbe = "a2a.tasks.chat-otter-1a2b.task-0001.supervisor"
 		eventsProbe     = "a2a.tasks.chat-otter-1a2b.task-0001.events"
@@ -518,6 +539,7 @@ func TestTheEventsWriterCheckIsTightenedByConfigNotByCode(t *testing.T) {
 // against the strings rather than against a deleted symbol — a deleted symbol
 // is exactly what a re-add restores.
 func TestTheWorkerCredentialIsGone(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	for _, id := range a2aIdentities(agent) {
 		if id.user == "worker" {
@@ -561,6 +583,7 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 // than at the apply. A5 is what makes this reachable: `agent` is the first
 // callout identity keyed on a user-settable field.
 func TestAnOverriddenServiceAccountThatCollidesIsRefused(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	collide := a2aSessionServiceAccountName(agent)
 	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: collide}

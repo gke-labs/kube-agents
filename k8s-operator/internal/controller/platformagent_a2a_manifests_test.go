@@ -883,6 +883,7 @@ func TestSubjectMatches(t *testing.T) {
 // what keeps that true: re-widening any publish grant to `a2a.topics.>`
 // fails here rather than silently making the probe writable.
 func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
+	withEvalPrincipal(t)
 	const probe = "a2a.topics.shared.probe"
 	agent := a2aTestAgent()
 
