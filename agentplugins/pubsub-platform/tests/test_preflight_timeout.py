@@ -11,8 +11,9 @@ that. These tests pin the three properties that stop it:
 
   * a line naming the resource is logged **before** the RPC is issued, so a stall is
     attributable from the log alone;
-  * the RPC is passed the module's timeout, and a DeadlineExceeded from it is a WARNING
-    naming the resource and the elapsed time;
+  * the RPC is passed the module's timeout for the attempt and a retry that ends at the
+    same bound, and a DeadlineExceeded or RetryError from it is a WARNING naming the
+    resource and the elapsed time;
   * `_check_resources` still returns the subscription path, so connect() proceeds.
 
 The client library is faked: nothing here touches the network, a cluster, or the
@@ -45,6 +46,34 @@ class _NotFound(Exception):
 
 class _DeadlineExceeded(Exception):
     pass
+
+
+class _RetryError(Exception):
+    pass
+
+
+class _Aborted(Exception):
+    pass
+
+
+class _ServiceUnavailable(Exception):
+    pass
+
+
+class _Unknown(Exception):
+    pass
+
+
+class _FakeRetry:
+    """Records what the adapter asked the retry loop to do; retries nothing itself."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _fake_if_exception_type(*exception_types):
+    """The real one returns a predicate closure; a frozenset compares by content instead."""
+    return frozenset(exception_types)
 
 
 class _FakeClient:
@@ -86,17 +115,28 @@ def _install_fake_google():
 
     Returns the entries that were there before, so the caller can put them back.
     """
-    names = ("google", "google.cloud", "google.cloud.pubsub_v1", "google.api_core", "google.api_core.exceptions")
+    names = (
+        "google", "google.cloud", "google.cloud.pubsub_v1",
+        "google.api_core", "google.api_core.exceptions", "google.api_core.retry",
+    )
     previous = {name: sys.modules.get(name) for name in names}
     modules = {name: types.ModuleType(name) for name in names}
     modules["google"].cloud = modules["google.cloud"]
     modules["google"].api_core = modules["google.api_core"]
     modules["google.cloud"].pubsub_v1 = modules["google.cloud.pubsub_v1"]
     modules["google.api_core"].exceptions = modules["google.api_core.exceptions"]
+    modules["google.api_core"].retry = modules["google.api_core.retry"]
     modules["google.cloud.pubsub_v1"].PublisherClient = _FakePublisher
     modules["google.cloud.pubsub_v1"].SubscriberClient = _FakeSubscriber
-    modules["google.api_core.exceptions"].NotFound = _NotFound
-    modules["google.api_core.exceptions"].DeadlineExceeded = _DeadlineExceeded
+    exceptions = modules["google.api_core.exceptions"]
+    exceptions.NotFound = _NotFound
+    exceptions.DeadlineExceeded = _DeadlineExceeded
+    exceptions.RetryError = _RetryError
+    exceptions.Aborted = _Aborted
+    exceptions.ServiceUnavailable = _ServiceUnavailable
+    exceptions.Unknown = _Unknown
+    modules["google.api_core.retry"].Retry = _FakeRetry
+    modules["google.api_core.retry"].if_exception_type = _fake_if_exception_type
     sys.modules.update(modules)
     return previous
 
@@ -170,22 +210,38 @@ class TimeoutTest(PreflightTestCase):
         self.assertTrue(any("Checking subscription" in m and SUB_PATH in m for m in messages), messages)
         self.assertTrue(any(f"Subscription '{SUB_PATH}' exists" in m for m in messages), messages)
 
-    def test_the_rpcs_are_passed_the_modules_timeout(self):
+    def test_the_rpcs_are_bounded_for_the_attempt_and_for_the_retry_loop(self):
+        """`timeout=` alone bounds one gRPC attempt; the method's default retry would keep
+        retrying UNAVAILABLE for up to 600 s. Both have to carry the module's bound."""
         self.check_resources()
         bound = adapter_mod.PREFLIGHT_RPC_TIMEOUT_SECONDS
-        self.assertEqual(
-            self.rpc_calls(_FakePublisher),
-            [("get_topic", {"request": {"topic": TOPIC_PATH}, "timeout": bound})],
-        )
-        self.assertEqual(
-            self.rpc_calls(_FakeSubscriber),
-            [("get_subscription", {"request": {"subscription": SUB_PATH}, "timeout": bound})],
-        )
+        transient = frozenset({_Aborted, _ServiceUnavailable, _Unknown})
+        for client, rpc, request in (
+            (_FakePublisher, "get_topic", {"topic": TOPIC_PATH}),
+            (_FakeSubscriber, "get_subscription", {"subscription": SUB_PATH}),
+        ):
+            calls = self.rpc_calls(client)
+            self.assertEqual(len(calls), 1, calls)
+            name, kwargs = calls[0]
+            self.assertEqual(name, rpc)
+            self.assertEqual(kwargs["request"], request)
+            self.assertEqual(kwargs["timeout"], bound)
+            self.assertIsInstance(kwargs["retry"], _FakeRetry)
+            self.assertEqual(kwargs["retry"].kwargs, {"predicate": transient, "timeout": bound})
+            self.assertEqual(set(kwargs), {"request", "timeout", "retry"})
 
-    def test_the_bound_is_what_the_issue_decided(self):
-        """30 seconds, per the maintainer's decision; and positive, or gapic would treat
-        it as no timeout at all."""
-        self.assertEqual(adapter_mod.PREFLIGHT_RPC_TIMEOUT_SECONDS, 30)
+    def test_a_retry_loop_that_runs_out_is_a_timeout_too(self):
+        """An unreachable endpoint surfaces as retried UNAVAILABLE and ends in RetryError,
+        not DeadlineExceeded; it must land in the same warning, with the cause."""
+        _FakePublisher.behaviour = _RetryError("Timeout of 30.0s exceeded, last exception: 503 failed to connect")
+        result, records = self.check_resources()
+        warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+        self.assertEqual(result, SUB_PATH)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("Timed out", warnings[0])
+        self.assertIn(TOPIC_PATH, warnings[0])
+        self.assertIn("503 failed to connect", warnings[0])
+        self.assertRegex(warnings[0], ELAPSED_RE)
 
 
 class SubscriptionTimeoutTest(PreflightTestCase):

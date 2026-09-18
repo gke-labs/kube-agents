@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 # a registry entry written before entries recorded their own — see _entry_window.
 DEFAULT_DEDUP_WINDOW_SECONDS = 86400  # 24 hours
 
-# Ceiling on each preflight RPC (get_topic, get_subscription). connect() runs the two
-# checks synchronously on the event loop, before the gateway is marked connected, so
+# Ceiling on each preflight RPC (get_topic, get_subscription): the deadline of a single
+# attempt and of the retry loop around it, see _preflight_rpc_kwargs. connect() runs the
+# two checks synchronously on the event loop, before the gateway is marked connected, so
 # an unbounded call that stalled held the whole gateway down in silence until the
 # startup probe restarted it ten minutes later. Their results are only logged, so a
 # call that hits this bound is a warning and startup continues.
@@ -122,45 +123,72 @@ class PubSubAdapter(BasePlatformAdapter):
         return f"projects/{project_id}/subscriptions/{sub_input}"
 
     @staticmethod
-    def _preflight_exceptions() -> Tuple[type, type]:
-        """The api_core exceptions the preflight checks tell apart: (NotFound, DeadlineExceeded).
+    def _preflight_rpc_kwargs() -> dict:
+        """Keyword arguments that end a preflight RPC within PREFLIGHT_RPC_TIMEOUT_SECONDS.
 
-        Stand-ins are returned when the library is absent so the except clauses still
-        bind to something; without it no RPC can be issued, so neither is ever raised.
+        `timeout=` on its own is the deadline of one gRPC attempt. The gapic method's
+        default Retry still wraps that attempt and retries UNAVAILABLE, ABORTED and UNKNOWN
+        until its own deadline, 600 s for get_topic, so an endpoint the pod cannot reach
+        (egress blocked, DNS failing) would still hold connect() for the whole startup-probe
+        budget. The retry is therefore replaced with one that keeps the library's predicate
+        and ends at the same bound; the loop then raises RetryError with the last transient
+        error as its cause. Without the library only the timeout is returned; no RPC can be
+        issued then.
+        """
+        kwargs = {"timeout": PREFLIGHT_RPC_TIMEOUT_SECONDS}
+        try:
+            from google.api_core.exceptions import Aborted, ServiceUnavailable, Unknown
+            from google.api_core.retry import Retry, if_exception_type
+        except Exception:
+            return kwargs
+        kwargs["retry"] = Retry(
+            predicate=if_exception_type(Aborted, ServiceUnavailable, Unknown),
+            timeout=PREFLIGHT_RPC_TIMEOUT_SECONDS,
+        )
+        return kwargs
+
+    @staticmethod
+    def _preflight_exceptions() -> Tuple[type, Tuple[type, ...]]:
+        """(NotFound, the exceptions that mean the bound was hit).
+
+        DeadlineExceeded is one attempt running out of time; RetryError is the retry loop
+        running out with a transient error as its cause. Stand-ins are returned when the
+        library is absent so the except clauses still bind to something; no RPC can be
+        issued then, so none of them is ever raised.
         """
         try:
-            from google.api_core.exceptions import DeadlineExceeded, NotFound
-            return NotFound, DeadlineExceeded
+            from google.api_core.exceptions import DeadlineExceeded, NotFound, RetryError
+            return NotFound, (DeadlineExceeded, RetryError)
         except Exception:
             class NotFound(Exception):
                 pass
 
-            class DeadlineExceeded(Exception):
+            class TimedOut(Exception):
                 pass
-            return NotFound, DeadlineExceeded
+            return NotFound, (TimedOut,)
 
     def _check_topic_exists(self, publisher, topic_path: str) -> bool:
         """Verify if the Pub/Sub topic exists and log clearly if not present.
 
-        Announces the call before issuing it and bounds it with
+        Announces the call before issuing it and bounds it, attempt and retries, with
         PREFLIGHT_RPC_TIMEOUT_SECONDS, so a stall reads as "waiting on get_topic" in the
         log rather than silence, and ends in a warning rather than holding connect().
         """
-        NotFound, DeadlineExceeded = self._preflight_exceptions()
+        NotFound, timed_out = self._preflight_exceptions()
         logger.info(
             "PubSub: Checking topic '%s' exists (get_topic, %ss timeout)",
             topic_path, PREFLIGHT_RPC_TIMEOUT_SECONDS,
         )
         started = time.monotonic()
         try:
-            publisher.get_topic(request={"topic": topic_path}, timeout=PREFLIGHT_RPC_TIMEOUT_SECONDS)
+            publisher.get_topic(request={"topic": topic_path}, **self._preflight_rpc_kwargs())
             logger.info("PubSub: Topic '%s' exists (%.1fs)", topic_path, time.monotonic() - started)
             return True
-        except DeadlineExceeded:
+        except timed_out as e:
             logger.warning(
                 "PubSub: Timed out after %.1fs waiting on get_topic for topic '%s'"
-                " (bound %ss). Continuing startup without verifying it.",
-                time.monotonic() - started, topic_path, PREFLIGHT_RPC_TIMEOUT_SECONDS,
+                " (bound %ss): %s. Continuing startup without verifying it.",
+                time.monotonic() - started, topic_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, e,
             )
             return False
         except NotFound:
@@ -181,21 +209,21 @@ class PubSubAdapter(BasePlatformAdapter):
 
         Same shape as _check_topic_exists: announced before, bounded, warns on timeout.
         """
-        NotFound, DeadlineExceeded = self._preflight_exceptions()
+        NotFound, timed_out = self._preflight_exceptions()
         logger.info(
             "PubSub: Checking subscription '%s' exists (get_subscription, %ss timeout)",
             sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS,
         )
         started = time.monotonic()
         try:
-            subscriber.get_subscription(request={"subscription": sub_path}, timeout=PREFLIGHT_RPC_TIMEOUT_SECONDS)
+            subscriber.get_subscription(request={"subscription": sub_path}, **self._preflight_rpc_kwargs())
             logger.info("PubSub: Subscription '%s' exists (%.1fs)", sub_path, time.monotonic() - started)
             return True
-        except DeadlineExceeded:
+        except timed_out as e:
             logger.warning(
                 "PubSub: Timed out after %.1fs waiting on get_subscription for subscription '%s'"
-                " (bound %ss). Continuing startup without verifying it.",
-                time.monotonic() - started, sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS,
+                " (bound %ss): %s. Continuing startup without verifying it.",
+                time.monotonic() - started, sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, e,
             )
             return False
         except NotFound:

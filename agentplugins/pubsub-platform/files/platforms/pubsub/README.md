@@ -36,7 +36,7 @@ graph TD
 
 ## Key Features
 
-1. **Resource Presence Verification**: The adapter checks for the presence of configured GCP Pub/Sub topics and subscriptions upon connecting and logs clearly if any required resource is missing. Each check is announced before it runs and bounded at 30 seconds; a check that times out or errors logs a warning naming the resource and the elapsed time, and startup continues. The equivalent log-sink check is currently disabled — see `sink` below.
+1. **Resource Presence Verification**: The adapter checks for the presence of configured GCP Pub/Sub topics and subscriptions upon connecting and logs clearly if any required resource is missing. Each check is announced before it runs and bounded at 30 seconds (`PREFLIGHT_RPC_TIMEOUT_SECONDS` in `adapter.py`), covering the client library's retries; a check that times out or errors logs a warning naming the resource and the elapsed time, and startup continues. The equivalent log-sink check is currently disabled — see `sink` below.
 2. **Programmatic Payload Validation**: Allows setups to provide custom Python code (`validation_code`) to programmatically validate message payloads before spawning agent prompts.
 3. **Dynamic Prompt Rendering**: Supports template syntax (e.g. `{incident.summary}`) to format raw JSON message payloads into readable, context-rich prompts.
 4. **Skill Wrapping**: Directly routes incoming alerts to specific agent skills by mapping route paths to skill names (e.g. wrapping stockout alerts with `/gke-stockout-investigator`).
