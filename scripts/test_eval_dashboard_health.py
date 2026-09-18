@@ -1098,6 +1098,21 @@ class PoolNote(unittest.TestCase):
         artifact["trend"]["days"][-1]["judged"] = True
         self.assertEqual(health.pool_wait_p50_s(artifact, T0), 2400)
 
+    def test_a_quiet_night_falls_back_to_the_last_day_the_producer_judged(self):
+        # A night with no runs at all already prints yesterday's median, because
+        # the producer emits no row for an empty day. Three overnight runs must
+        # not say less than none: the floor above withholds the unjudged row,
+        # not the figure, and this is the headline that teaches normal.
+        artifact = pressure(verdict="OK")
+        artifact["trend"]["days"].append(
+            {"day": "2026-09-08", "runs": 3, "p50_minutes": 90.0, "p95_minutes": 95.0, "judged": False})
+        self.assertEqual(health.pool_wait_p50_s(artifact, T0), 24)
+        # Bounded by the same two days: reaching back past them would print
+        # Friday's median under a Monday heading, which is what POOL_DIGEST_DAYS
+        # was added to stop.
+        artifact["trend"]["days"][0]["day"] = "2026-09-06"
+        self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
+
     def test_the_worst_breached_day_wins_even_when_it_breached_on_p95_alone(self):
         # Excess over either limit, so a day that went over on p95 only is
         # still picked ahead of a quieter day that went over on p50.

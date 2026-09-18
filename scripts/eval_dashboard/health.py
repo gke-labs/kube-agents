@@ -1204,30 +1204,35 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
     """The digest's `typical wait`: the median of the artifact's newest day.
 
     `trend.p50_minutes` is the seven-day figure and belongs to the note; the
-    digest headline says "last 24h", so it reads the last `days[]` row. None
-    when there is no artifact, it is too old, or its newest row predates the
-    heading -- a quiet weekend would otherwise print Friday's median as today's.
+    digest headline says "last 24h", so it reads the newest judged `days[]`
+    row. None when there is no artifact, it is too old, or every row inside the
+    heading went unjudged -- a quiet weekend would otherwise print Friday's
+    median as today's.
     """
     if not isinstance(artifact, dict):
         return None
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
         return None
-    days = _rows(_section(artifact, "trend"))
-    latest = days[-1] if days and isinstance(days[-1], dict) else {}
-    try:
-        day = datetime.strptime(latest["day"], POOL_DAY_FORMAT).date()
-    except (KeyError, TypeError, ValueError):
-        return None
-    if (measured.date() - day).days >= POOL_DIGEST_DAYS:
-        return None
-    if not latest.get("judged"):
-        # The producer withholds a row's verdict below its sample floor and
-        # prints "(too few runs to judge)" instead. At 13:00 UTC the newest row
-        # holds only the overnight runs, so a single slow one would otherwise
-        # be the morning's "typical wait" and the evidence a queue had cleared.
-        return None
-    return _as_seconds(latest.get("p50_minutes"))
+    # The newest judged row, not the newest row. The producer withholds a
+    # verdict below its sample floor, and at 13:00 UTC today's row holds only
+    # the overnight runs -- one slow run would otherwise be the morning's
+    # typical wait. Withholding the figure instead costs the headline on every
+    # quiet morning, and a night with no runs at all already falls back, since
+    # the producer writes no row for an empty day. Rows are oldest first, so
+    # the first one outside POOL_DIGEST_DAYS ends the walk.
+    for row in reversed(_rows(_section(artifact, "trend"))):
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = datetime.strptime(row["day"], POOL_DAY_FORMAT).date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (measured.date() - day).days >= POOL_DIGEST_DAYS:
+            break
+        if row.get("judged"):
+            return _as_seconds(row.get("p50_minutes"))
+    return None
 
 
 def pool_evidence(pool: dict) -> str:

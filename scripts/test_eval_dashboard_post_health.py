@@ -957,6 +957,18 @@ class PoolNote(RunHarness):
         self.assertIn("could not read the queue", self.opener.texts[0])
         self.assertIn("Check the build cluster", self.opener.texts[1])
 
+    def test_a_full_pool_claims_no_queue_it_did_not_measure(self):
+        # The pool being full is this hour's Boskos reading, so the remedy
+        # stands; "runs are queuing" is Deck's and can be a week old. The
+        # message keeps the half that was measured.
+        self.tick(pooled(free=0, waiting_longest_s=None), self.at(10))
+        self.assertEqual(
+            self.first()[0],
+            "⏳ *Smoke gate: pool full* — all 30 projects are leased. Consider onboarding a project.",
+        )
+        # The measured wording is pinned by
+        # test_the_full_pool_message_asks_for_a_project_and_pairs_each_number_with_its_limit.
+
     def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):
         # The other order. Once the reader has the build cluster, "cannot say
         # whose fault it is" is less than they already have, so an hour of

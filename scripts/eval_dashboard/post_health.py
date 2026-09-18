@@ -707,9 +707,13 @@ def pool_cause_text(pool: dict) -> str:
     nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
+        # The full pool is this hour's Boskos reading and carries the remedy on
+        # its own; the queue is Deck's, and on an unread one the clause would
+        # assert a backlog from a verdict up to a week old.
+        queuing = "" if pool.get("waiting_now") is None else " and runs are queuing"
         return (
             f"*Smoke gate: pool full* — all {figure(pool.get('total'))} projects are leased"
-            " and runs are queuing. Consider onboarding a project."
+            f"{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
         return (
