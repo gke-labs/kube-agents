@@ -217,7 +217,10 @@ LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
 uses Workload Identity (below); `litellm.modelDefaultName`
-overrides the per-provider default model. Set `litellm.enabled=false`
+overrides the per-provider default model; `litellm.maxTokens` (default `0`,
+meaning none) puts a `max_tokens` under every alias for a request that names
+none, which a self-hosted backend with one combined prompt-plus-output budget
+needs — a request's own `max_tokens` still wins. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS

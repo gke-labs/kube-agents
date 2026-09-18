@@ -63,6 +63,22 @@ make -C k8s-operator deploy-litellm
 
 Either way the agent picks up the new model on its next request without any change to its own config.
 
+### Setting the output-token budget
+
+`MODEL_MAX_TOKENS` is the number of output tokens the gateway asks the provider for on a request that names none. Set it in `install.env` or with `--model-max-tokens=N`; it reaches the chart as `litellm.maxTokens` and the Terraform example as `model_max_tokens`, and renders as `max_tokens` under every `model_list` alias:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
+      max_tokens: 8192
+```
+
+Left empty, the default, nothing is rendered and the gateway config is what it was. The hosted providers above need no value: they read a large `max_tokens` as a ceiling. A self-hosted backend such as vLLM, SGLang, TGI or llama.cpp admits a request only if the prompt and `max_tokens` together fit its served window, so a request that asks for more output than the window holds is refused before the model runs. Set the value below that window, leaving the prompt the room it needs.
+
+The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. Until the agent image stops sending its own `max_tokens` on every request, the client's value wins for agent turns, and only a request that omits the field, such as a direct call to the gateway's `/v1/chat/completions`, takes the configured one.
+
 ### Prompt caching
 
 Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request — so the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in the shipped `config.yaml`:

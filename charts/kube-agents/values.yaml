@@ -231,6 +231,16 @@ litellm:
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
+  # Output-token budget the gateway asks the provider for on a request that
+  # names none, rendered as max_tokens under every model_list alias. 0 leaves
+  # the key out, so the rendered config and its rollout checksum are what they
+  # were. Set it for a backend with one combined prompt-plus-output budget
+  # (vLLM, SGLang, TGI, llama.cpp), which refuses a request whose max_tokens
+  # alone fills the served window. A request that carries its own max_tokens
+  # keeps it, because LiteLLM lets the caller's value win, and the pinned
+  # agent image sends one on every request: until that image stops doing so,
+  # this is a default the gateway supplies, not a cap it enforces.
+  maxTokens: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity, so the chart always creates this KSA — no operator reconciles it.

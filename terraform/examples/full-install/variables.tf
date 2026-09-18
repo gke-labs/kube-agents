@@ -276,6 +276,17 @@ variable "model_default_name" {
   default     = ""
 }
 
+variable "model_max_tokens" {
+  description = "Output tokens the LiteLLM gateway asks the provider for on a request that names none, rendered as max_tokens under every model_list alias. 0 leaves the key out. A request carrying its own max_tokens keeps it, and the agent image sends one, so this is a default the gateway supplies rather than a cap on the agent; a self-hosted backend whose prompt and output share one window (vLLM, SGLang, TGI, llama.cpp) is what it is for."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.model_max_tokens >= 0 && floor(var.model_max_tokens) == var.model_max_tokens
+    error_message = "model_max_tokens must be a whole number of tokens, 0 or more."
+  }
+}
+
 variable "api_server_key" {
   description = "API_SERVER_KEY for the agent harness (required; stored in the platform-agent-secrets Secret)"
   type        = string

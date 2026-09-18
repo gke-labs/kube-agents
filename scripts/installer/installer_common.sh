@@ -180,6 +180,13 @@ is_valid_model_provider() {
   [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai)$ ]]
 }
 
+# MODEL_MAX_TOKENS: a whole number of output tokens, 0 meaning none. Digits
+# only, so a sign, a decimal point or a unit suffix is refused before it
+# reaches terraform.tfvars as a bare word HCL cannot parse.
+is_non_negative_integer() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
 # read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
@@ -1733,6 +1740,17 @@ write_tfvars_from_state() {
     fi
   fi
 
+  # Empty and 0 both mean "no gateway default", which the chart renders as
+  # nothing. Checked here as well as in install.sh's interview because
+  # upgrade.sh and uninstall.sh regenerate from install.env without it, and a
+  # bare word in HCL would otherwise fail at terraform's parser with a message
+  # naming neither the key nor the file to fix.
+  local model_max_tokens="${MODEL_MAX_TOKENS:-0}"
+  if ! is_non_negative_integer "$model_max_tokens"; then
+    print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
+    return 1
+  fi
+
   local old_umask
   old_umask="$(umask)"
   umask 077
@@ -1780,6 +1798,7 @@ write_tfvars_from_state() {
     echo ""
     echo "model_provider     = $(hcl_str "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")"
     echo "model_default_name = $(hcl_str "${MODEL_DEFAULT_NAME:-}")"
+    echo "model_max_tokens   = ${model_max_tokens}"
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"

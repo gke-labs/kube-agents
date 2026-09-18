@@ -896,6 +896,47 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MANAGE=false", proc.stdout)
 
+    def test_parse_args_model_max_tokens_is_read(self):
+        cmd = 'parse_args --model-max-tokens=4096; echo "MAX=$PARAM_MODEL_MAX_TOKENS"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MAX=4096", proc.stdout)
+
+    def test_model_max_tokens_defaults_to_unset(self):
+        cmd = 'echo "MAX=[$PARAM_MODEL_MAX_TOKENS]"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MAX=[]", proc.stdout)
+
+    def test_validate_model_max_tokens_accepts_whole_numbers_and_empty(self):
+        for value in ("4096", "0", ""):
+            with self.subTest(value=value):
+                proc = self._run_install_func(
+                    _SOURCE_INSTALLER_COMMON
+                    + f"parse_args --model-max-tokens={value}; validate_model_max_tokens"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+
+    def test_validate_model_max_tokens_rejects_anything_else(self):
+        # The same helper the tfvars generator applies, so the interview and
+        # upgrade.sh cannot disagree on what a valid value is.
+        for value in ("4k", "-1", "4096.5", "+1"):
+            with self.subTest(value=value):
+                proc = self._run_install_func(
+                    _SOURCE_INSTALLER_COMMON
+                    + f"parse_args --model-max-tokens={value}; validate_model_max_tokens"
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(
+                    "--model-max-tokens must be a whole number of tokens",
+                    proc.stderr + proc.stdout,
+                )
+        # install.env's recorded value is checked too, not only the flag.
+        proc = self._run_install_func(
+            _SOURCE_INSTALLER_COMMON + 'MODEL_MAX_TOKENS="4k"; validate_model_max_tokens'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+
     def test_parse_args_vertex_location_overrides_the_default(self):
         """An explicit --vertex-location still wins over DEFAULT_VERTEX_LOCATION."""
         cmd = (
