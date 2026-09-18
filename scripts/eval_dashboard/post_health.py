@@ -1169,15 +1169,18 @@ def run(
     pool_causes = list(before.get("pool_causes") or [])
     if KIND_POOL in sent:
         pool_causes += [key for key in pool_told_keys(health.get("pool") or {}) if key not in pool_causes]
-    # `pool_drained` is what the last reading showed, and it is what keeps an
-    # unread queue from re-opening the ⏳ every time Deck fails: the memory is
-    # empty, so the cause looks new. Dropped again by a reading with a backlog
-    # in it, which is the jam the empty memory is there to announce.
-    pool_drained = bool(before.get("pool_drained"))
     if pool_was_read(health) and (not health.get("pool") or withheld):
         pool_causes = []
+    # `pool_drained` is what stops an unread queue re-opening the ⏳ every time
+    # Deck fails: the memory above is empty, so the cause looks new. Only a
+    # withheld breach sets it -- a reading with no note at all is the episode
+    # ending, and the next one is entitled to open on an unread queue. Dropped
+    # by that, and by a reading with a backlog in it, which is the jam the
+    # empty memory is there to announce.
+    pool_drained = bool(before.get("pool_drained"))
+    if withheld:
         pool_drained = True
-    elif (health.get("pool") or {}).get("waiting_now"):
+    elif pool_was_read(health) and (not health.get("pool") or health["pool"].get("waiting_now")):
         pool_drained = False
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,

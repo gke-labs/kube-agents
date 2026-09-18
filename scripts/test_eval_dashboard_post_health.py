@@ -1207,6 +1207,16 @@ class PoolNote(RunHarness):
         self.tick(pooled(), self.at(11, 15))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳"])
 
+    def test_an_episode_that_opens_on_an_unread_queue_is_still_told(self):
+        # A healthy reading ends the episode; it is not a drained backlog. Set
+        # the flag on one and it stands for the life of the state file, and
+        # every later breach that opens on an unreachable Deck goes unsaid.
+        self.tick(pooled(waiting_longest_s=0, over_threshold=0), self.at(9))
+        self.tick(cleared(), self.at(9, 15))
+        self.assertFalse(self.recorded()["pool_drained"], "the episode is over, not drained")
+        self.tick(pooled(waiting_longest_s=None, over_threshold=0), self.at(10))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳"])
+
     def test_a_measured_jam_ends_the_memory_of_the_drain(self):
         # Otherwise one drained reading silences every unread tick for the rest
         # of the run, including the opening of the next episode, which is the
