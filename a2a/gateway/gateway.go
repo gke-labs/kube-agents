@@ -372,7 +372,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		}
 		// After the notice, and whether or not one was posted: an adapter
 		// whose caller is a program has to learn about the drop it is not
-		// being told about a second time (DropObserver). Ordered after,
+		// being told about a second time (InboundObserver). Ordered after,
 		// because this wakes a waiting request, and a waiter that answered
 		// between the signal and the post would hand its caller a reply with
 		// the notice missing from the transcript.
@@ -651,23 +651,31 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	if active == nil || active.Detached {
 		return
 	}
-	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
+	task, terminalSubject, err := g.client.TasksGetAttributed(ctx, rec.Addressee, active.TaskID)
 	healed := false
 	switch {
 	case err == nil && task.Final:
 		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
 		g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
 		// The terminal the relay should have delivered, delivered to the
-		// adapter now: the stream's word, so it is the executor's. A chat
-		// backend is told nothing (TaskObserver); the inject door records
-		// it, and a program awaiting the task ends its wait on it rather
-		// than on a status card it would have to parse. With the reason the
-		// fold carries, because the two deliveries of one terminal must not
-		// disagree: a caller classifying a bridge's own failure by its
-		// reason token would grade it as the persona's for the one that
-		// came this way.
-		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, TerminalFromExecutor,
-			finalMessageText(task))
+		// adapter now, with whose word it is: the fold reads both of the
+		// task's subjects, and a terminal off the supervisor subject is the
+		// supervisor's (an executor that died or never ran, the install's)
+		// where one off the events subject is the executor's -- the same
+		// attribution probeConversation makes, because a caller grades the
+		// executor's terminal and not the supervisor's, whichever route the
+		// terminal reached it by. A chat backend is told nothing
+		// (TaskObserver); the inject door records it, and a program
+		// awaiting the task ends its wait on it rather than on a status
+		// card it would have to parse. With the reason the fold carries,
+		// because the two deliveries of one terminal must not disagree: a
+		// caller classifying a bridge's own failure by its reason token
+		// would grade it as the persona's for the one that came this way.
+		source := TerminalFromExecutor
+		if terminalSubject == lib.TaskSupervisorSubject(rec.Addressee, active.TaskID) {
+			source = TerminalFromSupervisor
+		}
+		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
 		healed = true
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:

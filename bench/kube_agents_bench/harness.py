@@ -1434,6 +1434,45 @@ class KubeAgentsHarness(AgentHarness):
                             "inject: port-forward respawn failed before retry: %s", pf_exc
                         )
 
+        def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bool, bool]:
+            """Cancel a task an exchange left active, after the read.
+
+            Every exchange -- the opening turn and each status turn -- goes
+            through this, because each can end with its task still on the
+            bus: an executor has it (working or queued), nobody took it yet
+            (the submission waits for a bridge that binds later), or the
+            gateway could not say. The cancel comes only now, after the read
+            and naming the task the POST answered with, so it reaches the bus
+            even where the gateway's own heal has released the record on
+            this very turn. It never changes the classification. The settle
+            read after it contributes one thing, and only to the graded
+            timeout: the executor's terminal, with its reason. The
+            deliverable stays what the task produced inside its budget --
+            the cancel acknowledgement the gateway posts after it is not the
+            agent's answer -- and anything else the settle says (a transient
+            at that one read, a task that has not confirmed) must not relabel
+            what the first, authoritative read classified.
+
+            Returns ``(timed_out, stop_pending)``: whether the exchange ended
+            at its budget, and whether a stop was already pending on the
+            record so none was sent.
+            """
+            timed_out = exchange.outcome in (inject.OUTCOME_DEADLINE, inject.OUTCOME_QUEUED)
+            leaves_active = timed_out or exchange.outcome in (
+                inject.OUTCOME_NEVER_STARTED,
+                inject.OUTCOME_UNCLASSIFIED,
+            )
+            stop_pending = leaves_active and exchange.probe is not None and exchange.probe.detached
+            if leaves_active and not stop_pending:
+                settled = task.cancel(exchange.task_id, settle=None if timed_out else 0)
+                if timed_out and settled is not None and settled.outcome == inject.OUTCOME_TERMINAL:
+                    exchange.fold.mark_terminal(
+                        settled.fold.terminal,
+                        settled.fold.terminal_source,
+                        settled.fold.terminal_reason,
+                    )
+            return timed_out, stop_pending
+
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
@@ -1455,32 +1494,7 @@ class KubeAgentsHarness(AgentHarness):
         identity["inject_only"] = task.inject_only
         identity["backend"] = task.backend
 
-        timed_out = exchange.outcome in (inject.OUTCOME_DEADLINE, inject.OUTCOME_QUEUED)
-        leaves_active = timed_out or exchange.outcome in (
-            inject.OUTCOME_NEVER_STARTED,
-            inject.OUTCOME_UNCLASSIFIED,
-        )
-        stop_pending = leaves_active and exchange.probe is not None and exchange.probe.detached
-        if leaves_active and not stop_pending:
-            # The read has classified, and the task may still be on the bus:
-            # an executor has it (working or queued), nobody took it yet
-            # (the submission waits for a bridge that binds later), or the
-            # gateway could not say. The cancel comes only now, after the
-            # read and naming the task the POST answered with, so it reaches
-            # the bus even where the gateway's own heal has released the
-            # record on this very turn. It never changes the classification.
-            # The settle read after it contributes one thing, and only to
-            # the graded timeout: the executor's terminal, with its reason.
-            # The deliverable stays what the task produced inside its budget
-            # -- the cancel acknowledgement the gateway posts after it is
-            # not the agent's answer -- and anything else the settle says (a
-            # transient at that one read, a task that has not confirmed)
-            # must not relabel what the first, authoritative read classified.
-            settled = task.cancel(exchange.task_id, settle=None if timed_out else 0)
-            if timed_out and settled is not None and settled.outcome == inject.OUTCOME_TERMINAL:
-                exchange.fold.mark_terminal(
-                    settled.fold.terminal, settled.fold.terminal_source, settled.fold.terminal_reason
-                )
+        timed_out, stop_pending = _bound_stray(task, exchange)
 
         if exchange.outcome == inject.OUTCOME_UNCLASSIFIED:
             # The read at the deadline could not say -- the gateway could not
@@ -1614,6 +1628,10 @@ class KubeAgentsHarness(AgentHarness):
                         f"{follow.conversation}: {follow.note}",
                         retryable=True,
                     )
+                # A status turn's task can be left active at its budget the
+                # same as the opening turn's, and the next turn on a key
+                # whose record still holds it would be absorbed as a steer.
+                _bound_stray(follow, turn_exchange)
                 return _inject_result(turn_exchange, identity), ""
 
             def _respawn_tunnel() -> None:

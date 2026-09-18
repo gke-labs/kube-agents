@@ -238,8 +238,8 @@ const (
 	// holding pods/portforward in the namespace could drive the platform
 	// persona with the install's cluster and GitHub credentials. 32 bytes
 	// because it is machine-generated and machine-read; nothing types it.
-	a2aInjectTokenKey      = "token" // #nosec G101 -- Secret key name, not a credential
-	a2aInjectTokenEnvVar   = "A2A_INJECT_TOKEN"
+	a2aInjectTokenKey      = "token"            // #nosec G101 -- Secret key name, not a credential
+	a2aInjectTokenEnvVar   = "A2A_INJECT_TOKEN" // #nosec G101 -- Environment variable name, not a credential
 	a2aInjectTokenNumBytes = 32
 
 	// a2aStrictEventsWriterEnvVar is read from the CONTROLLER's environment

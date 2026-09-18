@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2321,5 +2322,240 @@ func TestInjectHealedTerminalCarriesTheExecutorsReason(t *testing.T) {
 		if entry.Reason != reason {
 			t.Fatalf("the healed terminal's reason = %q, want the executor's %q", entry.Reason, reason)
 		}
+	}
+}
+
+// TestInjectHealedTerminalNamesTheSupervisorsAsItsOwn: the heal is the third
+// reader of the fold, after the relay and the read route, and the only one
+// that delivers a terminal the relay lost. A supervisor's terminal (a session
+// pod that died or could not be spawned) healed as the executor's would reach
+// the door as `source: executor`, and a caller that adopts a healed terminal
+// on its settle read would grade an outage as the agent failing.
+func TestInjectHealedTerminalNamesTheSupervisorsAsItsOwn(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-healed-supervisor", injectTestAuthor, "long job")
+	origin := r.awaitTask(t, "platform")
+	ctx := context.Background()
+	const reason = "reason: spawn-failed"
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateFailed, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-healed-sup", TaskID: origin.TaskID, ContextID: origin.ContextID,
+			Parts: []lib.Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskSupervisorSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+
+	r.restoreActiveTask(t, reply.Conversation, origin, time.Minute)
+	before, _, _ := r.adapter.snapshot(reply.Conversation, 0, "")
+	r.inject(t, "case-healed-supervisor", injectTestAuthor, "anything")
+
+	entries, _, _ := r.adapter.snapshot(reply.Conversation, len(before), "")
+	var healed *InjectEntry
+	for _, entry := range terminalEntries(entries) {
+		if entry.TaskID == reply.TaskID {
+			healed = &entry
+		}
+	}
+	if healed == nil {
+		t.Fatalf("the heal handed the door no terminal for %s; entries = %+v", reply.TaskID, entries)
+	}
+	if healed.Source != string(TerminalFromSupervisor) {
+		t.Fatalf("the healed terminal's source = %q, want %q", healed.Source, TerminalFromSupervisor)
+	}
+	if healed.Reason != reason {
+		t.Fatalf("the healed terminal's reason = %q, want %q", healed.Reason, reason)
+	}
+}
+
+// fakeDoor is an InjectAdapter run over a handler the test supplies in place
+// of the gateway, for the waits whose subject is the ORDER of observer calls
+// rather than what the gateway does. It answers a POST or a cancel the way
+// the rig's helpers do.
+type fakeDoor struct {
+	door *InjectAdapter
+	addr string
+}
+
+func startFakeDoor(t *testing.T, handler func(InboundMessage)) *fakeDoor {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	door, err := NewInjectAdapter(ln.Addr().String(), injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.listener = ln
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = door.Run(ctx, handler) }()
+	waitFor(t, "the door to accept messages", func() bool {
+		door.handlerMu.RLock()
+		defer door.handlerMu.RUnlock()
+		return door.handler != nil
+	})
+	return &fakeDoor{door: door, addr: ln.Addr().String()}
+}
+
+func (f *fakeDoor) post(t *testing.T, target string, body any) injectResponse {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, "http://"+f.addr+target, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(authorizationHeader, "Bearer "+injectTestToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var reply injectResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+		t.Fatal(err)
+	}
+	return reply
+}
+
+func (f *fakeDoor) inject(t *testing.T, conversation, text string) injectResponse {
+	t.Helper()
+	return f.post(t, injectPath, injectRequest{Conversation: conversation, Author: injectTestAuthor, Text: text})
+}
+
+func (f *fakeDoor) cancel(t *testing.T, key string) injectResponse {
+	t.Helper()
+	return f.post(t, conversationsPath+key+cancelSuffix, cancelRequest{Author: injectTestAuthor})
+}
+
+// evictEverything mints more conversations than the door retains, so that
+// every conversation minted before the call is gone.
+func (f *fakeDoor) evictEverything(t *testing.T, tag string) {
+	t.Helper()
+	for i := range injectMaxConversations {
+		if _, err := f.door.Post(fmt.Sprintf("%s-filler-%d", tag, i), "filler"); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// TestInjectAnswersAnAcceptThatLandsWithTheTurnEnd pins the invariant the
+// wait classifies by: a turn that has ended after recording an accept
+// answers the accept, however the two land relative to the waiter's looks.
+// The handler runs startTask's whole sequence to completion before the wait
+// takes its first look, so the first reading already shows the turn over --
+// the ordering that, read as two lookups (logs, then counts), lets an accept
+// recorded between them be classified as a turn that ended without one.
+// Deterministic for the "turn already over" ordering; the descheduled-waiter
+// ordering is the same reading and cannot be forced from here.
+func TestInjectAnswersAnAcceptThatLandsWithTheTurnEnd(t *testing.T) {
+	var f *fakeDoor
+	ready := make(chan struct{})
+	handler := func(msg InboundMessage) {
+		<-ready
+		id := "task-" + msg.MessageID
+		f.door.TaskStarted(msg.Conversation, id)
+		if _, err := f.door.Post(msg.Conversation, "⏳ submitted…"); err != nil {
+			t.Error(err)
+		}
+		f.door.TaskAccepted(msg.Conversation, id)
+		f.door.TurnFinished(msg.Conversation)
+	}
+	f = startFakeDoor(t, handler)
+	close(ready)
+
+	const turns = 25
+	for i := range turns {
+		reply := f.inject(t, fmt.Sprintf("turn-end-%d", i), "go")
+		if reply.TaskID == "" || reply.Refusal != "" {
+			t.Fatalf("POST %d: reply = %+v, want the accepted task id with no refusal", i, reply)
+		}
+	}
+}
+
+// TestInjectRefusesWhenItsConversationWasEvictedUnderTheWait: the door evicts
+// a conversation wholesale at its cap and mints it again with every counter
+// at zero. A waiter that read its counts before that would otherwise classify
+// from the new incarnation: on a conversation's second turn, prior holds one
+// turn and one accept, the new incarnation's single accept sits at position
+// zero where prior already looked past, and its turn count never exceeds
+// prior's -- so the wait sees nothing move and holds the connection for the
+// whole bound while the task it was waiting on runs. The wait compares the
+// mint generation instead and says what happened, at once.
+func TestInjectRefusesWhenItsConversationWasEvictedUnderTheWait(t *testing.T) {
+	var f *fakeDoor
+	ready := make(chan struct{})
+	var turn atomic.Int32
+	handler := func(msg InboundMessage) {
+		<-ready
+		id := fmt.Sprintf("task-%d", turn.Add(1))
+		f.door.TaskStarted(msg.Conversation, id)
+		if _, err := f.door.Post(msg.Conversation, "⏳ submitted…"); err != nil {
+			t.Error(err)
+		}
+		if turn.Load() > 1 {
+			// Between the announcement and the accept, every conversation
+			// the door held is evicted; the accept mints this one again.
+			f.evictEverything(t, "evicted-under-wait")
+		}
+		f.door.TaskAccepted(msg.Conversation, id)
+		f.door.TurnFinished(msg.Conversation)
+	}
+	f = startFakeDoor(t, handler)
+	close(ready)
+
+	if first := f.inject(t, "evicted-under-wait", "go"); first.TaskID != "task-1" {
+		t.Fatalf("first turn: reply = %+v, want task-1", first)
+	}
+	started := time.Now()
+	reply := f.inject(t, "evicted-under-wait", "again")
+	if elapsed := time.Since(started); elapsed > injectSubmitWait/2 {
+		t.Fatalf("the POST took %s, want an answer well inside the %s bound", elapsed, injectSubmitWait)
+	}
+	if reply.Refusal != injectRefusalNoAnswer || reply.TaskID != "" {
+		t.Fatalf("reply = %+v, want a %s refusal and no task id", reply, injectRefusalNoAnswer)
+	}
+	if !strings.Contains(reply.Note, "evicted this conversation") {
+		t.Fatalf("note = %q, want it to name the eviction rather than a turn that did nothing", reply.Note)
+	}
+}
+
+// TestInjectCancelRefusesWhenItsConversationWasEvictedUnderTheWait: the
+// cancel's wait reads the same counters and has the same hole; without the
+// generation it would wait out the whole bound on a conversation whose reply
+// it can no longer see.
+func TestInjectCancelRefusesWhenItsConversationWasEvictedUnderTheWait(t *testing.T) {
+	var f *fakeDoor
+	ready := make(chan struct{})
+	handler := func(msg InboundMessage) {
+		<-ready
+		go func() {
+			f.evictEverything(t, "cancel-evicted")
+			if _, err := f.door.Post(msg.Conversation, "nothing is running here"); err != nil {
+				t.Error(err)
+			}
+			f.door.TurnFinished(msg.Conversation)
+		}()
+	}
+	f = startFakeDoor(t, handler)
+	close(ready)
+
+	started := time.Now()
+	reply := f.cancel(t, injectKeyPrefix+"cancel-evicted")
+	if elapsed := time.Since(started); elapsed > injectSubmitWait/2 {
+		t.Fatalf("the cancel took %s, want an answer well inside the %s bound", elapsed, injectSubmitWait)
+	}
+	if !strings.Contains(reply.Note, "evicted this conversation") {
+		t.Fatalf("note = %q, want it to name the eviction", reply.Note)
 	}
 }

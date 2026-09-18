@@ -565,7 +565,8 @@ not be silent about it.
   rather than as prose it would have to match: `unverified-author` (the door's principal map does
   not carry the author, so the gateway dropped the message), `publish-failed`, `no-task` (a steer,
   a status answer or a stop) and `no-answer` (the bound expired with the gateway visibly doing
-  nothing). A repeat of the same backend message id is answered with the same refusal, and the
+  nothing, or the door's own retention scrolled past the answer: more tasks than it keeps started
+  on the conversation, or the conversation itself was evicted and minted again under the wait). A repeat of the same backend message id is answered with the same refusal, and the
   reply the conversation received is in the same payload. All four are infrastructure to the
   harness: in none of them did an agent see the prompt.
 

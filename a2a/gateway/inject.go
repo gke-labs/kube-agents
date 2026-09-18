@@ -465,6 +465,12 @@ type injectConversation struct {
 	// read this before handing its message over knows its own turn is over
 	// when the count moves.
 	turns int
+	// gen is which minting of this key the state belongs to. The door evicts
+	// a conversation wholesale at its cap and mints it again on the next
+	// touch with every counter at zero, so a waiter that read its counts
+	// before the eviction would otherwise classify from the new incarnation
+	// as though nothing had moved. It compares this instead, and says so.
+	gen int
 	// requester is the author of the last message injected here, which is
 	// the whole membership of a synthetic conversation. Roster returns it.
 	requester string
@@ -490,6 +496,9 @@ type InjectAdapter struct {
 
 	mu            sync.Mutex
 	conversations map[string]*injectConversation
+	// mints counts every conversation minted, and stamps each with its
+	// generation (injectConversation.gen).
+	mints int
 	// order is the conversation keys in first-seen order, for the eviction
 	// the map cannot do on its own.
 	order []string
@@ -892,7 +901,8 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 		}
 		delete(a.conversations, oldest)
 	}
-	conv := &injectConversation{nextSeq: 1, terminals: map[string]string{}}
+	a.mints++
+	conv := &injectConversation{nextSeq: 1, terminals: map[string]string{}, gen: a.mints}
 	a.conversations[key] = conv
 	a.order = append(a.order, key)
 	return conv
@@ -935,33 +945,6 @@ func (a *InjectAdapter) snapshot(key string, after int, taskID string) ([]Inject
 	return out, conv.nextSeq - 1, terminal
 }
 
-// startedSince reports the first task started on a conversation past the
-// given count of prior starts, acceptedSince the first whose submission
-// reached the bus, and publishFailedSince the first that could not. Each also
-// reports whether the position has been evicted, which is a different answer
-// from "nothing yet" -- see injectIDLog.at.
-func (a *InjectAdapter) startedSince(key string, prior int) (string, bool) {
-	return a.sinceLocked(key, prior, func(conv *injectConversation) *injectIDLog { return &conv.started })
-}
-
-func (a *InjectAdapter) acceptedSince(key string, prior int) (string, bool) {
-	return a.sinceLocked(key, prior, func(conv *injectConversation) *injectIDLog { return &conv.accepted })
-}
-
-func (a *InjectAdapter) publishFailedSince(key string, prior int) (string, bool) {
-	return a.sinceLocked(key, prior, func(conv *injectConversation) *injectIDLog { return &conv.publishFailed })
-}
-
-func (a *InjectAdapter) sinceLocked(key string, prior int, pick func(*injectConversation) *injectIDLog) (string, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	conv, ok := a.conversations[key]
-	if !ok {
-		return "", false
-	}
-	return pick(conv).at(prior)
-}
-
 // injectCounts is what a waiting request records before handing a message
 // over, so it can tell this turn's work from the last one's.
 type injectCounts struct {
@@ -971,6 +954,22 @@ type injectCounts struct {
 	entries       int
 	drops         int
 	turns         int
+	// gen is the conversation's mint generation; see injectConversation.gen.
+	// Zero when the conversation did not exist when the counts were read.
+	gen int
+}
+
+// countsOf reads a conversation's counts. Caller holds a.mu.
+func countsOf(conv *injectConversation) injectCounts {
+	return injectCounts{
+		starts:        conv.started.total,
+		accepted:      conv.accepted.total,
+		publishFailed: conv.publishFailed.total,
+		entries:       conv.nextSeq - 1,
+		drops:         conv.drops,
+		turns:         conv.turns,
+		gen:           conv.gen,
+	}
 }
 
 // counts is the conversation's state as a waiting request sees it.
@@ -981,14 +980,57 @@ func (a *InjectAdapter) counts(key string) injectCounts {
 	if !ok {
 		return injectCounts{}
 	}
-	return injectCounts{
-		starts:        conv.started.total,
-		accepted:      conv.accepted.total,
-		publishFailed: conv.publishFailed.total,
-		entries:       conv.nextSeq - 1,
-		drops:         conv.drops,
-		turns:         conv.turns,
+	return countsOf(conv)
+}
+
+// injectTurn is one reading of what a conversation has done since a waiter's
+// prior counts: the counts as they now stand, and the answers to the "first
+// since" questions the wait asks of the id logs.
+//
+// One reading under one lock, and not several. The gateway's inbox worker
+// records the accept (or the publish failure) and then, on its way out of
+// handleInbound, the end of the turn, each under this mutex; a wait that read
+// the logs in one acquisition and the counts in another could be descheduled
+// between the two for the length of that gap -- the end-of-turn record write
+// sits in it -- and see the turn over without the accept that happened
+// before it, refusing a submission that is on the bus. Read together, a turn
+// count that has moved carries with it everything that turn recorded.
+type injectTurn struct {
+	now injectCounts
+	// remade reports that the conversation the counts came from is not the
+	// one prior was read from: it was evicted at the conversation cap and
+	// minted again, so nothing in now is comparable to prior.
+	remade bool
+	// accepted, failed and started are the first task past prior's count in
+	// each log, or "" when none yet; acceptedGone and failedGone report that
+	// the position has been evicted from the log (injectIDLog.at).
+	accepted, failed, started string
+	acceptedGone, failedGone  bool
+}
+
+// turnSince is the conversation's state since prior, read at once.
+func (a *InjectAdapter) turnSince(key string, prior injectCounts) injectTurn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv, ok := a.conversations[key]
+	if !ok {
+		return injectTurn{remade: prior.gen != 0}
 	}
+	turn := injectTurn{now: countsOf(conv), remade: conv.gen != prior.gen}
+	if turn.remade {
+		return turn
+	}
+	turn.accepted, turn.acceptedGone = conv.accepted.at(prior.accepted)
+	turn.failed, turn.failedGone = conv.publishFailed.at(prior.publishFailed)
+	turn.started, _ = conv.started.at(prior.starts)
+	return turn
+}
+
+// remadeNote is the refusal note for a conversation evicted under a waiter.
+func remadeNote() string {
+	return fmt.Sprintf("the door evicted this conversation while its turn ran (more than %d "+
+		"conversations were minted in the meantime), so what became of the message is no longer "+
+		"retained", injectMaxConversations)
 }
 
 // waitCh returns the channel closed on the next change to any conversation.
@@ -1071,13 +1113,15 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		defer a.completeSubmission(sub, "",
 			"the first POST with this message id aborted before its turn answered", injectRefusalNoAnswer)
 	}
+	// Recorded before the turn, so Roster answers for this conversation even
+	// if the gateway reads it inside handleInbound. It also mints the
+	// conversation, which is why it comes before the counts: read from a
+	// conversation that exists, they carry its generation, and the wait can
+	// tell an eviction under it from a turn that did nothing.
+	a.noteRequester(key, req.Author)
 	// Read the counters BEFORE handing the message over, so the wait below
 	// cannot mistake a previous turn's task or reply for this one's.
 	prior := a.counts(key)
-
-	// Recorded before the turn, so Roster answers for this conversation even
-	// if the gateway reads it inside handleInbound.
-	a.noteRequester(key, req.Author)
 
 	handler(InboundMessage{
 		Conversation: key,
@@ -1164,8 +1208,9 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	if messageID == "" {
 		messageID = injectInboundIDPrefix + randHex(messageIDHexWidth)
 	}
-	prior := a.counts(key)
+	// Requester first, then counts, for the reason handleInject gives.
 	a.noteRequester(key, req.Author)
+	prior := a.counts(key)
 	handler(InboundMessage{
 		Conversation: key,
 		Kind:         injectConversationKind,
@@ -1202,6 +1247,9 @@ func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior inject
 	deadline := time.Now().Add(injectSubmitWait)
 	for {
 		now := a.counts(key)
+		if now.gen != prior.gen {
+			return remadeNote()
+		}
 		if now.entries > prior.entries {
 			return ""
 		}
@@ -1251,19 +1299,31 @@ func (a *InjectAdapter) awaitEntry(ctx context.Context, key string, prior inject
 // The drop is a signal rather than a post for a related reason: the gateway's
 // notice is posted once per sender, so the second drop from the same author
 // posts nothing at all.
+//
+// Each look is one reading under the lock (injectTurn), and a conversation
+// evicted and minted again under the wait is refused as such rather than
+// classified from the new incarnation's counters.
 func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectCounts) (string, string, string) {
 	deadline := time.Now().Add(injectSubmitWait)
 	for {
-		accepted, acceptedGone := a.acceptedSince(key, prior.accepted)
-		if accepted != "" {
-			return accepted, "", ""
+		// Everything below is classified from this one reading; see
+		// injectTurn for why it is not several.
+		turn := a.turnSince(key, prior)
+		if turn.remade {
+			// The conversation under this wait was evicted and minted again,
+			// and none of its counters answer for prior any more. Said
+			// rather than read off the new incarnation, whose zeroes would
+			// pass for a turn that did nothing.
+			return "", remadeNote(), injectRefusalNoAnswer
 		}
-		failed, failedGone := a.publishFailedSince(key, prior.publishFailed)
-		if failed != "" {
+		if turn.accepted != "" {
+			return turn.accepted, "", ""
+		}
+		if turn.failed != "" {
 			return "", fmt.Sprintf("the gateway minted task %s and could not put it on the bus; "+
-				"it has released the conversation and nothing is running", failed), injectRefusalPublishFailed
+				"it has released the conversation and nothing is running", turn.failed), injectRefusalPublishFailed
 		}
-		if acceptedGone || failedGone {
+		if turn.acceptedGone || turn.failedGone {
 			// More than this door retains has happened on the conversation
 			// since the message was handed over, so the answer to this POST
 			// has scrolled off. Said rather than guessed: the id at the
@@ -1272,7 +1332,7 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 				"this message was routed, so what became of it is no longer retained",
 				injectMaxEntries), injectRefusalNoAnswer
 		}
-		now := a.counts(key)
+		now := turn.now
 		if now.turns > prior.turns {
 			// The turn is over and no task of it reached the bus. Which
 			// refusal it is follows from what the turn did, in the order the
@@ -1284,10 +1344,10 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 					"sender, so it may not be in the entries)", injectRefusalUnverifiedAuthor
 			case now.starts > prior.starts:
 				// Announced, and the turn ended without the publish either
-				// succeeding or failing: the gateway went away mid-turn.
-				started, _ := a.startedSince(key, prior.starts)
+				// succeeding or failing. startTask's own paths all end in one
+				// or the other, so this is a turn that unwound past it.
 				return "", fmt.Sprintf("the gateway minted task %s and the turn ended without putting "+
-					"it on the bus or saying it could not", started), injectRefusalNoAnswer
+					"it on the bus or saying it could not", turn.started), injectRefusalNoAnswer
 			case now.entries > prior.entries:
 				return "", "the gateway answered this turn without starting a task (a steer, a status " +
 					"answer, or a stop); the reply is in entries", injectRefusalNoTask
@@ -1301,9 +1361,9 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 			// The turn never ended, which is the gateway itself being stuck:
 			// handleInbound runs under its own turn timeout, below this
 			// bound, so reaching here means it has not returned at all.
-			if started, _ := a.startedSince(key, prior.starts); started != "" {
+			if turn.started != "" {
 				return "", fmt.Sprintf("the gateway minted task %s and within %s neither put it on the "+
-					"bus nor said it could not", started, injectSubmitWait), injectRefusalNoAnswer
+					"bus nor said it could not", turn.started, injectSubmitWait), injectRefusalNoAnswer
 			}
 			return "", fmt.Sprintf("the gateway did not finish this turn within %s",
 				injectSubmitWait), injectRefusalNoAnswer

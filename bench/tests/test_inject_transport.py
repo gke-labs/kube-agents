@@ -160,7 +160,7 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
                     "accepted": False,
                     "note": self.server.refusal_note,
                     "refusal": self.server.refusal_code,
-                    "entries": self.server.refusal_entries,
+                    "entries": [],
                     "firstEventGraceSeconds": self.server.grace_seconds,
                 },
             )
@@ -181,6 +181,8 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
         }
         if deduplicated:
             body["deduplicated"] = True
+        if self.server.accepted_at is None:
+            self.server.accepted_at = time.monotonic()
         self._respond(200, body)
 
     def do_GET(self) -> None:
@@ -191,9 +193,19 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
         after = int(query.get("after", ["0"])[0])
         probed = query.get(inject.PROBE_PARAM, ["0"])[0] != "0"
         task = query.get("task", [""])[0]
-        self.server.polls.append({"path": parsed.path, "after": after, "task": task, "probe": probed})
-        if self.server.poll_status is not None:
-            self.send_error(self.server.poll_status)
+        failed = self.server.poll_fails()
+        self.server.polls.append(
+            {
+                "path": parsed.path,
+                "after": after,
+                "task": task,
+                "probe": probed,
+                "wait": int(query.get("wait", ["0"])[0]),
+                "failed": failed,
+            }
+        )
+        if failed:
+            self.send_error(self.server.poll_status or 503)
             return
         probe: dict[str, Any] | None = None
         if probed:
@@ -255,8 +267,6 @@ class _StubGatewayServer(ThreadingHTTPServer):
     probe_result: str = ""
     probe_reason: str = ""
     probe_error: str = ""
-    # Probed reads after this many start carrying probe_error; -1 means all.
-    probe_error_after: int = -1
     inject_only: bool = True
     backend: str = "inject"
     # The first-event grace the stub reports.
@@ -266,17 +276,37 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # The machine-readable half of a refusal, which is what the harness
     # branches on; "" is a door too old to send one.
     refusal_code: str = ""
-    refusal_entries: list[dict[str, Any]]
-    # Non-None makes a POST (or every GET) answer with that status instead;
-    # submit_failures bounds how many leading POSTs do (-1: all of them).
+    # Non-None makes a POST answer with that status instead; submit_failures
+    # bounds how many leading POSTs do (-1: all of them).
     submit_status: int | None = None
     submit_failures: int = -1
+    # Non-None makes GETs answer with that status: every GET when
+    # poll_failures is -1, otherwise the first poll_failures GETs that
+    # arrive poll_fail_after_seconds or more after the first accepted POST,
+    # which is a tunnel dropping mid-task.
     poll_status: int | None = None
+    poll_failures: int = -1
+    poll_fail_after_seconds: float = 0.0
+    failed_polls: int = 0
+    accepted_at: float | None = None
     # Serve at most this many entries per GET; 0 means all of them.
     page_size: int = 0
     # A terminal the gateway reports out of band once the entries are drained,
     # which is how a late reader learns an answer it missed.
     terminal_out_of_band: str = ""
+
+    def poll_fails(self) -> bool:
+        """Whether this GET is one of the scripted failures."""
+        if self.poll_status is None:
+            return False
+        if self.poll_failures < 0:
+            return True
+        if self.accepted_at is None or self.failed_polls >= self.poll_failures:
+            return False
+        if time.monotonic() - self.accepted_at < self.poll_fail_after_seconds:
+            return False
+        self.failed_polls += 1
+        return True
 
     def probe_report(self) -> dict[str, Any]:
         self.probed_reads += 1
@@ -320,9 +350,7 @@ class _StubGatewayServer(ThreadingHTTPServer):
                 posts = [e for e in self.entries if e["kind"] == inject.ENTRY_POST]
                 if posts:
                     report["lastPost"] = posts[-1]
-        if self.probe_error and (
-            self.probe_error_after < 0 or self.probed_reads > self.probe_error_after
-        ):
+        if self.probe_error:
             report["error"] = self.probe_error
         return report
 
@@ -339,7 +367,6 @@ def stub_gateway(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubGatewayServe
     server.calls = []
     server.on_cancel = []
     server.executor_states = []
-    server.refusal_entries = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_TRANSPORT", "inject")
@@ -848,6 +875,42 @@ def test_a_retried_post_carries_the_same_body_and_is_deduped(
     assert len(stub_gateway.submissions) == 2
     assert stub_gateway.submissions[0] == stub_gateway.submissions[1]
     assert stub_gateway.submissions[1]["messageId"] == CONVERSATION
+
+
+def test_a_transport_failure_after_the_accept_rejoins_the_same_wait(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll lost mid-task -- the port-forward dropping, a 5xx from the door
+    -- is retried without a second POST, the fold is rebuilt from the start
+    of the conversation, and the retry rejoins the budget already running
+    rather than starting a new one. A budget that restarted would triple a
+    30-minute run's ceiling on two dropped polls."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_failures = 2
+    # A second into the task, so the polls before and after the failures
+    # visibly ask the gateway to wait for different remainders.
+    stub_gateway.poll_fail_after_seconds = 1.0
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "3")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert stub_gateway.failed_polls == 2
+    assert len(stub_gateway.submissions) == 1, "the retry re-sent the prompt"
+    assert result.output == "partial findings"
+    assert any("did not reach a terminal state" in e for e in result.errors)
+    assert not infra(result)
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+    failed_at = max(i for i, p in enumerate(stub_gateway.polls) if p["failed"])
+    before = stub_gateway.polls[failed_at - 2]
+    resumed = stub_gateway.polls[failed_at + 1]
+    # Replayed from the start, so the deliverable posted before the drop is
+    # in the fold again.
+    assert resumed["after"] == 0
+    # And on the original clock: the poll before the drop asked for the
+    # whole remainder of a fresh budget, the one after it for what was left.
+    assert before["wait"] == 2
+    assert resumed["wait"] <= 1, f"the budget restarted: {resumed}"
 
 
 def test_a_status_outside_the_retry_set_is_not_retried(stub_gateway: _StubGatewayServer) -> None:
