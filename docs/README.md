@@ -89,9 +89,9 @@ Which file owns which category of content is defined once, in the
 canonical-home table in [`AGENTS.md`](../AGENTS.md) — do not duplicate a fact
 outside its home; link to it.
 
-Five artifacts are **generated, not hand-written** — four regions inside
-hand-written documents (one of them spliced into three pages), plus one whole
-file. `scripts/generate_docs.py` (run via `make docs-generate`) rewrites
+The artifacts below are **generated, not hand-written** — regions inside
+hand-written documents (a region may be spliced into several pages), plus one
+whole file. `scripts/generate_docs.py` (run via `make docs-generate`) rewrites
 everything between the markers; everything outside them is hand-written. Never
 edit inside the markers — edit the source and regenerate.
 

@@ -26,8 +26,7 @@ FENCE_RE = re.compile(r"\A```json\n(.*)\n```\Z", re.S)
 
 
 def roster_entry(job_id: str) -> dict:
-    data = json.loads(generate_docs.PLATFORM_CRON_ROSTER.read_text(encoding="utf-8"))
-    jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
+    jobs = generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
     return next(job for job in jobs if job["id"] == job_id)
 
 
@@ -102,6 +101,71 @@ class MultiPageBlockTest(unittest.TestCase):
             self.assertIn("GENERATED BODY", new_text)
             self.assertNotIn("stale", new_text)
             self.assertTrue(new_text.startswith("# Page\n\n"), new_text)
+
+    def test_two_blocks_on_one_page_accumulate(self):
+        # `reference/cron-jobs.md` carries the jobs table and the job example.
+        # Spliced each from a fresh read of the disk, the second block's text
+        # still held the first block's stale region, and writing the targets
+        # in order put that stale region back: one run of the generator left
+        # `--check` red on the table. Each block splices into what the block
+        # before it produced, so the page's last target carries both.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "page.md"
+            page.write_text(
+                "<!-- BEGIN GENERATED: first -->\n"
+                "stale first\n"
+                "<!-- END GENERATED: first -->\n\n"
+                "<!-- BEGIN GENERATED: second -->\n"
+                "stale second\n"
+                "<!-- END GENERATED: second -->\n",
+                encoding="utf-8",
+            )
+            targets = generate_docs.collect_targets(
+                blocks={
+                    "first": ((page,), lambda: "NEW FIRST"),
+                    "second": ((page,), lambda: "NEW SECOND"),
+                },
+                files={},
+            )
+        self.assertEqual([block for _, _, _, block in targets], ["first", "second"])
+        self.assertTrue(all(changed for _, _, changed, _ in targets))
+        _, last_text, _, _ = targets[-1]
+        self.assertIn("NEW FIRST", last_text)
+        self.assertIn("NEW SECOND", last_text)
+        self.assertNotIn("stale", last_text)
+
+    def test_an_unchanged_block_beside_a_changed_one_is_reported_unchanged(self):
+        # `changed` stays per block: the report names the region that moved,
+        # and a block whose region is already current is not written as new
+        # because the other block on the page changed.
+        current = (
+            "<!-- BEGIN GENERATED: first -->\n"
+            "<!-- Regenerate with: make docs-generate -- do not edit by hand. -->\n"
+            "<!-- prettier-ignore-start -->\n\n"
+            "SAME\n\n"
+            "<!-- prettier-ignore-end -->\n"
+            "<!-- END GENERATED: first -->"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "page.md"
+            page.write_text(
+                f"{current}\n\n"
+                "<!-- BEGIN GENERATED: second -->\n"
+                "stale second\n"
+                "<!-- END GENERATED: second -->\n",
+                encoding="utf-8",
+            )
+            targets = generate_docs.collect_targets(
+                blocks={
+                    "first": ((page,), lambda: "SAME"),
+                    "second": ((page,), lambda: "NEW SECOND"),
+                },
+                files={},
+            )
+        self.assertEqual(
+            [(block, changed) for _, _, changed, block in targets],
+            [("first", False), ("second", True)],
+        )
 
 
 if __name__ == "__main__":

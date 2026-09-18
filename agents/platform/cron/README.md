@@ -305,7 +305,10 @@ to an install:
 
 - Run `make docs-generate` after editing either roster. The site's cron
   reference table is generated from both, and a cron expression missing from
-  `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
+  `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`. The
+  `compliance-audit` entry is also rendered in full as the job-schema example
+  on the watchdogs, skills and cron-jobs pages, so an edit to it changes those
+  three pages too.
 - For a dev workspace, `scripts/dev/dev_rebuild_agent.sh` rebuilds and restarts
   the agent image without a release; `./upgrade.sh --upgrade-mode=harness
 --image-tag=<ref>` is the path for an installed cluster.

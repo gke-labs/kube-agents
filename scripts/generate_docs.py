@@ -72,6 +72,8 @@ CRON_ROSTERS = (
 # stale every time the prompt was reworded, and a guard that compared them to
 # the roster was the cost of keeping them by hand.
 EXAMPLE_JOB_ID = "compliance-audit"
+# The roster file's own indentation, so the example reads as the file spells it.
+EXAMPLE_INDENT = 2
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 IMAGES_JSON = REPO / "images.json"
@@ -211,15 +213,24 @@ def md_escape(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def load_roster(path: Path) -> list[dict]:
+    """Return the job entries of a cron roster, whichever shape the file takes.
+
+    A roster is either a bare list of jobs or an object carrying them under
+    ``jobs``. Both generators and the tests read through this one reader so
+    the shape rule lives in one place.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data["jobs"] if isinstance(data, dict) and "jobs" in data else data
+
+
 def gen_cron_jobs() -> str:
     rows = [
         "| ID | Profile | Schedule | Cadence | Enabled | Runs |",
         "| -- | ------- | -------- | ------- | :-----: | ---- |",
     ]
     for profile, path in CRON_ROSTERS:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
-        for job in jobs:
+        for job in load_roster(path):
             # A disabled entry on the Platform Agent's roster is a tombstone —
             # an id on its way out, shipped switched off for a release because
             # the start-up merge never prunes, then deleted and named in
@@ -270,15 +281,14 @@ def gen_cron_job_example(job_id: str = EXAMPLE_JOB_ID) -> str:
     page that silently rendered nothing would read as a schema with no
     example, which is the drift this region exists to prevent.
     """
-    data = json.loads(PLATFORM_CRON_ROSTER.read_text(encoding="utf-8"))
-    jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
-    job = next((j for j in jobs if j.get("id") == job_id), None)
+    job = next((j for j in load_roster(PLATFORM_CRON_ROSTER) if j.get("id") == job_id), None)
     if job is None:
         raise SystemExit(
             f"{PLATFORM_CRON_ROSTER.relative_to(REPO)}: no job with id '{job_id}'; "
             "the cron-job-example region has nothing to render."
         )
-    return "```json\n" + json.dumps(job, indent=2, ensure_ascii=False) + "\n```"
+    rendered = json.dumps(job, indent=EXAMPLE_INDENT, ensure_ascii=False)
+    return f"```json\n{rendered}\n```"
 
 
 def read_frontmatter(path: Path) -> dict[str, str]:
@@ -497,9 +507,16 @@ def region_markers(path: Path, block_id: str) -> tuple[str, str, str]:
     )
 
 
-def splice(path: Path, block_id: str, body: str) -> tuple[bool, str]:
-    """Return (changed, new_text) with the generated region replaced."""
-    text = path.read_text(encoding="utf-8")
+def splice(path: Path, block_id: str, body: str, text: str | None = None) -> tuple[bool, str]:
+    """Return (changed, new_text) with the generated region replaced.
+
+    ``text`` is the document to splice into when the caller already holds it;
+    a page carrying several regions is spliced cumulatively, each block into
+    the text the previous one produced, so the last result carries them all.
+    Left ``None``, the file is read from disk.
+    """
+    if text is None:
+        text = path.read_text(encoding="utf-8")
     begin, end, notice = region_markers(path, block_id)
     pattern = re.compile(
         re.escape(begin) + r".*?" + re.escape(end),
@@ -538,12 +555,19 @@ def collect_targets(blocks=BLOCKS, files=FILES) -> list[Target]:
 
     A region's generator runs once and the one body is spliced into each of
     the region's files, so two pages carrying the same block cannot differ.
+    A file carrying several regions is spliced cumulatively: each block goes
+    into the text the previous block left, not into a fresh read of the disk,
+    so its last target holds every block and writing the targets in order
+    cannot put a stale region back. ``changed`` is per block, so the report
+    still names which region moved.
     """
     targets: list[Target] = []
+    pending: dict[Path, str] = {}
     for block_id, (paths, generator) in blocks.items():
         body = generator()
         for path in paths:
-            changed, new_text = splice(path, block_id, body)
+            changed, new_text = splice(path, block_id, body, pending.get(path))
+            pending[path] = new_text
             targets.append((path, new_text, changed, block_id))
     for block_id, (path, generator) in files.items():
         new_text = generator()
