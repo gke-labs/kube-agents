@@ -5887,6 +5887,44 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertEqual([e["path"] for e in self.filed()], ["intent/api.md"])
         self.assertIn("3 file(s) the broker did not send lie outside the searched notes", self.err)
 
+    def test_a_skipped_link_under_the_searched_paths_is_not_a_note_the_broker_withheld(self):
+        # The broker will not follow a symlink and says so with its own
+        # reason; the walk in directory mode never yields one either. A link
+        # named `.md` under the searched paths is therefore not a note the
+        # harness missed, in either mode, and the repository keeps its entry
+        # and its bound. A tracked name that is not a regular file (a
+        # submodule) is the same case. A note over the ceiling is not.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        for reason in ("symlink", "notAFile"):
+            with self.subTest(reason):
+                self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+                    copy, complete=False, skipped=[{"path": "intent/link.md", "reason": reason}]
+                )
+                self.out = ""
+                payload = self.start()
+                self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+                self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["intent"])
+                self.assertEqual([e["path"] for e in self.filed()], ["intent/api.md"])
+                self.assertNotIn("did not send 1 note(s)", self.err)
+                self.assertIn("1 file(s) the broker did not send lie outside the searched notes", self.err)
+        # The link beside a note the broker withheld: the note still costs the entry.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy,
+            complete=False,
+            skipped=[
+                {"path": "intent/link.md", "reason": "symlink"},
+                {"path": "intent/big.md", "reason": "tooLarge"},
+            ],
+        )
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+
     def test_a_skipped_note_under_the_searched_paths_costs_the_repository_its_entry(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         self.context("acme/terraform-live")

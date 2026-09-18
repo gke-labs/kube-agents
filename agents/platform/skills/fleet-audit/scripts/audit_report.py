@@ -664,6 +664,12 @@ INTENT_DIR = str(PurePosixPath(INTENT_FILE).parent)
 # Never descended, in either mode: a `.git` is repository state, and a symlink
 # is a path out of the copy the bound was checked against.
 SKIPPED_TREE_DIRS = frozenset({".git"})
+# The broker's `skipped` reasons that name a path the search never reads: a
+# symlink it will not follow (the walk above never yields one either) and a
+# tracked name that is not a regular file (a submodule). Every other reason
+# (`tooLarge`, `requestBudget`) withholds a file the harness would have read,
+# and such a file under the searched paths is a note it may have missed.
+BROKER_SKIP_NOT_A_FILE_REASONS = frozenset({"symlink", "notAFile"})
 # The copies come from the sibling skill's script, which works in both broker
 # modes and prints `sha` and `complete`; resolved from this file so the staged
 # and the source layouts both find it. Shallow, because the read is of one
@@ -7265,17 +7271,19 @@ def _head_sha(tree: Path) -> str:
 class _Copy(NamedTuple):
     """One repository copy: the tree to read, its commit, the scratch to remove, and what is missing.
 
-    `skipped` is every path the broker listed and did not send (a file over
-    its per-file ceiling, a symlink). Whether that makes the copy one the
-    harness may call searched is decided once the search bound is known: a
-    skipped `crds.yaml` costs a note nothing, a skipped note under the
-    searched paths costs the repository its entry.
+    `skipped` is every path the broker listed and did not send, each with
+    the broker's reason (a file over its per-file ceiling, a symlink).
+    Whether that makes the copy one the harness may call searched is decided
+    once the search bound is known: a skipped `crds.yaml` costs a note
+    nothing, a skipped note under the searched paths costs the repository its
+    entry, and a link there is not a note in either mode
+    (`BROKER_SKIP_NOT_A_FILE_REASONS`).
     """
 
     tree: Path
     sha: str
     into: Path
-    skipped: tuple[str, ...] = ()
+    skipped: tuple[tuple[str, str], ...] = ()
     # The bound a content-mode copy was fetched under, already read from the
     # intent file; None when the tree is whole and the reader reads it itself.
     prefixes: list[str] | None = None
@@ -7289,9 +7297,10 @@ def _clone_step(
     None whenever the copy is not one the harness may call searched: the
     script exited non-zero, printed something other than its JSON line, or
     was stopped by a bound (`stopped` set: the listing was cut and what lies
-    past the cut is unknown). The reply's `skipped` is normalised to the
-    paths the broker did not send; whether any of them mattered is the
-    caller's question.
+    past the cut is unknown). The reply's `skipped` is normalised to
+    `(path, reason)` pairs for the paths the broker did not send, the reason
+    empty when it gave none; whether any of them mattered is the caller's
+    question.
     """
     cmd = [
         sys.executable,
@@ -7326,7 +7335,9 @@ def _clone_step(
         log(f"WARNING: {slug}: clone printed no JSON line; not searched.")
         return None
     skipped = tuple(
-        str(entry.get("path") if isinstance(entry, dict) else entry)
+        (str(entry.get("path")), str(entry.get("reason") or ""))
+        if isinstance(entry, dict)
+        else (str(entry), "")
         for entry in reply.get("skipped") or []
     )
     if reply.get("stopped"):
@@ -7385,7 +7396,7 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
         return None
     if first.get("mode") == CLONE_MODE_DIRECTORY:
         return _Copy(tree, sha, into)
-    skipped: dict[str, None] = dict.fromkeys(first["skipped"])
+    skipped: dict[str, str] = dict(first["skipped"])
     if INTENT_FILE in skipped:
         log(
             f"WARNING: {slug}: the broker did not send {INTENT_FILE}, so the "
@@ -7407,7 +7418,7 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
                 "repository moved between copies; not searched."
             )
             return False
-        skipped.update(dict.fromkeys(step["skipped"]))
+        skipped.update(step["skipped"])
         return True
 
     for prefix in prefixes or [None]:
@@ -7423,7 +7434,7 @@ def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> 
         prefixes = []
         if not fetch(None):
             return None
-    return _Copy(tree, sha, into, tuple(skipped), prefixes)
+    return _Copy(tree, sha, into, tuple(skipped.items()), prefixes)
 
 
 def discover_declarations(
@@ -7477,7 +7488,7 @@ def discover_declarations(
             )
             continue
         into: Path | None = None
-        skipped: tuple[str, ...] = ()
+        skipped: tuple[tuple[str, str], ...] = ()
         bound: list[str] | None = None
         try:
             if is_gitops and not content_mode():
@@ -7506,11 +7517,14 @@ def discover_declarations(
                 continue
             # The copy's gaps, the same way: a skipped file that is not a note
             # under the searched paths could not have carried a declaration,
-            # and a skipped note could have.
+            # and a skipped note could have. A link the broker would not
+            # follow is not a note, as the directory-mode walk has it.
             missed = [
                 path
-                for path in skipped
-                if path.endswith(NOTE_SUFFIX) and _under_prefixes(path, prefixes)
+                for path, reason in skipped
+                if path.endswith(NOTE_SUFFIX)
+                and reason not in BROKER_SKIP_NOT_A_FILE_REASONS
+                and _under_prefixes(path, prefixes)
             ]
             if missed:
                 log(
