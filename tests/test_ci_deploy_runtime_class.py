@@ -5,9 +5,9 @@ to `gvisor`, so a release that passes no override renders a sandboxed agent pod.
 `hack/ci-deploy.sh` then reaches that pod over `kubectl port-forward`, which a
 GKE Sandbox pod refuses -- the forward is established in the host-side CNI netns
 while the listener lives in the sandbox's own network stack
-(`scripts/exec_tunnel.py` is canonical). On a pool cluster with no `gvisor`
-RuntimeClass registered the pod does not schedule at all and the rollout gate
-times out instead.
+(`docs/site/src/content/docs/operator/platformagent-crd.md` is canonical).
+On a pool cluster with no `gvisor` RuntimeClass registered the pod does not
+schedule at all and the rollout gate times out instead.
 
 Both failures are silent in the diff that causes them: nothing in `ci-deploy.sh`
 mentions the sandbox, so the pipeline breaks the next time a chart default moves.

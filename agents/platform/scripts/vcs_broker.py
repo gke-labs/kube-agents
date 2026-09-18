@@ -202,10 +202,12 @@ class VcsBroker:
         git_runner: Callable[..., subprocess.CompletedProcess],
         cli_runner: Callable[..., subprocess.CompletedProcess] | None = None,
         refresh: Callable[[str, str], None] | None = None,
+        base_branch: str | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         self._git_runner = git_runner
+        self.base_branch = (base_branch or "").strip()
         # A CLI transport needs the broker's credential environment but no
         # repository. When the caller does not separate the two, the git runner
         # serves both.
@@ -500,18 +502,39 @@ class VcsBroker:
             git(root, "init", "--quiet")
             git(root, "remote", "add", "origin", bound.forge.clone_url(bound.repo))
             # Which branch the remote calls its default, from the remote and
-            # not from the request. Review found the `branch == target` check
-            # above bypassed by naming any other existing branch as `target`:
-            # `existing_head` is then set, the base check is skipped, both
-            # ancestry checks hold for a fast-forward, and the push lands on
-            # the shared branch with no proposal. The remote's HEAD is the one
-            # notion of "shared" the broker can establish for itself; a
-            # protected branch that is not the default is the forge's own
-            # branch protection to enforce, and this does not claim otherwise.
+            # not from the request. The broker enforces protected branch policy
+            # across all write doors: main, master, production, the remote default
+            # branch, any operator-configured base override, and any run/** branch
+            # are strictly refused without a pull request.
             default = self._default_branch_of_remote(git, root)
-            if default and branch == default:
+            protected_branches = {"main", "master", "production"}
+            if default:
+                protected_branches.add(default.casefold())
+            base_override = (
+                self.base_branch
+                or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+                or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+            )
+            if base_override:
+                norm_override = base_override.strip()
+                if norm_override.startswith("refs/heads/"):
+                    norm_override = norm_override[len("refs/heads/"):]
+                elif norm_override.startswith("heads/"):
+                    norm_override = norm_override[len("heads/"):]
+                protected_branches.add(norm_override.casefold())
+
+            normalized_branch = branch.strip()
+            if normalized_branch.startswith("refs/heads/"):
+                normalized_branch = normalized_branch[len("refs/heads/"):]
+            elif normalized_branch.startswith("heads/"):
+                normalized_branch = normalized_branch[len("heads/"):]
+
+            if (
+                normalized_branch.casefold() in protected_branches
+                or normalized_branch.casefold().startswith("run/")
+            ):
                 raise WorkspaceError(
-                    f"{branch} is the remote's default branch. Publish a branch "
+                    f"{branch} is a protected, default, or run branch. Publish a branch "
                     "of your own and open a proposal onto it.",
                     status=409,
                     code="PROTECTED_BRANCH",

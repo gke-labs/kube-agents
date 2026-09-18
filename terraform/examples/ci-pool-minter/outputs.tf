@@ -4,7 +4,7 @@ output "minter_service_account_email" {
 }
 
 output "allowed_service_account_email" {
-  description = "The platform agent's GSA — the single identity the minty rule accepts a platform-agent-scope request from. The chart derives it from platformAgent.harness.projectId, so this is here to be checked against the rendered rule, not to be passed in."
+  description = "The platform agent's GSA — the single identity the minty rule accepts a request from, for either scope. The chart derives it from platformAgent.harness.projectId, so this is here to be checked against the rendered rule, not to be passed in."
   value       = "kubeagents-platform-gsa@${var.project_id}.iam.gserviceaccount.com"
 }
 

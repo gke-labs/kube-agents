@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import profile_scaffold as ps  # noqa: E402
 
 ITEMS = ("config.yaml", "SOUL.md", "AGENTS.md", "CAPABILITIES.md", "cron", "skills", "governance")
+SHIPPED_ROSTER = Path(__file__).resolve().parents[1] / "cron" / "jobs.json"
 
 
 def job(job_id, **extra):
@@ -309,6 +310,24 @@ class CronStoreMergeTest(unittest.TestCase):
         # The platform profile's path, unchanged: it passes no filter.
         merged = self.overlay([job("audit"), job("drift")], [job("audit")])
         self.assertEqual(["audit", "drift"], [j["id"] for j in merged])
+
+    def test_the_shipped_roster_lands_a_new_entry_on_a_volume_that_predates_it(self):
+        # The real roster, not a fixture: this is how a job added to the image
+        # reaches every existing install at its next pod start, with no
+        # migration. `feedback-prompt` is the entry that relies on it -- an
+        # install upgraded to the image that ships it gets the job, armed from
+        # that first tick, while its `.feedback_prompt_*` markers on the volume
+        # are what keep a later roll from re-arming it.
+        shipped = json.loads(SHIPPED_ROSTER.read_text(encoding="utf-8"))["jobs"]
+        volume = [dict(j, last_run_at="2026-09-01T06:20:00Z") for j in shipped if j["id"] != "feedback-prompt"]
+        self.assertNotIn("feedback-prompt", [j["id"] for j in volume])
+        merged = self.overlay(shipped, volume)
+        by_id = {j["id"]: j for j in merged}
+        self.assertIn("feedback-prompt", by_id)
+        self.assertIs(True, by_id["feedback-prompt"]["enabled"])
+        self.assertEqual("feedback_prompt.py", by_id["feedback-prompt"]["script"])
+        self.assertNotIn("last_run_at", by_id["feedback-prompt"])
+        self.assertEqual("2026-09-01T06:20:00Z", by_id["compliance-audit"]["last_run_at"])
 
     def test_the_merge_is_skipped_when_cron_is_not_being_overlaid(self):
         # `--items` without `cron` means the caller is not touching the cron

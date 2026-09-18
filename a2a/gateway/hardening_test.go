@@ -365,7 +365,7 @@ func TestSpawnSetsSeccompRuntimeDefault(t *testing.T) {
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1",
 		BusSession: "chat-otter-seccomp", Addressee: "chat-otter-seccomp"}
-	if _, err := s.Spawn(context.Background(), rec, "task-1", ""); err != nil {
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
 		t.Fatal(err)
 	}
 	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-seccomp", metav1.GetOptions{})

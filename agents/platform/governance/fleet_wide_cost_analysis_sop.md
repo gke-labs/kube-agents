@@ -252,6 +252,7 @@ What to report in each case:
 - `silent_ok: true` → `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the ledger issue closed as completed and every open remediation PR for this stream closed with it; on `UPDATED` nothing moved since last week. Dispatched on demand, say which in one line and give the issue URL.
 - `CLEAN` with `resolved: > 0` → the waste this audit was tracking is gone. Report the issue URL and the count that closed with it. Reclaimed capacity is the whole point of the stream and the one result worth interrupting someone for.
 - `CLEAN` with `partial: true` → nothing was found, but nothing was closed either. One line giving the clean result, the `coverage_gaps`, and the issue URL.
+- `HELD` → zero findings, but the ledger stayed open because the run did not account for findings it was carrying (`start` listed them under `carried`; `unaccounted` names the ones held): one line reporting the clean result, the held ids and the issue URL, then stop. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
 - `OPENED`, or `UPDATED` with a non-zero `new` or `resolved` → one line: counts of new and resolved findings by severity, the ledger issue URL, and anything in `prs_opened` / `prs_closed`. The helper wrote the issue body; do not restate it, do not edit it.
 
 ## Red Lines

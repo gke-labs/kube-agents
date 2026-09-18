@@ -887,17 +887,18 @@ type fakeSpawner struct {
 }
 
 type fakeSpawn struct {
-	Session string
-	TaskID  string
+	Session   string
+	TaskID    string
+	OriginSeq uint64
 }
 
-func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ string) (string, error) {
+func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ string, originSeq uint64) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.spawnErr != nil {
 		return "", s.spawnErr
 	}
-	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID})
+	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID, OriginSeq: originSeq})
 	return rec.BusSession, nil
 }
 

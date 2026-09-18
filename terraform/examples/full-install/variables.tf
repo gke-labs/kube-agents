@@ -20,9 +20,15 @@ variable "cluster_mode" {
 }
 
 variable "create_cluster" {
-  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled and enforce NetworkPolicy (Dataplane V2 or the legacy Calico addon); the module refuses the plan otherwise."
+  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled and enforce NetworkPolicy (Dataplane V2 or the legacy Calico addon); the module refuses the plan otherwise, the NetworkPolicy half unless accept_no_network_policy is set."
   type        = bool
   default     = true
+}
+
+variable "accept_no_network_policy" {
+  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's — is accepted by the API server and enforced by nothing. The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
+  type        = bool
+  default     = false
 }
 
 variable "location" {

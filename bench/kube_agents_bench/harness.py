@@ -6,6 +6,15 @@ the prompt to its Responses-style endpoint. No model SDK is imported; all
 inference happens in the cluster, and reading the reply lives in
 :mod:`kube_agents_bench.parsing`.
 
+That port-forward cannot reach a pod running under GKE Sandbox (gVisor), which
+a stock install turns on. Nothing here notices: the forward binds its local
+port before anything dials the pod, so ``_ensure_port_forward`` sees an open
+port and returns, and the run dies later as a transport failure. Noticing at
+all takes a request rather than a port check, as ``tests/e2e/conftest.py``
+does -- though a request only separates a working transport from a broken one,
+never a sandboxed agent from one that is down. ``bench/README.md`` has the
+symptoms and the remedies.
+
 The platform agent delegates substantive work to subagents by filing a kanban
 card and ending its turn -- there is no synchronous await tool, by design. Its
 first reply is therefore an acknowledgement carrying a task id, not the answer.

@@ -3,17 +3,25 @@
 // sidecar in the platform-agent pod. Design: a2a/docs/hermes-bridge.md.
 //
 // PLAYGROUND POSTURE: this deployment exists to prove the A2A fabric shape.
-// A shared bus user and no queue-staleness guard are the playground, not the
-// product; the stage-3 dispatcher replaces the second.
+// No queue-staleness guard is the playground, not the product; the stage-3
+// dispatcher replaces it.
 //
-// The first is now this program's own debt. The auth callout is armed, but
-// main() below sets nats.UserInfo from the environment and has no path that
-// reads a projected ServiceAccount token, so the bridge cannot authenticate
-// through the callout; it is the last workload of its kind still holding a
-// shared password. Note there is nothing waiting for it either: the rendered
-// map has no `agent` principal and deliberately so, so moving the bridge means
-// giving it an identity of its own rather than reaching for one already there.
-// a2a/docs/hermes-bridge.md owns the move.
+// The bus user is no longer shared. It was `worker`, one credential covering
+// both this program's task plane and the `a2a` CLI's topic blackboard in the
+// container next door; that split into `bridge` (here) and `agent` (the CLI),
+// and main() below dials as `bridge` with a password from
+// <agent>-a2a-nats-creds.
+//
+// Still a password, and not a debt this program can pay. The auth callout is
+// armed, but it resolves an identity from a ServiceAccount token and the API
+// server issues one ServiceAccount per POD -- this container shares the agent's
+// pod, so a token would resolve it to the `agent` entry in the map and hand
+// both containers the union of the two grant sets, which is `worker` rebuilt.
+// The map's `agent` principal is therefore the one identity this program must
+// NOT reach for. What unblocks a token here is the bridge leaving the pod,
+// which is the stage-3 dispatcher; see bridgeIdentity in
+// k8s-operator/internal/controller/platformagent_a2a_identities.go and
+// a2a/docs/hermes-bridge.md.
 package main
 
 import (

@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable, Mapping
 import repo_ref
 
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
-from ..credentials import BrokeredCredential
+from ..credentials import BrokeredCredential, Credential, MintedReadCredential, NoCredential
 from ..validate import (
     repo_segments,
     validate_branch,
@@ -48,9 +48,14 @@ class GitHubForge(Forge):
     cli = "gh"
     error_overrides = ERROR_OVERRIDES
 
-    def __init__(self, refresh: Callable[[str, str], None] | None = None) -> None:
+    def __init__(
+        self,
+        refresh: Callable[[str, str], None] | None = None,
+        mint: Callable[[str, str], str] | None = None,
+    ) -> None:
         super().__init__()
         self.credential = BrokeredCredential(self.name, refresh)
+        self._mint = mint
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
@@ -58,9 +63,23 @@ class GitHubForge(Forge):
 
         An install has one GitHub or it has none, and "none" is not a state
         this repository has ever been in -- github.com is where it lives. The
-        argument is read only for the refresh operation to hand the credential.
+        argument is read only for the two privileged operations to hand the
+        credentials: `refresh` for the write token, `mint` for a read-only one.
         """
-        return (cls(refresh=config.get("refresh")),)
+        return (cls(refresh=config.get("refresh"), mint=config.get("mint")),)
+
+    def read_credential(self, repo: str) -> Credential:
+        """A `contents: read` App installation token for `repo`, per clone.
+
+        Minted from the repository's own policy in the minter (the operator
+        renders one per `context_repos` entry) by the executor, which refuses
+        the mint for a repository not registered as context. Presented to git as
+        an `extraheader` on this host, never installed. Without a mint operation
+        -- an install with no minter -- there is nothing to present.
+        """
+        if self._mint is None:
+            return NoCredential()
+        return MintedReadCredential(self.name, self._mint, self.hosts[0])
 
     # -- identity -----------------------------------------------------------
 

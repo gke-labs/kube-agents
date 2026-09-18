@@ -591,20 +591,26 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     # The adjudicator verdict and its history, when the target has them, so the
     # rendered Brief bakes the current state instead of waiting for the first
     # page poll (and on storage.cloud.google.com that XHR redirects and fails).
-    # Missing is the normal case until the adjudicator has run.
+    # Missing is the normal case until the adjudicator has run. The published
+    # store.json rides along the same way for the Trend page: this hook never
+    # reads the evidence store itself (the ci-health workflow does), it only
+    # keeps the page on the last read instead of blanking it.
     case "$3" in
       gs://*)
         gsutil cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
         gsutil cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
+        gsutil cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
         ;;
       *)
         [ -f "${3%/}/health.json" ] && cp "${3%/}/health.json" "$2/health.json" || true
         [ -f "${3%/}/health-history.jsonl" ] && cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" || true
+        [ -f "${3%/}/store.json" ] && cp "${3%/}/store.json" "$2/store.json" || true
         ;;
     esac
     render_args=()
     [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
     [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+    [ -f "$2/store.json" ] && render_args+=(--store "$2/store.json")
     # Same --public-url rule as hack/ci-dashboard-refresh.sh: a bucket target
     # is the published site, so pass the target to derive <base href> without
     # hardcoding production when targeting a staging bucket. A local directory
@@ -660,12 +666,54 @@ profile_and_dump_on_exit() {
   # was captured above and publish_eval_dashboard never returns non-zero, so
   # this cannot change what Prow reports (errexit is already cleared above).
   publish_eval_dashboard
+  # Last, after everything slow: the eval-lifetime Boskos heartbeat started
+  # below the traps keeps the lease alive through this tail too. On a run
+  # past boskosctl's 5h --timeout nothing else beats, and the tail is not
+  # bounded by the ~5m reaper window (the artifact dump's kubectl calls
+  # carry no --request-timeout; the dashboard publish has a 900s budget), so
+  # killing it first would reopen the gap this daemon closes. The wrapper's
+  # release comes after ci-teardown.sh, minutes from now, so the daemon is
+  # gone long before it; caller_alive stops it even if this kill is never
+  # reached. Unset outside Prow.
+  kill "${EVAL_HEARTBEAT_PID:-}" 2>/dev/null || true
 }
 trap profile_and_dump_on_exit EXIT
 # A Prow deadline delivers SIGTERM, which does not run the EXIT trap on its
 # own; converting it to an exit is what lets the artifact collection above
 # fire on a deadline kill.
 trap 'exit 143' TERM INT
+
+# ─── Boskos lease heartbeat for the eval's own lifetime ──────────────────────
+# The Prow wrapper's `boskosctl heartbeat` covers this step, but boskosctl
+# stops beating after its default --timeout of 5h ("reached timeout,
+# stopping heartbeats", exit 0, so the wrapper's abort fallback never fires)
+# and the wrapper sets no --timeout. Boskos's ~5m reaper then clears the
+# lease's owner, and every later /update and the final release answer 401
+# OwnerNotMatch: the first full nightly (build 2100374258805903360,
+# 2026-09-17) lost kube-agents-evals-6 that way at 05:01Z of a run that ended
+# 05:57Z and could not hand the project back (#1491). A presubmit that
+# outlives 5h under a quota storm (#1214) is exposed the same way.
+#
+# The daemon ci-teardown.sh already runs beats here for exactly this script's
+# lifetime -- it has no timeout -- so the lease stays fresh however long the
+# fan-out and the EXIT trap's artifact tail take; profile_and_dump_on_exit
+# kills it as its last act, minutes before the wrapper's release, and the
+# daemon stops itself once this script is gone. Same endpoint and owner convention as the
+# wrapper (BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}", oss-test-infra
+# prow/prowjobs/gke-labs/kube-agents/*.yaml); outside Prow nothing is derived
+# and the daemon disables itself with one line. `disown` is load-bearing: the
+# fan-out below sizes its lanes with `jobs -rp`, and a daemon left in the job
+# table would take one of them for the whole run (and be waited on).
+if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
+  export BOSKOS_HOST="${BOSKOS_HOST:-http://boskos.boskos.svc.cluster.local}"
+  export BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"
+  export BOSKOS_OWNER_NAME="${BOSKOS_OWNER_NAME:-${JOB_NAME}-${BUILD_ID}}"
+fi
+"${SCRIPT_DIR}/boskos_heartbeat.sh" &
+EVAL_HEARTBEAT_PID=$!
+# Outside Prow the daemon exits within milliseconds; if bash has already
+# reaped it, disown answers "no such job", which must not be a set -e death.
+disown "${EVAL_HEARTBEAT_PID}" 2>/dev/null || true
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
@@ -725,9 +773,10 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # own.
 #
 # The other half is the token-creator grant -- `fleet_reader_token_creators`
-# in bench/tf/fleet/variables.tf, which now defaults to the Prow runner, so an
-# apply of that stack grants it. In a project whose fleet was applied before
-# that default landed, `gcloud auth print-access-token
+# in bench/tf/fleet/variables.tf, which defaults to both runners, the
+# presubmit's and the nightly's, and to the CI health bot, so an apply of that
+# stack grants each. In a project whose fleet was applied before that default
+# landed, `gcloud auth print-access-token
 # --impersonate-service-account` fails, fleet-kubeconfigs.sh warns per cluster,
 # and the role kubeconfigs keep the runner's own read-write credential. That is
 # a privilege gap on a fleet every open PR shares, not a functional one: the
@@ -744,58 +793,9 @@ source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
 write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
-# ─── 2c. Heal seeded-a's default pool: two nodes, not one ───────────────────
-# The seeded fleet's slot-a cluster hosts the namespace-level defect workloads
-# (payments-api, checkout-gateway) alongside GKE's system pods, and one
-# e2-medium's 940m allocatable CPU is fully claimed by the system set alone.
-# The fixtures only ever ran because they scheduled before the system pods
-# filled the node; the 2026-09-08 auto-upgrade rebuilt the node on all 30
-# pool projects, system-critical pods scheduled first, and every fixture went
-# Pending -- the crashloop trio redded every pull request (#1278).
-# bench/tf/fleet/main.tf now says node_count = 2, but a fleet re-apply is a
-# per-project human action on 30 projects, and this job -- running as the
-# Prow identity that holds container.admin in the leased project -- is the
-# first thing to touch each project after the break. So it heals at lease
-# time, the same posture as the poisoned-Helm-record guard in ci-deploy.sh:
-# discover slot a by the fleet's labels and the "-a" name suffix (the rule
-# hack/fleet-kubeconfigs.sh uses; fixtures.json sanctions exactly this), and
-# resize the default pool to SEEDED_A_DEFAULT_POOL_NODES when it is short.
-# Idempotent (a two-node pool is left alone), non-fatal (a failure warns and
-# the fixture checks report what they see, as they do today), and mutates
-# only the pool's node count -- never the fixtures, never the state file,
-# which the tofu change keeps in agreement. FLEET_HEAL_SEEDED_A=0 disables it.
-readonly SEEDED_A_DEFAULT_POOL_NODES=2
-readonly SEEDED_A_DEFAULT_POOL_NAME="default-pool"
-if [ "${FLEET_HEAL_SEEDED_A:-1}" != "0" ]; then
-  STEP_START=$SECONDS
-  # `|| true` as at the section-3b listing: under `set -euo pipefail` a
-  # failed `clusters list` (revoked credential, disabled API, a 5xx) would
-  # otherwise trip errexit on this assignment and kill the run at 2c.
-  SEEDED_A_LINE="$(gcloud container clusters list --project "${PROJECT_ID}" \
-    --filter='resourceLabels.environment=seeded AND resourceLabels.managed-by=kube-agents-seeded-fleet' \
-    --format='value(name,location)' 2>/dev/null | awk '$1 ~ /-a$/ {print; exit}' || true)"
-  if [ -z "${SEEDED_A_LINE}" ]; then
-    echo "seeded-a heal: no slot-a seeded cluster found in ${PROJECT_ID}; nothing to heal"
-  else
-    SEEDED_A_NAME="${SEEDED_A_LINE%%[[:space:]]*}"
-    SEEDED_A_LOCATION="${SEEDED_A_LINE##*[[:space:]]}"
-    SEEDED_A_NODES="$(gcloud container node-pools describe "${SEEDED_A_DEFAULT_POOL_NAME}" \
-      --cluster "${SEEDED_A_NAME}" --location "${SEEDED_A_LOCATION}" --project "${PROJECT_ID}" \
-      --format='value(initialNodeCount)' 2>/dev/null || true)"
-    if [ -z "${SEEDED_A_NODES}" ]; then
-      echo "WARNING: seeded-a heal: could not read ${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} node count; leaving it alone" >&2
-    elif [ "${SEEDED_A_NODES}" -ge "${SEEDED_A_DEFAULT_POOL_NODES}" ]; then
-      echo "seeded-a heal: ${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} already has ${SEEDED_A_NODES} node(s)"
-    elif gcloud container clusters resize "${SEEDED_A_NAME}" --node-pool "${SEEDED_A_DEFAULT_POOL_NAME}" \
-        --num-nodes "${SEEDED_A_DEFAULT_POOL_NODES}" --location "${SEEDED_A_LOCATION}" \
-        --project "${PROJECT_ID}" --quiet; then
-      echo "✓ seeded-a heal: HEALED ${PROJECT_ID}/${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} ${SEEDED_A_NODES} -> ${SEEDED_A_DEFAULT_POOL_NODES} nodes (#1278); fixtures reschedule on their own"
-    else
-      echo "WARNING: seeded-a heal: resize of ${SEEDED_A_NAME}/${SEEDED_A_DEFAULT_POOL_NAME} failed; the pod-state fixture checks will report what they see (#1278)" >&2
-    fi
-  fi
-  echo "✓ seeded-a heal finished in $((SECONDS - STEP_START))s"
-fi
+# Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
+# own manual sweep had already raised all 30 projects and main.tf declares the same
+# count, so the heal never fired: this job's last deliberate fleet write (#1693).
 
 
 # 3. Agent & Harness Configuration
@@ -815,6 +815,10 @@ export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 # completions: 606s / 827s / 1497s / ~2170s on identical inputs. 2700s puts
 # the ceiling above the worst observed; the variance itself is #985's
 # problem, this export just stops mislabeling slowness as wrongness.
+#
+# This is the ceiling every unit inherits. The full-audit units override it
+# per unit in run_one_unit through unit_delegation_timeout (beside
+# unit_cost_hint, below): the measured audit outgrew 2700s too (#1683).
 export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
 
@@ -1070,10 +1074,11 @@ EVAL_DEFAULT_LOCATION="${GCP_LOCATION}"
 # the run pays neither the ~6-minute provision nor the ~8-minute teardown.
 # The discovery filter is the fleet's documented address (both labels from
 # `local.cluster_labels` in bench/tf/fleet/main.tf), the same one
-# hack/fleet-kubeconfigs.sh uses. This block and section 2c's seeded-a heal
-# are the two sanctioned addressers of a seeded cluster outside that catalog
-# chain, and the catalog's own description (bench/tf/fleet/fixtures.json)
-# names both as the exceptions; 2c is the only one that mutates anything.
+# hack/fleet-kubeconfigs.sh uses. This block is the only sanctioned addresser
+# of a seeded cluster outside that catalog chain, and the catalog's own
+# description (bench/tf/fleet/fixtures.json) names it as the exception. It
+# mutates nothing in-cluster; since #1693 no part of this job writes to the
+# fleet's clusters at all.
 #
 # ONLY slot c, never another slot. Slot a carries the planted namespace
 # defects -- including a real, live HPA at max replicas (fixture
@@ -1623,6 +1628,46 @@ unit_cost_hint() {
   esac
 }
 
+# The harness's delegation ceiling for one unit, in seconds: how long
+# devops-bench keeps polling the Platform Agent for a delegated worker before
+# it grades whatever the parent has said so far. Every unit inherits the
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the six
+# full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
+# a ledger write, one closing line -- get 3000s.
+#
+# Why more than 2700 (#1683). The nightly of 2026-09-16 (build
+# 2100374258805903360) cut three audits at the ceiling after their work was
+# done: compliance-rbac-overgrant rep 1's worker rewrote its ledger 2520s
+# after launch and the harness gave up 192s later, while the same case's
+# passing rep needed 160s between its ledger write and its delivered answer;
+# upgrade-readiness-lagging-cluster rep 1 timed out 30s after its ledger was
+# created; fleet-cost-idle-pool rep 1 ran 2739s. The audit's own wall clock
+# at p90 is ~35 minutes (2074s over 903 presubmit repetitions, 2026-09-04 to
+# 09-15), so a run at p90 fits under 2700s -- the reps that hit the ceiling
+# are the tail beyond it, whose true length the graded durations cannot show
+# because they are cut there. The variance is still #985's problem.
+#
+# Why not more than 3000. The ledger read token is minted just before
+# devops-bench starts (mint_ledger_token, below) and lives one hour, and
+# ledger_issue_contains reads GitHub with it only after the agent turn, the
+# delegation wait and the settle. The delegation clock starts after the
+# opening turn, so everything outside it -- startup, port-forward, the
+# opening turn, settle, the verifier's own GET -- has to fit in the hour
+# minus this ceiling. 3000 leaves 600s for that; 3600 left nothing, and a
+# worker that delivered its URL in the last minutes would have handed the
+# verifier an expired token and a rung-2 "checks errored" red on a run that
+# had done its work. 300s over 2700 covers all three cut reps above with
+# margin. The task lock a later repetition waits behind is sized from this
+# ceiling (run_one_unit), so a unit that uses all of it cannot make its
+# successor give up.
+unit_delegation_timeout() {
+  case "$1" in
+    compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
+    upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
+    *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
+  esac
+}
+
 # Per-task env is decided ONCE, before the fan-out, and handed to each unit:
 # the serial loop exported it globally per iteration, which two concurrent
 # units would trample. Per TASK, not per repetition, so repetitions stay
@@ -1700,7 +1745,15 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # the correlationId -- so the audit chain runs from this run directory to
   # every hop the task took, with nothing else added.
   export EVAL_CASE_ID="${name}" EVAL_REPETITION="${rep}"
-  if ! lock_acquire "${STATE_DIR}/lock-task-${name}"; then
+  # The task lock is held for the holder's whole unit, so the wait must
+  # outlast one: the unit's delegation ceiling plus grading and teardown
+  # (about 300s on the record; 600s here). A fixed 1800s deadline under a
+  # 3000s ceiling would make a same-task successor give up while its
+  # predecessor was still legitimately running -- 24% of presubmit runs
+  # launch compliance rep 2 within 2090s of rep 1 (385 logs, 09-04 to
+  # 09-15). The infra lock keeps its default: audit units carry no stack.
+  if ! lock_acquire "${STATE_DIR}/lock-task-${name}" \
+    "$(($(unit_delegation_timeout "${name}") + 600))"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
@@ -1729,6 +1782,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     unset TF_VAR_reuse_existing_cluster
   fi
   export BENCH_NO_INFRA="false"
+  # Per unit, inside this subshell, so the audit units' longer ceiling never
+  # leaks to a sibling lane; see unit_delegation_timeout.
+  AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
+  export AGENT_DELEGATION_TIMEOUT
   local start end dir
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true

@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -105,12 +107,34 @@ import (
 // SecretKeyRef: that key lives in a different Secret, and anything keyed to the
 // default name would silently miss it.
 //
-// The digest is SHA-256 over the referenced values — the construction Helm's
-// `checksum/secret` annotation uses. It discloses no value: confirming a guess
-// means guessing every referenced value at once, and they are API keys and
-// tokens. The alternative that reveals even less, hashing resourceVersion, was
-// rejected because a metadata-only write to the Secret bumps it and would roll
-// the gateway for a change no container can see.
+// # Why the digest is keyed
+//
+// The annotation sits on the pod template, which anyone who can read pods or
+// Deployments can read. An unkeyed SHA-256 over the referenced values — the
+// construction Helm's `checksum/secret` annotation uses — would let such a
+// reader verify guesses offline: the pod spec names every Secret and key in the
+// digest, and a CR-supplied SecretKeyRef can point at a value with far less
+// entropy than a generated API key (code-scanning alert #37,
+// go/weak-sensitive-data-hashing). So the digest is an HMAC-SHA256 whose key
+// is built from the UID of each Secret the values are read from. A UID is 122 random bits
+// minted by the API server, and reading it takes the same `get` on the Secret
+// that reads the values — so a reader who can recover the key needs no digest
+// to learn the values. The other places a UID can surface are Events and owner
+// references that point at the Secret, and this operator emits no Events on
+// Secrets and owns nothing under one; a third-party controller in the
+// namespace that does would widen who can read the key, not what it protects.
+// The key is stable for the life of the Secret, so an in-place edit, `kubectl
+// apply`, or a patch keeps it and the digest moves only when a value does;
+// deleting and recreating the Secret mints a new UID and rolls the pod once,
+// which a recreate deserves anyway.
+//
+// Two keys that would have done less were rejected. The PlatformAgent's own UID
+// is readable by the same audience as the annotation. A dedicated random
+// Secret would need a create path outside `mode: next`, the only place the
+// operator writes Secrets today, and one more object for a rotation to go wrong
+// on. Hashing resourceVersion instead of the values was rejected too: a
+// metadata-only write to the Secret bumps it and would roll the gateway for a
+// change no container can see.
 const (
 	// secretEnvHashAnnotation carries the digest on the pod template. Named for
 	// environment specifically, because a mounted Secret is not in it.
@@ -218,6 +242,9 @@ func (r *PlatformAgentReconciler) secretEnvHash(ctx context.Context, agent *agen
 	// One Get per distinct Secret, however many keys are read out of it.
 	loaded := map[string]*corev1.Secret{}
 	material := map[string]string{}
+	// The HMAC key: the UID of every Secret that was there to read. An absent
+	// Secret has no UID and contributes only its marker to the material.
+	keyMaterial := map[string]string{}
 	for _, ref := range refs {
 		secret, seen := loaded[ref.name]
 		if !seen {
@@ -226,6 +253,7 @@ func (r *PlatformAgentReconciler) secretEnvHash(ctx context.Context, agent *agen
 			switch {
 			case err == nil:
 				secret = fetched
+				keyMaterial[ref.name] = string(fetched.UID)
 			case apierrors.IsNotFound(err):
 				secret = nil
 			default:
@@ -252,15 +280,24 @@ func (r *PlatformAgentReconciler) secretEnvHash(ctx context.Context, agent *agen
 		}
 	}
 
-	// encoding/json sorts map keys, so the digest does not depend on Go's
-	// randomised map iteration order — the same property getConfigMapHash
-	// relies on, and the reason this marshals a map rather than ranging over
-	// one.
+	// encoding/json sorts map keys, so neither the digest nor its key depends
+	// on Go's randomised map iteration order — the same property
+	// getConfigMapHash relies on, and the reason this marshals maps rather than
+	// ranging over them.
 	encoded, err := json.Marshal(material)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x", sha256.Sum256(encoded)), nil
+	key, err := json.Marshal(keyMaterial)
+	if err != nil {
+		return "", err
+	}
+	// Keyed by the Secrets' UIDs rather than an unkeyed SHA-256, so the
+	// annotation cannot be used to verify guesses at the values; see the file
+	// comment. hash.Hash.Write never returns an error.
+	mac := hmac.New(sha256.New, key)
+	mac.Write(encoded)
+	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 // stampSecretEnvHash annotates the pod template with the digest of the Secret

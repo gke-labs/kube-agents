@@ -21,16 +21,26 @@ import pytest
 try:
     import google.auth
     from google.auth.credentials import Credentials
+    from google.auth.exceptions import RefreshError, TransportError
     from google.oauth2.credentials import Credentials as UserCredentials
     from googleapiclient.discovery import Resource, build
     from googleapiclient.errors import HttpError
     HAS_GOOGLE_LIBS = True
 except ImportError:
     HAS_GOOGLE_LIBS = False
+    # Bound so the module imports and the names resolve; every fixture fails before one is used.
+    RefreshError = Exception  # type: ignore
+    TransportError = Exception  # type: ignore
     Credentials = Any  # type: ignore
     UserCredentials = Any  # type: ignore
     Resource = Any  # type: ignore
     HttpError = Exception  # type: ignore
+
+try:
+    # pytest puts tests/e2e on sys.path when it collects this file.
+    from gchat_poller import ChatMessagePoller, ChatReadAccessDenied, OTA_ENV_VARS, describe_credential
+except ImportError:  # imported as tests.e2e.gchat_agent_test from the repository root
+    from tests.e2e.gchat_poller import ChatMessagePoller, ChatReadAccessDenied, OTA_ENV_VARS, describe_credential
 
 # Configuration from Environment Variables (read dynamically from tests/e2e/.env or the CI environment)
 GCP_PROJECT_ID: Optional[str] = os.environ.get("GCP_PROJECT_ID") or os.environ.get("PROJECT_ID")
@@ -66,6 +76,21 @@ SCOPES: list[str] = [
     "https://www.googleapis.com/auth/cloud-platform",
 ]
 
+# Reading the space back as the service account is app authentication, which needs the
+# chat.app.* scope and a one-time Google Workspace administrator approval of it; without the
+# approval spaces.messages.list answers 403 and the poller falls back to the OTA user credential.
+# The poller gets its own credential carrying only this scope, so the token that posts the prompt
+# and publishes the event (SCOPES above) is the one that worked before the scope existed.
+CHAT_APP_MESSAGES_READONLY_SCOPE: str = "https://www.googleapis.com/auth/chat.app.messages.readonly"
+POLL_SCOPES: list[str] = [CHAT_APP_MESSAGES_READONLY_SCOPE]
+CHAT_USER_MESSAGES_READONLY_SCOPE: str = "https://www.googleapis.com/auth/chat.messages.readonly"
+OAUTH_TOKEN_URI: str = "https://oauth2.googleapis.com/token"
+POLL_PAGE_SIZE: int = 50
+POLL_ORDER_BY: str = "createTime desc"
+
+
+GOOGLE_LIBS_MISSING: str = "google-api-python-client or google-auth not installed; Google Chat E2E test requires Google client libraries."
+
 
 def wait_for_gateway_deployment_ready(namespace: str = AGENT_NAMESPACE) -> None:
     """Wait for deployment/platform-agent-gateway to finish any rolling restart before posting a prompt."""
@@ -95,7 +120,7 @@ def wait_for_gateway_deployment_ready(namespace: str = AGENT_NAMESPACE) -> None:
 def credentials() -> Any:
     """Returns GCP credentials authenticated with required Chat and Pub/Sub scopes."""
     if not HAS_GOOGLE_LIBS:
-        pytest.fail("google-api-python-client or google-auth not installed; Google Chat E2E test requires Google client libraries.")
+        pytest.fail(GOOGLE_LIBS_MISSING)
     creds, _ = google.auth.default(scopes=SCOPES)
     return creds
 
@@ -114,31 +139,42 @@ def chat_service(credentials: Credentials) -> Resource:
 
 
 @pytest.fixture(scope="module")
-def poll_chat_service(credentials: Credentials) -> Resource:
-    """Builds authenticated Google Chat API service for polling space messages.
-    Uses OTA User Refresh Token if provided in environment (for CI), otherwise falls back to standard credentials.
+def chat_poller() -> ChatMessagePoller:
+    """Builds the poller that reads space messages: the runner's own credentials first (service
+    account app auth in CI), the OTA user refresh token second when its three variables are set.
+    The poller's own credential carries POLL_SCOPES rather than SCOPES.
     """
-    refresh_token = os.environ.get("E2E_CHAT_REFRESH_TOKEN")
-    client_id = os.environ.get("E2E_CHAT_CLIENT_ID")
-    client_secret = os.environ.get("E2E_CHAT_CLIENT_SECRET")
+    if not HAS_GOOGLE_LIBS:
+        pytest.fail(GOOGLE_LIBS_MISSING)
+    poll_creds, _ = google.auth.default(scopes=POLL_SCOPES)
+    refresh_token, client_id, client_secret = (os.environ.get(name) for name in OTA_ENV_VARS)
 
+    fallback: Optional[Resource] = None
     if refresh_token or client_id or client_secret:
         if not (refresh_token and client_id and client_secret):
             pytest.fail(
                 "Incomplete OTA credentials configuration. "
-                "Please ensure E2E_CHAT_REFRESH_TOKEN, E2E_CHAT_CLIENT_ID, and E2E_CHAT_CLIENT_SECRET are all set."
+                f"Please ensure {', '.join(OTA_ENV_VARS)} are all set."
             )
         user_creds = UserCredentials(
             token=None,
             refresh_token=refresh_token,
             client_id=client_id,
             client_secret=client_secret,
-            token_uri="https://oauth2.googleapis.com/token",
-            scopes=["https://www.googleapis.com/auth/chat.messages.readonly"],
+            token_uri=OAUTH_TOKEN_URI,
+            scopes=[CHAT_USER_MESSAGES_READONLY_SCOPE],
         )
-        return build("chat", "v1", credentials=user_creds)
+        fallback = build("chat", "v1", credentials=user_creds)
 
-    return build("chat", "v1", credentials=credentials)
+    return ChatMessagePoller(
+        build("chat", "v1", credentials=poll_creds),
+        fallback,
+        primary_credential=describe_credential(poll_creds),
+        # A refused token mint (a scope IAM will not grant, an OTA refresh token that no longer
+        # exchanges) is a denial; google-auth marks the token endpoint's 5xx as retryable and the
+        # poller lets those propagate to the poll loop, which retries them.
+        denial_types=(RefreshError,),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -150,7 +186,7 @@ def pubsub_service(credentials: Credentials) -> Resource:
 def test_gchat_agent_math_response(
     chat_service: Resource,
     pubsub_service: Resource,
-    poll_chat_service: Resource
+    chat_poller: ChatMessagePoller
 ) -> None:
     """
     End-to-End Test for Hermes Platform Agent:
@@ -174,6 +210,8 @@ def test_gchat_agent_math_response(
     print(f"[E2E Test] Pub/Sub Topic: {CHAT_TOPIC_NAME}")
     print(f"[E2E Test] Test Identity: {TEST_USER_EMAIL}")
     print(f"[E2E Test] Chat UI Prompt: '{prompt_body}'")
+    print(f"[E2E Test] Space read credential: {chat_poller.auth_label}; "
+          f"OTA fallback {'configured' if chat_poller.fallback_configured else 'not configured'}")
 
     wait_for_gateway_deployment_ready()
 
@@ -238,41 +276,57 @@ def test_gchat_agent_math_response(
     bot_response_found: bool = False
     received_response_text: str = ""
 
-    while time.time() - start_time < TEST_TIMEOUT_SEC:
-        time.sleep(POLL_INTERVAL_SEC)
-        elapsed: int = int(time.time() - start_time)
-        print(f"[E2E Test] Polling thread for bot response... ({elapsed}s / {TEST_TIMEOUT_SEC}s)")
+    try:
+        while time.time() - start_time < TEST_TIMEOUT_SEC:
+            time.sleep(POLL_INTERVAL_SEC)
+            elapsed: int = int(time.time() - start_time)
+            print(f"[E2E Test] Polling thread for bot response... ({elapsed}s / {TEST_TIMEOUT_SEC}s)")
 
-        try:
-            response: dict[str, Any] = poll_chat_service.spaces().messages().list(
-                parent=CHAT_SPACE_ID,
-                pageSize=50,
-                orderBy="createTime desc"
-            ).execute()
+            try:
+                response: dict[str, Any] = chat_poller.list_messages(CHAT_SPACE_ID, POLL_PAGE_SIZE, POLL_ORDER_BY)
 
-            for msg in response.get("messages", []):
-                # Only check messages posted by a BOT
-                if msg.get("sender", {}).get("type") != "BOT":
-                    continue
+                for msg in response.get("messages", []):
+                    # Only check messages posted by a BOT
+                    if msg.get("sender", {}).get("type") != "BOT":
+                        continue
 
-                msg_thread: str = msg.get("thread", {}).get("name", "")
-                msg_text: str = msg.get("text", "")
+                    msg_thread: str = msg.get("thread", {}).get("name", "")
+                    msg_text: str = msg.get("text", "")
 
-                # Ignore system setup notifications
-                if "No home channel is set" in msg_text or "/sethome" in msg_text:
-                    continue
+                    # Ignore system setup notifications
+                    if "No home channel is set" in msg_text or "/sethome" in msg_text:
+                        continue
 
-                if msg_thread == thread_name and re.search(r"\b5\b", msg_text):
-                    received_response_text = msg_text
-                    bot_response_found = True
-                    print(f"\n[E2E Test SUCCESS] Received Bot Math Response: '{received_response_text}'")
-                    break
+                    if msg_thread == thread_name and re.search(r"\b5\b", msg_text):
+                        received_response_text = msg_text
+                        bot_response_found = True
+                        print(f"\n[E2E Test SUCCESS] Received Bot Math Response: '{received_response_text}'")
+                        break
 
-        except HttpError as err:
-            print(f"[E2E Test Warning] Polling error: {err}")
+            except ChatReadAccessDenied as err:
+                pytest.fail(f"Cannot read the space back: {err}")
+            except HttpError as err:
+                print(f"[E2E Test Warning] Polling error: {err}")
+            except RefreshError as err:
+                # The poller has already turned a refused mint into ChatReadAccessDenied; what
+                # reaches here is the token endpoint's 5xx/408/429 that google-auth marks
+                # retryable. Poll again.
+                print(f"[E2E Test Warning] Transient token error while polling, retrying: {err}")
+            except TransportError as err:
+                print(f"[E2E Test Warning] Transient transport error while polling, retrying: {err}")
 
-        if bot_response_found:
-            break
+            if bot_response_found:
+                break
+    finally:
+        # The feasibility signal for #1558: which credential read the space, and why it changed.
+        # Printed however the loop ends, so a failure on the fallback keeps the record.
+        if chat_poller.reads:
+            print(f"[E2E Test] Space messages were read with: {chat_poller.auth_label}")
+        else:
+            print(f"[E2E Test] No credential read the space; last attempted: {chat_poller.auth_label}")
+        if chat_poller.fell_back:
+            print(f"[E2E Test] {chat_poller.primary_label} fell back to the OTA user refresh token "
+                  f"because: {chat_poller.fallback_reason}")
 
     # Step 4: Assertions
     assert bot_response_found, f"Timed out after {TEST_TIMEOUT_SEC}s waiting for agent response in {CHAT_SPACE_ID}"

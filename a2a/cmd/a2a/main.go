@@ -2,12 +2,14 @@
 // topic, or write one. It is the reader beat 3 needs before any session pod
 // exists, and the thing the platform agent's a2a-topics skill shells out to.
 //
-// Playground posture: credentials are a static per-role NATS user in the
-// environment. Not because the callout is future work - it is armed, and
-// session pods authenticate through it - but because this is a CLI, usually
-// hand-run at a port-forward by someone who has no pod and therefore no
-// projected token to present. The subject grants it dials into are the real
-// ones either way.
+// Credentials: in the platform-agent container, which is where this binary
+// mostly runs, it authenticates through the auth callout as `agent` -- the
+// operator projects a ServiceAccount token bound to the `a2a-bus` audience and
+// names the principal in A2A_BUS_USER, and no password is rendered beside it.
+// Hand-run at a port-forward there is no token file, so a static per-role NATS
+// user in the environment is all there is; connect() below chooses by whether a
+// token is present rather than by a mode flag. The subject grants it dials into
+// are the real ones either way.
 package main
 
 import (
@@ -38,11 +40,18 @@ usage:
 name that matches more than one provisioned topic is an error, not a guess.
 
 environment:
-  NATS_URL       bus address (required)
-  NATS_USER      static bus user; also selects the _INBOX.<user> prefix
-  NATS_PASSWORD  its password
-  A2A_SESSION    from.session on writes (default: the bus user)
-  A2A_PROFILE    from.profile on writes, when the writer runs as a profile
+  NATS_URL            bus address (required)
+  A2A_BUS_USER        the principal to connect as; also selects the
+                      _INBOX.<user> prefix. Rendered by the operator.
+  A2A_BUS_TOKEN_FILE  a projected ServiceAccount token to authenticate with
+                      (default: /var/run/secrets/a2a-bus/token, used when it
+                      exists). Setting this asserts the token; a path that
+                      cannot be read is an error, not a fallback.
+  NATS_USER           static bus user, if there is no token. Also serves as
+                      A2A_BUS_USER when that is unset.
+  NATS_PASSWORD       its password
+  A2A_SESSION         from.session on writes (default: the bus user)
+  A2A_PROFILE         from.profile on writes, when the writer runs as a profile
 `
 
 // cliTimeout bounds one CLI operation end to end, connect included.
@@ -90,21 +99,55 @@ func runTopics(args []string) error {
 	}
 }
 
-// connect dials the bus with the environment's static user, pinning that
-// user's inbox prefix (see lib.WithUserPassword - the grant does not cover
-// nats.go's default inbox).
+// busUser is the principal this CLI connects as. It is also the inbox prefix
+// it has to pin and the default writer identity on a topic entry, which is why
+// it is one function rather than three reads of the environment.
+//
+// In the agent pod the operator renders lib.EnvBusUser; NATS_USER is the older
+// spelling and still works for a static login, so it is the fallback rather
+// than a second supported name.
+func busUser() string {
+	if u := os.Getenv(lib.EnvBusUser); u != "" {
+		return u
+	}
+	return os.Getenv("NATS_USER")
+}
+
+// connect dials the bus and pins _INBOX.<busUser>, which is the prefix the
+// grant covers; nats.go's default inbox is not in any principal's grant, so a
+// client that skips this authenticates and then times out on every reply.
+//
+// Token first, password second, and the choice is made by whether a token is
+// there rather than by a mode flag: under `mode: next` the operator mounts a
+// projected ServiceAccount token into this container and the callout resolves
+// it, and off-cluster there is no such file and a static login is all there is.
+// An explicitly set lib.EnvBusTokenFile is an assertion and gets no fallback —
+// a caller who names a token file and is quietly logged in as something else is
+// the failure this ordering exists to prevent.
 func connect(ctx context.Context, name string) (*lib.Client, error) {
 	url := os.Getenv("NATS_URL")
 	if url == "" {
 		return nil, errors.New("NATS_URL is not set")
 	}
+	user := busUser()
+	if user == "" {
+		return nil, fmt.Errorf("no bus identity: set %s or NATS_USER", lib.EnvBusUser)
+	}
+
+	auth := lib.WithUserPassword(user, os.Getenv("NATS_PASSWORD"))
+	if path := os.Getenv(lib.EnvBusTokenFile); path != "" {
+		auth = lib.WithKSAToken(path, user)
+	} else if _, err := os.Stat(lib.BusTokenPath); err == nil {
+		auth = lib.WithKSAToken(lib.BusTokenPath, user)
+	}
+
 	// The library logs connection events at info; a CLI should say nothing
 	// unless something is wrong, so only errors reach stderr.
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	return lib.Connect(ctx, url,
 		lib.WithName("a2a-cli-"+name),
 		lib.WithLogger(log),
-		lib.WithUserPassword(os.Getenv("NATS_USER"), os.Getenv("NATS_PASSWORD")),
+		auth,
 	)
 }
 
@@ -327,10 +370,10 @@ func topicsWrite(args []string) error {
 		session = os.Getenv("A2A_SESSION")
 	}
 	if session == "" {
-		session = os.Getenv("NATS_USER")
+		session = busUser()
 	}
 	if session == "" {
-		return errors.New("no writer identity: set --from, A2A_SESSION, or NATS_USER")
+		return fmt.Errorf("no writer identity: set --from, A2A_SESSION, or %s", lib.EnvBusUser)
 	}
 	corr := *correlationID
 	if corr == "" {

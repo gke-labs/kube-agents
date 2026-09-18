@@ -7,7 +7,7 @@ sidebar:
 
 The PlatformAgent shell sandbox receives no API keys, access tokens, refresh tokens, or Kubernetes ServiceAccount tokens through its environment or filesystem, and its ServiceAccount is bound to no Google service account, so the metadata server has nothing to give it either. Credentials live in a trusted **credential broker** that runs as a Pod of its own, and the sandbox reaches credentialed capabilities only through a policy-enforced proxy across the network.
 
-This is the only layout. There is no configuration that puts the broker back in the agent Pod and none that turns the shell sandbox off — `spec.harness.experimental.shellSandbox.enabled: false` is refused with `Degraded`/`ShellSandboxCannotBeDisabled`. The gateway's `platform-agent` container does hold one credential, the audience-bound token it presents to the broker — two under the unsupported `mode: next` toggle, which adds the A2A bus's `worker` password by SecretKeyRef; [the agent now holds a credential](#the-agent-now-holds-a-credential-and-that-was-a-choice) has the trade.
+This is the only layout. There is no configuration that puts the broker back in the agent Pod and none that turns the shell sandbox off — `spec.harness.experimental.shellSandbox.enabled: false` is refused with `Degraded`/`ShellSandboxCannotBeDisabled`. The gateway's `platform-agent` container does hold one credential, the audience-bound token it presents to the broker — two under the unsupported `mode: next` toggle, which adds a second audience-bound projected ServiceAccount token for the A2A bus (no password: the container names its bus principal in `A2A_BUS_USER` and the bus's auth callout resolves the token to that principal's grants); [the agent now holds a credential](#the-agent-now-holds-a-credential-and-that-was-a-choice) has the trade.
 
 This page summarizes the architecture. The canonical design — including scope, deny-policy details, migration steps, and CI verification assertions — is [`docs/credential-isolation-design.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/credential-isolation-design.md).
 
@@ -15,15 +15,15 @@ This page summarizes the architecture. The canonical design — including scope,
 
 Each PlatformAgent runs as three Pods.
 
-| Pod / container                        | Trust level | Role                                                                                                                    |
-| -------------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------- |
-| **`<name>-gateway`**                   |             |                                                                                                                         |
-| &nbsp;&nbsp;`platform-agent`           | Untrusted   | The model, the skills and the chat adapters. No CLI, and one credential: the broker-audience token.                     |
-| &nbsp;&nbsp;`agent-api-auth`           | Trusted     | The PlatformAgent API front door, and the event watcher, which forwards cluster events on its own Kubernetes-API token. |
-| &nbsp;&nbsp;`fluent-bit`               | Trusted     | Log forwarding.                                                                                                         |
-| &nbsp;&nbsp;`platform-agent-dashboard` | Untrusted   | Optional local dashboard (also credential-free).                                                                        |
-| **`<name>-shell`**                     | Untrusted   | `sshd`, `/opt/data`, the agent's tools and the CLI wrappers. Everything the model executes runs here.                   |
-| **`<name>-credential-proxy`**          | Trusted     | Envoy, the credentialed command and chat runtime, the Minty client. Runs nothing the model wrote.                       |
+| Pod / container                        | Trust level | Role                                                                                                                         |
+| -------------------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| **`<name>-gateway`**                   |             |                                                                                                                              |
+| &nbsp;&nbsp;`platform-agent`           | Untrusted   | The model, the skills and the chat adapters. No CLI, and one credential: the broker-audience token — two under `mode: next`. |
+| &nbsp;&nbsp;`agent-api-auth`           | Trusted     | The PlatformAgent API front door, and the event watcher, which forwards cluster events on its own Kubernetes-API token.      |
+| &nbsp;&nbsp;`fluent-bit`               | Trusted     | Log forwarding.                                                                                                              |
+| &nbsp;&nbsp;`platform-agent-dashboard` | Untrusted   | Optional local dashboard (also credential-free).                                                                             |
+| **`<name>-shell`**                     | Untrusted   | `sshd`, `/opt/data`, the agent's tools and the CLI wrappers. Everything the model executes runs here.                        |
+| **`<name>-credential-proxy`**          | Trusted     | Envoy, the credentialed command and chat runtime, the Minty client. Runs nothing the model wrote.                            |
 
 `agent-api-auth` is a **native sidecar** — an `initContainers` entry with `restartPolicy: Always`, needing Kubernetes 1.29+ — so it starts before the others and does not appear in `spec.containers`.
 
@@ -85,22 +85,22 @@ A first deployment in a live environment will find read-only commands nobody ant
 
 ## Credential placement
 
-| Data                             | `<name>-shell`                | `platform-agent`       | Credential broker         |
-| -------------------------------- | ----------------------------- | ---------------------- | ------------------------- |
-| `spec.deployment.env`            | No                            | No                     | Yes                       |
-| Slack tokens                     | No                            | No                     | Yes, Secret-backed env    |
-| PlatformAgent external API key   | No                            | No                     | Yes, Secret-backed env    |
-| Session KV API key and HMAC salt | No                            | Yes, Secret-backed env | Yes, API key only         |
-| Automatic KSA token mount        | Disabled                      | Disabled               | Disabled                  |
-| Explicit projected KSA token     | Broker audience               | Broker audience        | Read-only, one-hour token |
-| Cloud identity via metadata      | None — unbound ServiceAccount | Yes                    | Yes                       |
-| gcloud/kubectl configuration     | No                            | No                     | Private `emptyDir`        |
-| GitHub installation token/cache  | No                            | No                     | Private `emptyDir`        |
-| Working tree for proxied `git`   | No                            | No                     | Broker's own volume       |
+| Data                             | `<name>-shell`                | `platform-agent`                                  | Credential broker         |
+| -------------------------------- | ----------------------------- | ------------------------------------------------- | ------------------------- |
+| `spec.deployment.env`            | No                            | No                                                | Yes                       |
+| Slack tokens                     | No                            | No                                                | Yes, Secret-backed env    |
+| PlatformAgent external API key   | No                            | No                                                | Yes, Secret-backed env    |
+| Session KV API key and HMAC salt | No                            | Yes, Secret-backed env                            | Yes, API key only         |
+| Automatic KSA token mount        | Disabled                      | Disabled                                          | Disabled                  |
+| Explicit projected KSA token     | Broker audience               | Broker audience; `a2a-bus` too under `mode: next` | Read-only, one-hour token |
+| Cloud identity via metadata      | None — unbound ServiceAccount | Yes                                               | Yes                       |
+| gcloud/kubectl configuration     | No                            | No                                                | Private `emptyDir`        |
+| GitHub installation token/cache  | No                            | No                                                | Private `emptyDir`        |
+| Working tree for proxied `git`   | No                            | No                                                | Broker's own volume       |
 
 `SESSION_KV_API_KEY` and `SESSION_KV_SALT` are `platform-agent`'s only Secret-backed environment variables, and both are pod-scoped: neither opens anything outside the gateway Pod. They cannot sit behind the proxy because that container is the _server_ here — `session_kv_server.py` binds `127.0.0.1:8699` and needs the key in order to reject callers that are not the event watcher, the Platform MCP server, the `incident_context` plugin, or the kanban notifier — and because the salt hashes chat identities before they are written, which has to happen where the identity already is. The design doc has the [full reasoning](https://github.com/gke-labs/kube-agents/blob/main/docs/credential-isolation-design.md#the-loopback-only-exception). Both are optional in the sense that the pod starts without them, and one of them is not optional in practice: the `k8s-event-watcher` in `agent-api-auth` authenticates with `SESSION_KV_API_KEY` and treats an empty value as fatal, so it exits on every start and no cluster events are watched at all — the container stays Ready, so its log is the only place that says so. The Session KV server also answers `503`, and identity hashing falls back to a per-process salt with a warning.
 
-Pod-wide `automountServiceAccountToken` is `false` everywhere. The broker's own projected token uses the audience `kubeagents-credential-proxy` and expires after one hour, and the gateway's is minted for `kubeagents-credential-proxy-chat`; the event watcher gets a separate one-hour Kubernetes-API token projection in `agent-api-auth` at the conventional in-cluster path. Neither is mounted in the sandbox or the dashboard.
+Pod-wide `automountServiceAccountToken` is `false` everywhere. The broker's own projected token uses the audience `kubeagents-credential-proxy` and expires after one hour, and the gateway's is minted for `kubeagents-credential-proxy-chat`; the event watcher gets a separate one-hour Kubernetes-API token projection in `agent-api-auth` at the conventional in-cluster path; and under the unsupported `mode: next` toggle the agent container gets one more, audience `a2a-bus`, one hour, at `/var/run/secrets/a2a-bus/token`. None is mounted in the sandbox or the dashboard.
 
 ## Request paths
 
@@ -111,7 +111,7 @@ Pod-wide `automountServiceAccountToken` is `false` everywhere. The broker's own 
 
 ## Guarantee and limitation
 
-**Guarantee:** the operator places no managed credential in the `<name>-shell` Pod's environment, root filesystem, persistent data volume, or ServiceAccount token path — and its ServiceAccount carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server answers it with a principal IAM grants nothing. That is the Pod that runs everything the model wrote. `spec.deployment.env` goes to the credential broker because it may contain credentials; only a short allowlist reaches the agent — the OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, and the `ALERT_DAILY_LIMIT_*` alert ceilings — as literal values only.
+**Guarantee:** the operator places no managed credential in the `<name>-shell` Pod's environment, root filesystem, persistent data volume, or ServiceAccount token path — and its ServiceAccount carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server answers it with a principal IAM grants nothing. That is the Pod that runs everything the model wrote. `spec.deployment.env` goes to the credential broker because it may contain credentials; only a short allowlist reaches the agent — the OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, and the `FEEDBACK_PROMPT_*` switch and delay — as literal values only.
 
 **Limitation:** the gateway Pod keeps a cloud identity. It and the broker Pod share the `kubeagents-platform-agent` ServiceAccount, whose Workload Identity annotation lets anything with execution in either mint the Google service account's token from `169.254.169.254`. The sandbox cannot, which is the property this page is about; what is left is trusted code holding more than it needs. Two ways to close it — configure [`spec.security.workloadIdentityFederation`](#running-the-shell-in-its-own-pod), which gives the broker a credential source that is a file in its own Pod, or give the broker a ServiceAccount of its own and take the annotation off the gateway's. Neither ships today, and [Denying the sandbox the metadata server](#denying-the-sandbox-the-metadata-server) does not close it either.
 
@@ -122,6 +122,8 @@ Pod-wide `automountServiceAccountToken` is `false` everywhere. The broker's own 
 The `platform-agent` container mounts the broker-audience projected token, so the model can read it. A prompt-injected agent gains no new authority _inside_ the Pod, because it could already reach the broker. What it gains is **exportability**: the token is a file, and a file can be exfiltrated, after which an outside party has broker access — bounded by the command policy — until the token expires.
 
 Against the credential requirements this token is short-lived, audience-bound and independently revocable, but **not non-exportable**, and that last clause is the one it misses.
+
+Under the unsupported `mode: next` toggle there is a second file with the same property, the `a2a-bus` token. It is bounded more tightly than the broker's: the bus resolves it through an auth callout to the `agent` principal, whose grants are the topic blackboard and nothing else — no task plane in either direction, and no JetStream consumer verb at all, so an exfiltrated copy cannot ask the server to deliver a stream anywhere. It replaced a shared static password, which was neither short-lived nor bound to this workload.
 
 **An alternative was considered and deferred.** `agent-api-auth` is already a credential-holding container in the agent Pod, on loopback, at a different UID, with no volumes the agent can read. A mirror image of it — an egress forwarder that holds the token, listens on `127.0.0.1:8765`, and attaches the credential on its way out to the broker Service — would preserve "the agent holds no credential at all". It is not built because it is a new component with its own failure modes and lifecycle, and nothing forecloses it: the client's `authorization_headers()` would return nothing and the forwarder would supply the header instead.
 

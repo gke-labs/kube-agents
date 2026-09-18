@@ -33,6 +33,33 @@ type Task struct {
 	// detail]`), and a reader classifying a failed terminal needs it from
 	// the fold as much as from the live event.
 	FinalMessage *Message
+	// SubmittedMissing reports that the first event folded was not a
+	// `submitted` status-update — assertion 9's observation, the sibling of
+	// PostFinalDropped for assertion 10.
+	//
+	// Surfaced like it but NOT counted like it: TasksGet logs it, and does
+	// not add it to protocolViolations. PostFinalDropped counts a publisher
+	// breaking the protocol; the common cause of this one is TASKS' own
+	// per-subject limit doing exactly what it was configured to do, and a
+	// counter that rises when our own retention policy works is a counter
+	// nobody can alert on.
+	//
+	// It exists because the head of a task's history can now go missing
+	// without anything else saying so. TASKS carries a per-subject message
+	// limit with discard=old, so a task that outruns it loses its OLDEST
+	// events first, and its oldest event is exactly the `submitted` one.
+	// Without this field a truncated replay is a short history that reads
+	// like a real one; with it, the degradation is observable at the reader.
+	//
+	// Truncation is not the only way to set it. A task whose executor died
+	// before publishing anything replays as its supervisor's synthesized
+	// terminal alone, and that is also a history that does not start at
+	// `submitted`. The field says what was observed — the head is not
+	// there — and does not claim to know which.
+	//
+	// Never set on an empty fold: no events is not a missing head, it is a
+	// task with nothing on the stream, which the caller can already see.
+	SubmittedMissing bool
 }
 
 // Artifact returns the merged artifact with the given name, or nil.
@@ -51,7 +78,10 @@ func (t *Task) Artifact(name string) *Artifact {
 // surfaces them as a warning and a metric; the fold survives.
 func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 	task := &Task{ID: taskID}
-	for _, env := range events {
+	for i, env := range events {
+		if i == 0 {
+			task.SubmittedMissing = !isSubmittedEvent(env)
+		}
 		if env.TaskID != taskID {
 			return nil, &ProtocolError{Msg: fmt.Sprintf("event for task %q on task %q's stream", env.TaskID, taskID)}
 		}
@@ -98,6 +128,25 @@ func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 		}
 	}
 	return task, nil
+}
+
+// isSubmittedEvent reports whether this envelope is the `submitted`
+// status-update assertion 9 requires a task's history to open with.
+//
+// A malformed payload answers false rather than raising: FoldTask reaches its
+// own parse below and reports the malformation as the ProtocolError it is, and
+// this must not pre-empt that with a worse-scoped error. False is also the
+// right answer on its own terms — an event nobody can parse is not a readable
+// `submitted`.
+func isSubmittedEvent(env *Envelope) bool {
+	if env == nil || env.Kind != KindStatusUpdate {
+		return false
+	}
+	var s StatusUpdate
+	if err := json.Unmarshal(env.Payload, &s); err != nil {
+		return false
+	}
+	return s.Status.State == StateSubmitted
 }
 
 // mergeArtifact applies one artifact-update: append chunks extend the
@@ -265,6 +314,18 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		c.protocolViolations.Add(int64(task.PostFinalDropped))
 		c.log.Warn("a2a events after final dropped from fold",
 			"task", taskID, "dropped", task.PostFinalDropped)
+	}
+	if task.SubmittedMissing {
+		// Not a protocol violation and not counted as one — see the
+		// field. The line is the whole point of the field: without it a
+		// replay whose head was evicted is a short history that reads
+		// like a complete one.
+		opensAt := "<no status event>"
+		if len(task.StatusHistory) > 0 {
+			opensAt = string(task.StatusHistory[0])
+		}
+		c.log.Warn("a2a task replayed without its submitted event",
+			"task", taskID, "events", len(events), "opensAt", opensAt)
 	}
 	return task, terminalSubject, nil
 }

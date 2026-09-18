@@ -2152,9 +2152,9 @@ class IamGrantsTest(unittest.TestCase):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
 
     def _fleet_reader_policy(self, members=None):
-        """seeded-fleet-reader's own policy, with the Prow runner and the CI health bot able to borrow it."""
+        """seeded-fleet-reader's own policy, with every listed borrower on it."""
         if members is None:
-            members = list(checker.FLEET_READER_TOKEN_CREATORS)
+            members = [member for _, member, _ in checker.FLEET_READER_TOKEN_CREATORS]
         return json.dumps(
             {"bindings": [{"role": "roles/iam.serviceAccountTokenCreator", "members": members}]}
         )
@@ -2163,18 +2163,24 @@ class IamGrantsTest(unittest.TestCase):
         self,
         project_id="kube-agents-evals-3",
         prow_roles=None,
+        nightly_roles=None,
         platform_roles=None,
         litellm_roles=None,
         conditional_roles=(),
         extra_bindings=(),
     ):
-        """The project's own policy: all three identities holding exactly what they should."""
+        """The project's own policy: all four identities holding exactly what they should."""
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
+        nightly = checker.PROW_RUNNER_ROLES if nightly_roles is None else nightly_roles
         platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
         litellm = checker.LITELLM_GSA_ROLES if litellm_roles is None else litellm_roles
         platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
         litellm_member = checker.LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
-        bindings = [{"role": r, "members": [checker.PROW_RUNNER_MEMBER]} for r in sorted(prow)]
+        held_by = ((prow, checker.PROW_RUNNER_MEMBER), (nightly, checker.NIGHTLY_RUNNER_MEMBER))
+        bindings = [
+            {"role": r, "members": [member for held, member in held_by if r in held]}
+            for r in sorted(set(prow) | set(nightly))
+        ]
         bindings += [{"role": r, "members": [platform_member]} for r in sorted(platform)]
         bindings += [{"role": r, "members": [litellm_member]} for r in sorted(litellm)]
         bindings += [
@@ -2378,7 +2384,7 @@ class IamGrantsTest(unittest.TestCase):
         self.assertEqual(
             "the Workload Identity binding, the cross-project AR reader grants, "
             "the fleet reader's token-creator binding verified; "
-            "the Prow runner and platform GSA project roles not checked",
+            "the runners' and platform GSA project roles not checked",
             result.message,
         )
 
@@ -2401,7 +2407,7 @@ class IamGrantsTest(unittest.TestCase):
         # only the skipped half cannot tell whether the other one passed or was
         # skipped too, and goes and re-checks something this run already did.
         self.assertEqual(
-            "the Workload Identity binding, the Prow runner and platform GSA project roles, "
+            "the Workload Identity binding, the runners' and platform GSA project roles, "
             "the fleet reader's token-creator binding verified; "
             "the cross-project AR reader grants not checked",
             result.message,
@@ -2439,6 +2445,30 @@ class IamGrantsTest(unittest.TestCase):
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertFalse(result.passed)
         self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
+
+    def test_nightly_runner_missing_every_role_fails_and_names_it(self):
+        # kube-agents-evals-10 as it stood on 2026-09-16: the presubmit's account
+        # holding all twelve, the nightly's holding nothing, and the second
+        # nightly dying at get-credentials on the lease (gke-labs/kube-agents#1491).
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-10")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-10")),
+                _ok(self._project_policy("kube-agents-evals-10", nightly_roles=set())),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-10", "123456")
+        self.assertFalse(result.passed)
+        nightly = [d for d in result.details if "eval-baseline-recorder@kube-agents-prow" in d]
+        self.assertEqual(len(nightly), 1, result.details)
+        self.assertIn("The nightly runner", nightly[0])
+        self.assertIn(f"{len(checker.PROW_RUNNER_ROLES)} role(s) on kube-agents-evals-10", nightly[0])
+        self.assertIn("The nightly periodic authenticates as this account", nightly[0])
+        self.assertFalse(
+            any("prowjob-default-sa" in d for d in result.details),
+            f"the presubmit's account holds everything and must not be accused: {result.details}",
+        )
 
     def test_prow_runner_conditional_binding_does_not_count(self):
         # A condition the presubmit does not satisfy grants nothing, so counting
@@ -2553,7 +2583,7 @@ class IamGrantsTest(unittest.TestCase):
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
         self.assertEqual(
-            "Workload Identity, Prow runner and platform GSA project roles, "
+            "Workload Identity, both runners' and platform GSA project roles, "
             "cross-project AR reader grants, and the fleet reader's token-creator "
             "binding verified",
             result.message,
@@ -2578,17 +2608,40 @@ class IamGrantsTest(unittest.TestCase):
             result.details,
         )
 
-    def test_fleet_reader_missing_only_the_health_bot_fails_and_names_it(self):
-        # The pool's state before the grant in docs/ci-health.md was run: the
-        # runner can borrow the reader, the CI health bot's hourly scan cannot,
-        # so the project is invisible to fixture-drift detection.
+    def test_fleet_reader_missing_the_nightly_token_creator_names_it(self):
+        # Every pool project on 2026-09-16: every other borrower on the binding,
+        # the nightly's not, since its entry in bench/tf/fleet's default
+        # postdates every apply. "Every other" rather than the presubmit's
+        # alone so that a borrower added to FLEET_READER_TOKEN_CREATORS later
+        # (the CI health bot, #1612) does not turn this into a two-finding case.
+        others = [m for _, m, _ in checker.FLEET_READER_TOKEN_CREATORS if m != checker.NIGHTLY_RUNNER_MEMBER]
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
-                _ok(self._fleet_reader_policy(members=[checker.PROW_RUNNER_MEMBER])),
+                _ok(self._fleet_reader_policy(members=others)),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        token_creator = [d for d in result.details if "roles/iam.serviceAccountTokenCreator" in d]
+        self.assertEqual(len(token_creator), 1, result.details)
+        self.assertIn("The nightly runner (eval-baseline-recorder@kube-agents-prow", token_creator[0])
+        self.assertNotIn("prowjob-default-sa", token_creator[0])
+
+    def test_fleet_reader_missing_only_the_health_bot_fails_and_names_it(self):
+        # The pool's state before the grant in docs/ci-health.md was run: every
+        # runner can borrow the reader, the CI health bot's hourly scan cannot,
+        # so the project is invisible to fixture-drift detection.
+        runners = [m for _, m, _ in checker.FLEET_READER_TOKEN_CREATORS if m != checker.CI_HEALTH_BOT_MEMBER]
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy(members=runners)),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2597,6 +2650,7 @@ class IamGrantsTest(unittest.TestCase):
         self.assertIn("eval-dashboard-publisher@kube-agents-prow", bot[0])
         self.assertIn("docs/ci-health.md", bot[0])
         self.assertFalse(any("The Prow runner" in d for d in result.details), result.details)
+        self.assertFalse(any("The nightly runner" in d for d in result.details), result.details)
 
     def test_fleet_reader_account_absent_fails(self):
         # kube-agents-evals and -2, -3, -4 as they stood on 2026-09-03: fleets
@@ -2650,7 +2704,7 @@ class IamGrantsTest(unittest.TestCase):
             result.warnings,
         )
         self.assertEqual(
-            "the Workload Identity binding, the Prow runner and platform GSA project roles, "
+            "the Workload Identity binding, the runners' and platform GSA project roles, "
             "the cross-project AR reader grants verified; "
             "the fleet reader's token-creator binding not checked",
             result.message,
@@ -2699,27 +2753,47 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
 
 
 class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
-    """PROW_RUNNER_ROLES must equal what the two granting sites grant.
+    """PROW_RUNNER_ROLES and RUNNERS must equal what the two granting sites grant.
 
-    The twelve are written here, in the provisioning script's loop, and in the
-    repair block on the prerequisites page, and none reads another. Drift is
-    silent the worst way round: a role dropped from the script leaves a project
-    the verifier still passes, registered, dying on its first lease as #966 did.
+    The twelve roles and the two members are written here, in the provisioning
+    script's loop, and in the repair block on the prerequisites page, and none
+    reads another. Drift is silent the worst way round: a role dropped from the
+    script leaves a project the verifier still passes, registered, dying on its
+    first lease as #966 did; a member dropped from it leaves one dying on the
+    first night that draws it, as #1491 did.
     """
 
-    def _loop_roles(self, text, what):
+    _MEMBER_VARS = ("PROW_RUNNER_SA", "NIGHTLY_RUNNER_SA")
+
+    def _grant_loop(self, text, what):
         loops = [
-            m.group(1)
+            m
             for m in re.finditer(r"for role in(.*?);\s*do(.*?)done", text, re.S)
             if re.search(r"prowjob-default-sa|PROW_RUNNER_SA", m.group(2))
         ]
-        self.assertEqual(len(loops), 1, f"expected exactly one Prow runner grant loop in {what}")
-        return set(re.findall(r"roles/[\w.]+", loops[0]))
+        self.assertEqual(len(loops), 1, f"expected exactly one runner grant loop in {what}")
+        return loops[0]
+
+    def _loop_roles(self, text, what):
+        return set(re.findall(r"roles/[\w.]+", self._grant_loop(text, what).group(1)))
+
+    def _loop_members(self, text, what):
+        """The member variables the loop grants each role to."""
+        body = self._grant_loop(text, what).group(2)
+        return {var for var in self._MEMBER_VARS if f'"${{{var}}}"' in body}
 
     def test_matches_the_loop_the_provisioning_script_runs(self):
         script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
         granted = self._loop_roles(script, "provision_ci_pool_project.sh")
         self.assertEqual(granted, checker.PROW_RUNNER_ROLES)
+
+    def test_the_provisioning_script_grants_every_runner(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._loop_members(script, "provision_ci_pool_project.sh"), set(self._MEMBER_VARS))
+        assigned = {
+            var: re.search(rf'^{var}="([^"]+)"$', script, re.MULTILINE).group(1) for var in self._MEMBER_VARS
+        }
+        self.assertEqual(set(assigned.values()), {member for _, _, member in checker.RUNNERS})
 
     def test_matches_the_repair_block_on_the_prerequisites_page(self):
         page = (
@@ -2727,16 +2801,16 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         ).read_text()
         documented = self._loop_roles(page, "docs/ci-pool-projects.md")
         self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
+        self.assertEqual(self._loop_members(page, "docs/ci-pool-projects.md"), set(self._MEMBER_VARS))
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
     """FLEET_READER_TOKEN_CREATORS must equal bench/tf/fleet's token-creator default.
 
     The verifier asserts these members hold the grant and Terraform grants it to
-    others, and neither reads the other. Rename the runner or the bot in one
-    place and the verifier fails every correctly-applied project -- or, worse
-    round, passes a project whose grant went to an account that no longer runs
-    anything.
+    others, and neither reads the other. Rename a borrower in one place and the
+    verifier fails every correctly-applied project -- or, worse round, passes a
+    project whose grant went to an account that no longer runs anything.
     """
 
     def test_matches_the_variable_default(self):
@@ -2748,7 +2822,9 @@ class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
         default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
         self.assertIsNotNone(default, "fleet_reader_token_creators has no default")
         members = re.findall(r'"([^"]+)"', default.group(1))
-        self.assertEqual(members, list(checker.FLEET_READER_TOKEN_CREATORS))
+        self.assertEqual(
+            sorted(members), sorted(member for _, member, _ in checker.FLEET_READER_TOKEN_CREATORS)
+        )
 
 
 class ExitStatusTest(unittest.TestCase):

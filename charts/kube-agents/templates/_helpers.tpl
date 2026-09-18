@@ -489,6 +489,67 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+topologySpreadConstraints for a multi-replica workload this chart owns.
+
+Renders nothing below two replicas, so the operator gets the field only if
+someone raises operator.replicaCount. A constraint over a single pod is
+satisfied by construction, and printing it would leave a reader working out that
+it means nothing. Hindsight has no call site at all for the same reason taken
+further: both its workloads carry a literal `replicas: 1` with no value behind
+it, so a call there could never render and would read as coverage it does not
+have.
+
+The chart shipped PDBs and a default replicaCount of 2 for litellm and
+github-token-minter without this, and the Workload Reliability Audit in this
+repository found both on 2026-09-06: "replicas=2, no topologySpreadConstraints
+or podAntiAffinity". The PDB does not cover the gap it names. maxUnavailable: 1
+stalls a *drain* that would take both replicas, but a node that fails takes
+whatever is on it, and nothing was keeping the two pods apart.
+
+ScheduleAnyway, not DoNotSchedule — obtainability_audit_sop.md 3.8 calls that
+mandatory, and the reason is the shape of the clusters this chart installs into.
+A pool that cannot satisfy maxSkew: 1 leaves the second replica Pending
+indefinitely, which is worse than the co-location this exists to avoid.
+
+kubernetes.io/hostname and not the zone key, for the same section's reason: the
+loss this guards against is a node going away under a drain or a repair, and a
+zonal cluster has one zone to spread across.
+
+The selector is the workload's own and is passed in rather than derived, as
+already-rendered YAML rather than a dict so the operator can hand over
+`kube-agents.operatorSelectorLabels` verbatim instead of a second copy of it. A
+labelSelector that does not match the pods the constraint is attached to counts
+some other population and skews against it; these selectors are also immutable
+once the Deployment exists, so the caller is the only thing that knows the right
+answer. Keep each call in step with its Deployment's spec.selector, the way
+pdb.yaml's selectors already have to be.
+
+matchLabelKeys scopes the skew to one ReplicaSet. Without it the constraint
+counts old and new pods together during a rollout, and with maxSurge: 1,
+maxUnavailable: 1 and two nodes holding one replica each, the surge pod lands
+beside an old one, the controller prefers to delete the old pod that shares a
+node, and the second new pod then sees a tie and can land on the same node —
+both live replicas on one node until the next rollout, which the constraint
+exists to prevent. Every image pin, config checksum or resource change is a
+rollout, so this is ordinary use. pod-template-hash is the label the
+Deployment controller stamps per revision; the field is on by default from
+Kubernetes 1.27, inside the chart's 1.29 floor.
+*/}}
+{{- define "kube-agents.topologySpreadConstraints" -}}
+{{- if and .enabled (gt (int .replicas) 1) -}}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    matchLabelKeys:
+      - pod-template-hash
+    labelSelector:
+      matchLabels:
+        {{- .selectorLabels | nindent 8 }}
+{{- end }}
+{{- end }}
+
+{{/*
 Admission-webhook object names, mirroring k8s-operator/config/webhook and
 config/certmanager.
 

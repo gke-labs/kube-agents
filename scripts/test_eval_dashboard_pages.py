@@ -356,7 +356,7 @@ class RenderedFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = render_to(tmp, data, health=health_doc())
             names = sorted(p.name for p in out.iterdir())
-            self.assertEqual(names, ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html"])
+            self.assertEqual(names, ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "trend.html", "trend.json"])
             brief = json.loads((out / "brief.json").read_text())
             self.assertEqual(brief["health"]["state"], "OUTAGE")
             index = (out / "index.html").read_text()
@@ -376,7 +376,7 @@ class RenderedFilesTest(unittest.TestCase):
             self.assertNotIn("__LOGO__", index)
             run_page = (out / "run.html").read_text()
             self.assertIn('data-page="run"', run_page)
-            for name in ("grid.html", "cases.html", "nightly.html"):
+            for name in ("grid.html", "cases.html", "nightly.html", "trend.html"):
                 page = (out / name).read_text()
                 self.assertIn(f'data-page="{name[:-5]}"', page)
                 self.assertIn('<a href="index.html" >Brief</a>', page)
@@ -395,7 +395,9 @@ class RenderedFilesTest(unittest.TestCase):
             for name in ("index.html", "run.html"):
                 page = (out / name).read_text()
                 head = page.split("<body", 1)[0]
-                self.assertEqual(inline_blob(head, render.INLINE_BRIEF_ID), brief, f"{name}: the inline brief is brief.json")
+                # Less the trend block, which only trend.html reads (it grows
+                # every night; test_eval_dashboard_trend covers that page).
+                self.assertEqual(inline_blob(head, render.INLINE_BRIEF_ID), {**brief, "trend": None}, f"{name}: the inline brief is brief.json")
                 self.assertEqual(inline_blob(head, render.INLINE_HEALTH_ID), brief["health"], f"{name}: the inline verdict")
                 self.assertEqual(page.count('id="inline-brief">'), 1, f"{name}: one copy of the document, not two")
                 raw = re.search(r'id="inline-brief">(.*?)</script>', head, re.DOTALL).group(1)
@@ -414,10 +416,10 @@ class RenderedFilesTest(unittest.TestCase):
         data["generated_at"] = NOW
         with tempfile.TemporaryDirectory() as tmp:
             out = render_to(tmp, data)
-            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
+            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html", "trend.html"):
                 self.assertNotIn("<base", (out / name).read_text(), f"{name}: a local render keeps relative links")
             out = render_to(pathlib.Path(tmp) / "pub", data, extra_args=["--public-url", "https://example.test/evals"])
-            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
+            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html", "trend.html"):
                 page = (out / name).read_text()
                 self.assertEqual(page.count("<base "), 1, name)
                 self.assertIn('<base href="https://example.test/evals/">', page.split("<body", 1)[0], f"{name}: in <head>, with the trailing slash")
@@ -461,7 +463,7 @@ class RenderedFilesTest(unittest.TestCase):
         script = PAGES_JS.read_text()
         for token in ('param("cases")', 'param("since")', 'param("until")', 'param("build")', 'param("view")', "location.search", "location.hash",
                       "shared_break", "storm", "setup_deaths", "only-this-pr", "#build=", 'pick("window"', 'pick("sort"', 'pick("show"', 'pick("rows"',
-                      "grid.html", "cases.html", "nightly.html", "health.json", "brief.json"):
+                      "grid.html", "cases.html", "nightly.html", "trend.html", 'param("domain")', 'param("metric")', "health.json", "brief.json"):
             self.assertIn(token, script)
         self.assertNotIn("run.html?build=", script, "the pages write the fragment form only")
         self.assertNotIn("index.html?", script)

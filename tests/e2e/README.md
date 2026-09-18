@@ -10,8 +10,8 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
 └───────┬─────────────────────────────────┬───────────────────────▲───────┘
         │ 1. Post prompt message          │ 2. Publish Chat Event │
         │    (Service Account WIF)        │    with Thread ID     │ 5. Polls & asserts
-        │                                 │    (Service Account)  │    response (OTA User)
-        ▼                                 ▼                       │
+        │                                 │    (Service Account)  │    response (SA app auth;
+        ▼                                 ▼                       │    OTA user on a denial)
 ┌──────────────────────┐      ┌──────────────────────┐            │
 │  Google Chat API     │      │    Pub/Sub Topic:    │            │
 │(spaces.messages.create)     │ platform-agent-events│            │
@@ -31,10 +31,13 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
 ### 1. Hybrid Auth Model & Google Chat API Restrictions
 
 - **Service Account (WIF Keyless Authentication)**:
-  Used to post the initial thread message (`spaces.messages.create`) and trigger Pub/Sub (`pubsub.projects.topics.publish`).
+  Used to post the initial thread message (`spaces.messages.create`), trigger Pub/Sub (`pubsub.projects.topics.publish`), and, as the first choice, to poll space messages (`spaces.messages.list`).
 - **Owned Test Account (OTA User Credentials)**:
-  Used to poll and read space messages (`spaces.messages.list`).
-  _Why OTA User Credentials?_ By Google Chat API security policy, Service Accounts using `chat.bot` or `chat.messages.readonly` are **strictly forbidden** from calling `spaces.messages.list` (returns HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`). Using a dedicated OTA (Owned Test Account) user credential enables 100% automated message verification in CI without using personal developer accounts.
+  The fallback for polling space messages when the service account is denied.
+
+_Why two credentials for reading?_ A service account calls `spaces.messages.list` only under app authentication with the `chat.app.messages.readonly` scope, and every `chat.app.*` scope needs a one-time approval by a Google Workspace administrator. The `chat.bot` scope is not accepted for that call (HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`), and `chat.messages.readonly` is a user-authentication scope that is not accepted from a service account, which is what the OTA user credential is for. Under app authentication the call returns only public messages in the space; the bot's thread reply is one. Until the approval exists the API answers 403 `The administrator must grant the app the required OAuth authorization scope for this action`, so `tests/e2e/gchat_poller.py` polls with the runner's own credentials first and switches to the OTA user credential on a 400/401/403 from the API or a refused token mint (a DM answers an app-auth read with 400 `DMs are not supported for methods requiring app authentication with administrator approval`; the CI space is not a DM). The run prints which credential read the space (`Space messages were read with: …`) and, on a fallback, the denial that caused it, so a CI log shows whether app authentication works under the organisation's policy. A denial with no OTA configured fails the test at once with the remedy rather than polling to the timeout.
+
+Approving the scope takes more than the Admin console, per Google's [app-authentication guide](https://developers.google.com/workspace/chat/authenticate-authorize-chat-app). In the Chat app's GCP project (the one the E2E service account lives in): create a **Google Workspace Marketplace-compatible OAuth client** from the service account's _Advanced settings_; enable the **Google Workspace Marketplace SDK** and, under _App Configuration_, set visibility **Private**, installation **Individual + admin install**, integration **Chat app**, list `https://www.googleapis.com/auth/chat.app.messages.readonly` under OAuth scopes, and save the draft. A Workspace administrator then grants the app that scope ([Set up authorization for Chat apps](https://support.google.com/a?p=chat-app-auth)). The app must be a member of the space. Once the log shows the space read with the service account across runs, the OTA steps in sections 3 to 5 below and the three OTA secrets (`E2E_CHAT_CLIENT_ID`, `E2E_CHAT_CLIENT_SECRET`, `E2E_CHAT_REFRESH_TOKEN`) can go; `E2E_CHAT_SPACE_ID` still names the space.
 
 ### 2. Why Hybrid Pub/Sub Triggering is Required
 
@@ -44,13 +47,13 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
   2. **Step 1**: Test runner posts a prompt via Service Account WIF to establish a real Google Chat Space Thread ID (`spaces/{SPACE_ID}/threads/{THREAD_ID}`).
   3. **Step 2**: Test runner constructs a valid Google Chat event payload referencing the real Thread ID and authorized test identity (`TEST_USER_EMAIL`), publishing it directly to Pub/Sub topic `platform-agent-chat-events`.
   4. **Step 3**: **Hermes Agent** in GKE receives the Pub/Sub event, computes a well-known, predictable answer that can be validated deterministically, and posts the reply into the real space thread.
-  5. **Step 4**: Test runner polls the thread via `poll_chat_service` using the OTA User credentials (`chat.messages.readonly`) and asserts the expected response.
+  5. **Step 4**: Test runner polls the thread via `chat_poller` (service-account app auth first, OTA user credentials on a denial) and asserts the expected response.
 
 ---
 
 ## 🛠️ Complete GCP Project & CI Setup Checklist
 
-To configure a new or existing GCP project for running this E2E test suite in CI/CD, complete the following 4 setup sections:
+To configure a new or existing GCP project for running this E2E test suite in CI/CD, complete the following setup sections:
 
 ### 1. Enable Required GCP APIs
 
@@ -85,6 +88,8 @@ _What this script provisions:_
 _(To teardown CI IAM resources when no longer needed, run `./tests/e2e/scripts/teardown_ci_iam.sh --gcp_project <GCP_PROJECT_ID> --git_project <GITHUB_OWNER/REPO>`)._
 
 ### 3. Setup Owned Test Account (OTA) & Google Chat Space
+
+The OTA steps in sections 3 to 5 configure the fallback read credential. They are needed until the service account's `chat.app.messages.readonly` scope is approved ("Hybrid Auth Model" above) and the run log shows the space read with it. The space itself is needed either way.
 
 1. **Create OTA Account**: Create or configure a dedicated test account (e.g. `kube-agents-e2e-verifier@gmail.com`).
 2. **Activate Google Chat**: Open Chrome Incognito, log in as the test account, and navigate to `https://chat.google.com` to accept initial setup.
@@ -138,7 +143,7 @@ pip install -r tests/e2e/requirements.txt
 
 ### Step 2: Authenticate GCP ADC for Local Execution
 
-> **Note on Local Runs**: When running locally without `E2E_CHAT_*` environment variables, the test runner automatically falls back to your personal `gcloud` ADC credentials. You can run the test locally against any GCP project and target Google Chat Space without requiring OTA user credentials!
+> **Note on Local Runs**: Locally the poller reads the space with your personal `gcloud` ADC first, which is user authentication, so the login below asks for `chat.messages.readonly`; set the `E2E_CHAT_*` variables only if you want the OTA fallback as well. The run's `Space messages were read with:` line then names user credentials rather than a service account, so a local run says nothing about app authentication.
 
 ```bash
 set -a; . install.env; set +a
@@ -321,5 +326,5 @@ gh workflow run .github/workflows/e2e-gchat-test.yml \
 
 ### Authentication in CI:
 
-1. **Service Account via WIF**: Authenticates `github-actions-e2e@kube-agents-autopush.iam.gserviceaccount.com` for keyless message creation and Pub/Sub publishing.
-2. **OTA User Credentials & Target Space via Secrets**: Uses `E2E_CHAT_REFRESH_TOKEN`, `E2E_CHAT_CLIENT_ID`, `E2E_CHAT_CLIENT_SECRET`, and `E2E_CHAT_SPACE_ID` secrets for space resolution and response polling.
+1. **Service Account via WIF**: Authenticates `github-actions-e2e@kube-agents-autopush.iam.gserviceaccount.com` for keyless message creation, Pub/Sub publishing, and the first attempt at reading the space back.
+2. **OTA User Credentials & Target Space via Secrets**: `E2E_CHAT_SPACE_ID` names the space; `E2E_CHAT_REFRESH_TOKEN`, `E2E_CHAT_CLIENT_ID` and `E2E_CHAT_CLIENT_SECRET` supply the fallback credential for response polling when the service account is denied `spaces.messages.list`.

@@ -338,6 +338,13 @@ def required_roles(path: str) -> tuple[str, ...]:
 # imposes anyway.
 MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 
+# What `repository_role` answers. `managed` is a repository in `managed_repos`,
+# whatever else it is in; `context` is one in `context_repos` alone; the third
+# is neither. Only the content workspace's clone reads the answer.
+ROLE_MANAGED = "managed"
+ROLE_CONTEXT = "context"
+ROLE_UNREGISTERED = "unregistered"
+
 _managed_repository_cache: tuple[float, frozenset[str]] | None = None
 _managed_repository_lock = threading.Lock()
 
@@ -356,17 +363,27 @@ def managed_repositories() -> frozenset[str]:
     Returning empty for both would make them indistinguishable in the log at the
     moment an operator most needs to tell them apart.
     """
-    global _managed_repository_cache
+    return _cached_repository_slugs("_managed_repository_cache", "get_managed_github_repos")
+
+
+def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str]:
+    """One ConfigMap list, lowercased and cached for MANAGED_REPOSITORY_CACHE_SECONDS.
+
+    The cache is a named module global rather than a dict entry because tests
+    (and anyone invalidating by hand) reset it by assigning `None` to that
+    name; the reader is looked up on `gitops_workspace` at call time so a
+    patched reader is the one consulted.
+    """
     now = time.monotonic()
     with _managed_repository_lock:
-        cached = _managed_repository_cache
+        cached = globals()[cache_name]
         if cached is not None and cached[0] > now:
             return cached[1]
-    from gitops_workspace import get_managed_github_repos
+    import gitops_workspace
 
-    slugs = frozenset(slug.lower() for slug in get_managed_github_repos())
+    slugs = frozenset(slug.lower() for slug in getattr(gitops_workspace, reader_name)())
     with _managed_repository_lock:
-        _managed_repository_cache = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
+        globals()[cache_name] = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
     return slugs
 
 
@@ -379,6 +396,69 @@ def repository_is_managed(repository: str) -> bool:
     one in the ConfigMap from whoever registered it.
     """
     return repository.lower() in managed_repositories()
+
+
+_context_repository_cache: tuple[float, frozenset[str]] | None = None
+
+
+def context_repositories() -> frozenset[str]:
+    """The `owner/name` slugs registered under `context_repos`, lowercased.
+
+    The list the agent may only *read*: the second key of the same ConfigMap,
+    through the same module and with the same cache window as the managed list,
+    and never merged with it -- see `gitops_workspace.CONTEXT_REPOS_KEY` for why
+    that separation is the safety property. Raises when unreadable, for the
+    reason `managed_repositories` gives.
+    """
+    return _cached_repository_slugs("_context_repository_cache", "get_context_github_repos")
+
+
+def repository_role(repository: str) -> str:
+    """Which list ``repository`` is registered in: managed, context, or neither.
+
+    Managed wins. A repository in both lists is one the install writes to, and
+    the write path must see it exactly as it would without the second entry.
+    Consulted by the content workspace to decide what credential a clone gets,
+    and by nothing that gates a write: `repository_is_managed` stays the only
+    question `commit`, `push`, the API routes and the refresh route ask, and
+    `ROLE_CONTEXT` is not an answer any of them accepts.
+    """
+    if repository_is_managed(repository):
+        return ROLE_MANAGED
+    if repository.lower() in context_repositories():
+        return ROLE_CONTEXT
+    return ROLE_UNREGISTERED
+
+
+def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
+    """The credential the broker's own clone of ``repository`` presents.
+
+    A context repository gets the forge's read-only credential; anything else
+    gets none, and that "none" is not the same thing for the two remaining
+    roles. A managed repository rides the ambient write credential the CLI
+    installed, as it always has, so the broker adds nothing. An unregistered
+    one is a public upstream read with no credential at all, as it always was.
+
+    An unreadable list is logged and answered with no credential rather than
+    raised: this is not an authorization check -- `open` has none by design --
+    and refusing the clone would take `inspect-repository` away from every
+    public repository for the sake of a private one that would have failed
+    anyway.
+    """
+    try:
+        role = repository_role(repository)
+    except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
+        LOGGER.warning(
+            "content workspace open repo=%s role=unknown: the repository lists "
+            "could not be read type=%s; cloning without a credential",
+            repository,
+            type(exc).__name__,
+        )
+        return providers.NoCredential()
+    LOGGER.info("content workspace open repo=%s role=%s", repository, role)
+    if role != ROLE_CONTEXT or registry.default is None:
+        return providers.NoCredential()
+    return registry.default.read_credential(repository)
 
 
 def require_managed_workspace(store, handle: object) -> None:
@@ -1655,10 +1735,53 @@ GIT_MUTATING_SUBCOMMANDS = frozenset(
 
 # git's own global options, split by whether they consume the next argument.
 # Needed to find the subcommand in `git --literal-pathspecs add …` (which
-# audit_report issues) without mistaking a flag for a verb.
+# audit_report issues) without mistaking a flag for a verb. Includes options
+# added in git ≥2.40 so neither `_git_plan` nor the push scanner desynchronises
+# on options such as `--attr-source`, `--config-env`, or `--shallow-file` (#1498).
 _GIT_GLOBAL_WITH_VALUE = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--super-prefix",
+        "--attr-source",
+        "--config-env",
+        "--shallow-file",
+    }
 )
+
+_GIT_PUSH_GLOBAL_WITH_VALUE = _GIT_GLOBAL_WITH_VALUE
+
+# The remote a push is judged against when it names none, or names one that
+# `_detect_repo_default_branch` cannot look up.
+GIT_DEFAULT_REMOTE = "origin"
+
+# Where a clone keeps its remote-tracking refs, relative to the git directory,
+# and the file under `<remote>/` there that records the remote's default branch.
+GIT_REMOTES_REFS_DIR = Path("refs") / "remotes"
+GIT_REMOTE_HEAD_FILE = "HEAD"
+
+# What `_detect_repo_default_branch` accepts as a remote *name*. The
+# `<repository>` slot of `git push` takes a name, a URL, or a filesystem path,
+# and only a name has a tracking HEAD under `refs/remotes/` to read; a path,
+# joined onto that directory verbatim, walked out of it (`../../../../etc`)
+# and read whichever file the agent's argv pointed at (CodeQL alert #38). This
+# pre-check is deliberately thin: not empty, not the two names that mean a
+# directory, and no character that cannot be in a ref. `/` stays allowed
+# because git accepts slash-named remotes (`git remote add team/upstream …`
+# keeps `refs/remotes/team/upstream/HEAD`), and refusing it here would drop
+# the lookup, and the protection, for a remote git honours -- the same
+# narrowing an ASCII allowlist would do to `gh+fork` or `my@fork`. Containment
+# is not this check's job: `_remote_head_path` normalises the joined path at
+# the sink and refuses anything that leaves `refs/remotes/`, whatever mix of
+# `..` and `/` it was built from. A value this drops, or the sink refuses, is
+# not looked up, and the push is judged against `origin`, which is what a URL
+# push already got.
+_GIT_REMOTE_NAME_SEPARATORS = frozenset({"\\", "\0"})
+_GIT_REMOTE_NOT_A_NAME = frozenset({"", ".", ".."})
 
 # Directory `core.hooksPath` is pinned to. It lives under the state dir, which
 # is a sidecar-only emptyDir, and is created empty and mode 0500 at startup.
@@ -1715,6 +1838,18 @@ VCS_GIT_SUBCOMMANDS = frozenset(
 # own name under this directory, which is how the generic route reaches a
 # provider-specific operation without this file listing providers.
 FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
+
+# The flag that turns a forge's refresh helper into a read-only mint: the helper
+# then prints a token for the one repository named and installs nothing.
+# `github_token_refresh.READ_ONLY_FLAG` is the same string; the two are kept in
+# step by test rather than by import, because importing the helper here would
+# import its CLI side into the broker.
+FORGE_READ_ONLY_FLAG = "--read-only"
+
+# How much of a failed helper's stderr reaches the broker log. The full text is
+# bounded only by the executor's output ceiling, which is not a log line; this
+# runs on every failed cron tick.
+FORGE_HELPER_LOG_DETAIL_CHARS = 1000
 
 # What may be spliced into that filename. Closed, anchored and lowercase: a
 # provider name reaching a path is the one place a forge's own string could
@@ -1834,6 +1969,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    "--shallow-file": "points git at a shallow file outside the shared workspace",
     # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
     # `config` is not a mutating verb so it needs no lease. Demonstrated: the
     # agent writes `alias.zz = !<payload>` into the broker's own global config
@@ -2088,6 +2224,249 @@ def _git_refused_name(argument: str) -> str:
     )
 
 
+def _is_git_remote_name(value: str) -> bool:
+    """Could `value` be a remote name at all? Containment is `_remote_head_path`'s."""
+    return value not in _GIT_REMOTE_NOT_A_NAME and _GIT_REMOTE_NAME_SEPARATORS.isdisjoint(value)
+
+
+def _remote_head_path(remotes_dir: Path, remote: str) -> Path | None:
+    """`<remotes_dir>/<remote>/HEAD`, or None when that path leaves `remotes_dir`.
+
+    `remote` is the agent's `git push <repository>` argument, and this is the
+    check that confines it, placed at the sink: normalise the joined path and
+    require the refs directory to be a proper prefix of it, so `../x`, an
+    absolute path, and `team/../../x` are all refused while `team/upstream`
+    resolves to its own tracking HEAD. Spelled with
+    `os.path.normpath` and `str.startswith` rather than `Path.resolve` and
+    `_within` because that pair is what CodeQL's `py/path-injection` query
+    recognises as a sanitiser; the workspace containment the rest of this
+    module does through `_within` is invisible to it.
+    """
+    base = os.path.normpath(str(remotes_dir))
+    candidate = os.path.normpath(os.path.join(base, remote, GIT_REMOTE_HEAD_FILE))
+    if candidate.startswith(base + os.sep):
+        return Path(candidate)
+    return None
+
+
+def _detect_repo_default_branch(
+    repo_dir: Path | None, remote: str = GIT_DEFAULT_REMOTE
+) -> str | None:
+    """Best-effort detection of remote default branch from local clone ref metadata (#1498).
+
+    Reads refs/remotes/<remote>/HEAD directly without subprocess or network calls.
+    On repositories with non-standard default trunks, this local detection acts as a
+    cooperative guard against accidental pushes; authoritative protection against
+    deliberate workspace ref manipulation requires setting CREDENTIAL_PROXY_BASE_BRANCH
+    or GITOPS_BASE_BRANCH.
+
+    `remote` comes from the agent's argv. Only a value that stays under
+    `refs/remotes/` once joined is looked up. A URL in that slot never reached
+    here (the caller keeps `origin` for anything with a `:`); a filesystem
+    path used to be joined and read, and is now refused at the sink, so both
+    are judged against `origin`.
+    """
+    if not repo_dir:
+        return None
+    repo_root = _find_repo_root(repo_dir) or Path(repo_dir)
+    remotes = [
+        name
+        for name in dict.fromkeys((remote, GIT_DEFAULT_REMOTE))
+        if _is_git_remote_name(name)
+    ]
+    for rem in remotes:
+        for remotes_dir in (
+            repo_root / ".git" / GIT_REMOTES_REFS_DIR,
+            repo_root / GIT_REMOTES_REFS_DIR,
+        ):
+            head_candidate = _remote_head_path(remotes_dir, rem)
+            if head_candidate is None:
+                continue
+            try:
+                if head_candidate.is_file() and head_candidate.stat().st_size <= 4096:
+                    with open(head_candidate, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read(4096).strip()
+                    prefix = f"ref: refs/remotes/{rem}/"
+                    if text.startswith(prefix):
+                        branch = text[len(prefix):].strip()
+                        if branch:
+                            return branch
+                    if text.startswith("ref: refs/heads/"):
+                        branch = text[len("ref: refs/heads/"):].strip()
+                        if branch:
+                            return branch
+                    if text.startswith("ref:"):
+                        ref = text.split(":", 1)[1].strip()
+                        return ref.split("/")[-1]
+            except Exception:
+                pass
+    return None
+
+
+def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | None:
+    """Refuse direct pushes to protected rollout or base branches (#1498)."""
+    if not argv or Path(argv[0]).name != "git":
+        return None
+
+    # Locate 'push' subcommand by walking past global options. The first
+    # non-option token after global options is the subcommand slot.
+    idx = 1
+    push_idx = -1
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == "--":
+            break
+        name, sep, _ = arg.partition("=")
+        if name in _GIT_PUSH_GLOBAL_WITH_VALUE and not sep:
+            idx += 2
+            continue
+        if arg.startswith("-"):
+            idx += 1
+            continue
+        if arg.lower() == "push":
+            push_idx = idx
+        break
+
+    if push_idx == -1:
+        return None
+
+    push_args = argv[push_idx + 1:]
+
+    protected = {"main", "master", "production"}
+    handler_base = getattr(CredentialProxyHandler, "base_branch", "")
+    base_override = (
+        handler_base
+        or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    if base_override:
+        norm_override = base_override.strip().lower()
+        if norm_override.startswith("refs/heads/"):
+            norm_override = norm_override[len("refs/heads/"):]
+        elif norm_override.startswith("heads/"):
+            norm_override = norm_override[len("heads/"):]
+        protected.add(norm_override)
+
+    has_tags = False
+    positional: list[str] = []
+    idx = 0
+    while idx < len(push_args):
+        arg = push_args[idx]
+        if arg in ("--all", "--mirror"):
+            return (
+                f"`git push {arg}` is refused: pushing all branches directly "
+                "is not permitted."
+            )
+        if arg == "--tags":
+            has_tags = True
+            idx += 1
+            continue
+        if arg == "--repo":
+            if idx + 1 < len(push_args):
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if arg.startswith("--repo="):
+            idx += 1
+            continue
+        if arg == "-o":
+            if idx + 1 < len(push_args):
+                idx += 2
+                continue
+            idx += 1
+            continue
+        if arg.startswith("-o") and len(arg) > 2:
+            idx += 1
+            continue
+        if arg == "--":
+            positional.extend(push_args[idx + 1:])
+            break
+        if arg.startswith("--"):
+            opt_name, sep, _ = arg.partition("=")
+            if (
+                len(opt_name) > 2
+                and any(
+                    opt.startswith(opt_name)
+                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules")
+                )
+            ):
+                if sep:
+                    idx += 1
+                    continue
+                if idx + 1 < len(push_args):
+                    idx += 2
+                    continue
+                idx += 1
+                continue
+            idx += 1
+            continue
+        if arg.startswith("-"):
+            idx += 1
+            continue
+        positional.append(arg)
+        idx += 1
+
+    remote_name = GIT_DEFAULT_REMOTE
+    if positional and ":" not in positional[0] and not positional[0].startswith("+"):
+        remote_name = positional[0]
+
+    if cwd:
+        repo_dir = Path(cwd).resolve()
+        detected_default = _detect_repo_default_branch(repo_dir, remote=remote_name)
+        if detected_default:
+            norm_def = detected_default.strip().lower()
+            if norm_def.startswith("refs/heads/"):
+                norm_def = norm_def[len("refs/heads/"):]
+            elif norm_def.startswith("heads/"):
+                norm_def = norm_def[len("heads/"):]
+            protected.add(norm_def)
+
+    # In `git push [<repository> [<refspec>...]]`, the first positional argument
+    # is the repository unless no positional arguments are supplied. Even if
+    # `--repo` is specified, git's cmd_push treats the first positional arg as the repo.
+    refspecs = positional[1:] if len(positional) > 1 else []
+
+    if not refspecs:
+        if has_tags:
+            return None
+        return (
+            "`git push` without an explicit destination refspec is refused: specify an explicit "
+            "destination branch (e.g. 'HEAD:platform-agent/<name>')."
+        )
+
+    for ref in refspecs:
+        if ref == ":" or ref.endswith(":") or (":" in ref and not ref.split(":")[-1].lstrip("+")):
+            return (
+                "`git push` with matching refspec ':' is refused: specify an explicit "
+                "destination branch."
+            )
+        target = ref.split(":")[-1].lstrip("+")
+        if "*" in target or "*" in ref:
+            return (
+                f"`git push` with wildcard refspec '{ref}' is refused: specify an explicit "
+                "destination branch."
+            )
+        if target.casefold() in {"head", "@"}:
+            return (
+                "`git push` with bare 'HEAD' refspec is refused: specify an explicit "
+                "destination branch (e.g. 'HEAD:platform-agent/<name>')."
+            )
+        norm_target = target.strip()
+        if norm_target.lower().startswith("refs/heads/"):
+            norm_target = norm_target[len("refs/heads/"):]
+        elif norm_target.lower().startswith("heads/"):
+            norm_target = norm_target[len("heads/"):]
+
+        if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
+            return (
+                f"`git push` to protected branch '{norm_target}' is refused: changes to "
+                "base or run branches must be proposed via pull request and merged through "
+                "the approved workflow."
+            )
+    return None
+
+
 def git_argument_violation(argv: list[str]) -> str | None:
     """Why this git argv may not run, or None if it may.
 
@@ -2104,6 +2483,9 @@ def git_argument_violation(argv: list[str]) -> str | None:
     """
     if not argv or Path(argv[0]).name != "git":
         return None
+    push_violation = git_push_violation(argv)
+    if push_violation is not None:
+        return push_violation
     rest = argv[1:]
     scoped: dict[str, str] = {}
     for subcommand, (letters, why) in _GIT_REFUSED_SHORT_FOR_SUBCOMMAND.items():
@@ -2136,6 +2518,253 @@ def git_argument_violation(argv: list[str]) -> str | None:
                 "ask an operator for anything that has to change the proxy's own "
                 "configuration."
             )
+    if "config" in rest:
+        for argument in rest:
+            clean = argument.split("=", 1)[0].strip().lower()
+            if (
+                clean.startswith("alias.")
+                or clean == "alias"
+                or clean.startswith("include.")
+                or clean.startswith("includeif.")
+                or clean == "include"
+            ):
+                return (
+                    "`git config` configuring an alias or config include is refused: "
+                    "git aliases and includes cannot be configured through the credential proxy."
+                )
+    return None
+
+
+GIT_BUILTIN_SUBCOMMANDS = (
+    GIT_MUTATING_SUBCOMMANDS
+    | frozenset(_GIT_REFUSED_SUBCOMMANDS.keys())
+    | frozenset(
+        {
+            "add",
+            "am",
+            "annotate",
+            "apply",
+            "archive",
+            "bisect",
+            "blame",
+            "bugreport",
+            "bundle",
+            "cat-file",
+            "check-attr",
+            "check-ignore",
+            "check-mailmap",
+            "check-ref-format",
+            "checkout-index",
+            "commit-graph",
+            "commit-tree",
+            "config",
+            "count-objects",
+            "credential",
+            "credential-cache",
+            "credential-store",
+            "describe",
+            "diagnose",
+            "diff",
+            "diff-files",
+            "diff-index",
+            "diff-tree",
+            "difftool",
+            "fast-export",
+            "fast-import",
+            "fmt-merge-msg",
+            "for-each-ref",
+            "for-each-repo",
+            "format-patch",
+            "fsck",
+            "gc",
+            "grep",
+            "hash-object",
+            "help",
+            "hook",
+            "init",
+            "interpret-trailers",
+            "log",
+            "ls-files",
+            "ls-remote",
+            "ls-tree",
+            "maintenance",
+            "merge-base",
+            "merge-file",
+            "merge-index",
+            "merge-one-file",
+            "merge-tree",
+            "name-rev",
+            "notes",
+            "pack-refs",
+            "patch-id",
+            "prune",
+            "push",
+            "range-diff",
+            "read-tree",
+            "reflog",
+            "remote",
+            "repack",
+            "replace",
+            "rerere",
+            "rev-list",
+            "rev-parse",
+            "shortlog",
+            "show",
+            "show-branch",
+            "show-ref",
+            "status",
+            "stripspace",
+            "symbolic-ref",
+            "tag",
+            "update-index",
+            "var",
+            "verify-commit",
+            "verify-pack",
+            "verify-tag",
+            "version",
+            "whatchanged",
+            "write-tree",
+        }
+    )
+)
+
+
+def _find_repo_root(cwd: Path | str | None) -> Path | None:
+    if not cwd:
+        return None
+    cur = Path(cwd).resolve()
+    while cur != cur.parent:
+        candidate_git = cur / ".git"
+        if candidate_git.is_dir() and (candidate_git / "config").is_file():
+            return cur
+        elif candidate_git.is_file():
+            try:
+                if candidate_git.stat().st_size <= 4096:
+                    with open(candidate_git, "r", encoding="utf-8", errors="replace") as f:
+                        line = f.read(4096).strip()
+                    if line.startswith("gitdir:"):
+                        return cur
+            except Exception:
+                pass
+        elif cur.name == ".git" and (cur / "config").is_file():
+            return cur.parent
+        elif (cur / "config").is_file() and (cur / "HEAD").is_file():
+            # Bare repository root (#1498)
+            return cur
+        cur = cur.parent
+    return None
+
+
+_GIT_PROBE_ENVIRONMENT = {
+    "GIT_ALLOW_PROTOCOL": "https",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "KUBECTL_KUBERC": "false",
+}
+
+
+def _read_repo_alias(
+    cwd: Path | str | None,
+    subcommand: str | None,
+    executor: "CommandExecutor | None" = None,
+) -> list[str] | None:
+    """If `subcommand` is an alias defined in the repo-local `.git/config`, return its argv expansion.
+
+    Git never alias-expands builtin subcommands, and expands non-builtin aliases recursively.
+    Uses git config --get to ensure identical lexing, quoting, continuation, and include semantics.
+    Runs inside the executor's hardened environment (GIT_ALLOW_PROTOCOL=https, GIT_CONFIG_NOSYSTEM=1) (#1498).
+    """
+    if not cwd or not subcommand:
+        return None
+    if subcommand in GIT_BUILTIN_SUBCOMMANDS:
+        return None
+
+    repo_root = _find_repo_root(cwd)
+    if not repo_root:
+        return None
+
+    import shlex
+
+    visited: set[str] = set()
+    current_name = subcommand.lower()
+    accumulated_tokens: list[str] = []
+
+    git_bin = "git"
+    env = os.environ.copy()
+    env.update(_GIT_PROBE_ENVIRONMENT)
+    if executor is not None:
+        git_bin = executor.executables.get("git") or "git"
+        env = executor.environment.copy()
+
+    MAX_ALIAS_DEPTH = 10
+    for _ in range(MAX_ALIAS_DEPTH):
+        if current_name in GIT_BUILTIN_SUBCOMMANDS:
+            if accumulated_tokens:
+                accumulated_tokens[0] = current_name
+            break
+        if current_name in visited:
+            return ["!cycle"]
+        visited.add(current_name)
+
+        try:
+            proc = subprocess.run(
+                [git_bin, "-C", str(repo_root), "config", "--get", f"alias.{current_name}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=env,
+            )
+        except Exception:
+            return ["!error"]
+
+        if proc.returncode == 1 and not proc.stderr:
+            # Not an alias in git config.
+            # If we already accumulated alias tokens, the chain terminated at an undefined
+            # subcommand name that is not a git builtin: fail closed (#1498).
+            if accumulated_tokens and current_name not in GIT_BUILTIN_SUBCOMMANDS:
+                return ["!undefined_alias", current_name]
+            if accumulated_tokens and current_name in GIT_BUILTIN_SUBCOMMANDS:
+                accumulated_tokens[0] = current_name
+            break
+        elif proc.returncode != 0:
+            # Fatal error, syntax error, excessive include depth: fail closed!
+            return ["!config_error"]
+
+        raw_val = proc.stdout.strip()
+        if not raw_val:
+            break
+        if raw_val.startswith("!"):
+            return ["!" + raw_val[1:].strip()]
+
+        try:
+            tokens = shlex.split(raw_val)
+        except Exception:
+            return ["!shlex_error"]
+
+        if not tokens:
+            break
+
+        accumulated_tokens = tokens + accumulated_tokens[1:] if accumulated_tokens else tokens
+        current_name = accumulated_tokens[0].lower()
+    else:
+        # Loop exhausted MAX_ALIAS_DEPTH without reaching a non-alias or builtin: fail closed (#1498)!
+        return ["!max_depth"]
+
+    return accumulated_tokens or None
+
+
+def _find_subcommand_index(argv: list[str]) -> int | None:
+    """Find the index of the subcommand token in argv, walking past global options."""
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return None
+        if not token.startswith("-"):
+            return index
+        name, sep, _ = token.partition("=")
+        if name in _GIT_GLOBAL_WITH_VALUE and not sep:
+            index += 1
+        index += 1
     return None
 
 
@@ -2610,7 +3239,12 @@ class CommandExecutor:
         """Run a trusted, operator-defined helper that is not agent selectable."""
         return self._execute(argv, cwd=cwd)
 
-    def execute_workspace_git(self, argv: list[str], cwd: Path) -> ExecutionResult:
+    def execute_workspace_git(
+        self,
+        argv: list[str],
+        cwd: Path,
+        config: tuple[tuple[str, str], ...] = (),
+    ) -> ExecutionResult:
         """git the broker issues on its own behalf, in a tree the agent cannot name.
 
         A separate door from `/v1/exec`, and separate on purpose. The point of
@@ -2632,6 +3266,12 @@ class CommandExecutor:
         * the working directory is inside the *content workspace* root, which
           `assert_disjoint_roots` has already proven is not inside the volume
           the agent writes to.
+
+        `config` is what the credential for this clone asked git to carry --
+        the read-only token's `extraheader`, for a context repository -- and it
+        travels the same way `execute_vcs_git`'s does: into the
+        `GIT_CONFIG_COUNT` layer ahead of the forced pins, so a credential can
+        add a header and cannot turn a pin off.
         """
         from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
 
@@ -2654,6 +3294,7 @@ class CommandExecutor:
             [executable_path, *argv[1:]],
             cwd=str(cwd),
             containment_root=self.content_workspace_root,
+            extra_config=tuple(config),
         )
 
     def execute_vcs_git(
@@ -2759,39 +3400,90 @@ class CommandExecutor:
         provider's own name -- so a second forge that needs a brokered
         credential ships a helper and edits nothing in this file.
 
-        The provider is matched against a closed grammar before it reaches a
-        path. It comes from a forge class rather than from a request today, and
-        the check is what keeps that true if a route ever passes one through.
-
         Whether the repository is one this install acts on is settled here too,
         for the reason `_repository_is_permitted` gives: this is the call that
         spends the token, so it is the call that has to ask.
         """
-        if not _PROVIDER_RE.fullmatch(provider or ""):
-            raise ValueError("provider is not a forge name")
+        helper = self._forge_helper(provider)
         if not repository_is_managed(repository):
             raise PermissionError(f"{repository} is not a repository this install manages")
-        helper = Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
+        self._run_forge_helper(provider, helper, [repository], "credential refresh")
+
+    @staticmethod
+    def _forge_helper(provider: str) -> Path:
+        """The helper that performs a forge's privileged operations, by name.
+
+        The provider is matched against a closed grammar before it reaches a
+        path. It comes from a forge class rather than from a request today, and
+        the check is what keeps that true if a route ever passes one through.
+        """
+        if not _PROVIDER_RE.fullmatch(provider or ""):
+            raise ValueError("provider is not a forge name")
+        return Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
+
+    def _run_forge_helper(
+        self, provider: str, helper: Path, arguments: list[str], action: str
+    ) -> ExecutionResult:
+        """Run a forge helper after its caller has settled admission, or raise.
+
+        An absent helper is a refusal rather than a no-op. A credential
+        strategy that asked to be made current and silently was not is a 401
+        later, from inside a clone, that reads like the repository is gone.
+
+        A failure's detail is logged here and not returned: it crosses back
+        into the sandbox otherwise, and this is the one place a broker outage is
+        diagnosable. Redacted before it is bounded, so a token cut in half by
+        the slice is not what survives. `action` names the operation in the log
+        line and the exception, and nothing else about the two operations
+        differs on this path.
+        """
         if not helper.is_file():
-            # An absent helper is a refusal rather than a no-op. A credential
-            # strategy that asked to be made current and silently was not is a
-            # 401 later, from inside a clone, that reads like the repository is
-            # gone.
             raise RuntimeError(f"no credential refresh helper for {provider}")
-        result = self.execute_internal([str(helper), repository])
+        result = self.execute_internal([str(helper), *arguments])
         if result.exit_code != 0:
-            # Logged here and not returned: the detail crosses back into the
-            # sandbox otherwise, and it is the one place a broker outage is
-            # diagnosable. Redacted before it is bounded, so a token cut in half
-            # by the slice is not what survives.
             detail = redact_credentials(result.stderr.strip())
             LOGGER.warning(
-                "%s credential refresh exited %d%s",
+                "%s %s exited %d%s",
                 provider,
+                action,
                 result.exit_code,
-                f": {detail[:1000]}" if detail else "",
+                f": {detail[:FORGE_HELPER_LOG_DETAIL_CHARS]}" if detail else "",
             )
-            raise RuntimeError("credential refresh failed")
+            raise RuntimeError(f"{action} failed")
+        return result
+
+    def mint_read_credential(self, provider: str, repository: str) -> str:
+        """A read-only token for one clone of a context repository, or raise.
+
+        The privileged operation a `MintedReadCredential` names and does not
+        perform. The same helper `refresh_forge_credential` runs, with the flag
+        that makes it print a `contents: read` token for this one repository
+        instead of installing a write token for every managed one.
+
+        The role check is the admission: only a repository registered under
+        `context_repos` and not under `managed_repos` is minted for. A managed
+        repository already has the write credential and must keep riding it,
+        an unregistered one gets no credential of either kind, and neither
+        refusal is a failure the caller can act on, so it is a `PermissionError`
+        the credential swallows into a credential-less clone. Checked here and
+        not only in the caller because this is the call that spends the token.
+
+        The token comes back on stdout and is returned, never logged: what the
+        helper wrote to stderr is logged redacted on failure, as the refresh
+        path does, and stdout is not.
+        """
+        helper = self._forge_helper(provider)
+        if repository_role(repository) != ROLE_CONTEXT:
+            raise PermissionError(
+                f"{repository} is not a context repository of this install"
+            )
+        result = self._run_forge_helper(
+            provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
+        )
+        token = result.stdout.strip()
+        if not token:
+            raise RuntimeError("read-only credential mint returned no token")
+        return token
 
     def _within_workspace(self, candidate: Path) -> bool:
         return _within(self.workspace_dir, candidate)
@@ -2807,6 +3499,91 @@ class CommandExecutor:
             except OSError:
                 break
         return None
+
+    def resolve_git_command(self, argv: list[str], cwd: str | None) -> tuple[str | None, list[str]]:
+        """Why this git command may not run here, or None if it may, along with the execution argv.
+
+        When an alias is present, returns the checked expansion as execution argv so execution
+        does not re-read .git/config at execution time. Unknown subcommands that are neither recognized
+        git builtins nor defined aliases fail closed, preventing TOCTOU races between check and execute
+        where an agent modifies .git/config after check passes (#1498).
+        """
+        if not argv or Path(argv[0]).name != "git":
+            return None, argv
+        subcommand, redirects = _git_plan(argv)
+        candidate = Path(cwd).resolve() if cwd else self.workspace_dir
+        # `-C` is applied the way git applies it: each one relative to the last.
+        for redirect in redirects:
+            candidate = (candidate / redirect).resolve()
+
+        alias_expansion = _read_repo_alias(candidate, subcommand, executor=self)
+        if alias_expansion:
+            if alias_expansion[0].startswith("!"):
+                if alias_expansion[0] in ("!cycle", "!max_depth", "!config_error", "!error", "!shlex_error", "!undefined_alias"):
+                    err_code = alias_expansion[0][1:]
+                    return (
+                        f"`git` alias recursion, configuration error, or undefined alias target ({err_code}) is refused: "
+                        "aliases must expand cleanly without cycles, errors, exceeding depth, or undefined targets.",
+                        argv,
+                    )
+                return (
+                    "`git` alias executing a shell command (`!`) is refused: "
+                    "shell aliases cannot be executed through the credential proxy.",
+                    argv,
+                )
+            sub_idx = _find_subcommand_index(argv)
+            head = argv[:sub_idx] if sub_idx is not None else [argv[0]]
+            tail = argv[sub_idx + 1:] if sub_idx is not None else []
+            expanded_argv = head + alias_expansion + tail
+
+            arg_violation = git_argument_violation(expanded_argv)
+            if arg_violation is not None:
+                return arg_violation, argv
+
+            push_violation = git_push_violation(expanded_argv, cwd=candidate)
+            if push_violation is not None:
+                return push_violation, argv
+            subcommand, _ = _git_plan(expanded_argv)
+            if subcommand and subcommand not in GIT_BUILTIN_SUBCOMMANDS:
+                return (
+                    f"`git {subcommand}` is not a recognized git subcommand.",
+                    argv,
+                )
+            execution_argv = expanded_argv
+        else:
+            if subcommand and subcommand not in GIT_BUILTIN_SUBCOMMANDS:
+                return (
+                    f"`git {subcommand}` is not a recognized git subcommand or alias.",
+                    argv,
+                )
+            push_violation = git_push_violation(argv, cwd=candidate)
+            if push_violation is not None:
+                return push_violation, argv
+            execution_argv = argv
+
+        if not self.require_git_lease:
+            return None, execution_argv
+
+        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
+            return None, execution_argv
+
+        if not self._within_workspace(candidate):
+            return (
+                f"`git {subcommand}` would run in {candidate}, outside the shared "
+                "workspace.",
+                argv,
+            )
+        if self._lease_holder(candidate) is None:
+            return (
+                f"`git {subcommand}` is only allowed inside a leased GitOps "
+                f"workspace, and {candidate} is not one (no {GIT_LEASE_MARKER} in "
+                "it or any directory above it). Other agents share this volume: "
+                "run the skill's workspace step — `audit_report.py start` for a "
+                "fleet audit, `submit_suggestion.py prepare` for a suggestion — "
+                "and work in the directory it prints.",
+                argv,
+            )
+        return None, execution_argv
 
     def git_lease_violation(self, argv: list[str], cwd: str | None) -> str | None:
         """Why this git command may not run here, or None if it may.
@@ -2824,34 +3601,8 @@ class CommandExecutor:
         checked by the skill (`gitops_workspace.assert_lease_owner`), which is
         the only layer that knows which lease it holds.
         """
-        if not self.require_git_lease:
-            return None
-        if not argv or Path(argv[0]).name != "git":
-            return None
-        subcommand, redirects = _git_plan(argv)
-        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
-            return None
-
-        candidate = Path(cwd).resolve() if cwd else self.workspace_dir
-        # `-C` is applied the way git applies it: each one relative to the last.
-        for redirect in redirects:
-            candidate = (candidate / redirect).resolve()
-
-        if not self._within_workspace(candidate):
-            return (
-                f"`git {subcommand}` would run in {candidate}, outside the shared "
-                "workspace."
-            )
-        if self._lease_holder(candidate) is None:
-            return (
-                f"`git {subcommand}` is only allowed inside a leased GitOps "
-                f"workspace, and {candidate} is not one (no {GIT_LEASE_MARKER} in "
-                "it or any directory above it). Other agents share this volume: "
-                "run the skill's workspace step — `audit_report.py start` for a "
-                "fleet audit, `submit_suggestion.py prepare` for a suggestion — "
-                "and work in the directory it prints."
-            )
-        return None
+        violation, _ = self.resolve_git_command(argv, cwd)
+        return violation
 
     def _resolve_kubeconfig(self, context: str, *, scoped: bool = True) -> Path:
         """Turn the cluster name a caller sent into a kubeconfig the proxy wrote.
@@ -3222,7 +3973,7 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
-def build_workspace_store(executor: CommandExecutor):
+def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
     """The content-passing store, or None when the feature is off.
 
     Returning None rather than an inert object is deliberate: the handler tests
@@ -3239,16 +3990,23 @@ def build_workspace_store(executor: CommandExecutor):
         return None
     from content_workspace import ContentWorkspaceStore
 
+    # Its own registry, carrying the read-only mint and nothing else: the store
+    # clones one host, and the credential it may add to a clone is the one that
+    # can only read. The write token is not this registry's to hand out -- the
+    # broker's has it, and the content workspace never asks.
+    registry = providers.Registry({"mint": executor.mint_read_credential})
     store = ContentWorkspaceStore(
         executor.content_workspace_root,
         executor.workspace_dir,
         executor.execute_workspace_git,
+        base_branch=base_branch,
+        credential_for=lambda repository: read_credential_for(registry, repository),
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
 
 
-def build_vcs_broker(executor: CommandExecutor):
+def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
     """The version-control broker. Always built; there is no switch.
 
     Unlike the content workspace this has no off state. It is the forge-neutral
@@ -3271,6 +4029,7 @@ def build_vcs_broker(executor: CommandExecutor):
         git_runner=executor.execute_vcs_git,
         cli_runner=executor.execute_forge_cli,
         refresh=executor.refresh_forge_credential,
+        base_branch=base_branch,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -3414,6 +4173,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    base_branch: str = ""
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
     # which is what lets a migrating client detect support by asking rather than
@@ -3738,7 +4498,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         # Not a policy rule: the policy matches on argv alone, and this refusal
         # turns on the working directory as well.
-        violation = self.executor.git_lease_violation(argv, cwd)
+        if hasattr(self.executor, "resolve_git_command"):
+            violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
+        else:
+            violation = self.executor.git_lease_violation(argv, cwd)
+            exec_argv = argv
         if violation is not None:
             LOGGER.warning(
                 "git lease refused request_id=%s cwd=%s",
@@ -3763,6 +4527,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # be refused by the denylist with that rule id. If the gate ran first, it
         # would refuse as `kubernetes.read-only`, losing the specific rule.
         refusal_result = read_only_refusal(argv)
+        if refusal_result is None and exec_argv != argv:
+            refusal_result = read_only_refusal(exec_argv)
         if refusal_result is not None:
             refusal, log_hint = refusal_result
             safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
@@ -3774,7 +4540,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         try:
             result = self.executor.execute(
-                argv,
+                exec_argv,
                 stdin=stdin,
                 cwd=cwd,
                 kubeconfig_context=kubeconfig_context,
@@ -4456,8 +5222,17 @@ def serve(args: argparse.Namespace) -> None:
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
-    CredentialProxyHandler.workspaces = build_workspace_store(executor)
-    CredentialProxyHandler.vcs = build_vcs_broker(executor)
+    CredentialProxyHandler.base_branch = (
+        getattr(args, "base_branch", "")
+        or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
+        or os.getenv("GITOPS_BASE_BRANCH", "")
+    ).strip()
+    CredentialProxyHandler.workspaces = build_workspace_store(
+        executor, base_branch=CredentialProxyHandler.base_branch
+    )
+    CredentialProxyHandler.vcs = build_vcs_broker(
+        executor, base_branch=CredentialProxyHandler.base_branch
+    )
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
@@ -4568,6 +5343,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--state-dir",
         default=os.getenv("CREDENTIAL_PROXY_STATE_DIR", "/var/lib/credential-proxy"),
+    )
+    parser.add_argument(
+        "--base-branch",
+        default=os.getenv(
+            "CREDENTIAL_PROXY_BASE_BRANCH", os.getenv("GITOPS_BASE_BRANCH", "")
+        ),
+        help="Protected GitOps base branch that agents may not push to directly",
     )
     return parser.parse_args()
 
