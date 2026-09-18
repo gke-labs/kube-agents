@@ -128,6 +128,10 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
+# Not a cause the periodic emits: the key `pool_causes` records when
+# CONTROL_PLANE is announced without the queue, which says something different
+# and names no build cluster. See `pool_cause_key`.
+CAUSE_CONTROL_PLANE_UNREAD = "CONTROL_PLANE:queue-unread"
 # The periodic's own "I could not tell", distinct from a label added later that
 # this file has no remedy for. Both ask for nothing; only this one knows why.
 CAUSE_UNKNOWN = "UNKNOWN"
@@ -322,6 +326,30 @@ def pool_advisable(pool: dict) -> bool:
     return pool.get("verdict") != POOL_BREACH or pool.get("waiting_now") is not False
 
 
+def pool_cause_key(pool: dict) -> str | None:
+    """What a ⏳ would tell the reader, which is not always its cause.
+
+    `pool_causes` is what this episode has already said, and CONTROL_PLANE says
+    two things: the build cluster to go and check, or that the queue could not
+    be read so nothing can be blamed. Keyed on the cause alone, an hour of
+    unreadable Deck at the start of an episode would record the vague one as
+    the remedy and the remedy would never post.
+    """
+    if pool.get("cause") == CAUSE_CONTROL_PLANE and pool.get("waiting_now") is None:
+        return CAUSE_CONTROL_PLANE_UNREAD
+    return pool.get("cause")
+
+
+def pool_told_keys(pool: dict) -> list[str]:
+    """The keys a sent ⏳ marks as told, which the diagnosis widens.
+
+    Once the build cluster has been named, the unread-queue message is less
+    than the reader already has, so it is not owed later in the same episode.
+    """
+    key = pool_cause_key(pool)
+    return [key, CAUSE_CONTROL_PLANE_UNREAD] if key == CAUSE_CONTROL_PLANE else [key]
+
+
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:
     """Which message kinds go out this tick.
 
@@ -371,7 +399,7 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
         and pool_advisable(pool)
         and (
             pool.get("verdict") != told.get("pool_verdict")
-            or pool.get("cause") not in (told.get("pool_causes") or [])
+            or pool_cause_key(pool) not in (told.get("pool_causes") or [])
         )
     ):
         kinds.append(KIND_POOL)
@@ -1122,8 +1150,8 @@ def run(
     # The causes this episode has named. Appended only on a send, so a failed
     # one is retried; emptied when a reading shows the episode over.
     pool_causes = list(before.get("pool_causes") or [])
-    if KIND_POOL in sent and (health.get("pool") or {}).get("cause") not in pool_causes:
-        pool_causes.append((health.get("pool") or {}).get("cause"))
+    if KIND_POOL in sent:
+        pool_causes += [key for key in pool_told_keys(health.get("pool") or {}) if key not in pool_causes]
     if not health.get("pool") and pool_was_read(health):
         pool_causes = []
     if prev is None:

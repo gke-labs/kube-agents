@@ -946,6 +946,26 @@ class PoolNote(RunHarness):
         # Three attempts: the first note, the cap that 500'd, and its retry.
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⏳", "⏳"])
 
+    def test_the_build_cluster_is_still_named_after_a_tick_that_could_not_read_the_queue(self):
+        # CONTROL_PLANE says two different things depending on whether Deck was
+        # read, and only one of them names the build cluster. Recorded as told
+        # under the bare cause, the vaguer one would stand in for the remedy and
+        # the remedy would never post -- for the rest of a week-long episode.
+        self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=None), self.at(10))
+        self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=40 * 60), self.at(11))
+        self.assertEqual(len(self.opener.requests), 2)
+        self.assertIn("could not read the queue", self.opener.texts[0])
+        self.assertIn("Check the build cluster", self.opener.texts[1])
+
+    def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):
+        # The other order. Once the reader has the build cluster, "cannot say
+        # whose fault it is" is less than they already have, so an hour of
+        # unreadable Deck inside the same episode is not news.
+        self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=40 * 60), self.at(10))
+        self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=None), self.at(11))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertIn("Check the build cluster", self.opener.texts[0])
+
     def test_a_new_episode_names_its_remedy_again(self):
         # The list is the episode's, not the channel's memory: the same cause a
         # month later is news.
