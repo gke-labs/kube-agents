@@ -45,14 +45,20 @@ class RollbackEnvironmentResolveTest(unittest.TestCase):
         _git(self.repo, "config", "user.name", "t")
         _git(self.repo, "config", "commit.gpgsign", "false")
         _git(self.repo, "config", "tag.gpgsign", "false")
+        # The shape the release automation produces: each GA tag sits on a
+        # stamped child of the candidate it was cut from, not on the candidate.
         self.commits = []
         for tag in ("0.4.0", "0.5.0", None):
-            (self.repo / "file").write_text(f"{tag}\n")
+            (self.repo / "file").write_text(f"candidate for {tag}\n")
             _git(self.repo, "add", "-A")
-            _git(self.repo, "commit", "-q", "-m", f"commit {tag}")
+            _git(self.repo, "commit", "-q", "-m", f"candidate for {tag}")
             self.commits.append(_git(self.repo, "rev-parse", "HEAD"))
             if tag:
+                (self.repo / "VERSION").write_text(f"{tag}\n")
+                _git(self.repo, "add", "-A")
+                _git(self.repo, "commit", "-q", "-m", f"chore(release): stamp release version {tag}")
                 _git(self.repo, "tag", tag)
+        self.stamped_050 = _git(self.repo, "rev-parse", "0.5.0^{commit}")
         self.bin_dir = create_minimal_tools_bin(self.tmp_dir)
 
     def _run(self, **env):
@@ -75,11 +81,30 @@ class RollbackEnvironmentResolveTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines()[-1], "0.4.0")
 
-    def test_refuses_when_the_candidate_is_the_ga_itself(self):
-        """From the 0.5.0 commit, 0.5.0 is not an older release to go back to."""
+    def test_refuses_when_the_ga_was_cut_from_the_candidate(self):
+        """The night after a release: the newest GA is a stamped child of N.
+
+        Equality would miss it and record an N-to-N move as a rollback.
+        """
         proc = self._run(CANDIDATE_SHA=self.commits[1])
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("no older release", proc.stderr)
+
+    def test_refuses_when_the_candidate_is_the_stamped_ga_commit_itself(self):
+        proc = self._run(CANDIDATE_SHA=self.stamped_050)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no older release", proc.stderr)
+
+    def test_refuses_a_candidate_older_than_the_ga(self):
+        """A hand-dispatched old candidate would run the two directions swapped."""
+        proc = self._run(CANDIDATE_SHA=self.commits[0], ROLLBACK_TAG="0.5.0")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no older release", proc.stderr)
+
+    def test_accepts_an_older_ga_for_the_same_candidate(self):
+        proc = self._run(CANDIDATE_SHA=self.commits[1], ROLLBACK_TAG="0.4.0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "0.4.0")
 
     def test_refuses_without_a_candidate(self):
         proc = self._run()

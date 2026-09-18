@@ -94,8 +94,13 @@ fi
 validate_pure_numeric_semver "${ROLLBACK_TAG}" "ROLLBACK_TAG" || exit 1
 ROLLBACK_COMMIT="$(git -C "${REPO_ROOT}" rev-parse --verify "refs/tags/${ROLLBACK_TAG}^{commit}" 2>/dev/null)" ||
   fail "Tag '${ROLLBACK_TAG}' is not in this checkout; fetch it first (git fetch --tags)."
-if [ "${ROLLBACK_COMMIT}" = "${CANDIDATE_SHA}" ]; then
-  fail "The candidate ${CANDIDATE_SHA:0:7} is the ${ROLLBACK_TAG} release itself; there is no older release to roll back to from it."
+# A GA tag lands on a stamped child of the candidate it was cut from, not on
+# the candidate itself, so equality alone would let the night after a release
+# move N to N under another tag and call it a rollback. Ancestry catches that
+# shape, the direct-tag shape, and a hand-dispatched candidate older than the
+# newest GA, where the two directions would run swapped.
+if git -C "${REPO_ROOT}" merge-base --is-ancestor "${CANDIDATE_SHA}" "${ROLLBACK_COMMIT}"; then
+  fail "The ${ROLLBACK_TAG} release was cut from the candidate ${CANDIDATE_SHA:0:7} or from a commit after it; there is no older release to roll back to from here."
 fi
 
 output "rollback_tag" "${ROLLBACK_TAG}"
@@ -186,6 +191,10 @@ collect_diagnostics() {
   local status=$?
   if [ "${status}" -ne 0 ]; then
     echo "==> Collecting diagnostics for the failed step '${CURRENT_STEP}' into ${DIAGNOSTICS_DIR}."
+    # A failure between the handoff and the operator step's return would
+    # otherwise leave the operator at zero replicas: on the nightly the
+    # teardown erases that, on a workstation it is an outage.
+    restart_operator_after_handoff || true
     # Pod listings and events rather than `describe` or the CR's spec: those
     # carry the rendered environment (allowlists, channel ids, the project),
     # and the artifact is downloadable from a public repository.
@@ -234,24 +243,36 @@ run_upgrade() {
 }
 
 # The images the re-tag will pull: every first-party image the install's
-# workloads reference now, at the target tag, in the registry each one is
-# pulled from. The registry the install uses is the one Helm keeps across the
-# re-tag, whatever install.env says, so that is where the tag has to exist;
-# and a release image the install does not run (a replay proxy, an
-# investigator) is not a reason to refuse. Refusing here is what keeps a
-# missing tag from being discovered as an ImagePullBackOff after the CRDs
-# and the operator have already moved.
+# workloads reference now that the target release knows about, at the target
+# tag, in the registry each one is pulled from. The registry the install uses
+# is the one Helm keeps across the re-tag, whatever install.env says, so that
+# is where the tag has to exist. The names come from the target checkout's
+# images.json, not this one's: an image added after the target release was
+# never published at its tag, and the target's re-tag does not pull it (its
+# chart either deletes the object or leaves it on the current image), so it
+# is not a reason to refuse; nor is a release image the install does not run.
+# Refusing here is what keeps a missing tag from being discovered as an
+# ImagePullBackOff after the CRDs and the operator have already moved.
+readonly RETAGGED_IMAGE_NAMES="k8s-operator
+platform-agent
+agent-sandbox"
+
 release_image_names() {
-  jq -r '.images[] | select(.origin == "first-party" and .tagPolicy == "release") | .name' "${REPO_ROOT}/images.json"
+  local checkout="$1"
+  if [ -f "${checkout}/images.json" ]; then
+    jq -r '.images[] | select(.origin == "first-party" and .tagPolicy == "release") | .name' "${checkout}/images.json"
+  else
+    echo "${RETAGGED_IMAGE_NAMES}"
+  fi
 }
 
 check_images_exist() {
-  local tag="$1" names repos repo name missing=""
+  local tag="$1" checkout="$2" names repos repo name missing=""
   if ! command -v docker >/dev/null 2>&1; then
     echo "::warning title=Image pre-check skipped::docker is not available, so whether :${tag} exists for the install's images is found out by the rollout instead."
     return 0
   fi
-  names="$(release_image_names)"
+  names="$(release_image_names "${checkout}")"
   repos="$( {
     kubectl get deployment,statefulset -n "${NAMESPACE}" \
       -o jsonpath='{range .items[*]}{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{end}' 2>/dev/null
@@ -311,10 +332,14 @@ handoff_litellm_policy_if_needed() {
   HANDOFF_DONE="true"
 }
 
+# Also called from the EXIT trap, which can fire before the variables above
+# are declared, hence the defaults. Clears the flag so a restart done here
+# is not repeated by the trap.
 restart_operator_after_handoff() {
-  [ "${HANDOFF_DONE}" = "true" ] || return 0
+  [ "${HANDOFF_DONE:-false}" = "true" ] || return 0
   local replicas="${OPERATOR_REPLICAS_BEFORE_HANDOFF:-1}"
   echo "==> Scaling ${OPERATOR_DEPLOYMENT} back to ${replicas} after the handoff."
+  HANDOFF_DONE="false"
   kubectl scale deployment "${OPERATOR_DEPLOYMENT}" -n "${NAMESPACE}" --replicas="${replicas}"
   kubectl rollout status "deployment/${OPERATOR_DEPLOYMENT}" -n "${NAMESPACE}" --timeout="${OPERATOR_SCALE_TIMEOUT_SECONDS}s"
 }
@@ -354,7 +379,7 @@ record "before" "recorded" "agent :${before_agent##*:}, operator :${before_opera
 
 CURRENT_STEP="checkout ${ROLLBACK_TAG}"
 checkout_at "${ROLLBACK_TAG}" "${ROLLBACK_CHECKOUT}"
-check_images_exist "${ROLLBACK_TAG}"
+check_images_exist "${ROLLBACK_TAG}" "${ROLLBACK_CHECKOUT}"
 record "checkout ${ROLLBACK_TAG}" "✅" "${ROLLBACK_COMMIT:0:7}"
 
 CURRENT_STEP="dry run ${ROLLBACK_TAG}"
@@ -389,7 +414,7 @@ record "check ${ROLLBACK_TAG}" "✅" "both images :${ROLLBACK_TAG}, Ready=True"
 if [ "${ROLL_FORWARD}" = "true" ]; then
   CURRENT_STEP="checkout candidate"
   checkout_at "${CANDIDATE_SHA}" "${CANDIDATE_CHECKOUT}"
-  check_images_exist "${CANDIDATE_SHA}"
+  check_images_exist "${CANDIDATE_SHA}" "${CANDIDATE_CHECKOUT}"
   record "checkout candidate" "✅" "${CANDIDATE_SHA:0:7}"
 
   CURRENT_STEP="roll forward operator"

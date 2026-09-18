@@ -154,7 +154,7 @@ and `--upgrade-mode=harness` back to that GA, checks that both images carry the 
 `PlatformAgent` reports `Ready`, and that the gateway rollout is complete, then runs the same pair
 from the candidate checkout to bring the cluster back to the candidate. The job carries
 `continue-on-error` and is not in step 4's `needs`, so a red leg is reported in the run and in the
-`nightly-rollback-leg` artifact (the upgrade logs, pod descriptions, operator log and Helm history)
+`nightly-rollback-leg` artifact (the upgrade logs and, on failure, the pod list, events, operator log and Helm history)
 without holding the promotion; admitting it as a gate is a decision taken on its record, by moving it
 into that list and dropping the flag together. Step 5 depends on it for ordering only and its condition names the deploy and matrix results rather than the leg's, so a red leg still tears the cluster down.
 

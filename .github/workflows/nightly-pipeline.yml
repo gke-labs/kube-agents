@@ -335,10 +335,12 @@ jobs:
 
   step-5-teardown-env:
     name: Step 5 - Tear Down Nightly Environment
-    # The implicit success() on `needs` is the gate: a failure in resolve, deploy
-    # or the matrix leaves the environment standing to be examined live. The `if:`
-    # below adds to that check rather than replacing it — an `always()` here would
-    # remove it and start destroying the environments this exists to preserve.
+    # A failure in resolve, deploy or the matrix leaves the environment standing
+    # to be examined live: the `if:` below names those results explicitly, in
+    # place of the implicit success() on `needs`, so that one job can be listed
+    # for ordering without its result deciding anything. An `always()` here
+    # would drop the gate and start destroying the environments this exists to
+    # preserve.
     #
     # `step-4-create-staging-tag` is deliberately absent from the list. Its only
     # failure modes are credential ones — an invalid GitHub App key or ID, a rejected
