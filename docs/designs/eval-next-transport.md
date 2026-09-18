@@ -81,20 +81,27 @@ the presubmit exports nothing new until it chooses to. The exchange:
 1. Port-forward the adapter's Service on `AGENT_CLUSTER_CONTEXT`, through the harness's existing
    forward machinery and its retry classes.
 2. `POST /inject` with a synthetic conversation key, a principal the gateway resolves through
-   the inject section of its principal map (below), the prompt as the text, and the case id
-   plus repetition as the backend message id. The gateway takes the message through
+   the inject section of its principal map (below), the prompt as the text, and the run id, case
+   id and repetition, `<run>/<case>/<rep>`, as the backend message id; the run id is minted once
+   per harness invocation from the variable the api transport honours for its conversation id,
+   `AGENT_CONVERSATION_ID`, or fresh when it is unset. The gateway takes the message through
    `handleInbound` like a message from any backend: routing, the session record, `startTask`,
    and the relay back, with `taskId`, `contextId`, `correlationId` and the `authority` block
    minted by the gateway. The response names the task id. The adapter dedupes on the backend
    message id, bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an
-   id it has already accepted returns the same task id and starts nothing. That is what makes
-   the harness's retry classes safe on this path: the opening request is retried with the same
+   id it has already accepted returns the same task id and starts nothing. Because the id
+   carries the run id, the dedupe is idempotence within one invocation's retries and never
+   across invocations: a rerun of the same case and repetition mints a new run id, so a new key
+   and a fresh session record, and the seen set never answers it with an earlier run's task.
+   That is what makes the harness's retry classes safe on this path: the opening request is
+   retried with the same
    body on a gateway status or a dropped connection, and `startTask` writes the session record
    before it answers, so without the dedupe the retry would reach `handleInbound` with an active
    task and be routed as a steer, no new task and no `ingress` line; and a fresh key per attempt
    is ruled out because it would start a second persona task doing the same mutations. The
-   gateway's `ingress` log joins the backend message id to the `correlationId`, so with the case
-   and repetition as that id the audit chain reaches the eval record with nothing added.
+   gateway's `ingress` log joins the backend message id to the `correlationId`, so with the run,
+   case and repetition as that id, and the record storing the run id beside the case and
+   repetition, the audit chain reaches the eval record with nothing added.
 3. Await the terminal of that task id, as [Completion signals](#completion-signals) says.
    Replies arrive the way the relay would post them to a conversation, over SSE or a `GET` on
    the conversation key, and the harness returns when the terminal lands or its deadline passes.
@@ -109,8 +116,15 @@ the presubmit exports nothing new until it chooses to. The exchange:
    deadline, so nothing it does there can mint a task or spend a model turn.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
-   executor publishes them. Token counts are not on the bus; the record says so rather than
-   failing.
+   executor publishes them. Token counts are not on the bus, and the scorer's liveness rule
+   fails a record whose token total is null, so the inject record is written the way the
+   diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
+   `working` and the terminal, is a trajectory entry under the status-event name, the token
+   buckets are null, the latency is set, and the scorer's rung-3 rule accepts a final status
+   entry as liveness evidence in place of a token total. A task nobody took reaches the scorer
+   as infrastructure through the harness's marker, never as a record the rung blocks. That
+   scorer rule lands with the diagnostic transport, and whichever of the two transports merges
+   first brings it.
 
 The adapter binds to localhost or a ClusterIP Service. A NetworkPolicy edge fences it from every
 in-cluster pod but the eval runner's path; it does not govern the port-forward the harness uses,
@@ -133,8 +147,9 @@ stamps its own `verifiedBy`, `inject-bearer`, so nothing downstream can mistake 
 `chat-event-topic-iam` verified. And an unmapped principal is dropped at ingress with the same
 notice the Discord path gives (drop, log, no task); nothing is defaulted.
 
-**The synthetic conversation is a session like any other.** Its key is `inject:<key>`,
-backend-qualified like `discord:` and `gchat:` keys so it cannot collide with a real
+**The synthetic conversation is a session like any other.** Its key is
+`inject:<run>/<case>/<rep>`, backend-qualified like `discord:` and `gchat:` keys so it cannot
+collide with a real
 conversation; its `Kind` is `dm`; its roster is the requester alone with `complete: true`; and
 `openDirect` returns the same conversation. Those are the five adapter operations the
 test-backend section names, inbound message with verified sender, conversation and thread
@@ -152,7 +167,8 @@ the harness does with it.
 Chat; a localhost door has no silent-stop failure mode, so it is a side door that may sit beside
 exactly one real backend, and the guard keeps refusing two real ones. The door beside a real
 backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
-against one install and compare them, and the Slack adapter in flight agrees on the same reading.
+against one install and compare them, and meets the A2A owner's condition that the guard change
+be coordinated with the Slack adapter in flight.
 The door alone is also enough for the gateway to start (decided 2026-09-17 by the A2A owner,
 whose reason is that this is what makes the adapter the answer for an eval install with no real
 backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
@@ -196,22 +212,28 @@ or not the gateway has released the conversation yet; an active task at `submitt
 cancel goes out, which the bridge answers with a `canceled-before-start` terminal; an active task
 at `working`, a graded timeout, and the cancel goes out. The release still happens on the next
 real inbound message, as today, which matters only if the key is reused, and the harness uses a
-fresh key per case and repetition. The cancel follows the read rather than preceding it, because
-the read is what says whether an executor holds the task: a cancel sent to a task nobody consumed
-gets "cancel sent" back and no terminal ever follows. That is how the harness and the gateway
-agree on what "nobody took it" means, one grace read from the gateway rather than configured
-twice, and nothing the harness does at the deadline can mint a task. A `failed` terminal is not
-graded on its state alone: the harness reads the reason token, the part of the terminal's reason
-before the first space, because the bridge publishes `failed` for its own faults as well as the
-persona's. The bridge's own reasons, `bridge-shutdown`, `bridge-queue-overflow`,
-`bus-publish-failed`, `spawn-failed` and `bridge-died-without-terminal-event`, are
-infrastructure, the class the api transport gives an exhausted transport retry, because they say
-the executor lost the task rather than the persona failing it, the same line the profiles spec
-draws with `worker-evicted`; the persona's reasons, `hermes-exited-nonzero`, `deadline-exceeded`
-and `no-text-parts`, and any reason the harness does not know, are graded failures. A `canceled`
-terminal after the harness's own cancel is the graded timeout above, and `canceled-before-start`
-the infrastructure outcome above. The rule is the same on both transports: the diagnostic
-transport below folds the same terminals and classifies them the same way.
+fresh key per run, case and repetition. The cancel follows the read rather than preceding it,
+because the read is what says whether an executor holds the task: a cancel sent to a task nobody
+consumed gets "cancel sent" back and no terminal ever follows. That is how the harness and the
+gateway agree on what "nobody took it" means, one grace read from the gateway rather than
+configured twice, and nothing the harness does at the deadline can mint a task. A `failed`
+terminal is not graded on its state alone, because the bridge publishes `failed` for its own
+faults as well as the persona's. The reason rides as the terminal's status message, written
+`reason: <token>` or `reason: <token> - <detail>`; the harness strips the `reason:` prefix and
+takes the token up to the next space, so `bus-publish-failed at working` reads as
+`bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
+reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
+`spawn-failed` and `bridge-died-without-terminal-event` and the worker adapter's `worker-evicted`
+and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
+transport gives an exhausted transport retry, because they say the executor lost the task rather
+than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
+persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, and any reason the harness
+does not know, are graded failures. A `rejected` terminal, which both executors publish for a
+submission with no text parts, is infrastructure and never graded, because it is the harness's
+own defect. A `canceled` terminal after the harness's own cancel is the graded timeout above, and
+`canceled-before-start` the infrastructure outcome above. The rule is the same on both
+transports: the diagnostic transport below folds the same terminals and classifies them the same
+way.
 
 **What it proves.** The NATS StatefulSet is up and reachable; the streams exist, which means the
 provisioning Job completed, which means the callout authenticated it; the gateway started,
@@ -384,9 +406,10 @@ names card ids, the case runner waits for the cards one hop further in, with the
 moved with it. Today's wait cannot be re-entered as it is: it is a method of the api transport
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
 `kanban_show` payloads in the trajectory, and gives up after three turns that report nothing, and
-on this path the bridge publishes no trajectory. Stage 1 writes the wait again for the inject
-path: card ids and statuses read from the `result` text, the status question sent as a new turn
-on the same conversation key, the delivered card results appended to the graded answer as
+on this path the trajectory holds no tool calls, only the lifecycle entries of step 4. Stage 1
+writes the wait again for the inject path: card ids and statuses read from the `result` text, the
+status question sent as a new turn on the same conversation key, the delivered card results
+appended to the graded answer as
 today's wait appends them, so `ledger_issue_contains` and `report_contains` see what the worker
 returned, and the worker logs read by those ids for `worker_commands`. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
