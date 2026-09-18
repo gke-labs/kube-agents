@@ -62,7 +62,9 @@ class RollbackEnvironmentResolveTest(unittest.TestCase):
         self.bin_dir = create_minimal_tools_bin(self.tmp_dir)
 
     def _run(self, **env):
-        overrides = {"ROLLBACK_MODE": "resolve", **env}
+        self.summary = self.tmp_dir / "summary.md"
+        self.summary.write_text("")
+        overrides = {"ROLLBACK_MODE": "resolve", "GITHUB_STEP_SUMMARY": str(self.summary), **env}
         return subprocess.run(
             ["bash", str(self.repo / "scripts" / "release" / "rollback_environment.sh")],
             capture_output=True,
@@ -81,25 +83,27 @@ class RollbackEnvironmentResolveTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines()[-1], "0.4.0")
 
-    def test_refuses_when_the_ga_was_cut_from_the_candidate(self):
+    def _assert_skipped(self, proc):
+        """A skip: exit 0, nothing moved, and the summary says why."""
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Skipping", proc.stdout)
+        self.assertIn("no older release", proc.stdout)
+        self.assertIn("Rollback leg skipped", self.summary.read_text())
+
+    def test_skips_when_the_ga_was_cut_from_the_candidate(self):
         """The night after a release: the newest GA is a stamped child of N.
 
-        Equality would miss it and record an N-to-N move as a rollback.
+        Equality would miss it and record an N-to-N move as a rollback; a
+        refusal would make that night red for having nothing to test.
         """
-        proc = self._run(CANDIDATE_SHA=self.commits[1])
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("no older release", proc.stderr)
+        self._assert_skipped(self._run(CANDIDATE_SHA=self.commits[1]))
 
-    def test_refuses_when_the_candidate_is_the_stamped_ga_commit_itself(self):
-        proc = self._run(CANDIDATE_SHA=self.stamped_050)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("no older release", proc.stderr)
+    def test_skips_when_the_candidate_is_the_stamped_ga_commit_itself(self):
+        self._assert_skipped(self._run(CANDIDATE_SHA=self.stamped_050))
 
-    def test_refuses_a_candidate_older_than_the_ga(self):
+    def test_skips_a_candidate_older_than_the_ga(self):
         """A hand-dispatched old candidate would run the two directions swapped."""
-        proc = self._run(CANDIDATE_SHA=self.commits[0], ROLLBACK_TAG="0.5.0")
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("no older release", proc.stderr)
+        self._assert_skipped(self._run(CANDIDATE_SHA=self.commits[0], ROLLBACK_TAG="0.5.0"))
 
     def test_accepts_an_older_ga_for_the_same_candidate(self):
         proc = self._run(CANDIDATE_SHA=self.commits[1], ROLLBACK_TAG="0.4.0")

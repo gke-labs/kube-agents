@@ -113,9 +113,16 @@ ROLLBACK_COMMIT="$(git -C "${REPO_ROOT}" rev-parse --verify "refs/tags/${ROLLBAC
 # the candidate itself, so equality alone would let the night after a release
 # move N to N under another tag and call it a rollback. Ancestry catches that
 # shape, the direct-tag shape, and a hand-dispatched candidate older than the
-# newest GA, where the two directions would run swapped.
+# newest GA, where the two directions would run swapped. A skip, not a
+# failure: the night after a release with nothing newer validated reaches
+# this on purpose, and a red leg with nothing to roll back to would say
+# nothing about rollback.
 if git -C "${REPO_ROOT}" merge-base --is-ancestor "${CANDIDATE_SHA}" "${ROLLBACK_COMMIT}"; then
-  fail "The ${ROLLBACK_TAG} release was cut from the candidate ${CANDIDATE_SHA:0:7} or from a commit after it; there is no older release to roll back to from here."
+  echo "==> Skipping: the ${ROLLBACK_TAG} release was cut from the candidate ${CANDIDATE_SHA:0:7} or from a commit after it, so there is no older release to roll back to from here."
+  summary "### Rollback leg skipped"
+  summary ""
+  summary "The newest GA, ${ROLLBACK_TAG}, was cut from the candidate ${CANDIDATE_SHA:0:7} or from a commit after it; there is no older release to roll back to from here, so nothing was moved."
+  exit 0
 fi
 
 echo "======================================================================"
@@ -234,8 +241,10 @@ collect_diagnostics() {
   local row
   for row in "${RESULT_ROWS[@]}"; do summary "${row}"; done
   summary ""
-  if [ "${status}" -eq 0 ]; then
+  if [ "${status}" -eq 0 ] && [ "${ROLL_FORWARD}" = "true" ]; then
     summary "Every step passed. The environment is back on ${CANDIDATE_SHA:0:7}."
+  elif [ "${status}" -eq 0 ]; then
+    summary "Every step passed. The environment is left on ${ROLLBACK_TAG} (ROLL_FORWARD=false)."
   else
     summary "Failed at **${CURRENT_STEP}**. The diagnostics artifact holds the upgrade logs, the pod list, the events, the operator log and the Helm history at the time of the failure."
   fi
