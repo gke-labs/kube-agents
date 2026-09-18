@@ -441,14 +441,17 @@ hindsight:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-    # The request covers steady state and the limit covers recall. At rest the
-    # API sits near 9m of CPU, and the request is what the scheduler places,
-    # what Autopilot bills and what a ResourceQuota counts, so it stays small.
-    # Recall is CPU-bound on the in-process cross-encoder reranker and bursts
-    # up to the limit; see the template before raising it — more CPU has been
-    # measured to buy nothing on e2-standard-4, and a request of 4 CPUs never
-    # schedules there. An Autopilot cluster without Pod bursting resets the
-    # limit to the request, so raise the request there if recall is slow.
+    # The request covers steady state: at rest the API sits near 9m of CPU,
+    # and the request is what the scheduler places, what Autopilot bills and
+    # what a ResourceQuota counts, so it stays small. The limit is the ceiling
+    # recall may burst to on the in-process cross-encoder reranker; CPU above
+    # the request is best-effort, so on a node shared with other CPU-heavy
+    # tenants the request is the number to raise. An Autopilot cluster without
+    # Pod bursting resets the limit to the request, so raise the request there
+    # too if recall is slow. Raising the limit buys nothing: more CPU has been
+    # measured to change no recall latency on e2-standard-4, and a request of
+    # 4 CPUs never schedules there (docs/designs/memory.md, "What a recall
+    # costs"; k8s-operator/config/integrations/hindsight/api.yaml is canonical).
     resources:
       requests:
         cpu: 250m

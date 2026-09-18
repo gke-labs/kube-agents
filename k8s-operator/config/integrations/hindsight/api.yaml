@@ -147,13 +147,16 @@ spec:
             # scored.
             - name: HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
               value: "true"
-          # The request covers steady state and the limit covers recall. At
-          # rest the API sits near 9m of CPU, and the request is what the
-          # scheduler places, what Autopilot bills and what a ResourceQuota
-          # counts, so it stays small. Recall is CPU-bound on the cross-encoder
-          # reranker, which runs a transformer forward pass per candidate
-          # in-process (see docs/designs/memory.md, "What a recall costs"), and
-          # bursts up to the limit.
+          # The request covers steady state: at rest the API sits near 9m of
+          # CPU, and the request is what the scheduler places, what Autopilot
+          # bills and what a ResourceQuota counts, so it stays small. The limit
+          # is the ceiling recall may burst to: recall is CPU-bound on the
+          # cross-encoder reranker, which runs a transformer forward pass per
+          # candidate in-process (see docs/designs/memory.md, "What a recall
+          # costs"). CPU above the request is best-effort, so on a node shared
+          # with other CPU-heavy tenants the request is the number to raise,
+          # and an Autopilot cluster without Pod bursting resets the limit to
+          # the request, so raise the request there too if recall is slow.
           #
           # Do not raise the limit expecting a speedup — that experiment has
           # been run. Going from 500m/2 to 2/4 left recall latency unchanged. The
