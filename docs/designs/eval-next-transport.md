@@ -148,11 +148,12 @@ whose reason is that this is what makes the adapter the answer for an eval insta
 backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
 the guard say so in code and in the gateway spec's test-backend section. What that trades away is
 the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
-install that wants no real backend from one whose relay URL failed to render; the two-backend
-refusal stays. So the door-alone start is not silent: the gateway logs it and the read route
-reports the armed backend as inject-only, a stage-2 install whose relay URL failed to render reds
-its Chat transport on no reply rather than passing on the door, and the operator's render of the
-relay URL is covered by its golden tests, which is where a failed render is caught.
+install that wants no real backend from one whose relay URL failed to render. The adapter's
+guard change drops only that refusal, only when the door is rendered, and keeps the two-backend
+refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
+the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
+run as infrastructure when Chat is not the one, before any case grades; the operator's render of
+the relay URL is covered by its golden tests, which is where a failed render is caught.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
 for a dead tunnel: the adapter unreachable, the gateway refusing the injection, or no executor
@@ -291,11 +292,11 @@ environment, and the `verifiedBy` value names a project-IAM boundary, not a per-
 lands in the same change that gives the gateway rendered under `next` the credential proxy's chat
 relay URL as its backend, so an install with Google Chat configured has a gateway that starts
 without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
-which the read route reports as inject-only and the Chat transport reds on no reply, the guard
-paragraph in stage 1 saying why the guard no longer catches it. And it settles the one-backend
-guard with the Slack adapter in flight, so the relay URL beside a Slack credential is still a
-refusal and never a collision, while the inject door beside the relay URL is not one (stage 1,
-above), so the install this stage wires runs both transports.
+which the read route reports as inject-only and the stage's preflight fails as infrastructure
+before any case runs, the guard paragraph in stage 1 saying why the guard no longer catches it.
+And it settles the one-backend guard with the Slack adapter in flight, so the relay URL beside a
+Slack credential is still a refusal and never a collision, while the inject door beside the relay
+URL is not one (stage 1, above), so the install this stage wires runs both transports.
 
 Two decisions sit beside that list. The legacy Chat consumer still runs under `next`, and a topic
 fans out to every subscription, so an install that arms the A2A subscription beside it answers
