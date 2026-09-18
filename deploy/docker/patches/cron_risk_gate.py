@@ -35,8 +35,23 @@ APPROVALS_KEY = "approvals"
 #: command in place of reproducing it; a refused command is user-authored
 #: shell that can embed credentials (CodeQL py/clear-text-logging-sensitive-data,
 #: alert 29). The lookalike line still names the offending host, a token
-#: derived from the command, so an operator can see which domain was refused.
+#: derived from the command, so an operator can see which domain was refused;
+#: ``LOG_HOST_MAX_LEN`` bounds it.
 LOG_DIGEST_LEN = 12
+#: Longest host a lookalike refusal log line reproduces whole. ``_HOST_TOKEN``'s
+#: capture group admits letters of either case, digits, dots and hyphens and
+#: nothing else, so the ``:``, ``@``, ``/`` and ``?`` that delimit a scheme,
+#: userinfo, port, path or query never cross into a captured host. The token
+#: is still whatever host-shaped text the command holds -- a userinfo that is
+#: itself shaped like a host is captured as one -- and it can be arbitrarily
+#: long; 253 is the longest presentation-form DNS name (RFC 1035), so the cap
+#: cuts nothing that could resolve.
+LOG_HOST_MAX_LEN = 253
+#: Appended to a host the log line cut at ``LOG_HOST_MAX_LEN``, naming how much
+#: is missing. The apex can sit anywhere in the host, so a cut can hide the
+#: segment that mimics it; the marker keeps a cut host from reading as a whole
+#: one, and the apex is logged beside it either way.
+LOG_HOST_CUT_MARKER = "...[+{cut} chars]"
 #: ``str.encode`` error handler for the digest. A lone surrogate, which
 #: ``json.loads`` yields for a ``\ud800``-style escape in a tool call, cannot
 #: be encoded strictly; a refusal must log and return, never raise.
@@ -66,8 +81,14 @@ MSG_MUTATION_REFUSED = (
 #: DEL (\x7f), and C1 control characters (\x80-\x9f, including 8-bit CSI \x9b).
 _ESC = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
 
-#: Apex domains trusted for Kubernetes and GKE platform operations.
-TRUSTED_APEX = (
+#: Apex domains the lookalike check protects from impersonation: a host that
+#: embeds one of these at a label boundary without being it or one of its
+#: subdomains is refused. Membership grants nothing -- a host outside the list
+#: is not refused for being outside it -- so this is not a trust allowlist and
+#: is not named as one: CodeQL's clear-text-logging heuristic treats every
+#: identifier containing ``trusted`` as a secret source, and alert 32 flagged
+#: the ``apex`` a lookalike refusal logs, a public suffix from this tuple.
+PROTECTED_APEX_DOMAINS = (
     "kubernetes.io",
     "googleapis.com",
     "github.com",
@@ -655,6 +676,17 @@ def _segment_is_read_only(tokens: list[str]) -> bool:
     return res_value and res_bool
 
 
+def _log_host(host: str) -> str:
+    """Return ``host`` as a lookalike refusal log line reproduces it.
+
+    Whole up to ``LOG_HOST_MAX_LEN``; past that, the head with
+    ``LOG_HOST_CUT_MARKER`` naming how many characters were cut.
+    """
+    if len(host) <= LOG_HOST_MAX_LEN:
+        return host
+    return host[:LOG_HOST_MAX_LEN] + LOG_HOST_CUT_MARKER.format(cut=len(host) - LOG_HOST_MAX_LEN)
+
+
 def _command_digest(command: str) -> str:
     """Return a truncated SHA-256 hex digest identifying ``command`` in a log line.
 
@@ -707,7 +739,7 @@ def cron_execute_code_block() -> Optional[dict]:
 
 
 def find_lookalike_domain(command: str) -> Optional[tuple[str, str]]:
-    """Detect whether any host token in the command mimics a trusted apex domain.
+    """Detect whether any host token in the command mimics a protected apex domain.
 
     Returns (detected_host, matched_apex) if a lookalike is detected, else None.
     Legitimate exact matches (e.g. 'k8s.io') and proper subdomains (e.g.
@@ -719,7 +751,7 @@ def find_lookalike_domain(command: str) -> Optional[tuple[str, str]]:
 
     for match in _HOST_TOKEN.finditer(command):
         raw = match.group(1).lower().rstrip(".:/'\"")
-        for apex in TRUSTED_APEX:
+        for apex in PROTECTED_APEX_DOMAINS:
             # Legitimate apex or proper subdomain of apex
             if raw == apex or raw.endswith("." + apex):
                 continue
@@ -761,7 +793,7 @@ def cron_content_block(
         host, apex = lookalike
         logger.warning(
             "Cron risk gate block [lookalike]: command contains lookalike domain '%s' mimicking apex '%s' (sha256=%s len=%d)",
-            host,
+            _log_host(host),
             apex,
             _command_digest(command),
             len(command),

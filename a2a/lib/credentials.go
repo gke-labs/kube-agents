@@ -56,6 +56,17 @@ const (
 	// (local runs, tests). Unset means BusTokenPath.
 	EnvBusTokenFile = "A2A_BUS_TOKEN_FILE"
 
+	// EnvBusUser carries the principal name the operator authenticated this
+	// container as, for a client whose inbox owner is a fixed user rather
+	// than its own pod name. The agent container is that client: the callout
+	// resolves its ServiceAccount to the `agent` identity and grants
+	// _INBOX.agent.>, and a client that does not pin a matching prefix
+	// authenticates fine and then times out on every JetStream call. Reading
+	// the name back from the render is what keeps the two from drifting; the
+	// operator cannot import this package, so the literal is duplicated and
+	// the rendered-config fixture is what holds them equal.
+	EnvBusUser = "A2A_BUS_USER"
+
 	// EnvPodName carries the pod's own name by the downward API. Under the
 	// callout a session's grants are derived from the pod name the API
 	// server attests, and the client has to pin the matching inbox prefix

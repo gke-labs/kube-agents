@@ -713,5 +713,83 @@ class RefreshCredentialsOnceTest(unittest.TestCase):
             self.assertEqual(mock_refresh.call_count, 1)
 
 
+class ReadOnlyMintTest(unittest.TestCase):
+    """`--read-only`: one repository, the read scope, straight to Minty, nothing installed."""
+
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("gitops_workspace.get_managed_github_repos")
+    def test_requests_the_read_scope_for_one_repository_and_installs_nothing(
+        self, get_managed_github_repos, urlopen, run, fetch
+    ):
+        import json
+
+        # The managed list is what the write mint widens its request with. The
+        # read mint must not consult it: the token is per clone of one
+        # repository, and widening it would grant a read of every managed
+        # repository to a clone that asked for one context repository.
+        get_managed_github_repos.return_value = ["owner/repo1", "owner/repo2"]
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "gcloud":
+                return MagicMock(stdout="fake-oidc-token\n")
+            self.fail(f"the read-only mint ran a subprocess it must not: {cmd}")
+
+        run.side_effect = fake_run
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b"fake-read-token\n"
+        response.__enter__.return_value = response
+        urlopen.return_value = response
+
+        # Even with a sidecar URL in the environment: this runs *in* the
+        # sidecar, and there is nothing to delegate to.
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://sidecar.invalid"}):
+            token = github_token_refresh.mint_read_only_token("owner/repo1")
+
+        self.assertEqual("fake-read-token", token)
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual("owner", body["org_name"])
+        self.assertEqual(["repo1"], body["repositories"])
+        self.assertEqual("platform-agent-read-scope", body["scope"])
+        get_managed_github_repos.assert_not_called()
+        for invocation in run.call_args_list:
+            self.assertEqual("gcloud", invocation.args[0][0])
+
+    def test_refuses_anything_that_is_not_an_owner_slash_repo(self):
+        for repository in (None, "", "owner", "github.com/owner", "owner/repo/extra"):
+            with self.subTest(repository=repository):
+                with self.assertRaises(RuntimeError):
+                    github_token_refresh.mint_read_only_token(repository)
+
+    @patch("github_token_refresh.mint_read_only_token", return_value="fake-read-token")
+    def test_main_prints_the_token_and_only_the_token(self, mint):
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["github_token_refresh.py", "--read-only", "owner/repo"]):
+            with patch("sys.stdout", out):
+                main()
+        self.assertEqual("fake-read-token", out.getvalue())
+        mint.assert_called_once_with("owner/repo")
+
+    @patch("github_token_refresh.mint_read_only_token", side_effect=RuntimeError("Minty down"))
+    def test_main_read_only_failure_exits_nonzero_with_nothing_on_stdout(self, mint):
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["github_token_refresh.py", "--read-only", "owner/repo"]):
+            with patch("sys.stdout", out):
+                with self.assertRaises(SystemExit) as cm:
+                    main()
+        self.assertEqual(1, cm.exception.code)
+        self.assertEqual("", out.getvalue())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_main_without_the_flag_still_refreshes(self, run):
+        # The positional form every existing caller uses is unchanged.
+        with patch.object(sys, "argv", ["github_token_refresh.py", "org/repo"]):
+            with patch("github_token_refresh.refresh_git_credentials") as refresh:
+                main()
+        refresh.assert_called_once_with("org/repo")
+
 if __name__ == "__main__":
     unittest.main()

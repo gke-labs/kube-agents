@@ -55,7 +55,7 @@ __INLINE_HEALTH__
     -webkit-font-smoothing:antialiased; }
   .wrap { max-width:760px; margin:0 auto; padding:0 24px 80px; }
   /* The two table pages need the width; the prose pages read better narrow. */
-  body[data-page="grid"] .wrap, body[data-page="cases"] .wrap, body[data-page="nightly"] .wrap { max-width:1120px; }
+  body[data-page="grid"] .wrap, body[data-page="cases"] .wrap, body[data-page="nightly"] .wrap, body[data-page="trend"] .wrap { max-width:1120px; }
   a { color:var(--accent-link,var(--accent)); text-decoration:none; font-weight:600; }
   a:hover { text-decoration:underline; }
   b, strong { font-weight:650; }
@@ -296,6 +296,50 @@ __INLINE_HEALTH__
   .nights span.now { border-color:var(--accent); background:var(--accent-soft); color:var(--text-primary); }
   .nights .p-fail, .nights .p-pass, .nights .p-partial, .nights .p-infra { margin-left:6px; padding:1px 6px; }
 
+  /* The Trend page: two charts per scope, drawn as inline SVG from
+     brief.json's trend block. One series per chart in the page accent;
+     text wears the text tokens, never the series colour; grid and axes are
+     solid hairlines one step off the surface. */
+  .tcard { background:var(--surface-1); border:1px solid var(--line); border-radius:12px; padding:14px 16px 10px; box-shadow:var(--shadow); margin-top:12px; }
+  .tcard h3 { font-size:14px; font-weight:650; display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; }
+  .tcard h3 small { font-weight:500; color:var(--text-muted); font-size:12.5px; }
+  .tgrid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:820px) { .tgrid { grid-template-columns:1fr; } }
+  .tchart { display:block; width:100%; height:auto; margin-top:6px; overflow:visible; font:11px ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .tchart .grid { stroke:var(--line); stroke-width:1; }
+  .tchart .axis { fill:var(--text-muted); }
+  .tchart .bar { fill:var(--accent); opacity:.55; }
+  .tchart .bar.win { fill:var(--accent); opacity:.28; }
+  .tchart .line { fill:none; stroke:var(--accent); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+  .tchart .band { fill:var(--accent); opacity:.14; }
+  .tchart .dot { fill:var(--accent); stroke:var(--surface-1); stroke-width:2; }
+  .tchart .dot.lone { fill:var(--surface-1); stroke:var(--accent); }
+  .tchart .thr { stroke:var(--warn); stroke-width:1; }
+  .tchart .thr-l { fill:var(--warn-text); }
+  .tchart .keym { stroke:var(--hl); stroke-width:2; }
+  .tchart .keym-l { fill:var(--text-primary); font-weight:600; }
+  .tchart .incm { stroke:var(--crit); stroke-width:2; }
+  .tchart .incm-l { fill:var(--crit-text); font-weight:600; }
+  .tchart .lab { fill:var(--text-secondary); font-weight:600; }
+  .tchart .hit { fill:transparent; cursor:crosshair; }
+  .tchart .hit:hover, .tchart .hit:focus { fill:var(--accent); opacity:.08; outline:0; }
+  .tlegend { display:flex; gap:16px; flex-wrap:wrap; color:var(--text-muted); font-size:12px; margin-top:6px; }
+  .tlegend i { display:inline-block; width:14px; height:10px; border-radius:2px; vertical-align:-1px; margin-right:5px; background:var(--accent); opacity:.55; }
+  .tlegend i.win { opacity:.28; }
+  .tlegend i.line { height:2px; opacity:1; vertical-align:3px; }
+  .tlegend i.band { opacity:.14; }
+  .tlegend i.keym { width:3px; border-radius:0; background:var(--hl); opacity:1; }
+  .tlegend i.incm { width:3px; border-radius:0; background:var(--crit); opacity:1; }
+  .tlegend i.thr { width:14px; height:1px; background:var(--warn); opacity:1; vertical-align:3px; }
+  .ttip { position:fixed; z-index:9; pointer-events:none; background:var(--surface-1); border:1px solid var(--line-2); border-radius:8px; padding:8px 10px;
+    font-size:12.5px; color:var(--text-secondary); box-shadow:var(--shadow); max-width:320px; display:none; }
+  .ttip b { color:var(--text-primary); font-weight:650; }
+  table.tt { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:8px; }
+  table.tt th { text-align:left; font-size:10.5px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.06em; padding:4px 8px; border-bottom:1px solid var(--line); }
+  table.tt td { padding:4px 8px; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  table.tt tr:last-child td { border-bottom:0; }
+  details.tv summary { cursor:pointer; color:var(--text-muted); font-size:12.5px; margin-top:8px; font-weight:600; }
+  .rec { font-size:13px; color:var(--text-secondary); margin-top:6px; }
   .foot { margin-top:40px; color:var(--text-muted); font-size:13.5px; display:flex; gap:18px; flex-wrap:wrap; }
   .foot.block { display:block; }
 </style>
@@ -305,7 +349,7 @@ __INLINE_HEALTH__
 <div class="top"><div class="top-in">
   <span class="brand"><img class="logo" src="__LOGO__" alt="" width="22" height="22">kube-agents <span class="tag">evals</span></span>
   <nav class="nav">
-    <a href="index.html" __NAV_BRIEF__>Brief</a><a href="grid.html" __NAV_GRID__>Grid</a><a href="cases.html" __NAV_CASES__>Cases</a><a href="nightly.html" __NAV_NIGHTLY__>Nightly</a>__NAV_RUN__
+    <a href="index.html" __NAV_BRIEF__>Brief</a><a href="grid.html" __NAV_GRID__>Grid</a><a href="cases.html" __NAV_CASES__>Cases</a><a href="nightly.html" __NAV_NIGHTLY__>Nightly</a><a href="trend.html" __NAV_TREND__>Trend</a>__NAV_RUN__
   </nav>
   <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
 </div></div>

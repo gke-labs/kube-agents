@@ -203,8 +203,12 @@ requires Workload Identity (`GKE_METADATA`).
 
 `ENABLE_NETWORK_POLICY=true` (or `--enable-network-policy`) authorizes enabling the legacy Calico
 NetworkPolicy addon and enforcement on pre-existing GKE Standard clusters lacking Dataplane V2.
-Enabling Calico may recreate nodes and restart workloads. Without opt-in, the install aborts before
-making any cluster changes because kube-agents requires NetworkPolicy enforcement.
+Enabling Calico may recreate nodes and restart workloads. `ACCEPT_NO_NETWORK_POLICY=true` (or
+`--accept-no-network-policy`) is the other answer: install without enforcement and leave the cluster
+as it is. The generator emits it as `accept_no_network_policy` in `terraform.tfvars`, which is what
+gets the plan past the gke-cluster module's postcondition, so the key has to stay in `install.env`
+for `upgrade.sh` and the Day-2 menu to regenerate an applicable file. Without either, the install
+aborts before making any cluster changes.
 
 `ALLOW_UNENCRYPTED_SECRETS=true` skips the out-of-band Cloud KMS CMEK database encryption on
 pre-existing clusters (testing environments only).

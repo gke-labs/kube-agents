@@ -303,6 +303,7 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
 )
 
 PROTECTED_BRANCHES = {"main", "master", "production"}
+PROTECTED_BRANCH_PREFIXES = ("run/",)
 
 # Both directories must live on the PVC. `gh` and `git` are not binaries in the
 # agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
@@ -424,6 +425,16 @@ ID_SCHEME_RE = re.compile(
 # by title when it no longer exists in the current findings.json.
 FINDING_MARKER_RE = re.compile(
     r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
+)
+# The `Where:` line `render_finding` writes under every heading above: the
+# cluster, the namespace (or the cluster-scoped placeholder) and the object.
+# Read back by `parse_finding_locations` so a later run can ask whether it
+# looked at the same object again. `_ident` keeps a backtick out of all three.
+WHERE_LINE_RE = re.compile(
+    r"^- \*\*Where:\*\* `([^`\n]*)`"
+    r"(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)`[ \t]*$",
+    re.M,
 )
 
 # Idempotency markers. Design §3.1 deliberately never mutates a `/remediate`
@@ -565,6 +576,14 @@ DECLARED_INTENT_REPOS_KEY = "declared_intent_repos"
 # Where `finish` files what it withheld: on the document, so every renderer
 # derives the same gap from it, and on the JSON line, as the withheld ids.
 POSTURES_WITHHELD_KEY = "postures_withheld"
+# The ids of previous findings a clean run checked again and neither
+# reported nor explained (`unaccounted_previous_findings`). Non-empty only on
+# a `HELD` result; carried on every JSON line so the field is never absent.
+UNACCOUNTED_KEY = "unaccounted"
+# What `start` hands the worker about the open ledger: every finding its body
+# carries, by id and identity, so a run that finds one gone can say so under
+# `resolved_because` instead of being held over the silence.
+CARRIED_KEY = "carried"
 # An abbreviated sha is what `git rev-parse --short` prints and a full one is
 # what the broker reports; anything between the two is a sha, anything else is
 # not one.
@@ -1112,8 +1131,8 @@ def base_branch() -> str:
     origin/main` then failed, and the whole remediation half of the run died
     after the findings had already been written. Resolution lives in
     `gitops_workspace` so that `submit-suggestion` gets the same answer; see
-    `resolve_base_branch` for the order (`GITOPS_BASE_BRANCH`, then
-    `origin/HEAD`, then `main`).
+    `resolve_base_branch` for the order (`CREDENTIAL_PROXY_BASE_BRANCH` /
+    `GITOPS_BASE_BRANCH`, then `origin/HEAD`, then `main`).
 
     Answering `main` with no workspace is deliberate, not a fallback that got
     forgotten: `resolve_base_branch` cannot ask a clone that does not exist yet,
@@ -1127,7 +1146,23 @@ def base_branch() -> str:
 
 def assert_pushable(branch: str) -> str:
     """Refuse to force-push a protected branch (same guardrail as submit_suggestion.py)."""
-    if branch.strip().lower() in PROTECTED_BRANCHES:
+    short = branch.strip().lower()
+    if short.startswith("refs/heads/"):
+        short = short[len("refs/heads/"):]
+    elif short.startswith("heads/"):
+        short = short[len("heads/"):]
+    protected = set(PROTECTED_BRANCHES)
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip().lower()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip().lower()
+    )
+    if override:
+        if override.startswith("refs/heads/"):
+            override = override[len("refs/heads/"):]
+        elif override.startswith("heads/"):
+            override = override[len("heads/"):]
+        protected.add(override)
+    if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
             f"'{branch}' is strictly blocked by GKE SRE guardrails!"
@@ -1249,6 +1284,9 @@ def validate_check_command(value: object, where: str, check: str) -> str:
 # the document that can *shrink* the fleet the run is measured against — it has
 # to cost a sentence.
 MIN_NA_REASON_CHARS = 16
+# Same floor for a `resolved_because` reason, for the same reason: it is the
+# one sentence that lets a clean run retire a finding the ledger was carrying.
+MIN_RESOLVED_REASON_CHARS = 16
 
 
 def validate_na_reason(value: object, where: str, check: str) -> str:
@@ -1889,6 +1927,79 @@ def validate_findings(data: object, audit_id: str) -> dict:
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
 
+    # Previous findings this run confirmed gone, each with the reason. The
+    # clean-close guard (`unaccounted_previous_findings`) refuses to retire a
+    # ledger whose last body carried a finding whose check this run's own
+    # `checks_run` says ran again on that cluster while its `findings` omit
+    # it: from the document alone, "fixed" and "not written down" are the same
+    # absence, and on 2026-09-16 that absence closed a compliance ledger as
+    # clean over a live cluster-admin binding. This list is how a run says
+    # which of the two it was; `start` prints the ids to answer for under
+    # `carried`. Optional; `[]` and an absent key mean the same thing. An
+    # entry carries a finding's four identity fields and a reason — no
+    # severity, no evidence, no id — because it is not a finding: it enters no
+    # delta block and is never rendered on the ledger.
+    resolved = data.get("resolved_because")
+    if resolved is not None:
+        if not isinstance(resolved, list):
+            raise ValidationError(
+                "resolved_because: must be a list when present — one entry per "
+                "previous finding this run confirmed gone, or omit the key"
+            )
+        seen_resolved: dict[str, int] = {}
+        for i, entry in enumerate(resolved):
+            where = f"resolved_because[{i}]"
+            if not isinstance(entry, dict):
+                raise ValidationError(
+                    f"{where}: expected an object with 'check', 'cluster', "
+                    "'object' and 'reason' (and 'namespace' unless cluster-scoped)"
+                )
+            _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+            check = str(entry["check"])
+            if check not in finding_check_set:
+                # No roster, for the reason `findings[].check` gives none.
+                raise ValidationError(
+                    f"{where}.check: {check!r} is not a check in the {audit_id} "
+                    "SOP. Name checks by the backticked slug in their `####` "
+                    f"heading. {_sop_pointer(audit_id)}"
+                )
+            _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)
+            cluster = str(entry["cluster"])
+            if cluster not in audited_names:
+                raise ValidationError(
+                    f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
+                    "finding can only be confirmed gone on a cluster this run read"
+                )
+            _require_str(entry.get("namespace", ""), f"{where}.namespace")
+            _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
+            for field in ("cluster", "object"):
+                if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
+                    raise ValidationError(
+                        f"{where}.{field}: {entry[field]!r} has no letter or digit "
+                        "in it, so it names nothing"
+                    )
+            reason = _require_str(
+                entry.get("reason"), f"{where}.reason", allow_empty=False
+            )
+            if len(reason.strip()) < MIN_RESOLVED_REASON_CHARS:
+                raise ValidationError(
+                    f"{where}.reason: {reason!r} is too short to say why the "
+                    "finding is gone. Say what the command showed — the binding "
+                    "deleted, the setting changed — so a reader can weigh it"
+                )
+            full_id = derive_finding_id(entry)
+            if full_id in seen_ids:
+                raise ValidationError(
+                    f"{where}: same identity as findings[{seen_ids[full_id]}] — a "
+                    "finding cannot be reported and confirmed gone in one "
+                    "document. Drop one of the two"
+                )
+            if full_id in seen_resolved:
+                raise ValidationError(
+                    f"{where}: duplicate of resolved_because[{seen_resolved[full_id]}]"
+                )
+            seen_resolved[full_id] = i
+
     # Postures a check would have flagged and a linked repository declares on
     # purpose. Optional: a document without the key is the shape every stream
     # wrote before declarations existed, and it validates unchanged. An entry
@@ -2451,6 +2562,106 @@ def compute_delta(
     rendered = set(rendered_ids)
     current = set(rendered_ids if all_current_ids is None else all_current_ids)
     return sorted(rendered - previous), sorted(previous - current)
+
+
+def parse_finding_locations(body: str | None) -> dict[str, dict[str, str]]:
+    """Recover {finding id: {title, cluster, namespace, object}} from a previous body.
+
+    `parse_finding_titles` names a resolved finding; this reads the rest of its
+    heading block — the `Where:` line `render_finding` writes directly under
+    it — so a later run can ask whether it looked at that object again. Only
+    the harness writes these lines, in one shape, so a block whose `Where:`
+    line is missing or does not parse is left out rather than guessed at.
+    """
+    body = normalise_newlines(body)
+    if not body:
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    markers = list(FINDING_MARKER_RE.finditer(body))
+    for index, match in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(body)
+        where = WHERE_LINE_RE.search(body, match.end(), end)
+        if not where:
+            continue
+        out[match.group(2)] = {
+            "title": match.group(1).strip(),
+            "cluster": where.group(1),
+            "namespace": where.group(2) or "",
+            "object": where.group(3),
+        }
+    return out
+
+
+def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list[dict]:
+    """Previous findings this run checked again, dropped, and did not explain.
+
+    The clean path used to close the ledger on `findings == []` plus complete
+    coverage, and `checks_run` is the only evidence of coverage it has — a
+    claim the harness takes on trust. On 2026-09-16 a compliance run whose
+    document listed `cluster-admin-binding` on every cluster closed ledger #29
+    as clean while the planted `debug-binding` still granted cluster-admin. A
+    padded `checks_run` cannot be detected from here, but this can: the last
+    ledger body carried a finding under that check on that cluster, and this
+    run says the same check ran there again, so the run either saw the finding
+    gone or left it out. It is asked to say which, through `resolved_because`;
+    until it does, the ledger is not closed over the silence.
+
+    The join is on the check and the cluster, not on the command's text: the
+    SOPs' prescribed commands are fleet-wide listings (`kubectl get
+    clusterrolebindings -o json | jq …`) that name no object, and a run that
+    ran one has checked every object it lists. A check the document declares
+    not applicable on that cluster did not run there, and holds nothing.
+
+    Returns one entry per finding held: its rendered `id` and `title`, the
+    `check`, `cluster`, `namespace` and `object` from the body, and `commands`,
+    what this run says it ran for that check on that cluster. Empty when the
+    previous body is unreadable, carries no findings, or every previous
+    finding is reported again, explained under `resolved_because`, moved
+    under `declared`, or on a cluster this run did not read or did not run
+    that check against. Sorted by id.
+    """
+    previous = parse_finding_locations(previous_body)
+    if not previous:
+        return []
+    # Explained under `resolved_because`, or moved under `declared`: a
+    # posture now covered by a declaration is present and accounted for, and
+    # SKILL.md says that move is its designed retirement path. Neither is
+    # "not written down".
+    explained = {
+        derive_finding_id(entry)
+        for key in ("resolved_because", "declared")
+        for entry in data.get(key) or []
+        if isinstance(entry, dict)
+    }
+    current = {
+        derive_finding_id(finding)
+        for finding in data.get("findings") or []
+        if isinstance(finding, dict)
+    }
+    clusters_by_key: dict[str, dict] = {}
+    for cluster in (data.get("scope") or {}).get("clusters") or []:
+        if isinstance(cluster, dict):
+            clusters_by_key.setdefault(_id_segment(str(cluster.get("name", ""))), cluster)
+    held: list[dict] = []
+    for fid, where in previous.items():
+        # `_shorten_id` never touches the leading segment, so the check slug
+        # survives shortening; the other three are read verbatim off the body
+        # rather than off the id, which may have been clipped.
+        check = fid.split(".", 1)[0]
+        key = derive_finding_id({"check": check, **where})
+        if key in explained or key in current:
+            continue
+        cluster = clusters_by_key.get(_id_segment(where["cluster"]))
+        if not cluster:
+            continue
+        commands = [
+            str(entry.get("command", ""))
+            for entry in cluster.get("checks_run") or []
+            if isinstance(entry, dict) and str(entry.get("check", "")).strip() == check
+        ]
+        if commands:
+            held.append({"id": fid, "check": check, **where, "commands": commands})
+    return sorted(held, key=lambda entry: entry["id"])
 
 
 # --------------------------------------------------------------------------- #
@@ -4414,6 +4625,13 @@ def render_clean_comment(
     that is not happening — a reader who takes "closed as completed" at face
     value on a still-open issue learns to distrust every other line the harness
     writes.
+
+    Both endings carry the run's evidence table. A clean run does not rewrite
+    the body, so until now the commands behind an all-clear were published
+    nowhere: a ledger closed over a live finding (evals-6 #29, 2026-09-16) left
+    the date and the cluster list, and no way to see what the run had asked
+    the fleet. The table is the same one the body renders, dropped whole rather
+    than clipped if the comment would otherwise pass GitHub's limit.
     """
     scope = data.get("scope") or {}
     clusters = list(scope.get("clusters") or [])
@@ -4477,30 +4695,136 @@ def render_clean_comment(
         if len(withheld) > MAX_DECLARED_ROWS:
             out.append(f"- _…and {len(withheld) - MAX_DECLARED_ROWS} more_")
 
-    # A clean run closes the ledger without rewriting it, so this comment is
-    # the last place a declared posture is published on the issue tracker:
-    # once the ledger is closed, a clean run with declarations opens nothing
-    # (see the CLEAN branch of `handle_finish`), and the record is the
-    # declaration itself in the repository plus the `declared` count on the
-    # `finish` line. Say what was seen and where it is declared; "0 findings"
-    # over a fleet with pinned replicas the operator never hears about is a
-    # quieter claim than the run can back.
+    out += _comment_resolved(data)
+    out += _comment_declared(data)
+    out += _comment_evidence(audit_id, clusters, out)
+    return _clip_comment("\n".join(out))
+
+
+def _comment_resolved(data: dict) -> list[str]:
+    """The `resolved_because` entries, id and reason, for a comment.
+
+    The reason is the one sentence that retired a carried finding, and the
+    ledger body is not rewritten on a clean run, so the comment is the only
+    place it can be published. Validated and then dropped, it would be a
+    claim made to the harness and to nobody else.
+    """
+    resolved = [e for e in data.get("resolved_because") or [] if isinstance(e, dict)]
+    if not resolved:
+        return []
+    noun = "finding" if len(resolved) == 1 else "findings"
+    out = [
+        "",
+        f"{len(resolved)} previously reported {noun} the run confirmed gone, in its "
+        "own words:",
+        "",
+    ]
+    for entry in resolved[:MAX_DELTA_ROWS]:
+        out.append(
+            f"- `{_cell(derive_finding_id(entry))}` — "
+            f"{_cell(str(entry.get('reason', '')))}"
+        )
+    if len(resolved) > MAX_DELTA_ROWS:
+        out.append(f"- _…and {len(resolved) - MAX_DELTA_ROWS} more_")
+    return out
+
+
+def _comment_declared(data: dict) -> list[str]:
+    """The declared postures, with their `repo:path` pointers, for a comment.
+
+    A clean run closes the ledger without rewriting it, so this comment is
+    the last place a declared posture is published on the issue tracker:
+    once the ledger is closed, a clean run with declarations opens nothing
+    (see the CLEAN branch of `handle_finish`), and the record is the
+    declaration itself in the repository plus the `declared` count on the
+    `finish` line. Say what was seen and where it is declared; "0 findings"
+    over a fleet with pinned replicas the operator never hears about is a
+    quieter claim than the run can back. A held run is not rewritten either.
+    """
     declared = list(data.get("declared") or [])
-    if declared:
-        out += [
-            "",
-            f"{len(declared)} posture(s) a check would have flagged are declared "
-            "on purpose in a linked repository and were not reported as findings:",
-            "",
-        ]
-        for entry in declared[:MAX_DECLARED_ROWS]:
-            obj, where = _declared_pointer(entry)
-            out.append(
-                f"- `{_cell(str(entry.get('check', '')))}` on `{obj}` in "
-                f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`"
-            )
-        if len(declared) > MAX_DECLARED_ROWS:
-            out.append(f"- _…and {len(declared) - MAX_DECLARED_ROWS} more_")
+    if not declared:
+        return []
+    out = [
+        "",
+        f"{len(declared)} posture(s) a check would have flagged are declared "
+        "on purpose in a linked repository and were not reported as findings:",
+        "",
+    ]
+    for entry in declared[:MAX_DECLARED_ROWS]:
+        obj, where = _declared_pointer(entry)
+        out.append(
+            f"- `{_cell(str(entry.get('check', '')))}` on `{obj}` in "
+            f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`"
+        )
+    if len(declared) > MAX_DECLARED_ROWS:
+        out.append(f"- _…and {len(declared) - MAX_DECLARED_ROWS} more_")
+    return out
+
+
+def _comment_evidence(audit_id: str, clusters: list[dict], out: list[str]) -> list[str]:
+    """The evidence table for a comment, against what the comment has left."""
+    budget = MAX_BODY_CHARS - len("\n".join(out)) - 1
+    return _render_check_evidence(clusters, audit_id, budget) if budget > 0 else []
+
+
+def render_held_comment(
+    audit_id: str, data: dict, held: list[dict], generated_at: datetime
+) -> str:
+    """Comment posted when a clean run is refused its close (`HELD`).
+
+    The third ending of a clean run, next to the all-clear and the coverage
+    gap: zero findings over complete coverage, but the previous ledger carried
+    findings whose checks this run says it ran again and the document neither
+    reports nor explains. The comment has to say what would let the ledger
+    close, because the run that reads it next is the same worker with the same
+    SOP, and "stays open" alone teaches it nothing.
+    """
+    scope = data.get("scope") or {}
+    clusters = list(scope.get("clusters") or [])
+    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    shown = clusters[:MAX_SCOPE_ROWS]
+    names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
+    if len(clusters) > len(shown):
+        names += f", and {len(clusters) - len(shown)} more"
+    noun = "finding" if len(held) == 1 else "findings"
+    out = [
+        f"### `{audit_id}` found nothing — but did not account for {len(held)} "
+        f"previous {noun}, so the ledger stays open",
+        "",
+        f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
+        f"{len(clusters)} audited cluster(s): {names}.",
+        "",
+        "**This is not an all-clear.** This ledger reported each finding below, "
+        "and this run's own `checks_run` says the check that found it ran again "
+        "on that cluster — yet the document neither reports the finding again nor "
+        "carries a `resolved_because` entry saying what that check showed. From "
+        'here "fixed" and "not written down" are the same absence, so nothing has '
+        "been reported as resolved, no remediation pull request has been closed, "
+        "and the ledger stays open. It closes on the next run that reports each of "
+        "these again, or says per finding why it is gone; `start` lists them "
+        "under `carried`.",
+        "",
+    ]
+    for entry in held[:MAX_DELTA_ROWS]:
+        namespace = str(entry.get("namespace", ""))
+        place = f"`{_cell(str(entry.get('cluster', '')))}`"
+        place += f" / `{_cell(namespace)}`" if namespace else " / _cluster-scoped_"
+        commands = entry["commands"]
+        others = len(commands) - 1
+        line = (
+            f"- `{_cell(str(entry.get('id', '')))}` — {_cell(str(entry.get('title', '')))} "
+            f"— `{_cell(str(entry.get('object', '')))}` in {place}; "
+            f"`{_cell(str(entry.get('check', '')))}` ran there as "
+            f"`{_cell(commands[0])}`"
+        )
+        if others:
+            line += f" _(and {others} more)_"
+        out.append(line)
+    if len(held) > MAX_DELTA_ROWS:
+        out.append(f"- _…and {len(held) - MAX_DELTA_ROWS} more_")
+    out += _comment_resolved(data)
+    out += _comment_declared(data)
+    out += _comment_evidence(audit_id, clusters, out)
     return _clip_comment("\n".join(out))
 
 
@@ -4742,34 +5066,63 @@ def render_ack_comment(
 
 
 def render_clean_remediate_answer(
-    audit_id: str, request: dict, generated_at: datetime, *, closing: bool
+    audit_id: str,
+    request: dict,
+    generated_at: datetime,
+    *,
+    closing: bool,
+    held: bool = False,
 ) -> str:
     """Said once per `/remediate` standing on a ledger that came back clean.
 
-    Not a refusal — nothing was wrong with the request. The finding it named has
-    simply stopped reproducing, which is the outcome the requester wanted, and
-    saying so is what stops them from re-asking on an issue that is about to
-    close.
+    Not a refusal — nothing was wrong with the request. On a closing or a
+    partial run the finding it named has simply stopped reproducing, which is
+    the outcome the requester wanted, and saying so is what stops them from
+    re-asking on an issue that is about to close.
+
+    On a held run (`held=True`) it must say something else: the run did not
+    account for the findings the ledger carries, and the requester's target
+    is, by construction, one of them. "No longer reproduces" would contradict
+    the held-open comment posted right after it.
     """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     targets = request.get("targets") or []
     named = ", ".join(f"`{_ident(t)}`" for t in targets)
+    if held:
+        middle = (
+            f"The {audit_name(audit_id)} audit found **0 findings** on this run, but "
+            "it did not account for the findings this ledger was carrying"
+            + (f" — {named} among them" if targets else "")
+            + ", so nothing has been reported as resolved. A pull request here "
+            "would propose a fix for a finding whose state this run did not "
+            "establish."
+        )
+    else:
+        middle = (
+            f"The {audit_name(audit_id)} audit found **0 findings** on this run"
+            + (
+                f", so {named} no longer reproduces."
+                if targets
+                else ", so there is nothing left to remediate."
+            )
+            + " A pull request here would propose a change nobody needs."
+        )
     out = [
         f"@{request.get('author', 'someone')} — that `/remediate` was read on "
         f"{stamp}, and no pull request was opened.",
         "",
-        f"The {audit_name(audit_id)} audit found **0 findings** on this run"
-        + (
-            f", so {named} no longer reproduces."
-            if targets
-            else ", so there is nothing left to remediate."
-        )
-        + " A pull request here would propose a change nobody needs.",
+        middle,
         "",
         (
             "This ledger is closing as completed. If the finding comes back, the "
             "next run opens a fresh ledger issue — ask again there."
             if closing
+            # Two reasons a clean run leaves the ledger open, and they must not
+            # share a sentence: a held close read the whole fleet.
+            else "This ledger stays open because the run did not account for "
+            "findings it was carrying (see the held-open comment below); ask "
+            "again once a run reports or explains them."
+            if held
             else "This ledger stays open because the run could not see the whole "
             "fleet; ask again once it reports complete coverage."
         ),
@@ -6231,8 +6584,19 @@ def handle_start(args: argparse.Namespace) -> None:
     existing_issue, _ = find_existing_issue(repo, audit_id)
 
     pending: list[str] = []
+    carried: list[dict[str, str]] = []
     if existing_issue is not None:
         pending = pending_remediate_targets(fetch_issue_comments(repo, existing_issue))
+        # What the ledger carries, read off the same body `finish` will join
+        # against. An unreadable body prints an empty list and says so on
+        # stderr (fetch_issue_body logs it); `finish` then holds nothing, by
+        # the same rule the delta applies.
+        carried = [
+            {"id": fid, "check": fid.split(".", 1)[0], **where}
+            for fid, where in sorted(
+                parse_finding_locations(fetch_issue_body(repo, existing_issue)).items()
+            )
+        ]
 
     try:
         os.makedirs(SCRATCH_DIR, exist_ok=True)
@@ -6275,6 +6639,16 @@ def handle_start(args: argparse.Namespace) -> None:
                 "workspace": str(root),
                 "findings_path": findings_path,
                 "pending_remediation_requests": pending,
+                # The findings the open ledger carries — id, check, cluster,
+                # namespace, object, title — so the worker knows what it is
+                # answering for. A clean run whose `checks_run` says one of
+                # these checks ran again on that cluster must report the
+                # finding or list it under `resolved_because`, or `finish`
+                # holds the close (`unaccounted_previous_findings`). Printed
+                # here because nothing else tells the worker: the ledger body
+                # is not in its context, and the held-open comment is
+                # addressed to a reader that never reads it.
+                CARRIED_KEY: carried,
                 # The repositories the SOP's declared-intent step reads —
                 # `context_repos` in the gitops-state ConfigMap, `owner/name`
                 # slugs. Printed here so the worker never runs `kubectl get
@@ -7001,9 +7375,26 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
+        # Findings the last body carried, this run says it checked again, and
+        # this document neither reports nor explains. Only asked on the path
+        # that would close: over a gap the ledger stays open anyway, and an
+        # unreadable body cannot be joined against — the same rule the delta
+        # applies, announcing nothing rather than something fabricated.
+        unaccounted = (
+            unaccounted_previous_findings(previous_body, data)
+            if existing_issue and delta_known and not gaps
+            else []
+        )
+        for entry in unaccounted:
+            log(
+                f"UNACCOUNTED: {entry['id']} ({entry['object']} in "
+                f"{entry['cluster']}) is on the ledger and this run says "
+                f"`{entry['check']}` ran there again, but it is neither reported "
+                "nor in resolved_because; the ledger stays open."
+            )
         prs_closed = (
             []
-            if gaps
+            if gaps or unaccounted
             else close_stale_remediation_prs(
                 repo, audit_id, remediation_prs, set(), previous_titles, {}, now
             )
@@ -7040,7 +7431,11 @@ def handle_finish(args: argparse.Namespace) -> None:
                     repo,
                     existing_issue,
                     render_clean_remediate_answer(
-                        audit_id, request, now, closing=not gaps
+                        audit_id,
+                        request,
+                        now,
+                        closing=not (gaps or unaccounted),
+                        held=bool(unaccounted) and not gaps,
                     ),
                     what="/remediate answer on a clean run",
                 )
@@ -7059,6 +7454,24 @@ def handle_finish(args: argparse.Namespace) -> None:
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot speak for the fleet; issue #{existing_issue} stays "
                 "open and no remediation pull request was closed."
+            )
+        elif existing_issue and unaccounted:
+            # Zero findings over complete coverage, and the previous body
+            # carried findings under checks this run says it ran again. The run
+            # either saw those findings gone or left them out, and from here
+            # the two are the same absence; the ledger is not closed over it.
+            # The comment says what would let it close, so the next run can.
+            post_comment(
+                repo,
+                existing_issue,
+                render_held_comment(audit_id, data, unaccounted, now),
+                what="held-open comment",
+            )
+            log(
+                f"Audit {audit_id} found nothing, but {len(unaccounted)} previous "
+                "finding(s) under checks it says it ran are neither reported nor "
+                f"explained; issue #{existing_issue} stays open and no remediation "
+                "pull request was closed."
             )
         elif existing_issue:
             post_comment(
@@ -7133,11 +7546,15 @@ def handle_finish(args: argparse.Namespace) -> None:
         # about is gone whatever it was called. The coverage guard still
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
-        clean_resolved = 0 if gaps else len(previous_ids)
+        clean_resolved = 0 if (gaps or unaccounted) else len(previous_ids)
         print(
             json.dumps(
                 {
-                    "status": "CLEAN",
+                    # HELD is CLEAN refused its close: the same zero findings,
+                    # with the ledger left open over findings the run did not
+                    # account for. A distinct word because the worker relays
+                    # this line, and "clean" is the one thing it is not.
+                    "status": "HELD" if unaccounted else "CLEAN",
                     "issue_url": existing_url,
                     "new": 0,
                     "resolved": clean_resolved,
@@ -7148,7 +7565,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                     # unconditionally: `resolved > 0` is the fleet getting
                     # better and is the best news this audit ever delivers, and
                     # a gap means it could not look rather than found nothing.
-                    "silent_ok": not (clean_resolved or gaps or prs_closed),
+                    "silent_ok": not (clean_resolved or gaps or prs_closed or unaccounted),
                     "partial": bool(gaps),
                     "coverage_gaps": gaps,
                     # How many postures a declaration kept off the ledger.
@@ -7161,6 +7578,10 @@ def handle_finish(args: argparse.Namespace) -> None:
                     # declared-intent search; the gap sentence above names
                     # them and the repositories not searched.
                     POSTURES_WITHHELD_KEY: finding_ids(postures_withheld(data)),
+                    # The previous findings the close was refused over, by
+                    # their ledger ids; the comment on the issue names each
+                    # one with the check this run says it ran.
+                    UNACCOUNTED_KEY: [entry["id"] for entry in unaccounted],
                 }
             )
         )
@@ -7439,6 +7860,9 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # Same field as the CLEAN branch; see the note there.
                 "declared": len(declared),
                 POSTURES_WITHHELD_KEY: finding_ids(postures_withheld(data)),
+                # Only a clean run can be refused its close, so this is always
+                # empty here; carried so the line has one shape.
+                UNACCOUNTED_KEY: [],
             }
         )
     )

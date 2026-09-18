@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -53,6 +54,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -62,6 +64,29 @@ const (
 	minIPv4CIDRPrefix      = 12
 	minIPv6CIDRPrefix      = 48
 	maxCIDRsPerAnnotation  = 50
+
+	// The two keys of the <agent>-gitops-state ConfigMap the minter policy is
+	// synced from: managed_repos renders write policies, context_repos read-only
+	// ones. gitops_workspace.py names the same two keys on the agent side.
+	gitopsStateManagedReposKey = "managed_repos"
+	gitopsStateContextReposKey = "context_repos"
+	// minterConfigMapName is the minty rule ConfigMap the chart and the kustomize
+	// template render; minterBaseTemplateKey is the policy every rendered key is
+	// derived from.
+	minterConfigMapName   = "github-token-minter-config"
+	minterBaseTemplateKey = "default.yaml"
+	// minterPolicyKeySuffix turns a bare repository name into its policy key. A
+	// repository whose key would be minterBaseTemplateKey is skipped: rendering
+	// it would overwrite the template every other policy is derived from.
+	minterPolicyKeySuffix = ".yaml"
+	// minterReadScope is the scope a context repository's policy carries and
+	// nothing else: contents: read, as the chart's default.yaml declares it. A
+	// default.yaml without it predates the read grant and renders no context
+	// policies. minterScopeField and minterRepositoriesField are the minty v2
+	// rule fields the read-only rendering rewrites.
+	minterReadScope         = "platform-agent-read-scope"
+	minterScopeField        = "scope"
+	minterRepositoriesField = "repositories"
 
 	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
 	// Identity tokens. It is only ever the pre-DNAT destination.
@@ -661,7 +686,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
 	// so completion, failure, and the TTL removing a finished Job are all
 	// invisible without a requeue.
-	if a2aNext && !a2aState.done {
+	//
+	// gatewayHeld shares the requeue rather than getting its own: the gateway
+	// is waiting on BusCredentialsReady, which this reconcile writes on its
+	// way out, so the pass that finally sees it true has to be a pass that
+	// happens. The callout Deployment is owned and its readiness does trigger
+	// one, but a gate that only converges because something else is watched
+	// is a gate with a hidden dependency.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -983,7 +1015,7 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Create(ctx, cm); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data[gitopsStateManagedReposKey], cm.Data[gitopsStateContextReposKey])
 		}
 		return err
 	}
@@ -1000,17 +1032,17 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Update(ctx, found); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo)
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo, found.Data[gitopsStateContextReposKey])
 		}
 		specEntries, err := parseManagedRepoEntries(cmRepo)
 		if err != nil {
 			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON")
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 		existingEntries, err := parseManagedRepoEntries(existing)
 		if err != nil {
 			logger.Error(err, "skipping gitops state reconcile due to unparseable existing managed_repos in ConfigMap", "configMap", found.Name)
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 		updated := false
 		for _, se := range specEntries {
@@ -1033,11 +1065,11 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Update(ctx, found); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 	}
 
-	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 }
 
 func parseManagedKeysAnnotation(ann string) map[string]struct{} {
@@ -1092,22 +1124,128 @@ func renderRepoPolicy(baseTemplate string, repos []string) string {
 	})
 }
 
+// renderReadOnlyPolicy renders the policy a context repository gets: baseTemplate
+// with its scope map reduced to minterReadScope alone and that scope's
+// repositories replaced by repos. Everything else at the top level (version,
+// rule) is carried over as parsed.
+//
+// Parsed rather than edited by regex like renderRepoPolicy, because dropping
+// the write scope is a structural edit: a text substitution that removes one
+// mapping from a block it did not author is how a policy ends up carrying a
+// scope nobody meant it to. sigs.k8s.io/yaml marshals through JSON, so keys come
+// out sorted and the rendering is stable across reconciles.
+//
+// The second return is false when baseTemplate does not parse or carries no
+// minterReadScope; the caller then renders no context policies rather than
+// inventing a scope the minter was never told about.
+func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(baseTemplate), &doc); err != nil || doc == nil {
+		return "", false
+	}
+	scopes, ok := doc[minterScopeField].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	readScope, ok := scopes[minterReadScope].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	repoList := make([]interface{}, 0, len(repos))
+	for _, repo := range repos {
+		repoList = append(repoList, repo)
+	}
+	readScope[minterRepositoriesField] = repoList
+	doc[minterScopeField] = map[string]interface{}{minterReadScope: readScope}
+	rendered, err := yaml.Marshal(doc)
+	if err != nil {
+		return "", false
+	}
+	return string(rendered), true
+}
+
+// minterBareRepos returns the bare repository names in reposStr (a managed_repos
+// or context_repos JSON list) that belong to primaryOrg, deduplicated and
+// sorted. An empty primaryOrg accepts every organisation, as the managed sync
+// always has. listName is for the log lines only. A list that is not JSON is
+// an error, never an empty result: the caller skips the whole sync on it,
+// because an empty result would read as "no repositories" and prune every
+// policy the operator tracks.
+func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) ([]string, error) {
+	reposStr = strings.TrimSpace(reposStr)
+	if reposStr == "" {
+		return nil, nil
+	}
+	repos, err := parseManagedRepos(reposStr)
+	if err != nil {
+		return nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
+	}
+	seen := make(map[string]struct{}, len(repos))
+	var bare []string
+	for _, fullRepo := range repos {
+		fullRepo = strings.TrimSpace(fullRepo)
+		if fullRepo == "" {
+			continue
+		}
+		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
+		if err != nil {
+			logger.V(1).Info("skipping invalid repo in minter policy sync", "list", listName, "repo", fullRepo, "error", err)
+			continue
+		}
+		parts := strings.SplitN(slug, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		repoOrg, bareRepo := parts[0], parts[1]
+		if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
+			logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
+				"list", listName, "repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
+			continue
+		}
+		if bareRepo+minterPolicyKeySuffix == minterBaseTemplateKey {
+			// The base template is never claimed: a policy rendered under its
+			// key becomes the template the next reconcile derives every policy
+			// from, and a read-only rendering there strips the write scope from
+			// every managed repository.
+			logger.Info("skipping repository whose minter policy key would be the base template",
+				"list", listName, "repo", fullRepo, "key", minterBaseTemplateKey)
+			continue
+		}
+		if _, exists := seen[bareRepo]; exists {
+			continue
+		}
+		seen[bareRepo] = struct{}{}
+		bare = append(bare, bareRepo)
+	}
+	sort.Strings(bare)
+	return bare, nil
+}
+
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
 // to the primary GitHub organization (spec.integration.github.org), a corresponding <repo>.yaml
-// entry exists in github-token-minter-config ConfigMap.
+// entry exists in github-token-minter-config ConfigMap, and that every same-organization
+// repository in context_repos has a <repo>.yaml carrying the read-only scope alone.
 // Repositories belonging to a different organization are skipped because the minter instance is
 // bound to the primary organization directory (/etc/minty/<primary-org>/).
 //
+// A managed repository's policy is default.yaml with the repository list replaced by every
+// same-org managed repository (renderRepoPolicy). A context repository's policy is default.yaml
+// reduced to minterReadScope, listing every same-org context repository (renderReadOnlyPolicy):
+// the broker mints from it for its own clone and nothing else, so a private context repository
+// is readable without a write token ever covering it. A repository in both lists is managed and
+// keeps the write rendering. A default.yaml without the read scope renders no context policies.
+//
 // Key ownership contract:
-// The operator owns every <repo>.yaml key for an active managed repository (including adopting
-// pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active managed repositories
-// is unsupported: custom edits will be overwritten with policy rendered from default.yaml on reconcile,
-// and the key will be pruned when the repository is unregistered. Keys for repositories not present in
-// managed_repos (and default.yaml itself) are never claimed or pruned.
-func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr string) error {
+// The operator owns every <repo>.yaml key for an active managed or context repository (including
+// adopting pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active
+// repositories is unsupported: custom edits will be overwritten with policy rendered from
+// default.yaml on reconcile, and the key will be pruned when the repository is unregistered from
+// both lists. Keys for repositories present in neither list (and default.yaml itself) are never
+// claimed or pruned.
+func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr, contextReposStr string) error {
 	logger := logf.FromContext(ctx)
 	minterCM := &corev1.ConfigMap{}
-	err := r.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: agent.Namespace}, minterCM)
+	err := r.Get(ctx, client.ObjectKey{Name: minterConfigMapName, Namespace: agent.Namespace}, minterCM)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
@@ -1119,12 +1257,13 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		return nil
 	}
 
-	baseTemplate, ok := minterCM.Data["default.yaml"]
+	baseTemplate, ok := minterCM.Data[minterBaseTemplateKey]
 	if !ok || strings.TrimSpace(baseTemplate) == "" {
 		return nil
 	}
 
 	managedReposStr = strings.TrimSpace(managedReposStr)
+	contextReposStr = strings.TrimSpace(contextReposStr)
 
 	// Read operator-managed keys from annotation
 	existingAnn := ""
@@ -1133,8 +1272,8 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	}
 	operatorManagedKeys := parseManagedKeysAnnotation(existingAnn)
 
-	// If managed_repos is empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
-	if managedReposStr == "" && len(operatorManagedKeys) == 0 {
+	// If both lists are empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
+	if managedReposStr == "" && contextReposStr == "" && len(operatorManagedKeys) == 0 {
 		return nil
 	}
 
@@ -1152,48 +1291,54 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		}
 	}
 
-	repos, err := parseManagedRepos(managedReposStr)
+	// Both lists are parsed before anything is computed from either: an
+	// unparseable one skips the sync and leaves the ConfigMap as it is, as the
+	// managed-only sync always did. Treating it as empty would prune every
+	// tracked policy and break every write until the JSON was repaired.
+	allBareRepos, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
 	if err != nil {
-		logger.Error(err, "skipping minter policy sync due to unparseable managed_repos in ConfigMap")
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateManagedReposKey)
 		return nil
 	}
-	var allBareRepos []string
-	activeKeys := make(map[string]string, len(repos))
-	for _, fullRepo := range repos {
-		fullRepo = strings.TrimSpace(fullRepo)
-		if fullRepo == "" {
-			continue
+	contextCandidates, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	if err != nil {
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateContextReposKey)
+		return nil
+	}
+	// Managed wins: a repository registered in both lists is written to, so its
+	// policy is the write one, and it is left out of the read-only list too.
+	var contextBareRepos []string
+	for _, bareRepo := range contextCandidates {
+		if !slices.Contains(allBareRepos, bareRepo) {
+			contextBareRepos = append(contextBareRepos, bareRepo)
 		}
-		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
-		if err != nil {
-			logger.V(1).Info("skipping invalid repo in managed_repos for minter policy sync", "repo", fullRepo, "error", err)
-			continue
-		}
-		parts := strings.SplitN(slug, "/", 2)
-		if len(parts) == 2 {
-			repoOrg := parts[0]
-			bareRepo := parts[1]
-			if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
-				logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
-					"repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
-				continue
-			}
-			if _, exists := activeKeys[bareRepo+".yaml"]; !exists {
-				activeKeys[bareRepo+".yaml"] = bareRepo
-				allBareRepos = append(allBareRepos, bareRepo)
+	}
+
+	// key -> the content it must hold.
+	expected := make(map[string]string, len(allBareRepos)+len(contextBareRepos))
+	writeContent := renderRepoPolicy(baseTemplate, allBareRepos)
+	for _, bareRepo := range allBareRepos {
+		expected[bareRepo+minterPolicyKeySuffix] = writeContent
+	}
+	if len(contextBareRepos) > 0 {
+		readContent, ok := renderReadOnlyPolicy(baseTemplate, contextBareRepos)
+		if !ok {
+			logger.Info("skipping context_repos in minter policy sync; default.yaml has no read-only scope",
+				"scope", minterReadScope, "repos", contextBareRepos)
+		} else {
+			for _, bareRepo := range contextBareRepos {
+				expected[bareRepo+minterPolicyKeySuffix] = readContent
 			}
 		}
 	}
-	sort.Strings(allBareRepos)
 
 	updated := false
 
-	// Ensure all active managed repositories have policy entries containing all same-org managed repositories.
-	// The operator claims and owns every <repo>.yaml key for an active managed repository: if unmanaged (!managed),
-	// it adopts the key and overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml
-	// for an active managed repository is unsupported; when the repository is later unregistered, the key is pruned.
-	expectedContent := renderRepoPolicy(baseTemplate, allBareRepos)
-	for key := range activeKeys {
+	// Ensure every active repository has its policy entry. The operator claims and owns every
+	// <repo>.yaml key for an active repository: if unmanaged (!managed), it adopts the key and
+	// overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml for an
+	// active repository is unsupported; when the repository is later unregistered, the key is pruned.
+	for key, expectedContent := range expected {
 		currentVal, exists := minterCM.Data[key]
 		_, managed := operatorManagedKeys[key]
 		if !exists || !managed || currentVal != expectedContent {
@@ -1205,10 +1350,10 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active
 	for key := range operatorManagedKeys {
-		if key == "default.yaml" {
+		if key == minterBaseTemplateKey {
 			continue
 		}
-		if _, active := activeKeys[key]; !active {
+		if _, active := expected[key]; !active {
 			delete(minterCM.Data, key)
 			delete(operatorManagedKeys, key)
 			updated = true
@@ -2276,8 +2421,9 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	return nil
 }
 
-// splitWorkloadStatus is one of the two workloads the credential-broker split made
-// mandatory alongside the gateway, read back so Ready can depend on it.
+// splitWorkloadStatus is one workload the gateway's readiness does not cover,
+// read back so Ready can depend on it: the two the credential-broker split made
+// mandatory, and on a next install the A2A gateway as well.
 type splitWorkloadStatus struct {
 	// name is the object's name, and what the Provisioning message reports.
 	name string
@@ -2288,9 +2434,10 @@ type splitWorkloadStatus struct {
 }
 
 // readSplitWorkloads reads the shell sandbox StatefulSet and the credential broker
+// Deployment, and on an install that renders the A2A stack, the A2A gateway
 // Deployment.
 //
-// Ready has to depend on both. Before the split the credential runtime was a native
+// Ready has to depend on all of them. Before the split the credential runtime was a native
 // sidecar of the gateway pod, so a broker that could not start held the gateway out of
 // readiness and the existing pod scan reported why. Splitting it into its own pod took
 // that away: the gateway now becomes Ready on its own while the model cannot run a single
@@ -2320,10 +2467,38 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 		broker.Status.ReadyReplicas = 0
 	}
 
-	return []splitWorkloadStatus{
+	workloads := []splitWorkloadStatus{
 		{name: shellName, kind: "StatefulSet", ready: shell.Status.ReadyReplicas},
 		{name: brokerName, kind: "Deployment", ready: broker.Status.ReadyReplicas},
-	}, nil
+	}
+
+	// The A2A gateway stands in the same relation to Ready as those two: a next
+	// install without one cannot serve an A2A request at all, and nothing about the
+	// agent gateway's own readiness says so. It is also the one workload here that
+	// the operator withholds ON PURPOSE -- a2aGatewayWaitsForCallout holds the first
+	// creation while the auth callout is short of serving -- and until that hold is
+	// counted, the CR reports Ready: True beside a BusCredentialsReady of False and
+	// the two contradict each other. The hold stays; it stops being silent.
+	//
+	// a2aStackRendering, not a2aAgentSurface: this has to be the same predicate as
+	// whatever creates the Deployment. On version skew the A2A objects are frozen
+	// rather than reconciled, and that CR is already Degraded for the skew itself --
+	// a second reason to hold Ready there would report the freeze as a fault.
+	if a2aStackRendering(agent) {
+		gateway := &appsv1.Deployment{}
+		gatewayName := a2aGatewayName(agent)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: gatewayName}, gateway); err != nil {
+			if !errors.IsNotFound(err) {
+				return nil, fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", err)
+			}
+			gateway.Status.ReadyReplicas = 0
+		}
+		workloads = append(workloads, splitWorkloadStatus{
+			name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
+		})
+	}
+
+	return workloads, nil
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
@@ -2381,8 +2556,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newAddress = fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
 	}
 
-	// The two workloads the split made mandatory. Read before the phase is decided,
-	// because Ready is a claim about all three and not about the gateway alone.
+	// The workloads the gateway's own readiness does not cover. Read before the phase
+	// is decided, because Ready is a claim about every one of them and not about the
+	// gateway alone.
 	splitWorkloads, errSplit := r.readSplitWorkloads(ctx, agent)
 	if errSplit != nil {
 		return "", errSplit
@@ -2405,6 +2581,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
+		if a2aStackRendering(agent) {
+			condMsg = "Gateway, shell sandbox, credential broker and A2A gateway are all ready"
+		}
 	case errWorkload == nil:
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
@@ -2609,18 +2788,40 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
 
-	// All three pods, gateway first so an install with a fault in more than one of
-	// them reports the same sentence it always has. The other two are here because
-	// the faults this function names are exactly the ones the split introduced a
-	// new way to hit: a runtimeClassName the cluster has no node pool for, and a
-	// sandbox or broker image tag nothing published. Neither is visible from the
-	// gateway's own pod any more.
-	pods := make([]corev1.Pod, 0)
-	for _, selector := range []map[string]string{
+	// Every pod Ready is a claim about, gateway first so an install with a fault in
+	// more than one of them reports the same sentence it always has. The middle two
+	// are here because the faults this function names are exactly the ones the split
+	// introduced a new way to hit: a runtimeClassName the cluster has no node pool
+	// for, and a sandbox or broker image tag nothing published. Neither is visible
+	// from the gateway's own pod any more.
+	selectors := []map[string]string{
 		{"app": agent.Name + "-gateway"},
 		shellSandboxSelector(agent),
 		{"app": credentialProxyName(agent)},
-	} {
+	}
+
+	// Appended last, for that same reason, one release later: readSplitWorkloads
+	// made the A2A gateway gate Ready, and a workload that gates Ready and is never
+	// scanned leaves an operator with nothing to act on. Unscanned, a gateway pod in
+	// ImagePullBackOff or CrashLoopBackOff reads as "Waiting for Deployment
+	// <agent>-a2a-gateway to become ready" indefinitely -- which is also what the
+	// deliberate callout hold says, and what a slow scheduler says, so the phase
+	// distinguishes none of the three. Scanned, the container fault names itself.
+	//
+	// Last rather than first: the ordering above is load-bearing, and an install
+	// faulting in more than one workload has to keep reporting the sentence it
+	// always did.
+	//
+	// a2aStackRendering, the same predicate readSplitWorkloads gates on and the same
+	// one that renders the Deployment: a today install has no such pod, and a skewed
+	// one has its A2A objects frozen and is already Degraded/ModeNotRecognized for
+	// the skew itself -- a second reason there would report the freeze as a fault.
+	if a2aStackRendering(agent) {
+		selectors = append(selectors, map[string]string{"app": a2aGatewayName(agent)})
+	}
+
+	pods := make([]corev1.Pod, 0)
+	for _, selector := range selectors {
 		podList := &corev1.PodList{}
 		if err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
 			continue

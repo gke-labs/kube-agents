@@ -155,6 +155,56 @@ Every threshold above is a named constant read from the environment. All of them
 points, to be tuned by running the suite against `main` and setting the bars above the observed
 movement.
 
+## What a score is
+
+Two numbers come out of a case, and they are not the same kind of number. This section is the one
+place that says which is which; the dashboard's Trend page (`scripts/eval_dashboard/trend.py`,
+`docs/ci-health.md`) and the record format below follow it.
+
+**The deterministic pass rate is the gate's number.** A repetition passes or fails on the
+deterministic checks alone (rungs 1–4), and a case's rate is `passes / runs` over the repetitions
+that were scored: `blocked` and `infra` repetitions are counted in the record and kept out of the
+rate. Admission reads that rate over a window — the newest whole records at the current version key
+pooled until they hold `EVAL_ADMISSION_MIN_RUNS` runs (20; seven nightlies at three repetitions
+give 21) — against `EVAL_ADMISSION_RATE` (0.95), and the presubmit's aggregate rule compares the
+same kind of rate against `main`'s. Nothing judged enters it.
+
+**Judged quality is advisory.** `OutcomeValidity` and the other GEval metrics never fail a
+repetition on their own; rung 6 reads the mean of one metric against `main`'s pooled mean with a
+margin sized to the judge's own measured noise ([Why the margin is 0.5](#why-the-margin-is-05)), and
+that is the only place a judged score touches a verdict. Everywhere it is shown it is shown **with
+its spread across repetitions, never as a single point**: three repetitions of one unchanged task
+scored 0.9, 1.0 and 0.2, so a lone mean of three is a number with a standard error near 0.25 and
+must not read as the truth about the case.
+
+What the store can support today, and what it cannot, follows from the record: a `judged` block
+carries a `mean` and its `n` per metric and not the repetitions' own values. So:
+
+- A night's mean is drawn with its `n`, and a case with one night at a key is drawn as one marked
+  point that says so, with no line and no band.
+- The spread the Trend page draws for a case is the **range of its nightly means** over the
+  trailing seven nights at the same key; for a domain it is the `n`-weighted mean across its cases
+  with the range of their means. Both are honest about what they are and neither is the
+  per-repetition spread.
+- The per-repetition spread needs an addition to the record: the repetitions' values (or their
+  standard deviation) per metric, written by `bench-gate record` beside `mean` and `n`. It is
+  additive and optional, so old lines stay readable; it is listed under [Open items](#open-items).
+
+**Only the nightly's lines feed the trend.** The store holds what ran on `main` — only the nightly
+appends to it, a pull request's run is graded against it and never writes — so a trend read from
+the store is nightly-only by construction. The presubmit's judged scores stay on the run page: they
+are per pull request, mix in broken branches, and are not evidence about `main`.
+
+**Retention covers a quarter, and more.** Nothing in the bucket is ever deleted (no lifecycle rule,
+no `storage.objects.delete` on either identity); what is bounded is the read. The reader takes the
+newest `EVAL_BASELINE_MAX_OBJECTS` (200) objects **per case per key**
+([Reading is capped, and says so](#reading-is-capped-and-says-so)), and the nightly writes one
+object per case per night, so the cap holds about 200 nights at one key — six and a half months —
+against the 91 a quarter needs. The Trend page draws a 90-day window, reads two weeks further back
+so the first drawn night's admission window pools the nights before it as the gate does, applies the
+same cap and says which cases it trimmed, if it ever does; a version-key change starts a new
+directory and does not consume the old one's budget.
+
 ## What is stored
 
 One JSON object per line, one line per **batch of runs** — a deliberate screening campaign, or the
@@ -334,6 +384,11 @@ job and withhold it from the other, so the split was unimplementable until the n
 dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
 why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a
 follow-up, and why the change that armed the store named it on the periodic in the same diff.
+Different accounts in `kube-agents-prow`, the same twelve roles in every pool project: the nightly
+runs the same `hack/ci-eval-pr.sh` against a leased project, so
+[`docs/ci-pool-projects.md`](../ci-pool-projects.md) section 3 grants and verifies its account
+beside the presubmit's, after the second nightly died at `get-credentials` on a project that
+granted only the presubmit's ([#1491](https://github.com/gke-labs/kube-agents/issues/1491)).
 
 **Who can grant this.** `kube-agents-prow` has a single `roles/owner`, who is also one of its two
 `storage.admin` holders, so the bucket, the service account and all three grants are one person's
@@ -1283,6 +1338,10 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   wall clock and record the result on
   [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491).
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
+- The per-repetition judged values (or a standard deviation) in the record's `judged` block, so the
+  Trend page can draw the spread across repetitions rather than the range of nightly means
+  ([What a score is](#what-a-score-is)). Additive and optional; `bench-gate record` writes it,
+  `_pool_judged()` ignores it.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
   for and `bench-gate suite` reads many cases at potentially different keys. Scoping the listing to

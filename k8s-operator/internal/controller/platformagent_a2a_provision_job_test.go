@@ -238,3 +238,75 @@ func TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges(t *testing.T) 
 		t.Errorf("the new Job %q carries %q, want %q", survivor.Name, image, pinned)
 	}
 }
+
+// TestA2AProvisionJobFailsFastOnADeterministicRefusal is the other half of the
+// script's exit-2 convention: the status only means anything because the Job
+// asks for it.
+//
+// The refusal the script's closing block can reach — a TASKS stream whose
+// max_consumers is below this CR's budget — is fixed until somebody lowers
+// maxSessions or recreates the stream (nats-server will not change a stream's
+// max_consumers in place), so the default backoffLimit handling would spend
+// twenty pods and about ninety minutes reaching it again while the CR still
+// read Ready. A FailJob rule on exit code 2 ends it on the first pod.
+// Everything else stays on the retry budget, which is why the backoffLimit is
+// asserted here too: a change that "fixed" the wait by dropping it to 1 would
+// take NATS-unreachable down with it.
+func TestA2AProvisionJobFailsFastOnADeterministicRefusal(t *testing.T) {
+	job := buildA2AProvisionJob(a2aTestAgent())
+
+	// podFailurePolicy is rejected by the API server alongside
+	// restartPolicy: OnFailure ("This field cannot be used in combination
+	// with restartPolicy=OnFailure"), so Never is not a taste question —
+	// the rule below does not exist without it.
+	if got := job.Spec.Template.Spec.RestartPolicy; got != corev1.RestartPolicyNever {
+		t.Errorf("restartPolicy = %q, want %q; the API server refuses a podFailurePolicy on any other value", got, corev1.RestartPolicyNever)
+	}
+
+	policy := job.Spec.PodFailurePolicy
+	if policy == nil {
+		t.Fatal("no podFailurePolicy on the provision Job: a deterministic refusal burns the whole backoffLimit, roughly ninety minutes, while the CR reads Ready")
+	}
+	if len(policy.Rules) != 1 {
+		t.Fatalf("podFailurePolicy has %d rules, want 1", len(policy.Rules))
+	}
+	rule := policy.Rules[0]
+	if rule.Action != batchv1.PodFailurePolicyActionFailJob {
+		t.Errorf("rule action = %q, want %q; any other action leaves the refusal on the retry budget", rule.Action, batchv1.PodFailurePolicyActionFailJob)
+	}
+	if rule.OnExitCodes == nil {
+		t.Fatal("the rule matches on something other than an exit code; the script signals a deterministic refusal by its status")
+	}
+	if rule.OnExitCodes.Operator != batchv1.PodFailurePolicyOnExitCodesOpIn {
+		t.Errorf("rule operator = %q, want %q; NotIn would fail the Job on every status except 2", rule.OnExitCodes.Operator, batchv1.PodFailurePolicyOnExitCodesOpIn)
+	}
+	if len(rule.OnExitCodes.Values) != 1 || rule.OnExitCodes.Values[0] != 2 {
+		t.Errorf("rule matches exit codes %v, want [2]: 2 is the script's \"this will fail the same way next time\"", rule.OnExitCodes.Values)
+	}
+
+	// Not vacuous: a rule matching a status the script never returns is the
+	// same as no rule at all, and the script is where that status is
+	// chosen. Matched as a whole line rather than a substring, so a comment
+	// that merely talks about exit 2 cannot satisfy it.
+	var returnsTwo bool
+	for _, line := range strings.Split(a2aProvisionScriptOf(t, job), "\n") {
+		if strings.TrimSpace(line) == "exit 2" {
+			returnsTwo = true
+		}
+	}
+	if !returnsTwo {
+		t.Error("the provision script returns no exit 2; the rule above matches a status nothing emits")
+	}
+
+	// The retryable half. NATS unreachable is a real failure mode here and
+	// it matches no rule, so it still gets the full budget, and the TTL
+	// still removes the Failed Job — which is what makes the next
+	// reconcile's create-if-absent re-check a stream an operator has since
+	// recreated.
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 20 {
+		t.Errorf("backoffLimit = %v, want 20: the fail-fast rule is for the deterministic refusal only, and everything else still retries", job.Spec.BackoffLimit)
+	}
+	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 86400 {
+		t.Errorf("ttlSecondsAfterFinished = %v, want 86400: the daily re-create is how a failed-fast install picks up a recreated stream", job.Spec.TTLSecondsAfterFinished)
+	}
+}

@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"strings"
@@ -92,7 +93,9 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseFlags returned error: %v", err)
 	}
-	filter := newFilterFromFlags(f)
+	// nil getter: this test is about the flags reaching the classifier, and a
+	// nil getter keeps the join from being the thing under test.
+	filter, _ := newFilterFromFlags(f, nil)
 
 	if !filter.logDropped {
 		t.Error("logDropped did not reach the filter")
@@ -103,7 +106,7 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 		"ada@corp.example",   // the configured domain: human, and actionable
 		"mallory@other.test", // a domain, but not a configured one
 	} {
-		filter.Handle(AuditRecord{Principal: principal, StatusCode: statusCodeOK})
+		filter.Handle(context.Background(), AuditRecord{Principal: principal, StatusCode: statusCodeOK})
 	}
 
 	counts := filter.Counts()
@@ -118,6 +121,61 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 	}
 	if counts.Actionable != 1 {
 		t.Errorf("actionable = %d, want 1", counts.Actionable)
+	}
+}
+
+// The cluster identity is assembled from three flag values, one of which
+// (--project) is not named after the field it fills, so a transposition or an
+// omission here is invisible to the compiler and to go vet -- the same hazard
+// NewClassifier has and the reason newFilterFromFlags exists at all. The result
+// would be a detector that matches no record and reports the whole stream
+// unreachable, and no test constructing a joiner directly would see it.
+func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
+	f, err := parseFlags([]string{
+		"--project", "example-project",
+		"--cluster-name", "prod-a",
+		"--cluster-location", "us-central1",
+		"--gitops-managers", "argocd-controller",
+		"--in-cluster",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+
+	stub := &stubGetter{obj: managedFieldsObject()}
+	filter, join := newFilterFromFlags(f, stub)
+
+	// The project half comes from --project rather than a flag of its own, so
+	// this also pins that wiring: a joiner built with an empty project matches
+	// nothing, and every record would come out unreachable.
+	want := clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-a"}
+	if join.cluster != want {
+		t.Errorf("joiner.cluster = %+v, want %+v", join.cluster, want)
+	}
+	if !join.gitopsManagers["argocd-controller"] {
+		t.Errorf("joiner.gitopsManagers = %v, want argocd-controller in it", join.gitopsManagers)
+	}
+	if join.getter == nil {
+		t.Error("the getter did not reach the joiner")
+	}
+
+	// End to end through the filter: a human change on this cluster has to come
+	// out the other side as an enriched join, which is the only assertion that
+	// covers the filter and the joiner being connected at all.
+	// All three identity fields, because the gate ANDs them: a record carrying
+	// only the cluster name comes out unreachable and Enriched stays zero.
+	filter.Handle(context.Background(), AuditRecord{
+		Principal:  "ada@example.com",
+		Project:    "example-project",
+		Location:   "us-central1",
+		Cluster:    "prod-a",
+		Verb:       "patch",
+		StatusCode: statusCodeOK,
+		Resource:   ResourceRef{Group: "apps", Version: "v1", Namespace: "prod", Resource: "deployments", Name: "api"},
+	})
+
+	if got := join.Counts().Enriched; got != 1 {
+		t.Errorf("enriched = %d, want 1 -- the filter is not forwarding to the join", got)
 	}
 }
 
@@ -149,6 +207,75 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 			argv:    []string{"--project", "p", "--max-messages", "1001"},
 			wantErr: "--max-messages must be between",
 		},
+		{
+			// Zero would expire every batch before its first lookup, so the
+			// join would be off with nothing in the output saying so.
+			name:    "batch-join-budget of zero",
+			argv:    []string{"--project", "p", "--batch-join-budget", "0s"},
+			wantErr: "--batch-join-budget must be between",
+		},
+		{
+			// Above the ceiling the budget guarantees the redelivery it exists
+			// to prevent: Pub/Sub's own maximum ack deadline is 600s.
+			name:    "batch-join-budget above the ceiling",
+			argv:    []string{"--project", "p", "--batch-join-budget", "10m"},
+			wantErr: "--batch-join-budget must be between",
+		},
+		{
+			name:    "in-cluster and kubeconfig both name the one cluster the join reads",
+			argv:    []string{"--project", "p", "--in-cluster", "--kubeconfig", "/tmp/kubeconfig", "--cluster-name", "prod-a"},
+			wantErr: "mutually exclusive",
+		},
+		{
+			// Refused rather than defaulted: without a name the join cannot
+			// tell a record from this cluster from one about a same-named
+			// object elsewhere, and guessing reads the wrong object silently.
+			name:    "in-cluster without a cluster name",
+			argv:    []string{"--project", "p", "--in-cluster"},
+			wantErr: "--cluster-name and --cluster-location are both required",
+		},
+		{
+			name:    "kubeconfig without a cluster name",
+			argv:    []string{"--project", "p", "--kubeconfig", "/tmp/kubeconfig"},
+			wantErr: "--cluster-name and --cluster-location are both required",
+		},
+		{
+			// The half-identity case, and the one the name-only check used to
+			// let through: a GKE cluster name is unique within a project and
+			// location, so "prod-a" with no location matches a same-named
+			// cluster in every other region the subscription carries.
+			name:    "cluster name without its location",
+			argv:    []string{"--project", "p", "--in-cluster", "--cluster-name", "prod-a"},
+			wantErr: "--cluster-name and --cluster-location are both required",
+		},
+		{
+			name:    "cluster location without its name",
+			argv:    []string{"--project", "p", "--in-cluster", "--cluster-location", "us-central1"},
+			wantErr: "--cluster-name and --cluster-location are both required",
+		},
+		{
+			// The inverse misconfiguration: a name with nothing to read
+			// through would otherwise start a detector that enriches nothing.
+			name:    "cluster name with no credentials to reach it",
+			argv:    []string{"--project", "p", "--cluster-name", "prod-a"},
+			wantErr: "without --in-cluster or --kubeconfig",
+		},
+		{
+			name:    "cluster location with no credentials to reach it",
+			argv:    []string{"--project", "p", "--cluster-location", "us-central1"},
+			wantErr: "without --in-cluster or --kubeconfig",
+		},
+		{
+			// A project number pulls the subscription perfectly well and then
+			// matches no record at all, because the join compares it against
+			// project_id, which is always the ID. Everything comes out
+			// unreachable -- which is also what a healthy single-cluster
+			// detector reports for the rest of the project, so nothing at
+			// runtime tells the two apart.
+			name:    "project given as a number with the join enabled",
+			argv:    []string{"--project", "123456789012", "--in-cluster", "--cluster-name", "prod-a", "--cluster-location", "us-central1"},
+			wantErr: "is a project number",
+		},
 	}
 
 	for _, tc := range tests {
@@ -161,6 +288,72 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 				t.Errorf("realMain(%v) error = %q, want it to contain %q", tc.argv, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestRealMainRefusesAClusterTheCredentialsDoNotReach(t *testing.T) {
+	// The one case in this file that runs past the flag validation, and the
+	// reason realMain builds the cluster side before the Pub/Sub client: every
+	// other case returns before newPubsubSource, which wants credentials, so
+	// nothing downstream of it was reachable from a test at all. What is pinned
+	// here is the wiring rather than the comparison -- TestVerifyClusterIdentity
+	// covers the comparison, and it stays green if this call site logs the
+	// mismatch instead of returning it, which would leave a detector that
+	// announces it is reading the wrong cluster and then reads it.
+	//
+	// No credentials are needed: building a client from a kubeconfig connects to
+	// nothing, and the identity comes out of the file's own context name.
+	const reachesUSEast4 = `apiVersion: v1
+kind: Config
+clusters:
+  - name: prod-a
+    cluster:
+      server: https://127.0.0.1:1
+contexts:
+  - name: gke_example-project_us-east4_prod-a
+    context:
+      cluster: prod-a
+      user: prod-a
+current-context: gke_example-project_us-east4_prod-a
+users:
+  - name: prod-a
+    user:
+      token: not-a-real-token
+`
+
+	argv := []string{
+		"--project", "example-project",
+		"--kubeconfig", writeKubeconfig(t, reachesUSEast4),
+		"--cluster-name", "prod-a",
+		"--cluster-location", "us-central1",
+	}
+
+	err := realMain(argv)
+	if err == nil {
+		t.Fatalf("realMain(%v) succeeded, want it to refuse a cluster the credentials do not reach", argv)
+	}
+	if want := "refusing to enrich"; !strings.Contains(err.Error(), want) {
+		t.Errorf("realMain error = %q, want it to contain %q", err, want)
+	}
+}
+
+func TestLooksLikeProjectNumber(t *testing.T) {
+	// The whole test is "nothing but digits", and it is exact rather than
+	// heuristic because a GCP project ID must begin with a lowercase letter.
+	// Worth pinning both directions: widened, this rejects real project IDs at
+	// startup and the detector will not run at all.
+	for value, want := range map[string]bool{
+		"123456789012":        true,
+		"1":                   true,
+		"example-project":     false,
+		"project-2":           false,
+		"2nd-project":         false, // not a legal project ID either, but not this check's business
+		"":                    false,
+		"123456789012-backup": false,
+	} {
+		if got := looksLikeProjectNumber(value); got != want {
+			t.Errorf("looksLikeProjectNumber(%q) = %v, want %v", value, got, want)
+		}
 	}
 }
 

@@ -133,7 +133,16 @@ def main() -> None:
     #    set, because the set is one of several ways a name can be dropped.
     from tools.environments.local import build_subprocess_env
 
-    for name in ("SESSION_KV_API_KEY", "CRON_REPORT_RELAY_URL"):
+    #    The two feedback-prompt knobs take the same route: rendered by the
+    #    operator's allowlist, then through this scrub to `feedback_prompt.py`.
+    #    Scrubbed, `FEEDBACK_PROMPT_ENABLED=false` on the CR would still render
+    #    and the prompt would post on an install that turned it off.
+    for name in (
+        "SESSION_KV_API_KEY",
+        "CRON_REPORT_RELAY_URL",
+        "FEEDBACK_PROMPT_ENABLED",
+        "FEEDBACK_PROMPT_DELAY",
+    ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(
             child_env.get(name) == "sentinel",

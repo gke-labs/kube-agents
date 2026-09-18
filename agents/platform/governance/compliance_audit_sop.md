@@ -375,7 +375,7 @@ Three `rationale`/`risk` pairs in this SOP are check-specific and must not be wr
 ./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
   --findings-file /opt/data/scratch/findings_compliance-audit.json \
   [--repo "<owner>/<repo>"]
-# -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```
@@ -396,6 +396,7 @@ What to report in each case:
 - `silent_ok: true` → `[SILENT]` on a scheduled run. No preamble, no "no issues found"; a clean fleet is a silent fleet. On `CLEAN` the ledger issue closed as completed; on `UPDATED` nothing moved and the ledger already says everything you would. Dispatched on demand, say so in one line and give the issue URL.
 - `status == "CLEAN"` with `resolved: > 0` → the fleet was carrying findings and is not any more. Report it: the issue URL, and how many findings closed with it. This is the one piece of good news the audit produces, and swallowing it while reporting every failure teaches the operator that the audit only ever brings problems.
 - `status == "CLEAN"` with `partial: true` → the ledger stayed open because the run could not see the whole fleet: one line reporting the clean result and `coverage_gaps`, then stop.
+- `status == "HELD"` → zero findings, but the ledger stayed open because the run did not account for findings it was carrying (`start` listed them under `carried`; `unaccounted` names the ones held): one line reporting the clean result, the held ids and the issue URL, then stop. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
 - `status == "OPENED"`, or `"UPDATED"` with a non-zero `new` or `resolved` → one line, then stop: `Security & RBAC posture audit: <new> new, <resolved> resolved across <count(scope.clusters)> clusters — <issue_url>`
 - Exit 2 means the validator rejected the document and nothing was published: fix the findings file and re-run `finish`. Exit 1 is fatal. Exit 0 published. Do not work around the validator, and never open the issue or a PR by hand.
 - A finding that still reproduces after its remediation PR merged renders in the ledger with a `⚠ fix merged, still reproduces` warning and the merged PR gets one comment. The audit never reopens it, and neither do you — re-verify the finding and let the next run carry it.

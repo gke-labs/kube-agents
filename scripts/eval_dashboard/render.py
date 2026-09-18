@@ -5,9 +5,9 @@ Usage::
 
     python3 scripts/eval_dashboard/render.py --data data.json --out-dir out/ \\
         [--health health.json] [--health-history health-history.jsonl] \\
-        [--public-url [BASE]]
+        [--store store.json] [--public-url [BASE]]
 
-writes five pages and two data files into ``out/``:
+writes six pages and two data files into ``out/``:
 
 * ``index.html`` -- **the Brief**: what state the smoke gate is in, why the
   bot thinks so, what the agent saw, what changed right before, what is
@@ -31,11 +31,22 @@ writes five pages and two data files into ``out/``:
   by domain with pass / partial / fail and the grader's reason, what is
   newly failing against the night before, the wall clock and whether the
   night was cut short (``nightly.py``).
-* ``brief.json`` -- what the five pages render from: the per-run
+* ``trend.html[#cases=a,b|domain=<domain>][&metric=<judged metric>][&since=<ISO>]``
+  -- **the Trend page**: scores over time on ``main``, read from the
+  evidence store (``--store``, the ``store.json`` ``store.py`` wrote): per
+  case and per domain, the pass rate by night with the trailing admission
+  window beside it, the judged quality by night with the spread the store
+  can support, and the nights where the version key changed marked
+  (``trend.py``). Without ``--store`` the page says the store was not read.
+* ``brief.json`` -- what the six pages render from: the per-run
   classification, the per-case record, the current health verdict, the
   incident history, the recent merges, the release-candidate runs and the
-  nights on record.
-  ``data.json`` is copied verbatim beside it.
+  nights on record. The trend block is ``trend.json`` beside it, polled by
+  the Trend page alone (every page polls brief.json, and the block grows
+  every night). ``data.json`` is copied verbatim beside them, and
+  ``store.json`` when one was given (the next refresh reads it back as
+  ``store.py --prior``, so a tick fetches only the objects it has not
+  seen).
 
 Every page is rendered in the browser (``template/page.html.tmpl`` +
 ``template/pages.js``) from the brief.json document inlined into it as
@@ -94,13 +105,14 @@ import urllib.parse
 import yaml
 
 try:
-    from . import classify, nightly, post_health, tiers
+    from . import classify, nightly, post_health, tiers, trend
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
     import nightly
     import post_health
     import tiers
+    import trend
 
 HERE = pathlib.Path(__file__).resolve().parent
 PAGE_TEMPLATE = HERE / "template" / "page.html.tmpl"
@@ -113,14 +125,22 @@ LOGO = HERE / "template" / "logo.jpeg"
 DEFAULT_NOTES = HERE / "case-notes.yaml"
 DEFAULT_EVENTS = HERE / "events.yaml"
 
-# --- the five pages and their data ----------------------------------------
+# --- the six pages and their data -----------------------------------------
 BRIEF_PAGE = "index.html"
 # The file post_health.run_link points at; one name for it.
 RUN_PAGE = post_health.DASHBOARD_RUN_PAGE
 GRID_PAGE = "grid.html"
 CASES_PAGE = "cases.html"
 NIGHTLY_PAGE = nightly.NIGHTLY_PAGE
+TREND_PAGE = trend.TREND_PAGE
 BRIEF_JSON = "brief.json"
+#: The Trend page's block, published on its own: every page polls
+#: brief.json every minute and only trend.html reads the block, which grows
+#: a night's records every night (about 2 MB at a quarter).
+TREND_JSON = "trend.json"
+# The evidence-store read this render was given (store.py's output), copied
+# beside data.json so the next refresh can read it as --prior.
+STORE_JSON = "store.json"
 # Per page: the file and the <title>. The PR view has no tab of its own on
 # the other pages; it appears only when opened.
 PAGES = {
@@ -129,6 +149,7 @@ PAGES = {
     "grid": {"file": GRID_PAGE, "title": "kube-agents · cases by run"},
     "cases": {"file": CASES_PAGE, "title": "kube-agents · how reliable is each test"},
     "nightly": {"file": NIGHTLY_PAGE, "title": "kube-agents · last night's run"},
+    "trend": {"file": TREND_PAGE, "title": "kube-agents · scores over time on main"},
 }
 # The object names the pages poll beside their own; the adjudicator job
 # writes both (health-history.jsonl is appended one line per tick).
@@ -540,6 +561,21 @@ def load_health(path: pathlib.Path | None) -> dict | None:
         return normalize_health(json.loads(path.read_text()))
     except (OSError, ValueError):
         return None
+
+
+def load_store(path: pathlib.Path | None) -> dict | None:
+    """store.json as ``store.py`` wrote it, or None when absent or
+    unreadable: the Trend page then says the store was not read this
+    tick, and every other page renders as before. The records themselves
+    are validated one by one in ``trend.py``, so a document that parses but
+    carries odd entries still yields a page."""
+    if path is None or not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) and isinstance(doc.get("records"), list) else None
 
 
 def load_health_history(path: pathlib.Path | None) -> list[dict] | None:
@@ -964,7 +1000,8 @@ def pending_builds(data: dict) -> list[dict]:
 
 def brief_document(data: dict, health: dict | None, history: list[dict] | None, merges: list[dict] | None,
                    notes: dict | None = None, events: dict | None = None,
-                   admitted: frozenset | None = None, demoted: dict[str, str] | None = None) -> dict:
+                   admitted: frozenset | None = None, demoted: dict[str, str] | None = None,
+                   store: dict | None = None) -> dict:
     """The document every page reads. Runs are the presubmit's last
     RUN_VIEW_DAYS of data.json, oldest first, each classified against every
     run on record with the verdict in force when it finished. The nightly's
@@ -973,7 +1010,8 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
     for each case's nightly_failed_recent note, and into each case's record
     (its nightly rates, and its last failure when the presubmit has none).
     ``admitted`` and ``demoted`` default to the checkout's roster and roster
-    page; tests pass their own."""
+    page; tests pass their own. ``store`` is the evidence-store read for the
+    Trend page (``load_store``), None when there was none."""
     anchor = reference_ms(data)
     runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
     now = ms_to_utc(anchor) if anchor is not None else None
@@ -1020,6 +1058,7 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
         "pending": pending_builds(data),
         "releases": [compact_release(r) for r in sorted_releases(data)],
         "nightly": nightly.nightly_document(data),
+        "trend": trend.trend_document(store, data),
     }
 
 
@@ -1028,10 +1067,14 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
 
 
 def render_page(page: str, brief: dict, data: dict, public_url: str | None = None) -> str:
-    """One of the five pages from the shared template, with brief.json (and
+    """One of the six pages from the shared template, with brief.json (and
     the health verdict, when there is one) inlined as JSON data elements and
-    pages.js after them. ``page`` is a PAGES key."""
+    pages.js after them. ``page`` is a PAGES key. The trend block is the
+    Trend page's alone: it grows a night's records every night (a quarter
+    of it is megabytes), and no other page reads it, so they carry
+    ``trend: null`` and stay the size they were."""
     template = PAGE_TEMPLATE.read_text()
+    inlined = brief if page == "trend" else {**brief, "trend": None}
     values = {
         "__TITLE__": PAGES[page]["title"],
         "__PAGE__": page,
@@ -1039,10 +1082,11 @@ def render_page(page: str, brief: dict, data: dict, public_url: str | None = Non
         "__NAV_GRID__": 'class="on"' if page == "grid" else "",
         "__NAV_CASES__": 'class="on"' if page == "cases" else "",
         "__NAV_NIGHTLY__": 'class="on"' if page == "nightly" else "",
+        "__NAV_TREND__": 'class="on"' if page == "trend" else "",
         # The PR view is a tab only while it is the page being read.
         "__NAV_RUN__": f'<a href="{RUN_PAGE}" class="on">PR view</a>' if page == "run" else "",
         "__BASE__": base_html(public_url),
-        "__INLINE_BRIEF__": inline_json_html(INLINE_BRIEF_ID, brief),
+        "__INLINE_BRIEF__": inline_json_html(INLINE_BRIEF_ID, inlined),
         "__INLINE_HEALTH__": inline_json_html(INLINE_HEALTH_ID, brief["health"]) if brief.get("health") else "",
         "__META__": meta_html(data),
         "__FRESHNESS__": freshness_html(data),
@@ -1148,6 +1192,11 @@ def main(argv: list[str] | None = None) -> int:
         help=f"{HEALTH_HISTORY_FILE}, one health.json per line plus a tick stamp (optional; absent means current state only)",
     )
     parser.add_argument(
+        "--store",
+        default=None,
+        help=f"{STORE_JSON} from store.py, the evidence-store read the Trend page draws (optional; absent or malformed renders the page as 'store not read' and copies nothing)",
+    )
+    parser.add_argument(
         "--repo-root",
         default=str(classify.REPO_ROOT),
         help="checkout whose git log lists the merges to main (a shallow checkout omits the block)",
@@ -1168,18 +1217,28 @@ def main(argv: list[str] | None = None) -> int:
     health = load_health(pathlib.Path(args.health)) if args.health else None
     history = load_health_history(pathlib.Path(args.health_history)) if args.health_history else None
     merges = recent_merges(pathlib.Path(args.repo_root), reference_ms(data))
-    brief = brief_document(data, health, history, merges, notes=notes, events=events)
+    store = load_store(pathlib.Path(args.store)) if args.store else None
+    brief = brief_document(data, health, history, merges, notes=notes, events=events, store=store)
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for page, spec in PAGES.items():
         (out_dir / spec["file"]).write_text(render_page(page, brief, data, args.public_url))
-    (out_dir / BRIEF_JSON).write_text(json.dumps(brief, separators=(",", ":")))
+    # brief.json is what every page polls; the trend block rides in
+    # trend.json, which the Trend page alone polls (and has inlined).
+    (out_dir / BRIEF_JSON).write_text(json.dumps({**brief, "trend": None}, separators=(",", ":")))
+    (out_dir / TREND_JSON).write_text(json.dumps(brief["trend"], separators=(",", ":")))
     # health.json and health-history.jsonl are deliberately not copied into
     # the out-dir: the adjudicator owns those objects, and republishing a
     # copy would overwrite a fresher verdict with the one this render read.
     shutil.copyfile(args.data, out_dir / "data.json")
-    print(f"wrote {', '.join(str(out_dir / spec['file']) for spec in PAGES.values())}, {BRIEF_JSON}")
+    # store.json travels with the pages for the same reason data.json does:
+    # the next refresh reads the published copy back (store.py --prior) and
+    # fetches only what it has not seen. Only a store that parsed is copied,
+    # so a broken read never replaces the good prior in the bucket.
+    if store is not None:
+        shutil.copyfile(args.store, out_dir / STORE_JSON)
+    print(f"wrote {', '.join(str(out_dir / spec['file']) for spec in PAGES.values())}, {BRIEF_JSON}, {TREND_JSON}")
     return 0
 
 

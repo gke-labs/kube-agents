@@ -650,7 +650,14 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 	}
 
-	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, taskID), env); err != nil {
+	// PublishSeq rather than Publish: the sequence the server assigns is the
+	// only thing that lets the session pod name THIS message as its
+	// submission. Its `…in` subject collects every steer after it under one
+	// per-subject cap, and past that cap a worker scanning the subject
+	// cannot tell the evicted submission's replacement from the real thing
+	// (lib.EnvOriginSeq).
+	originSeq, err := g.client.PublishSeq(ctx, lib.TaskInSubject(rec.Addressee, taskID), env)
+	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
 			_ = g.adapter.Edit(rec.Key, statusMsgID, "❌ could not reach the bus; try again")
@@ -667,8 +674,14 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// Hermes-first "platform") have their own executor and spawn nothing.
 	// A task addressed to the conversation's own bus session - the standing
 	// session route or a one-shot Delegate - is what needs a pod.
+	//
+	// The publish above precedes this by more than convention: the pod is
+	// told the submission's sequence, so the submission has to exist and
+	// have one before the pod is created. The spec's ordering rule ("the pod
+	// exists because the message is already durable") is now load-bearing
+	// rather than an optimisation.
 	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
-		g.ensureSessionPod(ctx, rec, taskID)
+		g.ensureSessionPod(ctx, rec, taskID, originSeq)
 	}
 }
 

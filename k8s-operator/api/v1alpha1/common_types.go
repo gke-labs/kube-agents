@@ -48,15 +48,100 @@ var SensitiveEnvVars = map[string]struct{}{
 	// spec.deployment.env[i].name.
 	"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},
 	"HERMES_HOME":                        {},
-	// The A2A bus wiring the operator renders under `mode: next`. NATS_PASSWORD
-	// arrives by SecretKeyRef, so the credential is in the container no matter
-	// what the address says: a CR-set NATS_URL would send the worker password
-	// to an address of the setter's choosing, in the CONNECT frame, in the
-	// clear. NATS_USER is here for the same reason at one remove — picking the
-	// identity picks which grants the connection gets.
-	"NATS_URL":      {},
-	"NATS_USER":     {},
-	"NATS_PASSWORD": {},
+	// The A2A bus wiring the operator renders under `mode: next`. The agent
+	// container's credential is a projected ServiceAccount token since A5, not
+	// a password, but the address is still the thing that decides who receives
+	// it: a CR-set NATS_URL would send the bearer token to a server of the
+	// setter's choosing, in the CONNECT frame, in the clear. The token is
+	// audience-bound so it does not authenticate anywhere else, but it still
+	// names this ServiceAccount to whoever catches it, and egress rule 7
+	// permits 443 to the internet whenever FQDN policy is off.
+	//
+	// A2A_BUS_USER picks the inbox prefix the client pins. It is not a
+	// credential — the grants come from the callout's answer about the
+	// ServiceAccount — so the failure it buys is denial rather than
+	// escalation: a wrong value connects and then times out on every reply.
+	// Reserved anyway, because a control whose subject can silently break it
+	// is the same argument as the one below.
+	//
+	// NATS_USER and NATS_PASSWORD are no longer rendered into the agent
+	// container and stay reserved regardless. The Hermes bridge sidecar still
+	// authenticates with both, and a spec.deployment.env entry is the wrong
+	// place to decide which identity anything in this pod connects as.
+	// A2A_BUS_TOKEN_FILE is the same argument one step stronger: it names the
+	// file the client reads and presents as its bearer token, and the client
+	// prefers an explicitly set value over the projected path with no
+	// fallback. Denial rather than escalation, and the reason is the audience
+	// alone: automountServiceAccountToken is false, but the container is not
+	// tokenless — it holds the broker-audience projection at
+	// /var/run/secrets/kubeagents/credential-proxy, and a sidecar or an
+	// extraVolumes entry can put more files in reach. Redirecting to any of
+	// them presents a token minted for somebody else's audience, which the bus
+	// refuses at connect. What the reservation buys is that the operator never
+	// sets this variable, so a spec.deployment.env entry naming it is never
+	// anything but an override of the projection.
+	"A2A_BUS_TOKEN_FILE": {},
+	"A2A_BUS_USER":       {},
+	"NATS_URL":           {},
+	"NATS_USER":          {},
+	"NATS_PASSWORD":      {},
+}
+
+// ReservedVolumeNames defines pod volume names the operator renders itself and
+// a user-authored container must not mount or shadow.
+//
+// The same two-layer shape as SensitiveEnvVars above, and for the same reason:
+// the validating webhook rejects a spec.deployment field that names one of
+// these, and the render strips it. The webhook alone is not enough because the
+// chart's default failurePolicy is Ignore; the strip is what holds, and the
+// rejection is what says why.
+//
+// FIVE fields, because spec.deployment has five user-authored volume and mount
+// surfaces and a reservation that covers four of them is not a reservation:
+// sidecars[].volumeMounts, initContainers[].volumeMounts, sidecarVolumes,
+// extraVolumes and extraVolumeMounts. The last one was the miss. It names no
+// container, so it does not read like a mount surface at all — but
+// buildBaseContainers appends it verbatim to the platform-agent container AND
+// to platform-agent-dashboard, which put the projected bus token into a second
+// container with the CR never mentioning one. spec.deployment.storages is NOT
+// in the list and does not need to be: it renders a PersistentVolumeClaim
+// volume under the name plus a "-vol" suffix, so it cannot collide with a
+// reserved name or carry a token projection.
+//
+// What this reservation does NOT cover is the volume SOURCE. It is a check on
+// names, so a differently-named projected volume whose
+// serviceAccountToken.audience is `a2a-bus`, mounted into a sidecar, mints the
+// same credential and is admitted. The only source-type check on
+// sidecarVolumes/extraVolumes today is the hostPath refusal in the webhook.
+// Established by execution rather than by reading the render: a sidecarVolumes
+// entry named innocuous-cache projecting that audience renders intact and the
+// sidecar authenticates as `agent`.
+//
+// Which fixes the terms this should be read on. KSA tokens are pod-scoped and
+// the callout cannot see which container presented one, so neither a name nor
+// an audience reservation is a boundary against a hostile sidecar; it is a
+// guard against a misconfiguration. Worth having on those terms for the reason
+// agentForbiddenVolumeNames gives for the same class in
+// credential_proxy_manifests.go: the CR is authored by the platform operator
+// and not by the agent — buildPlatformLocalRole grants the agent
+// get/list/watch on its own CR and nothing more, and no tenant-facing or
+// aggregated role on platformagents ships — so this is a configuration hazard
+// rather than an escape, guarded because nothing else would notice. That rests
+// on who may write the CR, which makes it re-decidable rather than settled: a
+// delegable role, or the CR moving into a repo the agent can open pull
+// requests against, changes the answer. gke-labs#1667 closes the audience
+// route and the creds-Secret route that is cheaper than it.
+//
+// One member so far. `a2a-bus-token` is the projected ServiceAccount token the
+// platform-agent container presents to the bus under `mode: next`, and it is
+// that container's alone — the auth callout resolves the POD's ServiceAccount,
+// so any other container mounting this token is a second workload wearing the
+// agent's bus identity. One that also holds bridge-password would hold the
+// union of the two grant sets, which is the retired `worker` credential rebuilt
+// out of a volumeMount. See a2aStripBusTokenMounts and, for the fifth field,
+// a2aStripBusTokenVolumeMounts.
+var ReservedVolumeNames = map[string]struct{}{
+	"a2a-bus-token": {},
 }
 
 type HermesSpec struct {
@@ -334,7 +419,7 @@ type TuningSpec struct {
 	// hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
 	// preemption.
 	//
-	// The number lands in two places that deliberately differ. The gateway's
+	// The number lands in three places that deliberately differ. The gateway's
 	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
 	// delegation is refused with a chat reply naming the numbers, never queued,
 	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
@@ -346,7 +431,32 @@ type TuningSpec struct {
 	// bounds everything else in the namespace: an install whose namespace
 	// carries many non-session pods can see unrelated pod creation refused at
 	// admission before sessions reach this cap, and the headroom is an
-	// operator constant, not a CR field.
+	// operator constant, not a CR field. The third is the bus: the TASKS
+	// stream's max_consumers is provisioned from this number, because each
+	// session pod creates three named consumers there and a stream that
+	// cannot hold the configured concurrency refuses a legitimate session's
+	// consumer create at load. That one is capacity, not a control - it is
+	// sized to fit this cap rather than to enforce it - and because
+	// provisioning never edits an existing stream, an install whose TASKS
+	// stream is too small for the configured cap makes the provision Job
+	// fail rather than letting the shortfall surface later as a legitimate
+	// session's consumer create being refused and reported as a task
+	// failure. What that refusal names is the two ways out, and neither is
+	// a stream edit, because max_consumers is the one limit nats-server
+	// will not change on a stream that already exists: lower this number
+	// until it fits the stream, or delete TASKS and let provisioning
+	// recreate it at the width this number asks for, paying the task
+	// history the stream was holding. The two do not finish the same way.
+	// Lowering this number re-renders the provision Job, so it re-runs by
+	// itself. Recreating the stream also needs the provision Job re-run,
+	// and then the A2A gateway restarted - deleting a stream deletes the
+	// durable consumers on it, the gateway's event relay and any Hermes
+	// bridge sidecar do not re-create theirs, and a gateway in that state
+	// still accepts delegations and spawns session pods while relaying no
+	// events. The refusal names the order. An operator upgrade reaches that
+	// refusal as readily as an edit here does: a stream created before the
+	// derivation existed holds whatever it was created with, whatever this
+	// field says.
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.

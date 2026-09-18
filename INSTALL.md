@@ -64,9 +64,11 @@ The installer's engine is [Method 1](#method-1-the-install-engine--terraform--he
 the canonical description of what gets created. When adopting a **pre-existing** cluster, four mutations
 are checked out-of-band by `install.sh` before the apply: CMEK database encryption (a control-plane
 update), Workload Identity pool enablement, node-pool migration to `GKE_METADATA` (recreates nodes;
-requires `--migrate-node-pools` or `MIGRATE_NODE_POOLS=true`), and legacy Calico NetworkPolicy
-enforcement (may recreate nodes; requires `--enable-network-policy` or `ENABLE_NETWORK_POLICY=true`);
-see the site's
+requires `--migrate-node-pools` or `MIGRATE_NODE_POOLS=true`), and NetworkPolicy enforcement, where
+the cluster's owner chooses between enabling the legacy Calico addon (`--enable-network-policy` or
+`ENABLE_NETWORK_POLICY=true`; may recreate nodes) and installing without enforcement
+(`--accept-no-network-policy` or `ACCEPT_NO_NETWORK_POLICY=true`; the cluster is left as it is and the
+choice is recorded); see the site's
 [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
 On Standard clusters, Terraform also adds a `gvisor-pool` node pool unless `--gvisor=false`.
 Outside cluster adoption, two tasks stay outside Terraform: setting the managed-OTel collection scope
@@ -111,7 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 #### What `--generate-only` Does:
 
 1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
-2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools` or `--enable-network-policy` is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
+2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
    - **Terraform Apply execution** with remote state management via `lifecycle.sh`:
@@ -324,7 +326,8 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
 - **GKE Database Encryption (CMEK)**: GKE etcd database encryption is configured automatically using Cloud KMS (`kms_keyring_name` / `kms_key_name`, default `platform-agent-keyring` / `k8s-secret-encryption-key`; `GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY` in `install.env` set both). On a **pre-existing** cluster Terraform cannot enable it, so `install.sh` enables Cloud KMS encryption on the control plane as a `gcloud` pre-step before the apply (a permanent, non-revertible cluster update), reading the same two keys.
 - **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before running `install.sh` against an existing unencrypted cluster to skip that CMEK pre-step (testing environments only).
 - **`MIGRATE_NODE_POOLS`**: kube-agents requires Workload Identity (`GKE_METADATA`) to authenticate agent and operator pods. On existing clusters, migrating legacy node pools to `GKE_METADATA` can recreate nodes and restart workloads. Pass `--migrate-node-pools` / `MIGRATE_NODE_POOLS=true` to authorize migration; without opt-in, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NODE_POOL_MIGRATION`).
-- **`ENABLE_NETWORK_POLICY`**: kube-agents requires NetworkPolicy enforcement for agent sandbox isolation. On an existing GKE Standard cluster lacking Dataplane V2 and Calico, enabling Calico can recreate nodes and restart workloads. Pass `--enable-network-policy` / `ENABLE_NETWORK_POLICY=true` to authorize enablement; without opt-in, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NETWORK_POLICY`).
+- **`ENABLE_NETWORK_POLICY`**: kube-agents ships NetworkPolicies that isolate the agent's execution sandbox, and they enforce only on Dataplane V2 or with the legacy Calico addon. On an existing GKE Standard cluster with neither, `--enable-network-policy` / `ENABLE_NETWORK_POLICY=true` authorizes enabling Calico, which can recreate nodes and restart workloads. This is one of two answers; without either, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NETWORK_POLICY`).
+- **`ACCEPT_NO_NETWORK_POLICY`**: the other answer. `--accept-no-network-policy` / `ACCEPT_NO_NETWORK_POLICY=true` installs onto such a cluster without modifying it. Every NetworkPolicy the install ships is then inert, the agent sandbox's included; the choice is recorded in the install report (`network_policy_enforcement`) and on the `PlatformAgent` (`kubeagents.x-k8s.io/network-policy-enforcement`). Record the key in `install.env`, or the next `upgrade.sh` is refused for the enforcement this install accepted; remove it once the cluster enforces, or every later apply waives that check. The site's [Installing without NetworkPolicy enforcement](docs/site/src/content/docs/install/prerequisites.md#installing-without-networkpolicy-enforcement) says exactly what stops being enforced. Mutually exclusive with `ENABLE_NETWORK_POLICY`.
 - **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials (API keys, Slack tokens) are saved to `install.env`. Set `PERSIST_SECRETS_ON_DISK=false` to keep them out of every file the installer writes; they travel to Terraform as `TF_VAR_*` and later runs recover them from the live `platform-agent-secrets` Secret.
 
 #### Private container registry

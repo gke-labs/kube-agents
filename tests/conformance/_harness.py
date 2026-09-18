@@ -268,14 +268,41 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
     ),
-    # A3's task-plane writer sets. The bus principals are data in one Go file
+    # A3's task-plane writer sets, and A5's split of the shared `worker`
+    # credential into a callout principal for the agent container and a static
+    # one for the bridge sidecar. The bus principals are data in one Go file
     # (the rendered map and the static nats.conf users come from the same
-    # list), except the session's, which the callout derives from the
-    # attested pod name at mint time and which is therefore in no map at all.
-    # Two files, two modules, and the writer-set invariant is about the union.
+    # list), except the session's, which the callout derives from the attested
+    # pod name at mint time and which is therefore in no map at all. Two files,
+    # two modules, and the writer-set invariant is about the union. The same
+    # file also holds one half of a contract neither module can import: the
+    # operator renders an env var naming the agent's principal, and the `a2a`
+    # CLI reads it back to pin its inbox prefix.
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("func gatewayIdentity", "func workerIdentity", "a2a.tasks.*.*.supervisor"),
+        (
+            "func gatewayIdentity",
+            "func agentIdentity(",
+            "func bridgeIdentity(",
+            "a2a.tasks.*.*.supervisor",
+            "a2aBusUserEnv",
+            "a2aAgentBusUser",
+            "a2aBridgeUser",
+        ),
+    ),
+    # The JetStream halves of the publish lists live in the manifests file, and
+    # the identity builders append them by call. A reader of the identities file
+    # alone sees an unresolved `append(publish, a2aAgentJetStreamGrants()...)`
+    # and has to either resolve it here or report the list as partial -- and a
+    # partial list for a callout principal, which appears in no served config,
+    # is a list no test can check against anything.
+    "a2a_jetstream_grants": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        (
+            "func a2aAgentJetStreamGrants(",
+            "func a2aBridgeJetStreamGrants(",
+            "func a2aSeedJetStreamGrants(",
+        ),
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
@@ -289,7 +316,29 @@ SOURCES: dict[str, Source] = {
     # which made A3's own known violation report as closed.
     "a2a_rendered_nats_conf": Source(
         "a2a/authcallout/testdata/rendered-nats.conf",
-        ("user: worker", "auth_users:", "a2a.tasks.*.*.supervisor"),
+        ("user: bridge", "auth_users:", "a2a.tasks.*.*.supervisor"),
+    ),
+    # The operator side of the projected-token contract: the audience it mints
+    # under, the path it mounts at, and the two strips that keep a user-authored
+    # container from mounting the same volume.
+    "operator_a2a_callout": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        (
+            "a2aBusTokenAudience",
+            "a2aBusTokenPath",
+            "a2aBusTokenFile",
+            "a2aBusTokenVolume",
+            "func a2aBusTokenVolumeSource(",
+            "func a2aStripBusTokenMounts(",
+        ),
+    ),
+    "a2a_bus_credentials": Source(
+        "a2a/lib/credentials.go",
+        ("EnvBusUser", "EnvBusTokenFile", "BusTokenAudience", "BusTokenPath"),
+    ),
+    "a2a_cli_main": Source(
+        "a2a/cmd/a2a/main.go",
+        ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(

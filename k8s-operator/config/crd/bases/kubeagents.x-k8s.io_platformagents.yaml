@@ -9413,7 +9413,7 @@ spec:
                             hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
                             preemption.
 
-                            The number lands in two places that deliberately differ. The gateway's
+                            The number lands in three places that deliberately differ. The gateway's
                             A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
                             delegation is refused with a chat reply naming the numbers, never queued,
                             never dropped. The namespace ResourceQuota is rendered a fixed headroom
@@ -9425,7 +9425,32 @@ spec:
                             bounds everything else in the namespace: an install whose namespace
                             carries many non-session pods can see unrelated pod creation refused at
                             admission before sessions reach this cap, and the headroom is an
-                            operator constant, not a CR field.
+                            operator constant, not a CR field. The third is the bus: the TASKS
+                            stream's max_consumers is provisioned from this number, because each
+                            session pod creates three named consumers there and a stream that
+                            cannot hold the configured concurrency refuses a legitimate session's
+                            consumer create at load. That one is capacity, not a control - it is
+                            sized to fit this cap rather than to enforce it - and because
+                            provisioning never edits an existing stream, an install whose TASKS
+                            stream is too small for the configured cap makes the provision Job
+                            fail rather than letting the shortfall surface later as a legitimate
+                            session's consumer create being refused and reported as a task
+                            failure. What that refusal names is the two ways out, and neither is
+                            a stream edit, because max_consumers is the one limit nats-server
+                            will not change on a stream that already exists: lower this number
+                            until it fits the stream, or delete TASKS and let provisioning
+                            recreate it at the width this number asks for, paying the task
+                            history the stream was holding. The two do not finish the same way.
+                            Lowering this number re-renders the provision Job, so it re-runs by
+                            itself. Recreating the stream also needs the provision Job re-run,
+                            and then the A2A gateway restarted - deleting a stream deletes the
+                            durable consumers on it, the gateway's event relay and any Hermes
+                            bridge sidecar do not re-create theirs, and a gateway in that state
+                            still accepts delegations and spawns session pods while relaying no
+                            events. The refusal names the order. An operator upgrade reaches that
+                            refusal as readily as an edit here does: a stream created before the
+                            derivation existed holds whatever it was created with, whatever this
+                            field says.
 
                             Raising it buys concurrent delegations at the per-pod price plus model
                             concurrency against the shared LiteLLM endpoint; the quota lifts with it.
