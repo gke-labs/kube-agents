@@ -91,10 +91,11 @@ const (
 // out of each Cluster Agent profile, asking the GKE API where that cluster's
 // control plane is, and authenticating to all of them as this pod's own Google
 // identity -- one token source shared across the fleet, not a credential per
-// cluster. k8s-event-watcher's discoverClusterProfiles already does exactly
-// that, and doing it here is the next task; this function is what it replaces.
+// cluster. internal/clusterprofiles does exactly that and returns a rest.Config
+// per cluster, which is the shape a dynamic.Interface is built from; wiring it
+// up here is the next task, and this function is what it replaces.
 //
-// Worth carrying across with it: that watcher deliberately does not read a
+// Worth carrying across with it: that package deliberately does not read a
 // kubeconfig back out of the sandbox volume, because anything written there is
 // writable by the model and this process would attach a cloud-platform token to
 // whatever host it was pointed at. --kubeconfig below is an operator-supplied
