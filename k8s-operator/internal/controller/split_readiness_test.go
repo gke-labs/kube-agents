@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -195,5 +196,94 @@ func TestReadSplitWorkloadsReportsAnAbsentObjectAsNotReady(t *testing.T) {
 		if workloads[i] != want[i] {
 			t.Errorf("workload %d: got %#v, want %#v", i, workloads[i], want[i])
 		}
+	}
+}
+
+// The A2A gateway is the fourth workload, on the installs that render one. It
+// belongs here for the same reason the shell and the broker do — a next install
+// without it serves no A2A request, and the agent gateway's own readiness says
+// nothing about that — and for one the other two do not have: the operator
+// withholds it deliberately, in a2aGatewayWaitsForCallout, while the auth
+// callout is short of serving. These tests are what a reader sees during that
+// hold.
+
+// splitReadinessNextAgent is the same CR on an install that renders the A2A
+// stack.
+func splitReadinessNextAgent() *agentv1alpha1.PlatformAgent {
+	agent := splitReadinessAgent()
+	agent.Spec.Mode = ptr.To(string(ModeNext))
+	return agent
+}
+
+func a2aGatewayWorkload(agent *agentv1alpha1.PlatformAgent, ready int32) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace},
+		Status:     appsv1.DeploymentStatus{ReadyReplicas: ready},
+	}
+}
+
+// TestANextInstallCountsItsA2AGateway: the full set, and the sentence says so.
+func TestANextInstallCountsItsA2AGateway(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	phase, msg := settleStatus(t, agent,
+		readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))
+
+	if phase != "Ready" {
+		t.Errorf("got phase %q, want Ready: all four workloads have a ready replica", phase)
+	}
+	if want := "Gateway, shell sandbox, credential broker and A2A gateway are all ready"; msg != want {
+		t.Errorf("got message %q, want %q", msg, want)
+	}
+}
+
+// TestAWithheldA2AGatewayIsNotReady is the one that matters. The creation gate
+// holds the A2A gateway while BusCredentialsReady is false, which on a callout
+// short of its replica count is indefinite. Before this, the CR read Ready: True
+// the whole time, directly beside a BusCredentialsReady of False — two
+// conditions contradicting each other, with nothing saying the absent gateway
+// was the consequence. The hold is still the behaviour; what changes is that the
+// phase admits it and the message names the object.
+func TestAWithheldA2AGatewayIsNotReady(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+
+	if phase != "Provisioning" {
+		t.Errorf("got phase %q, want Provisioning: the install renders an A2A gateway and has none", phase)
+	}
+	if want := "Waiting for Deployment test-agent-a2a-gateway to become ready"; msg != want {
+		t.Errorf("got message %q, want %q", msg, want)
+	}
+}
+
+// TestATodayInstallDoesNotWaitOnAnA2AGateway keeps the dark stack dark. A today
+// install renders no A2A gateway, so requiring one would hold every one of them
+// at Provisioning forever.
+func TestATodayInstallDoesNotWaitOnAnA2AGateway(t *testing.T) {
+	agent := splitReadinessAgent()
+	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+
+	if phase != "Ready" {
+		t.Errorf("got phase %q, want Ready: a today install has no A2A gateway to wait on", phase)
+	}
+	if want := "Gateway, shell sandbox and credential broker are all ready"; msg != want {
+		t.Errorf("got message %q, want %q", msg, want)
+	}
+}
+
+// TestVersionSkewDoesNotAddASecondReasonToHoldReady. An unrecognized mode leaves
+// the A2A objects frozen rather than reconciled, on a CR the reconciler is
+// already reporting Degraded/ModeNotRecognized. Counting a gateway that nothing
+// is reconciling would report the freeze as a fault of its own, which is why
+// this reads a2aStackRendering and not a2aAgentSurface.
+func TestVersionSkewDoesNotAddASecondReasonToHoldReady(t *testing.T) {
+	agent := splitReadinessAgent()
+	agent.Spec.Mode = ptr.To("next-but-newer")
+	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+
+	if phase != "Ready" {
+		t.Errorf("got phase %q, want Ready: the skew is the CR's problem, not a missing workload", phase)
+	}
+	if want := "Gateway, shell sandbox and credential broker are all ready"; msg != want {
+		t.Errorf("got message %q, want %q", msg, want)
 	}
 }

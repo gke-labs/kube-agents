@@ -51,6 +51,12 @@ module "drift_pubsub" {
   cluster_names = ["platform-agent-host", "prod-us-east4"]
 ```
 
+The filter matches on the bare cluster name, which is unique within a project and location but not
+across locations, so listing `prod` here exports every `prod` in the project. That is the safe
+direction — the detector matches on the full `project/location/cluster` triple and reports anything
+it cannot reach as `unreachable` rather than reading the wrong cluster — but it does mean a narrowed
+`cluster_names` can still carry more traffic than the list suggests.
+
 `subscription_id` is the output to feed the detector's `--subscription` flag, alongside `--project`:
 
 ```bash
@@ -60,5 +66,12 @@ drift-detector --project my-gcp-project --subscription "$(terraform output -raw 
 The flag takes either form — this fully-qualified path, or the bare `subscription_name`, which it
 qualifies with `--project`. `--project` is required either way, because the detector's credentials
 are resolved against it.
+
+Lowering `ack_deadline_seconds` below its 60s default means passing the detector a matching
+`--batch-join-budget`. The detector holds a whole batch while it reads live objects, and the two
+values are not wired together — it reads this one at startup and warns when its budget takes more
+than half of it, but it does not adopt it.
+[The detector's README](../../../k8s-operator/cmd/drift-detector/README.md) is canonical for what
+happens when the budget outlasts the deadline.
 
 See the [Release versioning & promotion guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

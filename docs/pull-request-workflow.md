@@ -504,10 +504,17 @@ Four states that look like somebody else's problem and are not:
 - **`mergeable: UNKNOWN`.** GitHub computes mergeability lazily and the first query only triggers
   the job, so a conflict reads as conflict-free until you ask twice.
 
-`skip_reason()` in [`scripts/request_reviewers.py`](../scripts/request_reviewers.py) is the same
-rule in code for the one decision this repository automates — it declines to request a reviewer for
-a draft, for a title carrying an ignored keyword, when someone is already requested, and when a
-human other than the author has already submitted `APPROVED` or `CHANGES_REQUESTED`. A periodic
+`skip_reason()` and `already_reviewed_reason()` in
+[`scripts/request_reviewers.py`](../scripts/request_reviewers.py) are the same rule in code for the
+one decision this repository automates — it declines to request a reviewer for a draft, for a title
+carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
+the changed files has submitted `APPROVED`, and when a human other than the author has submitted
+`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An approval from outside
+`OWNERS` is not a hand-off: it cannot produce the `approved` label, so it counts no more than a
+comment. Of these reasons, `/request-review` skips the verdict check alone (it also bypasses the
+`AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
+one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
+naming the reason. A periodic
 triage sweep applies the wider rule and messages whoever owns each pull request; it runs outside
 this repository, so the rule above is all this page can state about it.
 

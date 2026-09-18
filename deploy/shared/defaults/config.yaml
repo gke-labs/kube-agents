@@ -90,16 +90,23 @@ mcp_servers:
   #     divergent value survives alone as a bare positional after the URL,
   #     which mcp-remote reads as its optional callback port and discards as
   #     NaN. The overlay's spelling is the one silently lost.
-  #   - One string, byte-identical at every call site. It names the product and
-  #     the build and nothing else; the customer project is already on the wire
-  #     as X-Goog-User-Project. Keep it that way — the API teams key dashboards
-  #     on this value, and a variation added in one file splits that key.
+  #   - `(daemon)` is the execution mode, in the RFC 9110 §5.6.5 comment after
+  #     the product token, which is where the Developer Knowledge telemetry
+  #     parser reads it from (kept apart from any OS/architecture metadata that
+  #     may share the parentheses). `daemon` is their taxonomy value for
+  #     Kubernetes operators and background controllers; `cli` is the value
+  #     for an interactive tool, which nothing here is.
+  #   - One string, byte-identical at every call site. It names the product,
+  #     the build and the mode and nothing else; the customer project is
+  #     already on the wire as X-Goog-User-Project. Keep it that way — the API
+  #     teams key dashboards on this value, and a variation added in one file
+  #     splits that key.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
-      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
       - "https://developerknowledge.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30
@@ -109,7 +116,7 @@ mcp_servers:
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
-      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
       - "https://container.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30

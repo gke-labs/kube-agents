@@ -223,22 +223,15 @@ fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
 for the spec side, including how the verifier keeps "the fixture is gone" (a fail)
 apart from "the cluster was unreachable" (an error).
 
-## The presubmit's two consumers outside the role catalog
+## The presubmit's one consumer outside the role catalog
 
-`hack/ci-eval-pr.sh` addresses this fleet directly in two places, both discovering by
-the same two labels and the trailing `-<slot>` name segment, and `fixtures.json`'s
-description names both as the sanctioned exceptions to its rule.
+`hack/ci-eval-pr.sh` addresses this fleet directly in one place, §3b, the log-fixture
+subject, which `fixtures.json`'s description names as the sanctioned exception to its
+rule. It mutates nothing in-cluster, and nothing in the job repairs a drifted fleet:
+the hourly scan above detects one, and a manual `tofu apply` per project corrects it.
 
-**§2c, the slot-a heal (#1278),** is the only consumer that mutates the fleet. On every
-presubmit it reads **slot a**'s `default-pool` node count and resizes it to two when it
-finds fewer -- the standing state `main.tf` declares, so a later `tofu apply` is a
-no-op. It touches nothing else: not the fixtures, not `node_config`, not the state
-file; a project with no seeded fleet, an unreadable count, or a failed resize each
-produce a warning and nothing more, and `FLEET_HEAL_SEEDED_A=0` turns it off. The cost
-paragraph at the end of this README says why the pool is two nodes.
-
-**§3b, the log-fixture subject,** mutates nothing in-cluster. On every presubmit in a
-fleet-carrying project it discovers **slot c** by the same two labels, verifies
+On every presubmit in a fleet-carrying project §3b discovers **slot c** by the same
+two labels and the trailing `-<slot>` name segment, verifies
 its `default` namespace is empty, runs `get-credentials` against it, and hands its
 name to the gpu-stress-test stack, which then creates no per-run cluster: the task's
 synthetic `hypercomputer-agent`/`hpa-controller` Cloud Logging entries name the slot-c
@@ -379,5 +372,4 @@ rest. Four of the nodes are e2-small; `seeded-a`'s default pool is two e2-medium
 since #1278 (roughly $25 per month more than the one it ran on), because a single
 e2-medium's 940m allocatable CPU is fully claimed by GKE system pods and the planted
 `payments-api` / `checkout-gateway` fixtures went Pending — the comment on
-`seeded_a_default` in `main.tf` has the numbers, and `hack/ci-eval-pr.sh` section 2c
-resizes a one-node pool back to two at lease time until every project is re-applied.
+`seeded_a_default` in `main.tf` has the numbers.

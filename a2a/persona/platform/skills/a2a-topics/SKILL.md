@@ -27,10 +27,11 @@ carries who wrote it and when, and you relay both.
 
 ## Prerequisites
 
-The bus address and credentials come from the environment: `NATS_URL`,
-`NATS_USER`, `NATS_PASSWORD`. If they are unset, this install is not running
-the A2A bus — say so plainly and answer the question another way. Do not
-attempt to guess an address.
+The bus address and identity come from the environment: `NATS_URL` and
+`A2A_BUS_USER`. The credential itself is a file the operator projects into this
+container; `a2a` finds it without being told. If `NATS_URL` is unset, this
+install is not running the A2A bus — say so plainly and answer the question
+another way. Do not attempt to guess an address.
 
 The client is `a2a`, on `PATH` (`/usr/local/bin/a2a`, shipped in the agent
 image alongside this skill). Because it is on `PATH` rather than at a

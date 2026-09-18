@@ -385,15 +385,29 @@ func (c *Client) conn() (*nats.Conn, jetstream.JetStream) {
 // (assertion 8 — the alternative is a silent drop at the server), and
 // publishes to subject with the envelopeId as the JetStream dedup id.
 func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) error {
+	_, err := c.PublishSeq(ctx, subject, env)
+	return err
+}
+
+// PublishSeq is Publish returning the stream sequence the server assigned.
+//
+// Only a caller that has to name the message later needs it — the gateway
+// telling a session pod which message on `…in` is the submission it was
+// spawned for, where the alternative is a scan the per-subject cap can
+// silently answer with a steer. A duplicate publish (same envelopeId inside
+// the dedup window) returns the ORIGINAL message's sequence with no second
+// copy stored, so a retried submission names the same message rather than a
+// sequence that does not exist.
+func (c *Client) PublishSeq(ctx context.Context, subject string, env *Envelope) (uint64, error) {
 	if err := env.ValidateEmit(); err != nil {
-		return err
+		return 0, err
 	}
 	// Task-subject tokens must be dot-free DNS-1123 labels - dots change the
 	// token count under every wildcard filter.
 	if strings.HasPrefix(subject, "a2a.tasks.") {
 		addressee, taskID, _, ok := ParseTaskSubject(subject)
 		if !ok || !validDNS1123Label(addressee) || !validDNS1123Label(taskID) {
-			return &ProtocolError{Msg: fmt.Sprintf("malformed task subject %q: addressee and taskId must be dot-free DNS-1123 labels", subject)}
+			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed task subject %q: addressee and taskId must be dot-free DNS-1123 labels", subject)}
 		}
 	}
 	// The envelope must agree with the subject it is published on - kind,
@@ -406,7 +420,7 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 	// window old) is counted here rather than refused.
 	if err := CheckSubjectAgreement(subject, env, c.opts.agreement); err != nil {
 		if !IsAdvisoryDisagreement(err) {
-			return &ProtocolError{Msg: err.Error()}
+			return 0, &ProtocolError{Msg: err.Error()}
 		}
 		c.protocolViolations.Add(1)
 		c.log.Warn("a2a publish disagrees with its subject (advisory)", "subject", subject, "err", err)
@@ -415,7 +429,7 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 	// artifact's name is the topic the subject names (assertion 16).
 	if strings.HasPrefix(subject, topicPrefix) {
 		if err := checkTopicPublish(subject, env); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	// The directory plane too: one dot-free profile token, carrying only the
@@ -424,15 +438,15 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 	// plane, not left to the caller.
 	if profile, ok := strings.CutPrefix(subject, agentsPrefix); ok {
 		if !validDNS1123Label(profile) {
-			return &ProtocolError{Msg: fmt.Sprintf("malformed agent subject %q: profile must be a dot-free DNS-1123 label", subject)}
+			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed agent subject %q: profile must be a dot-free DNS-1123 label", subject)}
 		}
 		if env.Kind != KindAgentCard && env.Kind != KindAgentClosed {
-			return &ProtocolError{Msg: fmt.Sprintf("kind %q on agent subject %q: the directory carries agent-card and agent-closed only", env.Kind, subject)}
+			return 0, &ProtocolError{Msg: fmt.Sprintf("kind %q on agent subject %q: the directory carries agent-card and agent-closed only", env.Kind, subject)}
 		}
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
-		return fmt.Errorf("marshal envelope: %w", err)
+		return 0, fmt.Errorf("marshal envelope: %w", err)
 	}
 	nc, js := c.conn()
 	// The server counts headers against max message size, so the gate must
@@ -440,16 +454,16 @@ func (c *Client) Publish(ctx context.Context, subject string, env *Envelope) err
 	// fail inside nats.go with a non-A2A error.
 	wire := len(data) + msgIDHeaderOverhead + len(env.EnvelopeID)
 	if max := nc.MaxPayload(); int64(wire) > max {
-		return &A2AError{
+		return 0, &A2AError{
 			Code:    CodeInvalidParams,
 			Message: fmt.Sprintf("envelope is %d bytes on the wire; bus max message size is %d", wire, max),
 		}
 	}
-	_, err = js.Publish(ctx, subject, data, jetstream.WithMsgID(env.EnvelopeID))
+	ack, err := js.Publish(ctx, subject, data, jetstream.WithMsgID(env.EnvelopeID))
 	if err != nil {
-		return fmt.Errorf("publish %s: %w", subject, err)
+		return 0, fmt.Errorf("publish %s: %w", subject, err)
 	}
-	return nil
+	return ack.Sequence, nil
 }
 
 // SubscribeConfig describes a durable subscription.

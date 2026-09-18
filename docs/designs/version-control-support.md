@@ -540,8 +540,15 @@ the target is. The client, which alone knows which branch its copy was cloned
 from, refuses to publish that branch under any target, and tells the broker
 which branch that was (`clonedFrom`) so the broker refuses it too,
 `CLONED_BRANCH` — defence in depth for a confused caller, since a client that
-lied would gain nothing it could not get by omitting the field. A protected branch that is not the default is the forge's own
-branch protection to enforce; the broker does not claim to know it.
+lied would gain nothing it could not get by omitting the field. In addition to
+the remote's default branch, the broker enforces protected branch policy on
+`/v1/vcs/publish`: `main`, `master`, `production`, any operator-configured base
+override (`CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH`), and any `run/**`
+branch are strictly refused without a pull request (`PROTECTED_BRANCH`, status 409).
+Across the broker's other write doors, protected branch policy is enforced under
+their respective protocols: the content workspace door (`/v1/workspace/*`) refuses
+with `ContentWorkspaceError` (HTTP 400 `workspace.invalid`), and the command
+execution door (`/v1/exec`) refuses with HTTP 403 `SECURITY_POLICY_BLOCKED`.
 
 The scratch repository is never checked out. It is fetched into and pushed from,
 and nothing materialises a working tree, so a `.gitattributes`, a hook, or a
@@ -1082,7 +1089,10 @@ around acquisition makes the second forge implement a method that does nothing
 and receive an argument nobody uses, and still leaves it nowhere to put the parts
 that are not empty.
 
-**So one member, which the forge constructs and owns:**
+**So one member, which the forge constructs and owns** — the ambient credential
+every credentialed verb makes current — with `read_credential(repo)` beside it
+as the per-clone counterpart the broker asks for when the repository is a
+registered context repository (§10, "Registered context repositories"):
 
 ```python
 # providers/credentials.py — shared, forge-neutral
@@ -1092,13 +1102,15 @@ class Credential(Protocol):
     def git_config(self, repo: str) -> tuple[tuple[str, str], ...]: ...
 ```
 
-`ensure` is "make yourself current, if that means anything to you." Two
-implementations cover both forges and, as far as anyone has proposed, the third:
+`ensure` is "make yourself current, if that means anything to you." Three
+implementations cover both forges and, as far as anyone has proposed, the third;
+the first two are ambient, the last is per clone:
 
-| Strategy               | `ensure`                                         | `headers`                        | `git_config`                                              |
-| ---------------------- | ------------------------------------------------ | -------------------------------- | --------------------------------------------------------- |
-| `BrokeredCredential`   | asks the broker's refresh route                  | none — the CLI carries it        | none — the CLI installs a helper                          |
-| `StaticFileCredential` | **nothing** — a long-lived token cannot go stale | reads the file, sends the header | the helper pin from [above](#gits-credential-has-no-seam) |
+| Strategy               | `ensure`                                              | `headers`                        | `git_config`                                                                                                    |
+| ---------------------- | ----------------------------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `BrokeredCredential`   | asks the broker's refresh route                       | none — the CLI carries it        | none — the CLI installs a helper                                                                                |
+| `StaticFileCredential` | **nothing** — a long-lived token cannot go stale      | reads the file, sends the header | the helper pin from [above](#gits-credential-has-no-seam)                                                       |
+| `MintedReadCredential` | asks the executor's read-only mint for one repository | none — the read path is a clone  | an `extraheader` on the forge's host, plus a `credential.helper` clear so the ambient helper is never consulted |
 
 GitHub takes the first, GitLab the second. **GitLab's `ensure` is `pass`**, and
 that is the point: a forge whose credential does not expire says so by choosing
@@ -1436,7 +1448,7 @@ agents/platform/scripts/
     validate.py            # the seven validators
     errors.py              # the status-to-guidance table, forge_error(status, detail)
     transport.py           # Transport protocol, CliTransport, HttpTransport
-    credentials.py         # Credential protocol, BrokeredCredential, StaticFileCredential
+    credentials.py         # Credential protocol, BrokeredCredential, StaticFileCredential, MintedReadCredential
     registry.py            # AVAILABLE, build_forges(config)
     github/
       __init__.py  forge.py  translate.py  errors.py
@@ -2352,6 +2364,25 @@ reads needs a credential-less path — a clone with no token, a read API call wi
 none — that the provider can take when the repository is public, which is a
 change to the credential strategy and not to the verbs, and is not designed
 here.
+
+**Registered context repositories** are the one unmanaged read the install does
+grant a credential for, and the shape is the credential-strategy change above
+for one case. A repository under `context_repos` is read for declared intent and
+never written, and it is usually private. The broker's content-mode `open`
+resolves the repository's registered role from the ConfigMap — `managed`,
+`context`, or neither, decided by the broker and never by a forge — and for a
+context repository asks the forge for `read_credential(repo)`: a credential that
+can read that one repository, obtained per clone, presented to the broker's own
+`git` as a per-invocation config layer, and installed nowhere. A credential that
+cannot be obtained falls back to the credential-less clone, with the ambient
+helper cleared in that same layer so the write token is never tried in its
+place. On GitHub it is a `contents: read` App installation token minted from the
+repository's own minter policy, which the operator renders per context
+repository; a forge without a read-only credential answers `NoCredential` and
+the clone proceeds as before.
+The write gate does not consult the role, so a context repository stays refused
+by `commit`, `push`, the collaboration verbs and the refresh route; the verbs'
+credential-less read path for public repositories remains open as above.
 
 ## 11. Open questions
 

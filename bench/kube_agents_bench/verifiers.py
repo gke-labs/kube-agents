@@ -322,6 +322,21 @@ _DELTA_RE = re.compile(
 # candidates to shotgun the API with.
 _MAX_LEDGER_CANDIDATES = 8
 
+# A report that retired the ledger rather than filing on it, in the words the
+# harness and the audit's closing line use for that: `render_clean_comment`'s
+# "found **0 findings**" and "is now clean", and the roll-up a parent writes
+# when it paraphrases the worker ("The open ledger issue has been closed").
+# Consulted only when the report names no issue URL at all, where the two
+# ways of arriving there -- a worker that never returned and a worker that
+# closed the ledger as clean and dropped the pointer -- used to share one
+# sentence (#1683). Clause-bounded so "closed" and "ledger" have to be about
+# each other.
+_CLEAN_CLOSE_RE = re.compile(
+    r"ledger[^\n.]{0,80}?\bclosed\b|\bclosed\b[^\n.]{0,80}?\bledger\b"
+    r"|\b0 findings\b|\bfound nothing\b|\bno findings\b|\bis now clean\b",
+    re.IGNORECASE,
+)
+
 _NO_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check cannot tell this run's ledger from a previous "
@@ -512,6 +527,20 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     return match.group("audit").strip(), stamp
 
 
+def _parse_github_time(value: Any) -> datetime | None:
+    """A GitHub API timestamp (``2026-09-17T03:12:16Z``) as an aware datetime, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
 def _finding_ids(body: str) -> list[str] | None:
     """This run's finding ids from the hidden delta block, or None when absent."""
     matches = _DELTA_RE.findall(body)
@@ -597,6 +626,19 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     run, so ``required_phrases: ["seeded-c"]`` against ``body`` would pass on a
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
+
+    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger without
+    rewriting its body, so a ledger the audit retired during this run still
+    carries the previous run's stamp and would read, above, as "a previous
+    run's ledger, so this run published nothing" — the one thing that run had
+    not done. When the issue is ``closed`` and its ``closed_at`` falls inside
+    this run, the reason says the ledger was closed as clean while this case
+    expected a finding on it. The same distinction is drawn when the report
+    names no URL at all but says in words that the ledger was closed or that
+    nothing was found (``_CLEAN_CLOSE_RE``): rep 2 of the 2026-09-16 nightly
+    did exactly that and shared its reason with a delegation that never
+    returned (#1683). Neither is a new pass or fail; both are the same fail
+    with a reason a reader can act on.
     """
 
     type: Literal["ledger_issue_contains"]
@@ -661,6 +703,17 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
+            clean = _CLEAN_CLOSE_RE.search(snap.final_message)
+            if clean:
+                return done(
+                    False,
+                    "the run's report names no github.com issue URL, but says the "
+                    f"ledger was retired as clean ({clean.group(0).strip()!r}): the "
+                    "audit closed the stream's ledger over a fleet this case planted "
+                    "a finding on, and dropped the pointer to it -- a false clean, "
+                    "not a report that never arrived; every non-silent fleet-audit "
+                    "report must carry issue_url in full",
+                )
             return done(
                 False,
                 "the run's report names no github.com issue URL, so no ledger "
@@ -737,6 +790,11 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     "slug": f"{owner}/{repo}#{number}",
                     "body": body,
                     "generated_at": footer[1],
+                    # Read here, decided below: a closed issue is only telling
+                    # once the stamp has said the body is not this run's.
+                    "state": str(payload.get("state") or "").lower(),
+                    "state_reason": str(payload.get("state_reason") or ""),
+                    "closed_at": _parse_github_time(payload.get("closed_at")),
                 }
             )
 
@@ -759,6 +817,29 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         age = (started - generated_at).total_seconds()
         if age > self.max_clock_skew_sec:
+            closed_at: datetime | None = ledger["closed_at"]
+            closed_by_this_run = (
+                ledger["state"] == "closed"
+                and closed_at is not None
+                and (started - closed_at).total_seconds() <= self.max_clock_skew_sec
+            )
+            if closed_by_this_run:
+                assert closed_at is not None
+                return done(
+                    False,
+                    f"{ledger['slug']} was closed as "
+                    f"{ledger['state_reason'] or 'completed'} at "
+                    f"{closed_at.isoformat()}, during this run, with its body still "
+                    f"carrying the previous run's stamp ({generated_at.isoformat()}): "
+                    "the audit reported the stream clean and retired the ledger "
+                    "while this case expected a finding on it -- a false clean, not "
+                    "an absent report",
+                    raw={
+                        "generated_at": generated_at.isoformat(),
+                        "closed_at": closed_at.isoformat(),
+                        "state_reason": ledger["state_reason"],
+                    },
+                )
             return done(
                 False,
                 f"{ledger['slug']} was generated at {generated_at.isoformat()}, "

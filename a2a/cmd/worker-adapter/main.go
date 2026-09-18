@@ -83,20 +83,23 @@ func run() int {
 		return 1
 	}
 
+	originSeq, originSeqStated := originSeq(log)
 	cfg := workeradapter.Config{
-		NATSURL:        natsURL,
-		NATSUser:       os.Getenv("NATS_USER"),
-		NATSPassword:   os.Getenv("NATS_PASSWORD"),
-		BusTokenFile:   busTokenFile(),
-		PodName:        os.Getenv(lib.EnvPodName),
-		TaskID:         taskID,
-		Profile:        profile,
-		Session:        os.Getenv("A2A_SESSION"),
-		HarnessCommand: harnessCommand(),
-		HarnessEnv:     harnessEnv(),
-		TaskDeadline:   envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
-		KillGrace:      envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
-		Logger:         log,
+		NATSURL:         natsURL,
+		NATSUser:        os.Getenv("NATS_USER"),
+		NATSPassword:    os.Getenv("NATS_PASSWORD"),
+		BusTokenFile:    busTokenFile(),
+		PodName:         os.Getenv(lib.EnvPodName),
+		TaskID:          taskID,
+		Profile:         profile,
+		Session:         os.Getenv("A2A_SESSION"),
+		OriginSeq:       originSeq,
+		OriginSeqStated: originSeqStated,
+		HarnessCommand:  harnessCommand(),
+		HarnessEnv:      harnessEnv(),
+		TaskDeadline:    envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
+		KillGrace:       envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
+		Logger:          log,
 	}
 
 	// The harness works out of the pod's scratch emptyDir; falling back to
@@ -257,6 +260,28 @@ func harnessEnv() []string {
 		}
 	}
 	return env
+}
+
+// originSeq reads the submission's stream sequence from the pod env, and
+// reports separately whether the spawner said anything at all.
+//
+// Unparseable is treated as the sentinel rather than as a boot failure: the
+// worst it costs is the scan the older spawners already get, whereas refusing
+// to start would turn a typo in one env var into a dead session.
+func originSeq(log *slog.Logger) (uint64, bool) {
+	raw := os.Getenv(lib.EnvOriginSeq)
+	if raw == "" {
+		return 0, false
+	}
+	if raw == lib.OriginSeqUnknown {
+		return 0, true
+	}
+	seq, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || seq == 0 {
+		log.Warn("ignoring unusable origin sequence", lib.EnvOriginSeq, raw)
+		return 0, true
+	}
+	return seq, true
 }
 
 func envDuration(key string, defSeconds int) time.Duration {

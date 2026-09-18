@@ -129,6 +129,19 @@ class Forge:
     def __init__(self) -> None:
         self.credential: Credential = NoCredential()
 
+    def read_credential(self, repo: str) -> Credential:
+        """A credential that can only read `repo`, for one clone of it.
+
+        What the broker presents when it clones a repository registered under
+        `context_repos` -- to be read for declared intent, never written -- in
+        place of `credential`, which on a forge with a write token is that
+        token. A fresh object per call, because it is scoped to one clone and
+        dies with it. The default is none: a forge that mints nothing
+        read-only clones a context repository with no credential at all, which
+        is what every forge did before this existed.
+        """
+        return NoCredential()
+
     # -- registration -------------------------------------------------------
 
     @classmethod

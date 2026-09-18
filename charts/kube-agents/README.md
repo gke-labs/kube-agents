@@ -459,6 +459,9 @@ it is the chart's route to the `kubeagents.x-k8s.io/*` annotations the operator
 reads, such as `prevent-deletion`, `enable-litellm-network-policy`, and
 `otlp-collector-namespace` (see the
 [PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)).
+The Terraform composition uses the same route for one annotation the operator
+does not read, `network-policy-enforcement: absent-accepted`, the record of an
+install that chose to proceed onto a cluster enforcing no NetworkPolicy.
 Two of those the chart also stamps from values: `litellm.networkPolicy=false`
 stamps `enable-litellm-network-policy: "false"`, and a non-empty
 `telemetry.collectorNamespace` stamps `otlp-collector-namespace`. When the

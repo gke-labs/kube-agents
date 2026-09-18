@@ -69,7 +69,7 @@ const (
 
 // a2aCalloutKeysName is the Secret holding the callout's keypairs.
 func a2aCalloutKeysName(agent *agentv1alpha1.PlatformAgent) string {
-	return a2aCalloutName(agent) + "-keys"
+	return agentv1alpha1.A2ACalloutKeysSecretName(agent.Name)
 }
 
 // a2aCalloutKeys is the rendered view: seeds for the callout, public halves for

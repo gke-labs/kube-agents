@@ -196,7 +196,11 @@ whose SOP has a declared-intent step (today `obtainability-audit`, §4a) searche
 reports a posture as a finding. They are read and nothing else: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
-could not be read, which `start` says on stderr; the GitOps clone is searched either way.
+could not be read, which `start` says on stderr; the GitOps clone is searched either way. A private
+context repository is readable through the broker's content-mode clone only (`inspect_repository.py
+clone` and `open`): the broker mints a `contents: read` token for it per clone and installs it
+nowhere. The sandbox's own CLI credential and the directory-mode clone cover managed repositories
+alone.
 
 `declared_intent_repos` is the set that step must account for: the GitOps repository plus every
 `context_repos` slug, one entry each. `start` writes the same set to a run record beside the

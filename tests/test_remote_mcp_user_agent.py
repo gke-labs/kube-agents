@@ -6,7 +6,8 @@ Calls to `developerknowledge.googleapis.com/mcp` and `container.googleapis.com/m
 used to go out with undici's default `node` User-Agent, so the API teams serving
 those endpoints could not tell kube-agents traffic from any other Node process.
 Each `mcp_servers` entry that launches the mcp-remote proxy now passes a
-`--header User-Agent: …` naming the product and the build it came from.
+`--header User-Agent: …` naming the product, the build it came from, and the
+execution mode (`daemon`) in the RFC 9110 comment after the product token.
 
 Three ways that silently stops being true, one check each:
 
@@ -55,6 +56,12 @@ CLOUDBUILDS = (
 
 PROXY_ARG = "/opt/mcp-remote/dist/proxy.js"
 VERSION_VAR = "KUBE_AGENTS_VERSION"
+# The execution mode, in the RFC 9110 §5.6.5 comment after the product token.
+# The Developer Knowledge telemetry parser reads it out of the parentheses,
+# apart from any OS/architecture metadata that may share them; `daemon` is its
+# taxonomy value for Kubernetes operators and background controllers, which is
+# what every profile here is (`cli` is the value for an interactive tool).
+EXECUTION_MODE = "daemon"
 
 # Discovered, not listed: a config.yaml added for a new agent profile is checked
 # the day it lands. agents/chat/config.yaml declares no remote server today and
@@ -62,10 +69,10 @@ VERSION_VAR = "KUBE_AGENTS_VERSION"
 # forget precisely when someone is copying an existing entry into a new profile.
 CONFIGS = (SHARED_DEFAULTS,) + tuple(sorted((REPO_ROOT / "agents").glob("*/config.yaml")))
 
-# One string at every call site, version placeholder included. Asserted whole
+# One string at every call site, version placeholder and mode included. Asserted whole
 # rather than by pattern: the point of the header is that the API teams can key
 # a dashboard on it, and a per-file variation is what quietly splits that key.
-USER_AGENT = "User-Agent: kube-agents/${%s}" % VERSION_VAR
+USER_AGENT = "User-Agent: kube-agents/${%s} (%s)" % (VERSION_VAR, EXECUTION_MODE)
 
 
 def remote_servers(config_path):

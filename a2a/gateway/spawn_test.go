@@ -28,7 +28,7 @@ func TestSpawnSetsPodDeadlineMirroringTheAdapters(t *testing.T) {
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-abcd", Addressee: "chat-otter-abcd"}
-	if _, err := s.Spawn(context.Background(), rec, "task-1", ""); err != nil {
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
 		t.Fatal(err)
 	}
 	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-abcd", metav1.GetOptions{})
@@ -53,6 +53,68 @@ func TestSpawnSetsPodDeadlineMirroringTheAdapters(t *testing.T) {
 	}
 }
 
+// TestSpawnCarriesTheOriginSequence: the pod is told which message on its
+// ...in subject is the submission it exists to run. Without it the worker
+// scans the subject and, past TASKS's per-subject cap, cannot tell the
+// evicted submission's successor from the request itself.
+func TestSpawnCarriesTheOriginSequence(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-3", BusSession: "chat-otter-4242", Addressee: "chat-otter-4242"}
+	if _, err := s.Spawn(context.Background(), rec, "task-3", "", 4242); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-4242", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := ""
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == lib.EnvOriginSeq {
+			found = e.Value
+		}
+	}
+	if found != "4242" {
+		t.Fatalf("worker env %s = %q, want the stream sequence the publish returned", lib.EnvOriginSeq, found)
+	}
+}
+
+// TestSpawnStatesAnUnknownOriginSequence: a spawner that could not determine a
+// sequence says so rather than leaving the variable off. Absent means "spawned
+// by an older gateway", which the worker is entitled to answer with the scan;
+// the sentinel means "asked and could not tell", which it should not be
+// silently confused with.
+func TestSpawnStatesAnUnknownOriginSequence(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-4", BusSession: "chat-otter-0000", Addressee: "chat-otter-0000"}
+	if _, err := s.Spawn(context.Background(), rec, "task-4", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-0000", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, present := "", false
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == lib.EnvOriginSeq {
+			found, present = e.Value, true
+		}
+	}
+	if !present {
+		t.Fatalf("%s is absent; a current spawner states the sentinel rather than saying nothing, because absence is how the worker recognises an older one", lib.EnvOriginSeq)
+	}
+	if found != lib.OriginSeqUnknown {
+		t.Fatalf("worker env %s = %q, want %q", lib.EnvOriginSeq, found, lib.OriginSeqUnknown)
+	}
+}
+
 // TestSpawnCarriesOwnerReference: spawned pods are owned by the gateway's
 // Deployment, so Kubernetes GC reaps sessions when it goes — cleanupA2A or
 // any other deletion — with no operator exception to IsControlledBy.
@@ -69,7 +131,7 @@ func TestSpawnCarriesOwnerReference(t *testing.T) {
 	}
 
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-2", BusSession: "chat-lynx-ef01", Addressee: "chat-lynx-ef01"}
-	if _, err := s.Spawn(context.Background(), rec, "task-2", ""); err != nil {
+	if _, err := s.Spawn(context.Background(), rec, "task-2", "", 1); err != nil {
 		t.Fatal(err)
 	}
 	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-lynx-ef01", metav1.GetOptions{})
@@ -118,7 +180,7 @@ func TestSpawnedSessionsCarryNoBusPasswordAndAPodBoundTokenInstead(t *testing.T)
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
-	if _, err := s.Spawn(context.Background(), rec, "task-9", ""); err != nil {
+	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
 		t.Fatal(err)
 	}
 	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
