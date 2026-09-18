@@ -216,7 +216,10 @@ to it.
 `declared_intent_searched`, `declared_intent_sources` and `declarations_path` are the harness's own
 half of that step, already done by the time `start` prints. On a stream with a declared-intent step,
 `start` reads every repository in `declared_intent_repos` it can — each `context_repos` entry
-through `inspect_repository.py clone` at the entry's `ref` when it has one, the GitOps repository
+through `inspect_repository.py clone` at the entry's `ref` when it has one and at its own default
+branch otherwise (the copy runs without `GITOPS_BASE_BRANCH` and `CREDENTIAL_PROXY_BASE_BRANCH`,
+which name the GitOps repository's branch and which a directory-mode clone with no `--ref` would
+otherwise check out), the GitOps repository
 from the clone it just reset or through the same script in content mode — for `declares:`
 frontmatter in OKF notes, within the paths each repository's `.kube-agents/intent.yaml` names
 (`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree

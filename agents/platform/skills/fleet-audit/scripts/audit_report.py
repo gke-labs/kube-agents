@@ -692,6 +692,17 @@ CLONE_TMP_PREFIX = "declared-intent-"
 CLONE_LEASE_SUFFIX = "-declared-intent"
 CLONE_MODE_CONTENT = "content"
 CLONE_MODE_DIRECTORY = "directory"
+# The GitOps base-branch override, which `gitops_workspace.resolve_base_branch`
+# consults before the remote's HEAD, names the branch the fleet deploys from
+# in that one repository. The sibling script inherits the environment, and a
+# directory-mode clone with no `--ref` asks that function which branch to
+# check out, so a context repository copied with the override in place was
+# read at the GitOps repository's branch, not its own default, and one with
+# no branch of that name failed to clone every run. Every copy the search
+# makes runs without the two variables: a pinned entry passes `--ref` and
+# never consulted them, and in content mode the broker resolves the default
+# branch per repository and never reads the agent container's environment.
+BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH")
 
 # `gh pr list` takes a limit, not a cursor. A full page means the oldest
 # remediation branches fell off the end, and a branch that reads as "no pull
@@ -5773,6 +5784,7 @@ def run_cmd(
     capture: bool = True,
     cwd: str | Path | None = None,
     stdin: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
@@ -5788,6 +5800,9 @@ def run_cmd(
     fd 0 for an argv that named `-` as an input file, so `--body-file -` carries
     a pull-request body across the container boundary that a
     `--body-file /some/path` could only cross while the two shared a volume.
+
+    `env` replaces the child's environment when given; None inherits this
+    process's, as `subprocess.run` does.
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
@@ -5800,6 +5815,7 @@ def run_cmd(
             capture_output=capture,
             cwd=str(target) if target is not None else None,
             input=stdin,
+            env=env,
         )
     except subprocess.CalledProcessError as exc:
         log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
@@ -7331,7 +7347,8 @@ def _clone_step(
         cmd += ["--prefix", prefix]
     if force:
         cmd.append("--force")
-    result = run_cmd(cmd, check=False)
+    env = {k: v for k, v in os.environ.items() if k not in BASE_BRANCH_OVERRIDE_VARS}
+    result = run_cmd(cmd, check=False, env=env)
     if result.returncode != 0:
         at = f" at {ref}" if ref else ""
         log(f"WARNING: {slug}: clone{at} exited {result.returncode}; not searched.")

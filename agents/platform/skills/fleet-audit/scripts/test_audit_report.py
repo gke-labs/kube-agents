@@ -424,6 +424,7 @@ class Recorder:
         # what a caller asserts about a body should not change with how the
         # body reaches `gh`. See `bodies_for` for why the seam exists at all.
         self.bodies: list[str | None] = []
+        self.envs: list[dict | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # `git diff --cached --quiet` is the harness's commit classifier: rc 0
@@ -437,9 +438,11 @@ class Recorder:
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None, env=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
+        # The environment the call named, None when it inherited the process's.
+        self.envs.append(env)
         self.bodies.append(self._read_body(cmd, stdin))
         joined = " ".join(cmd)
         for key, code in self.failures.items():
@@ -5365,15 +5368,6 @@ class TestDeclarationParsing(unittest.TestCase):
         self.assertTrue(long[0]["excerpt"].endswith("…(truncated)"))
 
 
-    def test_the_excerpt_is_redacted_and_clipped(self):
-        token = "ghp_" + "a" * 36
-        entries, _ = parse(note([declaration()], title=f"pinned with token {token}"))
-        self.assertNotIn(token, entries[0]["excerpt"])
-        long, _ = parse(note([declaration()], title="x" * 1000))
-        self.assertLess(len(long[0]["excerpt"]), 1000)
-        self.assertTrue(long[0]["excerpt"].endswith("…(truncated)"))
-
-
 class TestIntentPaths(unittest.TestCase):
     """`.kube-agents/intent.yaml` bounds the search; anything wrong with it means the whole tree."""
 
@@ -5871,6 +5865,32 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         # The leased checkout is left in place; only the scratch destination goes.
         self.assertTrue(leased.is_dir())
         self.assertEqual(self.temp_dirs(), [])
+
+    def test_the_copies_run_without_the_gitops_base_branch_override(self):
+        # `resolve_base_branch` consults the override before the remote's
+        # HEAD, and a directory-mode clone with no `--ref` asks it which
+        # branch to check out, so a context repository copied with the
+        # variable in the environment was read at the GitOps repository's
+        # branch, not its own default. Every copy the search makes runs
+        # without the two variables and with the rest of the environment.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        leased = self.tmp_path / "leased" / "acme__terraform-live"
+        self.write(leased, "intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            leased, mode="directory", depthIgnored=True
+        )
+        override = {"GITOPS_BASE_BRANCH": "release", "CREDENTIAL_PROXY_BASE_BRANCH": "release"}
+        with patch.dict(os.environ, {**override, "LIVE_1576_MARKER": "kept"}):
+            payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        clones = [i for i, c in enumerate(self.harness.calls) if str(audit_report.CLONE_SCRIPT) in c]
+        self.assertTrue(clones)
+        for index in clones:
+            env = self.harness.envs[index]
+            self.assertIsNotNone(env, "the copy inherited the process environment")
+            self.assertEqual(sorted(set(env) & set(override)), [])
+            self.assertEqual(env.get("LIVE_1576_MARKER"), "kept")
 
     def test_a_copy_the_harness_cannot_call_searched_is_left_out_with_a_warning(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
