@@ -157,10 +157,7 @@ func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
 	// Assembled as realMain assembles it, so the test covers the path the binary
 	// takes rather than a shortcut around buildClusterSet.
 	stub := &stubGetter{obj: managedFieldsObject()}
-	clusters, absorbed := buildClusterSet(stub, directClusterIdentity(f), nil)
-	if len(absorbed) != 0 {
-		t.Errorf("absorbed = %v, want none with no profiles", absorbed)
-	}
+	clusters := buildClusterSet(stub, directClusterIdentity(f), nil)
 	filter, join := newFilterFromFlags(f, clusters)
 
 	if got := join.Clusters(); got != 1 {

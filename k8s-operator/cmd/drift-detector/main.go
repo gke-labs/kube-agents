@@ -383,16 +383,25 @@ func realMain(argv []string) error {
 		}
 	}
 
+	// Only when the direct credentials exist. With them, the profile reconcile
+	// writes for this same cluster is redundant and the scan declines it before
+	// spending a GKE describe on a getter buildClusterSet would discard; without
+	// them, that profile is the only way the cluster is reached at all.
+	var directlyReached *clusterIdentity
+	if getter != nil {
+		directlyReached = &direct
+	}
+
 	// Fatal error propagated rather than degraded: internal/clusterprofiles
 	// returns one only for a --profiles-dir that is not there, which discovery
 	// runs once against and a restart fixes. Everything survivable has already
 	// been logged and recorded in the scan by this point.
-	scan, err := discoverProfileClusters(ctx, f.profilesDir, f.project)
+	scan, err := discoverProfileClusters(ctx, f.profilesDir, f.project, directlyReached)
 	if err != nil {
 		return err
 	}
 
-	clusters, absorbed := buildClusterSet(getter, direct, scan.Clusters)
+	clusters := buildClusterSet(getter, direct, scan.Clusters)
 	filter, join := newFilterFromFlags(f, clusters)
 
 	// Say which mode the join is in at startup rather than leaving it to be
@@ -426,10 +435,11 @@ func realMain(argv []string) error {
 	}
 	// Not a skip: the cluster is joined, through the direct credentials instead.
 	// Logged so that a profile count that does not match the cluster count has
-	// an explanation in the same place as the counts.
-	if len(absorbed) > 0 {
-		log.Printf("%s: profile(s) %s name the cluster --in-cluster/--kubeconfig already reaches; joined through those credentials instead",
-			commandName, strings.Join(absorbed, absorbedProfileSeparator))
+	// an explanation in the same place as the counts, and said in as many words
+	// because the line above it is about clusters that were lost.
+	if len(scan.Absorbed) > 0 {
+		log.Printf("%s: cluster(s) %s have a profile naming the cluster --in-cluster/--kubeconfig already reaches; joined through those credentials instead, and their profile was left unread",
+			commandName, strings.Join(scan.Absorbed, absorbedProfileSeparator))
 	}
 
 	source, err := newPubsubSource(ctx, f.project, f.subscription)

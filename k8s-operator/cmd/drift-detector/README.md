@@ -53,7 +53,10 @@ cluster at all takes `container.clusters.get` — `roles/container.viewer` is th
 `--project`, and only there: a profile naming a cluster in another project is dropped on its
 identity before anything is spent on reaching it, so no grant outside `--project` is wanted or
 used. Without the grant every profile is skipped at startup with
-`asking the GKE API where … is: 403` and the detector joins nothing it did not already reach.
+`asking the GKE API where … is: 403` and the detector joins nothing it did not already reach — with
+one exception, and it is the cluster that matters most on a single-cluster install: the profile for
+the cluster `--in-cluster`/`--kubeconfig` already reaches is declined before it is addressed, so
+that cluster is still joined, through a credential that needs no Google grant at all.
 Reading the objects then takes the same cluster-wide `get` as above, bound to that Google identity
 on every cluster in the fleet. A cluster where only the second is missing still starts: its records
 come out `failed` with the RBAC error, which is the difference between a cluster that was not
@@ -233,9 +236,14 @@ itself can reach. They overlap on every install, because reconcile gives the man
 profile like any other cluster, and the direct credential is kept: it reaches
 `kubernetes.default.svc` as the pod's Kubernetes service account and never leaves the cluster, where
 a profile authenticates as the pod's Google identity against the control-plane endpoint, which IAM
-without `roles/container.viewer` or a master authorized network can refuse. The absorbed profile is
-named at startup, so a profile count that does not match the cluster count has its explanation in
-the same place as the counts.
+without `roles/container.viewer` or a master authorized network can refuse. That profile is declined
+during the scan rather than dropped after it, on the same grounds as the out-of-project drop below:
+addressing it costs a GKE describe for a getter that is discarded, and on an install without
+`container.clusters.get` the describe fails and the profile is reported as skipped — telling an
+operator that a cluster this detector enriches normally will not be joined. The absorbed cluster is
+named at startup, and separately from the skip count, so a profile count that does not match the
+cluster count has its explanation in the same place as the counts without inflating the number that
+reads as lost coverage.
 
 **A profile for a cluster outside `--project` is dropped, and that is correctness rather than
 economy.** The subscription is a project-level sink, so a record can only ever name a cluster in

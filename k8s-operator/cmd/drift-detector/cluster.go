@@ -206,6 +206,16 @@ type profileScan struct {
 	// one per straggler, so it can be compared against the size of the fleet.
 	Skipped int
 
+	// Absorbed names the clusters whose profile was declined because the direct
+	// credentials already reach them. Deliberately not in Skipped: those two
+	// numbers would otherwise be added together by an operator reading "how much
+	// of my fleet is this missing", and this one is missing nothing.
+	//
+	// Clusters rather than profile directories, because the predicate that
+	// declines them is given an identity and nothing else. No loss: the Platform
+	// Agent derives the directory name from the same triple.
+	Absorbed []string
+
 	// DirUnreadable says the profiles directory itself could not be read:
 	// EACCES from a bad mount or the wrong fsGroup, ENOTDIR when the path names
 	// a file. Not folded into Skipped, because the number of clusters behind an
@@ -241,7 +251,13 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 
 // discoverProfileClusters turns a Hermes profiles directory into one live-object
 // reader per Cluster Agent profile, dropping the clusters whose records this
-// subscription will never carry.
+// subscription will never carry and the one the caller already reaches.
+//
+// directlyReached is the cluster --in-cluster or --kubeconfig serves, or nil
+// when neither is set. Nil rather than a bare identity because the two cases
+// need opposite treatment: with those credentials the profile for that cluster
+// is redundant and is declined, and without them it is the only way that cluster
+// is reached at all, so declining it would lose it.
 //
 // project is --project, and the filter is not an optimisation. The subscription
 // is a project-level sink, so every record on it names a cluster in that
@@ -278,7 +294,7 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 // mistake, not a caller's convenience: Discover calls os.ReadDir, "" is ENOENT,
 // and ENOENT is the one condition the package treats as fatal -- so a detector
 // that simply did not ask for the fan-in would refuse to start.
-func discoverProfileClusters(ctx context.Context, dir, project string) (profileScan, error) {
+func discoverProfileClusters(ctx context.Context, dir, project string, directlyReached *clusterIdentity) (profileScan, error) {
 	if dir == "" {
 		return profileScan{}, nil
 	}
@@ -300,19 +316,41 @@ func discoverProfileClusters(ctx context.Context, dir, project string) (profileS
 		log.Printf("%s: skipping profile %s, its cluster will NOT be joined: %v", commandName, profile, err)
 	}
 
-	// Counted with the rest, because an operator who mistyped --project needs
-	// this to show up in the skip total rather than as a fleet that was always
-	// this small. Discover calls Want once per profile, in order, on the one
-	// goroutine this runs on, so sharing the counter with skip is safe. The
-	// identity is named rather than the profile directory, which Want is not
+	// Two reasons to decline a profile before it is addressed, and only one of
+	// them is a skip. Discover calls Want once per profile, in order, on the one
+	// goroutine this runs on, so writing to the scan from here is safe. Both
+	// name the identity rather than the profile directory, which Want is not
 	// given -- and which the Platform Agent derives from the triple anyway.
 	want := func(id clusterprofiles.Identity) bool {
+		identity := identityFromProfile(id)
+
+		// The cluster the direct credentials already reach. Reconcile gives the
+		// management cluster a profile like every other cluster, so this is not
+		// an edge case but every install, and buildClusterSet would discard this
+		// profile's getter in favour of the direct one regardless -- declining
+		// here changes nothing about which getter serves the cluster.
+		//
+		// What it changes is the cost and the account of it. Addressing this
+		// cluster means a GKE describe for a getter that is about to be thrown
+		// away, and on an install whose pod holds no container.clusters.get --
+		// the ordinary IAM gap, since the direct credential is a Kubernetes
+		// ServiceAccount and needs no Google grant at all -- that describe fails
+		// and the profile is reported as skipped, telling an operator that a
+		// cluster this run enriches normally will NOT be joined. Same argument
+		// as the out-of-project drop below, arriving from the other direction.
+		if directlyReached != nil && identity == *directlyReached {
+			scan.Absorbed = append(scan.Absorbed, identity.String())
+			return false
+		}
+
 		if id.Project == project {
 			return true
 		}
+		// Counted, because an operator who mistyped --project needs this to show
+		// up in the skip total rather than as a fleet that was always this small.
 		scan.Skipped++
 		log.Printf("%s: skipping the profile for cluster %s: it is outside --project=%s, and this subscription carries no records from it",
-			commandName, identityFromProfile(id), project)
+			commandName, identity, project)
 		return false
 	}
 
@@ -346,40 +384,40 @@ func discoverProfileClusters(ctx context.Context, dir, project string) (profileS
 }
 
 // buildClusterSet merges the two credential sources into the join's routing
-// table, and reports which profiles it dropped as duplicates of the direct
-// cluster.
+// table.
 //
 // Additive, like k8s-event-watcher's watch set: --profiles-dir contributes the
 // fleet and --in-cluster/--kubeconfig contributes one more. They overlap on the
 // cluster the pod runs in, because reconcile gives the management cluster a
-// profile like any other, and the direct entry is the one kept -- newObjectGetter's
-// comment has the argument for which credential is the safer of the two.
+// profile like any other, and the direct entry is the one kept --
+// newObjectGetter's comment has the argument for which credential is the safer
+// of the two.
 //
-// The duplicate matters less here than it does in the watcher, where two
-// entries meant two dedup caches and two alerts for one event. A second getter
-// for one cluster would just be a second way to read the same object. It is
-// still dropped rather than allowed to win, because which one a map ends up
-// holding would otherwise depend on insertion order, and that is not a thing to
-// leave to the order a directory happened to be read in.
+// The overlap does not normally reach here any more: the profile scan's
+// predicate declines that cluster's profile before it is addressed, and records
+// it in profileScan.Absorbed, which is what startup reports. The check below
+// stays as the invariant rather than as the mechanism -- direct wins, whatever
+// order the profiles arrived in -- because a map that silently took whichever
+// entry was written last would make the choice depend on the order a directory
+// happened to be read in. It is not reported from here, so that "which clusters
+// were absorbed" has one answer and not two that could disagree.
 //
 // direct is nil when neither credential flag is set, which is legal: a
 // profiles-only detector is the fleet-wide mode, and a set with nothing in it
 // at all is the no-credentials mode the join has supported since T1.
-func buildClusterSet(direct objectGetter, directIdentity clusterIdentity, profiles []profileCluster) (map[clusterIdentity]objectGetter, []string) {
+func buildClusterSet(direct objectGetter, directIdentity clusterIdentity, profiles []profileCluster) map[clusterIdentity]objectGetter {
 	set := make(map[clusterIdentity]objectGetter, len(profiles)+1)
 	if direct != nil {
 		set[directIdentity] = direct
 	}
 
-	var absorbed []string
 	for _, p := range profiles {
 		if _, dup := set[p.Identity]; dup {
-			absorbed = append(absorbed, p.Profile)
 			continue
 		}
 		set[p.Identity] = p.Getter
 	}
-	return set, absorbed
+	return set
 }
 
 // verifyClusterIdentity checks the declared cluster identity against the one

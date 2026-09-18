@@ -167,7 +167,7 @@ func TestIdentityFromProfileDoesNotTransposeLocationAndCluster(t *testing.T) {
 // treats as fatal. Without the guard a detector that simply did not ask for the
 // fan-in would refuse to start.
 func TestDiscoverProfileClustersWithNoDirectoryConfigured(t *testing.T) {
-	scan, err := discoverProfileClusters(context.Background(), "", "example-project")
+	scan, err := discoverProfileClusters(context.Background(), "", "example-project", nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters(\"\") returned error: %v -- an unset --profiles-dir is not a missing directory", err)
 	}
@@ -184,7 +184,7 @@ func TestDiscoverProfileClustersFatalOnAMissingDirectory(t *testing.T) {
 	stubGKE(t)
 	missing := filepath.Join(t.TempDir(), "not-created-yet")
 
-	_, err := discoverProfileClusters(context.Background(), missing, "example-project")
+	_, err := discoverProfileClusters(context.Background(), missing, "example-project", nil)
 	if err == nil {
 		t.Fatal("discoverProfileClusters returned no error for a missing --profiles-dir")
 	}
@@ -199,7 +199,7 @@ func TestDiscoverProfileClustersBuildsOneReaderPerProfile(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "cluster-example-project-prod-b-europe-west1", "example-project", "prod-b", "europe-west1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestDiscoverProfileClustersLiftsTheClientSideThrottle(t *testing.T) {
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestDiscoverProfileClustersDropsClustersOutsideTheProject(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "cluster-other-project-prod-b-us-central1", "other-project", "prod-b", "us-central1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
@@ -310,6 +310,82 @@ func TestDiscoverProfileClustersDropsClustersOutsideTheProject(t *testing.T) {
 	// The point of the Want predicate: the foreign cluster is never addressed.
 	if len(described) != 1 || described[0] != "example-project/us-central1/prod-a" {
 		t.Errorf("GKE describe called for %v, want only the --project cluster -- the drop is happening after the cluster is addressed, not before", described)
+	}
+}
+
+// The overlap that happens on every install: reconcile gives the management
+// cluster a profile like every other cluster, so the cluster --in-cluster
+// already reaches also arrives from the profiles directory. buildClusterSet
+// would discard that profile's getter either way, so what is under test is the
+// cost and the account of it -- a describe spent on a getter about to be thrown
+// away, and, when the pod's Google identity holds no container.clusters.get,
+// that describe failing and the profile being reported as skipped. The line an
+// operator then reads says a cluster this run enriches normally will NOT be
+// joined.
+func TestDiscoverProfileClustersDeclinesTheProfileForTheDirectlyReachedCluster(t *testing.T) {
+	failures := stubGKE(t)
+	// The ordinary IAM gap: the direct credential is a Kubernetes ServiceAccount
+	// and needs no Google grant, so an install can reach its own cluster while
+	// every describe 403s.
+	failures["example-project/us-central1/prod-a"] = errors.New("403: caller lacks container.clusters.get")
+
+	described := []string{}
+	inner := profilesDiscovery.Describe
+	profilesDiscovery.Describe = func(ctx context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
+		described = append(described, id.String())
+		return inner(ctx, id)
+	}
+
+	logs := captureLog(t)
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
+	writeClusterProfile(t, dir, "cluster-example-project-prod-b-europe-west1", "example-project", "prod-b", "europe-west1")
+
+	direct := clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-a"}
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", &direct)
+	if err != nil {
+		t.Fatalf("discoverProfileClusters returned error: %v", err)
+	}
+
+	// Never addressed, so the 403 planted above is never provoked.
+	if len(described) != 1 || described[0] != "example-project/europe-west1/prod-b" {
+		t.Errorf("GKE describe called for %v, want only the cluster the direct credentials do not reach", described)
+	}
+	// Absorbed, not skipped. The two are separate because an operator reads the
+	// skip count as "how much of my fleet is this missing", and this is missing
+	// nothing.
+	if scan.Skipped != 0 {
+		t.Errorf("skipped = %d, want 0 -- the cluster is joined through the direct credentials", scan.Skipped)
+	}
+	if len(scan.Absorbed) != 1 || scan.Absorbed[0] != "example-project/us-central1/prod-a" {
+		t.Errorf("Absorbed = %v, want the direct cluster named", scan.Absorbed)
+	}
+	if len(scan.Clusters) != 1 || scan.Clusters[0].Identity.Cluster != "prod-b" {
+		t.Errorf("registered %v, want only the cluster the direct credentials do not reach", scan.Clusters)
+	}
+	// The false alarm this exists to prevent, in the words it would appear in.
+	if strings.Contains(logs.String(), "will NOT be joined") {
+		t.Errorf("a cluster the direct credentials reach was reported as not joined:\n%s", logs.String())
+	}
+}
+
+// The other half of the rule: with no direct credentials the same profile is
+// the only way that cluster is reached, so declining it would lose it. Nothing
+// but the nil distinguishes this from the test above.
+func TestDiscoverProfileClustersKeepsThatProfileWithNoDirectCredentials(t *testing.T) {
+	stubGKE(t)
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
+
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
+	if err != nil {
+		t.Fatalf("discoverProfileClusters returned error: %v", err)
+	}
+	if len(scan.Clusters) != 1 {
+		t.Fatalf("discovered %d clusters, want 1 -- the only route to that cluster was declined", len(scan.Clusters))
+	}
+	if len(scan.Absorbed) != 0 {
+		t.Errorf("Absorbed = %v, want none: there are no direct credentials to absorb it into", scan.Absorbed)
 	}
 }
 
@@ -337,7 +413,7 @@ func TestDiscoverProfileClustersSkipsAProfileWhoseClientWillNotBuild(t *testing.
 	writeClusterProfile(t, dir, "good", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "bad", "example-project", "prod-b", "europe-west1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v -- one bad profile is a skip, not a fatal", err)
 	}
@@ -377,7 +453,7 @@ func TestDiscoverProfileClustersDegradesOnAnUnreadableDirectory(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project")
+	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v -- an unreadable dir degrades, it is not fatal", err)
 	}
@@ -415,19 +491,16 @@ func TestBuildClusterSet(t *testing.T) {
 	other := clusterIdentity{Project: "example-project", Location: "europe-west1", Cluster: "prod-b"}
 
 	t.Run("the two sources are additive", func(t *testing.T) {
-		set, absorbed := buildClusterSet(direct, directID, []profileCluster{
+		set := buildClusterSet(direct, directID, []profileCluster{
 			{Identity: other, Profile: "prod-b", Getter: &stubGetter{}},
 		})
 		if len(set) != 2 {
 			t.Fatalf("set has %d entries, want 2", len(set))
 		}
-		if len(absorbed) != 0 {
-			t.Errorf("absorbed = %v, want none", absorbed)
-		}
 	})
 
 	t.Run("profiles alone are a valid set", func(t *testing.T) {
-		set, absorbed := buildClusterSet(nil, directID, []profileCluster{
+		set := buildClusterSet(nil, directID, []profileCluster{
 			{Identity: other, Profile: "prod-b", Getter: &stubGetter{}},
 		})
 		// One entry, not two: a nil direct getter is not registered, or the
@@ -438,28 +511,24 @@ func TestBuildClusterSet(t *testing.T) {
 		if _, ok := set[directID]; ok {
 			t.Error("a nil direct getter was registered under the flags' identity")
 		}
-		if len(absorbed) != 0 {
-			t.Errorf("absorbed = %v, want none", absorbed)
-		}
 	})
 
 	t.Run("neither source is a valid empty set", func(t *testing.T) {
-		set, absorbed := buildClusterSet(nil, directID, nil)
+		set := buildClusterSet(nil, directID, nil)
 		if len(set) != 0 {
 			t.Errorf("set has %d entries, want 0", len(set))
-		}
-		if len(absorbed) != 0 {
-			t.Errorf("absorbed = %v, want none", absorbed)
 		}
 	})
 
 	// The overlap that happens on every install: reconcile gives the management
 	// cluster a profile like any other cluster, so the pod's own cluster arrives
-	// from both sources. The direct credential wins -- see newObjectGetter for
-	// why that one and not the profile's.
+	// from both sources. The scan's predicate now declines that profile before
+	// it is addressed, so this is the invariant rather than the live path --
+	// whatever order the profiles arrive in, the direct credential wins. See
+	// newObjectGetter for why that one and not the profile's.
 	t.Run("the direct cluster wins a duplicate", func(t *testing.T) {
 		profileGetter := &stubGetter{}
-		set, absorbed := buildClusterSet(direct, directID, []profileCluster{
+		set := buildClusterSet(direct, directID, []profileCluster{
 			{Identity: directID, Profile: "cluster-example-project-prod-a-us-central1", Getter: profileGetter},
 			{Identity: other, Profile: "prod-b", Getter: &stubGetter{}},
 		})
@@ -468,9 +537,6 @@ func TestBuildClusterSet(t *testing.T) {
 		}
 		if set[directID] != objectGetter(direct) {
 			t.Error("the profile's getter displaced the direct one")
-		}
-		if len(absorbed) != 1 || absorbed[0] != "cluster-example-project-prod-a-us-central1" {
-			t.Errorf("absorbed = %v, want the duplicate profile named", absorbed)
 		}
 	})
 }
