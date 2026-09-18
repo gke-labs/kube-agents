@@ -216,6 +216,40 @@ func directClusterIdentity(f *flags) clusterIdentity {
 	}
 }
 
+// joinDisabledReason says why the live-object join has no clusters, in the one
+// line an operator gets. Three ways to reach nought clusters, and they call for
+// different action, so they are not reported alike: naming --profiles-dir as
+// un-set to someone who set it sends them to check the one thing that is
+// already right, and calling a directory empty when every profile in it failed
+// sends them to cluster-agent-reconcile when the cause is IAM, a mistyped
+// --project, or a GKE API that was down for the seconds this process spent
+// starting.
+//
+// It matters more than a log line usually would: discovery runs once, nothing
+// here retries and nothing exits, so this sentence is the whole account of why
+// the fan-in is off for the life of the pod.
+//
+// A function rather than a switch at the call site so the three branches can be
+// asserted without standing up a subscription.
+func joinDisabledReason(profilesDir string, skipped int) string {
+	switch {
+	case skipped > 0:
+		// Reached only with a profiles dir: discoverProfileClusters returns
+		// before scanning when it is unset, so skipped cannot be positive here
+		// without one to name.
+		return fmt.Sprintf("all %d Cluster Agent profile(s) in %s were skipped for the reasons above, and no --in-cluster or --kubeconfig", skipped, profilesDir)
+	case profilesDir != "":
+		// Normal before a fresh install's first cluster-agent-reconcile tick,
+		// which is why this degrades rather than refusing to start: the detector
+		// still parses, classifies and forwards, and only the ownership is
+		// missing. The watcher exits here instead because with no clusters it
+		// has nothing left to do at all.
+		return fmt.Sprintf("no Cluster Agent profiles in %s yet, and no --in-cluster or --kubeconfig", profilesDir)
+	default:
+		return "no cluster credentials (--in-cluster, --kubeconfig or --profiles-dir)"
+	}
+}
+
 func main() {
 	if err := realMain(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -353,19 +387,7 @@ func realMain(argv []string) error {
 	// credential flags otherwise sees DRIFT lines with no ownership on them and
 	// no statement anywhere that the join never ran.
 	if join.Clusters() == 0 {
-		// Two ways to reach nought clusters, and they call for different
-		// operator action, so they are not reported with one line. Naming
-		// --profiles-dir as un-set to someone who set it sends them to check the
-		// one thing that is already right.
-		reason := "no cluster credentials (--in-cluster, --kubeconfig or --profiles-dir)"
-		if f.profilesDir != "" {
-			// Normal before a fresh install's first cluster-agent-reconcile tick,
-			// which is why this degrades rather than refusing to start: the
-			// detector still parses, classifies and forwards, and only the
-			// ownership is missing. The watcher exits here instead because with
-			// no clusters it has nothing left to do at all.
-			reason = fmt.Sprintf("no Cluster Agent profiles in %s yet, and no --in-cluster or --kubeconfig", f.profilesDir)
-		}
+		reason := joinDisabledReason(f.profilesDir, skipped)
 		// Not "every record": a delete, and any record naming no object, is
 		// counted no_object before the join reaches the cluster lookup, so those
 		// two do not move the unreachable counter even with the join off.

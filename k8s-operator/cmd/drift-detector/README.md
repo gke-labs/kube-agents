@@ -50,7 +50,9 @@ line, not silently unenriched.
 `--profiles-dir` needs two more grants, and they attach to the pod's **Google** identity rather
 than to its ServiceAccount, because that is what a profile cluster is reached as. Addressing the
 cluster at all takes `container.clusters.get` — `roles/container.viewer` is the usual shape — in
-each profile's project; without it every profile is skipped at startup with
+`--project`, and only there: a profile naming a cluster in another project is dropped on its
+identity before anything is spent on reaching it, so no grant outside `--project` is wanted or
+used. Without the grant every profile is skipped at startup with
 `asking the GKE API where … is: 403` and the detector joins nothing it did not already reach.
 Reading the objects then takes the same cluster-wide `get` as above, bound to that Google identity
 on every cluster in the fleet. A cluster where only the second is missing still starts: its records

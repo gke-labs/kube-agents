@@ -387,9 +387,13 @@ users:
       token: not-a-real-token
 `
 
+	// stubGKE first, for its TokenSource: Discover mints the token before it
+	// calls Describe and skips the profile if minting fails, so a nil
+	// TokenSource would fall through to Application Default Credentials and
+	// leave described at 0 on any host without them -- green with the ordering
+	// reversed, which is the one thing this test exists to catch.
+	stubGKE(t)
 	described := 0
-	saved := profilesDiscovery
-	t.Cleanup(func() { profilesDiscovery = saved })
 	profilesDiscovery.Describe = func(context.Context, clusterprofiles.Identity) (*container.Cluster, error) {
 		described++
 		return nil, errors.New("the scan should not have run")
@@ -417,6 +421,30 @@ users:
 	}
 	if described != 0 {
 		t.Errorf("GKE describe called %d time(s) before the identity check refused; want 0", described)
+	}
+}
+
+// The line an operator gets when the join came up with nothing. The branch that
+// matters is the third: profiles were there and every one failed, which reads
+// as an empty directory unless the skip count is consulted, and sends the
+// operator to cluster-agent-reconcile instead of to IAM or --project.
+func TestJoinDisabledReason(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		profilesDir string
+		skipped     int
+		want        string
+	}{
+		{"no sources at all", "", 0, "no cluster credentials (--in-cluster, --kubeconfig or --profiles-dir)"},
+		{"a profiles dir with nothing in it yet", "/opt/data/profiles", 0, "no Cluster Agent profiles in /opt/data/profiles yet, and no --in-cluster or --kubeconfig"},
+		{"a profiles dir where every profile failed", "/opt/data/profiles", 5, "all 5 Cluster Agent profile(s) in /opt/data/profiles were skipped for the reasons above, and no --in-cluster or --kubeconfig"},
+		{"one profile, and it failed", "/opt/data/profiles", 1, "all 1 Cluster Agent profile(s) in /opt/data/profiles were skipped for the reasons above, and no --in-cluster or --kubeconfig"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := joinDisabledReason(tc.profilesDir, tc.skipped); got != tc.want {
+				t.Errorf("joinDisabledReason(%q, %d) = %q, want %q", tc.profilesDir, tc.skipped, got, tc.want)
+			}
+		})
 	}
 }
 

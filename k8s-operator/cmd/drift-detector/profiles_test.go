@@ -262,6 +262,18 @@ func TestDiscoverProfileClustersLiftsTheClientSideThrottle(t *testing.T) {
 // worth seeing: --project pointed at the wrong project.
 func TestDiscoverProfileClustersDropsClustersOutsideTheProject(t *testing.T) {
 	stubGKE(t)
+	// Wrapped so the test can see which clusters were addressed, not only which
+	// were registered. The drop has to happen before the GKE call: the pod's
+	// identity may hold no container.clusters.get in the other project, and a
+	// describe that fails there would be reported as a permission error against
+	// a cluster this detector was going to discard regardless.
+	described := []string{}
+	inner := profilesDiscovery.Describe
+	profilesDiscovery.Describe = func(ctx context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
+		described = append(described, id.String())
+		return inner(ctx, id)
+	}
+
 	logs := captureLog(t)
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
@@ -280,10 +292,14 @@ func TestDiscoverProfileClustersDropsClustersOutsideTheProject(t *testing.T) {
 	if skipped != 1 {
 		t.Errorf("skipped = %d, want 1 -- a dropped profile has to be counted, or a fan-in that reached one of two looks like a fleet of one", skipped)
 	}
-	for _, want := range []string{"cluster-other-project-prod-b-us-central1", "outside --project"} {
+	for _, want := range []string{"other-project/us-central1/prod-b", "outside --project"} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("log does not mention %q:\n%s", want, logs.String())
 		}
+	}
+	// The point of the Want predicate: the foreign cluster is never addressed.
+	if len(described) != 1 || described[0] != "example-project/us-central1/prod-a" {
+		t.Errorf("GKE describe called for %v, want only the --project cluster -- the drop is happening after the cluster is addressed, not before", described)
 	}
 }
 

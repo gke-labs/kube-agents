@@ -218,12 +218,17 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 // is a project-level sink, so every record on it names a cluster in that
 // project; a profile for a cluster elsewhere -- which the Platform Agent
 // legitimately creates, since a fleet can span projects -- produces a client no
-// record can ever match. Dropping it costs nothing either way: the token is
-// minted once inside Discover and shared, and dynamic.NewForConfig opens no
-// connection. What the drop buys is keeping a real misconfiguration visible --
-// an operator who pointed --project at the wrong project sees "8 clusters
-// skipped, outside project" instead of a detector that starts cleanly and
-// enriches nothing.
+// record can ever match. The drop goes through Discoverer.Want, on the identity
+// and before the cluster is addressed, because dropping it afterwards is not
+// free: Discover asks the GKE API where every cluster is before it returns, so a
+// foreign cluster would cost a describe call into a project this detector is
+// about to discard -- and where the pod's Google identity has no
+// container.clusters.get there, that call fails and the profile is reported as a
+// GKE permission error instead, sending an operator to grant access to a cluster
+// that was going to be dropped regardless. What the drop buys is keeping a real
+// misconfiguration visible -- an operator who pointed --project at the wrong
+// project sees "8 clusters skipped, outside project" instead of a detector that
+// starts cleanly and enriches nothing.
 //
 // Failure policy is internal/clusterprofiles's, and it is the watcher's: a
 // missing directory is fatal because discovery runs once and a restart fixes
@@ -260,9 +265,26 @@ func discoverProfileClusters(ctx context.Context, dir, project string) ([]profil
 		log.Printf("%s: skipping profile %s, its cluster will NOT be joined: %v", commandName, profile, err)
 	}
 
-	// A copy, so setting OnSkip does not write to the package-level seam.
+	// Counted with the rest, because an operator who mistyped --project needs
+	// this to show up in the skip total rather than as a fleet that was always
+	// this small. Discover calls Want once per profile, in order, on the one
+	// goroutine this runs on, so sharing the counter with skip is safe. The
+	// identity is named rather than the profile directory, which Want is not
+	// given -- and which the Platform Agent derives from the triple anyway.
+	want := func(id clusterprofiles.Identity) bool {
+		if id.Project == project {
+			return true
+		}
+		skipped++
+		log.Printf("%s: skipping the profile for cluster %s: it is outside --project=%s, and this subscription carries no records from it",
+			commandName, identityFromProfile(id), project)
+		return false
+	}
+
+	// A copy, so setting these does not write to the package-level seam.
 	d := profilesDiscovery
 	d.OnSkip = skip
+	d.Want = want
 	discovered, err := d.Discover(ctx, dir)
 	if err != nil {
 		return nil, skipped, err
@@ -271,13 +293,6 @@ func discoverProfileClusters(ctx context.Context, dir, project string) ([]profil
 	clusters := make([]profileCluster, 0, len(discovered))
 	for _, c := range discovered {
 		identity := identityFromProfile(c.Identity)
-		if identity.Project != project {
-			skipped++
-			log.Printf("%s: skipping profile %s: cluster %s is outside --project=%s, and this subscription carries no records from it",
-				commandName, c.Profile, identity, project)
-			continue
-		}
-
 		applyJoinThrottle(c.Config)
 		client, err := dynamic.NewForConfig(c.Config)
 		if err != nil {
