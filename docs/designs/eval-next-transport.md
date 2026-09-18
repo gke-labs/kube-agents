@@ -92,13 +92,20 @@ the presubmit exports nothing new until it chooses to. The exchange:
    hands the adapter no task id: its inbound handler only enqueues, and `startTask` mints the id
    and posts the submitted notice back through the adapter's `Post`. So the `POST` enqueues and
    then waits, inside the adapter, on the session record for its key until `ActiveTask`
-   appears, bounded by a short accept bound, and answers with the task id it finds there. Two
+   appears, bounded by a short accept bound, and answers with the task id it finds there. Three
    things end the wait as a refusal instead: the unverified-principal notice, which the drop
-   path posts to the key through the same `Post` and writes no record behind, and the bound
-   expiring with neither a record nor a notice. The harness classifies a refusal as the gateway
-   refusing the injection, infrastructure. The adapter dedupes on the backend message id,
+   path posts to the key through the same `Post` and writes no record behind; the placeholder's
+   failure edit, "could not reach the bus", which `startTask` makes through the adapter's `Edit`
+   when its publish fails, after it has written the record with the active task and before it
+   clears it again, so the record alone cannot tell a published task from one that never
+   reached the bus; and the bound expiring without `ActiveTask` appearing, whatever else the
+   record holds. The harness classifies a refusal as the gateway refusing the injection or
+   failing to publish it, infrastructure. The prompt is routed like any text, the gateway's
+   literal affordances included, `Delegate` among them; the harness sends none, and a case whose
+   prompt opens with one is the case's defect. The adapter dedupes on the backend message id,
    bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
-   already accepted answers with the record's task id and starts nothing. Because the id
+   already accepted gets the answer the first one got, the record's task id or the same refusal,
+   and starts nothing. Because the id
    carries the run id, the dedupe is idempotence within one invocation's retries and never
    across invocations: a rerun of the same case and repetition mints a new run id, so a new key
    and a fresh session record, and the seen set never answers it with an earlier run's task.
@@ -124,16 +131,22 @@ the presubmit exports nothing new until it chooses to. The exchange:
    adapter answered with, whether or not the record still holds it, and lands on the bus as
    `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the stop
    text. The harness sends no message at the deadline, so nothing it does there can mint a
-   task or spend a model turn.
+   task or spend a model turn. The failure edit of step 2 can also arrive after the answer,
+   when the record showed the active task before the publish failed; the harness is already
+   reading the conversation, so it treats that edit as the terminal: infrastructure, the
+   gateway failed to publish, and no cancel, because nothing was ever on a subject.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` and `progress` artifacts into the trajectory when the
    executor publishes them. Token counts are not on the bus, and the scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
    `working` and the terminal, is a trajectory entry under the status-event name, the token
-   buckets are null, the latency is set, and the scorer's rung-3 rule accepts a final status
-   entry as liveness evidence in place of a token total. A task nobody took reaches the scorer
-   as infrastructure through the harness's marker, never as a record the rung blocks. That
+   buckets are null, the latency is set, and the scorer's rung-3 rule accepts a `working` or a
+   final status entry as liveness evidence in place of a token total; `working` counts because
+   a graded timeout, canceled at the budget with the cancel unconfirmed, has no final entry and
+   would otherwise block as not a real run, and a `submitted` entry alone still blocks. A task
+   nobody took reaches the scorer as infrastructure through the harness's marker, never as a
+   record the rung blocks. That
    scorer rule lands with the diagnostic transport, and whichever of the two transports merges
    first brings it.
 
@@ -168,10 +181,12 @@ identity, roster read, post-to-conversation, and `openDirect`, and the inject ad
 all five rather than a subset the session record has to special-case. One more route sits on
 the adapter's side of the door and is not a sixth backend operation: a pure read of the
 conversation's state that mutates nothing. It returns what the session record holds for the key,
-the active task with its `SubmittedAt` and `Detached`, the fold of the task's stream, its state
-none, `submitted`, `working` or a terminal with the result text, and the last posted message,
-plus the gateway's configured grace and the backend the gateway armed; the infrastructure
-paragraph below says what the harness does with it.
+the active task with its `SubmittedAt`, from which the age in the nobody-took-it outcome is
+computed, and `Detached`, which the harness reads after its own cancel so it never sends a
+second one and grades the timeout from a detached record, the fold of the task's stream, its
+state none, `submitted`, `working` or a terminal with the result text, and the last posted
+message, plus the gateway's configured grace and the backend the gateway armed; the
+infrastructure paragraph below says what the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
@@ -194,8 +209,9 @@ renders the gateway's relay URL adds it to the operator's golden set, which is w
 render is caught from then on; until then the eval install has no real backend to lose.
 
 A transport failure is classified as infrastructure with the same marker the api transport uses
-for a dead tunnel: the adapter unreachable, the gateway refusing the injection, no executor
-taking the task, or an executor that accepted the task and never started it. The window for a
+for a dead tunnel: the adapter unreachable, the gateway refusing the injection or failing to
+publish it, no executor taking the task, or an executor that accepted the task and never
+started it. The window for a
 task nobody took is the gateway's, not the harness's: `A2A_FIRST_EVENT_GRACE` bounds how long an
 active task with nothing on its events subject may hold a conversation, and the never-started
 heal in `handleInbound` releases the conversation on its next message with a notice naming the
@@ -216,7 +232,7 @@ that reads "status". The harness therefore sends no message at the deadline. It 
 conversation's state through the adapter's read route, a pure read that mutates nothing: the
 heal is a write under the per-conversation lock, and a route that performed it from outside
 `handleInbound` would be a second writer racing the next inbound message for the record. The
-harness classifies from one of five outcomes, by the state the route's fold returns: no active
+harness classifies from one of six outcomes, by the state the route's fold returns: no active
 task and a terminal posted, the run finished as the deadline fired, so it is graded like any
 other; an active task with no executor event, nobody took it, infrastructure, whether or not the
 gateway has released the conversation yet; an active task at `submitted` and never `working`, an
@@ -226,7 +242,10 @@ is the relay's lost record write, the event acked when the relay enqueued it, be
 write cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
 like the first, with the answer read from the fold rather than the posted message, and gets no
 cancel, because there is nothing left to cancel; the record then holds a finished task until
-something releases it, which on a key never reused is nothing and costs nothing. In every other
+something releases it, which on a key never reused is nothing and costs nothing. The sixth is
+the state a failed publish leaves, no active task and no terminal, the fold none and the last
+posted message the failure edit; the harness ordinarily met that edit in step 3 long before
+the deadline, and at the deadline it grades the same, infrastructure, no cancel. In every other
 outcome that leaves an active task, the no-executor one included, the cancel then goes out for
 the task id the adapter answered with, whether or not the record still holds it. The
 classification comes from the read and never from
