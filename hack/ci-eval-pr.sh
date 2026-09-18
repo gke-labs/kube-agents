@@ -1958,40 +1958,56 @@ fi
 # infrastructure (or every case did), so the run cannot certify green and has
 # nothing against the change to debug either. Prow reds 2 as it reds 1, which
 # is right: a run that proved nothing does not merge. The distinct status and
-# the `outcome` in eval-verdict.json are for the artifact, the dashboards and
-# the release-candidate lane, which map it to "rerun when healthy" rather
-# than "the change is bad". --baseline-rate is not passed: the rate is
-# computed from the store, per admitted case at its own version key. While
-# the store holds nothing, and until EVAL_AGGREGATE_ARMED is set to 1, the
-# aggregate stays advisory and the markdown says so, rather than implying a
-# comparison that did not happen or a rule that was armed.
+# the `outcome` in eval-verdict.json are for the artifact and for the
+# release-candidate lane, which reports NOT RUN rather than RED on them. The
+# dashboard and the health bot do not read either yet: they classify this
+# run from the final line's `Failed` word and from Prow's FAILURE, so until
+# #1782 they still call it red; the banner in eval-verdict.md is what says
+# otherwise. --baseline-rate is not passed: the rate is computed from the
+# store, per admitted case at its own version key. While the store holds
+# nothing, and until EVAL_AGGREGATE_ARMED is set to 1, the aggregate stays
+# advisory and the markdown says so, rather than implying a comparison that
+# did not happen or a rule that was armed.
+#
+# A function, so tests/test_ci_eval_verdict.py can lift it out of this file
+# and run it: the status-2 confirmation below is the one branch of the verdict
+# the bench tests cannot reach, and the shell's copy of the outcome word has
+# to keep agreeing with scoring.py's. Prints the final line; returns the
+# status the job exits with.
+announce_suite_verdict() {
+  local suite_status=$1 verdict_json=$2 verdict_md=$3 total_duration=$4
+  # The status alone does not prove a not-evaluated verdict: argparse exits 2
+  # on a bad flag, and `uv run` can exit 2 without ever reaching bench-gate.
+  # Only a verdict file that says so is announced as one; anything else that
+  # is not 0 is the plain failure it always was, so a broken invocation
+  # cannot dress itself as weather.
+  local not_evaluated="false"
+  if [ "${suite_status}" -eq "${EVAL_SUITE_NOT_EVALUATED_STATUS}" ] && \
+    python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("outcome") == sys.argv[2] else 1)' \
+      "${verdict_json}" "${EVAL_VERDICT_OUTCOME_NOT_EVALUATED}" 2>/dev/null; then
+    not_evaluated="true"
+  fi
+  # The final line keeps the `PR Smoke Test Evaluation Failed` and
+  # `(Total Duration: Ns)` anchors that scripts/eval_dashboard/collect.py
+  # matches, so a not-evaluated run does not lose its final line on the
+  # dashboard; the classification words sit between them.
+  if [ "${suite_status}" -eq 0 ]; then
+    echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${total_duration}s) ==="
+    return 0
+  fi
+  if [ "${not_evaluated}" = "true" ]; then
+    echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See ${verdict_md} (Total Duration: ${total_duration}s)"
+    return "${EVAL_SUITE_NOT_EVALUATED_STATUS}"
+  fi
+  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- see ${verdict_md} (Total Duration: ${total_duration}s)"
+  return 1
+}
+
 TOTAL_DURATION=$((SECONDS - START_TIME))
 SUITE_STATUS=0
 (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
   --json-out "${ARTIFACT_DIR}/eval-verdict.json") || SUITE_STATUS=$?
-# The status alone does not prove a not-evaluated verdict: argparse exits 2 on
-# a bad flag, and `uv run` can exit 2 without ever reaching bench-gate. Only a
-# verdict file that says so is announced as one; anything else that is not 0
-# is the plain failure it always was, so a broken invocation cannot dress
-# itself as weather.
-SUITE_NOT_EVALUATED="false"
-if [ "${SUITE_STATUS}" -eq "${EVAL_SUITE_NOT_EVALUATED_STATUS}" ] && \
-  python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("outcome") == sys.argv[2] else 1)' \
-    "${ARTIFACT_DIR}/eval-verdict.json" "${EVAL_VERDICT_OUTCOME_NOT_EVALUATED}" 2>/dev/null; then
-  SUITE_NOT_EVALUATED="true"
-fi
-# The final line keeps the `PR Smoke Test Evaluation Failed` and
-# `(Total Duration: Ns)` anchors that scripts/eval_dashboard/collect.py
-# matches, so a not-evaluated run does not lose its final line on the
-# dashboard; the classification words sit between them.
-if [ "${SUITE_STATUS}" -eq 0 ]; then
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="
-elif [ "${SUITE_NOT_EVALUATED}" = "true" ]; then
-  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See ${ARTIFACT_DIR}/eval-verdict.md (Total Duration: ${TOTAL_DURATION}s)"
-  exit "${EVAL_SUITE_NOT_EVALUATED_STATUS}"
-else
-  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- see ${ARTIFACT_DIR}/eval-verdict.md (Total Duration: ${TOTAL_DURATION}s)"
-  exit 1
-fi
+announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
+  "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?

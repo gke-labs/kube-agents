@@ -127,8 +127,17 @@ readonly RESOLVE_SCRIPT="resolve-rc-target.sh"
 # What ci-eval-pr.sh exits when `bench-gate suite` could not evaluate the run:
 # an admitted case lost every repetition to infrastructure, or every case did.
 # Its EVAL_SUITE_NOT_EVALUATED_STATUS; kept in step by hand, as the marker
-# strings above are. Any other non-zero status from the eval is a red.
+# strings above are. The status alone is not the proof, though: a candidate's
+# ci-eval-pr.sh also dies with 2 when `bench-gate case` could not grade (an
+# unreadable task file, a store that will not load, a bad VERSIONS.json), and
+# for a candidate cut before the not-evaluated verdict existed that is the
+# only meaning 2 has. So the driver also reads `outcome` from the verdict
+# JSON bench-gate writes beside the markdown, as ci-eval-pr.sh itself does
+# before announcing the verdict. Any other non-zero status, and a 2 the JSON
+# does not confirm, is a red.
 readonly EVAL_NOT_EVALUATED_STATUS=2
+readonly EVAL_NOT_EVALUATED_OUTCOME="not_evaluated"
+readonly RC_VERDICT_JSON_FILE="eval-verdict.json"
 
 # ─── Everything below runs inside main() ────────────────────────────────────
 # See the header: the checkout in step 2 rewrites this file, so the body has to
@@ -276,11 +285,15 @@ main() {
     "${script_dir}/${EVAL_SCRIPT}" || eval_status=$?
     if [ "${eval_status}" -eq 0 ]; then
       verdict="GREEN"
-    elif [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ]; then
+    elif [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ] && [ -n "${artifacts_dir}" ] && \
+      python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("outcome") == sys.argv[2] else 1)' \
+        "${artifacts_dir}/${RC_VERDICT_JSON_FILE}" "${EVAL_NOT_EVALUATED_OUTCOME}" 2>/dev/null; then
       # The same reading as the failed deploy above, one step later: the eval
       # ran but lost an admitted case entirely to infrastructure, so it formed
       # no judgement on the candidate. RED would send someone to look for a
-      # regression in a build this run never measured.
+      # regression in a build this run never measured. Only with the JSON's
+      # word for it (see EVAL_NOT_EVALUATED_STATUS): a 2 without it, or a run
+      # outside Prow with no ARTIFACTS to find the JSON in, stays a RED.
       verdict="NOT RUN"
       echo "NOTE: evaluating ${rc_tag} (${rc_commit_sha:0:7}) could not certify a verdict (status ${eval_status}): an admitted case lost every repetition to infrastructure. This is not a verdict on the candidate; rerun when the environment is healthy." >&2
     else

@@ -132,15 +132,15 @@ environment. Unarmed,
 which is the default, a rate below the margin over a full sample is written into the verdict as a
 note rather than a reason: the flat margin has not been measured against how much an unchanged
 pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
-enough nights to say. Three job-level rules sit alongside it. Any blocking case reds the job
-(`suite` exits 1). An admitted case with no scored repetition — every one excluded as
-infrastructure — makes the run **not evaluated**: `suite` exits 2, the code `case` already uses for
+enough nights to say. Two job-level rules sit alongside it. Any blocking case reds the job
+(`suite` exits 1). And green has a coverage floor: an admitted case with no scored repetition —
+every one excluded as infrastructure — makes the run **not evaluated**: `suite` exits 2, the code `case` already uses for
 "could not grade", and writes `outcome: not_evaluated` with the case ids under `not_evaluated`; the
 markdown carries a banner saying rerun when the environment is healthy rather than debug the
 change, and `hack/ci-eval-pr.sh` passes the status through (confirming it against the JSON first,
 since argparse exits 2 too) so the release-candidate lane reports NOT RUN rather than RED. Weather
 that takes one repetition leaves the case scored and trips nothing; only a case lost whole does,
-and only an admitted one. _All_ cases failing on infrastructure is the same rule at its limit and
+and only an admitted one. _All_ cases failing on infrastructure is the same floor at its limit and
 reports the same outcome — individually that is weather, but all at once means the eval
 infrastructure is down and a green would be a lie about coverage. A blocking case outranks the
 weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in

@@ -102,7 +102,12 @@ the same layout and is collected from the moment it starts running.
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
 - `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
   the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
-  `RED`. `null` when the log has no such line — the job ended before its
+  `RED`. A run the suite could not evaluate (an admitted case lost every
+  repetition to infrastructure; the job exits `2` and the line carries
+  `NOT EVALUATED` between the anchors) records as `RED` here, because the
+  collector reads the `Failed` word and not the words after it; the
+  verdict's own `outcome` is in the run's `eval-verdict.json`, which nothing
+  on the dashboard reads yet. `null` when the log has no such line — the job ended before its
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
   `ABORTED`; build 2092688354838581248 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
@@ -346,9 +351,12 @@ Additive, optional, and safe to omit — consumers must default them.
   so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
   config's doing — it runs the driver under `|| true` — not the driver's, so
   a future config that drops the `|| true` would make the two agree without
-  anything here changing. `NOT RUN` is
-  the deploy-failed path — nothing was measured, so it is not a judgement
-  on the candidate.
+  anything here changing. `NOT RUN` is written on two paths, and on
+  neither is it a judgement on the candidate: the deploy failed, so nothing
+  was measured; or the eval ran and could not be evaluated (`ci-eval-pr.sh`
+  exited `2` and `eval-verdict.json` says `outcome: not_evaluated` — an
+  admitted case lost every repetition to infrastructure), so the candidate
+  was not measured on it.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
   may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
   line. `baseline_rate` and `margin` are `null` while the baseline store
