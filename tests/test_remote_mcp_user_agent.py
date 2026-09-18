@@ -32,7 +32,9 @@ server in every config, the Cluster Agent template included, and because the
 two live under different test roots (see AGENTS.md, "Where Tests Go").
 """
 
+import os
 import pathlib
+import subprocess
 import sys
 import unittest
 
@@ -62,6 +64,14 @@ VERSION_VAR = "KUBE_AGENTS_VERSION"
 # taxonomy value for Kubernetes operators and background controllers, which is
 # what every profile here is (`cli` is the value for an interactive tool).
 EXECUTION_MODE = "daemon"
+# The `make` targets that build an image the header can come out of: one agent
+# stage and the sidecar. The third entry point beside the two Cloud Build
+# configs, and the one that used to omit the version.
+MAKE_IMAGE_TARGETS = ("docker-build-platform", "docker-build-credential-proxy")
+MAKE_TIMEOUT_SECONDS = 60
+# `REPO` defaults through a `$(shell gcloud config get core/project)`, which a
+# dry run still evaluates; naming it keeps the sweep off gcloud and the network.
+MAKE_REPO_OVERRIDE = "REPO=registry.example/kube-agents"
 
 # Discovered, not listed: a config.yaml added for a new agent profile is checked
 # the day it lands. agents/chat/config.yaml declares no remote server today and
@@ -215,6 +225,25 @@ class RemoteMcpUserAgentTest(unittest.TestCase):
                 "through to the build, so every image it publishes would report the "
                 "`dev` default",
             )
+
+    def test_the_make_targets_pass_the_version_to_docker(self):
+        # Dry-run, so what is asserted is the command make would issue. An
+        # image built by `make docker-build` reported the Dockerfile's `dev`
+        # default on the wire whatever the caller set, because the target never
+        # passed the variable through.
+        proc = subprocess.run(
+            ["make", "-n", MAKE_REPO_OVERRIDE, *MAKE_IMAGE_TARGETS],
+            cwd=REPO_ROOT,
+            env={**os.environ, VERSION_VAR: "probe"},
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=MAKE_TIMEOUT_SECONDS,
+        )
+        builds = [line for line in proc.stdout.splitlines() if line.startswith("docker build")]
+        self.assertEqual(len(builds), len(MAKE_IMAGE_TARGETS), proc.stdout)
+        for line in builds:
+            self.assertIn(f"--build-arg {VERSION_VAR}=probe", line)
 
 
 if __name__ == "__main__":

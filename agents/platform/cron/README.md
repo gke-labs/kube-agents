@@ -196,6 +196,12 @@ under "Detecting a broken leg".
 `../skills/fleet-audit/scripts/test_audit_report.py` enforces this, and carries
 the exemption by name, pinned to a `no_agent` entry whose script exists.
 
+A misspelled `deliver` part next to one that resolves is dropped by the scheduler
+with the run still recording `ok`. `check_cron_delivery` in
+`scripts/check_prompt_assets.py` (`make prompt-check`) refuses a value outside the
+`CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
+the typo fails the pull request instead.
+
 ## `deliver: "chat"` — reporting through the Chat Agent
 
 `"all"` gets the words into a channel. It does not make them answerable: the

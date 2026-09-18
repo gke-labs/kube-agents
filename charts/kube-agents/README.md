@@ -247,8 +247,10 @@ default, and the rendered config is unchanged while it is; the feature is
 chart-only, so with it on the gateway diverges from the kustomize dev base,
 which carries no redaction. The site's
 [inference gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)
-owns what is redacted, what is not (responses, on-disk transcripts, chat
-egress) and why a pseudonymised identifier is one the agent cannot act on.
+owns what is redacted, what is not (responses, chat egress) and why a
+pseudonymised identifier is one the agent cannot act on; the site's
+[security and IAM page](../../docs/site/src/content/docs/reference/security-and-iam.md)
+owns what the image redacts in the files on the agent's volume.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 

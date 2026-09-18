@@ -258,6 +258,50 @@ class FindDefTest(unittest.TestCase):
         self.assertIn("does not parse", str(ctx.exception))
 
 
+class BodyStartTest(unittest.TestCase):
+    def test_body_start_follows_a_docstring(self):
+        source = (
+            "def main():\n"
+            '    """Entry point.\n'
+            "\n"
+            "    Two lines.\n"
+            '    """\n'
+            "    # a comment about the first statement\n"
+            "    first()\n"
+        )
+        p, target = patch(source=source)
+        site = p.find_def("main", label="entry point")
+        p.insert(site.body_start, site.body_indent + "prologue()\n")
+        p.commit("prologue")
+        self.assertEqual(
+            target.read_text(),
+            source.replace('    """\n    # a', '    """\n    prologue()\n    # a'),
+        )
+
+    def test_body_start_without_a_docstring_is_the_first_statement(self):
+        p, target = patch(source="def main():\n    # note\n    first()\n")
+        site = p.find_def("main", label="entry point")
+        p.insert(site.body_start, site.body_indent + "prologue()\n")
+        p.commit("prologue")
+        self.assertEqual(target.read_text(), "def main():\n    # note\n    prologue()\n    first()\n")
+
+    def test_body_indent_is_the_bodys_own(self):
+        p, _ = patch(source="def main():\n  first()\n")
+        self.assertEqual(p.find_def("main", label="entry point").body_indent, "  ")
+
+    def test_a_docstring_only_body_is_refused(self):
+        p, _ = patch(source='def main():\n    """Nothing else."""\n')
+        with self.assertRaises(SystemExit) as ctx:
+            p.find_def("main", label="entry point").body_start
+        self.assertIn("no body after its docstring", str(ctx.exception))
+
+    def test_a_body_on_the_def_line_is_refused(self):
+        p, _ = patch(source="def main(): first()\n")
+        with self.assertRaises(SystemExit) as ctx:
+            p.find_def("main", label="entry point").body_start
+        self.assertIn("body on the def line", str(ctx.exception))
+
+
 #: v2026.8.3's one-line spelling of cron.scheduler.run_one_job, and v2026.8.13's
 #: wrapped one with an extra parameter. The same insert has to work on both.
 FLAT_SIGNATURE = (

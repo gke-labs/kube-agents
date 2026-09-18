@@ -16,7 +16,7 @@ it was told to open and carries on without it. The failure is a *worse* answer,
 not an error, so it does not page anyone -- it just makes the fleet report
 slightly less true, indefinitely.
 
-Four checks, all offline and standard library only:
+Six checks, all offline and standard library only:
 
 ``asset-path``
     Every path reference in an instruction file resolves to a real file.
@@ -29,6 +29,11 @@ Four checks, all offline and standard library only:
     the loadable name disagree.
 ``cron-asset``
     Every cron prompt sends the worker to an SOP that exists.
+``cron-deliver``
+    Every cron job's ``deliver`` names somewhere a message can actually go.
+``cron-risk``
+    Every cron job declares a risk tier (``low`` or ``high``) the runtime
+    approval gate can key its command policy off.
 
 Scope is deliberately narrow, because a lint the team switches off protects
 nothing:
@@ -52,11 +57,11 @@ nothing:
   is COPYed to ``/opt/platform-template/skills``, so the profile home holds
   ``skills/``, never ``agents/``.
 
-What this does *not* check is the SOP *geography* in the cron prompts -- the
-line counts and section ranges. That is already covered, and better, by
+What this does *not* check is that a cron prompt's citation of its SOP's
+line geography still matches the SOP. That is covered by
 ``test_cron_prompts_cite_the_real_sop_geography`` in
 ``agents/platform/skills/fleet-audit/scripts/test_audit_report.py``, which
-re-derives the numbers from the SOP headings.
+re-derives the numbers from the SOP itself.
 
 Findings print to stderr as ``path:line: [rule] message``, and under GitHub
 Actions each one is also emitted as an ``::error`` annotation so it lands on the
@@ -195,14 +200,70 @@ TOKEN = re.compile(r"`([^`\n]+)`")
 # minimum, so ordinary prose ("this skill", "a skill") does not match.
 SKILL_IN_PROSE = re.compile(r"`?\b([a-z][a-z0-9]*(?:-[a-z0-9]+)+)`?\s+skill\b")
 
-# A quoted path inside a cron prompt. Any depth, not just `dir/file.ext`: the
+# A path a cron prompt names. Any depth, not just `dir/file.ext`: the
 # single-segment-then-file form left `agents/platform/governance/x_sop.md`
 # unchecked, and that spelling is the one the asset-path rule reports as always
 # wrong at runtime -- so the SOP was protected against it and the cron prompt
 # that sends a worker to the SOP was not.
-CRON_PROMPT_REF = re.compile(
-    r"['\"`]([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.(?:md|json|py|sh))['\"`]"
+#
+# Bounded by whitespace or a quote on each side, not by a quote pair around the
+# whole span. Demanding the closing quote right after the extension skipped
+# every reference with an argument after it or an interpreter before it -- a
+# prompt that says `'skills/x/scripts/run.py <stream>'` or
+# `'python3 skills/x/scripts/run.py'` -- so renaming the script behind such a
+# reference left `make prompt-check` at exit 0. Pairing the quotes first and
+# searching inside each pair had the opposite hole: `findall` pairs any quote
+# with the next quote of any kind, so a contraction earlier in the prose
+# (`Don't skip it. Read 'governance/x_sop.md'.`) consumed the path's own
+# opening quote and the path was never seen. So the quotes are boundaries, not
+# brackets, and a bare path in a prompt's prose is reported too; the extension
+# list keeps this from the false-positive rate that rules bare prose out for
+# the documents above.
+#
+# Clause punctuation on either side is a boundary too, so a path that ends a
+# sentence (`Read governance/x_sop.md.`), sits before a comma, or is wrapped in
+# parentheses is still a reference. The punctuation has to be followed by a
+# boundary of its own: `x/y.md.bak` is one token, not `x/y.md` and a suffix.
+#
+# A leading `/` fails the first segment, so an absolute interpreter is not
+# itself an asset -- `/opt/hermes/.venv/bin/python3` ships in the image, not
+# the profile -- while the script after it is still found, because the space
+# between them is a boundary.
+CRON_PROMPT_PATH = re.compile(
+    r"(?:\A|(?<=[\s'\"`(\[]))"
+    r"([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.(?:md|json|py|sh))"
+    r"(?=[.,;:!?)\]]*(?:\Z|[\s'\"`]))"
 )
+
+# Where a cron job may send its result. `deliver` is a comma-separated list of
+# these, and the scheduler resolves each part at fire time.
+#
+# `all` is a routing token: it expands to every platform that has a home channel
+# configured on *this* install, so a roster carrying it needs no edit when a
+# channel is added. A bare platform name binds to that one platform's home
+# channel and delivers nothing if it is unset. `origin` answers wherever the job
+# was created from, and `local` is the explicit "keep it, send nothing".
+#
+# `chat` is this repository's own platform, not a synonym for Google Chat:
+# `deploy/docker/plugins/chat/` relays the report to the Session KV server,
+# which runs one Chat Agent turn over it and posts the result. It is enabled
+# only inside a cron child, because `profile_cron_tick.py` is the sole setter of
+# its `CHAT_HOME_CHANNEL`, so probing for it anywhere else -- a `kubectl exec`,
+# the gateway process -- finds it unset and reads like a dead value. It is not.
+CRON_DELIVER_VALUES = frozenset(
+    {"all", "chat", "origin", "local", "slack", "google_chat"}
+)
+# What the scheduler reads when a job names no `deliver` at all.
+CRON_DELIVER_DEFAULT = "local"
+# The two values the scheduler compares as spelled. `_resolve_single_delivery_target`
+# tests `== "local"` and `== "origin"` before it lower-cases a platform name, and
+# `_expand_routing_tokens` lower-cases only `all`, so `Origin` is a value it drops.
+CRON_DELIVER_EXACT_CASE = frozenset({"local", "origin"})
+
+
+def cron_prompt_refs(prompt: str) -> set[str]:
+    """Every repository-relative asset path a cron prompt names."""
+    return set(CRON_PROMPT_PATH.findall(prompt))
 
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 FRONTMATTER_NAME = re.compile(r"^name:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
@@ -526,12 +587,34 @@ def cron_rosters() -> list[tuple[Path, list[dict]]]:
     both cron rules become no-ops while the run still prints OK. Globbing means
     a roster that moves within agents/ is still checked, and the count in the
     success line means one that moves out of it is visible in the log.
+
+    Shape errors are raised here with the file named. `["jobs"]` on a roster
+    that has no such key, and `["id"]` on a job that has no such key, both
+    raised a bare `KeyError: 'jobs'` from inside a glob -- a traceback that
+    tells a contributor which line of this script died and not which of their
+    files is wrong. Globbing makes that worse, not better: the point of finding
+    rosters rather than listing them is that a file this script has never seen
+    can turn up, and the first thing it does with one is index into it.
     """
     rosters = []
     for path in sorted(REPO.glob("agents/*/cron/jobs.json")) + sorted(
         REPO.glob("agents/*/defaults/cron/jobs.json")
     ):
-        rosters.append((path, json.loads(path.read_text(encoding="utf-8"))["jobs"]))
+        rel = path.relative_to(REPO)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if not isinstance(jobs, list):
+            raise SystemExit(
+                f"{rel}: cron roster has no top-level 'jobs' list -- "
+                "the run stops here rather than grade a roster it cannot read"
+            )
+        for index, job in enumerate(jobs):
+            if not isinstance(job, dict) or not str(job.get("id") or "").strip():
+                raise SystemExit(
+                    f"{rel}: job at index {index} has no 'id' -- the scheduler "
+                    "keys every job by it, and so does every message below"
+                )
+        rosters.append((path, jobs))
     return rosters
 
 
@@ -683,16 +766,17 @@ def check_skill_manifests(skills: dict[str, dict[str, Path]]) -> list[Finding]:
 def check_cron_assets() -> list[Finding]:
     """Every SOP a cron prompt sends its worker to has to be there.
 
-    The geography of those SOPs -- how long they are, which lines hold the
-    checks -- is verified by the fleet-audit suite, which can re-derive it. This
-    only asks the cheaper question that suite does not ask of every roster: does
-    the file exist at all.
+    Whether a prompt's line-count citation still matches its SOP is verified
+    by `test_cron_prompts_cite_the_real_sop_geography` in the fleet-audit
+    suite, which re-derives the numbers from the SOP itself. This only asks the
+    cheaper question that test does not ask of every roster: does the file
+    exist at all.
     """
     findings = []
     for path, jobs in cron_rosters():
         rel = path.relative_to(REPO)
         for job in jobs:
-            for ref in set(CRON_PROMPT_REF.findall(job.get("prompt", ""))):
+            for ref in cron_prompt_refs(job.get("prompt", "")):
                 # The same profile-home model the asset-path rule uses. Resolving
                 # against the whole of agents/<profile>/ instead was how this rule
                 # came to accept `docs/glossary.md` from the platform roster --
@@ -705,6 +789,100 @@ def check_cron_assets() -> list[Finding]:
                         str(rel),
                         f"job {job['id']!r} sends the worker to {ref!r}, "
                         "which is not in its profile",
+                    )
+                )
+    return findings
+
+
+
+def check_cron_delivery() -> list[Finding]:
+    """A `deliver` part the scheduler drops on the floor is the failure here.
+
+    `_resolve_delivery_targets` skips a part it cannot resolve and keeps the
+    rest. When every part drops, the scheduler records `no delivery target
+    resolved` as `last_delivery_error` and `chat_delivery_watch.py` grades it
+    within two runs. When one part resolves and another does not -- `all,gchat`,
+    `chat,slack;x` -- the run posts to the good half, records `ok`, and nothing
+    downstream ever sees the half that was silently dropped. That mixed shape is
+    what only the roster can catch.
+
+    Nothing offline can know which home channels a given install configures, so
+    this does not try -- a value here can be spelled correctly and still deliver
+    nowhere, and that is a deployment question. It asks the cheaper one: is this
+    a value we have decided means something? Adding a platform is then a
+    one-line edit to `CRON_DELIVER_VALUES`, which is the review moment the
+    silent version never had.
+
+    Deliberately not a check that every job reaches a *human*. `local` is a
+    legitimate answer -- `agents/chat/defaults/cron/jobs.json` uses it on all
+    four of its jobs -- and a checker that forbade it would be wrong about them.
+    """
+    findings = []
+    for path, jobs in cron_rosters():
+        rel = path.relative_to(REPO)
+        for job in jobs:
+            # `or`, not a `get` default: `_normalize_deliver_value` treats an
+            # explicit JSON `null` the same as an absent key. Defaulting on
+            # absence alone reported `"deliver": null` as a job delivering to
+            # `'None'` and failed the roster over a shape the scheduler handles.
+            deliver = job.get("deliver") or CRON_DELIVER_DEFAULT
+            # The scheduler accepts a list and flattens it; so do we, rather
+            # than reporting a shape it would have run happily.
+            #
+            # `,` and nothing else, case-folded below. The parser this guards
+            # is `cron/scheduler.py::_resolve_delivery_targets` -- the code that
+            # decides where a report actually goes -- and it splits on `,`
+            # alone. This once also split on `;`, on the authority of the chat
+            # relay's own token reader, which is not that parser: it decides
+            # only what the relay *subtracts* from its own fan-out. Following it
+            # made this gate looser than the delivering parser, so a roster
+            # carrying `deliver: "chat,slack;x"` passed `make prompt-check`
+            # while the scheduler resolved nothing from `slack;x` and posted
+            # nowhere -- the precise "reports ok and posts nowhere" outcome in
+            # this function's own docstring.
+            #
+            # Join *then* split, in that order, because that is the order the
+            # runtime uses. Splitting only the string branch left a list entry
+            # that itself carries a separator -- `["chat", "google_chat,slack"]`
+            # -- checked whole, so the gate reported a target the relay resolves
+            # into two working ones, and `make prompt-check` runs on every pull
+            # request in the repository.
+            joined = (
+                ",".join(str(entry) for entry in deliver)
+                if isinstance(deliver, (list, tuple))
+                else str(deliver)
+            )
+            parts = joined.split(",")
+            for part in (str(p).strip() for p in parts):
+                # An empty part is `"chat,,slack"` -- a stray comma, which the
+                # scheduler ignores and which costs no delivery. An empty
+                # *prefix* is `":C123"`, which resolves to no platform and
+                # drops silently, so the two cannot share a skip.
+                if not part:
+                    continue
+                # `platform:chat_id[:thread]` names its target outright. The id
+                # is install-specific and unknowable here, but the platform in
+                # front of it is neither -- and a misspelled prefix drops
+                # exactly as a misspelled bare value does, so it is checked the
+                # same way. Skipping the whole part on sight of a colon let
+                # `gchat:spaces/AAA` through, which is the silent shape. Platform
+                # names and `all` are matched the way the scheduler matches them,
+                # case-folded; `local` and `origin` only as spelled, because that
+                # is the one comparison the scheduler makes before it folds.
+                name = part.split(":", 1)[0].strip()
+                if name in CRON_DELIVER_EXACT_CASE:
+                    continue
+                if name.lower() in CRON_DELIVER_VALUES - CRON_DELIVER_EXACT_CASE:
+                    continue
+                findings.append(
+                    Finding(
+                        "cron-deliver",
+                        str(rel),
+                        f"job {job['id']!r} delivers to {part!r}, which is not a "
+                        f"known target ({', '.join(sorted(CRON_DELIVER_VALUES))} "
+                        "or platform:chat_id) -- the scheduler drops the part, and "
+                        "beside a part that resolves the run posts elsewhere and "
+                        "reports ok",
                     )
                 )
     return findings
@@ -789,6 +967,7 @@ def main(argv: list[str] | None = None) -> int:
         + check_skill_refs(files, skills)
         + check_skill_manifests(skills)
         + check_cron_assets()
+        + check_cron_delivery()
         + check_cron_risk()
     )
     if findings:

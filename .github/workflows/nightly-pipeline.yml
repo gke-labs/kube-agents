@@ -1,6 +1,7 @@
 name: "Nightly: Pipeline"
 
 # Builds a nightly environment from nothing, runs the full E2E matrix on it,
+# rolls it back to the previous GA and forward again (reported, not gating),
 # and — if the matrix passes — promotes the candidate to staging by creating
 # and pushing a staging tag (`staging_<ts>_<sha>`), before destroying the
 # nightly environment again.
@@ -11,9 +12,10 @@ name: "Nightly: Pipeline"
 # kept current through atomic deploys in autopush-deploy.yml when images are
 # published to GHCR.
 #
-# Nothing in it touches the RC environment. The three jobs that touch the
-# nightly cluster — deploy, the matrix, teardown — bind `nightly` and take the
-# `nightly-environment` lock, so none of them queues behind or races the
+# Nothing in it touches the RC environment. The four jobs that touch the
+# nightly cluster — deploy, the matrix, the rollback leg, teardown — bind
+# `nightly` and take the `nightly-environment` lock, so none of them queues
+# behind or races the
 # three-hourly RC pipeline. Step 1 binds `nightly` for its variables without
 # taking the lock; the promotion only pushes a Git tag, so it does neither.
 #
@@ -35,8 +37,8 @@ on:
         type: string
 
 # Distinct from the `nightly-environment` lock the called workflows take. That
-# one is acquired and released three times over — by the deploy, the matrix and
-# the teardown, whatever their step numbers happen to be — so a
+# one is acquired and released four times over — by the deploy, the matrix,
+# the rollback leg and the teardown, whatever their step numbers happen to be — so a
 # workflow pointed at the `nightly` environment can interleave in a gap. This
 # group is held for the whole run, and it is what keeps the only thing that
 # drives the environment end to end, another nightly, out of those gaps.
@@ -159,6 +161,123 @@ jobs:
       timeout_minutes: 120
     secrets: inherit
 
+  step-3b-rollback-leg:
+    name: Step 3b - Roll Back to the Previous GA and Forward Again
+    # The rollback runbook, run by a machine on the cluster the matrix just
+    # passed on: from a clean checkout of the newest GA tag, `upgrade.sh
+    # --upgrade-mode=operator` then `--upgrade-mode=harness` back to that GA,
+    # a check that both images, the PlatformAgent's Ready condition and the
+    # gateway rollout agree, then the same pair from the candidate checkout to
+    # bring the environment back to the candidate. After the matrix, so what
+    # the matrix graded is the fresh install and not an install that has been
+    # moved twice.
+    #
+    # `continue-on-error` for the reason step 3's optional suites carry it: a
+    # leg with no green run behind it cannot gate. Step 4 does not depend on
+    # this job, so a red leg promotes as before and reports here; promotion to
+    # blocking is a green record, then moving the job into step 4's `needs`.
+    # Step 5 does depend on it, for ordering: the teardown has to wait for the
+    # leg to finish with the cluster, and its condition names the deploy and
+    # the matrix results rather than this job's, so a red leg still tears
+    # down. What it leaves for diagnosis is the artifact below rather than the
+    # cluster.
+    needs: [step-1-resolve-candidate, step-3-run-e2e-matrix]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    environment: nightly
+    # The lock the called workflows take for this environment; see the comment
+    # on the workflow-level group above.
+    concurrency:
+      group: nightly-environment
+      cancel-in-progress: false
+    # Four Helm moves, each with a rollout wait of up to fifteen minutes.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CLOUDSDK_PYTHON: "/usr/bin/python3"
+    steps:
+      # The workflow's own ref, not the candidate: rollback_environment.sh is
+      # what runs here, and it checks out the GA tag and the candidate itself.
+      # fetch-depth 0 brings the tags it resolves the GA from.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Authenticate to GCP via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: "579.0.0"
+          install_components: "beta,gke-gcloud-auth-plugin"
+
+      # The install settings reconcile-environment.yml renders, less the
+      # secrets and the two allowlist switches: the operator and harness
+      # modes take the cluster, project and namespace from the file and
+      # re-tag the release, recovering what else they need from the live
+      # Secrets, so no credential has a reason to reach this job.
+      - name: Roll back to the previous GA, check, and roll forward
+        id: rollback
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          CANDIDATE_SHA: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          CLUSTER_MODE: ${{ vars.CLUSTER_MODE }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          THIRD_PARTY_REGISTRY_PREFIX: ${{ vars.THIRD_PARTY_REGISTRY_PREFIX }}
+          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
+          NAMESPACE: ${{ vars.NAMESPACE }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+          GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
+          GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
+          GOOGLE_CHAT_HOME_CHANNEL: ${{ vars.GOOGLE_CHAT_HOME_CHANNEL }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
+          ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
+          SLACK_ENABLED: ${{ vars.SLACK_ENABLED }}
+          SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
+          SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
+          SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
+          ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
+          ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
+          ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
+          PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
+          PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
+          MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
+          USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
+          HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}
+          KMS_KEYRING: ${{ vars.KMS_KEYRING }}
+          KMS_KEY: ${{ vars.KMS_KEY }}
+          GITOPS_ORG: ${{ vars.GITOPS_ORG }}
+          GITOPS_REPO: ${{ vars.GITOPS_REPO }}
+        run: ./scripts/release/rollback_environment.sh
+
+      - name: Upload the rollback leg's logs and diagnostics
+        if: always() && steps.rollback.outputs.diagnostics_dir != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-rollback-leg
+          path: ${{ steps.rollback.outputs.diagnostics_dir }}
+          if-no-files-found: warn
+          retention-days: 14
+
   step-4-create-staging-tag:
     name: Step 4 - Create Staging Tag
     needs: [step-1-resolve-candidate, step-3-run-e2e-matrix]
@@ -211,10 +330,12 @@ jobs:
 
   step-5-teardown-env:
     name: Step 5 - Tear Down Nightly Environment
-    # The implicit success() on `needs` is the gate: a failure in resolve, deploy
-    # or the matrix leaves the environment standing to be examined live. The `if:`
-    # below adds to that check rather than replacing it — an `always()` here would
-    # remove it and start destroying the environments this exists to preserve.
+    # A failure in resolve, deploy or the matrix leaves the environment standing
+    # to be examined live: the `if:` below names those results explicitly, in
+    # place of the implicit success() on `needs`, so that one job can be listed
+    # for ordering without its result deciding anything. An `always()` here
+    # would drop the gate and start destroying the environments this exists to
+    # preserve.
     #
     # `step-4-create-staging-tag` is deliberately absent from the list. Its only
     # failure modes are credential ones — an invalid GitHub App key or ID, a rejected
@@ -222,10 +343,25 @@ jobs:
     # it would needlessly strand a GKE cluster until the next run reclaims it:
     # running the two concurrently is safe, because step 4 touches no GCP resource
     # and this job holds the nightly-environment lock.
-    needs: [step-1-resolve-candidate, step-2-deploy-env, step-3-run-e2e-matrix]
+    #
+    # `step-3b-rollback-leg` is in the list for ordering alone: it holds the
+    # cluster after the matrix, and a red leg gates nothing, so its result is
+    # deliberately absent from the condition below. `!cancelled()` replaces the
+    # implicit success() so that absence means "tear down anyway"; the two
+    # results named are the ones whose failure keeps the cluster for diagnosis.
+    needs:
+      [
+        step-1-resolve-candidate,
+        step-2-deploy-env,
+        step-3-run-e2e-matrix,
+        step-3b-rollback-leg,
+      ]
     if: |
+      !cancelled() &&
       github.repository == 'gke-labs/kube-agents' &&
-      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true' &&
+      needs.step-2-deploy-env.result == 'success' &&
+      needs.step-3-run-e2e-matrix.result == 'success'
     uses: ./.github/workflows/teardown-environment.yml
     permissions:
       contents: read

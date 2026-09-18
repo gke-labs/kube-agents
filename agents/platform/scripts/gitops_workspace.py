@@ -153,6 +153,30 @@ LOGGER = logging.getLogger(__name__)
 #: there.
 GITHUB_REPO_TYPE = "github"
 
+#: The optional `ref` on a `context_repos` entry: the branch the declared-intent
+#: search reads instead of the remote's HEAD. Held to the shape of a git branch
+#: name and, above all, never allowed to begin with `-`, because the value is
+#: handed to `inspect_repository.py clone --ref` and from there to `git`, where
+#: a leading dash is an option. An entry whose `ref` fails the shape keeps its
+#: URL and carries the refused value under `refused_ref` instead, with a
+#: warning; the declared-intent search then skips the repository rather than
+#: reading its default branch, because the pin exists so that a curated branch
+#: is what silences a posture, and the default branch is where anyone with
+#: ordinary write access lands a note. The slug stays in every list, so the
+#: ledger names the repository as one not searched until the entry is fixed.
+CONTEXT_REF_KEY = "ref"
+CONTEXT_REF_REFUSED_KEY = "refused_ref"
+_REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]{0,254}\Z")
+# `@` is admitted after the first character: `release@2026` is a branch name
+# git accepts, and a lone `@`, which it does not, fails the first class.
+# `git check-ref-format`'s rules, the ones the shape regex above leaves open:
+# no `..`, no component starting with `.`, no empty component, no `@{`, and
+# no component ending in `.lock` — `.lock/` catches one in the middle, the
+# suffix below one at the end; `git clone --branch foo.lock/bar` exits 128,
+# so refusing it here names the reason on the entry instead of at the clone.
+_REF_FORBIDDEN_SUBSTRINGS = ("..", "/.", "//", "@{", ".lock/")
+_REF_FORBIDDEN_SUFFIXES = ("/", ".", ".lock")
+
 Runner = Callable[..., object]
 # One `git symbolic-ref` per clone per process, keyed by workspace path. The
 # answer cannot change while a process runs, and the call is not free: `git`
@@ -766,7 +790,13 @@ def _parse_repos_json(repos_str: str, key: str = MANAGED_REPOS_KEY) -> list[dict
                         url = str(item.get("url", "")).strip()
                         repo_type = str(item.get("type", "")).strip()
                         if url and repo_type:
-                            entries.append({"type": repo_type, "url": url})
+                            entry = {"type": repo_type, "url": url}
+                            ref, refused = _context_ref(item, url, key)
+                            if ref:
+                                entry[CONTEXT_REF_KEY] = ref
+                            elif refused is not None:
+                                entry[CONTEXT_REF_REFUSED_KEY] = refused
+                            entries.append(entry)
         except json.JSONDecodeError as err:
             LOGGER.warning("Failed to decode %s JSON: %s", key, err)
             return []
@@ -774,6 +804,50 @@ def _parse_repos_json(repos_str: str, key: str = MANAGED_REPOS_KEY) -> list[dict
         LOGGER.warning("%s JSON does not start with '[': %r", key, repos_str)
         return []
     return entries
+
+
+def is_valid_ref(ref: object) -> bool:
+    """True for a value shaped like a git branch name that cannot read as a flag."""
+    if not isinstance(ref, str) or not _REF_SHAPE_RE.match(ref):
+        return False
+    if any(part in ref for part in _REF_FORBIDDEN_SUBSTRINGS):
+        return False
+    return not ref.endswith(_REF_FORBIDDEN_SUFFIXES)
+
+
+def _context_ref(item: dict, url: str, key: str) -> tuple[str | None, str | None]:
+    """`(ref, refused)`: the entry's `ref` when it is a branch name, else the value refused.
+
+    Only a `context_repos` entry may carry one: the managed list is what the
+    push gate and the resolver read, and a branch pin there would be a claim
+    about where fixes land that nothing downstream honours. A refused value
+    is returned rather than dropped, with a warning naming it, so the caller
+    can mark the entry and the declared-intent search can skip the repository
+    instead of reading its default branch in the pin's place.
+    """
+    if CONTEXT_REF_KEY not in item or key != CONTEXT_REPOS_KEY:
+        return None, None
+    # Only an absent key means "no pin". A `null`, empty or blank value is
+    # refused with the rest: each is what a template with an unset variable
+    # emits, and the pin it lost is the one the default branch must not
+    # stand in for. Only a string is a candidate at all: `123` or `false` is
+    # a template that emitted the wrong type, not a branch named `123` or
+    # `False`, which `str()` would have made of it. A refused value that is
+    # not a string is named by its JSON spelling, `null` and `false` rather
+    # than `None` and `False`, because JSON is what the administrator wrote.
+    raw = item[CONTEXT_REF_KEY]
+    if isinstance(raw, str) and is_valid_ref(raw.strip()):
+        return raw.strip(), None
+    refused = raw if isinstance(raw, str) else json.dumps(raw)
+    LOGGER.warning(
+        "Refusing ref %r on %s repository %r: not a git branch name; the "
+        "declared-intent search skips this repository rather than reading "
+        "its default branch.",
+        refused,
+        key,
+        url,
+    )
+    return None, refused
 
 
 def _state_key_path(key: str) -> Path:
@@ -873,8 +947,10 @@ def get_context_repo_entries() -> list[dict[str, str]]:
     return _read_state_key(CONTEXT_REPOS_KEY)
 
 
-def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
-    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates.
+def _github_entries(
+    entries: list[dict[str, str]], key: str, *, fold_case: bool
+) -> list[dict]:
+    """The GitHub entries in `entries` as `{repo, ref}`, in order, one per slug.
 
     An entry naming a forge this agent cannot drive is logged rather than
     dropped in silence. It is still skipped — there is one provider — but this
@@ -883,8 +959,20 @@ def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
     never touch indistinguishable from one that was never registered. `key`
     names the list in the warning, because both ConfigMap keys come through
     here and an administrator fixing the entry needs to know which one.
+
+    `ref` is the entry's branch pin or None. The first entry for a slug wins,
+    ref included: two entries for one repository on two branches is one
+    repository read once, at the branch the first names. With `fold_case`
+    the slugs are compared case-folded, as GitHub compares them, so
+    `Acme/Live` and `acme/live` are one entry too: the context list's readers
+    key on the lowercased slug, and a second entry that survived here would
+    hand them the last ref, not the first. The managed list passes False and
+    dedups on the spelling, because its readers compare the spelling exactly
+    (the `--repo` allowlists, the token scope): folding it would refuse a
+    `--repo` spelt the way an entry it dropped was.
     """
-    res: list[str] = []
+    res: list[dict] = []
+    seen: set[str] = set()
     for entry in entries:
         url = entry.get("url", "")
         if entry.get("type") != GITHUB_REPO_TYPE:
@@ -901,14 +989,30 @@ def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
                 "Skipping %s repository %r: not a GitHub repository URL.", key, url
             )
             continue
-        if slug not in res:
-            res.append(slug)
+        seen_as = slug.lower() if fold_case else slug
+        if seen_as not in seen:
+            seen.add(seen_as)
+            out = {"repo": slug, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)}
+            if entry.get(CONTEXT_REF_REFUSED_KEY) is not None:
+                out[CONTEXT_REF_REFUSED_KEY] = entry[CONTEXT_REF_REFUSED_KEY]
+            res.append(out)
     return res
 
 
+def _github_slugs(
+    entries: list[dict[str, str]], key: str, *, fold_case: bool
+) -> list[str]:
+    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates."""
+    return [entry["repo"] for entry in _github_entries(entries, key, fold_case=fold_case)]
+
+
 def get_managed_github_repos() -> list[str]:
-    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap."""
-    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY)
+    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap.
+
+    Two spellings of one slug are two entries here, as they were before the
+    context list existed: every reader of this list compares the spelling.
+    """
+    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False)
 
 
 def get_context_github_repos() -> list[str]:
@@ -919,7 +1023,19 @@ def get_context_github_repos() -> list[str]:
     is one of them. Nothing goes the other way — this list never reaches
     `resolve_repo` or `get_managed_github_repos`.
     """
-    return _github_slugs(get_context_repo_entries(), CONTEXT_REPOS_KEY)
+    return _github_slugs(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
+
+
+def get_context_github_repo_entries() -> list[dict]:
+    """The `context_repos` GitHub entries as `[{repo, ref}]`, in ConfigMap order.
+
+    The same list as `get_context_github_repos` with each slug's branch pin
+    beside it (None when the entry has none), for the one caller that passes
+    the pin on to a clone. An entry whose pin was refused carries it under
+    `refused_ref` instead, and that caller skips the repository. Same skip
+    rule, same warning, same one-way relationship to the managed list.
+    """
+    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
 
 
 def resolve_repo(workspace: str | Path | None = None) -> str:

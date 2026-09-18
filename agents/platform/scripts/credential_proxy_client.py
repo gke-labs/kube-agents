@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -38,6 +39,13 @@ _GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
 # Enough for any real kubeconfig; the point is that the file is read into
 # memory before anything is known about it.
 MAX_KUBECONFIG_BYTES = 1 << 20
+
+# The broker's read-only Cloud API relay: `GET {broker}/v1/gcp/<host>/<path>`
+# forwards a permitted Google API read on the broker's credential. Declared
+# here rather than in the broker because both sides spell it and this is the
+# module both import; `credential_proxy` re-exports it. `ApiSession` below is
+# the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
+API_RELAY_PREFIX = "/v1/gcp/"
 
 
 class BrokerConnection(http.client.HTTPConnection):
@@ -809,6 +817,58 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
             # asking differently.
             raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
         raise WorkspaceRequestError(exc.code, answer) from exc
+
+
+class ApiSession:
+    """A requests-shaped session whose GETs to a Google API go through the broker.
+
+    The sandbox holds no Google credential, so a script that needs a Cloud
+    Monitoring read cannot call `monitoring.googleapis.com` itself. This
+    rewrites `https://<host>/<path>` onto the broker's `/v1/gcp/<host>/<path>`
+    route and attaches the caller token; the broker checks the read against
+    `api_policy.API_READ_ROUTES`, forwards it on its own credential, and hands
+    back the upstream status, `Content-Type` and body unchanged. A refusal
+    arrives as a 403 whose JSON body carries `rule` and `message`, the same
+    shape `/v1/exec` uses.
+
+    The URL a caller writes stays the real endpoint, so a collector's evidence
+    label still names it, and `.get(url, params=, timeout=)` is what a
+    `requests.Session` offers, so code written against one runs against this
+    unchanged. `requests` is imported here and not at module scope: it is in the
+    sandbox image, where this class runs, and nowhere else this module is
+    imported needs it. `http` is injectable for tests and for a caller that
+    already holds a configured session.
+    """
+
+    def __init__(self, endpoint: str | None = None, http=None) -> None:
+        endpoint = endpoint or os.environ.get("CREDENTIAL_PROXY_URL", "")
+        if not endpoint:
+            raise RuntimeError(
+                "CREDENTIAL_PROXY_URL is not set; the credential broker is the only "
+                "path from here to a Google API"
+            )
+        self._endpoint = endpoint.rstrip("/")
+        if http is None:
+            import requests
+
+            http = requests.Session()
+        self._http = http
+
+    def relay_url(self, url: str) -> str:
+        """The broker URL that stands for `url`; the query is kept where it was."""
+        parsed = urllib.parse.urlsplit(url)
+        relayed = f"{self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        if parsed.query:
+            relayed += f"?{parsed.query}"
+        return relayed
+
+    def get(self, url: str, *, params=None, timeout=None):
+        return self._http.get(
+            self.relay_url(url),
+            params=params,
+            headers=authorization_headers(),
+            timeout=timeout,
+        )
 
 
 def read_stdin_if_requested(argv: list[str]) -> str | None:

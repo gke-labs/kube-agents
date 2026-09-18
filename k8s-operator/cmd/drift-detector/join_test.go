@@ -93,6 +93,21 @@ func joinCluster() clusterIdentity {
 	return clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-a"}
 }
 
+// joinSet is the one-cluster routing table most of these tests want: joinRecord
+// resolves to getter and nothing else does.
+//
+// A nil getter builds an empty set rather than an entry pointing at nil,
+// because that is what the production path produces -- buildClusterSet skips a
+// nil direct getter instead of registering it -- and an entry holding nil would
+// be found by the lookup and then panic on Get, testing a state the binary
+// cannot reach.
+func joinSet(getter objectGetter) map[clusterIdentity]objectGetter {
+	if getter == nil {
+		return nil
+	}
+	return map[clusterIdentity]objectGetter{joinCluster(): getter}
+}
+
 // notFound is the error a dynamic client returns for a missing object.
 func notFound() error {
 	return apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "deployments"}, "api")
@@ -124,41 +139,36 @@ func TestJoinOutcomes(t *testing.T) {
 	obj := managedFieldsObject(entry("kubectl-edit", "Update", "", `{"f:spec":{"f:replicas":{}}}`, nil))
 
 	for _, tc := range []struct {
-		name    string
-		getter  objectGetter
-		cluster clusterIdentity
-		mutate  func(*AuditRecord)
-		want    joinOutcome
+		name   string
+		getter objectGetter
+		mutate func(*AuditRecord)
+		want   joinOutcome
 		// wantLookup says whether the getter should have been called at all.
 		wantLookup bool
 	}{
 		{
 			name:       "a successful lookup enriches",
 			getter:     &stubGetter{obj: obj},
-			cluster:    joinCluster(),
 			want:       joinEnriched,
 			wantLookup: true,
 		},
 		{
-			name:    "a delete has no object left to fetch",
-			getter:  &stubGetter{obj: obj},
-			cluster: joinCluster(),
-			mutate:  func(r *AuditRecord) { r.Verb = deleteVerb },
-			want:    joinNoObject,
+			name:   "a delete has no object left to fetch",
+			getter: &stubGetter{obj: obj},
+			mutate: func(r *AuditRecord) { r.Verb = deleteVerb },
+			want:   joinNoObject,
 		},
 		{
-			name:    "a create with no assigned name cannot be addressed",
-			getter:  &stubGetter{obj: obj},
-			cluster: joinCluster(),
-			mutate:  func(r *AuditRecord) { r.Resource.Name = "" },
-			want:    joinNoObject,
+			name:   "a create with no assigned name cannot be addressed",
+			getter: &stubGetter{obj: obj},
+			mutate: func(r *AuditRecord) { r.Resource.Name = "" },
+			want:   joinNoObject,
 		},
 		{
-			name:    "a record from a differently named cluster is not looked up here",
-			getter:  &stubGetter{obj: obj},
-			cluster: joinCluster(),
-			mutate:  func(r *AuditRecord) { r.Cluster = "prod-b" },
-			want:    joinUnreachable,
+			name:   "a record from a differently named cluster is not looked up here",
+			getter: &stubGetter{obj: obj},
+			mutate: func(r *AuditRecord) { r.Cluster = "prod-b" },
+			want:   joinUnreachable,
 		},
 		{
 			// The case a name-only guard gets wrong. A GKE cluster name is
@@ -166,60 +176,52 @@ func TestJoinOutcomes(t *testing.T) {
 			// is ordinary -- and the lookup would succeed, returning a real
 			// object of that name whose ownership belongs to a different
 			// cluster entirely. Nothing downstream could tell.
-			name:    "a same-named cluster in another location is a different cluster",
-			getter:  &stubGetter{obj: obj},
-			cluster: joinCluster(),
-			mutate:  func(r *AuditRecord) { r.Location = "europe-west1" },
-			want:    joinUnreachable,
+			name:   "a same-named cluster in another location is a different cluster",
+			getter: &stubGetter{obj: obj},
+			mutate: func(r *AuditRecord) { r.Location = "europe-west1" },
+			want:   joinUnreachable,
 		},
 		{
-			name:    "a same-named cluster in another project is a different cluster",
-			getter:  &stubGetter{obj: obj},
-			cluster: joinCluster(),
-			mutate:  func(r *AuditRecord) { r.Project = "other-project" },
-			want:    joinUnreachable,
+			name:   "a same-named cluster in another project is a different cluster",
+			getter: &stubGetter{obj: obj},
+			mutate: func(r *AuditRecord) { r.Project = "other-project" },
+			want:   joinUnreachable,
 		},
 		{
 			// An incompletely labelled record is refused rather than assumed
 			// local: the alternative is enriching it from whatever object of
 			// that name this cluster happens to hold.
-			name:    "a record with no location cannot be placed",
-			getter:  &stubGetter{obj: obj},
-			cluster: joinCluster(),
-			mutate:  func(r *AuditRecord) { r.Location = "" },
-			want:    joinUnreachable,
+			name:   "a record with no location cannot be placed",
+			getter: &stubGetter{obj: obj},
+			mutate: func(r *AuditRecord) { r.Location = "" },
+			want:   joinUnreachable,
 		},
 		{
-			name:    "no getter means no join",
-			getter:  nil,
-			cluster: joinCluster(),
-			want:    joinUnreachable,
+			name:   "an empty cluster set means no join",
+			getter: nil,
+			want:   joinUnreachable,
 		},
 		{
 			name:       "NotFound means the object has since been removed",
 			getter:     &stubGetter{err: notFound()},
-			cluster:    joinCluster(),
 			want:       joinGone,
 			wantLookup: true,
 		},
 		{
 			name:       "a NotFound from a path the cluster does not serve is a failed lookup, not a removal",
 			getter:     &stubGetter{err: unservedPathFromMux()},
-			cluster:    joinCluster(),
 			want:       joinFailed,
 			wantLookup: true,
 		},
 		{
 			name:       "and so is the same refusal answered by the group's own handler",
 			getter:     &stubGetter{err: unservedPathFromGroupHandler()},
-			cluster:    joinCluster(),
 			want:       joinFailed,
 			wantLookup: true,
 		},
 		{
 			name:       "any other error is a failed lookup",
 			getter:     &stubGetter{err: errors.New("forbidden")},
-			cluster:    joinCluster(),
 			want:       joinFailed,
 			wantLookup: true,
 		},
@@ -231,7 +233,7 @@ func TestJoinOutcomes(t *testing.T) {
 			}
 
 			var forwarded []DriftEvent
-			j := newJoiner(tc.getter, tc.cluster, nil, func(_ context.Context, e DriftEvent) {
+			j := newJoiner(joinSet(tc.getter), nil, func(_ context.Context, e DriftEvent) {
 				forwarded = append(forwarded, e)
 			})
 			j.Handle(context.Background(), record)
@@ -258,7 +260,7 @@ func TestJoinOutcomes(t *testing.T) {
 func TestJoinForwardsTheLookupError(t *testing.T) {
 	wantErr := errors.New("deployments.apps is forbidden")
 	var got DriftEvent
-	j := newJoiner(&stubGetter{err: wantErr}, joinCluster(), nil, func(_ context.Context, e DriftEvent) { got = e })
+	j := newJoiner(joinSet(&stubGetter{err: wantErr}), nil, func(_ context.Context, e DriftEvent) { got = e })
 	j.Handle(context.Background(), joinRecord())
 
 	if !errors.Is(got.LookupError, wantErr) {
@@ -271,7 +273,7 @@ func TestJoinPassesTheAuditResourceStraightThrough(t *testing.T) {
 	// so that no RESTMapper is needed here. If that ever changes, this is the
 	// test that says what depended on it.
 	stub := &stubGetter{obj: &unstructured.Unstructured{}}
-	j := newJoiner(stub, joinCluster(), nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(stub), nil, func(context.Context, DriftEvent) {})
 	record := joinRecord()
 	j.Handle(context.Background(), record)
 
@@ -284,7 +286,7 @@ func TestJoinPassesTheAuditResourceStraightThrough(t *testing.T) {
 }
 
 func TestJoinCountsEveryOutcome(t *testing.T) {
-	j := newJoiner(&stubGetter{err: notFound()}, joinCluster(), nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(&stubGetter{err: notFound()}), nil, func(context.Context, DriftEvent) {})
 
 	j.Handle(context.Background(), joinRecord()) // gone
 
@@ -326,7 +328,7 @@ func TestJoinBoundsTheLookup(t *testing.T) {
 	// also means the rest of it would pass against a joiner whose default was
 	// never set -- so the value the running binary actually uses is checked
 	// here, where newJoiner is the only place it comes from.
-	if def := newJoiner(nil, joinCluster(), nil, nil).timeout; def != joinRequestTimeout {
+	if def := newJoiner(joinSet(nil), nil, nil).timeout; def != joinRequestTimeout {
 		t.Errorf("newJoiner timeout = %s, want %s", def, joinRequestTimeout)
 	}
 
@@ -334,7 +336,7 @@ func TestJoinBoundsTheLookup(t *testing.T) {
 	defer close(blocked)
 
 	var got DriftEvent
-	j := newJoiner(&stubGetter{block: blocked}, joinCluster(), nil, func(_ context.Context, e DriftEvent) { got = e })
+	j := newJoiner(joinSet(&stubGetter{block: blocked}), nil, func(_ context.Context, e DriftEvent) { got = e })
 	j.timeout = time.Millisecond
 
 	done := make(chan struct{})
@@ -448,7 +450,7 @@ func TestReconciledBy(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			j := newJoiner(nil, joinCluster(), tc.managers, func(context.Context, DriftEvent) {})
+			j := newJoiner(joinSet(nil), tc.managers, func(context.Context, DriftEvent) {})
 			claim, manager := j.reconciledBy(tc.owners, changedAt)
 
 			if claim != tc.wantClaim {
@@ -479,7 +481,7 @@ func TestReconciledByIgnoresAStatusWriteAnsweringASpecChange(t *testing.T) {
 	suspendedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 	statusWrittenAt := suspendedAt.Add(4 * time.Second)
 
-	j := newJoiner(nil, joinCluster(), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
 
 	claim, claimed := j.reconciledBy([]fieldOwner{
 		{Manager: "flux-cli", UpdatedAt: suspendedAt, Paths: []string{"spec.suspend"}},
@@ -503,7 +505,7 @@ func TestReconciledByDoesNotInventAClaimFromTwoMissingTimes(t *testing.T) {
 	// field is a plain time.Time, so an absent or null `timestamp` decodes to
 	// the zero value without error. A genuinely malformed one fails
 	// json.Unmarshal and is nacked before it reaches here.
-	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller"}}, time.Time{})
 	if claim {
@@ -525,7 +527,7 @@ func TestReconciledByDoesNotClaimAgainstAChangeWithNoTimestamp(t *testing.T) {
 	// covered both.
 	wroteLongBefore := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy(
 		[]fieldOwner{{Manager: "argocd-controller", UpdatedAt: wroteLongBefore}},
@@ -548,7 +550,7 @@ func TestReconciledByDeclinesAWriteInTheChangesOwnSecond(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 600_000_000, time.UTC)
 	sameSecond := changedAt.Truncate(time.Second) // what the API server returns
 
-	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: sameSecond}}, changedAt); claim {
 		t.Errorf("Reconciled = true by %q, want no claim: the write in the change's own second may be the change", manager)
@@ -565,7 +567,7 @@ func TestReconciledByClaimsAWriteFromTheNextSecond(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 600_000_000, time.UTC)
 	reconciledAt := changedAt.Truncate(time.Second).Add(time.Second)
 
-	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: reconciledAt}}, changedAt)
 	if !claim {
@@ -587,7 +589,7 @@ func TestReconciledByFloorsTheManagerSideToo(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 200_000_000, time.UTC)
 	sameSecond := changedAt.Add(700 * time.Millisecond)
 
-	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: sameSecond}}, changedAt); claim {
 		t.Errorf("Reconciled = true by %q, want no claim: %v and %v are the same second", manager, sameSecond, changedAt)
@@ -603,7 +605,7 @@ func TestReconciledByDoesNotLetAnApplyReconcileItself(t *testing.T) {
 	const manager = "kustomize-controller"
 	changedAt := time.Date(2026, 9, 17, 9, 30, 12, 250_000_000, time.UTC)
 
-	j := newJoiner(nil, joinCluster(), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
 
 	claim, claimed := j.reconciledBy([]fieldOwner{
 		{Manager: manager, Operation: "Apply", UpdatedAt: changedAt.Truncate(time.Second), Paths: []string{"spec.replicas"}},
@@ -620,7 +622,7 @@ func TestReconciledByStillDeclinesAWriteFromAnEarlierSecond(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 1, 600_000_000, time.UTC)
 	earlier := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 
-	j := newJoiner(nil, joinCluster(), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
 
 	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: earlier}}, changedAt); claim {
 		t.Errorf("Reconciled = true by %q, want no claim for a write from the previous second", manager)
@@ -636,7 +638,7 @@ func TestJoinSetsReconciledFromTheLiveObject(t *testing.T) {
 	)
 
 	var got DriftEvent
-	j := newJoiner(&stubGetter{obj: obj}, joinCluster(), parseGitopsManagers("argocd-controller"),
+	j := newJoiner(joinSet(&stubGetter{obj: obj}), parseGitopsManagers("argocd-controller"),
 		func(_ context.Context, e DriftEvent) { got = e })
 
 	record := joinRecord()

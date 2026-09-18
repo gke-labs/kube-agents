@@ -53,8 +53,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -597,6 +599,111 @@ SEARCHED_REPO_RE = re.compile(
 # validator cannot tell the two apart. The fault is withheld with the postures,
 # and the gap sentence says so.
 DUAL_SHAPE_CHECK = "hpa-cannot-scale"
+# The severity the obtainability SOP's §3.6 fixes for the `min == max` posture
+# (`major`; the dangling-target fault is `minor`). The severity is the one
+# validated field that carries the shape, so the harness-side join moves an
+# `hpa-cannot-scale` finding only at this severity and leaves every other one a
+# finding whatever a note declares. The withhold keeps taking both shapes: it
+# errs toward holding a finding back, the join would err toward silencing one.
+DUAL_SHAPE_POSTURE_SEVERITY = "major"
+
+# Harness-side declaration discovery (the obtainability SOP's §4a). `start`
+# reads every repository the step must search, collects the declarations it
+# finds into one file beside the findings document, and records each
+# repository it read completely; `finish` joins the declarations against the
+# findings and folds the record into the document, so neither the match nor
+# the search record depends on the model performing the step.
+#
+# A declaration is an item under the `declares:` key of an OKF note's YAML
+# frontmatter — Markdown whose first line opens a `---` block carrying the
+# `type` the knowledge contract requires — with `check`, `namespace`,
+# `object` (`Kind/name`) and an optional `cluster`. The frontmatter is the
+# whole format: no body text is scanned, so a note that merely mentions a
+# workload declares nothing.
+DECLARATIONS_KEY = "declarations"
+DECLARATIONS_PATH_KEY = "declarations_path"
+DECLARED_INTENT_SOURCES_KEY = "declared_intent_sources"
+# What `start` hands the worker for each repository it owes and could not
+# read: the slug and the `ref` the entry pins, so the worker's own copy reads
+# the branch the administrator configured rather than the remote's HEAD. An
+# entry whose pin was refused as not a git branch name carries it under
+# `refused_ref` instead: the harness read nothing there, and the worker copies
+# nothing either, so the repository stays a named coverage gap until the
+# entry is corrected rather than being read at its default branch.
+DECLARED_INTENT_UNSEARCHED_KEY = "declared_intent_unsearched"
+REFUSED_REF_KEY = "refused_ref"
+RUN_RECORD_SEARCHED_KEY = "searched"
+RUN_RECORD_SOURCES_KEY = "sources"
+FRONTMATTER_DELIMITER = "---"
+# U+FEFF: what an editor that writes a UTF-8 byte-order mark puts before the
+# first `---`. `str.strip()` does not remove it (it is not whitespace), so it
+# is dropped by name before the delimiter check.
+UTF8_BOM = "\ufeff"
+FRONTMATTER_END_DELIMITERS = ("---", "...")
+OKF_TYPE_KEY = "type"
+OKF_TITLE_KEY = "title"
+DECLARES_KEY = "declares"
+DECLARATION_ITEM_FIELDS = ("check", "namespace", "object")
+DECLARATION_CLUSTER_FIELD = "cluster"
+NOTE_SUFFIX = ".md"
+# Linear on purpose: `text` runs to the end of the line and the closing
+# sequence (blanks and `#`) is trimmed afterwards. Giving the tail up lazily
+# and letting a trailing `[ \t#]*` take it back costs the square of the
+# line's length, and one heading line of a hundred thousand characters in one
+# note held `start`, which has no timeout, for most of a minute; the notes
+# come from repositories anyone with write access there can change.
+HEADING_RE = re.compile(r"^#{1,6}[ \t]+(?P<text>\S.*)$", re.M)
+HEADING_TRAILER_CHARS = " \t#"
+# The per-repository search bound: one key, `paths`, a list of repo-relative
+# prefixes held to the remediation-path rules (a trailing `/` allowed, because
+# they are prefixes) and to the broker's own path validator, which a
+# content-mode `clone --prefix` applies to each one. Absent or invalid reads
+# as the whole tree, said on stderr, because a bound that fails closed would
+# let a typo hide every declaration in the repository. A prefix with nothing behind it at the
+# commit read — `knowlege/` for a tree whose notes live under `knowledge/`,
+# or a directory renamed since the file was written — is the same typo in a
+# well-formed path, and is treated the same way rather than credited as a
+# search that found nothing.
+INTENT_FILE = ".kube-agents/intent.yaml"
+INTENT_PATHS_KEY = "paths"
+# The directory a content-mode copy fetches first, so the bound is known before
+# anything else is copied.
+INTENT_DIR = str(PurePosixPath(INTENT_FILE).parent)
+# Never descended, in either mode: a `.git` is repository state, and a symlink
+# is a path out of the copy the bound was checked against.
+SKIPPED_TREE_DIRS = frozenset({".git"})
+# The broker's `skipped` reasons that name a path the search never reads: a
+# symlink it will not follow (the walk above never yields one either) and a
+# tracked name that is not a regular file (a submodule). Every other reason
+# (`tooLarge`, `requestBudget`) withholds a file the harness would have read,
+# and such a file under the searched paths is a note it may have missed.
+BROKER_SKIP_NOT_A_FILE_REASONS = frozenset({"symlink", "notAFile"})
+# The copies come from the sibling skill's script, which works in both broker
+# modes and prints `sha` and `complete`; resolved from this file so the staged
+# and the source layouts both find it. Shallow, because the read is of one
+# tree at one commit. The temporary destination lives under the scratch
+# directory — the one place the sidecar and this container share — and each
+# context copy in directory mode lands under a lease of its own, distinct from
+# the audit's GitOps clone so `reset=True` there never scrubs this tree.
+CLONE_SCRIPT = (
+    Path(__file__).resolve().parents[2] / "inspect-repository" / "scripts" / "inspect_repository.py"
+)
+CLONE_DEPTH = 1
+CLONE_TMP_PREFIX = "declared-intent-"
+CLONE_LEASE_SUFFIX = "-declared-intent"
+CLONE_MODE_CONTENT = "content"
+CLONE_MODE_DIRECTORY = "directory"
+# The GitOps base-branch override, which `gitops_workspace.resolve_base_branch`
+# consults before the remote's HEAD, names the branch the fleet deploys from
+# in that one repository. The sibling script inherits the environment, and a
+# directory-mode clone with no `--ref` asks that function which branch to
+# check out, so a context repository copied with the override in place was
+# read at the GitOps repository's branch, not its own default, and one with
+# no branch of that name failed to clone every run. Every copy the search
+# makes runs without the two variables: a pinned entry passes `--ref` and
+# never consulted them, and in content mode the broker resolves the default
+# branch per repository and never reads the agent container's environment.
+BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH")
 
 # `gh pr list` takes a limit, not a cursor. A full page means the oldest
 # remediation branches fell off the end, and a branch that reads as "no pull
@@ -1120,6 +1227,11 @@ def findings_path_for(audit_id: str) -> str:
 def run_record_path_for(audit_id: str) -> str:
     """Where `start` records which repositories this run was told to search."""
     return f"{SCRATCH_DIR}/run_{audit_id}.json"
+
+
+def declarations_path_for(audit_id: str) -> str:
+    """Where `start` files the declarations it found for `finish` to join."""
+    return f"{SCRATCH_DIR}/declarations_{audit_id}.json"
 
 
 def base_branch() -> str:
@@ -2387,6 +2499,482 @@ def _declared_intent_gap(data: dict) -> str | None:
     return f"declared intent: {what} — {where}{tail}"
 
 
+def _split_note(text: str) -> tuple[str, str] | None:
+    """`(frontmatter, body)` of a note that opens with `---`, or None when it does not.
+
+    None for a file that does not open with the delimiter, or opens one and
+    never closes it: neither is an OKF note, and neither declares anything.
+    A leading UTF-8 byte-order mark is not part of the first line: without
+    this a note saved by an editor that writes one would be read, counted
+    as searched and declare nothing, with no warning anywhere.
+
+    A delimiter starts at column 0. YAML's document markers do, and an
+    indented `---` or `...` inside a block scalar (`notes: |` holding a
+    horizontal rule) is content; closing the frontmatter there would hand
+    PyYAML a truncated prefix and drop every `declares:` item after it,
+    with the note read and the repository counted as searched.
+    """
+    lines = normalise_newlines(text).lstrip(UTF8_BOM).split("\n")
+    if not lines or lines[0].rstrip() != FRONTMATTER_DELIMITER:
+        return None
+    for index in range(1, len(lines)):
+        if lines[index].rstrip() in FRONTMATTER_END_DELIMITERS:
+            return "\n".join(lines[1:index]), "\n".join(lines[index + 1 :])
+    return None
+
+
+def split_frontmatter(text: str) -> str | None:
+    """The YAML between a leading `---` line and the next `---`/`...` line, or None."""
+    split = _split_note(text)
+    return split[0] if split is not None else None
+
+
+def _note_excerpt(front: dict, text: str, path: str) -> str:
+    """What the ledger's Declaration cell shows: the note's title, else its first heading, else its path."""
+    title = front.get(OKF_TITLE_KEY)
+    if isinstance(title, str) and title.strip():
+        return clip_text(title, MAX_TITLE_CHARS)
+    split = _split_note(text)
+    body = split[1] if split is not None else text
+    for heading in HEADING_RE.finditer(strip_fenced_blocks(body)):
+        # A heading that is nothing but its closing sequence (`# ###`) is
+        # empty once trimmed, and an empty excerpt names nothing.
+        text = heading.group("text").rstrip(HEADING_TRAILER_CHARS)
+        if text:
+            return clip_text(text, MAX_TITLE_CHARS)
+    return clip_text(path, MAX_TITLE_CHARS)
+
+
+def parse_declarations(
+    text: str, *, repo: str, path: str, declarable: frozenset[str]
+) -> list[dict]:
+    """The declarations one note carries, each as the entry `finish` joins on.
+
+    A note counts when it is an OKF document — frontmatter carrying `type` —
+    whose `declares` is a list. Each item needs `check` (a declarable slug),
+    `namespace` (a string, empty for a cluster-scoped object) and `object` as
+    `Kind/name`; `cluster` is optional and, when present, a non-empty string.
+    An item that fails any of that is skipped with a warning naming the file
+    and the item, and the rest of the note still counts: one typo silences one
+    declaration, not the file.
+
+    Frontmatter that PyYAML cannot parse yields nothing for the file, with a
+    warning; a file with no frontmatter, no `type` or no `declares` yields
+    nothing and says nothing, because most notes are not declarations.
+    """
+    import yaml
+
+    where = f"{repo}:{path}"
+    front_text = split_frontmatter(text)
+    if front_text is None:
+        return []
+    try:
+        front = yaml.safe_load(front_text)
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
+        # The other two are PyYAML's own, raised outside the `YAMLError`
+        # tree: an unquoted `2026-02-30` or `T25:00` is resolved as a
+        # timestamp and built with `datetime`, which raises `ValueError`,
+        # and the pure-Python loader composes nested flow collections
+        # recursively, so a few hundred nested `[` raise `RecursionError`.
+        # Left uncaught either would cost the repository its entry, not the
+        # note its declaration.
+        log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
+        return []
+    if not isinstance(front, dict) or OKF_TYPE_KEY not in front:
+        return []
+    declares = front.get(DECLARES_KEY)
+    if declares is None:
+        return []
+    if not isinstance(declares, list):
+        log(f"WARNING: {where}: `{DECLARES_KEY}` must be a list of items; none read.")
+        return []
+    excerpt = _note_excerpt(front, text, path)
+    out: list[dict] = []
+    for index, item in enumerate(declares):
+        item_where = f"{where} {DECLARES_KEY}[{index}]"
+        if not isinstance(item, dict):
+            log(f"WARNING: {item_where}: expected an object; skipped.")
+            continue
+        missing = [
+            field
+            for field in DECLARATION_ITEM_FIELDS
+            if not isinstance(item.get(field), str)
+        ]
+        if missing:
+            log(f"WARNING: {item_where}: missing or non-string {', '.join(missing)}; skipped.")
+            continue
+        check = item["check"].strip()
+        if check not in declarable:
+            log(
+                f"WARNING: {item_where}: {check!r} is not a check a declaration may "
+                "justify; skipped."
+            )
+            continue
+        raw_object = item["object"].strip()
+        # Each side of the slash on its own: `Deployment / api` is a hand-typed
+        # spelling of `Deployment/api`. The join would fold the spacing anyway,
+        # since it reduces each field as the finding id does; stripping here
+        # keeps the filed entry, and the `Kind/name` the ledger prints from it,
+        # in the canonical spelling.
+        kind, _, name = (part.strip() for part in raw_object.partition("/"))
+        if not kind or not name or "/" in name:
+            log(f"WARNING: {item_where}: object must be Kind/name, got {raw_object!r}; skipped.")
+            continue
+        obj = f"{kind}/{name}"
+        entry = {
+            "check": check,
+            "namespace": item["namespace"].strip(),
+            "object": obj,
+            "repo": repo,
+            "path": path,
+            "excerpt": excerpt,
+        }
+        if DECLARATION_CLUSTER_FIELD in item:
+            cluster = item[DECLARATION_CLUSTER_FIELD]
+            if not isinstance(cluster, str) or not cluster.strip():
+                log(
+                    f"WARNING: {item_where}: {DECLARATION_CLUSTER_FIELD} must be a "
+                    "non-empty string when present, or omitted for a fleet-wide "
+                    "declaration; skipped."
+                )
+                continue
+            entry[DECLARATION_CLUSTER_FIELD] = cluster.strip()
+        out.append(entry)
+    return out
+
+
+def _symlinked_component(tree: Path, relative: str) -> str | None:
+    """The first component of `relative` under `tree` that is a symlink, or None.
+
+    Repo-relative, for the warning that names it.
+    """
+    probe = Path(tree)
+    for part in PurePosixPath(relative).parts:
+        probe = probe / part
+        if probe.is_symlink():
+            return probe.relative_to(tree).as_posix()
+    return None
+
+
+def read_intent_paths(tree: Path, repo: str) -> list[str]:
+    """The repo-relative prefixes `.kube-agents/intent.yaml` bounds the search to.
+
+    An empty list means the whole tree, and stderr says why: the file (or its
+    directory) is a symlink, is absent, is not YAML, has no `paths` list, or
+    names a path the remediation-path rules or the broker's path validator
+    refuse. Any one bad path discards the whole bound rather than the one
+    path, because a bound that silently narrowed itself would read as the
+    owner's choice.
+    """
+    import yaml
+
+    # Lazy, as `gitops_workspace` is (the module comment on `sys.path`).
+    import workspace_paths
+
+    intent = tree / INTENT_FILE
+    where = f"{repo}:{INTENT_FILE}"
+    # Before `is_file`, which follows a link. A directory-mode tree is a real
+    # clone and git materialises a committed symlink, so the one file that
+    # sets the bound is held to the rule `note_paths` applies to every note:
+    # a link is a path out of the copy the bound is checked against.
+    linked = _symlinked_component(tree, INTENT_FILE)
+    if linked is not None:
+        log(
+            f"WARNING: {where}: `{linked}` is a symbolic link, which is never "
+            "followed; searching the whole tree."
+        )
+        return []
+    if not intent.is_file():
+        log(f"{where}: absent; searching the whole tree.")
+        return []
+    try:
+        data = yaml.safe_load(intent.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError, RecursionError) as exc:
+        # `ValueError`: an unquoted date PyYAML resolves and `datetime` refuses;
+        # `RecursionError`: a flow collection nested past the recursion limit.
+        # Both as in `parse_declarations`.
+        log(f"WARNING: {where}: unreadable ({exc}); searching the whole tree.")
+        return []
+    paths = data.get(INTENT_PATHS_KEY) if isinstance(data, dict) else None
+    if not isinstance(paths, list) or not paths:
+        log(
+            f"WARNING: {where}: `{INTENT_PATHS_KEY}` must be a non-empty list of "
+            "repo-relative prefixes; searching the whole tree."
+        )
+        return []
+    out: list[str] = []
+    for index, raw in enumerate(paths):
+        item = f"{INTENT_PATHS_KEY}[{index}]"
+        try:
+            if not isinstance(raw, str):
+                raise ValidationError(f"{item}: expected a string")
+            prefix = _require_repo_relative(raw.rstrip("/"), item)
+            # The broker's validator, on the spelling the copy is asked for.
+            # The remediation-path rules let surrounding whitespace (a quoted
+            # `"knowledge/ "`) and a control character through; a content-mode
+            # `clone --prefix` runs the prefix through `validate_path` and
+            # exits non-zero on them, which would leave the repository
+            # unsearched every run with the clone blamed, while directory
+            # mode read the whole tree. Refused here, in both modes, the
+            # bound falls to the whole tree with the reason named.
+            try:
+                workspace_paths.validate_path(prefix)
+            except workspace_paths.WorkspaceError as exc:
+                raise ValidationError(f"{item}: {exc}") from exc
+            out.append(prefix)
+        except ValidationError as exc:
+            log(f"WARNING: {where}: {exc}; searching the whole tree.")
+            return []
+    return out
+
+
+def _under_prefixes(path: str, prefixes: list[str]) -> bool:
+    return not prefixes or any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
+def _unmatched_prefixes(tree: Path, prefixes: list[str], skipped: tuple[str, ...] = ()) -> list[str]:
+    """The prefixes in `prefixes` with nothing behind them in the copy at `tree`.
+
+    A prefix is matched when it names a file or directory in the copy — not
+    through a symlink at any component of it, which the walk never follows —
+    or when the broker reported skipping a file under it, which is a file
+    the repository has even though the copy does not. Git tracks no empty
+    directory, so a prefix that matches nothing names nothing at this commit.
+    """
+    out: list[str] = []
+    for prefix in prefixes:
+        # `Path.is_symlink` inspects the last component only; a prefix behind
+        # a linked directory exists through the link and the walk, which
+        # never enters one, would read nothing under it while the bound
+        # stood, and the repository would be credited with a search.
+        if _symlinked_component(tree, prefix) is not None or not (tree / prefix).exists():
+            if not any(_under_prefixes(path, [prefix]) for path in skipped):
+                out.append(prefix)
+    return out
+
+
+def _whole_tree_for_unmatched(repo: str, unmatched: list[str]) -> None:
+    log(
+        f"WARNING: {repo}:{INTENT_FILE}: {', '.join(f'`{p}`' for p in unmatched)} "
+        "names nothing in the repository at this commit; searching the whole tree."
+    )
+
+
+def _bounds_searched_notes(rel: str, prefixes: list[str]) -> bool:
+    """Whether a directory the walk could not enter may hold a searched note.
+
+    True for the tree root, for a directory at or under a prefix, and for an
+    ancestor of one; a directory the bound excludes cannot have held one.
+    """
+    if rel in ("", ".") or _under_prefixes(rel, prefixes):
+        return True
+    return any(prefix.startswith(rel + "/") for prefix in prefixes)
+
+
+def note_paths(tree: Path, prefixes: list[str]) -> tuple[list[str], list[str]]:
+    """`(notes, unlisted)`: every `.md` under `tree` within `prefixes`, and the directories the walk could not enter.
+
+    Both repo-relative and sorted. `.git` is never entered and a symlink —
+    file or directory — is never followed: the bound was checked against
+    paths inside the copy, and a link is a path out of it. A directory
+    `os.walk` could not list is reported when it lies where a searched note
+    could be, because the notes under it were never seen and the repository
+    must not be called read.
+    """
+    out: list[str] = []
+    unlisted: list[str] = []
+
+    def could_not_enter(exc: OSError) -> None:
+        failed = Path(str(exc.filename or tree))
+        try:
+            rel = failed.relative_to(tree).as_posix()
+        except ValueError:
+            rel = failed.as_posix()
+        if _bounds_searched_notes(rel, prefixes):
+            unlisted.append(rel)
+
+    for current, dirs, files in os.walk(tree, onerror=could_not_enter, followlinks=False):
+        here = Path(current)
+        dirs[:] = sorted(
+            d for d in dirs if d not in SKIPPED_TREE_DIRS and not (here / d).is_symlink()
+        )
+        for name in sorted(files):
+            if not name.endswith(NOTE_SUFFIX) or (here / name).is_symlink():
+                continue
+            rel = (here / name).relative_to(tree).as_posix()
+            if _under_prefixes(rel, prefixes):
+                out.append(rel)
+    return out, sorted(unlisted)
+
+
+def search_tree(
+    tree: Path,
+    *,
+    repo: str,
+    declarable: frozenset[str],
+    prefixes: list[str] | None = None,
+) -> tuple[list[dict], list[str], list[str]]:
+    """Read one repository copy: `(declarations, prefixes applied, paths not read)`.
+
+    `prefixes` is the bound when the caller already read the intent file (a
+    content-mode copy fetched it first); None reads it from the tree. The
+    third element names every note under the bound the harness could not read
+    — not UTF-8, unreadable, or in a directory it could not list. It is the
+    local twin of a note the broker withheld, and the caller treats it the
+    same way: a repository with one is not searched, because a declaration in
+    that note would go unhonoured while the record said the repository was
+    read.
+    """
+    if prefixes is None:
+        prefixes = read_intent_paths(tree, repo)
+        # A content-mode copy checked this before it fetched; a whole tree
+        # is checked here, against the same copy the walk will read.
+        unmatched = _unmatched_prefixes(tree, prefixes)
+        if unmatched:
+            _whole_tree_for_unmatched(repo, unmatched)
+            prefixes = []
+    notes, unread = note_paths(tree, prefixes)
+    found: list[dict] = []
+    for rel in notes:
+        try:
+            text = (tree / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            log(f"WARNING: {repo}:{rel}: unreadable ({exc}).")
+            unread.append(rel)
+            continue
+        found.extend(parse_declarations(text, repo=repo, path=rel, declarable=declarable))
+    return found, prefixes, unread
+
+
+def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
+    """The tuple a declaration and a finding are joined on: the finding id's segments.
+
+    Each field goes through `_id_segment`, the reduction `derive_finding_id`
+    applies, because the ledger's identity is the standard the join has to
+    meet: it lowers, trims and squeezes every run outside `[a-z0-9]` to one
+    `-`, so `Deployment/api`, `deployment/api` and `Deployment / api` are all
+    `deployment-api` there and one finding. An owner who writes the Kind the
+    way kubectl prints it, or copies it off the finding id, passes the item
+    shape check, and a finding the model wrote with a space around the slash
+    or around a field still carries the id the note's author read; a key that
+    folded less than the id did matched nothing in those cases and the posture
+    published under a note that covers it.
+    """
+    key = (
+        _id_segment(str(entry.get("check", "") or "")),
+        _id_segment(str(entry.get("namespace") or "")),
+        _id_segment(str(entry.get("object", "") or "")),
+    )
+    if with_cluster:
+        return (_id_segment(str(entry.get(DECLARATION_CLUSTER_FIELD, "") or "")),) + key
+    return key
+
+
+def fold_searched_record(data: dict, record: dict | None) -> None:
+    """Union the run record's `searched` into the document's search record.
+
+    The harness's entries join the model's rather than replace them: a model
+    that searched a repository the harness could not still gets credit for
+    it, and a harness entry never depends on the model having written any.
+    """
+    harness = list((record or {}).get(RUN_RECORD_SEARCHED_KEY) or [])
+    if not harness:
+        return
+    current = [
+        entry for entry in data.get(DECLARED_INTENT_SEARCHED_KEY) or [] if isinstance(entry, str)
+    ]
+    have = {entry.partition("@")[0].strip().lower() for entry in current}
+    for entry in harness:
+        slug = str(entry).partition("@")[0].strip().lower()
+        if slug and slug not in have:
+            have.add(slug)
+            current.append(str(entry))
+    data[DECLARED_INTENT_SEARCHED_KEY] = current
+
+
+def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
+    """Move each finding a declaration covers into `declared[]`; return the moved.
+
+    The lookup is on the fields the owner wrote, compared case-blind as the
+    finding id compares them: first `(cluster, check, namespace, object)`
+    against entries that name a cluster, then `(check, namespace, object)`
+    against fleet-wide ones. The first entry
+    wins in repository-then-path order, which is the order `start` wrote them
+    in. Only a declarable check is looked up at all, so a fault stays a
+    finding whatever a note says about it — and for `hpa-cannot-scale`, the
+    one slug that names both, only the `min == max` shape moves, read off the
+    severity §3.6 fixes for it (`DUAL_SHAPE_POSTURE_SEVERITY`); a match on the
+    dangling-target fault is said on stderr and not applied. An identity the
+    model already declared is left to the model's entry.
+
+    The moved entry is what the validator would have accepted from the model:
+    the finding's identity and title, and the declaration's `repo`, `path`
+    and `excerpt`. Run after `validate_findings`, on a document whose findings
+    already carry their derived ids, so the caller can name what moved.
+    """
+    if not declarations:
+        return []
+    declarable = audit_declarable_checks(str(data.get("audit") or ""))
+    scoped: dict[tuple, dict] = {}
+    fleet_wide: dict[tuple, dict] = {}
+    for entry in declarations:
+        has_cluster = bool(entry.get(DECLARATION_CLUSTER_FIELD))
+        target = scoped if has_cluster else fleet_wide
+        target.setdefault(_declaration_key(entry, with_cluster=has_cluster), entry)
+    declared = list(data.get("declared") or [])
+    already = {derive_finding_id(entry) for entry in declared}
+    kept: list[dict] = []
+    moved: list[dict] = []
+    for finding in data.get("findings") or []:
+        check = str(finding.get("check", ""))
+        match = None
+        if check in declarable:
+            match = scoped.get(_declaration_key(finding, with_cluster=True)) or fleet_wide.get(
+                _declaration_key(finding, with_cluster=False)
+            )
+        if (
+            match is not None
+            and check == DUAL_SHAPE_CHECK
+            and str(finding.get("severity", "")) != DUAL_SHAPE_POSTURE_SEVERITY
+        ):
+            # The slug names a posture at `major` and a fault at `minor`, and
+            # a declaration justifies only the posture.
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} at severity "
+                f"{finding.get('severity', '')!r} is the dangling-target fault (SOP §3.6(b)), "
+                f"which no declaration excuses; the min == max posture is severity "
+                f"{DUAL_SHAPE_POSTURE_SEVERITY!r}. {match.get('repo', '')}:{match.get('path', '')} "
+                "stands and the finding publishes."
+            )
+            match = None
+        if match is None or derive_finding_id(finding) in already:
+            kept.append(finding)
+            continue
+        declared.append(
+            {
+                "check": check,
+                "cluster": str(finding.get("cluster", "")),
+                "namespace": str(finding.get("namespace") or ""),
+                "object": str(finding.get("object", "")),
+                "title": str(finding.get("title", "")),
+                "declaration": {
+                    field: str(match.get(field, "")) for field in DECLARATION_FIELDS
+                },
+            }
+        )
+        moved.append(finding)
+        log(
+            f"DECLARED: {finding.get('id', '')} — {check} on "
+            f"{finding.get('cluster', '')}/{finding.get('namespace') or '(cluster)'}/"
+            f"{finding.get('object', '')} is declared at {match.get('repo', '')}:"
+            f"{match.get('path', '')}; listed under Declared intent, not as a finding."
+        )
+    if moved:
+        data["findings"] = kept
+        data["declared"] = declared
+    return moved
+
+
 class ContainmentError(ValidationError):
     """A remediation path that passed the string check still escapes the repo."""
 
@@ -3039,8 +3627,49 @@ def deferral_reason(target: str) -> str:
     )
 
 
+def declared_reason(target: str, entry: dict) -> str:
+    """Why a `/remediate` on a declared posture is refused, with the file that covers it.
+
+    A refusal, not a deferral: a declaration is an owner's standing choice,
+    not a gap the next run fills, so the request does not stay open against
+    it. The reason names the file, because removing the item there is what
+    brings the finding back, and a fresh request then opens it.
+    """
+    # The pointer goes through the same cell sanitiser the ledger table uses:
+    # `path` is a filename from the tree walk or the broker listing, neither
+    # of which refuses a backtick or a newline, and one backtick would close
+    # the code span and leave the rest of the comment, marker included, as
+    # live Markdown. `target` is an id the run already matched, not free text.
+    _, where = _declared_pointer(entry)
+    return (
+        f"`{target}` is a posture a repository declaration covers — "
+        f"`{where}` — so this "
+        "run lists it under _Declared intent_ rather than as a finding, and a "
+        "pull request for it would contradict the ledger. Remove the "
+        "declaration; the finding returns on the next run, and a new request "
+        "then opens it"
+    )
+
+
+def declared_by_id(declared: list[dict] | None) -> dict[str, dict]:
+    """Each `declared[]` entry under the id the finding it covers would carry.
+
+    The model's entries and the harness's moves alike: both carry the four
+    identity fields, so the id is derived the same way a finding's is — and
+    shortened the same way, because the id a finding carries, the ledger
+    prints and a requester copies into `/remediate` is `_shorten_id` of the
+    derived string whenever that overruns `MAX_FINDING_ID`, which a
+    63-character namespace does on its own. Keyed on the full id, such a
+    posture missed here and was refused as a typo.
+    """
+    return {_shorten_id(derive_finding_id(entry)): entry for entry in declared or []}
+
+
 def parse_remediate_commands(
-    comments: list[dict], findings: list[dict], withheld: list[dict] | None = None
+    comments: list[dict],
+    findings: list[dict],
+    withheld: list[dict] | None = None,
+    declared: list[dict] | None = None,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -3048,7 +3677,10 @@ def parse_remediate_commands(
     posted once per comment and marked with that comment's node id. An entry
     carrying `deferred: True` is not a refusal: it names a posture `finish`
     withheld this run, and `reply_to_refusals` answers it on the deferred
-    marker, which nothing reads as "answered", so the request stands.
+    marker, which nothing reads as "answered", so the request stands. A
+    target in `declared` — a posture a repository declaration covers, listed
+    on the ledger under Declared intent — is refused with that file named,
+    never as a typo.
 
     `accepted_by_comment` exists so a request that *worked* gets an answer too.
     A command that silently succeeds is indistinguishable from one that was
@@ -3074,6 +3706,12 @@ def parse_remediate_commands(
     # false reason — the requester would be told their id was a typo, and the
     # request would never be revisited when the posture returns.
     withheld_ids = {str(f.get("id", "")) for f in withheld or []}
+    # The postures a declaration covers, which `finish` lists under Declared
+    # intent instead of `findings`. A target among them is not a typo either:
+    # the id was right, and the answer names the file that covers it. Refused
+    # on the permanent marker, unlike a withheld one, because a declaration is
+    # an owner's standing choice rather than a gap the next run fills.
+    covered = declared_by_id(declared)
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -3173,6 +3811,9 @@ def parse_remediate_commands(
             target = raw.strip().strip("`")
             if target in withheld_ids:
                 deferred.append(deferral_reason(target))
+                continue
+            if target in covered:
+                reasons.append(declared_reason(target, covered[target]))
                 continue
             if not target:
                 # An empty target is not a wildcard. Reading it as one would
@@ -4293,7 +4934,9 @@ def _declared_pointer(entry: dict) -> tuple[str, str]:
     declaration = entry.get("declaration") or {}
     where = f"{declaration.get('repo', '')}:{declaration.get('path', '')}"
     namespace = str(entry.get("namespace") or "").strip()
-    obj = str(entry.get("object", ""))
+    # The moved entry keeps the finding's own spelling, whitespace included;
+    # the cell drops the whitespace so the table column does not carry it.
+    obj = str(entry.get("object", "")).strip()
     if namespace:
         obj = f"{namespace}/{obj}"
     # The pointer is the one cell a reader follows rather than reads, so it
@@ -5160,6 +5803,7 @@ def run_cmd(
     capture: bool = True,
     cwd: str | Path | None = None,
     stdin: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
@@ -5175,6 +5819,9 @@ def run_cmd(
     fd 0 for an argv that named `-` as an input file, so `--body-file -` carries
     a pull-request body across the container boundary that a
     `--body-file /some/path` could only cross while the two shared a volume.
+
+    `env` replaces the child's environment when given; None inherits this
+    process's, as `subprocess.run` does.
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
@@ -5187,6 +5834,7 @@ def run_cmd(
             capture_output=capture,
             cwd=str(target) if target is not None else None,
             input=stdin,
+            env=env,
         )
     except subprocess.CalledProcessError as exc:
         log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
@@ -6337,19 +6985,71 @@ def ack_remediate_requests(
         )
 
 
-def write_run_record(audit_id: str, repo: str, context: list[str]) -> str:
+def write_run_record(
+    audit_id: str,
+    repo: str,
+    context: list[str],
+    *,
+    searched: list[str] | None = None,
+    sources: list[dict] | None = None,
+) -> str:
     """Record which repositories this run's declared-intent step must search.
 
     Written by `start`, read by `finish`: the comparison is against what this
     run was told, not against the ConfigMap as it stands at `finish`, so a
     repository registered mid-run neither fails the run nor gets searched.
+
+    `searched` is the harness's own half of the answer — each repository
+    `start` read completely, as `owner/name@sha` — and `sources` says where
+    in each it looked. `finish` folds the first into the document; the second
+    is the record of the bound that was applied.
     """
     path = run_record_path_for(audit_id)
     Path(path).write_text(
-        json.dumps({"audit": audit_id, "repo": repo, "context_repos": list(context)}),
+        json.dumps(
+            {
+                "audit": audit_id,
+                "repo": repo,
+                "context_repos": list(context),
+                RUN_RECORD_SEARCHED_KEY: list(searched or []),
+                RUN_RECORD_SOURCES_KEY: list(sources or []),
+            }
+        ),
         encoding="utf-8",
     )
     return path
+
+
+def write_declarations(audit_id: str, repo: str, declarations: list[dict]) -> str:
+    """File what `start` found for `finish` to join, stamped with the run it belongs to."""
+    path = declarations_path_for(audit_id)
+    Path(path).write_text(
+        json.dumps({"audit": audit_id, "repo": repo, DECLARATIONS_KEY: list(declarations)}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
+    """The declarations `start` filed for this stream, or none.
+
+    The same reading as `read_run_record`: missing, unreadable, another
+    stream's or — when the caller knows which repository it is finishing —
+    another repository's file is no file, and no file joins nothing. A
+    document that reaches `finish` with no declarations file keeps every
+    posture it wrote, and the withhold decides what publishes.
+    """
+    try:
+        data = json.loads(Path(declarations_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or data.get("audit") != audit_id:
+        return []
+    recorded = data.get("repo")
+    if repo and (not isinstance(recorded, str) or recorded.strip().lower() != repo.strip().lower()):
+        return []
+    entries = data.get(DECLARATIONS_KEY)
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
 
 
 def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
@@ -6376,7 +7076,39 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
         return None
     if repo and recorded.strip().lower() != repo.strip().lower():
         return None
-    return {"repo": recorded, "context_repos": [str(slug) for slug in context]}
+    searched = data.get(RUN_RECORD_SEARCHED_KEY)
+    sources = data.get(RUN_RECORD_SOURCES_KEY)
+    return {
+        "repo": recorded,
+        "context_repos": [str(slug) for slug in context],
+        # Absent on a record an older `start` wrote, which is a run that
+        # searched nothing on the harness's behalf.
+        RUN_RECORD_SEARCHED_KEY: (
+            [str(entry) for entry in searched] if isinstance(searched, list) else []
+        ),
+        RUN_RECORD_SOURCES_KEY: (
+            [entry for entry in sources if isinstance(entry, dict)]
+            if isinstance(sources, list)
+            else []
+        ),
+    }
+
+
+def join_harness_declarations(
+    data: dict, record: dict | None, audit_id: str, repo: str | None
+) -> list[str]:
+    """Fold `start`'s search into the document and apply its declarations.
+
+    What `finish` — real and dry — and `remediate` share, in the one order
+    that is right: the record's `searched` joins the document's
+    `declared_intent_searched`, then every finding a filed declaration covers
+    moves to `declared[]`, each move logged. Returns the ids that moved so a
+    caller can refuse one by name. Run on a validated document, after
+    `load_findings`, so the ids are the derived ones.
+    """
+    fold_searched_record(data, record)
+    moved = apply_declarations(data, read_declarations(audit_id, repo=repo))
+    return [str(finding.get("id", "")) for finding in moved]
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -6540,8 +7272,8 @@ def _workspace_runner(
     return run_cmd(cmd, cwd=cwd, check=check)
 
 
-def context_repos() -> list[str]:
-    """The `context_repos` slugs, or an empty list when the key cannot be read.
+def context_repo_entries() -> list[dict]:
+    """The `context_repos` entries as `{repo, ref}`, or none when the key cannot be read.
 
     Unreadable is not fatal at `start`: the declared-intent step is a
     pre-report filter over an optional list, and a run that cannot read it
@@ -6552,7 +7284,14 @@ def context_repos() -> list[str]:
     import gitops_workspace
 
     try:
-        return list(gitops_workspace.get_context_github_repos())
+        return [
+            {
+                "repo": str(entry["repo"]),
+                "ref": entry.get("ref") or None,
+                REFUSED_REF_KEY: entry.get(REFUSED_REF_KEY),
+            }
+            for entry in gitops_workspace.get_context_github_repo_entries()
+        ]
     except Exception as exc:
         log(
             "WARNING: could not read context_repos from the gitops-state "
@@ -6562,14 +7301,356 @@ def context_repos() -> list[str]:
         return []
 
 
+def _searched_entry(slug: str, sha: object) -> str | None:
+    """`owner/name@sha` when `sha` has the shape the validator takes, else None."""
+    entry = f"{slug}@{str(sha or '').strip()}"
+    return entry if SEARCHED_REPO_RE.match(entry) else None
+
+
+def _head_sha(tree: Path) -> str:
+    """`git rev-parse HEAD` in a directory-mode checkout; empty when git cannot say."""
+    result = git(["rev-parse", "HEAD"], check=False, cwd=tree)
+    return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+class _Copy(NamedTuple):
+    """One repository copy: the tree to read, its commit, the scratch to remove, and what is missing.
+
+    `skipped` is every path the broker listed and did not send, each with
+    the broker's reason (a file over its per-file ceiling, a symlink).
+    Whether that makes the copy one the harness may call searched is decided
+    once the search bound is known: a skipped `crds.yaml` costs a note
+    nothing, a skipped note under the searched paths costs the repository its
+    entry, and a link there is not a note in either mode
+    (`BROKER_SKIP_NOT_A_FILE_REASONS`).
+    """
+
+    tree: Path
+    sha: str
+    into: Path
+    skipped: tuple[tuple[str, str], ...] = ()
+    # The bound a content-mode copy was fetched under, already read from the
+    # intent file; None when the tree is whole and the reader reads it itself.
+    prefixes: list[str] | None = None
+
+
+def _clone_step(
+    slug: str, ref: str | None, audit_id: str, into: Path, *, prefix: str | None, force: bool
+) -> dict | None:
+    """One `inspect_repository.py clone`, as its JSON reply, or None with a warning.
+
+    None whenever the copy is not one the harness may call searched: the
+    script exited non-zero, printed something other than its JSON line, or
+    was stopped by a bound (`stopped` set: the listing was cut and what lies
+    past the cut is unknown). The reply's `skipped` is normalised to
+    `(path, reason)` pairs for the paths the broker did not send, the reason
+    empty when it gave none; whether any of them mattered is the caller's
+    question.
+    """
+    cmd = [
+        sys.executable,
+        str(CLONE_SCRIPT),
+        "clone",
+        "--repo",
+        slug,
+        "--depth",
+        str(CLONE_DEPTH),
+        "--into",
+        str(into),
+        "--lease",
+        f"{audit_id}{CLONE_LEASE_SUFFIX}",
+    ]
+    if ref:
+        cmd += ["--ref", ref]
+    if prefix:
+        # One argument, not two: argparse reads `--prefix -notes` as the flag
+        # with no value and exits 2 before the broker, which accepts the name,
+        # is asked. A `ref` cannot begin with `-` (`_REF_SHAPE_RE`), so it
+        # needs no such care.
+        cmd.append(f"--prefix={prefix}")
+    if force:
+        cmd.append("--force")
+    env = {k: v for k, v in os.environ.items() if k not in BASE_BRANCH_OVERRIDE_VARS}
+    result = run_cmd(cmd, check=False, env=env)
+    if result.returncode != 0:
+        at = f" at {ref}" if ref else ""
+        log(f"WARNING: {slug}: clone{at} exited {result.returncode}; not searched.")
+        return None
+    lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
+    try:
+        reply = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict):
+        log(f"WARNING: {slug}: clone printed no JSON line; not searched.")
+        return None
+    skipped = tuple(
+        (str(entry.get("path")), str(entry.get("reason") or ""))
+        if isinstance(entry, dict)
+        else (str(entry), "")
+        for entry in reply.get("skipped") or []
+    )
+    if reply.get("stopped"):
+        log(
+            f"WARNING: {slug}: copy stopped at {reply.get('stopped')!r}; the rest "
+            "of the tree was never listed, so it is not searched."
+        )
+        return None
+    if reply.get("complete") is not True and not skipped:
+        log(f"WARNING: {slug}: copy reported incomplete without saying what is missing; not searched.")
+        return None
+    reply["skipped"] = skipped
+    return reply
+
+
+def _clone_for_search(slug: str, ref: str | None, audit_id: str, into: Path) -> _Copy | None:
+    """Copy what the search reads of `slug` into `into`, or None with a warning.
+
+    In content mode the copy is bounded to what the search will read, because
+    the script's default caps count every file in the repository and a GitOps
+    repository that vendors charts or renders manifests would be stopped by
+    files the search never opens: `.kube-agents/` is fetched first, for the
+    intent file, then each path it names (`--prefix`, into the same tree), and
+    only a repository with no usable intent file is copied whole, under those
+    caps. Every step is a clone of its own, so each must report the commit the
+    first did; a branch that moved between them would give a tree from two
+    commits and a sha for neither, and the repository is not searched that
+    run, its postures published as a coverage gap until the next one. One
+    broker handle per repository, pinning one base sha for the intent file
+    and every note the way the in-process `fetch`, `list` and `grep`
+    subcommands do, would remove both the repeated clone and the moved-sha
+    case; that is a follow-up, and the per-step clone stands until it lands. In
+    directory mode the script ignores `--prefix` and `--into`, makes one full
+    leased checkout and names it, so the first step is the whole copy and the
+    tree to read and the scratch to remove are two different paths.
+
+    None whenever the copy is not one the harness may call searched, with the
+    reason on stderr. A copy the broker merely skipped files from is returned
+    with the skipped paths, because whether any of them was a note under the
+    searched paths is the caller's question.
+    """
+    first = _clone_step(slug, ref, audit_id, into, prefix=INTENT_DIR, force=False)
+    if first is None:
+        return None
+    if first.get("mode") == CLONE_MODE_DIRECTORY:
+        tree = Path(str(first.get("workspace") or ""))
+        sha = _head_sha(tree) if first.get("workspace") else ""
+    else:
+        tree = Path(str(first.get("into") or into))
+        sha = str(first.get("sha") or "")
+    if not tree.is_dir():
+        log(f"WARNING: {slug}: clone named {tree}, which is not a directory; not searched.")
+        return None
+    if _searched_entry(slug, sha) is None:
+        log(f"WARNING: {slug}: no commit sha for the copy; not searched.")
+        return None
+    if first.get("mode") == CLONE_MODE_DIRECTORY:
+        return _Copy(tree, sha, into)
+    skipped: dict[str, str] = dict(first["skipped"])
+    if INTENT_FILE in skipped:
+        log(
+            f"WARNING: {slug}: the broker did not send {INTENT_FILE}, so the "
+            "search bound is unknown and the whole tree is searched."
+        )
+        prefixes: list[str] = []
+    else:
+        prefixes = read_intent_paths(tree, slug)
+
+    def fetch(prefix: str | None) -> bool:
+        step = _clone_step(slug, ref, audit_id, into, prefix=prefix, force=True)
+        if step is None:
+            return False
+        step_sha = str(step.get("sha") or "")
+        if step_sha != sha:
+            log(
+                f"WARNING: {slug}: the copy of {prefix or 'the whole tree'} is at "
+                f"{step_sha[:MIN_SHA_CHARS] or 'no sha'}, not {sha[:MIN_SHA_CHARS]}: the "
+                "repository moved between copies; not searched."
+            )
+            return False
+        skipped.update(step["skipped"])
+        return True
+
+    for prefix in prefixes or [None]:
+        if not fetch(prefix):
+            return None
+    # A named path the copy has nothing under, and the broker skipped nothing
+    # under, names nothing at this commit: the bound is unusable, as a
+    # misspelt one is, and the whole tree is fetched under the caps the bound
+    # existed to avoid — visible on stderr rather than credited as a search.
+    unmatched = _unmatched_prefixes(tree, prefixes, tuple(skipped))
+    if unmatched:
+        _whole_tree_for_unmatched(slug, unmatched)
+        prefixes = []
+        if not fetch(None):
+            return None
+    return _Copy(tree, sha, into, tuple(skipped.items()), prefixes)
+
+
+def discover_declarations(
+    audit_id: str, repo: str, root: Path, context: list[dict]
+) -> tuple[list[dict], list[str], list[dict]]:
+    """Search every repository the step owes and return what the run record needs.
+
+    `(declarations, searched, sources)`: the entries `finish` joins, each
+    repository read completely as `owner/name@sha`, and per searched
+    repository the `{repo, ref, paths}` the read was bounded by. The GitOps
+    repository is read in the tree `start` just reset when that tree is a
+    checkout, and through `inspect_repository.py clone` like a context
+    repository when the workspace is a content-mode scratch directory.
+
+    Nothing here raises: a repository whose copy or read fails is left out of
+    `searched` with a warning, and the withhold in `finish` does the rest. A
+    stream with no declared-intent step searches nothing.
+    """
+    declarable = audit_declarable_checks(audit_id)
+    if not declarable:
+        return [], [], []
+    try:
+        import yaml  # noqa: F401 — availability check; the readers import it again
+    except ImportError as exc:
+        log(
+            f"WARNING: PyYAML is not importable ({exc}); the declared-intent "
+            "search cannot read frontmatter, so no repository is searched."
+        )
+        return [], [], []
+    refs = {entry["repo"].lower(): entry.get("ref") for entry in context}
+    refused = {entry["repo"].lower(): entry.get(REFUSED_REF_KEY) for entry in context}
+    declarations: list[dict] = []
+    searched: list[str] = []
+    sources: list[dict] = []
+    for slug in declared_intent_repos(repo, [entry["repo"] for entry in context]):
+        is_gitops = slug.lower() == repo.strip().lower()
+        # The GitOps repository is read from the audit's own tree; a `ref` on
+        # a context entry naming it is not honoured, because the run reads the
+        # branch it will publish against.
+        ref = None if is_gitops else refs.get(slug.lower())
+        # A pin that is not a git branch name is not replaced by the default
+        # branch: the pin exists so a curated branch is what silences a
+        # posture, and the default branch is where anyone with write access
+        # lands a note. The repository is skipped, stays out of `searched`,
+        # and the ledger names it as not searched until the entry is fixed.
+        if not is_gitops and refused.get(slug.lower()) is not None:
+            log(
+                f"WARNING: {slug}: ref {refused[slug.lower()]!r} is not a git branch "
+                "name; not searched, and not read at its default branch instead. "
+                "Correct the ref on the context_repos entry."
+            )
+            continue
+        into: Path | None = None
+        skipped: tuple[tuple[str, str], ...] = ()
+        bound: list[str] | None = None
+        try:
+            if is_gitops and not content_mode():
+                tree, sha = root, _head_sha(root)
+                if _searched_entry(slug, sha) is None:
+                    log(f"WARNING: {slug}: no commit sha for the checkout; not searched.")
+                    continue
+            else:
+                into = Path(tempfile.mkdtemp(prefix=CLONE_TMP_PREFIX, dir=SCRATCH_DIR))
+                copied = _clone_for_search(slug, ref, audit_id, into)
+                if copied is None:
+                    continue
+                tree, sha, skipped, bound = copied.tree, copied.sha, copied.skipped, copied.prefixes
+            found, prefixes, unread = search_tree(
+                tree, repo=slug, declarable=declarable, prefixes=bound
+            )
+            # What the read could not reach, judged against the bound that
+            # was applied. A note under the searched paths the harness could
+            # not read locally, or a directory there it could not list, is a
+            # declaration it may have missed; the repository is not searched.
+            if unread:
+                log(
+                    f"WARNING: {slug}: {len(unread)} path(s) under the searched paths "
+                    f"could not be read ({', '.join(unread[:MAX_HINT_IDS])}); not searched."
+                )
+                continue
+            # The copy's gaps, the same way: a skipped file that is not a note
+            # under the searched paths could not have carried a declaration,
+            # and a skipped note could have. A link the broker would not
+            # follow is not a note, as the directory-mode walk has it.
+            missed = [
+                path
+                for path, reason in skipped
+                if path.endswith(NOTE_SUFFIX)
+                and reason not in BROKER_SKIP_NOT_A_FILE_REASONS
+                and _under_prefixes(path, prefixes)
+            ]
+            if missed:
+                log(
+                    f"WARNING: {slug}: the broker did not send {len(missed)} note(s) "
+                    f"under the searched paths ({', '.join(missed[:MAX_HINT_IDS])}); "
+                    "not searched."
+                )
+                continue
+            if skipped:
+                log(
+                    f"{slug}: {len(skipped)} file(s) the broker did not send lie outside "
+                    "the searched notes; the search counts as complete."
+                )
+        except Exception as exc:  # noqa: BLE001 — one repository must not end the run
+            log(f"WARNING: {slug}: declared-intent search failed ({exc}); not searched.")
+            continue
+        finally:
+            # Removed on every path, including the directory-mode one where it
+            # stayed empty; the leased checkout that mode reads is left where
+            # the SOP has the model leave it.
+            if into is not None:
+                shutil.rmtree(into, ignore_errors=True)
+        declarations.extend(found)
+        searched.append(_searched_entry(slug, sha))
+        sources.append({"repo": slug, "ref": ref, "paths": prefixes})
+        log(
+            f"Declared intent: searched {slug}@{sha[:MIN_SHA_CHARS]} "
+            f"({'whole tree' if not prefixes else ', '.join(prefixes)}): "
+            f"{len(found)} declaration(s)."
+        )
+    return declarations, searched, sources
+
+
+def unsearched_intent_entries(
+    audit_id: str, repo: str, context: list[dict], searched: list[str]
+) -> list[dict]:
+    """`[{repo, ref}]` for each repository the step owes that `searched` does not credit.
+
+    The list the worker has to copy itself, each with the `ref` the harness
+    was configured to read (None for the GitOps repository, whose pin is
+    never honoured, and for an entry without one): the only other place the
+    pin is printed lists repositories that were searched, and a worker that
+    cannot see it clones HEAD and records a branch the administrator did
+    not ask to be read. An entry whose pin was refused carries it under
+    `refused_ref` beside a null `ref`: that repository is not the worker's to
+    copy at HEAD either, and the SOP says so. Empty on a stream with no
+    declared-intent step, which owes no search.
+    """
+    if not audit_declarable_checks(audit_id):
+        return []
+    refs = {entry["repo"].lower(): entry.get("ref") for entry in context}
+    refused = {entry["repo"].lower(): entry.get(REFUSED_REF_KEY) for entry in context}
+    have = {entry.partition("@")[0].strip().lower() for entry in searched}
+    out: list[dict] = []
+    for slug in declared_intent_repos(repo, [entry["repo"] for entry in context]):
+        if slug.lower() in have:
+            continue
+        is_gitops = slug.lower() == repo.strip().lower()
+        item = {"repo": slug, "ref": None if is_gitops else refs.get(slug.lower())}
+        if not is_gitops and refused.get(slug.lower()) is not None:
+            item[REFUSED_REF_KEY] = refused[slug.lower()]
+        out.append(item)
+    return out
+
+
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
-    # `finish` to measure today's document against.
+    # `finish` to measure today's document against. Yesterday's declarations
+    # go with it: a note a reviewer removed since must not go on silencing the
+    # posture it covered.
     Path(run_record_path_for(audit_id)).unlink(missing_ok=True)
+    Path(declarations_path_for(audit_id)).unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
     repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
@@ -6614,8 +7695,19 @@ def handle_start(args: argparse.Namespace) -> None:
     # the worker was handed; with the unlink at the top, a `start` that did
     # not get this far leaves no record at all, and `finish` withholds rather
     # than measuring the document against yesterday's list.
-    context = context_repos()
-    write_run_record(audit_id, repo, context)
+    context_entries = context_repo_entries()
+    context = [entry["repo"] for entry in context_entries]
+    # The harness's half of the declared-intent step, before the record is
+    # written so the record carries what it read: every repository the step
+    # owes, each searched for `declares:` frontmatter within the bound its
+    # `.kube-agents/intent.yaml` names, and each one read completely recorded
+    # as `owner/name@sha`. Nothing in it raises; a repository it could not
+    # read is left out and `finish` withholds that repository's postures.
+    declarations, searched, sources = discover_declarations(
+        audit_id, repo, root, context_entries
+    )
+    declarations_path = write_declarations(audit_id, repo, declarations)
+    write_run_record(audit_id, repo, context, searched=searched, sources=sources)
 
     print(
         json.dumps(
@@ -6665,6 +7757,29 @@ def handle_start(args: argparse.Namespace) -> None:
                 # derive it, and so the list it searched is the list the
                 # harness recorded.
                 DECLARED_INTENT_REPOS_KEY: declared_intent_repos(repo, context),
+                # The harness's own search: the repositories it read
+                # completely, as `finish` will credit them; where in each it
+                # looked (`paths` is the bound applied, `[]` for the whole
+                # tree, `ref` the branch or null); and the file holding what
+                # it found, which `finish` joins against the document. A slug
+                # in `declared_intent_repos` and not here is one the harness
+                # could not read — stderr says why — and the postures it
+                # covers are withheld unless the document records that search
+                # itself.
+                DECLARED_INTENT_SEARCHED_KEY: searched,
+                DECLARED_INTENT_SOURCES_KEY: sources,
+                # The complement, as `{repo, ref}`: what the worker copies
+                # itself, at the branch the entry pins. Printed because the
+                # pin appears nowhere else the worker can read — `context_repos`
+                # above is slugs, `declared_intent_sources` lists only what was
+                # searched — and a worker that cannot see it clones HEAD and
+                # records a branch the administrator did not ask to be read.
+                # One whose pin was refused carries `refused_ref` instead, and
+                # is not copied at all.
+                DECLARED_INTENT_UNSEARCHED_KEY: unsearched_intent_entries(
+                    audit_id, repo, context_entries, searched
+                ),
+                DECLARATIONS_PATH_KEY: declarations_path,
                 # The roster, handed over rather than left to be discovered.
                 #
                 # It is in the SOP, and the SOP is required reading, but "the
@@ -7115,12 +8230,18 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # back for want of a declared-intent search, and a pull request for one of
     # them would contradict it.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
-    withheld_ids = set(
-        finding_ids(
-            withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
-        )
-    )
+    record = read_run_record(audit_id, repo=repo_hint)
+    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint))
+    withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
+    covered = [fid for fid in args.finding if fid in declared_ids]
+    if covered:
+        raise ValidationError(
+            f"--finding: {', '.join(covered)} declared — a repository declaration "
+            "covers this posture, so finish lists it under Declared intent rather "
+            "than as a finding, and a pull request for it would contradict the "
+            "ledger. Remove the declaration and run start and finish again, then ask"
+        )
     held = [fid for fid in args.finding if fid in withheld_ids]
     if held:
         raise ValidationError(
@@ -7306,7 +8427,13 @@ def handle_finish(args: argparse.Namespace) -> None:
     # holds the record to it; a dry run resolves nothing and compares only
     # when `--repo` was given.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
-    withheld = withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
+    record = read_run_record(audit_id, repo=repo_hint)
+    # The harness's search first, then the withhold against the record. The
+    # order matters: a posture a declaration covers moves to `declared[]`,
+    # where it cites the file it was read from, and only what is left is
+    # measured against the search record.
+    join_harness_declarations(data, record, audit_id, repo_hint)
+    withheld = withhold_unsearched_postures(data, record)
     if withheld:
         log(
             f"WITHHELD: {len(withheld)} posture finding(s) with no complete "
@@ -7407,11 +8534,18 @@ def handle_finish(args: argparse.Namespace) -> None:
             # it.
             # A request naming a posture this run withheld is not answered
             # with "no longer reproduces": the harness is holding it, not the
-            # fleet, so it is deferred on its own marker and stays open.
+            # fleet, so it is deferred on its own marker and stays open. One
+            # naming a posture a declaration covers is refused with the file
+            # named, as on the findings branch: the posture reproduces and is
+            # listed under Declared intent. The hold is checked first because
+            # its marker is not an answer and the refusal's is.
             withheld_ids = set(finding_ids(withheld))
+            covered_by_id = declared_by_id(declared)
             clean_comments = fetch_issue_comments(repo, existing_issue)
             for request in unanswered_remediate_comments(clean_comments):
-                held = [t for t in request.get("targets") or [] if t in withheld_ids]
+                targets = request.get("targets") or []
+                held = [t for t in targets if t in withheld_ids]
+                covered = [t for t in targets if t in covered_by_id]
                 if held:
                     reply_to_deferrals(
                         repo,
@@ -7421,6 +8555,23 @@ def handle_finish(args: argparse.Namespace) -> None:
                                 "comment_id": request.get("comment_id", ""),
                                 "author": request.get("author", "someone"),
                                 "reasons": [deferral_reason(t) for t in held],
+                            }
+                        ],
+                        clean_comments,
+                        now,
+                    )
+                    continue
+                if covered:
+                    reply_to_refusals(
+                        repo,
+                        existing_issue,
+                        [
+                            {
+                                "comment_id": request.get("comment_id", ""),
+                                "author": request.get("author", "someone"),
+                                "reasons": [
+                                    declared_reason(t, covered_by_id[t]) for t in covered
+                                ],
                             }
                         ],
                         clean_comments,
@@ -7601,7 +8752,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     }
 
     ledger_comments = fetch_issue_comments(repo, existing_issue) if existing_issue else []
-    requests = parse_remediate_commands(ledger_comments, findings, withheld)
+    requests = parse_remediate_commands(ledger_comments, findings, withheld, declared)
     plan = promotion_candidates(
         findings,
         pr_by_finding,

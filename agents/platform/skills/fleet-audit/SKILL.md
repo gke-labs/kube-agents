@@ -154,6 +154,10 @@ branch. It prints exactly one JSON line:
   ],
   "context_repos": ["acme/terraform-live"],
   "declared_intent_repos": ["acme/fleet", "acme/terraform-live"],
+  "declared_intent_searched": [],
+  "declared_intent_sources": [],
+  "declared_intent_unsearched": [],
+  "declarations_path": "/opt/data/scratch/declarations_compliance-audit.json",
   "sop": "governance/compliance_audit_sop.md",
   "checks": ["privileged-container", "host-namespace", "…"],
   "checks_contract": "Run every check above against every cluster you can read. …"
@@ -208,6 +212,32 @@ findings document (`/opt/data/scratch/run_<audit-id>.json`), before it prints, a
 the document's `declared_intent_searched` against that record rather than against the ConfigMap as
 it stands at finish time. Every stream prints it; only a stream with a declared-intent step is held
 to it.
+
+`declared_intent_searched`, `declared_intent_sources` and `declarations_path` are the harness's own
+half of that step, already done by the time `start` prints. On a stream with a declared-intent step,
+`start` reads every repository in `declared_intent_repos` it can — each `context_repos` entry
+through `inspect_repository.py clone` at the entry's `ref` when it has one and at its own default
+branch otherwise (the copy runs without `GITOPS_BASE_BRANCH` and `CREDENTIAL_PROXY_BASE_BRANCH`,
+which name the GitOps repository's branch and which a directory-mode clone with no `--ref` would
+otherwise check out), the GitOps repository
+from the clone it just reset or through the same script in content mode — for `declares:`
+frontmatter in OKF notes, within the paths each repository's `.kube-agents/intent.yaml` names
+(`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree
+was read). In content mode the copy is bounded the same way: `.kube-agents/` first, then only the
+named paths, so the sibling script's file and byte caps count notes rather than manifests; a
+repository with no usable intent file (one naming a path the broker refuses included), or whose
+file names a path with nothing behind it, is copied whole under those caps. `start` files what it found
+at `declarations_path` and lists each repository it read completely — every note under the
+searched paths arrived and was read; one the broker withheld or the harness could not decode costs
+the repository its entry, a symlink there being no note in either mode — as `owner/name@sha`. `finish` unions that list into the document's and
+moves every finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
+from `declared_intent_searched` is one the harness could not read; `declared_intent_unsearched`
+lists each as `{repo, ref}`, stderr says why, and the SOP says what the worker does about it — its
+own copy at that `ref`. An entry whose `ref` failed the branch-name check carries the value under
+`refused_ref` instead of a `ref`: the harness skipped that repository rather than reading its
+default branch in the pin's place, the worker copies nothing either, and the ledger names it as
+not searched until the entry is corrected. On every other stream the three lists are empty and the
+file at `declarations_path` holds none.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 
@@ -629,9 +659,21 @@ A finding says the fleet is wrong; a declared posture says the fleet is what som
 list exists because the audits judge live state against generic practice, and a platform team that
 pinned a replica count in Terraform on purpose was getting the same `no-hpa` finding every morning
 until someone suppressed it by hand. The SOP's declared-intent step (`obtainability_audit_sop.md`
-§4a, the pilot) searches the GitOps clone's `provisioning/` and `knowledge/` directories and every
-repository in `context_repos` for a declaration that names the same object and pins the flagged
-property, and moves a match here instead of into `findings`.
+§4a, the pilot) has two halves. The harness reads every repository in `declared_intent_repos` for
+OKF notes whose frontmatter carries a `declares:` list — items of `{check, namespace, object}` plus
+an optional `cluster`, `object` as `Kind/name` — within the paths each repository's
+`.kube-agents/intent.yaml` names, and `finish` moves every finding one covers here itself: a
+case-blind lookup on `(check, cluster, namespace, object)`, then on the fleet-wide
+`(check, namespace, object)`, compared as the finding id is (`deployment/api` joins `Deployment/api`),
+the finding's `cluster` and `title` kept and the note's `repo`, `path` and title as the declaration.
+For `hpa-cannot-scale`, the one slug that names both a posture and a fault, the join moves only the
+`min == max` shape, read off the severity the SOP fixes for it (`major`); a declaration matching the
+`minor` dangling-target fault is reported on stderr and not applied.
+The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
+machine-readable form yet; a match there is moved here by the worker with the lines that pin the
+property as `excerpt`. A posture a `declares:` note covers is written to `findings` like any other
+and the join moves it; a candidate the worker leaves out because it found the note itself gives the
+join nothing to move, and the declaration never reaches the ledger.
 
 What the shape enforces:
 
@@ -665,11 +707,17 @@ What `finish` does with it:
   time. Extra repositories are allowed. The sha is checked for shape only (7 to 40 lowercase hex
   characters), so the record is as forgeable as a padded `checks_run` and carries less; it makes a
   skipped step visible, not impossible.
+- **The harness's own search counts first.** `start` records each repository it read completely
+  in the run record, and `finish` unions that list into the document's before it measures, so a
+  repository the harness read needs no entry from the worker and a document with no key at all
+  is complete when the harness read every repository. What the worker owes is the rest: the
+  repositories `start` listed under `declared_intent_repos` and not under
+  `declared_intent_searched`.
 - **It is owed whenever a declarable check ran.** Keyed on `checks_run`, not on the postures in
   `findings`, for the reason above: a candidate left out without a search reads exactly like one a
   declaration covered. A run on which none of the four checks ran anywhere owes nothing.
-- **Anything less is no search, and the postures are withheld.** No key, a list missing a
-  repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
+- **Anything less is no search, and the postures are withheld.** A union of the worker's list and
+  `start`'s that misses a repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
   declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
   shares its slug with the `min == max` posture, and adds one `coverage_gaps` sentence naming each
   withheld entry and the repositories not searched. The faults publish; `declared[]` entries publish.
@@ -681,15 +729,18 @@ What `finish` does with it:
 - **A complete record renders.** One line under Scope, `Declared-intent search: owner/name@sha, …`,
   so a reader can see what was read.
 
-Where the sha comes from is the SOP's §4a: in content mode `list`, `grep` and `fetch` print it for
-the GitOps repository and `inspect_repository.py clone` and `open` print it for a context copy; in
-directory mode it is `git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that
-`clone` named for the context copy.
+Where the sha comes from is the SOP's §4a, and it is the same for the harness and the worker: in
+content mode `list`, `grep` and `fetch` print it for the GitOps repository and
+`inspect_repository.py clone` and `open` print it for a context copy; in directory mode it is
+`git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that `clone` named for
+the context copy.
 
 The withhold binds the direct-ask path too: `remediate --finding <id>` applies it against the same
 record and refuses a withheld id by name, because a pull request for a posture the ledger says was
-held back would contradict the ledger. A `/remediate` comment naming a withheld posture is deferred,
-not refused — see the answers list under [Remediation pull requests](#remediation-pull-requests).
+held back would contradict the ledger. It applies the harness's declarations the same way, and
+refuses an id a declaration covers for the same reason. A `/remediate` comment naming a withheld
+posture is deferred, not refused, and one naming a declared posture is refused with the declaring
+file named — see the answers list under [Remediation pull requests](#remediation-pull-requests).
 
 ## Evidence rules
 
@@ -801,7 +852,11 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   failed and the next run will retry. "3 requests processed" is indistinguishable from "3 requests
   silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
-  finding that is not in the current document, or one naming a non-`manifest` finding.
+  finding that is not in the current document, one naming a non-`manifest` finding, or one naming
+  a posture a repository declaration covers, the model's entry or the harness's: the reply names
+  the declaring `repo:path`, on the findings branch and the clean branch alike, since neither
+  "typo" nor "no longer reproduces" is true of it. Removing the declaration brings the finding
+  back, and a new request then opens it.
 - **Deferred**, when the target is a posture this run withheld for want of a declared-intent search
   ([`declared_intent_searched`](#declared_intent_searched)) — on the findings branch and on the clean
   branch alike, since "no longer reproduces" would be false there. One reply says the request is on

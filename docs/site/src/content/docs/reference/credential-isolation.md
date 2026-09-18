@@ -40,7 +40,7 @@ flowchart TB
         RUNTIME["Credential runtime<br/>real CLIs, Slack/Chat clients, Minty client<br/>secret env + projected KSA token"]
     end
     AGENT -->|ssh| SHELL
-    SHELL -->|"HTTP (structured argv) + bearer token"| ENVOY
+    SHELL -->|"HTTP (structured argv, relayed GETs) + bearer token"| ENVOY
     AGENT -->|"chat relay + bearer token"| ENVOY
     ENVOY -->|private Unix socket| RUNTIME
 ```
@@ -105,6 +105,7 @@ Pod-wide `automountServiceAccountToken` is `false` everywhere. The broker's own 
 ## Request paths
 
 - **CLI commands** — only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy rejects known credential-disclosure, credential-replacement, and self-modification operations, and the GitHub write path (see below); interactive TTY programs, unbounded streaming, sandbox-only file paths, and background processes fail closed.
+- **Cloud API reads** — `GET /v1/gcp/<host>/<path>` relays one Google REST read named in `api_policy.API_READ_ROUTES` (Cloud Monitoring and Managed Prometheus reads today) on the broker's identity, with the caller's headers dropped and the credential-substituting query keys stripped; another host, a write, a sibling path or a token endpoint is refused with a `gcp.api.*` rule. `credential_proxy_client.ApiSession` is the client. See [`designs/gcp-api-relay.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gcp-api-relay.md).
 - **Chat** — Slack and Google Chat adapters send credential-free payloads to Envoy; the credential runtime owns the platform tokens and performs the external API calls, enforcing user allowlists and payload limits.
 - **PlatformAgent API** — the Service targets port 8643 on `agent-api-auth` in the gateway Pod, which validates the external bearer key and forwards to the agent API on loopback (port 8642) with a non-secret sentinel. The real key never reaches `platform-agent`.
 - **GitHub** — the broker obtains a Google OIDC identity token and calls [Minty](/kube-agents/deploy/token-minter/), which brokers a repository-scoped GitHub App installation token with a maximum one-hour lifetime. The App's private key stays in Cloud KMS.

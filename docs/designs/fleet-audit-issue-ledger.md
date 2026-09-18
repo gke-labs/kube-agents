@@ -410,6 +410,16 @@ record — every finding whose check is declarable is withheld and the run goes 
 reads: `list`, `grep` and `fetch` print the broker's tree sha, and in content mode
 `inspect_repository.py clone` and `open` print it for a context copy (#1477).
 
+`start` also performs the search itself: it reads each repository in that set for `declares:`
+frontmatter within the paths its `.kube-agents/intent.yaml` names — in content mode copying the
+intent directory first and then only those paths, so the copy's caps count notes rather than
+manifests — files the result in `declarations_<audit-id>.json`, records each repository it read
+completely (every note under the searched paths arrived and was read) under `searched` in the run
+record, and `finish` unions that list into the document and moves each covered finding to
+`declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
+severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
+stays a finding.
+
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
 `git config --get remote.origin.url` to answer. The harness therefore clones lazily on the way in,
@@ -797,9 +807,11 @@ cluster's `checks_not_applicable`, which is what keeps a check the cluster's sha
 reading as a check nobody ran.
 
 The fourth is fleet-wide and comes from `withhold_unsearched_postures`, which `finish` runs once,
-right after the document loads and before the dry-run split. When any cluster's `checks_run` names a
-declarable check and the document's `declared_intent_searched` does not cover every repository in
-`start`'s run record — or `start` left none — it takes every finding whose check is declarable out
+after the document loads and `start`'s search record and declarations have been folded into it
+(the `start` section above), and before the dry-run split. When any cluster's `checks_run` names a
+declarable check and the document's `declared_intent_searched` — the worker's list with the run
+record's `searched` unioned in — does not cover every repository in `start`'s run record, or
+`start` left none, it takes every finding whose check is declarable out
 of `findings`, the dangling-target `hpa-cannot-scale` fault included (the validator cannot tell it
 from the `min == max` posture), and files them on the document under `postures_withheld`. Every
 caller of `coverage_gaps` then derives the same sentence — each withheld entry, the repositories not

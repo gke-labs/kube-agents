@@ -12,6 +12,7 @@ commands that do touch the network are driven through a single recorded seam
 
 import contextlib
 import copy
+import importlib.util
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +41,7 @@ import content_workspace  # noqa: E402
 import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import workspace_paths  # noqa: E402
 
 
 @dataclass
@@ -423,6 +426,7 @@ class Recorder:
         # what a caller asserts about a body should not change with how the
         # body reaches `gh`. See `bodies_for` for why the seam exists at all.
         self.bodies: list[str | None] = []
+        self.envs: list[dict | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # `git diff --cached --quiet` is the harness's commit classifier: rc 0
@@ -436,9 +440,11 @@ class Recorder:
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None, env=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
+        # The environment the call named, None when it inherited the process's.
+        self.envs.append(env)
         self.bodies.append(self._read_body(cmd, stdin))
         joined = " ".join(cmd)
         for key, code in self.failures.items():
@@ -661,6 +667,11 @@ class HarnessTestCase(BaseTestCase):
         context = patch.object(gitops_workspace, "get_context_github_repos", lambda: [])
         context.start()
         self.addCleanup(context.stop)
+        entries = patch.object(
+            gitops_workspace, "get_context_github_repo_entries", lambda: []
+        )
+        entries.start()
+        self.addCleanup(entries.stop)
         # Most tests describe a pod that has audited before, so the clone
         # already exists and `ensure_workspace` takes the fetch path. Tests
         # about the first run call `self.unclone()` to remove it.
@@ -3625,6 +3636,10 @@ class TestStart(HarnessTestCase):
             "run_record_path_for",
             lambda audit_id: str(self.tmp_path / f"run_{audit_id}.json"),
         )
+        self.patch_attr(
+            "declarations_path_for",
+            lambda audit_id: str(self.tmp_path / f"declarations_{audit_id}.json"),
+        )
 
     def test_emits_one_json_line(self):
         self.harness.replies = {"issue list": self.issue_list()}
@@ -3648,6 +3663,15 @@ class TestStart(HarnessTestCase):
                 "carried": [],
                 "context_repos": [],
                 "declared_intent_repos": ["acme/fleet"],
+                # A stream with no declared-intent step searches nothing on
+                # the harness's behalf, and says so with empty lists rather
+                # than by leaving the keys out.
+                "declared_intent_searched": [],
+                "declared_intent_sources": [],
+                "declared_intent_unsearched": [],
+                "declarations_path": str(
+                    self.tmp_path / "declarations_compliance-audit.json"
+                ),
                 "sop": "governance/compliance_audit_sop.md",
                 "checks": list(audit_report.audit_checks(AUDIT)),
             },
@@ -3742,8 +3766,8 @@ class TestStart(HarnessTestCase):
         self.harness.replies = {"issue list": "[]"}
         with patch.object(
             gitops_workspace,
-            "get_context_github_repos",
-            lambda: ["acme/terraform-live", "acme/fleet"],
+            "get_context_github_repo_entries",
+            lambda: context_entries("acme/terraform-live", "acme/fleet"),
         ):
             self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         payload = json.loads(self.out)
@@ -3761,7 +3785,7 @@ class TestStart(HarnessTestCase):
         def unreadable():
             raise RuntimeError("kubectl failed: Forbidden")
 
-        with patch.object(gitops_workspace, "get_context_github_repos", unreadable):
+        with patch.object(gitops_workspace, "get_context_github_repo_entries", unreadable):
             self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(self.out)["context_repos"], [])
         self.assertIn("could not read context_repos", self.err)
@@ -4028,6 +4052,19 @@ SEARCH_SHA = "0123456789abcdef0123456789abcdef01234567"
 def searched(*slugs, sha=SEARCH_SHA):
     """A `declared_intent_searched` list: each slug read at one sha."""
     return [f"{slug}@{sha}" for slug in slugs]
+
+
+def context_entries(*slugs, ref=None, refused_ref=None):
+    """What `get_context_github_repo_entries` returns for `slugs`, each at `ref`.
+
+    `refused_ref` is what the entry carries instead when its pin failed the
+    branch-name check: `ref` is then None and the value rides beside it.
+    """
+    entries = [{"repo": slug, "ref": ref} for slug in slugs]
+    if refused_ref is not None:
+        for entry in entries:
+            entry["refused_ref"] = refused_ref
+    return entries
 
 
 def searched_doc(findings=None, repos=("acme/fleet",), **kwargs):
@@ -4840,24 +4877,32 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         real = audit_report.write_run_record
         printed_before_write = []
 
-        def spy(audit_id, repo, context):
+        def spy(audit_id, repo, context, **kwargs):
             # A crash between the write and the print leaves a record; one
             # between the print and a write would leave none, and the run
             # would go on to withhold. Only the first order is acceptable.
             printed_before_write.append(sys.stdout.getvalue())
-            return real(audit_id, repo, context)
+            return real(audit_id, repo, context, **kwargs)
 
         self.patch_attr("write_run_record", spy)
         with patch.object(
             gitops_workspace,
-            "get_context_github_repos",
-            lambda: ["acme/terraform-live", "acme/fleet"],
+            "get_context_github_repo_entries",
+            lambda: context_entries("acme/terraform-live", "acme/fleet"),
         ):
             self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(printed_before_write, [""])
+        # The recorder answers `git rev-parse HEAD` and the context clone with
+        # nothing, so the harness's own search read neither repository and
+        # the record says so: `TestDeclaredIntentDiscovery` is where it reads.
         self.assertEqual(
             audit_report.read_run_record(DECLARING_AUDIT),
-            {"repo": "acme/fleet", "context_repos": ["acme/terraform-live", "acme/fleet"]},
+            {
+                "repo": "acme/fleet",
+                "context_repos": ["acme/terraform-live", "acme/fleet"],
+                "searched": [],
+                "sources": [],
+            },
         )
         payload = json.loads(self.out)
         self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
@@ -5041,8 +5086,1555 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(
             audit_report.read_run_record(DECLARING_AUDIT),
-            {"repo": "acme/fleet", "context_repos": []},
+            {"repo": "acme/fleet", "context_repos": [], "searched": [], "sources": []},
         )
+
+
+# --------------------------------------------------------------------------- #
+# Harness-side declaration discovery and matching (the obtainability SOP's §4a)
+# --------------------------------------------------------------------------- #
+
+
+def note(declares=None, *, type_="observation", title="checkout-gateway runs unbudgeted", body="", raw=None):
+    """One OKF note: frontmatter carrying `type` and, when given, `declares`."""
+    if raw is not None:
+        return raw
+    front = []
+    if type_ is not None:
+        front.append(f"type: {type_}")
+    if title is not None:
+        front.append(f"title: {title}")
+    if declares is not None:
+        front.append("declares:")
+        for item in declares:
+            if not isinstance(item, dict):
+                front.append(f"  - {json.dumps(item)}")
+                continue
+            first = True
+            for key, value in item.items():
+                prefix = "  - " if first else "    "
+                first = False
+                front.append(f"{prefix}{key}: {json.dumps(value)}")
+    return "---\n" + "\n".join(front) + "\n---\n" + body
+
+
+def declaration(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway", cluster=None):
+    """One `declares:` item."""
+    item = {"check": check, "namespace": namespace, "object": obj}
+    if cluster is not None:
+        item["cluster"] = cluster
+    return item
+
+
+DECLARABLE = audit_report.audit_declarable_checks(DECLARING_AUDIT)
+
+
+# Deep enough that PyYAML's recursive composer overruns Python's default
+# recursion limit of 1000 while composing the frontmatter's flow collection.
+NESTED_FRONTMATTER_DEPTH = 500
+# A heading line of this many ` #` pairs (a hundred kilobytes, under the
+# broker's per-file ceiling) took the quadratic heading scan the better part
+# of a minute; the linear one reads it in milliseconds, so the bound is loose.
+LONG_HEADING_PAIRS = 50_000
+LONG_HEADING_SECONDS = 5.0
+
+
+def parse(text, path="knowledge/checkout.md", repo="acme/fleet"):
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        entries = audit_report.parse_declarations(
+            text, repo=repo, path=path, declarable=DECLARABLE
+        )
+    return entries, err.getvalue()
+
+
+class TestDeclarationParsing(unittest.TestCase):
+    """`declares:` frontmatter is the whole declaration format; the body is never scanned."""
+
+    def test_each_item_is_one_entry_with_the_note_as_its_pointer(self):
+        entries, err = parse(
+            note([declaration(), declaration(check="no-hpa", obj="Deployment/api", cluster="prod-us-east")])
+        )
+        self.assertEqual(err, "")
+        self.assertEqual(
+            entries,
+            [
+                {
+                    "check": "no-pdb",
+                    "namespace": "payments",
+                    "object": "Deployment/checkout-gateway",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                },
+                {
+                    "check": "no-hpa",
+                    "namespace": "payments",
+                    "object": "Deployment/api",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                    "cluster": "prod-us-east",
+                },
+            ],
+        )
+        # A fleet-wide item carries no `cluster` key at all, not a null one.
+        self.assertNotIn("cluster", entries[0])
+
+    def test_a_cluster_scoped_object_declares_an_empty_namespace(self):
+        entries, _ = parse(note([declaration(namespace="", obj="Node/pool-a")]))
+        self.assertEqual(entries[0]["namespace"], "")
+
+    def test_whitespace_around_the_slash_is_a_hand_typed_kind_name(self):
+        # The join is an exact lookup against the finding's `Kind/name`, so an
+        # item that passed the shape check with the spaces kept would match
+        # nothing and the posture would publish under a note that covers it.
+        for spelling in ("Deployment / checkout-gateway", "Deployment/ checkout-gateway", " Deployment /checkout-gateway "):
+            with self.subTest(spelling=spelling):
+                entries, err = parse(note([declaration(obj=spelling)]))
+                self.assertEqual(err, "")
+                self.assertEqual([e["object"] for e in entries], ["Deployment/checkout-gateway"])
+        # Whitespace where a side should be is still a missing side.
+        for bad in ("Deployment/ ", " /api", "Deployment / "):
+            with self.subTest(bad=bad):
+                entries, err = parse(note([declaration(obj=bad)]))
+                self.assertEqual(entries, [])
+                self.assertIn("object must be Kind/name", err)
+
+    def test_an_indented_delimiter_inside_a_block_scalar_does_not_close_the_frontmatter(self):
+        # YAML's document markers start at column 0; an indented `---` in a
+        # `notes: |` block is content. Closing the frontmatter there handed
+        # PyYAML the prefix and dropped every `declares:` item after it, with
+        # the note read and the repository counted as searched.
+        text = (
+            "---\n"
+            "type: runbook\n"
+            "title: DB\n"
+            "notes: |\n"
+            "  Step 1:\n"
+            "  ---\n"
+            "  Step 2:\n"
+            "  ...\n"
+            "declares:\n"
+            "  - check: no-pdb\n"
+            "    namespace: default\n"
+            "    object: Deployment/api\n"
+            "---\n"
+            "# Body\n"
+        )
+        entries, err = parse(text)
+        self.assertEqual(err, "")
+        self.assertEqual([(e["check"], e["object"], e["excerpt"]) for e in entries], [("no-pdb", "Deployment/api", "DB")])
+        # Trailing whitespace on the delimiter is still the delimiter; leading
+        # whitespace on the opening line is not frontmatter at all.
+        self.assertEqual(audit_report.split_frontmatter("---  \ntype: x\n---\t\nbody\n"), "type: x")
+        self.assertIsNone(audit_report.split_frontmatter("  ---\ntype: x\n---\n"))
+
+    def test_notes_that_are_not_declarations_yield_nothing_quietly(self):
+        for text in (
+            "# No frontmatter\n\nDeployment/checkout-gateway no-pdb\n",
+            note([declaration()], type_=None),
+            note(None),
+            "---\ntype: runbook\n",
+        ):
+            with self.subTest(text=text[:30]):
+                entries, err = parse(text)
+                self.assertEqual(entries, [])
+                self.assertEqual(err, "")
+
+    def test_body_text_naming_the_object_and_the_slug_is_not_a_declaration(self):
+        entries, _ = parse(note(None, body="payments/Deployment/checkout-gateway is `no-pdb` on purpose.\n"))
+        self.assertEqual(entries, [])
+
+    def test_a_bad_item_is_skipped_by_name_and_the_rest_of_the_note_counts(self):
+        cases = {
+            "a fault slug": declaration(check="blocking-pdb"),
+            "an unknown slug": declaration(check="no-such-check"),
+            "a missing field": {"check": "no-pdb", "object": "Deployment/x"},
+            "a non-string field": {"check": "no-pdb", "namespace": 3, "object": "Deployment/x"},
+            "an object that is not Kind/name": declaration(obj="checkout-gateway"),
+            "an object with a path in it": declaration(obj="apps/Deployment/x"),
+            "an empty cluster": declaration(cluster=""),
+            "a non-object item": "no-pdb",
+        }
+        for label, bad in cases.items():
+            with self.subTest(label):
+                entries, err = parse(note([bad, declaration(check="no-hpa", obj="Deployment/api")]))
+                self.assertEqual([e["check"] for e in entries], ["no-hpa"])
+                self.assertIn("WARNING: acme/fleet:knowledge/checkout.md declares[0]", err)
+                self.assertIn("skipped", err)
+
+    def test_declares_that_is_not_a_list_reads_nothing_with_a_warning(self):
+        entries, err = parse("---\ntype: observation\ndeclares: no-pdb\n---\n")
+        self.assertEqual(entries, [])
+        self.assertIn("`declares` must be a list", err)
+
+    def test_unparseable_frontmatter_reads_nothing_with_a_warning(self):
+        entries, err = parse("---\ntype: [unclosed\ndeclares:\n  - check: no-pdb\n---\n")
+        self.assertEqual(entries, [])
+        self.assertIn("not valid YAML", err)
+        self.assertIn("acme/fleet:knowledge/checkout.md", err)
+
+    def test_an_impossible_date_in_the_frontmatter_costs_the_note_only(self):
+        # PyYAML resolves an unquoted date as a timestamp and builds it with
+        # `datetime`, which raises a plain ValueError rather than a YAMLError;
+        # uncaught, it would leave `parse_declarations` and cost the whole
+        # repository its `searched` entry. `timestamp:` is the OKF convention.
+        for label, line in {
+            "a day past the month": "timestamp: 2026-02-30T00:00:00Z",
+            "a thirteenth month": "updated: 2026-13-01",
+            "a twenty-fifth hour": "timestamp: 2026-07-23T25:00:00Z",
+        }.items():
+            with self.subTest(label):
+                entries, err = parse(
+                    f"---\ntype: observation\n{line}\ndeclares:\n"
+                    "  - check: no-pdb\n    namespace: payments\n"
+                    "    object: Deployment/checkout-gateway\n---\n"
+                )
+                self.assertEqual(entries, [])
+                self.assertIn("WARNING: acme/fleet:knowledge/checkout.md: frontmatter is not valid YAML", err)
+        # A real timestamp parses as any note does.
+        entries, err = parse(
+            "---\ntype: observation\ntimestamp: 2026-07-23T23:00:00Z\ndeclares:\n"
+            "  - check: no-pdb\n    namespace: payments\n"
+            "    object: Deployment/checkout-gateway\n---\n"
+        )
+        self.assertEqual(err, "")
+        self.assertEqual([e["check"] for e in entries], ["no-pdb"])
+
+    def test_a_pathologically_nested_frontmatter_costs_the_note_only(self):
+        # PyYAML composes nested flow collections recursively, so a note whose
+        # frontmatter nests a few hundred `[` raises RecursionError, a
+        # RuntimeError rather than a YAMLError or ValueError; uncaught, it
+        # would leave `parse_declarations` and cost the whole repository its
+        # `searched` entry without naming the note that did it.
+        nested = "[" * NESTED_FRONTMATTER_DEPTH + "]" * NESTED_FRONTMATTER_DEPTH
+        entries, err = parse(
+            f"---\ntype: {nested}\ndeclares:\n"
+            "  - check: no-pdb\n    namespace: payments\n"
+            "    object: Deployment/checkout-gateway\n---\n"
+        )
+        self.assertEqual(entries, [])
+        self.assertIn("WARNING: acme/fleet:knowledge/checkout.md: frontmatter is not valid YAML", err)
+        self.assertIn("recursion", err)
+
+    def test_an_unclosed_frontmatter_block_is_not_frontmatter(self):
+        self.assertIsNone(audit_report.split_frontmatter("---\ntype: x\n"))
+        self.assertEqual(audit_report.split_frontmatter("---\ntype: x\n...\n"), "type: x")
+
+    def test_a_utf8_byte_order_mark_before_the_delimiter_is_not_part_of_it(self):
+        # `str.strip()` leaves U+FEFF in place, so without the explicit strip the
+        # note would read as having no frontmatter and declare nothing, quietly.
+        entries, err = parse("\ufeff" + note([declaration()]))
+        self.assertEqual(err, "")
+        self.assertEqual([e["check"] for e in entries], ["no-pdb"])
+        self.assertEqual(entries[0]["excerpt"], "checkout-gateway runs unbudgeted")
+        self.assertEqual(audit_report.split_frontmatter("\ufeff---\ntype: x\n---\n"), "type: x")
+        # Only a leading mark is the encoder's; one inside the text stays text.
+        self.assertIsNone(audit_report.split_frontmatter("x\ufeff---\ntype: x\n---\n"))
+
+    def test_the_excerpt_falls_back_to_the_first_heading_then_the_path(self):
+        heading, _ = parse(note([declaration()], title=None, body="\n# Checkout runs without a budget\n"))
+        self.assertEqual(heading[0]["excerpt"], "Checkout runs without a budget")
+        # A heading inside a fence is code, not a heading.
+        fenced, _ = parse(note([declaration()], title=None, body="```\n# not a heading\n```\n"))
+        self.assertEqual(fenced[0]["excerpt"], "knowledge/checkout.md")
+
+    def test_a_heading_line_of_any_length_is_read_in_linear_time(self):
+        # A heading whose tail is a long run of blanks and hashes before one
+        # other character is what a lazy `.*?` followed by `[ \t#]*$` reads in
+        # the square of its length; one such line in one note held `start`,
+        # which has no timeout. The scan is linear now, and the excerpt is
+        # the heading's text clipped as any long title is.
+        line = "# x" + " #" * LONG_HEADING_PAIRS + "y"
+        started = time.monotonic()
+        entries, _ = parse(note([declaration()], title=None, body=f"\n{line}\n"))
+        self.assertLess(time.monotonic() - started, LONG_HEADING_SECONDS)
+        self.assertTrue(entries[0]["excerpt"].startswith("x # #"))
+        self.assertTrue(entries[0]["excerpt"].endswith("…(truncated)"))
+        # A closing sequence is still trimmed, and a heading that is nothing
+        # but one is no excerpt: the next heading, then the path, stand in.
+        trimmed, _ = parse(note([declaration()], title=None, body="\n# Budget ##\n"))
+        self.assertEqual(trimmed[0]["excerpt"], "Budget")
+        empty, _ = parse(note([declaration()], title=None, body="\n# ###\n\n## Real\n"))
+        self.assertEqual(empty[0]["excerpt"], "Real")
+        only, _ = parse(note([declaration()], title=None, body="\n# ###\n"))
+        self.assertEqual(only[0]["excerpt"], "knowledge/checkout.md")
+
+    def test_the_excerpt_is_redacted_and_clipped(self):
+        token = "ghp_" + "a" * 36
+        entries, _ = parse(note([declaration()], title=f"pinned with token {token}"))
+        self.assertNotIn(token, entries[0]["excerpt"])
+        long, _ = parse(note([declaration()], title="x" * 1000))
+        self.assertLess(len(long[0]["excerpt"]), 1000)
+        self.assertTrue(long[0]["excerpt"].endswith("…(truncated)"))
+
+
+class TestIntentPaths(unittest.TestCase):
+    """`.kube-agents/intent.yaml` bounds the search; anything wrong with it means the whole tree."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tree = Path(tmp.name)
+
+    def write(self, relative, text):
+        target = self.tree / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def read(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            paths = audit_report.read_intent_paths(self.tree, "acme/fleet")
+        return paths, err.getvalue()
+
+    def test_a_byte_order_mark_before_the_list_still_bounds_the_walk(self):
+        # PyYAML drops a leading U+FEFF itself; this pins that the intent file
+        # written by a BOM-emitting editor is the owner's bound, not a warning.
+        self.write(".kube-agents/intent.yaml", "\ufeffpaths:\n  - knowledge/\n")
+        paths, err = self.read()
+        self.assertEqual(paths, ["knowledge"])
+        self.assertEqual(err, "")
+
+    def test_a_valid_list_bounds_the_walk(self):
+        self.write(".kube-agents/intent.yaml", "paths:\n  - knowledge/\n  - docs/intent.md\n")
+        self.write("knowledge/a.md", "")
+        self.write("knowledge/deep/b.md", "")
+        self.write("knowledge.md", "")
+        self.write("docs/intent.md", "")
+        self.write("docs/other.md", "")
+        self.write("clusters/prod/c.md", "")
+        paths, err = self.read()
+        # The trailing slash is accepted and dropped; the prefix is a prefix.
+        self.assertEqual(paths, ["knowledge", "docs/intent.md"])
+        self.assertEqual(err, "")
+        self.assertEqual(
+            audit_report.note_paths(self.tree, paths),
+            (["docs/intent.md", "knowledge/a.md", "knowledge/deep/b.md"], []),
+        )
+
+    def test_an_absent_file_is_the_whole_tree(self):
+        paths, err = self.read()
+        self.assertEqual(paths, [])
+        self.assertIn("acme/fleet:.kube-agents/intent.yaml: absent", err)
+
+    def test_anything_wrong_with_the_file_is_the_whole_tree_with_a_warning(self):
+        cases = {
+            "invalid YAML": "paths: [unclosed\n",
+            "not a mapping": "- knowledge/\n",
+            "no paths key": "prefixes:\n  - knowledge/\n",
+            "a scalar": "paths: knowledge/\n",
+            "an empty list": "paths: []\n",
+            "a non-string entry": "paths:\n  - 3\n",
+            "an escaping path": "paths:\n  - knowledge/../secrets\n",
+            "an absolute path": "paths:\n  - /etc\n",
+            "a .git path": "paths:\n  - sub/.git\n",
+            "a glob": "paths:\n  - knowledge/*\n",
+            # An unquoted date `datetime` refuses: PyYAML raises ValueError,
+            # not YAMLError, and it must still be the whole tree, not a crash.
+            "an impossible date": "updated: 2026-02-30\npaths:\n  - knowledge/\n",
+            # A flow collection nested past the recursion limit: PyYAML raises
+            # RecursionError, a RuntimeError, and it is still the whole tree.
+            "a pathologically nested value": (
+                "updated: " + "[" * NESTED_FRONTMATTER_DEPTH + "]" * NESTED_FRONTMATTER_DEPTH
+                + "\npaths:\n  - knowledge/\n"
+            ),
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.write(".kube-agents/intent.yaml", text)
+                paths, err = self.read()
+                self.assertEqual(paths, [])
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
+                self.assertIn("searching the whole tree", err)
+
+    def test_a_path_the_broker_refuses_is_the_whole_tree_with_a_warning(self):
+        # The remediation-path rules accept each of these; the broker's
+        # validator, which a content-mode `clone --prefix` runs the prefix
+        # through, refuses each. Refused here, the bound falls to the whole
+        # tree in both modes rather than failing closed in one.
+        cases = {
+            "trailing whitespace": 'paths:\n  - "knowledge/ "\n',
+            "leading whitespace": 'paths:\n  - " knowledge"\n',
+            "a control character": 'paths:\n  - "know\\tledge"\n',
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.write(".kube-agents/intent.yaml", text)
+                paths, err = self.read()
+                self.assertEqual(paths, [], err)
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml: paths[0]", err)
+                self.assertIn("searching the whole tree", err)
+        # A name the broker accepts stays a bound, a leading `-` included; the
+        # copy is what has to pass it as a value.
+        self.write(".kube-agents/intent.yaml", 'paths:\n  - "-notes/"\n')
+        paths, err = self.read()
+        self.assertEqual(paths, ["-notes"])
+        self.assertEqual(err, "")
+
+    def test_a_symlinked_intent_file_or_directory_is_never_followed(self):
+        # git materialises a committed symlink in a directory-mode clone, and
+        # `is_file` and `read_text` both follow one. The bound must come from
+        # inside the copy, so a link at either component is the whole tree
+        # with a warning — and the target, however valid, is never read.
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        outside = Path(elsewhere.name) / "intent.yaml"
+        outside.write_text("paths:\n  - knowledge/\n", encoding="utf-8")
+        for label, link, target in (
+            ("the file", ".kube-agents/intent.yaml", outside),
+            ("its directory", ".kube-agents", outside.parent),
+        ):
+            with self.subTest(label):
+                (self.tree / link).parent.mkdir(parents=True, exist_ok=True)
+                (self.tree / link).symlink_to(target)
+                paths, err = self.read()
+                (self.tree / link).unlink()
+                if (self.tree / link).parent != self.tree:
+                    (self.tree / link).parent.rmdir()
+                self.assertEqual(paths, [])
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
+                self.assertIn(f"`{link}` is a symbolic link", err)
+                self.assertIn("searching the whole tree", err)
+
+    def test_the_walk_skips_git_and_symlinks(self):
+        self.write("knowledge/a.md", "")
+        self.write(".git/HOOKS.md", "")
+        self.write("sub/.git/x.md", "")
+        outside = self.write("outside/o.md", "")
+        (self.tree / "knowledge" / "link.md").symlink_to(outside)
+        (self.tree / "linked").symlink_to(self.tree / "outside", target_is_directory=True)
+        self.assertEqual(
+            audit_report.note_paths(self.tree, []), (["knowledge/a.md", "outside/o.md"], [])
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "root can list any directory")
+    def test_a_directory_the_walk_cannot_enter_is_reported_when_the_bound_reaches_it(self):
+        self.write("knowledge/a.md", "")
+        self.write("knowledge/deep/b.md", "")
+        self.write("manifests/sub/c.md", "")
+        for locked in ("knowledge/deep", "manifests/sub"):
+            (self.tree / locked).chmod(0)
+            self.addCleanup((self.tree / locked).chmod, 0o755)
+        # Under the bound: the notes in it were never seen.
+        self.assertEqual(
+            audit_report.note_paths(self.tree, ["knowledge"]), (["knowledge/a.md"], ["knowledge/deep"])
+        )
+        # Outside it: nothing the search reads could be there.
+        self.assertEqual(audit_report.note_paths(self.tree, ["knowledge/a.md"]), (["knowledge/a.md"], []))
+        # No bound: every directory is in reach.
+        self.assertEqual(
+            audit_report.note_paths(self.tree, []),
+            (["knowledge/a.md"], ["knowledge/deep", "manifests/sub"]),
+        )
+
+
+def _broker_parser():
+    """The sibling script's own argument parser, loaded from where the harness runs it."""
+    spec = importlib.util.spec_from_file_location("inspect_repository", audit_report.CLONE_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_parser()
+
+
+class DiscoveryTestCase(HarnessTestCase):
+    """The declaring stream's `start`, with a workspace the harness can read."""
+
+    def setUp(self):
+        super().setUp()
+        self.workspace = self.gitops_root / DECLARING_AUDIT / "acme__fleet"
+        (self.workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(self.workspace)
+        self.patch_attr("repo_root", lambda: self.workspace)
+        self.scratch = Path(audit_report.SCRATCH_DIR)
+        self.harness.replies = {"issue list": "[]"}
+
+    def write(self, root, relative, text):
+        target = Path(root) / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def context(self, *slugs, ref=None, refused_ref=None):
+        patcher = patch.object(
+            gitops_workspace,
+            "get_context_github_repo_entries",
+            lambda: context_entries(*slugs, ref=ref, refused_ref=refused_ref),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def copy_reply(self, into, sha=SEARCH_SHA, complete=True, mode="content", **extra):
+        reply = {"mode": mode, "repo": "acme/terraform-live", "complete": complete, **extra}
+        if mode == "content":
+            reply.update({"into": str(into), "sha": sha, "skipped": [], "stopped": None, **extra})
+        else:
+            reply["workspace"] = str(into)
+        return json.dumps(reply) + "\n"
+
+    def start(self):
+        rc = self.run_main(["start", "--audit", DECLARING_AUDIT])
+        self.assertEqual(rc, 0, self.err)
+        return json.loads(self.out)
+
+    def clone_calls(self):
+        return [c for c in self.harness.calls if "clone" in c and str(audit_report.CLONE_SCRIPT) in c]
+
+    def broker_prefix(self, cmd):
+        """The `--prefix` the sibling script reads from `cmd`, or None when it carries none.
+
+        Through the script's own parser and the broker's path validator, so a
+        prefix the harness passes is one the copy accepts: argparse reads
+        `--prefix -notes` as a flag with no value and exits before the broker
+        is asked, and the broker refuses every spelling `validate_path` does.
+        """
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = _broker_parser().parse_args(cmd[2:])
+        except SystemExit:
+            self.fail(f"the sibling script's parser refused {cmd[2:]}")
+        if args.prefix is not None:
+            workspace_paths.validate_path(args.prefix)
+        return args.prefix
+
+    def filed(self):
+        return audit_report.read_declarations(DECLARING_AUDIT)
+
+    def temp_dirs(self):
+        return sorted(p.name for p in self.scratch.glob(f"{audit_report.CLONE_TMP_PREFIX}*"))
+
+
+class TestDeclaredIntentDiscovery(DiscoveryTestCase):
+    """`start` reads every repository the step owes and records what it read."""
+
+    def test_directory_mode_walks_the_reset_workspace_and_takes_the_sha_from_git(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}]
+        )
+        self.assertEqual(payload["declarations_path"], str(self.scratch / f"declarations_{DECLARING_AUDIT}.json"))
+        self.assertEqual(
+            self.filed(),
+            [
+                {
+                    "check": "no-pdb",
+                    "namespace": "payments",
+                    "object": "Deployment/checkout-gateway",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                }
+            ],
+        )
+        record = audit_report.read_run_record(DECLARING_AUDIT)
+        self.assertEqual(record["searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(record["sources"], payload["declared_intent_sources"])
+        rev = [c for c in self.harness.calls if c[:3] == ["git", "rev-parse", "HEAD"]]
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(self.harness.cwds[self.harness.calls.index(rev[0])], str(self.workspace))
+        # Nothing was cloned: the tree was already there.
+        self.assertEqual(self.clone_calls(), [])
+        self.assertIn("searched acme/fleet@0123456 (whole tree): 1 declaration(s)", self.err)
+
+    def test_the_intent_file_bounds_the_walk_and_is_reported(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - knowledge/\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        payload = self.start()
+        self.assertEqual(
+            payload["declared_intent_sources"],
+            [{"repo": "acme/fleet", "ref": None, "paths": ["knowledge"]}],
+        )
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_named_path_with_nothing_behind_it_means_the_whole_tree_and_says_so(self):
+        # `knowlege/` is the typo the shape check cannot see: it passed, the
+        # walk found nothing under it, and the repository was credited with a
+        # complete search while every note under `knowledge/` went unread.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - knowlege/\n  - docs/\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}])
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "knowledge/checkout.md"])
+        self.assertIn(
+            "WARNING: acme/fleet:.kube-agents/intent.yaml: `knowlege` names nothing in the "
+            "repository at this commit; searching the whole tree.",
+            self.err,
+        )
+        # A symlinked prefix is never followed, so it too has nothing behind it.
+        (self.workspace / ".kube-agents" / "intent.yaml").write_text("paths: [linked/]\n", encoding="utf-8")
+        (self.workspace / "linked").symlink_to(self.workspace / "knowledge", target_is_directory=True)
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_sources"][0]["paths"], [])
+        self.assertIn("`linked` names nothing", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "knowledge/checkout.md"])
+
+    def test_a_prefix_behind_a_symlinked_directory_means_the_whole_tree(self):
+        # `Path.is_symlink` sees only the last component: `linked/sub` exists
+        # through the link, so the bound stood while the walk, which never
+        # enters a link, read nothing under it, and the repository was
+        # credited with a complete search of zero notes.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - linked/sub\n")
+        self.write(self.workspace, "real/sub/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        (self.workspace / "linked").symlink_to(self.workspace / "real", target_is_directory=True)
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}])
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "real/sub/checkout.md"])
+        self.assertIn(
+            "WARNING: acme/fleet:.kube-agents/intent.yaml: `linked/sub` names nothing in the "
+            "repository at this commit; searching the whole tree.",
+            self.err,
+        )
+
+    def test_a_note_saved_with_a_byte_order_mark_still_declares(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        target = self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        target.write_bytes(b"\xef\xbb\xbf" + target.read_bytes())
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            [(e["path"], e["check"], e["excerpt"]) for e in self.filed()],
+            [("knowledge/checkout.md", "no-pdb", "checkout-gateway runs unbudgeted")],
+        )
+        self.assertNotIn("WARNING", self.err)
+
+    def test_no_sha_for_the_checkout_leaves_it_unsearched(self):
+        # The recorder answers `git rev-parse HEAD` with nothing.
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(payload["declared_intent_sources"], [])
+        # The GitOps repository's pin is never honoured, so none is handed over.
+        self.assertEqual(payload["declared_intent_unsearched"], [{"repo": "acme/fleet", "ref": None}])
+        self.assertEqual(self.filed(), [])
+        self.assertIn("WARNING: acme/fleet: no commit sha for the checkout; not searched", self.err)
+
+    def test_content_mode_clones_the_gitops_repository_through_the_sibling_script(self):
+        self.patch_attr("detect_content_mode", lambda: True)
+        copy = self.tmp_path / "copy"
+        self.write(copy, "knowledge/checkout.md", note([declaration()]))
+        self.harness.replies["--repo acme/fleet"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertEqual(payload["mode"], "content")
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(self.filed()[0]["path"], "knowledge/checkout.md")
+        calls = self.clone_calls()
+        # Two copies into one tree: `.kube-agents/` for the bound, then — with
+        # no intent file in it — the whole tree.
+        self.assertEqual(len(calls), 2)
+        for cmd in calls:
+            self.assertEqual(cmd[0], sys.executable)
+            self.assertEqual(cmd[2:6], ["clone", "--repo", "acme/fleet", "--depth"])
+            self.assertEqual(cmd[6], "1")
+            self.assertIn("--into", cmd)
+            self.assertIn("--lease", cmd)
+            self.assertEqual(cmd[cmd.index("--lease") + 1], f"{DECLARING_AUDIT}-declared-intent")
+            self.assertNotIn("--ref", cmd)
+        self.assertEqual(self.broker_prefix(calls[0]), ".kube-agents")
+        self.assertNotIn("--force", calls[0])
+        self.assertIsNone(self.broker_prefix(calls[1]))
+        self.assertIn("--force", calls[1])
+        self.assertEqual(calls[0][calls[0].index("--into") + 1], calls[1][calls[1].index("--into") + 1])
+        self.assertEqual([c for c in self.harness.calls if c[:2] == ["git", "rev-parse"]], [])
+        # The temporary destination is gone once the read is done.
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_ref_on_the_gitops_repository_itself_is_ignored_in_content_mode(self):
+        # Directory mode reads the GitOps repository from the checkout `start`
+        # just reset, so a `ref` on a context entry naming it changes nothing
+        # there. Content mode clones it through the sibling script, where a
+        # `--ref` would read, and credit as `acme/fleet@<sha>`, a branch the
+        # run does not publish against. The pin is dropped: no `--ref` on
+        # either step, the repository owed and read once, its source unpinned.
+        self.patch_attr("detect_content_mode", lambda: True)
+        self.context("acme/fleet", ref="release-2026")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "knowledge/checkout.md", note([declaration()]))
+        self.harness.replies["--repo acme/fleet"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet"])
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}]
+        )
+        self.assertEqual(payload["declared_intent_unsearched"], [])
+        calls = self.clone_calls()
+        self.assertEqual(len(calls), 2)
+        for cmd in calls:
+            self.assertEqual(cmd[2:5], ["clone", "--repo", "acme/fleet"])
+            self.assertNotIn("--ref", cmd)
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_context_repository_is_cloned_with_its_ref_and_read(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live", ref="release-2026")
+        copy = self.tmp_path / "copy"
+        sha = "89abcdef" * 5
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.write(copy, "README.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy, sha=sha)
+        payload = self.start()
+        self.assertEqual(
+            payload["declared_intent_searched"],
+            [f"acme/fleet@{SEARCH_SHA}", f"acme/terraform-live@{sha}"],
+        )
+        self.assertEqual(
+            payload["declared_intent_sources"][1],
+            {"repo": "acme/terraform-live", "ref": "release-2026", "paths": ["intent"]},
+        )
+        self.assertEqual(payload["declared_intent_unsearched"], [])
+        calls = self.clone_calls()
+        self.assertEqual([c[c.index("--ref") + 1] for c in calls], ["release-2026"] * 2)
+        # The bound is read from the first copy and the second fetches only it.
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", "intent"])
+        self.assertEqual(
+            [(e["repo"], e["path"]) for e in self.filed()],
+            [("acme/terraform-live", "intent/api.md")],
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_content_mode_copy_fetches_each_named_path_and_nothing_else(self):
+        # The sibling script's default caps count every file in the repository,
+        # so a whole-tree copy of a GitOps repository that vendors charts would
+        # be stopped by files the search never opens. Only the intent
+        # directory and the paths it names are copied.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths:\n  - intent/\n  - docs/intent.md\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.write(copy, "docs/intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["intent", "docs/intent.md"])
+        calls = self.clone_calls()
+        self.assertEqual(
+            [self.broker_prefix(c) for c in calls], [".kube-agents", "intent", "docs/intent.md"]
+        )
+        self.assertEqual([("--force" in c) for c in calls], [False, True, True])
+        self.assertEqual(len({c[c.index("--into") + 1] for c in calls}), 1)
+        self.assertEqual(
+            [e["path"] for e in self.filed()], ["docs/intent.md", "intent/api.md"]
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_named_path_beginning_with_a_dash_reaches_the_copy_as_a_value(self):
+        # `--prefix -notes` reads to argparse as a flag with no value, so the
+        # copy exits 2 before the broker sees the path and the repository is
+        # never searched; the harness passes the prefix in the one form
+        # argparse reads as a value, and the broker, which accepts the name,
+        # copies it.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", 'paths:\n  - "-notes/"\n')
+        self.write(copy, "-notes/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["-notes"])
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", "-notes"])
+        self.assertEqual([e["path"] for e in self.filed()], ["-notes/api.md"])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_named_path_the_broker_refuses_is_the_whole_tree_in_content_mode(self):
+        # A trailing space inside a quoted scalar passes the remediation-path
+        # rules and fails the broker's: handed to `clone --prefix`, the copy
+        # exits non-zero and the repository is left unsearched every run with
+        # the clone blamed, where directory mode reads the whole tree with the
+        # intent-file warning. The bound is refused before any copy is asked
+        # for, in both modes, and the whole tree is fetched with the reason.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", 'paths:\n  - "knowledge/ "\n')
+        self.write(copy, "knowledge/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", None])
+        self.assertIn("--force", calls[1])
+        self.assertIn("acme/terraform-live:.kube-agents/intent.yaml: paths[0]", self.err)
+        self.assertIn("leading or trailing whitespace", self.err)
+        self.assertIn("searching the whole tree", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/api.md"])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_repository_that_moved_between_copies_is_not_searched(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        moved = "89abcdef" * 5
+        # The recorder answers with the first key that matches, so the
+        # specific one goes first.
+        self.harness.replies = {
+            "--prefix=.kube-agents": self.copy_reply(copy),
+            "--repo acme/terraform-live": self.copy_reply(copy, sha=moved),
+            **self.harness.replies,
+        }
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn(
+            "WARNING: acme/terraform-live: the copy of intent is at 89abcde, not 0123456: "
+            "the repository moved between copies; not searched",
+            self.err,
+        )
+        self.assertEqual(self.filed(), [])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_note_the_harness_cannot_read_costs_the_repository_its_entry(self):
+        # The local twin of a note the broker withheld: a cp1252 byte in a note
+        # under the searched paths, and the repository must not be recorded
+        # as read around it.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths: [knowledge/]\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        legacy = self.workspace / "knowledge" / "legacy.md"
+        legacy.write_bytes(note([declaration(check="no-hpa", obj="Deployment/api")]).encode("utf-8") + b"caf\xe9\n")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(payload["declared_intent_sources"], [])
+        self.assertEqual(self.filed(), [])
+        self.assertIn("WARNING: acme/fleet:knowledge/legacy.md: unreadable", self.err)
+        self.assertIn(
+            "WARNING: acme/fleet: 1 path(s) under the searched paths could not be read "
+            "(knowledge/legacy.md); not searched",
+            self.err,
+        )
+        # Outside the bound, the same file costs nothing.
+        legacy.rename(self.workspace / "docs.md")
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_note_with_an_impossible_date_costs_its_declaration_not_the_repository(self):
+        # One typo in one note's `timestamp:` silences that note; the
+        # repository is still read completely and its other notes filed.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths: [knowledge/]\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(
+            self.workspace,
+            "knowledge/api.md",
+            "---\ntype: observation\ntimestamp: 2026-02-30T00:00:00Z\ndeclares:\n"
+            "  - check: no-hpa\n    namespace: payments\n    object: Deployment/api\n---\n",
+        )
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+        self.assertIn("WARNING: acme/fleet:knowledge/api.md: frontmatter is not valid YAML", self.err)
+        self.assertNotIn("declared-intent search failed", self.err)
+
+    def test_a_directory_mode_copy_is_the_leased_workspace_the_clone_names(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        leased = self.tmp_path / "leased" / "acme__terraform-live"
+        self.write(leased, "intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            leased, mode="directory", depthIgnored=True
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        rev = [i for i, c in enumerate(self.harness.calls) if c[:3] == ["git", "rev-parse", "HEAD"]]
+        self.assertEqual([self.harness.cwds[i] for i in rev], [str(self.workspace), str(leased)])
+        # The leased checkout is left in place; only the scratch destination goes.
+        self.assertTrue(leased.is_dir())
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_the_copies_run_without_the_gitops_base_branch_override(self):
+        # `resolve_base_branch` consults the override before the remote's
+        # HEAD, and a directory-mode clone with no `--ref` asks it which
+        # branch to check out, so a context repository copied with the
+        # variable in the environment was read at the GitOps repository's
+        # branch, not its own default. Every copy the search makes runs
+        # without the two variables and with the rest of the environment.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        leased = self.tmp_path / "leased" / "acme__terraform-live"
+        self.write(leased, "intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            leased, mode="directory", depthIgnored=True
+        )
+        override = {"GITOPS_BASE_BRANCH": "release", "CREDENTIAL_PROXY_BASE_BRANCH": "release"}
+        with patch.dict(os.environ, {**override, "LIVE_1576_MARKER": "kept"}):
+            payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        clones = [i for i, c in enumerate(self.harness.calls) if str(audit_report.CLONE_SCRIPT) in c]
+        self.assertTrue(clones)
+        for index in clones:
+            env = self.harness.envs[index]
+            self.assertIsNotNone(env, "the copy inherited the process environment")
+            self.assertEqual(sorted(set(env) & set(override)), [])
+            self.assertEqual(env.get("LIVE_1576_MARKER"), "kept")
+
+    def test_a_copy_the_harness_cannot_call_searched_is_left_out_with_a_warning(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "intent.md", note([declaration()]))
+        cases = {
+            "stopped at a bound": (
+                self.copy_reply(copy, complete=False, stopped="maxBytes"),
+                "copy stopped at 'maxBytes'",
+            ),
+            "incomplete with nothing named": (
+                self.copy_reply(copy, complete=False),
+                "copy reported incomplete without saying what is missing",
+            ),
+            "no json": ("cloning...\n", "clone printed no JSON line"),
+            "no sha": (self.copy_reply(copy, sha=""), "no commit sha for the copy"),
+            "no such tree": (self.copy_reply(self.tmp_path / "missing"), "clone named"),
+        }
+        for label, (reply, expected) in cases.items():
+            with self.subTest(label):
+                self.harness.replies["--repo acme/terraform-live"] = reply
+                self.out = ""
+                payload = self.start()
+                self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+                self.assertIn(f"WARNING: acme/terraform-live: {expected}", self.err)
+                self.assertEqual(self.filed(), [])
+                self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_skipped_file_that_is_not_a_searched_note_does_not_cost_the_repository(self):
+        # The broker never sends a file over its per-file ceiling, and a
+        # repository that vendors one CRD bundle would otherwise never be
+        # searched. A skipped file that is not a note under the searched
+        # paths could not have carried a declaration.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        skipped = [
+            {"path": "crds/bundle.yaml", "reason": "tooLarge"},
+            {"path": "README.md", "reason": "tooLarge"},
+            {"path": "docs/link.md", "reason": "symlink"},
+        ]
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=skipped
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual([e["path"] for e in self.filed()], ["intent/api.md"])
+        self.assertIn("3 file(s) the broker did not send lie outside the searched notes", self.err)
+
+    def test_a_skipped_link_under_the_searched_paths_is_not_a_note_the_broker_withheld(self):
+        # The broker will not follow a symlink and says so with its own
+        # reason; the walk in directory mode never yields one either. A link
+        # named `.md` under the searched paths is therefore not a note the
+        # harness missed, in either mode, and the repository keeps its entry
+        # and its bound. A tracked name that is not a regular file (a
+        # submodule) is the same case. A note over the ceiling is not.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        for reason in ("symlink", "notAFile"):
+            with self.subTest(reason):
+                self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+                    copy, complete=False, skipped=[{"path": "intent/link.md", "reason": reason}]
+                )
+                self.out = ""
+                payload = self.start()
+                self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+                self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["intent"])
+                self.assertEqual([e["path"] for e in self.filed()], ["intent/api.md"])
+                self.assertNotIn("did not send 1 note(s)", self.err)
+                self.assertIn("1 file(s) the broker did not send lie outside the searched notes", self.err)
+        # The link beside a note the broker withheld: the note still costs the entry.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy,
+            complete=False,
+            skipped=[
+                {"path": "intent/link.md", "reason": "symlink"},
+                {"path": "intent/big.md", "reason": "tooLarge"},
+            ],
+        )
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+
+    def test_a_skipped_note_under_the_searched_paths_costs_the_repository_its_entry(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "intent/big.md", "reason": "tooLarge"}]
+        )
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+        # And with no bound at all, a skipped note anywhere is a note not read.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "elsewhere/x.md", "reason": "tooLarge"}]
+        )
+        (copy / ".kube-agents" / "intent.yaml").unlink()
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+
+    def test_a_content_mode_copy_of_a_path_with_nothing_behind_it_fetches_the_whole_tree(self):
+        # The bounded copy of a misspelt prefix comes back empty and complete
+        # at the same sha, which read as a search that found nothing. The
+        # bound is unusable, as a misspelt file is, so the whole tree is
+        # fetched under the caps and read.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "knowledge/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/api.md"])
+        self.assertIn("`intent` names nothing in the repository at this commit; searching the whole tree", self.err)
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual(
+            [self.broker_prefix(c) for c in calls],
+            [".kube-agents", "intent", None],
+        )
+        self.assertIn("--force", calls[2])
+        self.assertEqual(self.temp_dirs(), [])
+        # A prefix the broker skipped a file under is a prefix the repository
+        # has: the bound stands, and the skipped note costs the entry as before.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "intent/big.md", "reason": "tooLarge"}]
+        )
+        self.out = ""
+        self.err = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertNotIn("names nothing", self.err)
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+        self.assertEqual(len([c for c in self.clone_calls() if "acme/terraform-live" in c]), 3 + 2)
+
+    def test_a_skipped_intent_file_means_the_whole_tree_and_says_so(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "anywhere/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": ".kube-agents/intent.yaml", "reason": "tooLarge"}]
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        self.assertIn("did not send .kube-agents/intent.yaml, so the search bound is unknown", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["anywhere/api.md"])
+
+    def test_a_clone_that_exits_non_zero_is_not_searched_and_does_not_end_the_run(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.harness.failures = {"--repo acme/terraform-live": 1}
+        self.context("acme/terraform-live", ref="release-2026")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("WARNING: acme/terraform-live: clone at release-2026 exited 1; not searched", self.err)
+        # The worker's own copy needs the pin: the entry names it, because
+        # `context_repos` is slugs and `declared_intent_sources` lists only
+        # what was searched, so nowhere else in the payload carries it.
+        self.assertEqual(
+            payload["declared_intent_unsearched"],
+            [{"repo": "acme/terraform-live", "ref": "release-2026"}],
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_refused_ref_skips_the_repository_rather_than_reading_its_default_branch(self):
+        # `release/2026+hotfix` is a branch name git accepts and the shape
+        # check does not. The pin exists so a curated branch is what silences
+        # a posture, so the repository is not read at HEAD in its place: no
+        # clone is attempted, it stays out of `searched`, the warning names
+        # the refused value, and the worker's entry carries it under
+        # `refused_ref` so the worker does not copy at HEAD either.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        copy = self.tmp_path / "copy"
+        self.write(copy, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        self.context("acme/terraform-live", refused_ref="release/2026+hotfix")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
+        self.assertEqual(
+            payload["declared_intent_unsearched"],
+            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": "release/2026+hotfix"}],
+        )
+        self.assertEqual([c for c in self.clone_calls() if "acme/terraform-live" in c], [])
+        self.assertEqual(self.filed(), [])
+        self.assertIn(
+            "WARNING: acme/terraform-live: ref 'release/2026+hotfix' is not a git branch "
+            "name; not searched, and not read at its default branch instead.",
+            self.err,
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_yesterdays_declarations_are_cleared_before_anything_can_fail(self):
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(DECLARING_AUDIT, "acme/fleet", [{"check": "no-pdb"}])
+
+        def boom(repo, audit_id):
+            raise RuntimeError("gh label create: 502")
+
+        self.patch_attr("ensure_labels", boom)
+        self.assertNotEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
+        self.assertEqual(self.filed(), [])
+        self.assertFalse(Path(audit_report.declarations_path_for(DECLARING_AUDIT)).exists())
+
+    def test_without_pyyaml_nothing_is_searched_and_the_run_says_so(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        with patch.dict(sys.modules, {"yaml": None}):
+            payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(self.clone_calls(), [])
+        self.assertIn("PyYAML is not importable", self.err)
+
+    def test_a_stream_with_no_declared_intent_step_clones_nothing(self):
+        self.context("acme/terraform-live")
+        self.workspace = self.gitops_root / AUDIT / "acme__fleet"
+        rc = self.run_main(["start", "--audit", AUDIT])
+        self.assertEqual(rc, 0, self.err)
+        payload = json.loads(self.out)
+        self.assertEqual(payload["context_repos"], ["acme/terraform-live"])
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(self.clone_calls(), [])
+
+
+class TestHarnessDeclarationJoin(HarnessTestCase):
+    """`finish` and `remediate` apply what `start` filed, before the withhold."""
+
+    CONTEXT = ("acme/terraform-live",)
+    OTHER_SHA = "89abcdef" * 5
+
+    def setUp(self):
+        super().setUp()
+        self.workspace = self.gitops_root / DECLARING_AUDIT / "acme__fleet"
+        (self.workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(self.workspace)
+        self.patch_attr("repo_root", lambda: self.workspace)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.touch("clusters/prod-us-east/payments-db-pdb.yaml")
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
+    def record(self, searched=("acme/fleet", "acme/terraform-live"), context=CONTEXT, sources=()):
+        shas = {"acme/fleet": SEARCH_SHA, "acme/terraform-live": self.OTHER_SHA}
+        audit_report.write_run_record(
+            DECLARING_AUDIT,
+            "acme/fleet",
+            list(context),
+            searched=[f"{slug}@{shas[slug]}" for slug in searched],
+            sources=list(sources),
+        )
+
+    def file(self, *entries, repo="acme/fleet"):
+        audit_report.write_declarations(DECLARING_AUDIT, repo, list(entries))
+
+    @staticmethod
+    def entry(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway", cluster=None,
+              repo="acme/fleet", path="knowledge/checkout.md", excerpt="checkout runs unbudgeted"):
+        entry = {"check": check, "namespace": namespace, "object": obj,
+                 "repo": repo, "path": path, "excerpt": excerpt}
+        if cluster is not None:
+            entry["cluster"] = cluster
+        return entry
+
+    def doc(self, findings=None):
+        return declaring_doc(findings=posture_and_fault_findings() if findings is None else findings)
+
+    def finish(self, doc, *extra):
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=extra)
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json() if not extra else None
+
+    def ledger_body(self):
+        bodies = self.harness.bodies_for("issue", "create")
+        self.assertEqual(len(bodies), 1, bodies)
+        return bodies[0]
+
+    PDB_ID = staticmethod(lambda: derived_id(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway"))
+
+    def test_a_matching_finding_moves_to_declared_with_the_findings_cluster_and_title(self):
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc())
+        self.assertFalse(payload["partial"], payload["coverage_gaps"])
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["postures_withheld"], [])
+        # Five findings in, one declared: four publish.
+        self.assertEqual(payload["new"], 4)
+        body = self.ledger_body()
+        self.assertIn("## Declared intent", body)
+        self.assertIn(
+            "| `no-pdb` | `prod-us-east` | `payments/Deployment/checkout-gateway` "
+            "| `acme/fleet:knowledge/checkout.md` | checkout-gateway runs 3 replicas with no "
+            "PodDisruptionBudget: `checkout runs unbudgeted` |",
+            body,
+        )
+        self.assertNotIn(self.PDB_ID(), audit_report.parse_delta_block(body))
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        self.assertIn("acme/fleet:knowledge/checkout.md", self.err)
+        # And the harness's search record renders as the model's would have.
+        self.assertIn(f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`", body)
+
+    def test_the_join_is_case_blind_as_the_finding_id_is(self):
+        # `deployment/checkout-gateway` is what kubectl prints and what the
+        # finding id `no-pdb.<cluster>.payments.deployment-checkout-gateway`
+        # shows; the shape check passes it, and an exact lookup matched
+        # nothing, so the posture published under a note that covers it.
+        self.record()
+        self.file(self.entry(obj="deployment/checkout-gateway", cluster="PROD-US-EAST"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The moved entry carries the finding's own spelling, not the note's.
+        self.assertIn("| `payments/Deployment/checkout-gateway` |", self.ledger_body())
+
+    def test_the_join_trims_whitespace_as_the_finding_id_does(self):
+        # The validator keeps a finding field's surrounding whitespace and
+        # `derive_finding_id` strips it, so `"payments "` is the same finding
+        # as `"payments"` on the ledger; the key has to read it the same way.
+        findings = posture_and_fault_findings()
+        pdb = next(f for f in findings if f["check"] == "no-pdb")
+        pdb["namespace"] = "payments "
+        pdb["object"] = " Deployment/checkout-gateway"
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc(findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The pointer cell drops the whitespace the moved entry keeps.
+        self.assertIn("| `payments/Deployment/checkout-gateway` |", self.ledger_body())
+
+    def test_the_join_folds_whitespace_around_the_slash_as_the_finding_id_does(self):
+        # `Deployment / checkout-gateway` reduces to `deployment-checkout-gateway`
+        # in the finding id, the same segment `Deployment/checkout-gateway`
+        # gives, so the ledger already treats the two as one finding; a key
+        # that only trimmed the ends matched nothing for the spaced spelling.
+        findings = posture_and_fault_findings()
+        pdb = next(f for f in findings if f["check"] == "no-pdb")
+        pdb["object"] = "Deployment / checkout-gateway"
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc(findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The moved entry keeps the finding's spelling, the spaces around the
+        # slash included; the rendered cell strips only its two ends, so the
+        # column carries no margin and the spelling stays the finding's.
+        self.assertIn("| `payments/Deployment / checkout-gateway` |", self.ledger_body())
+
+    def test_a_cluster_scoped_entry_matches_only_its_cluster(self):
+        self.record()
+        self.file(self.entry(cluster="stage-eu"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertEqual(payload["new"], 5)
+        self.harness.calls.clear()
+        self.harness.bodies.clear()
+        self.file(self.entry(cluster="prod-us-east"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+
+    def test_a_scoped_entry_wins_over_a_fleet_wide_one_for_its_cluster(self):
+        self.record()
+        self.file(self.entry(path="knowledge/fleet.md"), self.entry(cluster="prod-us-east", path="knowledge/prod.md"))
+        self.finish(self.doc())
+        self.assertIn("`acme/fleet:knowledge/prod.md`", self.ledger_body())
+
+    def test_a_non_matching_entry_leaves_the_finding_alone(self):
+        self.record()
+        self.file(
+            self.entry(namespace="other"),
+            self.entry(obj="Deployment/checkout"),
+            self.entry(check="no-hpa"),
+        )
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertNotIn("## Declared intent", self.ledger_body())
+
+    def test_a_fault_is_never_moved_whatever_the_file_says(self):
+        # `parse_declarations` would not have written this entry; a file that
+        # carries one anyway still cannot silence a fault.
+        self.record()
+        self.file(self.entry(check="blocking-pdb", obj="PodDisruptionBudget/payments-db"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertIn("`blocking-pdb`", self.ledger_body())
+
+    def test_a_standing_hpa_declaration_does_not_move_the_dangling_target_fault(self):
+        # `hpa-cannot-scale` is a posture at `major` (`min == max`) and a fault
+        # at `minor` (a dangling target). The fixture's is the fault; a
+        # declaration filed for the HPA must leave it a finding, and say so.
+        self.record()
+        self.file(self.entry(check="hpa-cannot-scale", namespace="web", obj="HorizontalPodAutoscaler/web"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        dangling = derived_id(check="hpa-cannot-scale", namespace="web", obj="HorizontalPodAutoscaler/web")
+        self.assertIn(
+            f"DECLARATION NOT APPLIED: {dangling} — hpa-cannot-scale at severity 'minor' is the "
+            "dangling-target fault (SOP §3.6(b)), which no declaration excuses",
+            self.err,
+        )
+        self.assertIn("acme/fleet:knowledge/checkout.md stands and the finding publishes", self.err)
+        self.assertIn(f"[`{dangling}`]", self.ledger_body())
+        # The same declaration moves the posture shape.
+        self.harness.calls.clear()
+        self.harness.bodies.clear()
+        findings = self.doc()["findings"]
+        for finding in findings:
+            if finding["check"] == "hpa-cannot-scale":
+                finding["severity"] = "major"
+        payload = self.finish(self.doc(findings=findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertIn(f"DECLARED: {dangling}", self.err)
+
+    def test_a_model_written_entry_survives_beside_a_harness_one(self):
+        self.record()
+        self.file(self.entry())
+        doc = self.doc()
+        doc["declared"] = [make_declared(obj="Deployment/web")]
+        payload = self.finish(doc)
+        self.assertEqual(payload["declared"], 2)
+        body = self.ledger_body()
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", body)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", body)
+
+    def test_a_complete_harness_record_lifts_the_withhold_without_a_model_record(self):
+        self.record()
+        payload = self.finish(self.doc())
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["postures_withheld"], [])
+        self.assertIn(
+            f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`, `acme/terraform-live@{self.OTHER_SHA}`",
+            self.ledger_body(),
+        )
+
+    def test_a_partial_harness_record_withholds_and_names_the_unread_repository(self):
+        self.record(searched=("acme/fleet",))
+        self.file(self.entry())
+        payload = self.finish(self.doc())
+        self.assertTrue(payload["partial"])
+        gap = [g for g in payload["coverage_gaps"] if g.startswith("declared intent:")][0]
+        self.assertIn("repositories not searched: acme/terraform-live", gap)
+        self.assertNotIn("acme/fleet,", gap)
+        # The declared posture is its own record and is not among the withheld.
+        self.assertEqual(payload["declared"], 1)
+        self.assertNotIn(self.PDB_ID(), payload["postures_withheld"])
+        self.assertEqual(len(payload["postures_withheld"]), 2)
+
+    def test_the_model_record_and_the_harness_record_are_unioned(self):
+        self.record(searched=("acme/fleet",))
+        doc = self.doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/terraform-live")
+        payload = self.finish(doc)
+        self.assertFalse(payload["partial"])
+
+    def test_a_file_for_another_repository_joins_nothing(self):
+        self.record()
+        self.file(self.entry(), repo="acme/other")
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+
+    def test_the_dry_run_applies_the_same_join(self):
+        self.record()
+        self.file(self.entry())
+        self.finish(self.doc(), "--dry-run")
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        self.assertIn("DECLARED: 1 posture(s)", self.err)
+        self.assertIn("## Declared intent", self.out)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", self.out)
+        self.assertEqual(self.harness.gh_calls("issue"), [])
+
+    def test_remediate_refuses_a_declared_id_by_name(self):
+        self.record()
+        self.file(self.entry())
+        findings_file = self.write_findings(self.doc())
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                rc = self.run_main(
+                    ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+                     "--finding", self.PDB_ID(), *extra]
+                )
+                self.assertEqual(rc, 2, self.err)
+                self.assertIn("declared", self.err)
+                self.assertIn("Declared intent", self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+
+    def test_remediate_still_opens_a_fault_beside_a_declared_posture(self):
+        self.record()
+        self.file(self.entry())
+        findings_file = self.write_findings(self.doc())
+        fault = derived_id(check="blocking-pdb", namespace="payments", obj="PodDisruptionBudget/payments-db")
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file, "--finding", fault]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(self.stdout_json()["prs_opened"]), 1)
+
+    # -- a standing /remediate on a declared posture ---------------------------
+
+    def ledger_with(self, *comments):
+        self.harness.replies.update(
+            {
+                "issue list": self.issue_list(),
+                "--json comments": json.dumps({"comments": list(comments)}),
+            }
+        )
+
+    def test_a_ledger_request_for_a_declared_posture_is_refused_with_the_file_named(self):
+        """The id was right and the posture is declared: neither "typo" nor a hold.
+
+        The join takes the posture out of `findings` before the ledger's
+        comments are parsed, so read against `findings` alone the request
+        would fall to "not a finding in the current report". It is refused on
+        the permanent marker with the declaring file named, as the CLI path
+        refuses `--finding`, because a declaration is the owner's standing
+        choice and the request does not stay open against it.
+        """
+        self.record()
+        self.file(self.entry())
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
+        self.assertIn("Declared intent", refusals[0])
+        self.assertNotIn("typo", refusals[0])
+        self.assertNotIn("may have been resolved", refusals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+        self.assertNotIn(
+            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+        )
+
+    def test_a_clean_run_refuses_a_request_for_a_declared_posture(self):
+        # The one finding was the declared posture, so the run lands on the
+        # CLEAN branch with no gap. "No longer reproduces" would be false — it
+        # reproduces and is listed under Declared intent — so the request is
+        # refused there too, with the file named, and not acked.
+        self.record()
+        self.file(self.entry())
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        postures = [f for f in posture_and_fault_findings() if f["check"] == "no-pdb"]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn("no longer reproduces", body)
+
+    def test_the_refusal_names_the_declaring_file_through_the_cell_sanitiser(self):
+        # A note's filename comes from the tree walk or the broker listing,
+        # neither of which refuses a backtick, and the refusal wraps
+        # `repo:path` in a code span: one backtick in the name would close it
+        # and leave the rest of the comment, marker included, as live
+        # Markdown. The pointer goes through `_cell`, as the ledger table's
+        # does, so the two never name one declaration two different ways.
+        self.record()
+        self.file(self.entry(path="knowledge/check`out.md"))
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/check'out.md`", refusals[0])
+        self.assertNotIn("check`out", refusals[0])
+
+    def test_a_declared_posture_with_a_shortened_id_is_refused_and_not_a_typo(self):
+        # The id a finding carries, the ledger prints and a requester copies
+        # is `_shorten_id` of the derived string once the four fields overrun
+        # `MAX_FINDING_ID`; a 63-character namespace, the RFC 1123 maximum,
+        # does it alone. Keyed on the full id, the lookup missed the posture
+        # and the request fell through to the typo refusal.
+        namespace = "n" * 63
+        entry = make_declared(check="no-pdb", namespace=namespace, obj="Deployment/checkout-gateway",
+                              repo="acme/fleet", path="knowledge/long.md")
+        full = audit_report.derive_finding_id(entry)
+        target = audit_report._shorten_id(full)
+        self.assertNotEqual(target, full)
+        self.assertLessEqual(len(target), audit_report.MAX_FINDING_ID)
+        requests = audit_report.parse_remediate_commands(
+            [comment(f"/remediate {target}")], findings=[], declared=[entry]
+        )
+        self.assertEqual(requests.targets, [])
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertFalse(requests.refusals[0].get("deferred"))
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`acme/fleet:knowledge/long.md`", reason)
+        self.assertNotIn("typo", reason)
+        # The clean branch reads the same map.
+        self.assertIn(target, audit_report.declared_by_id([entry]))
+
+    def test_a_model_written_declared_entry_refuses_a_request_the_same_way(self):
+        # The classifier reads `declared[]` whole, not only what the harness
+        # moved: an entry the model wrote covers its posture just as well.
+        entry = make_declared(check="no-pdb", obj="Deployment/checkout-gateway",
+                              repo="acme/fleet", path="knowledge/model.md")
+        target = derived_id(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway")
+        requests = audit_report.parse_remediate_commands(
+            [comment(f"/remediate {target}")], findings=[], declared=[entry]
+        )
+        self.assertEqual(requests.targets, [])
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertFalse(requests.refusals[0].get("deferred"))
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`acme/fleet:knowledge/model.md`", reason)
+        self.assertNotIn("typo", reason)
+        # Without `declared` the same request reads as a typo: the fixture
+        # shows what the argument changes.
+        bare = audit_report.parse_remediate_commands([comment(f"/remediate {target}")], findings=[])
+        self.assertIn("typo", bare.refusals[0]["reasons"][0])
+
+    def test_a_run_with_nothing_but_declared_postures_is_clean(self):
+        self.record()
+        self.file(self.entry(), self.entry(check="no-hpa", obj="Deployment/api"))
+        postures = [f for f in posture_and_fault_findings() if f["check"] in ("no-pdb", "no-hpa")]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["declared"], 2)
+        self.assertIn("2 declared posture(s) were not reported as findings", self.err)
+
 
 
 class TestAiSecurityAuditStream(BaseTestCase):

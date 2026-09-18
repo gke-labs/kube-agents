@@ -33,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 
+import api_policy
 import command_policy
 import providers
 import repo_ref
@@ -44,6 +45,7 @@ import vcs_broker
 # sides share, and importing them keeps the context-name grammar in one place.
 # Nothing else in credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
+    API_RELAY_PREFIX,
     ClusterTarget,
     parse_gke_context,
     read_current_context,
@@ -67,6 +69,86 @@ AGENT_API_DRAIN_TIMEOUT_SECONDS = 10
 # match and the length guard both live there, at the same 256 this module
 # enforced before; the alias keeps the name this module's own tests use.
 MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
+
+# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
+# prefix itself is API_RELAY_PREFIX, imported above from the client module so
+# the two sides cannot spell it differently. `api_policy` decides what may be
+# relayed; these bound how. docs/designs/gcp-api-relay.md argues each value.
+#
+# Connect timeout: matches BROKER_CONNECT_TIMEOUT_SECONDS on the client side.
+# A SYN dropped by an egress policy hangs rather than fails, and this is what
+# turns that into an answer.
+API_RELAY_CONNECT_TIMEOUT_S = 10
+# Total deadline for one relayed read, connect included. A week of per-pod
+# series for a large cluster at the API's maximum page size is the slowest read
+# the table admits, and Monitoring has been observed to take tens of seconds to
+# assemble such a page; two minutes leaves room for that without letting a
+# stalled upstream park a handler thread for long.
+API_RELAY_DEADLINE_S = 120
+# Response cap. A full `timeSeries` page at the API's maximum `pageSize` is
+# under 4 MiB; a body over this is answered 502 and the caller's remedy is a
+# smaller `pageSize`, which every listed endpoint supports. Read in chunks up
+# to the cap rather than with `.read()`, so the cap bounds memory too.
+API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+API_RELAY_READ_CHUNK_BYTES = 64 * 1024
+# Query keys removed before forwarding. Each is a way to substitute a
+# credential for the broker's or to change the response class: an API key
+# would bill and authorise as someone else, and the two token keys would
+# replace the bearer header. Everything else in the query is forwarded
+# byte-for-byte; the filter grammar is Google's to validate.
+# `bearer_token` is the deprecated spelling of the same system parameter.
+API_RELAY_STRIPPED_QUERY_KEYS = frozenset({"key", "access_token", "oauth_token", "bearer_token"})
+# The two headers the upstream request carries beyond `Host`, and the only
+# two. Every header the caller sent is dropped.
+API_RELAY_ACCEPT = "application/json"
+API_RELAY_UPSTREAM_PORT = 443
+# The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
+# DNS name, no scheme, port, user info or percent-encoding -- before the
+# policy sees it. Anything else is a 400, not something to normalise: the
+# table matches exact text and what it sees must be what is forwarded.
+#
+# A percent-encoded slash decodes to a segment boundary the route regex never
+# saw. Refused rather than decoded, for the same reason.
+API_RELAY_ENCODED_SLASH = re.compile(r"%2f", re.IGNORECASE)
+# The query is forwarded byte-for-byte, so it has to be bytes the upstream
+# request line can carry. The set is what http.client itself will put on a
+# request line -- printable ASCII other than space and the characters that
+# would need escaping to survive it -- and not RFC 3986's gen-delims split:
+# `[` and `]` are gen-delims the RFC keeps out of a query, but http.client
+# sends them raw, Google's front end accepts them, `requests` leaves them
+# unquoted, and two of the Managed Prometheus routes take `match[]=` while
+# every range vector carries `[5m]`. Refusing them would refuse the routes.
+# What stays out: a raw UTF-8 byte, a control character, space, and `" < > \\
+# ^ ` { | }`, which http.client would either raise on or an upstream would
+# have to guess at; a percent-escape must be complete. A byte outside the set
+# would otherwise reach http.client, which raises rather than sends, and the
+# caller would see a closed connection instead of the 400 this turns it into.
+API_RELAY_QUERY_SHAPE = re.compile(
+    r"^(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?\[\]]|%[0-9A-Fa-f]{2})*\Z"
+)
+# The longest query forwarded. Google's front end answers an over-long URL
+# with a 414 and `Connection: close`; with no cap a caller could send it one
+# on demand. 8 KiB is that front end's usual request-URL ceiling, and a
+# `timeSeries` filter with an aggregation and several groupBy fields is well
+# under 2 KiB.
+API_RELAY_MAX_QUERY_BYTES = 8 * 1024
+# The `code` a 400 carries, per part of the request that was not in normal
+# form, so a caller can tell which of its own inputs to correct.
+API_RELAY_BAD_HOST = "API_RELAY_BAD_HOST"
+API_RELAY_BAD_PATH = "API_RELAY_BAD_PATH"
+API_RELAY_BAD_QUERY = "API_RELAY_BAD_QUERY"
+# Path segments that name a position rather than a resource; a path carrying
+# one is not in normal form.
+API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
+# Longer than the default 64 because an API path is caller text that has to be
+# readable in the audit line; the same 256 the exec route gives a `cwd`.
+API_RELAY_PATH_LOG_LENGTH = 256
+# The width a principal is logged at. The value comes from the TokenReview,
+# not from the request, and a ServiceAccount username truncated at the default
+# 64 loses exactly its discriminating part; the exec route's audit line uses
+# the same 512 as a literal.
+PRINCIPAL_LOG_LENGTH = 512
+MILLISECONDS_PER_SECOND = 1000
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -259,6 +341,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     ("/v1/exec", (CALLER_ROLE_SHELL,)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
+    # The constant, not a literal: required_roles() answers () on a miss and
+    # _role_permits then admits every role, so a prefix spelled twice is a
+    # rename away from opening the relay to the gateway.
+    (API_RELAY_PREFIX, (CALLER_ROLE_SHELL,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -870,6 +956,65 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
     )
 
 
+def sanitize_header(value: str) -> str:
+    """Strip CR/LF so an upstream header cannot split the response (CWE-113).
+
+    Shared by the agent API proxy, which relays every upstream header, and the
+    Cloud API relay, which relays one: a Content-Type is upstream text either way.
+    """
+    return value.replace("\r", "").replace("\n", "")
+
+
+def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
+    """Read a request body so a refusal is not lost to a connection reset.
+
+    Closing a socket that still holds unread request bytes sends a TCP RST,
+    and the peer discards whatever it has not yet handed to the application
+    -- including the response written a moment earlier. A client that POSTed
+    a body with the wrong key therefore read ECONNRESET rather than the 401
+    the agent API proxy sent, which is indistinguishable from a dead listener
+    and cost real time during an RC investigation. The credential proxy's
+    Cloud API relay has the same exposure on a refused POST.
+
+    Reachable before authentication on the agent API proxy, so it is bounded
+    three ways: it declines a body over ``max_bytes`` or one it cannot frame,
+    it discards in AGENT_API_DRAIN_CHUNK_BYTES chunks rather than
+    materialising the body, and it gives up after
+    AGENT_API_DRAIN_TIMEOUT_SECONDS so a client that announces a body and
+    stalls cannot hold the handler thread.
+
+    Declining the oversized case has a cost worth stating: a body over
+    ``max_bytes`` still loses its refusal to the reset, which is the symptom
+    this function exists to remove. Draining it anyway would mean reading an
+    unbounded stream from an unauthenticated caller to make an error message
+    survive, which is the trade the size limit already refused.
+    """
+    if handler.headers.get("Transfer-Encoding"):
+        return
+    try:
+        content_length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        return
+    if content_length <= 0 or content_length > max_bytes:
+        return
+    previous_timeout = handler.connection.gettimeout()
+    try:
+        handler.connection.settimeout(AGENT_API_DRAIN_TIMEOUT_SECONDS)
+        remaining = content_length
+        while remaining > 0:
+            chunk = handler.rfile.read(min(remaining, AGENT_API_DRAIN_CHUNK_BYTES))
+            if not chunk:
+                # The peer closed mid-body; there is nothing left to drain.
+                break
+            remaining -= len(chunk)
+    except (ConnectionError, TimeoutError, OSError):
+        # The peer went away or stalled mid-body. There is nothing left to protect.
+        LOGGER.debug("request body drain failed", exc_info=True)
+    finally:
+        with contextlib.suppress(OSError):
+            handler.connection.settimeout(previous_timeout)
+
+
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     """Authenticate the external PlatformAgent API without sharing its key."""
 
@@ -972,64 +1117,170 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             upstream.close()
 
     def _drain_request_body(self) -> None:
-        """Read the request body so a refusal is not lost to a connection reset.
-
-        Closing a socket that still holds unread request bytes sends a TCP RST,
-        and the peer discards whatever it has not yet handed to the application
-        -- including the response written a moment earlier. A client that POSTed
-        a body with the wrong key therefore read ECONNRESET rather than the 401
-        this handler sent, which is indistinguishable from a dead listener and
-        cost real time during an RC investigation.
-
-        This runs before authentication, so it is reachable by any caller the
-        listener accepts, and it is bounded three ways: it declines a body over
-        max_request_bytes or one this handler cannot frame, it discards in
-        AGENT_API_DRAIN_CHUNK_BYTES chunks rather than materialising the body,
-        and it gives up after AGENT_API_DRAIN_TIMEOUT_SECONDS so a client that
-        announces a body and stalls cannot hold the handler thread.
-
-        Declining the oversized case has a cost worth stating: a body over
-        max_request_bytes still loses its refusal to the reset, which is the
-        symptom this method exists to remove. Draining it anyway would mean
-        reading an unbounded stream from an unauthenticated caller to make an
-        error message survive, which is the trade the size limit already
-        refused.
-        """
-        if self.headers.get("Transfer-Encoding"):
-            return
-        try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            return
-        if content_length <= 0 or content_length > self.max_request_bytes:
-            return
-        previous_timeout = self.connection.gettimeout()
-        try:
-            self.connection.settimeout(AGENT_API_DRAIN_TIMEOUT_SECONDS)
-            remaining = content_length
-            while remaining > 0:
-                chunk = self.rfile.read(min(remaining, AGENT_API_DRAIN_CHUNK_BYTES))
-                if not chunk:
-                    # The peer closed mid-body; there is nothing left to drain.
-                    break
-                remaining -= len(chunk)
-        except (ConnectionError, TimeoutError, OSError):
-            # The peer went away or stalled mid-body. There is nothing left to protect.
-            LOGGER.debug("PlatformAgent API request body drain failed", exc_info=True)
-        finally:
-            with contextlib.suppress(OSError):
-                self.connection.settimeout(previous_timeout)
+        """Drain the body before a pre-authentication refusal; see drain_request_body."""
+        drain_request_body(self, self.max_request_bytes)
 
     @staticmethod
     def _sanitize_header(value: str) -> str:
-        """Strip CR/LF so upstream headers cannot split the response (CWE-113)."""
-        return value.replace("\r", "").replace("\n", "")
+        """See sanitize_header; kept as a method for the call sites below."""
+        return sanitize_header(value)
 
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler hands the raw request line through here, so
         # every argument is caller text and it is logged before any
         # authentication runs. See CredentialProxyHandler.log_message.
         LOGGER.info("agent-api " + message, *_sanitized_log_args(args))
+
+
+@dataclass(frozen=True)
+class ApiRelayResponse:
+    """What one relayed read produced, bounded by the response cap."""
+
+    status: int
+    content_type: str
+    body: bytes
+    # True when the upstream body ran past API_RELAY_MAX_RESPONSE_BYTES; `body`
+    # is then empty, because a truncated JSON page is worse than no page.
+    over_cap: bool = False
+
+
+class ApiRelayConnectTimeout(OSError):
+    """The upstream did not accept a connection within API_RELAY_CONNECT_TIMEOUT_S.
+
+    Its own class so the handler answers it as "unreachable" (502) rather than
+    as the read deadline (504): a dropped SYN and a slow page are different
+    faults with different remedies, and the log names the timeout that fired.
+    """
+
+
+class GoogleApiRelay:
+    """The broker's own credential and transport for the read-only Cloud API relay.
+
+    The credential is the one `GoogleChatRelay` and `scoped_sa_pool` already
+    obtain -- `google.auth.default()`, the ambient Workload Identity token --
+    fetched once on first use and refreshed by google-auth when it expires.
+    Nothing is imported at construction, so a broker with no cloud libraries
+    (the test suite, a sidecar with no identity) starts as before and the
+    route answers 503 rather than the process refusing to come up.
+
+    `AuthorizedSession` is deliberately not used. The upstream request is built
+    by hand in `fetch` so that exactly two headers leave this process and no
+    header the caller sent can ride along.
+
+    `connection` is the seam a test replaces with a plain HTTPConnection to a
+    fake upstream; everything above it -- the header set, the deadline, the
+    cap -- then runs for real.
+    """
+
+    SCOPES = (scoped_sa_pool.CLOUD_PLATFORM_SCOPE,)
+
+    def __init__(self) -> None:
+        self._credentials: Any = None
+        self._lock = threading.Lock()
+        # Built once: create_default_context loads the CA bundle, and a
+        # context is safe to share across connections.
+        self._tls_context = ssl.create_default_context()
+
+    def authorization_header(self) -> str:
+        """`Bearer <token>` for the broker's identity, refreshed if it has lapsed."""
+        with self._lock:
+            if self._credentials is None:
+                import google.auth
+
+                self._credentials, _ = google.auth.default(scopes=list(self.SCOPES))
+            if not self._credentials.valid:
+                from google.auth.transport.requests import Request
+
+                self._credentials.refresh(Request())
+            return f"Bearer {self._credentials.token}"
+
+    def connection(self, host: str) -> http.client.HTTPConnection:
+        """A fresh TLS connection to `host`, with the connect bounded."""
+        return http.client.HTTPSConnection(
+            host,
+            API_RELAY_UPSTREAM_PORT,
+            timeout=API_RELAY_CONNECT_TIMEOUT_S,
+            context=self._tls_context,
+        )
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the relay deadline passed")
+        return remaining
+
+    def fetch(self, host: str, target: str, authorization: str) -> ApiRelayResponse:
+        """One `GET https://{host}{target}` on the broker's credential.
+
+        `target` is the path and query as the handler assembled them, already
+        checked against the policy and stripped of the credential keys. Raises
+        `TimeoutError` when API_RELAY_DEADLINE_S passes at any point, and lets
+        `OSError` and `http.client.HTTPException` through for the handler to
+        answer 502; redirects are not followed, the 3xx comes back as a status.
+        """
+        deadline = time.monotonic() + API_RELAY_DEADLINE_S
+        connection = self.connection(host)
+        try:
+            try:
+                connection.connect()
+            except TimeoutError as exc:
+                # The connect timeout, not the deadline: a SYN nobody answered.
+                raise ApiRelayConnectTimeout(
+                    f"connect to {host} did not complete in {API_RELAY_CONNECT_TIMEOUT_S}s"
+                ) from exc
+            # http.client's timeout is per socket operation, not total. The
+            # deadline is applied by re-arming the socket before each read
+            # with whatever is left of it. The reference is taken once:
+            # getresponse() sets connection.sock to None for a close-delimited
+            # response (`Connection: close`, HTTP/1.0, no length) while the
+            # body stays readable through the response's own file handle, and
+            # that handle keeps this socket open until the response is closed.
+            sock = connection.sock
+            sock.settimeout(self._remaining(deadline))
+            # `skip_accept_encoding`: without it http.client adds a third
+            # header of its own. `Host` is added, because HTTP/1.1 requires it.
+            connection.putrequest("GET", target, skip_accept_encoding=True)
+            connection.putheader("Authorization", authorization)
+            connection.putheader("Accept", API_RELAY_ACCEPT)
+            connection.endheaders()
+            response = connection.getresponse()
+            chunks: list[bytes] = []
+            received = 0
+            while True:
+                if response.isclosed():
+                    # read1 closes the response's handle when the last
+                    # Content-Length byte arrives (or at EOF), and for a
+                    # close-delimited response that is the last reference to
+                    # the socket, so the fd is gone: nothing left to re-arm
+                    # or to read.
+                    break
+                sock.settimeout(self._remaining(deadline))
+                # read1, not read: read(n) loops recv until it has n bytes and
+                # each recv re-arms the socket timeout, so an upstream that
+                # trickles could outlive the deadline by a chunk per recv.
+                # read1 returns after one recv, and the deadline is checked
+                # again before the next.
+                chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > API_RELAY_MAX_RESPONSE_BYTES:
+                    return ApiRelayResponse(
+                        response.status, response.getheader("Content-Type", ""), b"", True
+                    )
+                chunks.append(chunk)
+            if response.length:
+                # A Content-Length-framed response that closed early: read1
+                # returns b"" on EOF without raising, so a page cut short would
+                # otherwise relay as a well-framed 200 with a truncated body.
+                # Only the chunked path raises this on its own.
+                raise http.client.IncompleteRead(b"".join(chunks), response.length)
+            return ApiRelayResponse(
+                response.status, response.getheader("Content-Type", ""), b"".join(chunks)
+            )
+        finally:
+            connection.close()
 
 
 class GoogleChatRelay:
@@ -4159,6 +4410,62 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     )
 
 
+def api_relay_target_problem(host: str, path: str, query: str) -> tuple[str, str] | None:
+    """Why the request is not in normal form, as ``(code, reason)``, or None.
+
+    Refuses rather than normalises. The policy table in `api_policy` matches
+    exact text, and the property the relay rests on is that what the table
+    saw is what the broker forwards; a normaliser between the two is a second
+    parser that can disagree with the first. So a `..` segment, an empty
+    segment, a percent-encoded slash, a scheme or a port in the host position,
+    or a query byte the upstream request line cannot carry are each a 400 that names the
+    reason and, in ``code``, which part of the request to correct.
+    """
+    if not host:
+        return API_RELAY_BAD_HOST, "the request names no upstream host"
+    if not api_policy.HOST_SHAPE.match(host):
+        return API_RELAY_BAD_HOST, (
+            "the host segment must be a lower-case DNS name with no scheme, port, "
+            "user info or encoding"
+        )
+    if not path:
+        return API_RELAY_BAD_PATH, "the request names no API path"
+    if API_RELAY_ENCODED_SLASH.search(path):
+        return API_RELAY_BAD_PATH, "a percent-encoded slash in the path is not in normal form"
+    for segment in path.split("/"):
+        if segment in API_RELAY_DOT_SEGMENTS:
+            return API_RELAY_BAD_PATH, "an empty, `.` or `..` path segment is not in normal form"
+    if len(query) > API_RELAY_MAX_QUERY_BYTES:
+        return API_RELAY_BAD_QUERY, (
+            f"the query is longer than {API_RELAY_MAX_QUERY_BYTES} bytes; use pageSize and "
+            f"pageToken rather than a longer filter"
+        )
+    if not API_RELAY_QUERY_SHAPE.match(query):
+        return API_RELAY_BAD_QUERY, (
+            "the query may contain only URL query characters (RFC 3986's set plus [ and ]) "
+            "and complete percent-escapes"
+        )
+    return None
+
+
+def strip_credential_query_keys(query: str) -> str:
+    """The query with API_RELAY_STRIPPED_QUERY_KEYS removed and nothing else touched.
+
+    Split on `&` and rejoined rather than parsed and re-encoded, so every pair
+    that stays is forwarded byte-for-byte: the filter grammar is Google's to
+    validate, and a re-encoding here would be a second opinion about it.
+    """
+    kept = []
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        key = urllib.parse.unquote_plus(pair.partition("=")[0])
+        if key in API_RELAY_STRIPPED_QUERY_KEYS:
+            continue
+        kept.append(pair)
+    return "&".join(kept)
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
@@ -4173,6 +4480,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    # The read-only Cloud API relay's credential and transport. Armed by
+    # serve() unconditionally, like the exec route: the shell role always
+    # exists. None only in a test that has not set it, where the route
+    # answers 503.
+    api_relay: GoogleApiRelay | None = None
     base_branch: str = ""
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
@@ -4305,6 +4617,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path != "/healthz" and self._authenticated() is None:
             return
+        if self.path.startswith(API_RELAY_PREFIX):
+            self._handle_api_relay()
+            return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
                 self._json(
@@ -4349,6 +4664,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         principal = self._authenticated()
         if principal is None:
+            return
+        if self.path.startswith(API_RELAY_PREFIX):
+            # Reaches the relay so that the refusal is the policy's
+            # `gcp.api.method`, named in the audit line, rather than a 404
+            # that reads as "no such route". The body is never read.
+            self._handle_api_relay()
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
@@ -4617,6 +4938,229 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if result.kubeconfig:
             response["kubeconfig"] = result.kubeconfig
         self._json(HTTPStatus.OK, response)
+
+    def _handle_api_relay(self) -> None:
+        """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
+
+        The second shape the broker speaks, beside the argv of `/v1/exec`. The
+        caller is already authenticated and its role checked against
+        ROUTE_ROLES by `_authenticated`; what happens here, in order, is the
+        normal-form check on the caller's text, the `api_policy` decision, the
+        upstream request with exactly the broker's two headers, and the
+        passthrough of the upstream's status, `Content-Type` and body. Two
+        audit lines per request, on the exec route's pattern: one before the
+        decision and exactly one verdict -- rejected, blocked, forwarded, or
+        one of the upstream failures. `host` and `path` are caller text and go through
+        `_sanitize_for_logging` as `argv[0]` does. docs/designs/gcp-api-relay.md
+        is the design and its security review names which line stops what.
+        """
+        principal = self.principal
+        request_id = str(uuid.uuid4())
+        if self.command != api_policy.API_READ_METHOD:
+            # A POST is refused below without its body being read, and closing
+            # on unread bytes sends a reset that can swallow the 403. Same
+            # bounded drain the agent API proxy uses for its pre-auth 401.
+            drain_request_body(self, self.max_request_bytes)
+        parts = urllib.parse.urlsplit(self.path)
+        host, _, path = parts.path[len(API_RELAY_PREFIX) :].partition("/")
+        LOGGER.info(
+            "api request_id=%s principal=%s host=%s path=%s",
+            request_id,
+            # Same width as the exec line, for the same reason: this value is
+            # the TokenReview's, and a truncated identity names the wrong
+            # ServiceAccount.
+            _sanitize_for_logging(
+                principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
+            ),
+            _sanitize_for_logging(host),
+            _sanitize_for_logging(path, max_length=API_RELAY_PATH_LOG_LENGTH),
+        )
+        problem = api_relay_target_problem(host, path, parts.query)
+        if problem is not None:
+            code, reason = problem
+            LOGGER.warning(
+                "api rejected request_id=%s code=%s reason=%s", request_id, code, reason
+            )
+            self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
+            return
+        # From here on `host` has passed api_policy.HOST_SHAPE, so the lines
+        # below log it as-is; `path` is never logged again.
+        decision = api_policy.evaluate(self.command, host, path, parts.query)
+        if not decision.allowed:
+            LOGGER.warning("api blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return
+        if self.api_relay is None:
+            LOGGER.warning("api disabled request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
+            )
+            return
+        try:
+            authorization = self.api_relay.authorization_header()
+        except Exception as exc:
+            # The type and not the message: google-auth's messages can name
+            # the credential file it looked for.
+            LOGGER.warning(
+                "api credential unavailable request_id=%s type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the credential proxy could not obtain its own credential",
+                    "code": "RELAY_CREDENTIAL_UNAVAILABLE",
+                },
+            )
+            return
+        query = strip_credential_query_keys(parts.query)
+        target = f"/{path}?{query}" if query else f"/{path}"
+        started = time.monotonic()
+        try:
+            upstream = self.api_relay.fetch(host, target, authorization)
+        except ApiRelayConnectTimeout:
+            LOGGER.warning(
+                "api upstream connect timeout request_id=%s host=%s connect_timeout_s=%d",
+                request_id,
+                host,
+                API_RELAY_CONNECT_TIMEOUT_S,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return
+        except TimeoutError:
+            LOGGER.warning(
+                "api upstream timeout request_id=%s host=%s deadline_s=%d",
+                request_id,
+                host,
+                API_RELAY_DEADLINE_S,
+            )
+            self._json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {
+                    "error": "the upstream did not answer within the relay deadline",
+                    "code": "UPSTREAM_TIMEOUT",
+                },
+            )
+            return
+        except (UnicodeError, http.client.InvalidURL) as exc:
+            # Belt to the query check's braces: what putrequest raises for a
+            # target it will not send -- a non-ASCII byte, a control character
+            # -- is the caller's text, and a 400 that names it beats a
+            # traceback and a closed connection. UnicodeError and not
+            # ValueError: ssl.SSLCertVerificationError is a ValueError too, and
+            # a TLS fault is the upstream's, answered 502 below.
+            LOGGER.warning(
+                "api rejected request_id=%s code=%s reason=%s",
+                request_id,
+                API_RELAY_BAD_QUERY,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "the request could not be placed on an upstream request line",
+                    "code": API_RELAY_BAD_QUERY,
+                },
+            )
+            return
+        except http.client.IncompleteRead as exc:
+            # The upstream closed before delivering what it announced. Its own
+            # code, so an operator can tell a page cut short from a host that
+            # never answered; nothing of the partial body is relayed.
+            LOGGER.warning(
+                "api upstream truncated request_id=%s host=%s received=%d expected=%d",
+                request_id,
+                host,
+                len(exc.partial),
+                len(exc.partial) + (exc.expected or 0),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "the upstream closed before sending the whole response",
+                    "code": "UPSTREAM_TRUNCATED",
+                },
+            )
+            return
+        except (OSError, http.client.HTTPException) as exc:
+            LOGGER.warning(
+                "api upstream unreachable request_id=%s host=%s type=%s",
+                request_id,
+                host,
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+            )
+            return
+        duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
+        if upstream.over_cap:
+            LOGGER.warning(
+                "api response too large request_id=%s host=%s status=%d cap_bytes=%d",
+                request_id,
+                host,
+                upstream.status,
+                API_RELAY_MAX_RESPONSE_BYTES,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": (
+                        f"the upstream response exceeded {API_RELAY_MAX_RESPONSE_BYTES} "
+                        f"bytes; request a smaller pageSize"
+                    ),
+                    "code": "UPSTREAM_RESPONSE_TOO_LARGE",
+                },
+            )
+            return
+        if HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
+            # Not followed, and not handed to the caller as a redirect either:
+            # a Location the sandbox followed itself would be a request the
+            # policy never saw.
+            LOGGER.warning(
+                "api redirect refused request_id=%s host=%s status=%d",
+                request_id,
+                host,
+                upstream.status,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": (
+                        "the upstream answered with a redirect, which the relay does not follow"
+                    ),
+                    "code": "UPSTREAM_REDIRECTED",
+                },
+            )
+            return
+        LOGGER.info(
+            "api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d",
+            request_id,
+            host,
+            upstream.status,
+            len(upstream.body),
+            duration_ms,
+        )
+        self.send_response(upstream.status)
+        if upstream.content_type:
+            self.send_header("Content-Type", sanitize_header(upstream.content_type))
+        self.send_header("Content-Length", str(len(upstream.body)))
+        self.end_headers()
+        self.wfile.write(upstream.body)
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.
@@ -5236,6 +5780,8 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
+    CredentialProxyHandler.api_relay = GoogleApiRelay()
+    LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

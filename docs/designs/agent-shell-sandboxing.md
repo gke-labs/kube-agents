@@ -2218,7 +2218,8 @@ the `TokenReview` layer. The audience is chosen by the operator, per Pod, and th
 will not validate a token against an audience it was not minted for, so it is a claim the
 caller cannot restate. `ROUTE_ROLES` in `credential_proxy.py` is the table it feeds: the
 sandbox, where every model-authored command runs, cannot reach `/v1/chat/**` at all, and the
-gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`. Neither of those
+gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`; `/v1/gcp/**`, the
+read-only Cloud API relay ([gcp-api-relay.md](gcp-api-relay.md)), is the shell's as well. Neither of those
 two ever needed the other's routes, so this enforces a separation the deployment already
 had and nothing checked. The same table carries a third role, `a2a-chat`, for the A2A
 gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
