@@ -708,8 +708,8 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("accept_no_network_policy   = true", dest.read_text())
 
     def test_tfvars_carry_model_max_tokens(self):
-        # Empty and unset both reach the chart as 0, which renders nothing;
-        # a value is emitted as a bare HCL number, not a string.
+        # Empty and unset both take DEFAULT_MODEL_MAX_TOKENS (0), which renders
+        # nothing; a value is emitted as a bare HCL number, not a string.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             for env, expected in (

@@ -459,9 +459,8 @@ CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
-# Empty means the gateway sets no output-token budget, as an empty
-# MODEL_DEFAULT_NAME means the provider's default model; the tfvars generator
-# turns empty into 0 for the chart.
+# Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
+# as an empty MODEL_DEFAULT_NAME takes the provider's default model.
 PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
 PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
 
@@ -494,10 +493,10 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
-                                request that names none; a request's own max_tokens
-                                still wins. For a self-hosted backend whose prompt and
-                                output share one window (vLLM, SGLang, TGI, llama.cpp).
-                                0 or empty (the default) renders nothing.
+                                request that names none, for a self-hosted backend
+                                whose prompt and output share one window
+                                (default: DEFAULT_MODEL_MAX_TOKENS, currently 0:
+                                no max_tokens is rendered)
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
   --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
                                 (default: DEFAULT_VERTEX_LOCATION, currently global)

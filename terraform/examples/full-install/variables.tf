@@ -277,7 +277,7 @@ variable "model_default_name" {
 }
 
 variable "model_max_tokens" {
-  description = "Output tokens the LiteLLM gateway asks the provider for on a request that names none, rendered as max_tokens under every model_list alias. 0 leaves the key out. A request carrying its own max_tokens keeps it, and the agent image sends one, so this is a default the gateway supplies rather than a cap on the agent; a self-hosted backend whose prompt and output share one window (vLLM, SGLang, TGI, llama.cpp) is what it is for."
+  description = "Output tokens the LiteLLM gateway asks the provider for on a request that names none, rendered as max_tokens under every model_list alias; 0 leaves the key out. For a self-hosted backend whose prompt and output share one window. What it does and does not cap: the site's inference-gateway page, \"Setting the output-token budget\"."
   type        = number
   default     = 0
 

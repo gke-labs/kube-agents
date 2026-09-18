@@ -107,15 +107,13 @@ class TestMaxTokensRender(unittest.TestCase):
         self.assertEqual(set_cm, file_cm)
 
     def test_a_string_or_a_negative_value_fails_the_schema(self) -> None:
-        for args, needle in (
-            (["--set-string", f"{_VALUE}=4096"], "want integer"),
-            (["--set", f"{_VALUE}=-1"], "minimum"),
-        ):
+        # Only the value's name is asserted: the rest of the message belongs to
+        # Helm's schema library, whose wording changed between Helm 3 releases.
+        for args in (["--set-string", f"{_VALUE}=4096"], ["--set", f"{_VALUE}=-1"]):
             with self.subTest(args=args):
                 proc = self._render(args)
                 self.assertNotEqual(proc.returncode, 0)
-                self.assertIn("/litellm/maxTokens", proc.stderr)
-                self.assertIn(needle, proc.stderr)
+                self.assertIn("maxTokens", proc.stderr)
 
 
 if __name__ == "__main__":

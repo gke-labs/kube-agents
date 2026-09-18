@@ -237,9 +237,9 @@ litellm:
   # were. Set it for a backend with one combined prompt-plus-output budget
   # (vLLM, SGLang, TGI, llama.cpp), which refuses a request whose max_tokens
   # alone fills the served window. A request that carries its own max_tokens
-  # keeps it, because LiteLLM lets the caller's value win, and the pinned
-  # agent image sends one on every request: until that image stops doing so,
-  # this is a default the gateway supplies, not a cap it enforces.
+  # keeps it: what that means for the agent's own traffic is on the site's
+  # inference-gateway page, "Setting the output-token budget". Chart-only;
+  # the kustomize dev base carries no such key.
   maxTokens: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload

@@ -1740,12 +1740,12 @@ write_tfvars_from_state() {
     fi
   fi
 
-  # Empty and 0 both mean "no gateway default", which the chart renders as
-  # nothing. Checked here as well as in install.sh's interview because
-  # upgrade.sh and uninstall.sh regenerate from install.env without it, and a
-  # bare word in HCL would otherwise fail at terraform's parser with a message
-  # naming neither the key nor the file to fix.
-  local model_max_tokens="${MODEL_MAX_TOKENS:-0}"
+  # Empty takes the default, 0, and both render nothing in the chart. Checked
+  # here as well as in install.sh's interview because upgrade.sh and
+  # uninstall.sh regenerate from install.env without it, and a bare word in
+  # HCL would otherwise fail at terraform's parser with a message naming
+  # neither the key nor the file to fix.
+  local model_max_tokens="${MODEL_MAX_TOKENS:-$DEFAULT_MODEL_MAX_TOKENS}"
   if ! is_non_negative_integer "$model_max_tokens"; then
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
