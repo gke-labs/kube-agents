@@ -259,6 +259,11 @@ for a week, so a pool that filled on Monday and drained by Tuesday would
 otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The
 two ⚪ messages below are exempt; neither advises anything.
 
+After the queue drains the dashboard and the digest keep reporting the episode,
+in the past tense. `runs not starting` needs the queue read too: it means the
+pool looked fine so Prow must be at fault, which holds only while something is
+queued. Unread, the message gives the free count and apportions no blame.
+
 `concurrency cap` (raise it), `runs not starting` (projects were free, so the
 delay is Prow's; the message names the build cluster) and `queue backed up`
 (the job could not read how many projects were in use) carry the same lines

@@ -529,6 +529,8 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 # The captured queue's longest wait: 150 minutes, the run that
                 # also makes over_threshold non-zero.
                 "waiting_longest_s": int(max(r["minutes"] for r in doc["queue"]["waiting_runs"]) * 60),
+                # That 150 minutes against the captured 15 minute p50 limit.
+                "waiting_now": True,
                 "over_threshold": doc["queue"]["over_threshold"],
                 "threshold_p50_s": int(doc["thresholds"]["p50_minutes"] * 60),
                 "threshold_p95_s": int(doc["thresholds"]["p95_minutes"] * 60),

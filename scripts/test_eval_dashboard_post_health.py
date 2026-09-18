@@ -116,7 +116,14 @@ def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:
     if verdict == "STALE":
         # health.py strips every number from a stale note.
         note = {"since": since, "verdict": verdict, "measured_at": note["measured_at"]}
-    return note | over
+        return note | over
+    note = note | over
+    if "waiting_now" not in over:
+        # Derived as health.pool_note derives it, so a test that moves the queue
+        # does not also have to restate the answer -- and cannot state a wrong one.
+        longest, limit = note.get("waiting_longest_s"), note.get("threshold_p50_s")
+        note["waiting_now"] = None if longest is None or limit is None else longest > limit
+    return note
 
 
 def pooled(wait_s=None, **note):
@@ -629,6 +636,29 @@ class Digest(RunHarness):
             " p95 61 min against 45.",
         )
 
+    def test_the_digest_drops_the_present_tense_once_the_queue_drains(self):
+        # The verdict lasts a week, so most mornings of an episode find nothing
+        # queued. "Queue backed up" then sends a reader after a jam that ended
+        # days ago; the numbers still stand, and the tense is what has to move.
+        drained = {"waiting_longest_s": 0, "over_threshold": 0}
+        self.tick(pooled(wait_s=22 * 60, **drained), T0.replace(hour=7))
+        self.tick(pooled(wait_s=22 * 60, **drained), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[-1].split("\n")[1],
+            "⏳ Queue was backed up — last 3h: median wait 22 min against a 15 min limit;"
+            " p95 61 min against 45. Nothing waiting right now.",
+        )
+
+    def test_the_digest_claims_no_all_clear_when_the_queue_was_not_read(self):
+        # Deck unread is not the same as an empty queue: past tense, because
+        # nothing measured a backlog this tick, but no "nothing waiting" either.
+        unread = {"waiting_longest_s": None, "over_threshold": 0}
+        self.tick(pooled(wait_s=22 * 60, **unread), T0.replace(hour=7))
+        self.tick(pooled(wait_s=22 * 60, **unread), self.at(DIGEST_UTC, 5))
+        line = self.opener.texts[-1].split("\n")[1]
+        self.assertTrue(line.startswith("⏳ Queue was backed up — last 3h:"), line)
+        self.assertNotIn("Nothing waiting", line)
+
     def test_the_digest_falls_back_to_the_worst_day_when_the_recent_stretch_is_too_thin(self):
         thin = {"day": "2026-09-03", "window_hours": None}
         self.tick(pooled(wait_s=22 * 60, **thin), T0.replace(hour=7))
@@ -803,6 +833,21 @@ class PoolNote(RunHarness):
         )
         self.assertEqual(lines[1], "Check the build cluster: kube-agents-prow, project kube-agents-prow.")
         self.assertIn("median wait 22 min", lines[2])
+
+    def test_the_control_plane_remedy_is_withheld_when_the_queue_was_not_read(self):
+        # The cause is a residual -- the pool looks fine, so Prow must be at
+        # fault -- and that only follows while something is queued. Here the
+        # free count is live and the waits can be six days old, so sending
+        # someone to the build cluster on that pairing finds nothing wrong.
+        self.tick(pooled(cause="CONTROL_PLANE", free=25, waiting_longest_s=None), self.at(10))
+        lines = self.first()
+        self.assertEqual(
+            lines[0],
+            "⏳ *Smoke gate: queue backed up* — 25 of 30 projects are free, but the job could not"
+            " read the queue, so this bot cannot say whether Prow or the pool is at fault.",
+        )
+        self.assertNotIn("Check the build cluster", "\n".join(lines))
+        self.assertNotIn("rather than the pool", "\n".join(lines))
 
     def test_an_unreadable_pool_asks_for_nothing(self):
         self.tick(pooled(cause="UNKNOWN"), self.at(10))

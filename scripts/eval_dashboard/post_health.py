@@ -310,23 +310,16 @@ def pool_was_read(health: dict) -> bool:
 
 
 def pool_advisable(pool: dict) -> bool:
-    """Whether the note is worth posting, and whether its verdict is worth
-    recording as told. The two answers have to match: a breach withheld here
-    but written to `pool_verdict` reads later as already said, and the next
-    live queue under the same cause would then go unannounced.
+    """Whether the note is worth posting, and worth recording as told. The two
+    answers have to match: a breach withheld here but written to `pool_verdict`
+    reads later as already said, and the next live queue under the same cause
+    would go unannounced.
 
-    The queue has to have been waiting a while, against the same p50 limit the
-    periodic breaches a day on. Neither end of the scale works alone: the
-    subset past p95 misses a pool full all afternoon at half an hour a run,
-    which is the incident this message is for, and any queued run at all
-    admits one triggered seconds ago, which is not a backlog and would let a
-    week-old verdict re-post under a freshly read remedy. `None` means Deck was
-    not read, which is not an answer -- an unreadable queue withholds nothing.
+    A breach needs a live backlog, because the verdict lasts a week while the
+    remedy is read fresh each hour. Unknown is not a refusal -- an unreadable
+    queue withholds nothing, and `pool_cause_text` drops the diagnosis instead.
     """
-    if pool.get("verdict") != POOL_BREACH:
-        return True
-    longest = pool.get("waiting_longest_s")
-    return longest is None or longest > (pool.get("threshold_p50_s") or 0)
+    return pool.get("verdict") != POOL_BREACH or pool.get("waiting_now") is not False
 
 
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:
@@ -696,9 +689,21 @@ def pool_cause_text(pool: dict) -> str:
             f" but the concurrency cap is only {figure(pool.get('max_concurrency'))}. Raise the cap."
         )
     if cause == CAUSE_CONTROL_PLANE:
-        # The queue and the occupancy are read in one pass, and decide() posts
-        # this only while runs are waiting, so both describe one moment. That
-        # is what used to need "looks like".
+        if pool.get("waiting_now") is None:
+            # This cause is a residual: the pool looks fine, so Prow must be at
+            # fault. That only follows while something is queued, and here the
+            # queue was not read -- the free count is live, the waits can be six
+            # days old. Send someone to the build cluster on that pairing and
+            # they find nothing wrong, which is what the verdict's week-long
+            # reach costs when nothing checks it.
+            return (
+                f"*Smoke gate: queue backed up* — {figure(pool.get('free'))} of"
+                f" {figure(pool.get('total'))} projects are free, but the job could not read"
+                " the queue, so this bot cannot say whether Prow or the pool is at fault."
+            )
+        # The queue and the occupancy are read in one pass, and both this and
+        # decide() require a live backlog, so both describe one moment. That is
+        # what used to need "looks like".
         return (
             f"*Smoke gate: runs not starting* — {figure(pool.get('free'))} of"
             f" {figure(pool.get('total'))} projects"
@@ -858,19 +863,26 @@ def pool_digest_line(pool: dict) -> str:
         return f"⚪ No pool numbers{since} — {POOL_PRESSURE_JOB} has stopped reporting."
     if verdict == POOL_UNMEASURED:
         return "⚪ Queue wait unknown — the hourly pool check couldn't read how long recent runs waited."
+    # The verdict lasts a week, so most mornings of an episode find the queue
+    # already drained. Saying "is backed up" then sends a reader to look for a
+    # jam that ended on Monday. Three tenses, one per thing known: it is, it
+    # was and has cleared, it was and the queue went unread.
+    live = pool.get("waiting_now")
+    headline = "⏳ Queue backed up" if live else "⏳ Queue was backed up"
+    cleared = "" if live is not False else " Nothing waiting right now."
     span = pool_span(pool)
     if not span:
         waiting = pool.get("over_threshold") or 0
         return (
-            f"⏳ Queue backed up — {waiting} {plural(waiting, 'run')} waiting"
-            f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
+            f"{headline} — {waiting} {plural(waiting, 'run')} waiting"
+            f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit.{cleared}"
         )
     # Both figures, as pool_numbers does: the stretch breaches on p50 or p95, so
     # the median on its own can be a passing number standing in as the reason.
     return (
-        f"⏳ Queue backed up — {span}:"
+        f"{headline} — {span}:"
         f" median wait {wait_text(pool.get('p50_s'))} against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
-        f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
+        f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}.{cleared}"
     )
 
 

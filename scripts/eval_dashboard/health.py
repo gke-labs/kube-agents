@@ -1172,20 +1172,23 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     quotable = bool(recent.get("judged")) and _over_limit(recent, thresholds)
     day = {} if quotable else (_worst_breached_day(trend, thresholds) or {})
     source = recent if quotable else day
+    longest = _longest_wait_s(_section(artifact, "queue"))
+    limit_p50 = _as_seconds(thresholds.get("p50_minutes"))
     return note | {
         "day": day.get("day"),
         "window_hours": recent.get("hours") if quotable else None,
         "p50_s": _as_seconds(source.get("p50_minutes")),
         "p95_s": _as_seconds(source.get("p95_minutes")),
-        # How long the longest run has been waiting for a project right now,
-        # which is what gates the message: a run triggered seconds ago is not a
-        # backlog, and `over_threshold` -- the subset already past the p95
-        # limit, which the periodic breaches on and the CONTROL_PLANE line
-        # quotes -- is the other end of the same scale and misses a pool that
-        # has been full all afternoon at half an hour a run.
-        "waiting_longest_s": _longest_wait_s(_section(artifact, "queue")),
+        # The longest current wait, and whether it is a backlog. Judged once
+        # here: the alert, the digest and the Brief all ask, and a verdict
+        # lasting a week outlives the queue that earned it. Against the p50
+        # limit, the periodic's own bar for a bad day -- `over_threshold`, the
+        # subset already past p95, misses a pool full all afternoon at half an
+        # hour a run. None when nothing can answer: Deck unread, or no limit.
+        "waiting_longest_s": longest,
+        "waiting_now": None if longest is None or limit_p50 is None else longest > limit_p50,
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
-        "threshold_p50_s": _as_seconds(thresholds.get("p50_minutes")),
+        "threshold_p50_s": limit_p50,
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
         "free": pool.get("free"),
         "total": pool.get("total"),

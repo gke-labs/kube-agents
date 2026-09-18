@@ -937,6 +937,7 @@ class PoolNote(unittest.TestCase):
                 "p50_s": 1446,
                 "p95_s": 9438,
                 "waiting_longest_s": 0,
+                "waiting_now": False,
                 "over_threshold": 0,
                 "threshold_p50_s": 900,
                 "threshold_p95_s": 2700,
@@ -1058,6 +1059,25 @@ class PoolNote(unittest.TestCase):
         self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 0)
         artifact["queue"]["read"] = False
         self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_longest_s"])
+
+    def test_whether_the_queue_is_a_backlog_is_judged_once_for_every_reader(self):
+        # The alert, the digest line and the Brief sentence all ask it, so the
+        # answer is derived here rather than three times. The bar is the p50
+        # limit, and it is strict: a wait exactly at the limit is not over it.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        limit = artifact["thresholds"]["p50_minutes"]
+        for name, minutes, expected in (("over", limit + 0.5, True), ("at", limit, False), ("under", limit - 0.5, False)):
+            with self.subTest(name):
+                artifact["queue"]["waiting_runs"] = [{"minutes": minutes, "pull": 1}]
+                self.assertIs(health.pool_note(artifact, T0, None)["waiting_now"], expected)
+        # Two ways to have no answer, and neither may read as "nothing is
+        # waiting": the readers say less on None instead of claiming it cleared.
+        artifact["queue"]["read"] = False
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_now"])
+        artifact["queue"]["read"] = True
+        artifact["queue"]["waiting_runs"] = [{"minutes": limit + 99, "pull": 1}]
+        artifact["thresholds"].pop("p50_minutes")
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_now"])
 
     def test_a_malformed_waiting_queue_costs_the_figure_not_the_tick(self):
         # Same filter as the rest of the artifact reader: the adjudicate step

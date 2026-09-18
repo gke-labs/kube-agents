@@ -247,6 +247,9 @@ function normalizeHealth(raw) {
       window_hours: count(pool.window_hours),
       p50_s: count(pool.p50_s),
       p95_s: count(pool.p95_s),
+      // Tri-state, so only a real bool passes: null is "Deck was not read",
+      // and the sentence must not reach it through a malformed field.
+      waiting_now: typeof pool.waiting_now === "boolean" ? pool.waiting_now : null,
       over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
       threshold_p95_s: count(pool.threshold_p95_s),
@@ -300,7 +303,13 @@ function poolSentence(h) {
     found.push(`${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`);
   }
   if (!found.length) return "";
-  return ` Runs are waiting to start${since}: ${found.join("; ")}. Runs still pass; /retest makes the queue longer.`;
+  // health.pool_note's waiting_now. The verdict lasts a week, so most renders
+  // of an episode find the queue already drained, and "are waiting" then sends
+  // a reader looking for a jam that ended on Monday. Null is Deck unread: past
+  // tense, but no claim that it cleared either.
+  const live = p.waiting_now;
+  const cleared = live === false ? " Nothing is queued right now." : "";
+  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
 }
 
 /* ---- URL contract ---- */

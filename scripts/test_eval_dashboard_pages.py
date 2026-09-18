@@ -204,18 +204,21 @@ class HealthInputsTest(unittest.TestCase):
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
-        # The rule-8 note, same treatment: the nine fields the lede reads, and
-        # a verdict the page does not know about is dropped rather than shown.
+        # The rule-8 note, same treatment: the fields the lede reads, and a
+        # verdict the page does not know about is dropped rather than shown.
         self.assertIsNone(minimal["pool"])
         note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
-                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "over_threshold": 2, "threshold_p50_s": 900,
-                "threshold_p95_s": 2700, "free": 0, "total": 30, "cause": "CAPACITY"}
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "waiting_now": True, "over_threshold": 2,
+                "threshold_p50_s": 900, "threshold_p95_s": 2700, "free": 0, "total": 30, "cause": "CAPACITY"}
         self.assertEqual(
             render.normalize_health(health_doc("GREEN", pool=note))["pool"],
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
-             "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "over_threshold": 2,
-             "threshold_p50_s": 900, "threshold_p95_s": 2700},
+             "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
+             "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
         )
+        # Tri-state: the page reads null as "Deck was not read", so a field that
+        # is not a real bool has to arrive as null rather than as a truthy string.
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"waiting_now": "yes"}))["pool"]["waiting_now"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"verdict": "WEDGED"}))["pool"]["verdict"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"p50_s": "ages"}))["pool"]["p50_s"])
         # `day` is printed verbatim, so it is shape-checked and not merely
@@ -689,7 +692,8 @@ class BrowserTest(unittest.TestCase):
         # health.py's rule-8 note, dated 8:00 AM ET on the page's Tuesday.
         # Unlike 🐢 it also rides on an incident lede, so both are rendered.
         note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
-                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "threshold_p50_s": 900, "threshold_p95_s": 2700}
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
+                "threshold_p50_s": 900, "threshold_p95_s": 2700}
         sentence = ("Runs are waiting to start since Tue 8:00 AM ET: on 2026-09-07 the median wait was 22 min against"
                     " a 15 min limit, p95 61 min against 45. Runs still pass; /retest makes the queue longer.")
         healthy = dom_text(render_to(pathlib.Path(self.tmp.name) / "pool", self.data, health=health_doc("GREEN", pool=note)) / "index.html")
@@ -728,6 +732,19 @@ class BrowserTest(unittest.TestCase):
                                   health=health_doc("GREEN", pool=note | {"day": "yesterday", "over_threshold": 3})) / "index.html")
         self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", junk)
         self.assertNotIn("yesterday", junk)
+        # The verdict lasts a week, so most renders of an episode find the queue
+        # already drained. The lede keeps the episode but stops claiming a jam.
+        drained = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooldrained", self.data,
+                                     health=health_doc("GREEN", pool=note | {"waiting_now": False})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET: on 2026-09-07 the median wait was 22 min", drained)
+        self.assertIn("p95 61 min against 45. Nothing is queued right now.", drained)
+        self.assertNotIn("Runs are waiting", drained)
+        # Deck unread is not the same answer: past tense, because nothing
+        # measured a queue this tick, but no claim that it cleared either.
+        unread = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolunread", self.data,
+                                    health=health_doc("GREEN", pool=note | {"waiting_now": None})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET", unread)
+        self.assertNotIn("Nothing is queued", unread)
         # A stopped periodic says so instead of quoting a reading hours old.
         stale = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolstale", self.data,
                                    health=health_doc("GREEN", pool={"verdict": "STALE", "measured_at": "2026-09-08T13:23:00+00:00"})) / "index.html")

@@ -571,6 +571,10 @@ def normalize_health(raw) -> dict | None:
             "window_hours": pool.get("window_hours") if is_count(pool.get("window_hours")) else None,
             "p50_s": pool.get("p50_s") if is_count(pool.get("p50_s")) else None,
             "p95_s": pool.get("p95_s") if is_count(pool.get("p95_s")) else None,
+            # Tri-state, so it is passed through only when it is a real bool:
+            # the page reads null as "Deck was not read" and must not get that
+            # answer from a malformed field.
+            "waiting_now": pool.get("waiting_now") if isinstance(pool.get("waiting_now"), bool) else None,
             "over_threshold": pool.get("over_threshold") if is_count(pool.get("over_threshold")) else None,
             "threshold_p50_s": pool.get("threshold_p50_s") if is_count(pool.get("threshold_p50_s")) else None,
             "threshold_p95_s": pool.get("threshold_p95_s") if is_count(pool.get("threshold_p95_s")) else None,
