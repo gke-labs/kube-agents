@@ -127,8 +127,14 @@ const (
 	// re-emitting a pod's FailedScheduling before the event describes a pod
 	// that is no longer pending. kube-scheduler retries every unschedulable
 	// pod at least every five minutes (its unschedulable-queue flush), each
-	// retry bumping the event's count and LastTimestamp, so a pod still stuck
-	// always has a sighting fresher than this. The check exists for the
+	// retry bumping the event's count and LastTimestamp, so on the core/v1
+	// recorder a pod still stuck always has a sighting fresher than this. An
+	// events.k8s.io/v1 recorder (upstream kube-scheduler, so GKE Standard)
+	// writes a continuing series back to the API server on a 30-minute
+	// refresh, so there a stuck pod's sighting can read up to 30 minutes old
+	// and this check delays its card to the next refresh (observed live: a
+	// declined pod held at "25m13s ago", fired at the refresh six minutes
+	// later); it never silences it. The check exists for the
 	// informer's initial list: after a restart it replays every event still
 	// inside the API server's TTL, and a FailedScheduling whose pod scheduled
 	// while the watcher was down arrives with a count past the backstop and a
