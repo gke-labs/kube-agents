@@ -1638,10 +1638,19 @@ def _pr_api(kind: str = "issues", number: int = 7, repo: str = _PR_REPO) -> str:
     return f"https://api.github.com/repos/gke-agentic/{repo}/{kind}/{number}"
 
 
-def _pr_payload(created_at: str = "2026-08-21T09:00:30Z", *, as_issue: bool = True) -> dict:
+def _pr_repo_api(repo: str = _PR_REPO) -> str:
+    return f"https://api.github.com/repos/gke-agentic/{repo}"
+
+
+def _pr_payload(
+    created_at: str = "2026-08-21T09:00:30Z",
+    updated_at: str | None = None,
+    *,
+    as_issue: bool = True,
+) -> dict:
     """What either endpoint returns. The issues endpoint marks a pull request
     with a `pull_request` sub-object; the pulls endpoint returns `head`."""
-    body = {"number": 7, "created_at": created_at}
+    body = {"number": 7, "created_at": created_at, "updated_at": updated_at or created_at}
     body["pull_request" if as_issue else "head"] = {"ref": "platform-agent/fix"}
     return body
 
@@ -1673,13 +1682,29 @@ def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
     """The defect this check exists for (#1755). Nothing sweeps the GitOps
     repository, so rep 1's pull request is still there for rep 2 to link. The
-    URL, the repository and the number are all identical to a real pass; only
-    created_at tells them apart."""
+    URL, the repository and the number are all identical to a real pass; the
+    stamps are what tell them apart, and a run that only quotes the URL moves
+    neither of them."""
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "BEFORE this run started" in res.reason
+
+
+def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
+    """submit_suggestion.py derives the branch from the change, so rep 2 pushes
+    onto rep 1's branch, `gh pr create` answers "already exists", and the skill
+    edits that pull request and returns its URL. Graded on created_at alone,
+    the rep that did the work would read as the rep that quoted it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T09:04:00Z"),
+    )
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "updated at 2026-08-21T09:04:00" in res.reason
 
 
 def test_a_pull_request_opened_seconds_before_the_run_is_still_stale(token, github):
@@ -1691,9 +1716,10 @@ def test_a_pull_request_opened_seconds_before_the_run_is_still_stale(token, gith
 
 
 def test_an_invented_pull_request_url_is_a_fail(token, github):
-    """No route registered, so both endpoints 404: the substring check this
-    replaces passed on exactly this report."""
+    """Neither endpoint has the number, but the repository is there: the
+    substring check this replaces passed on exactly this report."""
     _stash_pr_report()
+    github.routes[_pr_repo_api()] = (200, {"full_name": f"gke-agentic/{_PR_REPO}"})
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "no such pull request" in res.reason
@@ -1758,6 +1784,22 @@ def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, githu
     res = _pr_check().verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+def test_a_repository_the_installation_cannot_see_is_an_error(token, github):
+    """The ledger App is `repository_selection: selected`, and a repository
+    outside the list answers 404 exactly as a missing number does. Read as
+    absence, an onboarding gap on one pool project would grade every real pull
+    request the agent opens there as invented."""
+    _stash_pr_report()
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "add it to the App installation" in res.reason
+    assert [url for url, _ in github.calls] == [
+        _pr_api(),
+        _pr_api("pulls"),
+        _pr_repo_api(),
+    ]
 
 
 def test_a_404_after_a_denial_is_an_error_not_a_missing_pull_request(token, github):
@@ -1830,17 +1872,27 @@ def test_no_task_still_grades_a_pull_request_by_substring():
     tasks = sorted((Path(__file__).resolve().parents[1] / "tasks").glob("*/task.yaml"))
     assert tasks, "no task specs found"
     offenders = []
+
+    # Recursive, like validate_bench_cases.py's own walk: leaf checks nest
+    # under `all`/`any`/`none` to any depth, so reading the top node only would
+    # miss a wrapped one.
+    def walk(node, where):
+        if not isinstance(node, dict):
+            return
+        for child in node.get("checks") or []:
+            walk(child, where)
+        if node.get("type") != "report_contains":
+            return
+        phrases = (node.get("required_phrases") or []) + (
+            node.get("any_of_phrases") or []
+        )
+        if any("/pull/" in p for p in phrases):
+            offenders.append(where)
+
     for path in tasks:
         spec = yaml.safe_load(path.read_text())
         for entry in spec.get("verification_spec") or []:
-            check = entry.get("check") or {}
-            if check.get("type") != "report_contains":
-                continue
-            phrases = (check.get("required_phrases") or []) + (
-                check.get("any_of_phrases") or []
-            )
-            if any("/pull/" in p for p in phrases):
-                offenders.append(f"{path.parent.name}/{entry.get('name')}")
+            walk(entry.get("check"), f"{path.parent.name}/{entry.get('name')}")
     assert not offenders, (
         "report_contains cannot tell this run's pull request from a previous "
         f"rep's; use pull_request_opened: {offenders}"

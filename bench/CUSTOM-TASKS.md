@@ -493,21 +493,24 @@ repository, and the URL comes back in the final answer: `submit_suggestion.py` r
 `report_contains` over `["github.com/", "/pull/"]` was the first way to grade that, and it cannot
 work. It reads the reply as text and fetches nothing, so an invented URL passes — and nothing
 sweeps the GitOps repositories between repetitions, so the pull request rep 1 opened is still
-there for rep 2 and rep 3 to link. The repeats of a case were grading each other's leftovers
-(#1755).
+there for rep 2 and rep 3 to link. The repeats of a case were grading each other's leftovers.
 
-`pull_request_opened` resolves the URL instead and compares GitHub's `created_at` against
+`pull_request_opened` resolves the URL instead and compares GitHub's stamps against
 `TranscriptSnapshot.started_at`, less `max_clock_skew_sec` for the gap between the Prow runner's
-clock and the agent pod's. Only a pull request this run opened passes. `owner: gke-agentic` pins
-the organisation, which is a fair exact match across every pool project and breaks loudly if the
-organisation ever moves.
+clock and the agent pod's. Created during the run passes, and so does updated during it: the
+skill derives the branch from the change, so a later repetition pushes onto the branch the first
+one used and edits the pull request already open on it. A leftover the run merely quotes moves
+neither stamp. `owner: gke-agentic` pins the organisation, which is a fair exact match across
+every pool project and breaks loudly if the organisation ever moves.
 
 It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`
 mints that token for every fan-out unit, not only the audit ones. It asks `/repos/{o}/{r}/issues/{n}`
 first, because a pull request is an issue to that API and `issues: read` is what the ledger App
 carries; `/pulls/{n}` is tried only when that is denied or absent. Denied by both is
 `status: "error"` naming `pull_requests: read` as the permission to add — never a fail, since a
-credential gap is not the agent opening nothing.
+credential gap is not the agent opening nothing. 404 from both costs one more call, `/repos/{o}/{r}`:
+a repository the installation was never given answers 404 exactly as a missing number does, and
+only the repository's own visibility tells those apart.
 
 ##### Addressing a seeded-fleet fixture by role
 

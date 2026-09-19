@@ -14,11 +14,12 @@
 
 """Leaf verifiers this repository adds to devops-bench's own.
 
-Three of them answer the half of a task's exact checks that cluster state
+Four of them answer the half of a task's exact checks that cluster state
 cannot: did the *report* name the thing we planted, did the agent *call* the
-tools it claims to have used, and — for the fleet audits, whose SOPs
-deliberately keep the chat reply to one line — does the *ledger issue the run
-published* carry the finding. All three read the per-run stash in
+tools it claims to have used, — for the fleet audits, whose SOPs deliberately
+keep the chat reply to one line — does the *ledger issue the run published*
+carry the finding, and did the *pull request* the reply links get opened by
+this run rather than an earlier one. All four read the per-run stash in
 :mod:`kube_agents_bench.transcript`, and all three fail closed: an empty
 stash is ``status="error"`` — the check could not be evaluated — never a pass
 or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
@@ -942,9 +943,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
-    ``owner`` when one is set; and it was created at or after this run started,
-    less ``max_clock_skew_sec``. One surviving candidate is enough — a reply may
-    link the ticket it came from beside the fix.
+    ``owner`` when one is set; and it was written -- created or updated -- at or
+    after this run started, less ``max_clock_skew_sec``. Updating counts because
+    the skill reuses a branch and edits the pull request already open on it. One
+    surviving candidate is enough — a reply may link the ticket it came from
+    beside the fix.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -953,7 +956,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     that answers 401/403/404, which separates a number that is not there from a
     credential that cannot see pull requests. Denied by both is
     ``status="error"`` naming the permission to add, never a fail: an
-    unreadable API is the absence of an observation.
+    unreadable API is the absence of an observation. 404 on both is the same
+    answer for a repository the installation was never given, so the repository
+    itself is fetched (``metadata: read``) before that reads as absence.
     """
 
     type: Literal["pull_request_opened"]
@@ -992,7 +997,20 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"{LEDGER_TOKEN_ENV_VARS[0]} — so this check could not be evaluated"
             )
         if status_code == 404:
-            return None, None
+            # 404 is also how an installation answers for a repository it was
+            # never given (`repository_selection: selected`, docs/ci-pool-
+            # projects.md §5.4). `metadata: read` separates the two, so an
+            # onboarding gap is not reported as the agent having opened nothing.
+            repo_status, _ = _http_get_json(base, token, budget)
+            if repo_status == 200:
+                return None, None
+            return None, (
+                f"GitHub answered 404 for {owner}/{repo}#{number} and {repo_status} "
+                f"for {owner}/{repo} itself: either that repository does not exist "
+                f"or the token behind {LEDGER_TOKEN_ENV_VARS[0]} was never given it "
+                "— add it to the App installation — so this check could not be "
+                "evaluated"
+            )
         if status_code != 200 or not isinstance(payload, dict):
             return None, (
                 f"unexpected GitHub response {status_code} for "
@@ -1076,18 +1094,33 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if created is None:
                 rejected.append(f"{slug}: GitHub returned no readable created_at")
                 continue
-            age = (started - created).total_seconds()
+            # Creation is not the only way a run owns a pull request. The
+            # submit-suggestion skill derives the branch from the change, so a
+            # later rep pushes onto the branch the first one used, `gh pr
+            # create` answers "already exists", and the skill edits that pull
+            # request and returns its URL. The work happened; it shows up in
+            # `updated_at`. A run that only quotes a leftover URL moves neither
+            # stamp, which is the case this check exists to fail.
+            updated = _parse_github_time(payload.get("updated_at"))
+            touched = updated if updated and updated > created else created
+            age = (started - touched).total_seconds()
             if age > self.max_clock_skew_sec:
                 rejected.append(
-                    f"{slug}: created at {created.isoformat()}, {age:.0f}s BEFORE "
-                    f"this run started ({started.isoformat()}) — a previous run's "
-                    "pull request, still in the repository because nothing sweeps it"
+                    f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
+                    f"BEFORE this run started ({started.isoformat()}) — a previous "
+                    "run's pull request, quoted rather than worked on, still in the "
+                    "repository because nothing sweeps it"
                 )
                 continue
             return done(
                 True,
-                f"{slug} was created at {created.isoformat()}, during this run",
-                raw={"pull_request": slug, "created_at": created.isoformat()},
+                f"{slug} was {'opened' if touched == created else 'updated'} at "
+                f"{touched.isoformat()}, during this run",
+                raw={
+                    "pull_request": slug,
+                    "created_at": created.isoformat(),
+                    "updated_at": updated.isoformat() if updated else None,
+                },
             )
 
         return done(
