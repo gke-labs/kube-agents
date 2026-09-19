@@ -265,8 +265,9 @@ verification_spec:
       forbidden_phrases: ["<Action Title>", "<letter>", "<1-sentence"]
 
   # Cluster-state safeguard: "the fleet came out the way it went in."
-  # tool_called cannot see worker mutations (the trajectory carries only the
-  # delegating turn's calls), so read-only is asserted against the cluster
+  # tool_called cannot see worker mutations (it counts only the delegating
+  # turn's calls; the workers' entries in the trajectory are tagged and
+  # skipped), so read-only is asserted against the cluster
   # itself: the planted defect object must survive the triage untouched.
   # Addressed by fixture ROLE. `fleet_resource_property` resolves
   # `fixture_role` to the kubeconfig the runner wrote for whichever cluster

@@ -34,7 +34,8 @@ Environment:
     AGENT_NAMESPACE: Namespace of the service (default ``kubeagents-system``).
     AGENT_CLUSTER_CONTEXT: Optional kubectl context for the port-forward.
     AGENT_CONTAINER: Container to exec into when reading back a delegated card's
-        artifacts and clearing its state (default ``platform-agent``).
+        artifacts and its workers' session stores, and when clearing its state
+        (default ``platform-agent``).
     AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default
         ``model-default``, the name the operator pins on ``/v1/models`` via
         ``API_SERVER_MODEL_NAME`` and the one LiteLLM actually serves).
@@ -72,7 +73,7 @@ from typing import Any
 
 from devops_bench.agents import AgentHarness, AgentResult
 
-from kube_agents_bench import transcript
+from kube_agents_bench import transcript, worker_trajectory
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -123,9 +124,10 @@ _MAX_ARTIFACT_BYTES = 20000
 # a report, not a directory tree, and each file costs a round trip.
 _MAX_ARTIFACTS = 8
 
-# Ceiling on one kubectl exec. Reading a capped file or deleting a handful of
-# directories is near-instant; anything slower is a cluster problem, and both
-# callers would rather give up than hold the run open.
+# Ceiling on one kubectl exec. Reading a capped file, querying a session store
+# for one run's cards or deleting a handful of directories is near-instant;
+# anything slower is a cluster problem, and every caller would rather give up
+# than hold the run open.
 _EXEC_TIMEOUT = 60.0
 
 _PF_LOCK = threading.Lock()  # guards the three registries below
@@ -481,9 +483,11 @@ def _append_delivered(
 ) -> None:
     """Append each finished card's own result to the text the judge grades.
 
-    The worker runs as a separate hermes session, so its card result is the one
-    part of its work that crosses back; without this the graded answer is only
-    the router's closing message. ``observed`` is the status turns' trajectory
+    The worker runs as a separate hermes session, so its card result is the
+    part of its work that crosses back through the conversation (its tool
+    calls are read from its session store separately, see
+    :mod:`kube_agents_bench.worker_trajectory`); without this the graded
+    answer is only the router's closing message. ``observed`` is the status turns' trajectory
     rather than ``result.trajectory``, so the polls inform the answer without
     being graded as the agent's tool use.
     """
@@ -554,9 +558,11 @@ _LOG_ABSENT = "__NO_WORKER_LOG__"
 def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]] | None:
     """Every terminal command the delegated workers ran, from their card logs.
 
-    The worker is a separate hermes session and its tool calls never reach
-    ``result.trajectory`` (see ``ToolCalledVerifier``), but its log records
-    each terminal command it executed. Read here, before ``_purge_card_state``
+    The worker is a separate hermes session; its tool calls reach
+    ``result.trajectory`` only through the session-store read in
+    :mod:`kube_agents_bench.worker_trajectory`, tagged so that
+    ``ToolCalledVerifier`` skips them, and its log records each terminal
+    command it executed. Read here, before ``_purge_card_state``
     deletes the log, and stashed for the ``worker_commands`` verifier -- the
     one check that can say which route a worker took, not only what it
     answered. Only terminal commands are visible; MCP tool calls are not.
@@ -1006,9 +1012,12 @@ class KubeAgentsHarness(AgentHarness):
     ) -> str:
         """Poll the agent until every card it filed settles.
 
-        Only two things reach ``result``: the delivered card results, appended
-        to the agent's own answer, and the turns' token spend. Everything else
-        belongs to the harness -- see :func:`_fold_status_turn`.
+        Only two things reach ``result`` from the polling: the delivered card
+        results, appended to the agent's own answer, and the turns' token
+        spend. Everything else belongs to the harness -- see
+        :func:`_fold_status_turn`. (The workers' own tool calls join the
+        trajectory afterwards, in :meth:`_settle`, read from their session
+        stores rather than from any turn.)
 
         The harness cannot read the board itself (in-cluster SQLite, with only
         ``/v1/responses`` and ``/api/sessions`` exposed), so it asks the agent
@@ -1190,10 +1199,25 @@ class KubeAgentsHarness(AgentHarness):
 
         Reading precedes purging: the artifacts are only worth deleting once
         they are part of the answer.
+
+        The workers' own tool calls join the trajectory here, after the front
+        agent's, each tagged with the profile that made them (see
+        :mod:`kube_agents_bench.worker_trajectory`). ``metadata
+        ["worker_trajectory"]`` carries the card-to-session map the read used,
+        or ``None`` when the read could not run -- the same distinction
+        ``worker_commands`` draws between an empty capture and no capture. It
+        stays on the in-process result: devops-bench writes ``trajectory`` to
+        the record and drops ``metadata``.
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(awaited, _EXEC_TIMEOUT)
+        captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
+        if captured is None:
+            result.metadata["worker_trajectory"] = None
+        else:
+            result.trajectory.extend(captured.entries)
+            result.metadata["worker_trajectory"] = captured.summary
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
     @staticmethod
