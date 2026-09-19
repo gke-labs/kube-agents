@@ -22,6 +22,7 @@ import (
 	"log"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1291,5 +1292,246 @@ func TestToTriageEvent_Reporter(t *testing.T) {
 				t.Errorf("Reporter = %q; want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// streamedFakeWatch returns a fake watch already carrying the events of a
+// watch-list stream's initial state, ending with the bookmark that closes it,
+// in the order given. Buffered for the whole batch so the reactor can return
+// without a reader.
+func streamedFakeWatch(events ...corev1.Event) *watch.FakeWatcher {
+	fw := watch.NewFakeWithChanSize(len(events)+1, false)
+	for i := range events {
+		fw.Add(&events[i])
+	}
+	fw.Action(watch.Bookmark, initialEventsEndBookmark())
+	return fw
+}
+
+// assertMarkRecordedFirst checks the call order a watch-list batch produced:
+// the mark is recorded before anything is dispatched, and the batch itself
+// follows in whatever order the store handed it over, which in watch-list mode
+// is map order and so not asserted.
+func assertMarkRecordedFirst(t *testing.T, got []string, batch ...string) {
+	t.Helper()
+	if len(got) == 0 || got[0] != "mark:TriggeredScaleUp" {
+		t.Fatalf("call order = %v; want the mark recorded before anything is dispatched", got)
+	}
+	rest := append([]string(nil), got[1:]...)
+	want := append([]string(nil), batch...)
+	sort.Strings(rest)
+	sort.Strings(want)
+	if !reflect.DeepEqual(rest, want) {
+		t.Fatalf("dispatched after the mark = %v; want %v in any order", got[1:], batch)
+	}
+}
+
+// TestRun_WatchListStreamMarksAreRecordedBeforeTheStreamIsDelivered pins the
+// restart case in the reflector mode a real client runs in: the initial state
+// arrives through the watch call as a stream, with no List, and the reflector
+// hands it to the informer's store only at the bookmark that ends it. The
+// stream serves the FailedScheduling ahead of the TriggeredScaleUp; the mark
+// must be on record before either is dispatched, and a live event after the
+// bookmark is dispatched as it comes.
+func TestRun_WatchListStreamMarksAreRecordedBeforeTheStreamIsDelivered(t *testing.T) {
+	logs := captureLog(t)
+	underlying := fake.NewClientset()
+	allowPreflight(underlying)
+	var lists atomic.Int64
+	underlying.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		lists.Add(1)
+		return false, nil, nil
+	})
+	var openWatch atomic.Pointer[watch.FakeWatcher]
+	underlying.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		fw := streamedFakeWatch(
+			listedEvent("pod-1", "FailedScheduling", "api.1"),
+			listedEvent("pod-1", "TriggeredScaleUp", "api.2"),
+		)
+		openWatch.Store(fw)
+		return true, fw, nil
+	})
+	rec := &orderDispatcher{}
+	w := newWatcher(watchListCapableClient{underlying}, rec, targetCluster{Name: "streamed"}, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	synced := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Run(ctx, func(watching bool) {
+			if watching {
+				close(synced)
+			}
+		})
+	}()
+	select {
+	case <-synced:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the informer never synced")
+	}
+
+	awaitDispatches(t, rec, 3, "the stream was not delivered in full")
+	assertMarkRecordedFirst(t, rec.snapshot(), "FailedScheduling", "TriggeredScaleUp")
+	if got := lists.Load(); got != 0 {
+		t.Fatalf("the reflector listed %d time(s); want 0 in watch-list mode", got)
+	}
+	if !strings.Contains(logs.String(), "1 autoscaler mark(s) in the watch-list stream recorded ahead of its delivery") {
+		t.Errorf("no record line for the stream's mark in:\n%s", logs.String())
+	}
+
+	// A live event after the bookmark is dispatched as it comes, with no
+	// second mark line: the count was logged and reset at the bookmark.
+	live := listedEvent("pod-1", "FailedScheduling", "api.3")
+	live.ResourceVersion = "11"
+	openWatch.Load().Add(&live)
+	awaitDispatches(t, rec, 4, "live FailedScheduling never dispatched")
+	if got := rec.snapshot(); got[3] != "FailedScheduling" {
+		t.Errorf("live event dispatched as %q; want FailedScheduling", got[3])
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run returned %v; want nil on shutdown", err)
+	}
+}
+
+// TestRun_WatchListRelistMarksAreRecordedBeforeTheRelistIsDelivered pins the
+// relist in watch-list mode. The established stream ends with a 410, the
+// reflector opens a new watch-list stream rather than a List, and that stream
+// carries a pod created in the gap whose FailedScheduling precedes its
+// TriggeredScaleUp; the mark must be on record before either is dispatched.
+func TestRun_WatchListRelistMarksAreRecordedBeforeTheRelistIsDelivered(t *testing.T) {
+	logs := captureLog(t)
+	underlying := fake.NewClientset()
+	allowPreflight(underlying)
+	var lists, watches atomic.Int64
+	underlying.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		lists.Add(1)
+		return false, nil, nil
+	})
+	var openWatch atomic.Pointer[watch.FakeWatcher]
+	underlying.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		var fw *watch.FakeWatcher
+		if watches.Add(1) == 1 {
+			fw = streamedFakeWatch()
+		} else {
+			fw = streamedFakeWatch(
+				listedEvent("pod-2", "FailedScheduling", "api.1"),
+				listedEvent("pod-2", "TriggeredScaleUp", "api.2"),
+			)
+		}
+		openWatch.Store(fw)
+		return true, fw, nil
+	})
+	rec := &orderDispatcher{}
+	w := newWatcher(watchListCapableClient{underlying}, rec, targetCluster{Name: "restreamed"}, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	synced := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Run(ctx, func(watching bool) {
+			if watching {
+				close(synced)
+			}
+		})
+	}()
+	select {
+	case <-synced:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the informer never synced")
+	}
+	if got := rec.snapshot(); len(got) != 0 {
+		t.Fatalf("calls before the relist = %v; want none from an empty stream", got)
+	}
+
+	// The stream cannot be resumed: the reflector opens a new one.
+	openWatch.Load().Error(&metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    http.StatusGone,
+		Reason:  metav1.StatusReasonExpired,
+		Message: "too old resource version",
+	})
+	awaitDispatches(t, rec, 3, "the relist stream was not delivered in full")
+	assertMarkRecordedFirst(t, rec.snapshot(), "FailedScheduling", "TriggeredScaleUp")
+	if got := watches.Load(); got < 2 {
+		t.Fatalf("want a second watch-list stream after the 410, got %d watch call(s)", got)
+	}
+	if got := lists.Load(); got != 0 {
+		t.Fatalf("the reflector listed %d time(s) after the 410; want 0 in watch-list mode", got)
+	}
+	if !strings.Contains(logs.String(), "1 autoscaler mark(s) in the watch-list stream recorded ahead of its delivery") {
+		t.Errorf("no record line for the relist stream's mark in:\n%s", logs.String())
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run returned %v; want nil on shutdown", err)
+	}
+}
+
+// TestObserveWatch_ForwardsInOrderAndReleasesOnStop: the wrapper calls observe
+// on every event before forwarding it, forwards them unchanged and in order,
+// and lets its goroutine go when stopped with an event in flight, which is the
+// case watch.Filter leaks on.
+func TestObserveWatch_ForwardsInOrderAndReleasesOnStop(t *testing.T) {
+	label := func(ev watch.Event) string {
+		return string(ev.Type) + ":" + ev.Object.(*corev1.Event).Reason
+	}
+	fw := watch.NewFake()
+	seen := make(chan string, 8)
+	ow := observeWatch(fw, func(ev watch.Event) { seen <- label(ev) })
+	go func() {
+		a, b := listedEvent("pod-1", "FailedScheduling", "api.1"), listedEvent("pod-1", "TriggeredScaleUp", "api.2")
+		fw.Add(&a)
+		fw.Modify(&b)
+		fw.Action(watch.Bookmark, initialEventsEndBookmark())
+	}()
+	want := []string{"ADDED:FailedScheduling", "MODIFIED:TriggeredScaleUp", "BOOKMARK:"}
+	for i, w := range want {
+		select {
+		case got := <-ow.ResultChan():
+			if label(got) != w {
+				t.Fatalf("forwarded[%d] = %q; want %q", i, label(got), w)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("event %d never forwarded", i)
+		}
+		// observe ran before the forward: its record is already there.
+		select {
+		case got := <-seen:
+			if got != w {
+				t.Fatalf("observed[%d] = %q; want %q", i, got, w)
+			}
+		default:
+			t.Fatalf("event %d was forwarded before observe ran on it", i)
+		}
+	}
+
+	// An event nobody reads is in flight when the watch is stopped: observe
+	// has run and the wrapper is blocked on the forward. The goroutine must
+	// return rather than block on that send for good.
+	inFlight := listedEvent("pod-1", "FailedScheduling", "api.3")
+	go fw.Add(&inFlight)
+	select {
+	case <-seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight event was never observed")
+	}
+	ow.Stop()
+	deadline := time.After(5 * time.Second)
+	for closed := false; !closed; {
+		select {
+		case _, ok := <-ow.ResultChan():
+			// The in-flight event may still be handed over; the close follows.
+			closed = !ok
+		case <-deadline:
+			t.Fatal("the forwarding goroutine did not release within 5s of Stop")
+		}
+	}
+	if !fw.IsStopped() {
+		t.Error("Stop did not stop the upstream watch")
 	}
 }
