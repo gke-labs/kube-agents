@@ -359,7 +359,7 @@ XML_ATTRIBUTE_ESCAPES = XML_TEXT_ESCAPES + (
 # the run that had a source failure to report. Everything outside XML 1.0's
 # Char production is dropped before it reaches an attribute or text node.
 XML_INVALID_CHARS = re.compile(
-    "[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
+    r"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
 )
 
 

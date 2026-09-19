@@ -25,6 +25,7 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,9 @@ GIT_ENV = {
 }
 
 REAL_GIT = shutil.which("git") or "/usr/bin/git"
+
+# The hosts `AbstractionTest` reads the sandbox source for.
+FORGE_HOST_RE = re.compile(r"github\.com|gitlab\.com")
 
 
 def git(cwd: Path, *args: str, check: bool = True):
@@ -826,7 +830,7 @@ class AbstractionTest(unittest.TestCase):
         # broker's allowlist decides.
         body = self.source.split("# ---- the broker")[1]
         for line in body.splitlines():
-            if "github.com" in line or "gitlab.com" in line:
+            if FORGE_HOST_RE.search(line):
                 self.assertTrue(
                     line.lstrip().startswith("#") or '"""' in line,
                     f"a forge host reached the code: {line.strip()}",
