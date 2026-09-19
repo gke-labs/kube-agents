@@ -89,16 +89,17 @@ Which file owns which category of content is defined once, in the
 canonical-home table in [`AGENTS.md`](../AGENTS.md) — do not duplicate a fact
 outside its home; link to it.
 
-Four artifacts are **generated, not hand-written** — three regions inside
-hand-written documents, plus one whole file. `scripts/generate_docs.py` (run
-via `make docs-generate`) rewrites everything between the markers; everything
-outside them is hand-written. Never edit inside the markers — edit the source
-and regenerate.
+The artifacts below are **generated, not hand-written** — regions inside
+hand-written documents (a region may be spliced into several pages), plus one
+whole file. `scripts/generate_docs.py` (run via `make docs-generate`) rewrites
+everything between the markers; everything outside them is hand-written. Never
+edit inside the markers — edit the source and regenerate.
 
 <!-- prettier-ignore -->
 | Generated file or region | Block marker | Source of truth |
 | --- | --- | --- |
 | `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-jobs -->` | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |
+| `docs/site/src/content/docs/concepts/autonomous-watchdogs.md`, `docs/site/src/content/docs/concepts/skills.md`, `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-job-example -->` | The `compliance-audit` entry of `agents/platform/cron/jobs.json`, rendered as fenced JSON |
 | `docs/site/src/content/docs/skills/index.mdx` | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
 | `docs/site/src/content/docs/deploy/docker-images.md` | `<!-- BEGIN GENERATED: container-images -->` | `images.json` |
 | `docs/family-roster.txt` | whole file (`family-roster`) | The collapsed-family globs in this map's section 4, resolved against `git ls-files` |
@@ -115,11 +116,7 @@ CI enforcement: `make docs-check` runs the same checks as
   Go, shell, Dockerfiles, YAML, Terraform, TypeScript) must be one too.
 - `docs-check-terminology` — `hack/check-docs-terminology.sh`; identifiers in
   prose must match their source (service-account names, versions, the
-  fleet-audit finding-id pattern and rendering caps, …), and a fenced roster
-  entry, found by `hack/scan-cron-prompts.awk`, must carry a real job `"id"` and
-  quote enough of its prompt, verbatim, to identify it in `jobs.json` — or a
-  placeholder id in angle brackets, which marks an illustration and is left
-  ungraded.
+  fleet-audit finding-id pattern and rendering caps, …).
 - `docs-check-map` — `scripts/check_docs_map.py`; every tracked `.md`/`.mdx`
   file must be matched by an inventory entry in this map (globs count), every
   path in the inventory's path column must exist, and every table row in this

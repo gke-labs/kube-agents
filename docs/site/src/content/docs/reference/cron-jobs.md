@@ -53,22 +53,31 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 
 Both rosters use one schema. A governance watchdog:
 
+<!-- BEGIN GENERATED: cron-job-example -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
 ```json
 {
   "id": "compliance-audit",
   "name": "Security & RBAC Posture Audit",
-  "risk": "low",
   "schedule": {
     "kind": "cron",
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
   "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 414 lines of it, before you run anything. Its eleven checks are section 2, lines 107-320, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
-  "skills": ["fleet-audit"],
+  "skills": [
+    "fleet-audit"
+  ],
+  "risk": "low",
   "enabled": true,
   "deliver": "chat"
 }
 ```
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: cron-job-example -->
 
 | Field              | Type            | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ------------------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
