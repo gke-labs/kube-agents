@@ -959,9 +959,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     that answers 401/403/404, which separates a number that is not there from a
     credential that cannot see pull requests. Denied by both is
     ``status="error"`` naming the permission to add, never a fail: an
-    unreadable API is the absence of an observation. 404 on both is the same
-    answer for a repository the installation was never given, so the repository
-    itself is fetched (``metadata: read``) before that reads as absence.
+    unreadable API is the absence of an observation. 404 on both is either the
+    number or a repository this credential cannot see; nothing in the API
+    separates them, so both are graded as absence.
     """
 
     type: Literal["pull_request_opened"]
@@ -1119,17 +1119,20 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # request and returns its URL. That work lands in `updated_at`
             # alone. The stamp moves on any write by anyone, so a rep that only
             # comments on a leftover passes too; the head commit would separate
-            # the two and the ledger App cannot read it. Sweeping the GitOps
-            # repository between reps (#1755 item 2) is what removes leftovers.
+            # the two and the ledger App cannot read it. A rep that resubmits
+            # byte-identical content writes nothing at all -- the skill raises
+            # before the push -- so a correct rep lands here too, which is why
+            # the reason names both readings. Sweeping the GitOps repository
+            # between reps (#1755 item 2) is what removes leftovers.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()
             if age > self.max_clock_skew_sec:
                 rejected.append(
                     f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
-                    f"BEFORE this run started ({started.isoformat()}) — a previous "
-                    "run's pull request, quoted rather than worked on, still in the "
-                    "repository because nothing sweeps it"
+                    f"BEFORE this run started ({started.isoformat()}) — a leftover "
+                    "an earlier run opened, which this run either quoted or "
+                    "resubmitted unchanged"
                 )
                 continue
             return done(
