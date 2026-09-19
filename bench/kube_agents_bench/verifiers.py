@@ -943,9 +943,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
-    ``owner`` in a repository matching ``repo_pattern`` when those are set; and
-    it was written -- created or updated -- at or
-    after this run started, less ``max_clock_skew_sec``. Updating counts because
+    ``owner`` when one is set; it is not closed unmerged; and it was written --
+    created or updated -- at or after this run started, less
+    ``max_clock_skew_sec``. Updating counts because
     the skill reuses a branch and edits the pull request already open on it --
     which also means the stamp proves only that the pull request was written to
     during the run, by anyone. One surviving candidate is enough — a reply may
@@ -970,37 +970,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # a fair exact match across every pool project and breaks loudly if the org
     # moves.
     owner: str = ""
-    # What the repository half of the slug must match in full, "" for any. The
-    # owner gate leaves that half to the agent, and a repository it invents
-    # answers 404 exactly as one the App installation was never given does --
-    # which has to be an error. Pinning the shape the pool actually uses
-    # (`<pool project>-infra`, `gitops_repo_for_project` in hack/ci-deploy.sh)
-    # keeps an invented name a fail, where it belongs.
-    repo_pattern: str = ""
     # Tolerance between GitHub's creation stamp and the harness's run-start
     # clock, which are two different machines. Small on purpose: every second
     # of it is a second of a previous rep's pull request reading as this one's.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
-
-    @field_validator("repo_pattern")
-    @classmethod
-    def _repo_pattern_compiles(cls, pattern: str) -> str:
-        re.compile(pattern)
-        return pattern
 
     def _resolve(
         self, owner: str, repo: str, number: int, token: str, budget: float
     ) -> tuple[dict | None, str | None]:
         """``(payload, None)`` when resolved, ``(None, reason)`` when unevaluable.
 
-        ``(None, None)`` is the third answer: no such number, which is a
-        rejected candidate rather than a broken check.
+        ``(None, None)`` is the third answer: no such pull request, which is a
+        rejected candidate rather than a broken check. Only a credential the
+        API refuses is a broken check -- that is a fault of ours, it is the
+        same for every repetition, and no grade drawn from it would mean
+        anything. Everything else the agent chose, so it is graded.
         """
         base = f"https://api.github.com/repos/{owner}/{repo}"
         first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
         status_code = first
-        denied = status_code in (401, 403)
-        if denied or status_code == 404:
+        if first in (401, 403, 404):
             status_code, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
         if 401 in (first, status_code):
             # 401 is the credential itself, not its scopes: an installation
@@ -1012,38 +1001,29 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 "expires an hour after it is minted — so this check could not be "
                 "evaluated"
             )
-        if status_code == 403 or (status_code == 404 and denied):
-            # A 404 from the pulls endpoint after a denial is read as the
-            # denial, not as absence: grading a real pull request as missing is
-            # the one wrong answer a permission gap must not produce.
+        if status_code == 200 and isinstance(payload, dict):
+            return payload, None
+        if first == 403 and status_code == 403:
             return None, (
-                f"GitHub denied {owner}/{repo}#{number} on the issues endpoint and "
-                f"answered {status_code} on the pulls endpoint: the configured token "
-                "cannot read this repository's pull requests — add "
-                "`pull_requests: read` to the installation behind "
-                f"{LEDGER_TOKEN_ENV_VARS[0]} — so this check could not be evaluated"
+                f"GitHub denied {owner}/{repo}#{number} on both endpoints: the token "
+                f"behind {LEDGER_TOKEN_ENV_VARS[0]} can reach that repository but "
+                "read neither its issues nor its pull requests — add "
+                "`pull_requests: read` to the installation — so this check could "
+                "not be evaluated"
             )
-        if status_code == 404:
-            # 404 is also how an installation answers for a repository it was
-            # never given (`repository_selection: selected`, docs/ci-pool-
-            # projects.md §5.4). `metadata: read` separates the two, so an
-            # onboarding gap is not reported as the agent having opened nothing.
-            repo_status, _ = _http_get_json(base, token, budget)
-            if repo_status == 200:
-                return None, None
-            return None, (
-                f"GitHub answered 404 for {owner}/{repo}#{number} and {repo_status} "
-                f"for {owner}/{repo} itself: either that repository does not exist "
-                f"or the token behind {LEDGER_TOKEN_ENV_VARS[0]} was never given it "
-                "— add it to the App installation — so this check could not be "
-                "evaluated"
-            )
-        if status_code != 200 or not isinstance(payload, dict):
-            return None, (
-                f"unexpected GitHub response {status_code} for "
-                f"{owner}/{repo}#{number}; this check could not be evaluated"
-            )
-        return payload, None
+        if status_code in (403, 404):
+            # Absence, and graded as such. A 403 from one endpoint proves the
+            # repository is reachable, so the other endpoint's 404 is the
+            # number's own. 404 from both is either the number or a repository
+            # this credential cannot see -- and an onboarding gap belongs to
+            # `scripts/verify_ci_pool_project.py`, which checks installation
+            # membership, not to a grading check that would have to red every
+            # open pull request to report it.
+            return None, None
+        return None, (
+            f"unexpected GitHub response {status_code} for "
+            f"{owner}/{repo}#{number}; this check could not be evaluated"
+        )
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1102,12 +1082,6 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if self.owner and owner.lower() != self.owner.lower():
                 rejected.append(f"{slug}: not under {self.owner}")
                 continue
-            if self.repo_pattern and not re.fullmatch(self.repo_pattern, repo):
-                rejected.append(
-                    f"{slug}: {repo} is not an eval GitOps repository "
-                    f"({self.repo_pattern})"
-                )
-                continue
             try:
                 payload, unevaluable = self._resolve(owner, repo, number, token, budget)
             except OSError as exc:
@@ -1124,6 +1098,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # said /pull/ over a number that is a plain issue.
             if not payload.get("pull_request") and "head" not in payload:
                 rejected.append(f"{slug}: that number is an issue, not a pull request")
+                continue
+            merged_at = payload.get("merged_at") or (
+                payload.get("pull_request") or {}
+            ).get("merged_at")
+            if str(payload.get("state") or "").lower() == "closed" and not merged_at:
+                # Closing moves `updated_at`, so without this a run that closed
+                # a leftover -- or its own pull request -- would read as one
+                # that wrote a fix. The objective is that the fix went out.
+                rejected.append(f"{slug}: closed without being merged")
                 continue
             created = _parse_github_time(payload.get("created_at"))
             if created is None:

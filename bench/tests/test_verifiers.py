@@ -1638,10 +1638,6 @@ def _pr_api(kind: str = "issues", number: int = 7, repo: str = _PR_REPO) -> str:
     return f"https://api.github.com/repos/gke-agentic/{repo}/{kind}/{number}"
 
 
-def _pr_repo_api(repo: str = _PR_REPO) -> str:
-    return f"https://api.github.com/repos/gke-agentic/{repo}"
-
-
 def _pr_payload(
     created_at: str = "2026-08-21T09:00:30Z",
     updated_at: str | None = None,
@@ -1666,7 +1662,6 @@ def _stash_pr_report(final_message: str = "", started_at: float = _RUN_START) ->
 
 def _pr_check(**kw):
     kw.setdefault("owner", "gke-agentic")
-    kw.setdefault("repo_pattern", r"kube-agents-evals(-\d+)?-infra")
     return PullRequestOpenedVerifier(type="pull_request_opened", **kw)
 
 
@@ -1717,13 +1712,36 @@ def test_a_pull_request_opened_seconds_before_the_run_is_still_stale(token, gith
 
 
 def test_an_invented_pull_request_url_is_a_fail(token, github):
-    """Neither endpoint has the number, but the repository is there: the
-    substring check this replaces passed on exactly this report."""
+    """Neither endpoint has the number: the substring check this replaces
+    passed on exactly this report."""
     _stash_pr_report()
-    github.routes[_pr_repo_api()] = (200, {"full_name": f"gke-agentic/{_PR_REPO}"})
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "no such pull request" in res.reason
+    assert [url for url, _ in github.calls] == [_pr_api(), _pr_api("pulls")]
+
+
+def test_a_pull_request_closed_without_merging_is_a_fail(token, github):
+    """Closing moves `updated_at`, so a run that closed a leftover -- or closed
+    its own pull request -- would otherwise read as one that wrote a fix. The
+    objective is that the fix went out."""
+    _stash_pr_report()
+    payload = _pr_payload("2026-08-21T09:00:30Z") | {"state": "closed"}
+    github.routes[_pr_api()] = (200, payload)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail"
+    assert "closed without being merged" in res.reason
+
+
+def test_a_pull_request_merged_during_the_run_passes(token, github):
+    """Merged is closed, and a fix that went in went out."""
+    _stash_pr_report()
+    payload = _pr_payload("2026-08-21T09:00:30Z") | {
+        "state": "closed",
+        "merged_at": "2026-08-21T09:10:00Z",
+    }
+    github.routes[_pr_api()] = (200, payload)
+    assert _pr_check().verify(5.0).status == "pass"
 
 
 def test_a_pull_url_over_an_issue_number_is_a_fail(token, github):
@@ -1763,21 +1781,16 @@ def test_the_ticket_linked_beside_the_fix_does_not_sink_it(token, github):
 
 
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
-    """The shape this check exists to catch. A name outside the pool's own
-    `<project>-infra` is the agent's, not an onboarding gap, so it must not
-    reach the 404 probe: an error is rung 2, admission-blind, and would red the
-    eval job for every open pull request over one hallucination."""
+    """A repository the credential cannot see answers 404 exactly as a missing
+    number does, and nothing in the API separates them. Graded as absence: the
+    alternative is an error, which is rung 2 and admission-blind, so one
+    hallucinated repository would red the eval job for every open pull
+    request. An installation missing a pool repository is what
+    `scripts/verify_ci_pool_project.py` checks, at onboarding."""
     _stash_pr_report("Fix proposed: https://github.com/gke-agentic/payments-infra/pull/3")
     res = _pr_check().verify(5.0)
     assert res.status == "fail", res.reason
-    assert "not an eval GitOps repository" in res.reason
-    # Rejected on its name: no request was spent on it.
-    assert github.calls == []
-    # And the match is the whole name, so a pool name with something appended
-    # -- a fork, a mirror, a typo that grew -- is rejected the same way.
-    _stash_pr_report(f"Fix proposed: https://github.com/gke-agentic/{_PR_REPO}-old/pull/3")
-    assert _pr_check().verify(5.0).status == "fail"
-    assert github.calls == []
+    assert "no such pull request" in res.reason
 
 
 def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, github):
@@ -1794,17 +1807,21 @@ def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, githu
     assert res.status == "pass", res.reason
 
 
-def test_an_unreadable_repository_with_nothing_else_to_grade_is_an_error(token, github):
-    """The other half of the same rule: unevaluable still wins over a plain
-    rejection, so an onboarding gap is never graded as the agent's failure."""
+def test_a_denied_candidate_outranks_a_rejected_one(token, github):
+    """The other half of the same rule: a credential the API refuses still wins
+    over a plain rejection, so a permission gap is never graded as the agent's
+    failure just because another URL happened to resolve and fail."""
     _stash_pr_report(
-        f"Fix in https://github.com/gke-agentic/kube-agents-evals-infra/pull/7, "
+        f"Fix in https://github.com/gke-agentic/kube-agents-evals-9-infra/pull/7, "
         f"earlier attempt {_PR_URL}"
     )
+    denied = (403, {"message": "Resource not accessible"})
+    github.routes[_pr_api(repo="kube-agents-evals-9-infra")] = denied
+    github.routes[_pr_api("pulls", repo="kube-agents-evals-9-infra")] = denied
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     res = _pr_check().verify(5.0)
     assert res.status == "error"
-    assert "add it to the App installation" in res.reason
+    assert "pull_requests: read" in res.reason
     assert "also rejected" in res.reason
 
 
@@ -1845,30 +1862,27 @@ def test_an_expired_token_is_diagnosed_as_the_token_not_the_permission(token, gi
     assert "pull_requests: read" not in res.reason
 
 
-def test_a_repository_the_installation_cannot_see_is_an_error(token, github):
-    """The ledger App is `repository_selection: selected`, and a repository
-    outside the list answers 404 exactly as a missing number does. Read as
-    absence, an onboarding gap on one pool project would grade every real pull
-    request the agent opens there as invented."""
+def test_a_403_from_pulls_after_a_404_from_issues_is_a_missing_number(token, github):
+    """The pair the shipped credential produces for a number that is not there:
+    `issues: read` answers 404 for the missing number, and an App without
+    `pull_requests` gets 403 from the pulls endpoint. The 403 proves the
+    repository is reachable, so the 404 was the number's own -- a fail. Read as
+    a denial it would be an error, and an error reds every open pull request."""
     _stash_pr_report()
+    github.routes[_pr_api("pulls")] = (403, {"message": "Resource not accessible"})
     res = _pr_check().verify(5.0)
-    assert res.status == "error"
-    assert "add it to the App installation" in res.reason
-    assert [url for url, _ in github.calls] == [
-        _pr_api(),
-        _pr_api("pulls"),
-        _pr_repo_api(),
-    ]
+    assert res.status == "fail", res.reason
+    assert "no such pull request" in res.reason
 
 
-def test_a_404_after_a_denial_is_an_error_not_a_missing_pull_request(token, github):
-    """Otherwise a permission gap reads as the agent having opened nothing --
-    a red the reader would chase in the agent."""
+def test_a_404_from_pulls_after_a_denial_on_issues_is_a_missing_number(token, github):
+    """The mirror image, and the same reasoning: a 403 anywhere proves the
+    repository is reachable, so the other endpoint's 404 is absence."""
     _stash_pr_report()
     github.routes[_pr_api()] = (403, {"message": "Resource not accessible"})
     res = _pr_check().verify(5.0)
-    assert res.status == "error"
-    assert "pull_requests: read" in res.reason
+    assert res.status == "fail", res.reason
+    assert "no such pull request" in res.reason
 
 
 def test_an_unexpected_status_is_an_error(token, github):

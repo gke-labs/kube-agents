@@ -369,7 +369,7 @@ silently running the check with defaults.
 | `report_contains`         | `required_phrases` (all must appear), `any_of_phrases` (at least one must), `forbidden_phrases` (none may), `scope` (`final` \| `full`, default `final`)                                                      | Case-insensitive substring checks against the agent's answer, not the cluster. `final` is what the user ultimately receives: the delegating turn's closing message plus, when work was delegated, the delivered card results and artifacts — poll-turn recitals excluded. `full` is the accumulated output (every settled closer on top of that), which passes a phrase merely quoted in progress chatter and false-fails a forbidden phrase in quoted material; use it only for genuinely whole-transcript checks. Registered from this repository's `kube_agents_bench.verifiers` via the `devops_bench.verifiers` entry point. |
 | `tool_called`             | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false)                                                                                                                       | Counts the **delegating turn's** calls only — poll turns are excluded by design and a delegated worker's calls never reach the trajectory, so this asserts what the router did, never what a worker did on a cluster; use cluster-state checks (`resource_property`) for mutation safeguards. `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in router-level safeguards, where an attempt should trip the check.                                                                                                                |
 | `ledger_issue_contains`   | `audit` (required, one of the eight fleet-audit stream ids), `required_phrases`, `any_of_phrases`, `forbidden_phrases`, `scope` (`body` \| `finding_ids`, default `body`), `max_clock_skew_sec` (default 120) | The same phrase semantics as `report_contains`, but against the **GitHub ledger issue this run published** rather than the chat reply — the surface a fleet audit actually writes its findings to. See [Grading a fleet audit](#grading-a-fleet-audit) below, which you must read before using it: it needs a credential, and its freshness binding is what stops it passing forever.                                                                                                                                                                                                                                             |
-| `pull_request_opened`     | `owner` (the organisation the PR must sit under, `""` for any), `repo_pattern` (what the repository half of the slug must match in full, `""` for any), `max_clock_skew_sec` (default 120)                    | Resolves every `github.com/<owner>/<repo>/pull/<n>` URL in the agent's reply through the GitHub API and passes when one of them is a pull request under `owner` that this run created or updated. What a remediation case grades on, in place of `report_contains` over `/pull/`. See [Grading a remediation pull request](#grading-a-remediation-pull-request).                                                                                                                                                                                                                                                                  |
+| `pull_request_opened`     | `owner` (the organisation the PR must sit under, `""` for any), `max_clock_skew_sec` (default 120)                                                                                                            | Resolves every `github.com/<owner>/<repo>/pull/<n>` URL in the agent's reply through the GitHub API and passes when one of them is a pull request under `owner`, not closed unmerged, that this run created or updated. What a remediation case grades on, in place of `report_contains` over `/pull/`. See [Grading a remediation pull request](#grading-a-remediation-pull-request).                                                                                                                                                                                                                                            |
 | `fleet_resource_property` | every `resource_property` field except `kubeconfig`, plus `fixture_role` (**required**)                                                                                                                       | `resource_property` against the **standing seeded fleet**, addressed by the ROLE a fixture plays rather than by cluster name. Also splits "the fixture is gone" (a fail) from "the cluster was unreachable" (an error), which upstream cannot. See [Addressing a seeded-fleet fixture by role](#addressing-a-seeded-fleet-fixture-by-role).                                                                                                                                                                                                                                                                                       |
 
 The three transcript verifiers read the run's stash (`kube_agents_bench/transcript.py`), so unlike
@@ -503,23 +503,23 @@ one used and edits the pull request already open on it. That stamp moves on any 
 so what it proves is that the pull request was written to during the run — a repetition that only
 comments on a leftover passes as well. Telling those apart needs the head commit, which the ledger
 App cannot read; sweeping the GitOps repository between repetitions is what removes leftovers.
-`owner: gke-agentic` pins the organisation, which is a fair exact match across every pool project
-and breaks loudly if the organisation ever moves, and `repo_pattern` pins the other half of the
-slug to the shape the pool uses, `kube-agents-evals(-\d+)?-infra`. Without that the repository is
-the agent's to name, and a repository it invents answers 404 exactly as one the App installation
-was never given does — so an invented name would have to be an error. Matched in full, not
-searched for: `<pool repo>-old` is not a pool repository.
+A pull request closed without being merged is rejected: closing moves `updated_at` too, and what
+the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
+match across every pool project that breaks loudly if the organisation ever moves.
 
 It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`
 mints that token for every fan-out unit, not only the audit ones. It asks `/repos/{o}/{r}/issues/{n}`
 first, because a pull request is an issue to that API and `issues: read` is what the ledger App
-carries; `/pulls/{n}` is tried only when that is denied or absent. Denied by both is
-`status: "error"` naming `pull_requests: read` as the permission to add — never a fail, since a
-credential gap is not the agent opening nothing. 404 from both costs one more call, `/repos/{o}/{r}`:
-a repository the installation was never given answers 404 exactly as a missing number does, and
-only the repository's own visibility tells those apart. A candidate GitHub cannot answer for ends
-the check only when no other URL in the reply resolves: an error is admission-blind, so a mistyped
-slug beside the real pull request must not red the eval job.
+carries; `/pulls/{n}` is tried only when that is denied or absent. The check errors only on a fault
+of ours: a 401, which is the token having expired rather than a permission, and a denial from both
+endpoints, which names `pull_requests: read` as the permission to add. Everything else is graded.
+A 403 from one endpoint proves the repository is reachable, so the other's 404 is the number's own;
+404 from both is either the number or a repository this credential cannot see, and nothing in the
+API separates them. Both fail. Erroring instead would red the eval job for every open pull request
+over one repository name the agent invented, and an installation missing a pool repository is what
+`scripts/verify_ci_pool_project.py` catches at onboarding. A candidate GitHub refuses ends the check
+only when no other URL in the reply resolves: an error is admission-blind, so a mistyped slug beside
+the real pull request must not red the eval job.
 
 ##### Addressing a seeded-fleet fixture by role
 
