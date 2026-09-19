@@ -1442,14 +1442,15 @@ func TestDispatcherReplayedFailedSchedulingInsideTheHoldWindowIsHeld(t *testing.
 
 // TestDispatcherReplayedFailedSchedulingSightedBeforeItsDeclineIsNotPassed
 // pins the other restart case on the declined path: a pod the autoscaler
-// declined at T+3s that was placed or deleted before the scheduler's next
-// retry leaves one FailedScheduling object, sighted at T, and a watcher
-// restart within fifteen minutes replays it after the decline is on record.
-// It must not pass on a verdict that came after it; the same pod sighted
+// declined in the second it was created (the live measurement: both events
+// stamped 01:53:25Z) that was placed or deleted before the scheduler's next
+// retry leaves one FailedScheduling object, and a watcher restart within
+// fifteen minutes replays it after the decline is on record. It must not
+// pass on a verdict that did not come later than it; the same pod sighted
 // again after the decline fires.
 func TestDispatcherReplayedFailedSchedulingSightedBeforeItsDeclineIsNotPassed(t *testing.T) {
 	createdAt := time.Unix(1_700_000_000, 0)
-	declinedAt := createdAt.Add(3 * time.Second)
+	declinedAt := createdAt
 	now := createdAt.Add(5 * time.Minute)
 	disp, m, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
 	ctx := context.Background()
@@ -1457,7 +1458,7 @@ func TestDispatcherReplayedFailedSchedulingSightedBeforeItsDeclineIsNotPassed(t 
 	disp.Dispatch(ctx, autoscalerEvent("pod-1", "NotTriggerScaleUp", declinedAt))
 	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 1, createdAt))
 	if *injectCount != 0 {
-		t.Fatalf("replayed FailedScheduling sighted 3s before its decline fired %d injects; want 0", *injectCount)
+		t.Fatalf("replayed FailedScheduling sighted in the second of its decline fired %d injects; want 0", *injectCount)
 	}
 	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateFailedSchedulingMinCount))); got != 1 {
 		t.Errorf("events_filtered_total{gate=failedscheduling_min_count} = %v; want 1", got)
