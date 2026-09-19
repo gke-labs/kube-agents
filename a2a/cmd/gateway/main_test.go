@@ -19,7 +19,9 @@ const unreachableNATSURL = "nats://127.0.0.1:1"
 // realMain's first call is gateway.FromEnv, and every case below is refused
 // there, so none of them dials NATS. Each case pins A2A_CHAT_DISPLAY_MODE to
 // empty because FromEnv validates it before NATS_URL: a CI environment with
-// a stray value there would otherwise change which error fires.
+// a stray value there would otherwise change which error fires. The Slack
+// pair is cleared for the same reason — it arms a third backend, so a stray
+// SLACK_BOT_TOKEN turns a one-backend case into a two-backend refusal.
 func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 	cases := []struct {
 		name string
@@ -32,13 +34,31 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			want: "NATS_URL",
 		},
 		{
-			name: "both backends set",
+			name: "two backends set",
 			env: map[string]string{
 				"NATS_URL":            "nats://127.0.0.1:1",
 				"DISCORD_TOKEN":       "tok",
 				"A2A_GCHAT_RELAY_URL": "http://relay",
 			},
-			want: "both DISCORD_TOKEN and A2A_GCHAT_RELAY_URL are set",
+			want: "more than one chat backend is configured (A2A_GCHAT_RELAY_URL, DISCORD_TOKEN)",
+		},
+		{
+			name: "slack and discord set",
+			env: map[string]string{
+				"NATS_URL":        "nats://127.0.0.1:1",
+				"DISCORD_TOKEN":   "tok",
+				"SLACK_BOT_TOKEN": "xoxb-tok",
+				"SLACK_APP_TOKEN": "xapp-tok",
+			},
+			want: "more than one chat backend is configured (the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair, DISCORD_TOKEN)",
+		},
+		{
+			name: "half a slack pair",
+			env: map[string]string{
+				"NATS_URL":        "nats://127.0.0.1:1",
+				"SLACK_BOT_TOKEN": "xoxb-tok",
+			},
+			want: "SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together",
 		},
 		{
 			name: "no backend set",
@@ -56,6 +76,8 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			t.Setenv("NATS_URL", "")
 			t.Setenv("DISCORD_TOKEN", "")
 			t.Setenv("A2A_GCHAT_RELAY_URL", "")
+			t.Setenv("SLACK_BOT_TOKEN", "")
+			t.Setenv("SLACK_APP_TOKEN", "")
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}
@@ -83,6 +105,8 @@ func TestRealMainReturnsDialFailure(t *testing.T) {
 	t.Setenv("SESSION_KV_SALT", "test-salt")
 	t.Setenv("DISCORD_TOKEN", "tok")
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	err := realMain(context.Background(), log)
 	if !errors.Is(err, nats.ErrNoServers) {
@@ -100,6 +124,8 @@ func TestRunExitsNonZeroOnConfigError(t *testing.T) {
 	t.Setenv("NATS_URL", "")
 	t.Setenv("DISCORD_TOKEN", "")
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
 	if got := run(); got != exitFailure {
 		t.Errorf("run() = %d, want %d", got, exitFailure)
 	}
