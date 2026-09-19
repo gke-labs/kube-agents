@@ -43,10 +43,13 @@ distinction the build status throws away entirely.
 HOW FAR THAT DISTINCTION GOES TODAY, stated because "RED is a judgement on the
 candidate" is the load-bearing half of it and the driver's split is narrower
 than the sentence above sounds. ci-eval-rc.sh writes NOT RUN when the deploy
-fails or when it never reaches its reporting step; every other non-zero exit of
-hack/ci-eval-pr.sh becomes RED, and some of those measured nothing either -- a
-ledger token that would not mint, a runner image short of `uv`, a night on which
-every case died on infrastructure. Those land here as a settled RED, and a
+fails, when it never reaches its reporting step, or when hack/ci-eval-pr.sh
+exits 2 with eval-verdict.json saying `outcome: not_evaluated` -- an admitted
+case, or every case, lost every repetition to infrastructure, so the suite
+could not certify a verdict. Every other non-zero exit of hack/ci-eval-pr.sh
+becomes RED, and some of those measured nothing either -- a ledger token that
+would not mint, a runner image short of `uv`, a `bench-gate case` that could
+not grade. Those land here as a settled RED, and a
 settled RED keeps its evalcand_ tag, so that candidate is never measured again.
 It does not stall the lane: the next nightly resolves a newer commit and staging
 advances. It does cost one candidate and leave a rejection in the record that

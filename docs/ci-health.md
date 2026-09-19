@@ -342,6 +342,13 @@ Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — i
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
 dashboard's run page and the incident brief use; the comment only phrases it.
 
+A run the suite marked **not evaluated** because one admitted case lost every
+repetition to infrastructure while other cases were graded is, to this filter,
+a `FAILURE` with graded repetitions and no gate case failing all of its
+repetitions, so it draws the comment with the hard-failure heading. The comment
+does not read the suite's `outcome`; the banner at the top of that run's
+`eval-verdict.md` is what says the run is not a finding against the change.
+
 One zero-task run does get a comment: a lost pod (the build node went away
 under the job, #1478). It is one line, same marker and dedupe:
 
