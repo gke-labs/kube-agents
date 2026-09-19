@@ -110,6 +110,14 @@ release's namespace. The dev tooling's `load_state` clears it the same way.
 `KUBE_AGENTS_INSTALL_ENV` points at a different path, which is how CI renders one from
 its own variables rather than keeping install state on an ephemeral runner.
 
+Which file that is, for a front door that has to go and find one: `KUBE_AGENTS_INSTALL_ENV`
+first, then the checkout the run's own sources came from, then the working directory,
+and last the install checkout in `$HOME/kube-agents`. `upgrade.sh` reaches that last
+candidate on the path the release-pinned one-liner takes — it has no checkout of its own,
+so the installer's is where the install's configuration is — and it is last rather than
+first so that a workstation managing two installs upgrades the one whose directory the
+operator is standing in, not whichever one that shared checkout belongs to.
+
 `install.sh` reads it and does not rewrite it. It creates one at the end of a first
 install, when there is nothing there, and never touches it again; the Day-2 menu's
 "Save & Apply" is the one path that edits it, one key at a time, leaving comments and

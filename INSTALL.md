@@ -794,6 +794,27 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or f
    make dev-rebuild-agent ARGS="platform"
    ```
 
+## Upgrading
+
+To move a configured `kube-agents` installation to a newer release, run the `upgrade.sh` published
+for that release. It carries its own version, so the run names no image tag, and it reuses the
+install checkout — and the `install.env` in it — that `install.sh` left in `$HOME/kube-agents`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/upgrade.sh | bash -s -- \
+  --non-interactive \
+  --project-id="<PROJECT_ID>" \
+  --cluster-name="<CLUSTER_NAME>" \
+  --region="<REGION>"
+```
+
+From a checkout, run `./upgrade.sh` with the same flags. An unpacked release bundle carries sources
+and no configuration, so copy the install's `install.env` into it first, or point
+`KUBE_AGENTS_INSTALL_ENV` at one. `--image-tag` overrides the version the script carries and exists
+for development and CI/CD testing; `--plan` reports what a full upgrade would change without
+changing anything. The upgrade modes, the previews, and the refusals are in
+[the Upgrade page](docs/site/src/content/docs/install/upgrade.md).
+
 ## Teardown & Cleanup
 
 To safely remove provisioned resources:

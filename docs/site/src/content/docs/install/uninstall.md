@@ -69,10 +69,13 @@ These steps are irreversible and run **before** Terraform's own prompt, which is
 **No Terraform state anywhere.** With no state in the GCS bucket and none locally, the uninstaller exits **3** without touching anything and says so. Either nothing is installed against those coordinates — the ordinary answer on a clean project, and not a failure — or the install was created by a pre-Terraform release, which this uninstaller cannot take apart. For the second case, re-run with `--source-ref=<the release that installed it>` — the uninstaller fetches that release and hands over to its own `uninstall.sh`, so the code that made the install is what takes it apart:
 
 ```bash
-curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- --source-ref=<old release tag>
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/uninstall.sh | bash -s -- --source-ref=<old release tag>
 ```
+
+Substitute `<RELEASE_VERSION>` with a release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases). A release copy of the script tears an install down with its own release's engine, so the version you fetch is the version that runs — unless `--source-ref` names another one, as it does above, where the point is to run the engine of the release that built the install.
 
 ## Where to go next
 
+- [Upgrade](/kube-agents/install/upgrade/) — moving an install to a newer release instead of removing it.
 - [Full-install composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install#teardown-and-re-apply) — the teardown asymmetries in detail, and running `terraform destroy` by hand.
 - [Security & IAM](/kube-agents/reference/security-and-iam/) — the GCP service accounts and bindings the teardown removes.

@@ -8,7 +8,11 @@
 #
 # Usage:
 #   ./uninstall.sh [options]
-#   curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/uninstall.sh | bash
+#
+# The release-pinned script tears the install down with its own release's
+# engine. A copy carrying no baked version falls back to the engine on main,
+# which is not the one that built the install.
 # ==============================================================================
 
 set -Eeuo pipefail
