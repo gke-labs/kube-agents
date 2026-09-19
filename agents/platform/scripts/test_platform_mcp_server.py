@@ -841,6 +841,16 @@ class TestSessionKvHeaders(unittest.TestCase):
         env = config["mcp_servers"]["platform_control"]["env"]
         self.assertEqual(env.get("SESSION_KV_API_KEY"), "${SESSION_KV_API_KEY}")
 
+    def test_config_yaml_passes_platform_agent_home_into_this_subprocess(self):
+        """Hermes hands a stdio MCP server only the keys named in `env`, so
+        PLATFORM_AGENT_HOME is empty in profile-scoped homes unless config.yaml lists it."""
+        import yaml
+
+        config_path = Path(__file__).resolve().parents[1] / "config.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        env = config["mcp_servers"]["platform_control"]["env"]
+        self.assertEqual(env.get("PLATFORM_AGENT_HOME"), "${PLATFORM_AGENT_HOME}")
+
 
 class TestReportToChat(unittest.TestCase):
     """The specialist's hand-off to the Chat Agent relay."""
@@ -1305,6 +1315,57 @@ class TestFindingsTransport(unittest.TestCase):
     def test_a_bodyless_call_declares_no_content_type(self):
         sent, _ = self._send("GET", "/v1/findings")
         self.assertNotIn("content-type", sent["headers"])
+
+
+class TestClusterProfileTools(unittest.TestCase):
+    @patch("cluster_agent_profile.list_profiles")
+    def test_list_cluster_profiles_calls_list_profiles(self, mock_list):
+        mock_list.return_value = ["cluster-a", "cluster-b"]
+        result = platform_mcp_server.list_cluster_profiles()
+        mock_list.assert_called_once_with()
+        self.assertEqual(result, "cluster-a\ncluster-b")
+
+    def test_list_cluster_profiles_unmocked_with_profile_hermes_home(self):
+        tmp = Path(tempfile.mkdtemp(prefix="mcp-profiles-test-"))
+        try:
+            profiles_dir = tmp / "profiles"
+            profiles_dir.mkdir()
+            platform_home = profiles_dir / "platform"
+            platform_home.mkdir()
+            cluster_dir = profiles_dir / "cluster-prod"
+            cluster_dir.mkdir()
+            (cluster_dir / "USER.md").write_text("- project: p\n- cluster: c\n", encoding="utf-8")
+            (cluster_dir / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n", encoding="utf-8"
+            )
+
+            import cluster_agent_profile as cap
+
+            # 1. HERMES_HOME points to profile home while PLATFORM_AGENT_HOME is unset
+            env_without_platform = {k: v for k, v in os.environ.items() if k != "PLATFORM_AGENT_HOME"}
+            env_without_platform["HERMES_HOME"] = str(platform_home)
+            with patch.dict(os.environ, env_without_platform, clear=True), \
+                 patch.object(cap, "PROFILES_BASE", cap._resolve_profiles_base()):
+                result = platform_mcp_server.list_cluster_profiles()
+                self.assertEqual(result, "cluster-prod")
+
+            # 2. PLATFORM_AGENT_HOME is explicitly set to the data root
+            env_with_platform = {k: v for k, v in os.environ.items()}
+            env_with_platform["HERMES_HOME"] = "/arbitrary/unused"
+            env_with_platform["PLATFORM_AGENT_HOME"] = str(tmp)
+            with patch.dict(os.environ, env_with_platform, clear=True), \
+                 patch.object(cap, "PROFILES_BASE", cap._resolve_profiles_base()):
+                result = platform_mcp_server.list_cluster_profiles()
+                self.assertEqual(result, "cluster-prod")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @patch("cluster_agent_profile.profile_name")
+    def test_get_cluster_profile_name_calls_profile_name(self, mock_pname):
+        mock_pname.return_value = "cluster-myproj-myclust-us-central1"
+        result = platform_mcp_server.get_cluster_profile_name("myproj", "myclust", "us-central1")
+        mock_pname.assert_called_once_with("myproj", "myclust", "us-central1")
+        self.assertEqual(result, "cluster-myproj-myclust-us-central1")
 
 
 if __name__ == '__main__':

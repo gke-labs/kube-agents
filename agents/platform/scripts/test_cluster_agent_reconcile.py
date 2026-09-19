@@ -206,10 +206,16 @@ class IncompleteScaffoldTest(HomesMixin):
 
     def _reconcile(self, incomplete):
         created: list = []
+        home = self.homes / "cluster-beta"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("cluster_identity:\n  project: p\n  cluster: beta\n  location: us-central1\n")
+        if "cluster-beta" not in incomplete:
+            for artifact in (*rec.SCAFFOLD_ARTIFACTS, rec.KUBECONFIG_ARTIFACT):
+                (home / artifact).touch()
         with mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed), \
              mock.patch.object(rec, "_project", return_value="p"), \
              mock.patch.object(rec, "_all_clusters", return_value=[("p", "beta", "us-central1")]), \
-             mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
+             mock.patch.object(cap, "PROFILES_BASE", self.homes), \
              mock.patch.object(rec, "profile_home",
                                side_effect=_home_factory(self.homes, incomplete=incomplete)), \
              mock.patch.object(rec, "read_cluster_identity", side_effect=lambda home: _identity(cluster="beta")), \
@@ -219,6 +225,13 @@ class IncompleteScaffoldTest(HomesMixin):
                                side_effect=lambda pr, c, l: created.append(c) or f"cluster-{c}"):
             report = rec.reconcile(dry_run=False)
         return report, created
+
+    def test_reconcile_passes_include_incomplete_true_to_list_profiles(self):
+        with mock.patch.object(rec, "list_profiles", return_value=[]) as mock_list, \
+             mock.patch.object(rec, "_project", return_value="p"), \
+             mock.patch.object(rec, "_all_clusters", return_value=[]):
+            rec.reconcile(dry_run=True)
+            mock_list.assert_called_once_with(include_incomplete=True)
 
     def test_a_half_scaffolded_profile_is_recreated(self):
         report, created = self._reconcile(incomplete={"cluster-beta"})
@@ -504,10 +517,18 @@ class ListProfilesReservedTest(unittest.TestCase):
     def test_reserved_profiles_excluded(self):
         base = Path(tempfile.mkdtemp()) / "profiles"
         for name in ("default", "platform", "cluster-a", "cluster-b"):
-            (base / name).mkdir(parents=True)
+            p = base / name
+            p.mkdir(parents=True)
+            if name.startswith("cluster-"):
+                (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+                (p / "config.yaml").write_text(
+                    "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                    encoding="utf-8",
+                )
         (base / "a-file").write_text("not a dir")
         with mock.patch.object(cap, "PROFILES_BASE", base):
             self.assertEqual(cap.list_profiles(), ["cluster-a", "cluster-b"])
+            self.assertEqual(cap.list_profiles(include_incomplete=True), ["cluster-a", "cluster-b"])
 
 
 class ClusterExistsTest(unittest.TestCase):

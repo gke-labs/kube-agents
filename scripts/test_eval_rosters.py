@@ -88,6 +88,7 @@ NIGHTLY_AT_SPLIT = [
 # pull request that authored the case (a new case lands in the nightly first).
 ADDED_AFTER_THE_SPLIT = [
     "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625
+    "cluster-agent-unlocated-crashloop-debug",  # #953 unlocated cluster discovery, PR #1670
 ]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",

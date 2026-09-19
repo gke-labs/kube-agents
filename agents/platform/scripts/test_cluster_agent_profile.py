@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # (/opt/defaults/scripts); in the repo they live in deploy/shared.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"))
 
-import cluster_agent_profile as cap  # noqa: E402
+import cluster_agent_profile as cap
+import sandbox_exec  # noqa: E402
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -521,6 +522,202 @@ class CreateProfileTest(unittest.TestCase):
         cfg = self.plugin_config()
         self.assertFalse(cfg["enabled"])
         self.assertEqual(cfg["backends"], [])
+
+
+class ResolveProfilesBaseTest(unittest.TestCase):
+    def test_resolves_when_hermes_home_is_profile_home(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+
+    def test_resolves_when_platform_agent_home_is_set(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": "/custom/profiles/platform", "PLATFORM_AGENT_HOME": "/srv/agent"},
+            clear=True,
+        ):
+            self.assertEqual(cap._resolve_data_root(), Path("/srv/agent"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/agent/profiles"))
+
+    def test_resolves_standard_root_hermes_home(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+
+
+class ListProfilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-list-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _scaffold(self, name: str, user_md: bool = True, identity: bool = True):
+        p = self.tmp / name
+        p.mkdir(parents=True, exist_ok=True)
+        if user_md:
+            (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+        if identity:
+            (p / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                encoding="utf-8",
+            )
+        return p
+
+    def test_nonexistent_directory_returns_empty(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.assertEqual(cap.list_profiles(), [])
+
+    def test_filters_reserved_and_files(self):
+        (self.tmp / "default").mkdir()
+        (self.tmp / "platform").mkdir()
+        (self.tmp / "not-a-dir.txt").touch()
+        self._scaffold("cluster-beta")
+        self._scaffold("cluster-alpha")
+
+        self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
+
+    def test_incomplete_profiles_excluded_by_default(self):
+        self._scaffold("cluster-ready")
+        self._scaffold("cluster-no-user", user_md=False, identity=True)
+        self._scaffold("cluster-no-identity", user_md=True, identity=False)
+
+        self.assertEqual(cap.list_profiles(), ["cluster-ready"])
+        self.assertEqual(
+            cap.list_profiles(include_incomplete=True),
+            ["cluster-no-identity", "cluster-no-user", "cluster-ready"],
+        )
+
+    def test_cmd_list_prints_sorted(self):
+        self._scaffold("cluster-zeta")
+        self._scaffold("cluster-beta")
+        self._scaffold("cluster-halfbuilt", user_md=False)
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            cap.cmd_list(mock.MagicMock(all=False))
+        self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
+
+        out_all = io.StringIO()
+        with mock.patch("sys.stdout", out_all):
+            cap.cmd_list(mock.MagicMock(all=True))
+        self.assertEqual(out_all.getvalue(), "cluster-beta\ncluster-halfbuilt\ncluster-zeta\n")
+
+
+class DeleteProfileTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-delete-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @mock.patch("subprocess.run")
+    @mock.patch("sandbox_exec.sandbox_enabled", return_value=True)
+    @mock.patch("sandbox_exec.run")
+    def test_delete_profile_removes_home_and_cleans_sandbox(self, mock_sbox_run, mock_sbox_enabled, mock_sub_run):
+        home = self.tmp / "cluster-target"
+        home.mkdir()
+        (home / "USER.md").write_text("identity")
+
+        cap.delete_profile("cluster-target")
+
+        self.assertFalse(home.exists())
+        mock_sub_run.assert_called_once()
+        mock_sbox_run.assert_called_once_with(
+            ["rm", "-rf", "/opt/data/profiles/cluster-target"],
+            check=True,
+            timeout=15,
+            principal=sandbox_exec.TERMINAL_PRINCIPAL,
+        )
+
+
+class SandboxStubTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.stub_path = repo_root / "deploy" / "sandbox" / "agent-pod-only-stub.py"
+        self.assertTrue(self.stub_path.is_file(), f"missing {self.stub_path}")
+        self.tmp = Path(tempfile.mkdtemp(prefix="sandbox-stub-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_stub_refuses_execution_with_mcp_guidance(self):
+        wrapper = self.tmp / "cluster_agent_profile.py"
+        wrapper.symlink_to(self.stub_path)
+
+        # 1. list
+        res_list = subprocess.run(
+            [sys.executable, str(wrapper), "list"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_list.returncode, 1)
+        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res_list.stderr)
+        self.assertIn("list_cluster_profiles()", res_list.stderr)
+
+        # 2. name
+        res_name = subprocess.run(
+            [sys.executable, str(wrapper), "name", "--project", "p", "--cluster", "c", "--location", "l"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_name.returncode, 1)
+        self.assertIn("get_cluster_profile_name", res_name.stderr)
+
+        # 3. create
+        res_create = subprocess.run(
+            [sys.executable, str(wrapper), "create", "--name", "x"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_create.returncode, 1)
+        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res_create.stderr)
+
+
+class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.skill_path = (
+            repo_root / "agents" / "platform" / "skills" / "cluster-agent-lifecycle" / "SKILL.md"
+        )
+        self.assertTrue(self.skill_path.is_file(), f"missing {self.skill_path}")
+        self.content = self.skill_path.read_text(encoding="utf-8")
+
+    def test_delegation_handles_unnamed_cluster_via_fleet_enumeration(self):
+        # The procedure must explicitly guide resolution when the cluster name is omitted (#953).
+        self.assertIn("list_cluster_profiles()", self.content)
+        self.assertIn("get_cluster_profile_name", self.content)
+        self.assertIn("cluster_agent_profile.py list", self.content)
+        # Must instruct checking before asking the user
+        self.assertIn("existence", self.content.lower())
+        # Must instruct polling to settlement and waiting before completing
+        self.assertIn("settlement", self.content.lower())
+        self.assertIn("sleep 60", self.content)
+        # Must bound the polling loop and handle ready cards
+        self.assertIn("5 polling rounds", self.content)
+        self.assertIn("ready", self.content)
+        self.assertIn("timed out", self.content)
+        # Must define that blocked or failed probes do not count as a match
+        self.assertRegex(
+            self.content,
+            r"[Bb]locked.*not.*match|[Dd]o(es)?\s+(\*\*)?not(\*\*)?\s+count as a match",
+        )
+        # Must instruct asking only after searching / looking
+        self.assertRegex(
+            self.content,
+            r"[Aa]sk only after (looking|checking|searching)",
+        )
+        # Must require identifying which cluster was picked in the report
+        self.assertIn("Never resolve silently", self.content)
 
 
 if __name__ == "__main__":

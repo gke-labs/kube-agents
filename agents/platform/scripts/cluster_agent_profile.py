@@ -31,7 +31,38 @@ from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, ove
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+ENV_PLATFORM_AGENT_HOME = "PLATFORM_AGENT_HOME"
+ENV_HERMES_HOME = "HERMES_HOME"
+DEFAULT_DATA_ROOT = Path("/opt/data")
+PROFILES_DIR_NAME = "profiles"
+SANDBOX_PROFILES_BASE = Path(sandbox_exec.DEFAULT_SANDBOX_CWD) / PROFILES_DIR_NAME
+SANDBOX_CLEANUP_TIMEOUT_SECONDS = 15
+
+
+def _resolve_data_root() -> Path:
+    """Resolve the data PVC root containing the profiles/ directory.
+
+    In a Platform Agent worker, kanban session, or gateway child, HERMES_HOME is pointed
+    at the profile home (<root>/profiles/platform) while PLATFORM_AGENT_HOME points to
+    the data PVC root (/opt/data). If PLATFORM_AGENT_HOME is unset and HERMES_HOME points
+    directly to a profile home, derive the root from HERMES_HOME.parent.parent.
+    """
+    if os.environ.get(ENV_PLATFORM_AGENT_HOME):
+        return Path(os.environ[ENV_PLATFORM_AGENT_HOME])
+    raw_home = Path(os.environ.get(ENV_HERMES_HOME, str(DEFAULT_DATA_ROOT)))
+    if raw_home.parent.name == PROFILES_DIR_NAME:
+        return raw_home.parent.parent
+    return raw_home
+
+
+def _resolve_profiles_base() -> Path:
+    """Resolve the directory containing all profile subdirectories."""
+    return _resolve_data_root() / PROFILES_DIR_NAME
+
+
+HERMES_HOME = _resolve_data_root()
 # Operator-rendered config overlays and profile-targeted plugin image volumes. The
 # entrypoint applies both at pod startup; a profile scaffolded here appears later, so it
 # has to pick them up itself (see create_profile steps 2c/2d).
@@ -50,11 +81,13 @@ SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
-PROFILES_BASE = HERMES_HOME / "profiles"
+PROFILES_BASE = _resolve_profiles_base()
 
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
+CLUSTER_PROFILE_PREFIX = "cluster-"
+IDENTITY_FILE = "USER.md"
 
 # Non-cluster profiles that live under $HERMES_HOME/profiles but are never
 # managed as Cluster Agents: the front-door router (`default`) and the Platform
@@ -423,7 +456,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # It stays informational even so: the pin the runtime honours is KUBECONFIG
     # in the profile's .env (step 3b), not this line. Repointing an agent means
     # re-running this scaffold, not editing USER.md.
-    (home / "USER.md").write_text(
+    (home / IDENTITY_FILE).write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
@@ -470,15 +503,46 @@ def delete_profile(name: str) -> None:
         log(f"'hermes profile delete {name}' failed (continuing to clean up home): {e}")
     if home.exists():
         shutil.rmtree(home, ignore_errors=True)
+    if sandbox_exec.sandbox_enabled():
+        try:
+            sandbox_exec.run(
+                ["rm", "-rf", str(SANDBOX_PROFILES_BASE / name)],
+                check=True,
+                timeout=SANDBOX_CLEANUP_TIMEOUT_SECONDS,
+                principal=sandbox_exec.TERMINAL_PRINCIPAL,
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"sandbox cleanup of profile {name} skipped: {e}")
 
 
-def list_profiles() -> list[str]:
-    """Return sorted names of managed Cluster Agent profiles (excludes reserved profiles)."""
+def list_profiles(include_incomplete: bool = False) -> list[str]:
+    """Return sorted names of managed Cluster Agent profiles.
+
+    By default (include_incomplete=False), returns only fully scaffolded profiles:
+    profiles whose directory name starts with 'cluster-', not in RESERVED_PROFILES,
+    carrying a valid 'USER.md' identity file, and having readable cluster_identity
+    in config.yaml.
+
+    When include_incomplete=True, returns all directories under PROFILES_BASE
+    excluding RESERVED_PROFILES, allowing reconciliation to detect and repair
+    incomplete scaffolds.
+    """
     if not PROFILES_BASE.is_dir():
         return []
-    return sorted(
-        p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
-    )
+    if include_incomplete:
+        return sorted(
+            p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
+        )
+    valid = []
+    for p in PROFILES_BASE.iterdir():
+        if not p.is_dir() or p.name in RESERVED_PROFILES or not p.name.startswith(CLUSTER_PROFILE_PREFIX):
+            continue
+        if not (p / IDENTITY_FILE).is_file():
+            continue
+        if read_cluster_identity(p) is None:
+            continue
+        valid.append(p.name)
+    return sorted(valid)
 
 
 def cmd_delete(args: argparse.Namespace) -> None:
@@ -487,8 +551,9 @@ def cmd_delete(args: argparse.Namespace) -> None:
     print(name)
 
 
-def cmd_list(_args: argparse.Namespace) -> None:
-    for name in list_profiles():
+def cmd_list(args: argparse.Namespace) -> None:
+    include_incomplete = getattr(args, "all", False)
+    for name in list_profiles(include_incomplete=include_incomplete):
         print(name)
 
 
@@ -518,7 +583,12 @@ def main() -> None:
         sp.add_argument("--cluster", required=True)
         sp.add_argument("--location", required=True)
 
-    sub.add_parser("list", help="List existing cluster profiles")
+    list_parser = sub.add_parser("list", help="List existing cluster profiles")
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
+    )
 
     args = parser.parse_args()
     handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}
