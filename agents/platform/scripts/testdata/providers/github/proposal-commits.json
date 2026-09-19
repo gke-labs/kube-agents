@@ -1,0 +1,44 @@
+{
+  "payload": {
+    "number": 4321,
+    "limit": 2
+  },
+  "responses": [
+    [
+      {
+        "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "commit": {
+          "author": {
+            "name": "Example Author",
+            "date": "2026-08-29T09:00:00Z"
+          },
+          "committer": {
+            "name": "GitHub",
+            "date": "2026-08-29T09:05:00Z"
+          },
+          "message": "ingest: raise the batch limit"
+        },
+        "author": {
+          "login": "kube-agents[bot]"
+        },
+        "html_url": "https://github.com/acme/infra/commit/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+      },
+      {
+        "sha": "b2c3d4e5f60718293a4b5c6d7e8f901234567890",
+        "commit": {
+          "author": {
+            "name": "Example Author",
+            "date": "2026-08-30T12:00:00Z"
+          },
+          "committer": {
+            "name": "GitHub",
+            "date": "2026-08-30T12:01:00Z"
+          },
+          "message": "ingest: address review"
+        },
+        "author": null,
+        "html_url": "https://github.com/acme/infra/commit/b2c3d4e5f60718293a4b5c6d7e8f901234567890"
+      }
+    ]
+  ]
+}

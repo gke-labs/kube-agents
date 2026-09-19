@@ -46,16 +46,17 @@ Follow these steps to make, commit, and submit your GitOps suggestions asynchron
 
 ### Step 1: Prepare
 
-Never run `git` from wherever your shell happens to be. You share one volume with
-every other agent in this pod — the fleet audits, the other kanban workers — and
-a bare `git checkout` there lands inside a clone somebody else is mid-way
-through. `prepare` gives you somewhere of your own to work.
+Never run the plain `git` on this machine and never work from wherever your
+shell happens to start. That `git` is a different program: it reaches the
+network with a credential, and it is not the one your working copy answers to.
+`prepare` brings the repository down and stands you on the branch this change
+goes on.
 
 The script path is spelled out from `$HERMES_HOME` rather than as `./skills/…`
 because this skill is reached from a kanban card as well as from a cron turn,
 and a card dispatch starts you in the task's workspace, not the profile
 directory. `$HERMES_HOME` is the profile directory in both. Use that form
-everywhere below, including for `github_token_refresh.py` in Step 5.
+everywhere below, including for `vcs.py` in Step 5.
 
 If you do meet a `No such file or directory` on one of these scripts, do **not**
 recover by writing the absolute path out: `/opt/data/profiles/platform/…` is
@@ -73,99 +74,103 @@ _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` 
 
 In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.4).
 
-It refreshes credentials, opens the GitOps repository, and prints one JSON line.
-**Keep that whole line — Step 3 needs it back.** Its `mode` field says which of
-two ways Steps 2 and 3 work, and you follow that field rather than choosing:
-
-**`"mode": "content"`** — the repository is checked out on the credential
-broker's side, where you have no path to it. There is no `.git` for you to touch
-and no `git` for you to run.
-
-```json
-{
-  "mode": "content",
-  "handle": "4f1c…",
-  "branch": "platform-agent/provision-mercury-09",
-  "base": "main",
-  "baseSha": "9a3d…",
-  "repo": "acme/fleet"
-}
-```
-
-**`"mode": "directory"`** — a clone leased to you alone on the shared volume.
+It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
+`workspace` is named for your branch as well as the repository, because
+`/opt/data/scratch` is shared with every other card: another card suggesting a
+change to the same repository right now derives a different branch name for it,
+so it works in a different directory. Different, not protected — every card here
+runs as the same account and the whole tree is readable and writable from all of
+them. What keeps two suggestions apart is that no two of them share a branch
+name, which is why the name has to describe the change.
 
 ```json
 {
-  "mode": "directory",
-  "workspace": "/opt/data/gitops/t_9f3c1e07/acme__fleet",
-  "lease": "t_9f3c1e07",
-  "branch": "platform-agent/provision-mercury-09",
-  "base": "main",
+  "workspace": "/opt/data/scratch/vcs/github__acme__fleet__platform-agent__provision-mercury-09",
   "repo": "acme/fleet",
-  "started_from": "origin/main"
+  "branch": "platform-agent/provision-mercury-09",
+  "base": "main",
+  "started_from": "main",
+  "proposal": ""
 }
 ```
 
-In directory mode the credential proxy refuses `git add`, `commit`, `checkout`,
-`push` and every other tree-mutating verb outside a leased workspace, so a
-command run anywhere else comes back as a security refusal rather than quietly
-damaging another agent's work.
+`base` is what the change merges into: the repository's own default branch, not
+a hardcoded `main` — or, when a pull request for this branch is already open,
+whatever that one is already targeting.
 
-`base` is the repository's own default branch, not a hardcoded `main`. In
-directory mode `started_from` records what the branch was actually cut from:
-when the branch already exists on the remote (Step 5, addressing feedback on an
-open PR) it is `origin/<branch>` and your commits land **on top of** the ones
-already under review; when it does not, the branch is cut fresh from
-`origin/<base>`. Content mode always commits onto `origin/<base>` and carries the
-earlier commits by pushing on top of the same branch.
+`started_from` and `proposal` are two halves of one answer — whether this is new
+work or another round on a change already under review. `prepare` asks the forge
+rather than taking your word for it. When a pull request is open for the branch,
+its URL is in `proposal`, the copy is taken **of that branch** so every reviewed
+revision comes down with it, and `started_from` is the branch itself. Otherwise
+`proposal` is empty, the copy is taken of the base, and `started_from` is the
+base.
+
+There is one working copy per repository **and branch**, so preparing a second
+change to the same repository does not disturb the first. If the copy for this
+branch holds revisions that were never published, `prepare` refuses to replace
+it. Finishing them is the way past, not the flag: go to the copy the refusal
+names, publish what is in it and open the proposal, and this `prepare` becomes a
+second round on that branch instead of a replacement. `--force` deletes those
+revisions; it is the answer only once you have read them and decided they should
+not exist.
+
+`prepare` refuses the name for a second reason: the proposal it was last used
+for is closed, and its revisions are not in the history you just cloned. That is
+what a squash merge leaves behind — the change is in the trunk under a different
+revision, the branch is still on the forge, and building on it again would
+re-propose work that has already landed. Choose a different name; the derived
+one is a default, not a requirement.
 
 ### Step 2: Make the Changes
 
-**Content mode.** Work in a scratch directory of your own — `mktemp -d` is
-fine — laid out the way the repository is. A file at `<scratch>/policies/baseline.yaml`
-becomes `policies/baseline.yaml` in the commit.
+Generate or edit the files **inside the returned `workspace`**.
 
-Editing a file that already exists means fetching it first; there is no checkout
-here to `cat`. Fetch into the same scratch directory you will submit from:
-
-```bash
-S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py
-SCRATCH=$(mktemp -d)
-"$S" list --handle "<handle>" --prefix policies      # what is there
-"$S" fetch --handle "<handle>" --path policies/baseline.yaml --to "$SCRATCH"
-# edit "$SCRATCH"/policies/baseline.yaml, and write any new files under $SCRATCH
-```
-
-**CRITICAL SECURITY RULE:** the scratch directory _is_ the change set — there is
-no staging step and nothing to un-stage. Put only the declarative files you mean
-to propose in it. Never point `--from` at a directory holding transient
-debugging output, local credentials or logs, and never at a directory you did
-not create for this purpose. Symlinks in it are skipped rather than followed.
-
-**Directory mode.** Generate or edit the files **inside the returned
-`workspace`**, then stage and commit following Conventional Commit standards.
-**CRITICAL SECURITY RULE:** explicitly stage only the targeted declarative files
-you generated or modified. **Never use `git add .` or `git add -A`** — the same
-reason as above.
+The local version control binary is `/opt/vcs/libexec/git`. It holds no
+credential and cannot reach a forge, which is exactly why it is the one to use
+on the working copy. Export it once and call it through the variable:
 
 ```bash
+export G=/opt/vcs/libexec/git
 cd <workspace>
-git add <file_path_1> <file_path_2>
-git commit -m "<conventional_commit_message>"
+# create or edit the declarative files here
+$G add <file_path_1> <file_path_2>
+$G commit -m "<conventional_commit_message>"
 ```
 
-_(Example: `git add config/manifest.yaml && git commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
+Do **not** define a shell alias for it. Each command you run arrives in a fresh
+non-interactive shell, which never expands aliases, so an aliased `git`
+followed by `git commit` silently runs the credentialed program instead.
+
+**CRITICAL SECURITY RULE:** explicitly stage only the targeted declarative files
+you generated or modified. **Never use `git add .` or `git add -A`** — this is a
+real clone on a filesystem you also scratch in, and a blanket add sweeps
+transient debugging output, logs and anything else that landed there into a
+public pull request.
+
+_(Example: `$G add config/manifest.yaml && $G commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
+
+Committing here is optional. Uncommitted changes **to files the copy already
+tracks** are recorded as a single revision under the `--title` you pass when you
+run Step 3, which is what a single-purpose change wants. Commit yourself when
+the change deserves more than one revision, or a message that is not the pull
+request's headline.
+
+The rule above still holds at Step 3: a file the copy has never seen is not
+swept in for you. `submit` refuses and names it, because it cannot tell a
+manifest you generated from a log you left behind. Stage the ones that belong
+(`$G add <path>`) and delete the rest.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 
-The same helper with `submit` handles the GitHub App token exchange, git
-credential configuration, the push, and Pull Request creation. Pass back what
-Step 1 printed for the mode you are in.
+The same helper with `submit` publishes the branch and opens the pull request —
+or updates the one already open. It finds the working copy Step 1 made, so the
+only thing to pass back is the branch name.
 
-Write the description to a file first, in either mode, and pass the path. Inside
-double quotes bash expands backticks and `$(...)`, and a pull request body is
-full of backticks — through `--body` a benign one silently deletes its own text
-and a hostile one runs where a credentialed `git` and `gh` are on `PATH`:
+Write the description to a file first and pass the path. Inside double quotes
+bash expands backticks and `$(...)`, and a pull request body is full of
+backticks — through `--body` a benign one silently deletes its own text and a
+hostile one runs in the working copy you are about to publish:
 
 ```bash
 BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)
@@ -183,55 +188,39 @@ The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc
 expands the same constructs the argument would have. `mktemp` matters because
 `/opt/data/scratch` is shared with every other card running right now, and a
 fixed name there is two cards writing one file — one card's description on the
-other's pull request. Keep the file inside `/opt/data/scratch`, the only
-directory `--body-file` reads from, and outside `$SCRATCH` — everything under
-`--from` is committed.
-
-**Content mode** — the `handle`, the scratch directory, the `base`, and the `baseSha`:
-
-```bash
-"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
-  --handle "<handle>" \
-  --from "$SCRATCH" \
-  --base "<base>" \
-  --base-sha "<baseSha>" \
-  --branch "platform-agent/<change_type>-<target_id>" \
-  --title "<pr_title>" \
-  --body-file "$BODY"
-```
-
-Add `--delete <path>` (repeatable) to remove a file the repository has.
-`--base` carries the base branch from `prepare` so the client can refuse if `--branch` matches it before contacting the broker (falling back to `CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH` or `main` if omitted; on non-main default branches without `--base`, the broker authoritatively validates and refuses pushes against the repository's default branch upon commit).
-`--base-sha` is what makes the broker refuse rather than overwrite when somebody
-else changed one of these same files while you were working; without it the last
-writer wins. Drop it only when you are deliberately replacing whatever is there.
-
-**Directory mode** — the `workspace` and the `lease`, which the script checks is
-still yours and refuses outright if it belongs to another agent:
+other's pull request. Keep the file directly in `/opt/data/scratch`, the only
+directory `--body-file` reads from, and **not** inside the `workspace` — a file
+there is part of the change.
 
 ```bash
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
-  --workspace "<workspace>" \
-  --lease "<lease>" \
+  --repo "<owner>/<repo>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
   --body-file "$BODY"
 ```
 
-`--lease` is not optional bookkeeping. `prepare` and `submit` are separate
-processes, and outside a kanban card there is no session identity for `submit`
-to re-derive the lease from — so without it the script stops and tells you to
-pass it, rather than inventing an id that could never match the workspace.
+`--base <branch>` names what the change merges into, for the rare case where it
+is not the `base` Step 1 reported. It may not name the branch you are
+submitting: a head branch that is its own base carries nothing for anyone to
+review, and `prepare`, `submit` and the broker each refuse it. That covers the
+repository whose trunk is called something other than `main` — the name is read
+from the remote, not from a list.
 
-Finish in the mode you prepared in. A session that got a `handle` has no leased
-directory to fall back to, and one that got a `workspace` has no handle to
-present.
-
-The script returns the clean, live GitHub PR URL. If a Pull Request for this
+The script returns the clean, live pull request URL. If a pull request for this
 branch is already open, it updates that one's title and body in place and
 returns its URL — resubmitting is not an error. `--keep-description` (Step 5) is
-the one exception: it leaves the open Pull Request's title and body as their
+the one exception: it leaves the open pull request's title and body as their
 author wrote them.
+
+Older invocations carried `--workspace`, `--lease`, `--handle` and `--base-sha`.
+They are still accepted, and read and ignored with a line saying so. That is
+all they buy: a command written against the old shape fails on what is actually
+wrong with it — there is no working copy here, take the branch with `prepare`
+— rather than on "unrecognized arguments", which says nothing and hides the
+real cause. A card that prepared before an upgrade cannot submit after one; its
+clone was on a volume this script no longer has. Prepare again. Do not write
+new commands with these flags.
 
 ### Step 4: Confirm Suggestion
 
@@ -239,38 +228,51 @@ Record the PR link returned by the script, update the pending status inside your
 
 ### Step 5: Addressing Review Feedback on an Existing PR
 
-When you are asked to **address review comments / reviewer feedback** on an existing PR, **read the comments yourself — never expect them pasted into the task.** You have GitHub access via the minted, repo-scoped App token (cached into `gh` and the git credential store by `scripts/github_token_refresh.py`).
+When you are asked to **address review comments / reviewer feedback** on an
+existing PR, **read the comments yourself — never expect them pasted into the
+task.** The `version-control` skill reads and writes them through the same
+broker this skill publishes through; there is no forge CLI to authenticate and
+no token to refresh.
 
-1. **Refresh auth** if a call is unauthorized: `python3 "$HERMES_HOME"/scripts/github_token_refresh.py <owner/repo>`.
-2. **Read the PR and all its feedback** — both the conversation and inline (diff) review comments:
+1. **Read the pull request and all its feedback** — the conversation and the
+   inline review comments arrive together, each carrying the file and line it
+   sits on where it has one:
+
    ```bash
-   gh pr view <PR_NUMBER> --repo <owner/repo> --json title,url,headRefName,body,comments,reviews
-   gh api repos/<owner/repo>/pulls/<PR_NUMBER>/comments   # inline review-thread comments
+   V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
+   python3 "$V" proposal view <PR_NUMBER> --repo "<owner>/<repo>" --comments
    ```
-3. **Apply the requested changes on the PR's own branch.** Run Step 1 against
-   that branch — `prepare --repo "<owner>/<repo>" --branch <headRefName>` — and
-   follow the `mode` it prints, exactly as Steps 2 and 3 describe. Two things differ from a first
-   submission, and both are handled for you: the commits already under review
-   stay on the branch and yours go on top, and `submit` pushes with
-   `--force-with-lease`, so it updates the branch it fetched and refuses rather
-   than overwrites one somebody else has moved in the meantime.
 
-   In content mode, `fetch` the files the reviewer commented on into your
-   scratch directory before editing them — what is on the branch is what you are
-   being asked to change, and rewriting it from memory loses the rest of the
-   file. Directory mode is unchanged: edit in the `workspace`, stage only the
-   specific files (**never `git add .` / `-A`**), and commit.
+   Add `--diff` for the change under discussion. The `source` field of that
+   answer is the branch to work on in the next step.
 
-   Pass `--title` and `--body-file` again so the description matches the commits
-   now on the branch — or `--keep-description` and no body, when the change you
-   were asked for does not alter what the pull request is for. That flag keeps
-   the title along with the body, and it needs the pull request to still be
-   open: a merged or closed one is not a description to keep, and the script
-   refuses before it pushes anything rather than opening a fresh pull request
-   with no description at all. Keep `--title` in content mode even then — there
-   it is the message of the commit this script makes, not just the pull
-   request's headline.
+2. **Apply the requested changes on the PR's own branch.** Run Step 1 against
+   that branch — `prepare --repo "<owner>/<repo>" --branch <source>` — then
+   Steps 2 and 3 exactly as written. Two things differ from a first submission
+   and both are handled for you: the copy comes down with the revisions already
+   under review on it and yours go on top, and `submit` adds to the branch
+   rather than replacing it, refusing outright if somebody else has moved it in
+   the meantime.
 
-4. **Reply on the PR** summarizing what changed (`gh pr comment <PR_NUMBER> --repo <owner/repo> --body "..."`), then relay a clean confirmation (PR URL + what you changed) back through your kanban result.
+   Edit the files the reviewer commented on in the `workspace` — what is on the
+   branch is what you are being asked to change, and rewriting a file from
+   memory loses the rest of it. Stage only those specific files
+   (**never `git add .` / `-A`**).
 
-Never ask the requester to paste the comment text — fetching it from GitHub and addressing it is your job.
+   Pass `--title` and `--body-file` again so the description matches the
+   revisions now on the branch — or `--keep-description` and no body, when what
+   you were asked for does not alter what the pull request is for. That flag
+   keeps the title along with the body, so a `--title` passed beside it is
+   ignored and says so. It needs the pull request to still be open: a merged or
+   closed one is not a description to keep, and the script refuses before
+   publishing anything rather than opening a fresh pull request with no
+   description at all.
+
+3. **Reply on the PR** summarizing what changed, then relay a clean
+   confirmation (PR URL + what you changed) back through your kanban result.
+
+   ```bash
+   python3 "$V" proposal comment <PR_NUMBER> --repo "<owner>/<repo>" --body "<what changed>"
+   ```
+
+Never ask the requester to paste the comment text — fetching it and addressing it is your job.

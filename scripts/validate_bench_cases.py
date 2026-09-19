@@ -188,6 +188,20 @@ KNOWN_NO_DOMAIN = {
         "clone or gh from the sandbox); no domains.yaml row describes "
         "repository access"
     ),
+    "vcs-issue-resolver-triage": (
+        "the github-issue-resolver skill end to end -- poll, claim, "
+        "investigate, transition -- graded on the route the resolver took to "
+        "the forge and on the triage it produced; no domains.yaml row "
+        "describes issue triage, and incident-triage names the event-fired "
+        "autoops journey rather than this one"
+    ),
+    "vcs-review-feedback-read-back": (
+        "a second revision put on an existing proposal's branch and read back "
+        "from the forge before it is described, graded on the route the worker "
+        "took to the read-back; rca-remediation-pr owns the remediation "
+        "journey -- a proposed fix landing as a pull request -- and this case "
+        "proposes no fix"
+    ),
     "gpu-stress-test-diagnosis": (
         "a chat-prompted post-incident RCA, not the event-fired autoops triage "
         "that incident-triage names; no domains.yaml row describes it"

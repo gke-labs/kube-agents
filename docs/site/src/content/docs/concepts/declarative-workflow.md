@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the agent has a fix in mind — a policy update, a node pool tweak, a security patch, a namespace addition — it doesn't `kubectl apply`. It writes the change into your **GitOps repo** as a **pull request** via the `submit-suggestion` skill, using a short-lived GitHub token minted on demand by **Minty**.
+The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the agent has a fix in mind — a policy update, a node pool tweak, a security patch, a namespace addition — it doesn't `kubectl apply`. It writes the change into your **GitOps repo** as a **pull request** via the `submit-suggestion` skill. The short-lived GitHub token that push needs is minted on demand by **Minty** on the credential side of the boundary; it never enters the container the agent's shell runs in.
 
 ## Why
 
@@ -20,14 +20,16 @@ Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-lab
 
 The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of the `$GITOPS_STATE_CONFIGMAP` ConfigMap (per `SOUL.md §1`). The flow:
 
-1. Runs `"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That leases a private clone, refreshes it, cuts the topic branch off `origin/main`, and prints the workspace path as JSON. The path is spelled from `$HERMES_HOME` because the skill is reached from a kanban card as well as from a cron turn, and only a cron turn starts in the profile directory.
+1. Runs `"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That brings the repository down into a private copy, cuts the topic branch off the default branch, and prints the workspace path as JSON. The path is spelled from `$HERMES_HOME` because the skill is reached from a kanban card as well as from a cron turn, and only a cron turn starts in the profile directory.
 2. Applies the change **inside the printed workspace** (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
-3. Runs the same helper with `submit --workspace … --branch … --title … --body-file …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`. The description travels over a file under `/opt/data/scratch` rather than argv: a pull request body is full of backticks, and inside the double quotes the agent would write around it bash expands them.
+3. Runs the same helper with `submit --branch … --title … --body-file …`, which records the change, sends the branch up, and opens or refreshes the pull request. The description travels over a file under `/opt/data/scratch` rather than argv: a pull request body is full of backticks, and inside the double quotes the agent would write around it bash expands them.
 4. The script prints the PR URL to stdout; the agent posts it to Chat.
 
-The lease in step 1 is what keeps concurrent agents apart: a Pod runs nine audit crons alongside every kanban worker, each in a working tree of its own. `submit` refuses outright if the workspace it is handed belongs to another lease, and the credential proxy refuses tree-mutating `git` anywhere outside a leased directory — see [Credential isolation](/kube-agents/reference/credential-isolation/), with [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) canonical for the layout.
+Every one of those steps is a **version-control verb** the credential broker performs on the agent's behalf. There is no `gh` in the helper, no token in the container, and no directory shared with the process that holds the credential — see [Credential isolation](/kube-agents/reference/credential-isolation/).
 
-Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks pushes to the protected branches `main`, `master`, and `production`. The push is `--force-with-lease`, so re-submitting after review feedback updates the existing PR branch but will not overwrite one somebody else has moved.
+Keeping concurrent agents apart is step 1's other job: a Pod runs nine audit crons alongside every kanban worker. Each gets one copy per repository under its own scratch root, and `prepare` refuses to replace a copy that holds work which was never sent up. `--force` is the way past that refusal, and taking it discards the unpublished work.
+
+Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks pushes to the protected branches `main`, `master`, and `production`. Sending a branch up is **fast-forward only**: a second round on the same branch extends it, and a branch somebody else has moved since you read it is refused by name rather than overwritten.
 
 ## Answering a reviewer on the PR
 
@@ -41,7 +43,7 @@ The rest of the line gets the same treatment, for the same reason. `/agent fix t
 
 **Who may.** Accounts with write access to the repository. Anyone else is refused — usually with a reply saying so, posted by the poller itself without waking a model, since refusing needs no reasoning. "Usually", because the reply is rate-limited and the refusal is not: past three refusals in a tick, or ten on one pull request, the comment is passed over in silence instead. Being refused quietly is still being refused, but a reviewer who was never told is the failure mode worth knowing about. Comments from other bots are passed over rather than refused, since answering one is a loop. [Security and IAM](/kube-agents/reference/security-and-iam/) is canonical for this boundary: it names the environment variables behind both bounds, the third case this summary elides, and what an untrusted comment can still put in front of the model.
 
-**What it can do.** Answer a question, or amend the PR's own branch through `submit-suggestion` Step 5 — the same `--force-with-lease` push and protected-branch blocks as any other change. Never merge, approve, or close. Comment text is a request within the authority the agent already has: it cannot widen that authority, point the agent at another repository, or overturn a refusal.
+**What it can do.** Answer a question, or amend the PR's own branch through `submit-suggestion` Step 5 — the same fast-forward-only publish and protected-branch blocks as any other change. Never merge, approve, or close. Comment text is a request within the authority the agent already has: it cannot widen that authority, point the agent at another repository, or overturn a refusal.
 
 **Where the answer lands.** In the PR thread, as a reply carrying a hidden marker keyed on the comment it answers — the same scheme the audit ledger uses, and the reason a standing request is answered once rather than every ten minutes. Only markers in the agent's _own_ comments count, so pasting the string cannot suppress somebody else's request. There is no state file: the thread is the record, which is also what makes this work for a PR whose original chat session is long gone.
 

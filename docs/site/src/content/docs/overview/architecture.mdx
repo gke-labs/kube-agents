@@ -95,9 +95,9 @@ The Planning Agent profile's own job file — [`agents/chat/defaults/cron/jobs.j
 ### 3. Remediation → GitHub PR
 
 1. The agent invokes `submit-suggestion` with a proposed diff (usually a YAML patch generated from an SOP).
-2. `submit-suggestion` writes the file(s), commits to a topic branch, and calls Minty for a signed installation token.
-3. Minty signs a JWT with a KMS-held private key and exchanges it for a short-lived GitHub App token.
-4. `submit-suggestion` pushes the branch and opens a PR against the configured GitOps repo.
+2. `submit-suggestion` writes the file(s) and commits them to a topic branch, then asks the credential broker to publish it. Nothing in the agent's container holds a token.
+3. The broker calls Minty, which signs a JWT with a KMS-held private key and exchanges it for a short-lived GitHub App token.
+4. The broker pushes the branch and opens a PR against the configured GitOps repo; `submit-suggestion` gets back the PR's URL.
 5. The agent posts a Chat message with the PR link.
 
 ## Deployment topology

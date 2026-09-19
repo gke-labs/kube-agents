@@ -58,6 +58,41 @@
         "html_url": "https://github.com/acme/infra/issues/719#issuecomment-55512309",
         "author_association": "CONTRIBUTOR"
       }
+    ],
+    [
+      {
+        "id": 77712301,
+        "user": {
+          "login": "example-reviewer"
+        },
+        "body": "This limit is off by one.",
+        "created_at": "2026-08-30T10:15:00Z",
+        "html_url": "https://github.com/acme/infra/pull/4321#discussion_r77712301",
+        "path": "ingest/limits.yaml",
+        "line": 12
+      }
+    ],
+    [
+      {
+        "id": 88812301,
+        "user": {
+          "login": "example-reviewer"
+        },
+        "body": "One inline note, otherwise fine.",
+        "state": "COMMENTED",
+        "submitted_at": "2026-08-30T10:16:00Z",
+        "html_url": "https://github.com/acme/infra/pull/4321#pullrequestreview-88812301"
+      },
+      {
+        "id": 88812302,
+        "user": {
+          "login": "kube-agents[bot]"
+        },
+        "body": "",
+        "state": "APPROVED",
+        "submitted_at": "2026-08-30T11:00:00Z",
+        "html_url": "https://github.com/acme/infra/pull/4321#pullrequestreview-88812302"
+      }
     ]
   ]
 }

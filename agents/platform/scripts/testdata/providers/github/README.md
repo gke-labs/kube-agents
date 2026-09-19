@@ -44,6 +44,15 @@ ways and never regenerated wholesale:
   from `/issues` — so the filtering has something to filter. Those are
   arrangements of real responses, not invented ones.
 
+- **Refusals are recorded too.** A response of the form
+  `{"__status__": 404, "__detail__": "..."}` is what the transport would have
+  raised for that call; the harness raises it. `label-ensure.json` uses one, because
+  the verb's logic is a read that 404s followed by a create.
+- **Three endpoints for one conversation.** `proposal-view.json` carries the
+  conversation, the inline review comments and the review summaries as three
+  responses, in the order the translation asks for them, with one empty-bodied
+  approval among the reviews so the filter has something to drop.
+
 ## Changing them
 
 Prefer re-recording over hand-editing when a translation changes, and keep the

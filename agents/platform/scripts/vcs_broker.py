@@ -176,11 +176,14 @@ class Binding:
             self.forge.credential.ensure(self.repo)
             self._ready = True
 
-    def api(self, method: str, path: str, **kwargs: Any) -> Any:
+    def transport(self) -> Transport:
         if self._built is None:
             self._built = self._transport()
+        return self._built
+
+    def api(self, method: str, path: str, **kwargs: Any) -> Any:
         self.ensure()
-        return self._built.api(method, path, **kwargs)
+        return self.transport().api(method, path, **kwargs)
 
     def stamp(self, result: dict[str, Any]) -> dict[str, Any]:
         result.update({"forge": self.forge.name, "repo": self.repo})
@@ -420,7 +423,10 @@ class VcsBroker:
 
         The branch must not be the target either. That closes the same door for
         a copy cloned from a branch that is not the default, where the broker
-        has nothing to check against but what the caller declared.
+        has nothing to check against but what the caller declared. `advance`
+        waives the declared half of that pair and nothing else -- it is how a
+        caller says the branch it cloned is a proposal branch it is here to add
+        to, which is the one case where writing to it is the whole point.
 
         The bundle must carry exactly the branch it claims. A bundle holding a
         second ref would publish something the caller did not declare, and a
@@ -447,7 +453,15 @@ class VcsBroker:
         cloned_from = payload.get("clonedFrom")
         if cloned_from is not None:
             cloned_from = validate_branch(cloned_from, "clonedFrom")
-        if cloned_from and branch == cloned_from:
+        # The one legitimate reason to write to the branch this copy was cloned
+        # from: the copy was taken *of* a proposal branch in order to add to it.
+        # A caller revising an open proposal has to clone the branch the
+        # proposal is on -- there is nowhere else its revisions are -- and every
+        # other check still applies to it, the default-branch refusal below
+        # included. The field is the caller saying which of the two situations
+        # this is, and a caller that omits it gets the refusal.
+        advance = bool(payload.get("advance"))
+        if cloned_from and branch == cloned_from and not advance:
             # The client says so itself: this is the branch the copy was
             # cloned from, whatever `target` names. A client that lies here
             # gains nothing it could not get by omitting the field, so this
@@ -539,6 +553,23 @@ class VcsBroker:
                     status=409,
                     code="PROTECTED_BRANCH",
                 )
+            if advance:
+                # The waived refusal, verified against the forge rather than
+                # taken on the caller's word. `advance` says one thing -- this
+                # copy was cloned *of* a proposal branch in order to add to
+                # it -- and an open proposal whose source is this branch is
+                # that thing, stated in a fact the sandbox does not author.
+                # Without the check the field is simply a flag that turns the
+                # refusal off, and the client's own refusal text names it to
+                # every worker that meets one: a worker that clones
+                # `release-1.2`, commits, and publishes `--target main
+                # --advance` fast-forwards a long-lived shared branch, which is
+                # the live incident the refusal was added for.
+                #
+                # After the default-branch check, not before it. That refusal is
+                # the one the broker establishes for itself, and it must stay
+                # the answer a caller gets for trying `advance` on `main`.
+                self._require_open_proposal(bound, branch)
             # The target first, so the ancestry checks below have something to
             # be about.
             git(root, "fetch", "--quiet", "--no-tags", "origin", target)
@@ -685,6 +716,35 @@ class VcsBroker:
 
     # ---- collaboration verbs -------------------------------------------
 
+    def _require_open_proposal(self, bound: Binding, branch: str) -> None:
+        """Refuse unless `branch` already carries an open proposal.
+
+        One extra read on the `advance` path only, which is the second and
+        later rounds of a proposal the caller already opened -- not the first
+        publish of anything.
+
+        A forge that does not serve `proposal-list` is left alone. `publish`
+        holds no forge otherwise -- it is git against a URL, which is what makes
+        the seam a seam -- and a forge with no proposals has no branch this
+        could be the second round of, so there is nothing for the check to
+        establish. The refusals that do not come from the request, the
+        default-branch one above chief among them, still stand there.
+        """
+        if "proposal-list" not in getattr(bound.forge, "verbs", ()):
+            return
+        answer = bound.forge.proposal_list(
+            bound.api, bound.repo, {"state": "open", "source": branch, "limit": 1}
+        )
+        if not (answer.get("proposals") or []):
+            raise WorkspaceError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                "cloned in order to add to, but no open proposal on this "
+                "repository has it as its source. Publish a branch of your own "
+                "and open a proposal onto it.",
+                status=409,
+                code="CLONED_BRANCH",
+            )
+
     def _forge_verb(self, verb: str, payload: dict[str, Any]) -> dict[str, Any]:
         bound = self._bind(payload)
         method = getattr(bound.forge, verb.replace("-", "_"))
@@ -714,6 +774,58 @@ class VcsBroker:
     def issue_comment(self, payload):
         return self._forge_verb("issue-comment", payload)
 
+    def proposal_update(self, payload):
+        return self._forge_verb("proposal-update", payload)
+
+    def proposal_close(self, payload):
+        return self._forge_verb("proposal-close", payload)
+
+    def proposal_commits(self, payload):
+        return self._forge_verb("proposal-commits", payload)
+
+    def proposal_acknowledge(self, payload):
+        return self._forge_verb("proposal-acknowledge", payload)
+
+    def issue_update(self, payload):
+        return self._forge_verb("issue-update", payload)
+
+    def issue_close(self, payload):
+        return self._forge_verb("issue-close", payload)
+
+    def label_ensure(self, payload):
+        return self._forge_verb("label-ensure", payload)
+
+    def identity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Who this credential is on this forge, and whether a login may write.
+
+        A broker verb rather than a forge verb because half of it is a property
+        of the transport -- how the call is authenticated -- and not of the
+        API: a CLI reads its login out of the credential store, an HTTP client
+        asks the current-user route. The other half, `canWrite`, is the forge's
+        normalised answer to a question every forge spells differently. Both
+        exist so the agent-side policy that separates the agent's own
+        proposals and comments from a stranger's stays above the provider.
+
+        `login` in the payload asks about that login; absent, about the
+        credential itself.
+        """
+        bound = self._bind(payload)
+        bound.ensure()
+        transport = bound.transport()
+        viewer = transport.whoami()
+        login = payload.get("login")
+        if login is not None and not isinstance(login, str):
+            raise WorkspaceError("login must be a string")
+        # `canWrite` is answered for a login the caller named, never for the
+        # credential itself: on the shipped forge an App's own bot login is
+        # not a collaborator, so the permission endpoint answers 404 for it
+        # and would report the account that just pushed as unable to write. The
+        # callers that ask this ask about comment authors; the credential's own
+        # standing is what `publish` proves by doing it.
+        subject = (login or "").strip()
+        can_write = bound.forge.can_write(bound.api, bound.repo, subject) if subject else None
+        return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
+
 
 # The verbs that leave a mark on the forge, named here so the HTTP layer can
 # refuse an unmanaged repository before one of them runs. The classification
@@ -741,8 +853,14 @@ WRITE_VERBS = frozenset(
         "publish",
         "proposal-create",
         "proposal-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-acknowledge",
         "issue-create",
         "issue-comment",
+        "issue-update",
+        "issue-close",
+        "label-ensure",
     }
 )
 
@@ -766,6 +884,14 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "issue-list": broker.issue_list,
         "issue-view": broker.issue_view,
         "issue-comment": broker.issue_comment,
+        "proposal-update": broker.proposal_update,
+        "proposal-close": broker.proposal_close,
+        "proposal-commits": broker.proposal_commits,
+        "proposal-acknowledge": broker.proposal_acknowledge,
+        "issue-update": broker.issue_update,
+        "issue-close": broker.issue_close,
+        "label-ensure": broker.label_ensure,
+        "identity": broker.identity,
     }
 
 

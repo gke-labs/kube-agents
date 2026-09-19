@@ -30,7 +30,7 @@ After sending the initial notification, perform two critical safety checks to se
 
 To prevent duplicate effort and redundant PRs, inspect currently open Pull Requests in the repository:
 
-1. Resolve the GitOps repository as `<owner>/<repo>`, and name it on every `gh` call from here on. The pod is not a git checkout (Step 3 explains why), so `gh` has no `origin` remote to infer a repository from: an unqualified `gh pr list` fails on repository resolution rather than returning a list, and the duplicate check silently never happens. Query the `$GITOPS_STATE_CONFIGMAP` ConfigMap:
+1. Resolve the GitOps repository as `<owner>/<repo>`, and pass it as `--repo` on every call from here on. The pod is not a working copy (Step 3 explains why), so there is no local repository for a command to infer one from, and a call that omits it fails on repository resolution rather than returning a list — which is the duplicate check silently never happening. Query the `$GITOPS_STATE_CONFIGMAP` ConfigMap:
 
    ```bash
    kubectl get configmap "${GITOPS_STATE_CONFIGMAP:-platform-agent-gitops-state}" -n "${KUBE_DEFAULT_NAMESPACE:-kubeagents-system}" -o jsonpath='{.data.managed_repos}'
@@ -38,20 +38,21 @@ To prevent duplicate effort and redundant PRs, inspect currently open Pull Reque
 
    If multiple repositories are returned, choose the target repository. Step 3 prints the same value as `repo`.
 
-2. List all open PRs in that repository:
+2. Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`), and ask the forge for the open PRs on that workload's branch alone:
+
    ```bash
-   gh pr list --repo <owner>/<repo> --state open --json number,title,headRefName,url
+   V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
+   python3 "$V" proposal list --repo <owner>/<repo> --state open \
+     --source "platform-agent/remediate-stockout-<exact_workload_name>"
    ```
-   If that call comes back unauthorized, refresh the GitHub App token once with `./scripts/github_token_refresh.py <owner>/<repo>` and retry. Do not refresh pre-emptively — the PR-creation flow in Step 3 mints its own token.
-3. Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`). A PR is relevant ONLY IF:
-   - The PR branch name (`headRefName`) contains `remediate-stockout-<exact_workload_name>`.
-   - The PR title specifically names the `<exact_workload_name>`.
-     **CRITICAL**: If an open PR exists for a DIFFERENT workload (e.g. `ml-training-job-gpu` when current alert is for `data-warehouse-analytics`), it is NOT a duplicate. Proceed with diagnosis and create a new PR for `<exact_workload_name>`.
-4. **If a relevant PR is already open for THIS SPECIFIC workload**:
+
+   `--source` is what makes this a duplicate check rather than a guess. Listing every open PR and matching names here reads only the newest page, so on a busy repository the one you are looking for is not in the answer and the check passes when it should have stopped you. **CRITICAL**: do not widen the query and match branch names yourself. A PR for a DIFFERENT workload is on a different branch and will not come back — it is not a duplicate, and it is not a reason to stop.
+
+3. **If that list is non-empty — a PR is already open for THIS SPECIFIC workload**:
    - Immediately STOP processing.
    - Do NOT update, edit, modify, or rewrite the existing open PR description or contents.
    - Do NOT run any further diagnostics, do NOT search the workspace, do NOT create a new branch, and do NOT submit another PR.
-   - Output a clear message to the user explaining that a relevant PR is already in place, referencing the PR number and URL (e.g. `Deduplicated: An open PR is already active for this stockout: PR #123 - https://github.com/<org>/<repo>/pull/123`).
+   - Output a clear message to the user explaining that a relevant PR is already in place, referencing the `number` and `url` the listing returned (e.g. `Deduplicated: An open PR is already active for this stockout: PR #123 - https://github.com/<org>/<repo>/pull/123`).
 
 #### B. Determine if the Stockout is a Real Issue or a False Signal
 
@@ -79,7 +80,7 @@ A stockout alert is a "false signal" if the cluster has already recovered (e.g. 
 If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stockout issue):
 
 1. **Parse details**: Extract the GKE cluster name and location (region/zone) from the alert details.
-2. **Lease a private workspace.** The pod is not a git checkout, and its volume is shared with every other agent running in it. `submit_suggestion.py prepare` clones the GitOps repository into a working tree that is yours alone, takes the remediation branch, and prints one JSON line:
+2. **Get a working copy.** The pod is not a git checkout. `submit_suggestion.py prepare` brings the GitOps repository down onto this filesystem, stands you on the remediation branch, and prints one JSON line:
 
    ```bash
    ./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
@@ -89,21 +90,21 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
    ```json
    {
-     "workspace": "/opt/data/gitops/t_9f3c1e07/acme__fleet",
-     "lease": "t_9f3c1e07",
+     "workspace": "/opt/data/scratch/vcs/github__acme__fleet__platform-agent__remediate-stockout-frontend-web-app",
+     "repo": "acme/fleet",
      "branch": "platform-agent/remediate-stockout-frontend-web-app",
      "base": "main",
-     "repo": "acme/fleet",
-     "started_from": "origin/main"
+     "started_from": "main",
+     "proposal": ""
    }
    ```
 
-   **Keep that whole line — Step 7 needs `workspace` and `lease` back.**
+   **Keep that whole line — every step from here works inside `workspace`.**
 
    > [!CAUTION]
-   > **Every `git` command from here on runs inside the printed `workspace`, and nowhere else.** The credential proxy refuses `checkout`, `pull`, `add`, `commit`, `push` and every other tree-mutating verb outside a leased workspace, and the refusal is a security error rather than a retryable failure. There is no shared clone to work in: `/opt/data/workspace` and any other invented path will be rejected.
+   > **Every version-control command from here on runs inside the printed `workspace`, and through the credential-free binary `/opt/vcs/libexec/git`.** Export it once — `export G=/opt/vcs/libexec/git` — and use `$G` for `add`, `commit`, `diff` and every other local verb. Plain `git` on this machine is a different program that reaches the network holding a credential; running it is a security error rather than a retryable failure. Do not alias it: each command arrives in a fresh non-interactive shell, which never expands aliases. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
 
-   `prepare` has already refreshed the git credentials, fetched the repository and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `git checkout main`, `git pull` or `git checkout -b`.
+   `prepare` has already brought the repository down and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `$G checkout main`, `$G pull` or `$G checkout -b`. The copy has no remote to fetch from; the revisions go back up in Step 7.
 
 3. **Search the workspace**: Locate the YAML manifests **inside the printed `workspace`** using targeted file searches (DO NOT use pattern `.*` or broad wildcard loops that paginate indefinitely):
    - For ComputeClass definitions, check `<workspace>/agents/platform/skills/gke-compute-classes/assets/` directly or use `search_files(pattern="compute-class")`.
@@ -237,7 +238,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 1. Apply the fixes to the ComputeClass or workload YAML files **inside `<workspace>`**.
    - **Mandatory YAML Comments**: For EVERY change or addition in a YAML manifest (e.g. `topology.kubernetes.io/zone`, `nodeSelector`, `ComputeClass` priorities), append an inline YAML comment (`# Remediation: ...`) explaining how this specific change helps prevent or mitigate stockouts.
 2. **Self-Review Step**:
-   - Run `cd <workspace> && git diff` to inspect all proposed changes before committing.
+   - Run `cd <workspace> && $G diff` to inspect all proposed changes before committing.
    - Verify that ONLY changes strictly necessary to mitigate the stockout are included (no unrelated formatting or whitespace edits).
    - Confirm that every updated YAML line includes the explanatory remediation comment.
 3. **Special Case (Major Changes / Migration)**: If migrating to another region or changing architecture (Rule E), do NOT just change files. You **must** also write a detailed migration playbook in `<workspace>/docs/migrations/stockout-<workload_name>-plan.md`. This plan must detail:
@@ -245,22 +246,22 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
    - Resource copy strategy (DBs, storage, persistent volumes).
    - Network routing/DNS cutover approach.
    - Rollout steps.
-4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && git add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `git add .`, `git add -A`, or `git commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
-5. Commit using a Conventional Commit message (e.g., `cd <workspace> && git commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
+4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && $G add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `$G add .`, `$G add -A`, or `$G commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
+5. Commit using a Conventional Commit message (e.g., `cd <workspace> && $G commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
 
 ### 7. Submit Suggestion & Open PR
 
-**CRITICAL**: You MUST use the `submit_suggestion.py` helper script to open the Pull Request. Do NOT use `gh pr create` directly. Do NOT write your own python script to create the PR.
+**CRITICAL**: You MUST use the `submit_suggestion.py` helper script to open the Pull Request. Do NOT reach for a forge CLI. Do NOT write your own python script to create the PR.
 
 **MANDATORY Summary Requirements**:
 
 - 🛑 **NON-NEGOTIABLE RULE**: The description MUST contain the literal text `- **Checks Performed**:` followed by a `bash` code block containing the exact `kubectl describe pod ...`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include that block will cause the PR to be rejected by automated SRE audit rules.
 - Do NOT omit the `Checks Performed` section or its code block.
-- Do NOT include any `gh` commands (such as `gh pr list` or `gh pr create`) in the summary or PR description.
+- Do NOT include any forge CLI commands in the summary or PR description. The `Checks Performed` block records diagnostics, not how the PR was opened.
 
-Write the description to a file and pass the path, never `--body`. The `Checks Performed` block those rules mandate is nothing but backticks and `--format="json(...)"` strings, and inside the double quotes of a `--body` argument bash expands both — the diagnostic commands you are being told to record would run in the leased clone instead of appearing in the pull request.
+Write the description to a file and pass the path, never `--body`. The `Checks Performed` block those rules mandate is nothing but backticks and `--format="json(...)"` strings, and inside the double quotes of a `--body` argument bash expands both — the diagnostic commands you are being told to record would run in the working copy instead of appearing in the pull request.
 
-Run the `submit_suggestion.py` helper script with the `submit` subcommand to push the branch and open a SRE review Pull Request EXACTLY as follows, substituting `<workspace>` and `<lease>` with the values Step 3 printed:
+Run the `submit_suggestion.py` helper script with the `submit` subcommand to publish the branch and open a SRE review Pull Request EXACTLY as follows:
 
 ````bash
 BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)
@@ -283,8 +284,7 @@ gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-
 EOF
 
 ./skills/submit-suggestion/scripts/submit_suggestion.py submit \
-  --workspace "<workspace>" \
-  --lease "<lease>" \
+  --repo "<owner>/<repo>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
   --title "fix(capacity): remediate GKE stockout for <workload_name>" \
   --body-file "$BODY"
@@ -292,7 +292,7 @@ EOF
 
 The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc expands the same constructs the argument would have.
 
-`--workspace` and `--lease` are not optional bookkeeping. `prepare` and `submit` are separate processes: omit `--workspace` and `submit` falls back to the current directory, which holds no lease; omit `--lease` and it has no lease to check the tree against. Either way it stops with a `PermissionError` instead of opening the PR. The script returns the live GitHub PR URL on stdout.
+`submit` finds the working copy `prepare` made, so there is nothing else from Step 3 to hand back — but `--branch` must be the branch you are standing on, and it refuses rather than guessing if the copy is on another one. Anything still uncommitted is recorded as one revision under `--title`. The script returns the live PR URL on stdout.
 
 When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
 

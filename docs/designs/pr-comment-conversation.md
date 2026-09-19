@@ -77,10 +77,13 @@ Three properties are load-bearing, and each has a test:
 - **A raising sweep does not stop its sibling.** Two separate jobs gave that isolation for free;
   consolidating buys it back with a `try` per sweep.
 
-Each sweep resolves its own repo and runs its own `gh` preflight rather than sharing a hoisted one.
-That is deliberate: `resolver.py poll` already does both, and owns a precise reason-code vocabulary
-(`GH_CLI_NOT_FOUND` vs `GITHUB_AUTH_NOT_CONFIGURED` vs `REPO_UNREACHABLE`) that a shared preflight
-could only duplicate or flatten.
+Each sweep resolves its own repo and makes its own credential check rather than sharing a hoisted
+one. That is deliberate: `resolver.py poll` already does both, and owns a precise reason-code
+vocabulary — the broker's own refusal codes (`FORGE_UNAUTHENTICATED` vs `FORGE_NOT_FOUND` vs
+`FORGE_RATE_LIMITED`) when the forge refused, and `CONFIGMAP_READ_FAILED` vs `UNMANAGED_REPOSITORY`
+vs `REPO_UNREACHABLE` vs `SANDBOX_UNREACHABLE` when the fault is on this side — that a hoisted check
+could only duplicate or flatten. The gate keeps one code of its own, `GIT_REPO_UNPARSEABLE`, because
+it is the side that reads a repository value before there is anyone to ask about it.
 
 Consolidation removes one real thing: the per-job `enabled: false` an operator had when there were
 two roster entries. `GITHUB_WATCHER_SWEEPS` (comma-separated; unset means all) restores it. A name
@@ -168,51 +171,70 @@ exceptions and is fail-open, so such a hook must catch internally and decide exp
 
 **Status: implemented** as `agents/platform/scripts/forge.py`.
 
-Seven operations are the complete set this feature needs from a forge:
+Eight operations are the complete set this feature needs from a forge:
 
 ```python
 class ForgeProvider(Protocol):
-    supports_acknowledge: bool
-    def preflight(self) -> None                           # raises ForgeError with a reason code
-    def viewer_login(self) -> str                         # the account the credential is; may be ""
+    def viewer_login(self, repo) -> str                   # the account the credential is; may be ""
+    def supports_acknowledge(self, repo) -> bool          # is there anywhere to leave the 👀
     def list_open_prs(self, repo) -> list[PullRequest]    # number, head_ref, head_repo, head_sha,
                                                           # labels, author, url
-    def list_comments(self, repo, pr) -> list[Comment]    # node_id, numeric_id, author, body,
-                                                          # can_write, can_write_known,
-                                                          # created_at, kind, path/line
+    def list_comments(self, repo, pr) -> list[Comment]    # ref, author, body, can_write,
+                                                          # can_write_known, created_at, kind,
+                                                          # path/line
     def post_comment(self, repo, pr, body) -> None        # the text; travels on fd 0, not a path
-    def acknowledge(self, repo, comment) -> bool          # optional; see supports_acknowledge
+    def acknowledge(self, repo, pr, comment) -> bool      # optional; see supports_acknowledge
     def list_commits(self, repo, pr) -> list[Commit]      # sha + committed_at, tip last;
                                                           # backs the reply claim check
+    def truncations(self) -> list[str]                    # listings that filled their page this
+                                                          # tick; drained once, per instance
 ```
+
+`truncations` is the one member that takes no repository. A listing that fills its page is not a
+failure the sweep can recover from — it simply did not see everything — so the provider records a
+note per listing instead of raising, and the caller drains them all at the end of a tick into one
+operator warning rather than interrupting the repository it happened on. The other seven take the
+repository, including the two that read as install-wide. Identity and
+capability are properties of a forge, and the repository is how the caller names which one: an
+install serving two forges authenticates as two accounts, and only one of them can write here.
 
 `Commit` carries the committer date beside the sha because a list of shas cannot express the bound
 the claim check enforces — see step 4 of the worker skill below.
 
-`GitHubProvider` implements it over the proxied `gh`, merging GitHub's three comment endpoints
-(`issues/N/comments`, `pulls/N/comments`, `pulls/N/reviews`) into one normalised list. Selection
-dispatches on the host `repo_ref.parse` reads out of the repository value the caller passes: a host
-with no provider registered raises rather than falling back, while a value naming no host at all —
-the bare `owner/name` every caller here passes today, or no repository at all — still selects
-GitHub. [`version-control-support.md`](version-control-support.md) owns that rule
-under "Repository identity". Every provider call goes through
-one `_call()` seam, so a `ProxyForgeProvider` speaking to a future sidecar route drops in without
-touching anything above it.
+`BrokerProvider` implements it over the credential broker's version-control verbs, and it is the
+only implementation — one class for every forge, which is why it is not named after one. Merging
+GitHub's three comment endpoints (`issues/N/comments`, `pulls/N/comments`, `pulls/N/reviews`) into
+one normalised list is still done, but on the credential side, by the forge module the broker
+selects; nothing here branches on which forge answered.
+
+Selection is not made here either. `provider_for` parses the repository value only far enough to
+tell a value nobody can read from a host no forge serves — the first is a configuration error on
+this side, the second a refusal the broker makes — and then returns the one provider.
+[`version-control-support.md`](version-control-support.md) owns the host rule under "Repository
+identity". Every verb goes through one module-level `call()` seam, which is where the hop into the
+sandbox lives: the agent pod holds no forge credential by design, so the sweep crosses to reach one.
 
 Three shapes exist because of a forge that is not GitHub:
 
 - **`can_write` is a normalised boolean, not GitHub's `author_association`.** The plan assumed GitHub
-  hands the answer over free on every comment, so `GitHubProvider` could just map the field, and that
+  hands the answer over free on every comment, so the GitHub provider could just map the field, and that
   only GitLab and Bitbucket would need a members lookup. **That was wrong**, and live validation is
   what caught it: `author_association` is reported relative to what the _authenticated viewer_ can
   see, and an App installation token cannot see organisation membership. A repository admin's comment
   came back `CONTRIBUTOR`, so the gate refused the one person most entitled to direct the agent.
-  `GitHubProvider` therefore makes the members lookup too —
-  `repos/{repo}/collaborators/{user}/permission`, cached per account for the tick. The shape the
-  section prescribed for other forges turned out to be the shape GitHub needed as well; only the
-  claim that GitHub was exempt was mistaken.
-- **`supports_acknowledge` is a capability flag.** Bitbucket Cloud has no reactions on pull-request
-  comments, so the 👀 must be legitimately optional rather than assumed by the caller.
+  The membership question is therefore asked outright, over the `identity` verb, which the broker's
+  GitHub module answers from `repos/{repo}/collaborators/{user}/permission`. `BrokerProvider` caches
+  the answer per `(repository, login)` for the life of the instance — the sweep builds one per tick,
+  and a collaborator added between two ticks must not stay refused. The shape the section prescribed
+  for other forges turned out to be the shape GitHub needed as well; only the claim that GitHub was
+  exempt was mistaken.
+- **`supports_acknowledge` is a capability, asked per repository.** Bitbucket Cloud has no reactions
+  on pull-request comments, so the 👀 must be legitimately optional rather than assumed by the
+  caller. It is read from the repository's `capabilities`, which the broker computes from the forge
+  module alone — no credential, no network — so asking costs nothing. It is its own field rather
+  than the presence of `proposal-acknowledge` in `verbs`: every forge routes that verb, and one with
+  no reactions answers it having done nothing. The verb list says the call is accepted; this says it
+  would achieve something.
 - **`normalise_login` folds the `app/` prefix, the `[bot]` suffix and case.** GitHub gives one App
   three spellings, and a single tick sees all three: `gh pr list --json author` returns
   `app/<name>`, REST comment authors carry `<name>[bot]`, and a human @-mentions the bare `<name>`.
@@ -227,10 +249,12 @@ Three shapes exist because of a forge that is not GitHub:
   therefore permanent. The collaborator endpoint's 404 is an answer; any other failure is not, so
   the provider reports it as unknown and the sweep holds the trigger for a tick rather than guessing.
 
-The module also owns the plumbing that would otherwise become a third copy: the `gh` runner and the
-`gh auth status` preflight. Repository parsing was the third such thing until #504 removed the
-`SETTINGS.md` path that fed it; what remains of it lives in `repo_ref.py`, which `forge.py` calls
-rather than reimplements.
+The module used to own the plumbing that would otherwise become a third copy: a `gh` runner and a
+`gh auth status` preflight. Neither exists any more. The runner is the broker's, reached through
+`call()`, and the preflight question — can this credential act — is answered by `identity` as part
+of the work rather than ahead of it. Repository parsing was the third such thing until #504 removed
+the `SETTINGS.md` path that fed it; what remains of it lives in `repo_ref.py`, which `forge.py`
+calls rather than reimplements.
 
 ### Five departures from this section, and why
 
@@ -243,12 +267,18 @@ rather than reimplements.
   is circular: it answers "is this ours" with "whoever opened it", so any pull request looks
   self-authored to the marker scan. `viewer_login()` asks the credential instead, and the answer
   is a property of the token rather than of the thing under test. `GET /user` is not available — an
-  installation token cannot introspect itself and returns `401 Bad credentials` — so it parses the
-  account out of `gh auth status`, which reads the credential store and costs no API call. An empty
-  answer disables the whole sweep with a `⚠️` rather than falling back to the branch prefix.
-- **`preflight()` moved onto the protocol.** It began as a module-level function the sweep called
-  before constructing a provider, which meant a test holding a fake provider still reached past it
-  to the real `gh`. As a method, a caller that has a provider can never get behind it.
+  installation token cannot introspect itself and returns `401 Bad credentials` — so the broker's
+  GitHub module reads the account out of the credential store instead, and the `identity` verb hands
+  it back. It took no argument at first and takes a repository now, because an install serving two
+  forges has two credentials and two accounts. An empty answer disables the whole sweep with a `⚠️`
+  rather than falling back to the branch prefix.
+- **`preflight()` moved onto the protocol, and then off it.** It began as a module-level function
+  the sweep called before constructing a provider, which meant a test holding a fake provider still
+  reached past it to the real `gh`. Making it a method fixed that — a caller that has a provider
+  cannot get behind it — and then the consumer migration removed the method too. What it checked
+  was that a `gh` binary existed and was authenticated, and there is no binary on this side to
+  check; a credential that cannot act fails the first verb with the broker's own reason code, which
+  is the same answer arriving one call later and without a second way to say it.
 - **`acknowledge` returns a bool** rather than `None`. A 👀 that fails is not a fault worth
   aborting a tick for — the reviewer simply does not get the receipt — so the result is reported
   rather than raised, and a review-kind comment (which has no reaction endpoint) answers `False`
@@ -267,9 +297,11 @@ protocol above them.
 "Bitbucket" is two providers, which is the limit of how far one provider class stretches. Cloud
 (`/2.0/repositories/…`) and Data Center (`/rest/api/1.0/projects/…`) share almost nothing, so a class
 branching on which one it is talking to would be two implementations in a trench coat. Two separate
-providers are cheap here because of the `_call()` seam, which exists for a different reason: a forge
-with no CLI to shell cannot reach anything except through a sidecar route, and Bitbucket has no `gh`
-equivalent at all. Its tokens come from OAuth refresh flows, so it would want a third token strategy
+providers are cheap here because neither of them is on this side of the boundary: a forge module is
+something the broker registers, and `BrokerProvider` above it does not change. That was the
+argument's original point in reverse — a forge with no CLI to shell could only be reached through a
+sidecar route, and Bitbucket has no `gh` equivalent at all — and the migration made the route the
+only one there is. Its tokens come from OAuth refresh flows, so it would want a third token strategy
 again.
 
 ## 4. The pull-request sweep
@@ -278,7 +310,7 @@ again.
 `agents/platform/scripts/pr_triggers.py`.
 
 No new cron job and no new script: the watcher from §2 grows a `pr_comments` entry in `SWEEPS`,
-reusing its repo resolution, its preflight, its per-sweep isolation, and its card filing. Everything
+reusing its repo resolution, its credential check, its per-sweep isolation, and its card filing. Everything
 deterministic lives here, so an idle tick still costs no model at all.
 
 - **Scope.** Open pull requests that satisfy all three of: authored by the account the credential
@@ -311,7 +343,7 @@ deterministic lives here, so an idle tick still costs no model at all.
   text needs characters before the text — `` ` ``, `<!--`, `>`, a fence, four spaces — so there is
   no room for one ahead of a trigger that opens the comment. This is also what makes GitHub's "Quote
   reply" safe: idempotency is keyed on the comment carrying the trigger, so a quoted request is a
-  new node id with no marker on it, and `> /agent …` does not fire because `>` is not whitespace.
+  new comment with a new ref and no marker on it, and `> /agent …` does not fire because `>` is not whitespace.
   The cost is that the button is then unusable for addressing the agent at all — it puts the quote
   above the cursor, so the reviewer's own words never open the comment — which §4 lists among what
   the anchor gives up.
@@ -335,13 +367,14 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   it as untrusted posts a public refusal at a collaborator over a transient API failure — which the
   marker then makes permanent. Holding costs one tick and the next one asks again. The count goes
   to stderr, like deferral.
-- **Anything the gate posts goes to `gh` on stdin, never as a path.** `gh` does not run where the
-  caller does: the gate runs in the agent pod, ssh carries the command to the sandbox, and the shim
-  forwards it to the credential broker in a third pod. A `--body-file /some/path` names a file only
-  the first of those can open. Both earlier attempts to make a path work failed — `/tmp` is a
-  per-container `emptyDir`, so every refusal died on "no such file" live, and the shared volume that
-  replaced it then needed the file made group-readable across the uid split of #955. `--body-file -`
-  needs neither, and is what the fleet audit already does (`audit_report.BODY_STDIN`).
+- **Anything the gate posts travels as a field of the verb, never as a path.** The gate runs in the
+  agent pod; the credential that can post lives in another one. There is no volume both mount, so a
+  `--body-file /some/path` names a file only the caller can open. Both earlier attempts to make a
+  path work failed — `/tmp` is a per-container `emptyDir`, so every refusal died on "no such file"
+  live, and the shared volume that replaced it then needed the file made group-readable across the
+  uid split of #955. The text is now handed to `proposal-comment` as its `body`, which crosses on
+  fd 0 as part of the request and needs neither. `audit_report.BODY_STDIN` still takes the older
+  exit on the same fd, carrying the document itself rather than a request containing it.
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred
@@ -359,14 +392,19 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   in the gate rather than the worker means the reviewer sees a response within the tick, not after a
   model has been scheduled.
 
-  **Not through the credential proxy.** The reaction is a `gh api -X POST …/reactions` call, and the
-  proxy refuses mutating `gh api` — the same rule that stops the agent merging its own pull request.
-  Narrowing the rule to exempt reaction endpoints was considered and rejected: the rules match a
-  joined command string, so a path-shaped exemption is one that an argv can be built to satisfy, and
-  a recognisable emoji is not worth widening the control that keeps the review gate a gate. So a
-  brokered sweep leaves no 👀; it is best-effort by contract and the reply still lands. It logs the
-  refusal rather than dropping it silently, and the proxy logs one `SECURITY_POLICY_BLOCKED` warning
-  per acknowledgement, which is expected rather than a signal.
+  **Through the verb, and asked for first.** The reaction is the
+  [`proposal-acknowledge`](version-control-support.md) verb, naming the comment by `{id, kind}`, so
+  it is an ordinary brokered call rather than a mutating `gh api` the proxy refuses. Whether it will
+  achieve anything is asked before it is attempted: `capabilities` carries `acknowledge`, per
+  repository and with no credential spent, and a forge with nowhere to leave a 👀 is not called. That
+  flag is its own field rather than the presence of the verb in `verbs` — every forge routes the
+  verb, and one without reactions answers `{"acknowledged": false}` having done nothing.
+
+  It stays best-effort by contract: a failure is logged at INFO and the reply still lands. The
+  request shape names the proposal as well as the comment, which the shipped forge does not need —
+  a GitHub reaction endpoint is keyed on the comment alone — because a comment id is not everywhere
+  sufficient to locate a comment, and a request shape that depended on which forge answered it would
+  be the abstraction failing at the first thing it was built for.
 
 - **`--dry-run` reaches into the sweeps, not just the card filing.** The refusal and the 👀 are
   written by the sweep, so a flag that only suppressed `file_card` would still post to a public
@@ -375,9 +413,11 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   done on stderr rather than going quiet. One thing it cannot cover, and says so on stderr: the
   issues sweep runs `resolver.py poll`, whose stale-label sweep has no dry-run of its own.
 - **One card per pull request**, assigned to `platform`, keyed
-  `pr-conv-<owner>-<repo>-<n>-<node-id>-<hour>`, carrying the PR number, head ref and the triggering
-  comment node ids. The node id enters that key case-preserved: it is base64, so folding its case
-  could give two distinct comments one idempotency key and lose the second request. The hourly
+  `pr-conv-<owner>-<repo>-<n>-<comment-ref>-<hour>`, carrying the PR number, head ref and the
+  triggering comment refs. The ref enters that key case-preserved: nothing says a forge's ids are
+  case-insensitive, and one that spends base64 on them collides the moment the case is folded —
+  two distinct comments would share an idempotency key and the second request would be deduped
+  away. The hourly
   bucket is the one §2's issue sweep already uses, and it matters more here: the board matches a
   repeat key against non-archived rows whatever their state, so without it a single worker that
   ends without answering leaves a _finished_ card holding the key of the oldest unanswered request
@@ -393,7 +433,7 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
 
 `pr_triggers.py` sits between `forge.py` and its two consumers — the sweep and the worker skill —
 and holds what is neither forge mechanics nor caller-specific: the `/agent` and mention grammar, the
-marker format, and `handled_node_ids`. Both consumers must agree on all of it exactly, and neither
+marker format, and `handled_refs`. Both consumers must agree on all of it exactly, and neither
 is a plausible owner. Three layers, then: `forge.py` is mechanism, `pr_triggers.py` is policy, the
 gate and the skill are consumers.
 
@@ -488,10 +528,13 @@ of going the wrong way — every step checked, the direction never re-examined.
 
 ## 5. Idempotency without state
 
-**Status: implemented** as `pr_triggers.marker` and `pr_triggers.handled_node_ids`.
+**Status: implemented** as `pr_triggers.marker` and `pr_triggers.handled_refs`.
 
 A trigger is unanswered when no comment **written by the self identity** on that pull request
-contains `<!-- agent-answered:<node-id> -->` or `<!-- agent-refused:<node-id> -->`.
+contains `<!-- agent-answered:<comment-ref> -->` or `<!-- agent-refused:<comment-ref> -->`. The ref
+is the forge-neutral `<kind>-<id>` the verb surface reports, not a forge's own node id: the number
+alone is unique only within the endpoint that issued it, so a conversation comment and a review
+comment can share one and an answer to either would suppress the other.
 
 Three properties make this work without a watermark table:
 
@@ -516,10 +559,12 @@ prompt:
    requests too, so the worker can refuse one rather than appear to have missed it, and it returns
    the thread each request arrived in — see below.
 2. Act: answer a question directly; for a change request follow **submit-suggestion Step 5**, whose
-   `--force-with-lease` and protected-branch guards apply unchanged. Then read the branch back and
-   confirm the change is on it — see the claim check below.
+   protected-branch guard applies unchanged. Its `--force-with-lease` push does not: `publish` is
+   fast-forward only, so a second round on the branch extends it and a branch that has diverged is
+   refused by name rather than overwritten. Then read the branch back and confirm the change is on
+   it — see the claim check below.
 3. Write the reply to a file under `/opt/data/scratch`.
-4. Post it with `pr_conversation.py reply --pr N --comment-id <node-id> --body-file …`, which appends
+4. Post it with `pr_conversation.py reply --pr N --comment-id <comment-ref> --body-file …`, which appends
    the `agent-answered` marker — the helper stamps it from `--comment-id` rather than trusting the
    model to type it, because a missing marker is not a missing comment but the same request being
    answered every ten minutes forever. `refuse` is the same path with the `agent-refused` marker.
@@ -528,7 +573,7 @@ prompt:
    without answering it.
 
    `--comment-id` is checked against the forge before anything is posted, rather than trusted. A
-   numeric id in place of a node id, a truncated one, or the id of a different comment all post a
+   bare number in place of a ref, a truncated one, or the ref of a different comment all post a
    real, visible answer stamped with a marker that closes nothing — so the sweep files the card
    again on the next tick and the agent answers the same comment every ten minutes. After the post
    the comment is public, so the only place to cut that loop is before it. The same check re-applies
@@ -605,7 +650,7 @@ waiting; a transcript of a conversation nobody addressed is prompt with no use.
 Three details are deliberate:
 
 - **Markers are stripped from the bodies** (`pr_triggers.strip_markers`, display only —
-  `handled_node_ids` still reads raw bodies). Feeding the model its own `<!-- agent-answered:… -->`
+  `handled_refs` still reads raw bodies). Feeding the model its own `<!-- agent-answered:… -->`
   syntax invites it to imitate it in prose that `reply` then stamps a second, real marker onto.
 - **Caps report what they dropped** — `omitted_earlier` on the thread transcript (`CONTEXT_MAX_COMMENTS = 40`),
   `omitted_requests` on the thread (`CONTEXT_MAX_REQUESTS = 10`), `truncated_chars` on the comment body
@@ -665,7 +710,7 @@ threshold after the comment was posted earns one line in chat, and an answered o
 The mechanism is already shipped, which is the point:
 
 - The age is free. `Comment.created_at` is in the payload the sweep already fetches, and
-  `pr_triggers.handled_node_ids` already computes whether a trigger is unanswered.
+  `pr_triggers.handled_refs` already computes whether a trigger is unanswered.
 - The channel is free. `github-repo-watcher` is `deliver: "chat"` so that a sweep which cannot run is
   audible (§2); an escalation is the same class of message and rides the same stdout.
 - There is no new state, no table, no route, and nothing for `submit_suggestion.py` to register.

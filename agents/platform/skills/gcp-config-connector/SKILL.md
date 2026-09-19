@@ -98,34 +98,31 @@ the same branch Step 5 submits on. Then list what is already under
 
 ```bash
 S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py
-SCRATCH=$(mktemp -d)
 "$S" prepare --repo "<owner>/<repo>" --branch "platform-agent/kcc-<kind>-<name>"
-"$S" list --handle "<handle>" --prefix clusters/<cluster>/provisioning
-"$S" fetch --handle "<handle>" --path clusters/<cluster>/provisioning/<sibling>.yaml --to "$SCRATCH"
 ```
 
-(Directory mode: `ls` and `cat` inside the returned `workspace`.) From a
-sibling manifest take the `metadata.namespace`, how the project is bound,
+What it prints is one JSON line, and its `workspace` is a real working copy of
+the repository on this filesystem — so the reads are `ls` and `cat`, with no
+second tool and no network:
+
+```bash
+ls <workspace>/clusters/<cluster>/provisioning
+cat <workspace>/clusters/<cluster>/provisioning/<sibling>.yaml
+```
+
+From a sibling manifest take the `metadata.namespace`, how the project is bound,
 the label conventions, and one file per resource or one per kind. A manifest
 for the resource you were asked to change may already be there; then the
 change is an edit to that file, and Step 2's answer is "edit".
 
-**Close the handle on every stop before Step 5.** In content mode `prepare`
-cloned the repository on the credential broker, which holds at most eight
-open workspaces, releases one only when `submit` runs against it, and never
-times one out; eight abandoned runs and no skill on the install can `prepare`
-until the broker restarts. `submit_suggestion.py` has no `close`, so use the
-inspect-repository script's, which releases any handle:
-
-```bash
-python3 "$HERMES_HOME"/skills/inspect-repository/scripts/inspect_repository.py close --handle "<handle>"
-```
-
-Run it before you report Terraform HCL under `provisioning/`, a stop or a
-question from Step 2's table, an immutable field in Step 3, or a CRD Step 4
-finds missing. When the user answers and the work resumes, `prepare` again.
-Directory mode has no handle to close; an abandoned lease is reaped after its
-TTL.
+**Stopping before Step 5 leaves nothing to clean up.** The copy is on this
+filesystem, not on the credential broker, and nothing on the forge's side is
+held open by having read it. Stop where you need to — Terraform HCL under
+`provisioning/`, a stop or a question from Step 2's table, an immutable field
+in Step 3, a CRD Step 4 finds missing — and when the user answers and the work
+resumes, run `prepare` again. If it refuses because the copy holds revisions
+that were never published, that is an earlier run's work: read the refusal
+before reaching for `--force`.
 
 ### Step 2: Decide create, acquire, or edit — read-only
 
@@ -220,11 +217,11 @@ kubectl explain containernodepool.spec.autoscaling.totalMaxNodeCount --api-versi
 
 ### Step 5: Hand off as a pull request
 
-Write the manifest into the scratch directory (content mode) or the workspace
-(directory mode) at `clusters/<cluster>/provisioning/<kind>-<name>.yaml`
+Write the manifest into the workspace at
+`clusters/<cluster>/provisioning/<kind>-<name>.yaml`
 unless the siblings use another convention, and submit it through
 **submit-suggestion** with branch `platform-agent/kcc-<kind>-<name>`. Use
-this shape for `--body`, after the skill's standard header:
+this shape for the `--body-file` document, after the skill's standard header:
 
 ```
 ### Config Connector change
@@ -253,8 +250,6 @@ Record the PR URL for the user. Addressing review feedback follows
   from the repository, the cluster, or the user.
 - Never propose enabling Config Connector, granting its IAM, or creating a
   `ConfigConnectorContext`.
-- Never leave a content-mode handle open when you stop; Step 1 says how to
-  close it.
 
 ## References
 

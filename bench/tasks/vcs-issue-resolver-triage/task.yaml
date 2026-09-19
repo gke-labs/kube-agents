@@ -1,0 +1,124 @@
+# The issue resolver, end to end, over the migrated forge surface.
+#
+# THIS CASE IS NOT THE RED, and saying so is the point of this paragraph. It
+# was written expecting one. On `main`, `resolver.py` reaches the forge by
+# shelling the `gh` CLI -- its own `run_gh`, over `sandbox_exec.run(["gh", ...])`
+# -- and an audit on 2026-08-28 found no `gh` binary in the sandbox image
+# (`rc: 127`, `bash: line 1: gh: command not found`). Both halves of that are
+# true and the conclusion drawn from them was still wrong: #1253 ships a `gh`
+# shim in the sandbox that routes to the credential broker, so those calls
+# succeed and the resolver works on `main`. Run against `main-4556bc68` on
+# 2026-09-15 this case PASSED, both checks (`run_20260915_202553_528206`), and
+# it passes on the branch too (`run_20260916_132438_579519`).
+#
+# It is kept anyway, as a regression guard, and the shim is why it is a good
+# one: on `main` this skill reaches the forge through a CLI that a shim
+# redirects, and on the branch through the verbs directly. PR-2 rewrites every
+# forge call in `resolver.py`, the largest consumer in the migration, and
+# nothing else drives the skill end to end against a live forge.
+# vcs-review-feedback-read-back is the case that carries this PR's red.
+#
+# There is no route check here, for the same reason the red case's route check
+# is a negative one: the resolver's `gh` calls are subprocesses of a Python
+# script, not commands the worker ran, so `worker_commands` never sees them on
+# either build.
+#
+# WHAT IS GRADED, and what deliberately is not. The property under test is
+# whether the resolver reaches the forge and completes its procedure -- poll,
+# claim, comment, transition. The QUALITY of a triage is somebody else's case:
+# cluster-agent-crashloop-debug already grades an investigation against a
+# planted defect. Grading one here would buy nothing and would cost this case
+# the seeded fleet, which is the difference between a case that runs in any dev
+# project and one parked behind a fleet-activation step -- see
+# vcs-history-only-fact, parked exactly there. So: `deployer: noop`, no
+# `fixtures:`, no cluster read, and the assertion is on `status:resolved`, a
+# fixed string the skill itself defines and only a completed transition puts in
+# the answer.
+#
+# WHY THE CASE SEEDS ITS OWN ISSUE. The resolver polls for an open issue
+# carrying none of the skip labels. A GitOps repository holds audit ledgers,
+# and every one of those is labelled `agent:audit` and skipped, so a run
+# against an unseeded repository answers NO_ISSUES -- and the skill ends that
+# turn silently, which leaves `report_contains` nothing to grade at all. Step 1
+# of the prompt therefore files the ticket the rest of the prompt triages, and
+# it is a question about the repository rather than about a cluster so that
+# answering it needs nothing this case did not provide.
+#
+# WHAT IT LEAVES BEHIND: one issue per run, closed and labelled
+# `status:resolved` by the run that made it. Unlike rca-remediation-pr's pull
+# requests the accumulation is invisible to the poll -- a closed issue is not
+# an open one, and a `status:resolved` one is skipped either way. A run that
+# dies between the claim and the transition leaves an issue labelled
+# `status:in-progress`, also a skip label, until `STALE_AFTER_SECONDS` (7200)
+# elapses; after that the stale sweep returns it to the pool and a later run
+# may triage it instead of its own. That is the one stale-pass window, it is
+# two hours wide, and reaching it still requires the resolver to have reached
+# the forge, which is the property under test.
+#
+# Measured cost: 2027s on `main-4556bc68`, 1424s on `dev-vcs2-20260915a` --
+# one issue create, one poll, one claim, one repository read, one comment and
+# one transition. The first of those overlapped a Vertex capacity incident that
+# had the conversation loop retrying on HTTP 503 throughout, so take the second
+# as the figure. Budget it as a long nightly, not a presubmit.
+#
+# No `domain:`, for the reason vcs-history-only-fact gives: this grades a
+# route, not a journey in docs/designs/domains.yaml.
+id: vcs-issue-resolver-triage
+name: The issue resolver claims a real ticket and transitions it
+prompt: >-
+  Two steps, in order.
+
+  First, file an issue in the GitOps repository this install manages. Title it
+  exactly "eval: what does this repository pin for the agent image?" and in the
+  body ask, as a reporter would, which file in the repository sets the platform
+  agent's image tag and what it is set to. Do not answer it yet and do not read
+  the repository yet.
+
+  Second, run the github-issue-resolver skill from its first step and follow it
+  to the end: poll, claim whatever it hands you, answer the issue by reading
+  the repository, post your triage report to the issue and transition the
+  ticket.
+
+  In your final answer give the issue number, the answer you posted, and the
+  exact label you transitioned the ticket to.
+expected_output: >-
+  The resolver's poll returned the seeded issue rather than an error. The agent
+  claimed it, read the repository to answer it, posted a triage report to the
+  issue and transitioned the ticket to status:resolved. The final answer names
+  the issue number, the file and tag it found, and the transition label
+  verbatim.
+infrastructure:
+  deployer: noop
+validated: false
+owner: dshnayder
+
+verification_spec:
+  # THE RED, kept as its own named check rather than folded into the one below
+  # so that `verification_report[]` says "the resolver could not reach the
+  # forge" rather than "the report did not mention a label" -- both are true on
+  # main, but only the first names the cause. The phrases are the skill's own
+  # words for the failure: its SKILL.md ERROR branch mandates that chat line
+  # verbatim.
+  - name: the-resolver-reached-the-forge
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        - "resolver is not running"
+        - "gh: command not found"
+  - name: the-ticket-was-answered-and-transitioned
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # A fixed string the skill defines, not a fact about any particular
+      # repository: only a completed `transition` puts this label on a ticket,
+      # and the prompt asks for it verbatim. Nothing short of the full
+      # procedure -- poll, claim, comment, transition -- produces it.
+      required_phrases: ["status:resolved"]
+      # That the report was actually posted, in the spellings a correct answer
+      # uses for it.
+      any_of_phrases: ["triage report", "posted", "commented on"]

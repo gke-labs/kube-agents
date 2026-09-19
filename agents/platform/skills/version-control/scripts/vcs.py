@@ -43,14 +43,10 @@ Every subcommand prints one JSON object on stdout.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
-import shutil
 import subprocess
-import urllib.error
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.append("/opt/defaults/scripts")
@@ -58,288 +54,8 @@ sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import credential_proxy_client  # noqa: E402
-
-# The sandbox's own git, off PATH on purpose. `git` on PATH is the
-# credential-proxy shim and runs in the broker; this one runs here, against a
-# working copy with no remote, and is never given a URL.
-# deploy/sandbox/Dockerfile says why the two are different binaries.
-LOCAL_GIT = os.environ.get("KUBE_AGENTS_LOCAL_GIT", "/opt/vcs/libexec/git")
-
-ROOT = Path(os.environ.get("KUBE_AGENTS_VCS_ROOT", "/opt/data/scratch/vcs"))
-SESSIONS = ROOT / ".sessions"
-
-# Who the local revisions are authored by. Overridable, but it needs a value:
-# git refuses to commit without one and the resulting error talks about
-# `git config --global`, which is a file this container deliberately has none of.
-AUTHOR_NAME = os.environ.get("KUBE_AGENTS_VCS_AUTHOR_NAME", "kube-agents")
-AUTHOR_EMAIL = os.environ.get(
-    "KUBE_AGENTS_VCS_AUTHOR_EMAIL", "kube-agents@users.noreply.invalid"
-)
-
-# A change is manifests, not a build output. The broker enforces its own
-# ceilings and would refuse a larger payload anyway; refusing here means the
-# caller is told before anything is sent.
-MAX_BUNDLE_BYTES = 64 << 20
-
-
-class VcsError(RuntimeError):
-    """A refusal the caller is meant to read, as JSON on stdout.
-
-    `code` and `detail` are the broker's, when the refusal was the broker's:
-    SKILL.md's rules are written against the codes -- `BASE_MOVED` means clone
-    again, `FORGE_RATE_LIMITED` means wait, `FORGE_REJECTED` means read the
-    detail -- so a client that reduced the answer to its message would be
-    handing the agent a decision keyed on a field it never receives.
-    """
-
-    def __init__(self, message: str, *, code: str | None = None, detail: str | None = None):
-        super().__init__(message)
-        self.code = code or None
-        self.detail = detail or None
-
-    def as_json(self) -> dict:
-        answer = {"error": str(self)}
-        if self.code:
-            answer["code"] = self.code
-        if self.detail:
-            answer["detail"] = self.detail
-        return answer
-
-
-# ---- the broker -----------------------------------------------------------
-
-
-def call(verb: str, payload: dict) -> dict:
-    endpoint = os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
-    if not endpoint:
-        raise VcsError(
-            "CREDENTIAL_PROXY_URL is not set, so there is no broker to ask. "
-            "This skill runs in the shell sandbox."
-        )
-    try:
-        return credential_proxy_client.vcs_call(endpoint, verb, payload)
-    except credential_proxy_client.WorkspaceUnavailable as exc:
-        # There is no switch for this, so reaching it means the broker in this
-        # install predates the routes. Said plainly, because the alternative
-        # reading -- that something here can be turned on -- sends whoever hits
-        # it looking for a configuration field that does not exist.
-        raise VcsError(
-            f"this broker does not serve the version-control routes: {exc}. "
-            "Its image is older than this skill."
-        ) from exc
-    except credential_proxy_client.WorkspaceRequestError as exc:
-        payload = exc.payload or {}
-        raise VcsError(
-            payload.get("error", str(exc)),
-            code=payload.get("code"),
-            detail=payload.get("detail"),
-        ) from exc
-    except credential_proxy_client.TokenUnavailable as exc:
-        # The projected token is missing or empty -- the kubelet mid-rewrite,
-        # or a volume that was never projected. Nothing the caller can do from
-        # here except retry; saying so as JSON keeps the contract every other
-        # failure keeps.
-        raise VcsError(
-            f"the broker credential is not readable: {exc}. Retry shortly; "
-            "if it persists the sandbox's token volume is not projected."
-        ) from exc
-    except urllib.error.URLError as exc:
-        # Connection refused or dropped: a restarting broker, or a policy in
-        # the way. HTTP errors never reach here -- vcs_call turns them into
-        # WorkspaceRequestError above -- so this is the transport failing.
-        raise VcsError(
-            f"the broker at {endpoint} could not be reached: {exc.reason}. "
-            "Retry shortly."
-        ) from exc
-    except ValueError as exc:
-        raise VcsError(
-            "the broker answered with something that is not JSON; retry, and "
-            "if it persists the broker is unhealthy."
-        ) from exc
-
-
-# ---- the local working copy ----------------------------------------------
-
-
-def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    """git, in this container, on a repository with no remote.
-
-    The environment is the argument that this cannot execute anything the
-    repository supplied. A bundle carries objects and refs and no config, so the
-    only config this copy has is the one git just wrote — which means a
-    `.gitattributes` naming `filter.foo.clean` finds no `foo` defined and is
-    inert, the same reasoning `content_workspace` makes about the broker's
-    trees. `core.hooksPath` is pointed at an empty directory rather than left to
-    default, because a hook is the one thing that would not need a config entry
-    to have been supplied.
-    """
-    empty = ROOT / ".no-hooks"
-    empty.mkdir(parents=True, exist_ok=True)
-    (ROOT / ".home").mkdir(parents=True, exist_ok=True)
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ASKPASS": "/bin/false",
-            # `file` only, for the git this script runs. A default rather than
-            # a control -- the design says why an environment setting cannot
-            # be one inside the sandbox; the image's deletions are the control.
-            "GIT_ALLOW_PROTOCOL": "file",
-            "HOME": str(ROOT / ".home"),
-        }
-    )
-    if not Path(LOCAL_GIT).exists():
-        raise VcsError(
-            f"{LOCAL_GIT} is not present. This skill needs the sandbox's local "
-            "git; on an image without it, use the inspect-repository skill."
-        )
-    argv = [
-        LOCAL_GIT,
-        "-c", f"core.hooksPath={empty}",
-        "-c", "protocol.ext.allow=never",
-        "-c", "protocol.file.allow=always",
-        "-c", f"user.name={AUTHOR_NAME}",
-        "-c", f"user.email={AUTHOR_EMAIL}",
-        *args,
-    ]
-    return subprocess.run(
-        argv,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=check,
-        timeout=600,
-        env=environment,
-    )
-
-
-def _slug(forge: str, repo: str) -> str:
-    return f"{forge}__{repo.replace('/', '__')}"
-
-
-def session_path(forge: str, repo: str) -> Path:
-    return SESSIONS / f"{_slug(forge, repo)}.json"
-
-
-def save_session(data: dict) -> None:
-    SESSIONS.mkdir(parents=True, exist_ok=True)
-    session_path(data["forge"], data["repo"]).write_text(json.dumps(data, indent=2))
-
-
-def all_sessions() -> list[dict]:
-    if not SESSIONS.is_dir():
-        return []
-    found = []
-    for path in sorted(SESSIONS.glob("*.json")):
-        try:
-            found.append(json.loads(path.read_text()))
-        except (OSError, ValueError):
-            continue
-    return found
-
-
-def _matches(session: dict, spec: str) -> bool:
-    """Whether this working copy is the one `spec` names.
-
-    Matched against what the caller typed and against what the broker resolved
-    it to, so `infra`, `acme/infra` and the full URL all find the same
-    copy. Deliberately not re-derived here: parsing a URL into a forge and a
-    repository is the broker's job, and a second parser in this container is a
-    second thing to keep in agreement.
-    """
-    wanted = spec.strip().lower().rstrip("/").removesuffix(".git")
-    candidates = {
-        (session.get("repo") or "").lower(),
-        (session.get("spec") or "").lower().rstrip("/").removesuffix(".git"),
-    }
-    if wanted in candidates:
-        return True
-    repo = (session.get("repo") or "").lower()
-    return bool(repo) and (wanted.endswith("/" + repo) or repo.endswith("/" + wanted))
-
-
-def resolve_session(spec: str | None) -> dict:
-    """Which working copy a verb is about.
-
-    Named, then inferred from the directory the caller is standing in, then the
-    only one there is. That is the order every version-control system resolves
-    it in, and the last case is what makes `vcs.py log` work right after a clone
-    without repeating the URL.
-    """
-    sessions = all_sessions()
-    if spec:
-        hits = [session for session in sessions if _matches(session, spec)]
-        if len(hits) == 1:
-            return hits[0]
-        if not hits:
-            raise VcsError(
-                f"no local copy of {spec}. Run `vcs.py clone {spec}` first."
-            )
-        raise VcsError(
-            f"{spec} matches more than one local copy: "
-            + ", ".join(sorted(hit["repo"] for hit in hits))
-        )
-    if not sessions:
-        raise VcsError(
-            "there is no local copy of anything yet. Run `vcs.py clone <url>`."
-        )
-    here = Path.cwd().resolve()
-    for session in sessions:
-        path = Path(session["path"]).resolve()
-        if here == path or path in here.parents:
-            return session
-    if len(sessions) == 1:
-        return sessions[0]
-    raise VcsError(
-        "several repositories are cloned here; say which with --repo: "
-        + ", ".join(sorted(session["repo"] for session in sessions))
-    )
-
-
-def tree_of(session: dict) -> Path:
-    tree = Path(session["path"])
-    if not tree.is_dir():
-        raise VcsError(f"{tree} is gone; clone {session['repo']} again")
-    return tree
-
-
-def _local(session: dict, args: list[str], verb: str) -> dict:
-    done = local_git(tree_of(session), *args, check=False)
-    return {
-        "repo": session["repo"],
-        "forge": session["forge"],
-        "verb": verb,
-        "branch": current_branch(session),
-        "exitCode": done.returncode,
-        "stdout": done.stdout,
-        "stderr": done.stderr.strip()[:2000],
-    }
-
-
-def current_branch(session: dict) -> str:
-    done = local_git(
-        tree_of(session), "rev-parse", "--abbrev-ref", "HEAD", check=False
-    )
-    return (done.stdout or "").strip() or session.get("branch", "")
-
-
-def base_for(session: dict, branch: str) -> str:
-    """What a publish of `branch` builds on: its own last published tip.
-
-    Per branch, and that is the whole point. One copy can carry several branches
-    -- the second one made after the first was published is the ordinary case --
-    and each has a different answer. A single scalar advanced on every publish
-    gives the second branch the first branch's tip, which is on no target and
-    which the remote has under a name the publish never fetches, so the ancestry
-    check refuses and the message blames a rewritten target.
-
-    Falling back to the clone point is what makes a branch's first publish work:
-    nothing of it is on the forge yet, so the last thing this copy and the broker
-    agreed on is where the copy came from.
-    """
-    return session.get("published", {}).get(branch) or session["baseRevision"]
+import vcs_client as client  # noqa: E402
+from vcs_client import VcsError  # noqa: E402
 
 
 # ---- repository verbs -----------------------------------------------------
@@ -348,132 +64,38 @@ def base_for(session: dict, branch: str) -> str:
 def verb_capabilities(arguments) -> dict:
     spec = arguments.repository or (arguments.repo if arguments.repo else None)
     if not spec:
-        spec = resolve_session(None)["spec"]
-    answer = call("capabilities", {"repository": spec})
-    answer["localGit"] = LOCAL_GIT if Path(LOCAL_GIT).exists() else None
+        spec = client.resolve_session(None)["spec"]
+    answer = client.call("capabilities", {"repository": spec})
+    answer["localGit"] = client.LOCAL_GIT if Path(client.LOCAL_GIT).exists() else None
     return answer
 
 
-def _refuse_to_discard(destination: Path, *, force: bool) -> None:
-    """Stop a re-clone from deleting work that was never published.
-
-    A second `clone` of the same repository replaces the tree, and until this
-    check it did so silently -- so a commit made here and not yet published was
-    gone with no message. That is the wrong default anywhere; it is worse here
-    because `publish` used to answer a moved target by saying to clone again,
-    which pointed the caller straight at it.
-
-    Anything at all is enough to refuse: a commit past the recorded base, or an
-    uncommitted change, or a git that cannot answer either question. Refusing on
-    the third is deliberate -- a tree this cannot read is exactly the one whose
-    contents cannot be vouched for.
-    """
-    if force:
-        return
-    session = next(
-        (s for s in all_sessions() if Path(s.get("path", "")) == destination), None
-    )
-    reasons = []
-    dirty = local_git(destination, "status", "--porcelain", check=False)
-    if dirty.returncode != 0:
-        reasons.append("its state could not be read")
-    elif dirty.stdout.strip():
-        reasons.append(f"{len(dirty.stdout.strip().splitlines())} uncommitted change(s)")
-    # The base for the branch that is checked out, not the clone point: a branch
-    # whose work has been published is not work this would lose, and asking the
-    # clone point would count those revisions again and refuse to replace a copy
-    # with nothing left in it.
-    head = local_git(destination, "rev-parse", "--abbrev-ref", "HEAD", check=False)
-    base = (
-        base_for(session, (head.stdout or "").strip())
-        if session and session.get("baseRevision")
-        else None
-    )
-    if base:
-        ahead = local_git(
-            destination, "rev-list", "--count", f"{base}..HEAD", check=False
-        )
-        if ahead.returncode != 0:
-            reasons.append("its revisions could not be counted")
-        elif (ahead.stdout or "0").strip() not in ("", "0"):
-            reasons.append(f"{ahead.stdout.strip()} unpublished revision(s)")
-    if not reasons:
-        return
-    raise VcsError(
-        f"there is already a copy at {destination} with "
-        + " and ".join(reasons)
-        + ". Publish it, or re-run with --force to replace it."
-    )
-
-
 def verb_clone(arguments) -> dict:
-    """Bring the repository down as history, not as a directory listing.
+    return client.clone(arguments.repository, arguments.branch, force=arguments.force)
 
-    One call to the broker, which clones, bundles and deletes its tree before
-    answering. Nothing stays on the credential side after a read, and there is
-    no handle to release.
-    """
-    payload: dict = {"repository": arguments.repository}
-    if arguments.branch:
-        payload["branch"] = arguments.branch
-    answer = call("clone", payload)
 
-    destination = ROOT / _slug(answer["forge"], answer["repo"])
-    if destination.exists():
-        _refuse_to_discard(destination, force=arguments.force)
-        shutil.rmtree(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    handle, name = tempfile.mkstemp(dir=str(destination.parent), suffix=".bundle")
-    bundle_file = Path(name)
-    try:
-        with os.fdopen(handle, "wb") as stream:
-            stream.write(base64.b64decode(answer["bundleBase64"]))
-        # Cloning from a file gives the copy an `origin` pointing at the bundle.
-        # It is removed immediately: a remote is a thing a later command can be
-        # talked into fetching from or pushing to, and there is nothing here
-        # that should ever do either. Revisions go up through `publish`.
-        local_git(
-            destination.parent,
-            "clone", "--quiet", "--no-recurse-submodules",
-            "--branch", answer["branch"], str(bundle_file), str(destination),
-        )
-        local_git(destination, "remote", "remove", "origin", check=False)
-    finally:
-        bundle_file.unlink(missing_ok=True)
+def verb_branch(arguments) -> dict:
+    return client.branch(arguments.repo, arguments.name)
 
-    session = {
-        "forge": answer["forge"],
-        "repo": answer["repo"],
-        "spec": arguments.repository,
-        "branch": answer["branch"],
-        # What `publish` proves its revisions descend from. Recorded at clone
-        # time and never updated by a local commit: it is the last point the
-        # broker and this container agreed on.
-        "baseRevision": answer["revision"],
-        "path": str(destination),
-    }
-    save_session(session)
-    tracked = local_git(destination, "ls-files").stdout.splitlines()
-    return {
-        "forge": answer["forge"],
-        "repo": answer["repo"],
-        "branch": answer["branch"],
-        "revision": answer["revision"],
-        "path": str(destination),
-        "files": len(tracked),
-        "bundleBytes": answer["size"],
-        # Said out loud because it is the whole reason this verb exists: the
-        # thing on disk is a repository, and every question about its past is
-        # answerable here without asking anybody for a credential. History is
-        # always complete — a bundle cannot carry a shallow boundary, so there
-        # is no truncated case for a caller to have to notice.
-        "history": "complete",
-        "remotes": [],
-    }
+
+def verb_commit(arguments) -> dict:
+    return client.commit(arguments.message, arguments.paths, spec=arguments.repo)
+
+
+def verb_publish(arguments) -> dict:
+    return client.publish(arguments.repo, arguments.target, advance=arguments.advance)
+
+
+def verb_discard(arguments) -> dict:
+    return client.discard(arguments.repo)
+
+
+def _collaboration(arguments, verb: str, payload: dict) -> dict:
+    return client.forge(verb, payload, arguments.repo)
 
 
 def verb_log(arguments) -> dict:
-    session = resolve_session(arguments.repo)
+    session = client.resolve_session(arguments.repo)
     args = ["log", f"--max-count={arguments.limit}", "--date=iso"]
     # `--format` carries the format string, not a whole git option, which is
     # what its help text promises and what anybody typing `--format "%h %s"`
@@ -490,31 +112,31 @@ def verb_log(arguments) -> dict:
         args.append(arguments.revision)
     if arguments.paths:
         args += ["--", *arguments.paths]
-    return _local(session, args, "log")
+    return client.local(session, args, "log")
 
 
 def verb_show(arguments) -> dict:
-    session = resolve_session(arguments.repo)
-    return _local(session, ["show", arguments.revision], "show")
+    session = client.resolve_session(arguments.repo)
+    return client.local(session, ["show", arguments.revision], "show")
 
 
 def verb_diff(arguments) -> dict:
-    session = resolve_session(arguments.repo)
+    session = client.resolve_session(arguments.repo)
     args = ["diff"]
     if arguments.revision:
         args.append(arguments.revision)
     if arguments.paths:
         args += ["--", *arguments.paths]
-    return _local(session, args, "diff")
+    return client.local(session, args, "diff")
 
 
 def verb_annotate(arguments) -> dict:
-    session = resolve_session(arguments.repo)
+    session = client.resolve_session(arguments.repo)
     args = ["annotate", "--date=short"]
     if arguments.revision:
         args.append(arguments.revision)
     args += ["--", arguments.path]
-    return _local(session, args, "annotate")
+    return client.local(session, args, "annotate")
 
 
 def verb_files(arguments) -> dict:
@@ -524,11 +146,11 @@ def verb_files(arguments) -> dict:
     tree entry, and it is the one thing a protocol that carries only bytes has
     nowhere to put — which is why this verb exists rather than `ls`.
     """
-    session = resolve_session(arguments.repo)
+    session = client.resolve_session(arguments.repo)
     args = ["ls-files", "--stage"]
     if arguments.paths:
         args += ["--", *arguments.paths]
-    result = _local(session, args, "files")
+    result = client.local(session, args, "files")
     entries = []
     for line in result["stdout"].splitlines():
         head, _, path = line.partition("\t")
@@ -542,7 +164,7 @@ def verb_files(arguments) -> dict:
 
 
 def verb_grep(arguments) -> dict:
-    session = resolve_session(arguments.repo)
+    session = client.resolve_session(arguments.repo)
     args = ["grep", "--line-number"]
     if arguments.ignore_case:
         args.append("--ignore-case")
@@ -550,7 +172,7 @@ def verb_grep(arguments) -> dict:
     args += ["-e", arguments.pattern]
     if arguments.paths:
         args += ["--", *arguments.paths]
-    result = _local(session, args, "grep")
+    result = client.local(session, args, "grep")
     # git grep exits 1 for "no match", which is an answer rather than a failure
     # and should not read to the caller as one.
     if result["exitCode"] == 1 and not result["stderr"]:
@@ -562,8 +184,8 @@ def verb_grep(arguments) -> dict:
 
 
 def verb_status(arguments) -> dict:
-    session = resolve_session(arguments.repo)
-    result = _local(session, ["status", "--porcelain=v1"], "status")
+    session = client.resolve_session(arguments.repo)
+    result = client.local(session, ["status", "--porcelain=v1"], "status")
     result["changes"] = [
         {"state": line[:2].strip(), "path": line[3:]}
         for line in result["stdout"].splitlines()
@@ -574,209 +196,11 @@ def verb_status(arguments) -> dict:
     return result
 
 
-def verb_branch(arguments) -> dict:
-    """List the lines of development, or start one.
-
-    Local only, and it makes no network call. A branch is a name for a revision;
-    it becomes something the forge knows about when `publish` sends the
-    revisions under it, not before.
-    """
-    session = resolve_session(arguments.repo)
-    tree = tree_of(session)
-    if not arguments.name:
-        listing = local_git(tree, "branch", "--format=%(refname:short)", check=False)
-        return {
-            "repo": session["repo"],
-            "forge": session["forge"],
-            "verb": "branch",
-            "branch": current_branch(session),
-            "branches": listing.stdout.split(),
-            "exitCode": listing.returncode,
-            "stderr": listing.stderr.strip()[:2000],
-        }
-    exists = local_git(
-        tree, "rev-parse", "--verify", "--quiet", f"refs/heads/{arguments.name}",
-        check=False,
-    )
-    switch = ["switch", arguments.name] if exists.returncode == 0 else [
-        "switch", "--create", arguments.name
-    ]
-    done = local_git(tree, *switch, check=False)
-    return {
-        "repo": session["repo"],
-        "forge": session["forge"],
-        "verb": "branch",
-        "branch": current_branch(session),
-        "created": exists.returncode != 0,
-        "exitCode": done.returncode,
-        "stderr": done.stderr.strip()[:2000],
-    }
-
-
-def verb_commit(arguments) -> dict:
-    """Record a revision, here, with the sandbox's own git.
-
-    Local on purpose. The revision has a real parent and a real identifier
-    before anything leaves this container, so `log` shows the work in progress,
-    a branch of five changes stays five revisions rather than being flattened
-    into one, and `publish` has something whose ancestry it can prove.
-    """
-    session = resolve_session(arguments.repo)
-    tree = tree_of(session)
-    staged = local_git(
-        tree, "add", "--", *arguments.paths, check=False
-    ) if arguments.paths else local_git(tree, "add", "--all", check=False)
-    if staged.returncode != 0:
-        raise VcsError(f"nothing was staged: {staged.stderr.strip()}")
-    pending = local_git(tree, "diff", "--cached", "--name-only", check=False)
-    changed = [line for line in pending.stdout.splitlines() if line]
-    if not changed:
-        raise VcsError(
-            "there is nothing to record. `vcs.py status` shows what the working "
-            "copy has that its revision does not."
-        )
-    done = local_git(tree, "commit", "--message", arguments.message, check=False)
-    if done.returncode != 0:
-        raise VcsError(f"commit failed: {(done.stderr or done.stdout).strip()}")
-    revision = local_git(tree, "rev-parse", "HEAD").stdout.strip()
-    return {
-        "repo": session["repo"],
-        "forge": session["forge"],
-        "verb": "commit",
-        "branch": current_branch(session),
-        "revision": revision,
-        "files": changed,
-        "count": len(changed),
-        "published": False,
-    }
-
-
-def verb_publish(arguments) -> dict:
-    """Send the revisions made since `clone` to the shared repository.
-
-    Symmetric with `clone`: history goes up the way it came down, as a bundle of
-    objects and refs. The broker fetches the base, unpacks the bundle beside it,
-    checks that the tip descends from the revision it handed out, and pushes the
-    branch — without ever checking the objects out. So the revision identifiers
-    on the forge are the ones `log` printed here.
-    """
-    session = resolve_session(arguments.repo)
-    tree = tree_of(session)
-    branch = current_branch(session)
-    base = base_for(session, branch)
-    target = arguments.target or session["branch"]
-    ahead = local_git(tree, "rev-list", "--count", f"{base}..HEAD", check=False)
-    if ahead.returncode != 0:
-        raise VcsError(
-            f"cannot compare against {base[:12]}: {ahead.stderr.strip()}"
-        )
-    count = int((ahead.stdout or "0").strip() or "0")
-    if count == 0:
-        raise VcsError(
-            "there are no new revisions to publish. `vcs.py commit` records "
-            "one; `vcs.py status` shows what is still uncommitted."
-        )
-    if branch == session["branch"] or branch == target:
-        # After the count, not before: on the shared branch with nothing
-        # committed, "there is nothing to publish" is the more specific of the
-        # two true things and the one that says what to do next.
-        #
-        # Two comparisons, and the first is the one that matters. `branch ==
-        # target` alone was defeated by `--target <anything else>` while
-        # still standing on the branch the copy was cloned from -- seen live:
-        # a worker cloned a non-default branch, committed on it, published
-        # with `--target main`, and fast-forwarded the branch it had cloned.
-        # The copy knows which branch that was; the broker does not, so the
-        # copy is where the refusal is exact. The broker refuses the same
-        # thing when told (`clonedFrom` below) and refuses the remote's
-        # default branch on its own.
-        raise VcsError(
-            f"you are on {branch}, which is the branch this copy was cloned "
-            "from, so this would write to it directly. Make a branch of your "
-            "own with `vcs.py branch <name>` and publish that."
-        )
-
-    handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
-    bundle_file = Path(name)
-    os.close(handle)
-    try:
-        made = local_git(
-            tree, "bundle", "create", str(bundle_file), branch, f"^{base}",
-            check=False,
-        )
-        if made.returncode != 0:
-            raise VcsError(f"could not bundle the revisions: {made.stderr.strip()}")
-        blob = bundle_file.read_bytes()
-        if len(blob) > MAX_BUNDLE_BYTES:
-            raise VcsError(
-                f"the change is {len(blob)} bytes, over the "
-                f"{MAX_BUNDLE_BYTES}-byte ceiling for one publish"
-            )
-        answer = call(
-            "publish",
-            {
-                "repository": session["spec"],
-                "branch": branch,
-                "target": target,
-                "baseRevision": base,
-                "clonedFrom": session["branch"],
-                "bundleBase64": base64.b64encode(blob).decode("ascii"),
-            },
-        )
-    finally:
-        bundle_file.unlink(missing_ok=True)
-
-    # The published tip becomes this branch's base. A second publish of the same
-    # branch then sends only what came after it, and its ancestry check is
-    # against something the remote demonstrably has.
-    session.setdefault("published", {})[answer["branch"]] = answer["revision"]
-    session["publishedBranch"] = answer["branch"]
-    save_session(session)
-    answer["revisions"] = count
-    return answer
-
-
-def verb_discard(arguments) -> dict:
-    """Remove the local copy. Nothing is released on the credential side.
-
-    There is nothing there to release — every broker route is one request long.
-    This deletes a directory, and it is called `discard` rather than `close` for
-    that reason: closing implies a counterpart that was opened.
-    """
-    session = resolve_session(arguments.repo)
-    shutil.rmtree(session["path"], ignore_errors=True)
-    session_path(session["forge"], session["repo"]).unlink(missing_ok=True)
-    return {
-        "repo": session["repo"],
-        "forge": session["forge"],
-        "verb": "discard",
-        "removed": session["path"],
-    }
-
-
-# ---- collaboration verbs --------------------------------------------------
-
-
-def _collaboration(arguments, verb: str, payload: dict) -> dict:
-    """Every forge call: name the repository, POST, print what comes back.
-
-    The repository is the only thing resolved locally, and only so a caller
-    standing in a working copy need not repeat it. Everything else — which forge
-    this is, what it calls a change proposal, how to reach its API — is decided
-    on the credential side and arrives already translated.
-    """
-    if arguments.repo:
-        payload["repository"] = arguments.repo
-    else:
-        payload["repository"] = resolve_session(None)["spec"]
-    return call(verb, {key: value for key, value in payload.items() if value is not None})
-
-
 def verb_proposal_create(arguments) -> dict:
     source, target = arguments.source, arguments.target
     if not source or not target:
-        session = resolve_session(arguments.repo)
-        source = source or current_branch(session)
+        session = client.resolve_session(arguments.repo)
+        source = source or client.current_branch(session)
         target = target or session["branch"]
     return _collaboration(
         arguments,
@@ -795,7 +219,12 @@ def verb_proposal_list(arguments) -> dict:
     return _collaboration(
         arguments,
         "proposal-list",
-        {"state": arguments.state, "limit": arguments.limit},
+        {
+            "state": arguments.state,
+            "limit": arguments.limit,
+            "source": arguments.source,
+            "target": arguments.target,
+        },
     )
 
 
@@ -828,6 +257,8 @@ def verb_issue_list(arguments) -> dict:
             "state": arguments.state,
             "limit": arguments.limit,
             "labels": arguments.labels or None,
+            "excludeLabels": arguments.without_labels or None,
+            "query": arguments.query or None,
         },
     )
 
@@ -862,6 +293,81 @@ def verb_issue_comment(arguments) -> dict:
         "issue-comment",
         {"number": arguments.number, "body": arguments.body},
     )
+
+
+def verb_proposal_update(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "proposal-update",
+        {
+            "number": arguments.number,
+            "title": arguments.title,
+            "body": arguments.body,
+            "labelsAdd": arguments.add_label or None,
+            "labelsRemove": arguments.remove_label or None,
+        },
+    )
+
+
+def verb_proposal_close(arguments) -> dict:
+    return _collaboration(arguments, "proposal-close", {"number": arguments.number})
+
+
+def verb_proposal_commits(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "proposal-commits",
+        {"number": arguments.number, "limit": arguments.limit},
+    )
+
+
+def verb_proposal_acknowledge(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "proposal-acknowledge",
+        {
+            "number": arguments.number,
+            "comment": {"id": arguments.comment_id, "kind": arguments.kind},
+        },
+    )
+
+
+def verb_issue_update(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "issue-update",
+        {
+            "number": arguments.number,
+            "title": arguments.title,
+            "body": arguments.body,
+            "labelsAdd": arguments.add_label or None,
+            "labelsRemove": arguments.remove_label or None,
+        },
+    )
+
+
+def verb_issue_close(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "issue-close",
+        {"number": arguments.number, "reason": arguments.reason},
+    )
+
+
+def verb_label_ensure(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "label-ensure",
+        {
+            "name": arguments.name,
+            "color": arguments.color,
+            "description": arguments.description,
+        },
+    )
+
+
+def verb_identity(arguments) -> dict:
+    return _collaboration(arguments, "identity", {"login": arguments.login})
 
 
 # ---- command line ---------------------------------------------------------
@@ -948,6 +454,11 @@ def build_parser() -> argparse.ArgumentParser:
         "publish", aliases=["push"], help="send local revisions to the forge"
     )
     publish.add_argument("--target", help="the branch to build on (default: cloned)")
+    publish.add_argument(
+        "--advance",
+        action="store_true",
+        help="this copy was cloned of a proposal branch to add to it; needs --target",
+    )
     repo_option(publish).set_defaults(run=verb_publish)
 
     discard = verbs.add_parser(
@@ -970,6 +481,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     plist = actions.add_parser("list")
     plist.add_argument("--state", default="open", choices=["open", "closed", "all"])
+    plist.add_argument("--source", help="only proposals from this branch")
+    plist.add_argument("--target", help="only proposals onto this branch")
     plist.add_argument("-n", "--limit", type=int)
     repo_option(plist).set_defaults(run=verb_proposal_list)
 
@@ -985,12 +498,41 @@ def build_parser() -> argparse.ArgumentParser:
     pcomment.add_argument("--body", required=True)
     repo_option(pcomment).set_defaults(run=verb_proposal_comment)
 
+    pupdate = actions.add_parser("update", aliases=["edit"])
+    pupdate.add_argument("number", type=int)
+    pupdate.add_argument("--title")
+    pupdate.add_argument("--body")
+    pupdate.add_argument("--add-label", nargs="*")
+    pupdate.add_argument("--remove-label", nargs="*")
+    repo_option(pupdate).set_defaults(run=verb_proposal_update)
+
+    pclose = actions.add_parser("close")
+    pclose.add_argument("number", type=int)
+    repo_option(pclose).set_defaults(run=verb_proposal_close)
+
+    pcommits = actions.add_parser("commits", help="the revisions on a proposal's source branch")
+    pcommits.add_argument("number", type=int)
+    pcommits.add_argument("-n", "--limit", type=int)
+    repo_option(pcommits).set_defaults(run=verb_proposal_commits)
+
+    pack = actions.add_parser(
+        "acknowledge", aliases=["ack"], help="react to a comment so its author sees it was read"
+    )
+    pack.add_argument("number", type=int)
+    pack.add_argument("--comment-id", type=int, required=True, help="the comment's `id` from `view --comments`")
+    pack.add_argument("--kind", required=True, help="the comment's `kind` from `view --comments`")
+    repo_option(pack).set_defaults(run=verb_proposal_acknowledge)
+
     issue = verbs.add_parser("issue", help="work items on the forge")
     iactions = issue.add_subparsers(dest="action", required=True)
 
     ilist = iactions.add_parser("list")
     ilist.add_argument("--state", default="open", choices=["open", "closed", "all"])
     ilist.add_argument("--labels", nargs="*")
+    ilist.add_argument(
+        "--without-labels", nargs="*", help="skip issues carrying any of these"
+    )
+    ilist.add_argument("--query", help="free text to search for")
     ilist.add_argument("-n", "--limit", type=int)
     repo_option(ilist).set_defaults(run=verb_issue_list)
 
@@ -1011,12 +553,39 @@ def build_parser() -> argparse.ArgumentParser:
     icomment.add_argument("--body", required=True)
     repo_option(icomment).set_defaults(run=verb_issue_comment)
 
+    iupdate = iactions.add_parser("update", aliases=["edit"])
+    iupdate.add_argument("number", type=int)
+    iupdate.add_argument("--title")
+    iupdate.add_argument("--body")
+    iupdate.add_argument("--add-label", nargs="*")
+    iupdate.add_argument("--remove-label", nargs="*")
+    repo_option(iupdate).set_defaults(run=verb_issue_update)
+
+    iclose = iactions.add_parser("close")
+    iclose.add_argument("number", type=int)
+    iclose.add_argument("--reason", choices=["completed", "not-planned"])
+    repo_option(iclose).set_defaults(run=verb_issue_close)
+
+    label = verbs.add_parser("label", help="labels on the forge")
+    lactions = label.add_subparsers(dest="action", required=True)
+    lensure = lactions.add_parser("ensure", aliases=["create"], help="create the label, or update it if it exists")
+    lensure.add_argument("name")
+    lensure.add_argument("--color")
+    lensure.add_argument("--description")
+    repo_option(lensure).set_defaults(run=verb_label_ensure)
+
+    identity = verbs.add_parser(
+        "identity", aliases=["whoami"], help="who this install is on the forge, and whether a login may write"
+    )
+    identity.add_argument("--login", help="ask about this login instead of the credential's own")
+    repo_option(identity).set_defaults(run=verb_identity)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
-    ROOT.mkdir(parents=True, exist_ok=True)
+    client.ROOT.mkdir(parents=True, exist_ok=True)
     try:
         answer = arguments.run(arguments)
     except VcsError as exc:

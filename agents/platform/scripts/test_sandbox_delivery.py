@@ -23,12 +23,19 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "agents/platform/scripts"
+SKILL_SCRIPTS = REPO / "agents/platform/skills"
 DOCKERFILE = REPO / "deploy/sandbox/Dockerfile"
+
+# The second staging directory: root-owned, and the one the agent pod's crons
+# run over ssh. Everything else here is about what the *model* can run; this is
+# about what the trusted login runs, which must not be a file the model owns.
+TRUSTED_DIR = "/opt/vcs/libexec/platform"
 
 # Where an agent is told what to run. The cluster files are here because cluster
 # profiles run in the same pod as the platform agent and reach the same sandbox —
@@ -111,6 +118,72 @@ def stubbed_scripts() -> set[str]:
             r"agent-pod-only-stub\.py\s+(/opt/defaults/scripts/\S+)", text
         )
     }
+
+
+def forwarded_paths() -> dict[str, str]:
+    """Every script an agent-pod cron runs in the sandbox as `hermes`.
+
+    Imported rather than listed as strings so the test moves when the constant
+    does. A third crossing added later belongs here; nothing else in the suite
+    will notice it otherwise.
+    """
+    # resolver.py lives in its skill, not in `scripts/`, so its directory is not
+    # already on the path the way `forge`'s is.
+    sys.path.insert(0, str(SKILL_SCRIPTS / "github-issue-resolver/scripts"))
+    try:
+        import forge
+        import resolver
+    finally:
+        sys.path.pop(0)
+
+    return {
+        "forge": forge.SANDBOX_FORGE,
+        "resolver": resolver.SANDBOX_RESOLVER,
+    }
+
+
+# Where the agent pod's copy of a shared script looks for its siblings. Both are
+# chowned to `agent` at boot, so neither may be on the import path of the copy
+# the sandbox runs as `hermes`.
+AGENT_WRITABLE = ("/opt/data", "/opt/defaults")
+
+
+def staged_source(name: str) -> Path | None:
+    """The file in this checkout that the Dockerfile stages under `TRUSTED_DIR`."""
+    for path in (SCRIPTS / name, *SKILL_SCRIPTS.glob(f"*/scripts/{name}")):
+        if path.exists():
+            return path
+    return None
+
+
+def unguarded_path_appends(path: Path) -> list[str]:
+    """Additions of an agent-writable directory to `sys.path` that always run.
+
+    Guarded means inside an `if` that asks where this file is. The agent pod's
+    copy needs those directories to find its siblings; the trusted copy has
+    `sys.path[0]` and a closure staged beside it, and must not carry a directory
+    uid 1000 can write even as a fallback behind site-packages.
+    """
+    tree = ast.parse(path.read_text())
+    guarded = {
+        id(node)
+        for branch in ast.walk(tree)
+        if isinstance(branch, ast.If)
+        and "TRUSTED_CLOSURE" in ast.unparse(branch.test)
+        for node in ast.walk(branch)
+    }
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or id(node) in guarded:
+            continue
+        if ast.unparse(node.func) not in ("sys.path.append", "sys.path.insert"):
+            continue
+        for argument in node.args:
+            if isinstance(argument, ast.Constant) and str(
+                argument.value
+            ).startswith(AGENT_WRITABLE):
+                found.append(argument.value)
+    return found
 
 
 def local_imports(path: Path, universe: set[str]) -> set[str]:
@@ -210,6 +283,79 @@ class SandboxDelivery(unittest.TestCase):
             {},
             {k: sorted(v) for k, v in gaps.items()},
             "these skill scripts import shared modules the sandbox does not have",
+        )
+
+    def test_every_forwarded_script_is_the_root_owned_copy(self):
+        """A cron forwards as `hermes`, so it must not run a file uid 1000 owns.
+
+        /opt/data is the agent's volume and an edit there survives until the next
+        restart -- the smoke test plants one deliberately. Forwarding to that copy
+        would run the model's code with the cron's credential.
+
+        Both entry points are checked, not just the first one found: forge.py's
+        hop was moved here and resolver.py's was left behind under /opt/data for
+        a review round, which is the failure this shape of test exists to stop
+        repeating.
+        """
+        staged = dockerfile_paths(TRUSTED_DIR)
+        for name, path in forwarded_paths().items():
+            with self.subTest(entry_point=name):
+                self.assertTrue(
+                    path.startswith(TRUSTED_DIR + "/"),
+                    f"the forwarded path {path} is not under {TRUSTED_DIR}",
+                )
+                self.assertIn(Path(path).name, staged)
+
+    def test_the_root_owned_copy_is_closed_under_import(self):
+        """A module missing here is not an error: it is found under /opt/data.
+
+        `sys.path[0]` is the script's own directory, so the fallback is silent
+        and it is the agent-owned copy -- the boundary gone with nothing to show
+        for it. deploy/sandbox/trusted-closure-guard.py catches this at build
+        time by reading `__file__` off what actually loaded; this catches it at
+        review time, on a tree nobody has to build.
+        """
+        staged = dockerfile_paths(TRUSTED_DIR)
+        universe = self.shared | {Path(p).name for p in forwarded_paths().values()}
+        seen: set[str] = set()
+        pending = {Path(p).name for p in forwarded_paths().values()}
+        while pending:
+            name = pending.pop()
+            seen.add(name)
+            for path in (SCRIPTS / name, *SKILL_SCRIPTS.glob(f"*/scripts/{name}")):
+                if path.exists():
+                    pending |= local_imports(path, universe) - seen
+                    break
+        self.assertEqual(
+            set(),
+            seen - staged,
+            f"these modules are imported by a forwarded script but not staged "
+            f"in {TRUSTED_DIR}",
+        )
+
+    def test_no_staged_script_puts_an_agent_writable_directory_on_its_path(self):
+        """Staging the closure root-owned is undone if the path reaches back out.
+
+        `/opt/defaults/scripts` and `/opt/data/scripts` are appended, so they are
+        reached only for a module nothing else supplies -- which is exactly the
+        module a closure gap leaves open, and exactly the file uid 1000 gets to
+        write. The build guard proves the closure is complete for what loads at
+        import time; this is what keeps the gap from being fillable at all.
+        """
+        offenders = {}
+        for name in sorted(dockerfile_paths(TRUSTED_DIR)):
+            path = staged_source(name)
+            if path is None:
+                continue
+            appended = unguarded_path_appends(path)
+            if appended:
+                offenders[name] = appended
+        self.assertEqual(
+            {},
+            offenders,
+            f"these are staged in {TRUSTED_DIR} and add an agent-writable "
+            "directory to sys.path unconditionally; gate it on the file's own "
+            "location, the way vcs_client.py does",
         )
 
     def test_nothing_baked_names_the_agent_images_interpreter(self):

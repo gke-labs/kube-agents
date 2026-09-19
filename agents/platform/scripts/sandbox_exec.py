@@ -16,6 +16,14 @@ the model from a shell that is already in the sandbox. One call site serves both
 because `sandbox_enabled()` is false in the sandbox — the managed config it reads
 is an agent-pod file — and `run()` then executes locally.
 
+A caller with more than one command to run crosses once, with the whole job,
+rather than once per command: `resolver.py` and `github_token_refresh.py` both
+forward *themselves* through `run()` and do their work on the far side. An ssh
+hop costs the same whatever it carries, and a caller that makes a dozen of them
+under a timeout is spending the budget on the connection rather than on the
+work. Re-entry is not a loop for the same reason one call site serves both
+sides: `sandbox_enabled()` is false over there.
+
 Two things about this module are load-bearing and easy to undo by accident.
 
 It connects as `hermes`, not as `terminal.ssh_user`. That setting is the login

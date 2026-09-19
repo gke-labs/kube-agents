@@ -39,6 +39,9 @@ from .errors import Override, forge_error
 
 # What a CLI prints when the call reached the forge and the forge said no.
 _HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
+# The `<cli> auth status` convention: a line `Logged in to <host> account <login>`,
+# which some CLI versions print on stdout and others on stderr; both are read.
+_CLI_LOGIN_RE = re.compile(r"Logged in to \S+ account (\S+)")
 
 
 class Transport(Protocol):
@@ -53,6 +56,18 @@ class Transport(Protocol):
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
     ) -> Any: ...
+
+    def whoami(self) -> str:
+        """The login the credential authenticates as, or "" when it cannot say.
+
+        On the transport rather than the forge because it is a property of how
+        the call is authenticated, not of the API: a CLI reads it out of its
+        credential store, an HTTP client asks the API's own "current user"
+        route. An installation-style token cannot always introspect itself
+        over HTTP -- the current-user route answers 401 for one -- which is
+        why this is not a verb the forge composes.
+        """
+        ...
 
 
 def _with_query(path: str, params: Mapping[str, Any] | None) -> str:
@@ -121,6 +136,11 @@ class CliTransport:
                 status=502,
                 code="FORGE_CALL_FAILED",
             ) from exc
+
+    def whoami(self) -> str:
+        done = self._runner([self._executable, "auth", "status"], stdin=None)
+        found = _CLI_LOGIN_RE.search(f"{done.stdout or ''}\n{done.stderr or ''}")
+        return found.group(1).strip() if found else ""
 
     def _failure(self, stderr: str, stdout: str = "") -> WorkspaceError:
         """The forge's refusal, with the reason it actually gave as the detail.

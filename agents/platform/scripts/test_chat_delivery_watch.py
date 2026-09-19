@@ -26,7 +26,6 @@ import importlib
 import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -38,7 +37,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 cdw = importlib.import_module("chat_delivery_watch")
-sandbox_exec = importlib.import_module("sandbox_exec")
+forge = importlib.import_module("forge")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ROSTER = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
@@ -86,37 +85,46 @@ def job(job_id: str, run_at: str | None, error: str | None = None) -> dict:
     }
 
 
-class FakeGh:
-    """Records every gh call; answers `issue list` and `issue create` plausibly."""
+class FakeForge:
+    """Stands in for `forge.call`: records every verb, answers a few of them.
+
+    The seam is the verb and not the `gh` argv the verb used to compile into,
+    which is the whole point of the migration -- what this job asks for is
+    "list the open issues carrying this label", and how a particular forge
+    spells that is not something these tests should have an opinion about.
+    """
 
     def __init__(self, open_issues: list[dict] | None = None, fail: set[str] | None = None):
-        self.calls: list[list[str]] = []
-        self.stdins: list[str | None] = []
+        #: One `(verb, payload, repo)` per call, in order.
+        self.calls: list[tuple[str, dict, str]] = []
         self.open_issues = open_issues or []
+        #: Verb names to refuse, as the broker would.
         self.fail = fail or set()
         self.next_number = 41
 
-    def __call__(self, argv, repo=None, *, stdin=None):
-        self.calls.append(list(argv))
-        self.stdins.append(stdin)
-        verb = " ".join(argv[:2])
-        if verb in self.fail:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr=f"boom: {verb}")
-        if verb == "issue list":
-            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(self.open_issues), stderr="")
-        if verb == "issue create":
+    def __call__(self, name: str, payload: dict, repo: str) -> dict:
+        self.calls.append((name, dict(payload), repo))
+        if name in self.fail:
+            raise forge.ForgeError("FORGE_CALL_FAILED", f"boom: {name}")
+        if name == "issue-list":
+            issues = list(self.open_issues)
+            return {"issues": issues, "count": len(issues), "truncated": False}
+        if name == "issue-create":
             self.next_number += 1
             # A created issue is open until closed, as the real one would be.
-            self.open_issues.append({"number": self.next_number, "body": stdin or ""})
-            return subprocess.CompletedProcess(
-                argv, 0, stdout=f"https://github.com/{repo}/issues/{self.next_number}\n", stderr=""
-            )
-        if verb == "issue close":
-            self.open_issues = [i for i in self.open_issues if str(i["number"]) != argv[2]]
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            self.open_issues.append({"number": self.next_number, "body": payload.get("body") or ""})
+            return {"issue": {"number": self.next_number}}
+        if name == "issue-close":
+            self.open_issues = [
+                i for i in self.open_issues if int(i["number"]) != int(payload["number"])
+            ]
+        return {}
 
     def verbs(self) -> list[str]:
-        return [" ".join(c[:2]) for c in self.calls]
+        return [name for name, _, _ in self.calls]
+
+    def bodies(self) -> list[str]:
+        return [payload.get("body", "") for _, payload, _ in self.calls]
 
 
 class WatchCase(unittest.TestCase):
@@ -126,13 +134,12 @@ class WatchCase(unittest.TestCase):
         self.home = Path(self._tmp.name)
         self.store = self.home / "profiles" / "platform" / "cron" / "jobs.json"
         self.state = self.home / "state.json"
-        self.gh = FakeGh()
-        for target, value in (
-            ("run_gh", self.gh),
-            ("get_managed_github_repos", lambda: [LEDGER_REPO]),
-            ("agent_home", lambda: str(self.home)),
+        self.forge = FakeForge()
+        for owner, target, value in (
+            (cdw.forge, "call", self.forge),
+            (cdw.gitops_workspace, "get_managed_github_repos", lambda: [LEDGER_REPO]),
+            (cdw.gitops_workspace, "agent_home", lambda: str(self.home)),
         ):
-            owner = cdw.forge if target == "run_gh" else cdw.gitops_workspace
             patcher = mock.patch.object(owner, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -312,14 +319,14 @@ class TickTest(WatchCase):
         self.assertEqual((rc, out), (0, ""))
         self.assertTrue(self.state_data()["last_tick_ok"])
         self.assertIsNotNone(self.state_data()["last_tick_at"])
-        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.forge.calls, [])
 
     def test_streak_below_threshold_is_silent_and_persisted(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR))
         rc, out = self.run_tick()
         self.assertEqual((rc, out), (0, ""))
         self.assertEqual(self.state_data()["jobs"]["platform/a"]["streak"], 1)
-        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.forge.calls, [])
 
     def test_crossing_the_threshold_opens_one_issue_and_writes_the_log(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR), job("b", RUN_1, PARTIAL_ERROR))
@@ -327,8 +334,8 @@ class TickTest(WatchCase):
         self.write_store(job("a", RUN_2, HARD_ERROR), job("b", RUN_2, PARTIAL_ERROR))
         rc, out = self.run_tick()
         self.assertEqual(rc, 0)
-        self.assertEqual(self.gh.verbs(), ["issue list", "label create", "issue create"])
-        created = self.gh.stdins[-1]
+        self.assertEqual(self.forge.verbs(), ["issue-list", "label-ensure", "issue-create"])
+        created = self.forge.calls[-1][1]["body"]
         self.assertIn(cdw.BODY_MARKER, created)
         self.assertIn("`a`", created)
         self.assertIn("`b`", created)
@@ -347,10 +354,10 @@ class TickTest(WatchCase):
         self.write_store(job("a", RUN_2, HARD_ERROR))
         self.run_tick()
         before = self.state.read_bytes()
-        calls = len(self.gh.calls)
+        calls = len(self.forge.calls)
         self.run_tick()
         # One read, to notice an issue a person closed by hand; no write.
-        self.assertEqual(self.gh.verbs()[calls:], ["issue list"])
+        self.assertEqual(self.forge.verbs()[calls:], ["issue-list"])
         after = self.state_data()
         self.assertEqual(after["jobs"], json.loads(before)["jobs"])
         self.assertEqual(after["jobs"]["platform/a"]["streak"], 2)
@@ -362,8 +369,8 @@ class TickTest(WatchCase):
         self.run_tick()
         self.write_store(job("a", RUN_3, HARD_ERROR))
         self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue edit")
-        self.assertEqual(self.gh.calls[-1][2], "42")
+        self.assertEqual(self.forge.verbs()[-1], "issue-update")
+        self.assertEqual(self.forge.calls[-1][1]["number"], 42)
 
     def test_recovery_closes_once_with_a_comment(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR))
@@ -372,17 +379,21 @@ class TickTest(WatchCase):
         self.run_tick()
         self.write_store(job("a", RUN_3))
         rc, out = self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue close")
-        self.assertIn("--comment", self.gh.calls[-1])
+        # `gh issue close --comment` was one call; the verbs are two, closed
+        # first. The order is asserted because the failure modes differ: a
+        # missing note on a closed issue is untidy, a note on an issue that
+        # stayed open reads as a live outage and is re-posted every tick.
+        self.assertEqual(self.forge.verbs()[-2:], ["issue-close", "issue-comment"])
+        self.assertIn("reached chat again", self.forge.calls[-1][1]["body"])
         self.assertIn("recovered=true", out)
         self.assertIn(f"ledger={cdw.LEDGER_CLOSED}", out)
         self.assertEqual(self.state_data()["ledger"]["issue_number"], None)
-        calls = len(self.gh.calls)
+        calls = len(self.forge.calls)
         rc, out = self.run_tick()
-        self.assertEqual((rc, out, len(self.gh.calls)), (0, "", calls))
+        self.assertEqual((rc, out, len(self.forge.calls)), (0, "", calls))
 
     def test_an_existing_open_ledger_issue_is_reused_highest_number_wins(self) -> None:
-        self.gh.open_issues = [
+        self.forge.open_issues = [
             {"number": 7, "body": f"{cdw.BODY_MARKER}\nold"},
             {"number": 9, "body": "unrelated issue with the label"},
             {"number": 8, "body": f"{cdw.BODY_MARKER}\nolder"},
@@ -391,22 +402,23 @@ class TickTest(WatchCase):
         self.run_tick()
         self.write_store(job("a", RUN_2, HARD_ERROR))
         self.run_tick()
-        self.assertNotIn("issue create", self.gh.verbs())
-        self.assertEqual(self.gh.calls[-1][:3], ["issue", "edit", "8"])
+        self.assertNotIn("issue-create", self.forge.verbs())
+        self.assertEqual(self.forge.calls[-1][0], "issue-update")
+        self.assertEqual(self.forge.calls[-1][1]["number"], 8)
 
     def test_an_issue_closed_by_hand_is_replaced_not_edited(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR))
         self.run_tick()
         self.write_store(job("a", RUN_2, HARD_ERROR))
         self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue create")
+        self.assertEqual(self.forge.verbs()[-1], "issue-create")
         # Someone closes #42 by hand. A changed picture must open a new issue
         # rather than edit the closed one.
-        self.gh.open_issues = []
+        self.forge.open_issues = []
         self.write_store(job("a", RUN_3, HARD_ERROR))
         self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue create")
-        self.assertNotIn("issue edit", self.gh.verbs())
+        self.assertEqual(self.forge.verbs()[-1], "issue-create")
+        self.assertNotIn("issue-update", self.forge.verbs())
         self.assertEqual(self.state_data()["ledger"]["issue_number"], 43)
 
     def test_a_ledger_repository_change_closes_the_old_issue(self) -> None:
@@ -417,20 +429,20 @@ class TickTest(WatchCase):
         os.environ[cdw.LEDGER_REPO_ENV] = "other/ledger"
         self.write_store(job("a", RUN_3, HARD_ERROR))
         rc, out = self.run_tick()
-        closes = [c for c in self.gh.calls if c[:2] == ["issue", "close"]]
+        closes = [c for c in self.forge.calls if c[0] == "issue-close"]
         self.assertEqual(len(closes), 1)
-        self.assertIn(LEDGER_REPO, closes[0])
+        self.assertEqual(closes[0][2], LEDGER_REPO)
         self.assertEqual(self.state_data()["ledger"]["repo"], "other/ledger")
         self.assertIn("ledger=other/ledger#", out)
 
     def test_a_failed_lookup_never_creates_a_duplicate(self) -> None:
-        self.gh.fail = {"issue list"}
+        self.forge.fail = {"issue-list"}
         self.write_store(job("a", RUN_1, HARD_ERROR))
         self.run_tick()
         self.write_store(job("a", RUN_2, HARD_ERROR))
         rc, out = self.run_tick()
         self.assertEqual(rc, 0)
-        self.assertNotIn("issue create", self.gh.verbs())
+        self.assertNotIn("issue-create", self.forge.verbs())
         self.assertIn("self=error kind=LedgerError", out)
         self.assertIn("ledger=error:LedgerError", out)
 
@@ -456,7 +468,7 @@ class TickTest(WatchCase):
             self.write_store(job("a", RUN_2, HARD_ERROR))
             rc, out = self.run_tick()
         self.assertEqual(rc, 0)
-        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.forge.calls, [])
         self.assertIn(f"ledger={cdw.LEDGER_NONE}", out)
         self.assertEqual(len(self.log_lines()), 1)
 
@@ -480,12 +492,12 @@ class TickTest(WatchCase):
         self.run_tick()
         self.write_store(job("a", RUN_2, HARD_ERROR), job("b", RUN_2, HARD_ERROR))
         self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue create")
+        self.assertEqual(self.forge.verbs()[-1], "issue-create")
         disabled = dict(job("a", RUN_2, HARD_ERROR), enabled=False)
         paused = dict(job("b", RUN_2, HARD_ERROR), state="paused")
         self.write_store(disabled, paused)
         rc, out = self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue close")
+        self.assertEqual(self.forge.verbs()[-2:], ["issue-close", "issue-comment"])
         self.assertNotIn("platform/a", self.state_data()["jobs"])
 
     def test_several_managed_repositories_without_an_override_is_log_only(self) -> None:
@@ -494,7 +506,7 @@ class TickTest(WatchCase):
             self.run_tick()
             self.write_store(job("a", RUN_2, HARD_ERROR))
             rc, out = self.run_tick()
-        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.forge.calls, [])
         self.assertIn("self=error kind=LedgerRepoAmbiguous", out)
         self.assertIn("ledger=error:LedgerRepoAmbiguous", out)
         self.assertIn(cdw.LEDGER_REPO_ENV, out)
@@ -506,7 +518,7 @@ class TickTest(WatchCase):
         self.write_store(job("a", RUN_2, HARD_ERROR))
         rc, out = self.run_tick()
         self.assertIn("ledger=other/ledger#42", out)
-        self.assertIn("other/ledger", self.gh.calls[-1])
+        self.assertEqual(self.forge.calls[-1][2], "other/ledger")
 
     def test_dry_run_writes_nothing(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR))
@@ -516,7 +528,7 @@ class TickTest(WatchCase):
         rc, out = self.run_tick("--dry-run")
         self.assertIn(f"ledger={cdw.LEDGER_DRY_RUN}", out)
         self.assertEqual(self.state.read_bytes(), before)
-        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.forge.calls, [])
         # A hand check must not fire the log-based alert channel.
         self.assertEqual(self.log_lines(), [])
 
@@ -559,8 +571,8 @@ class TickTest(WatchCase):
         self.state.write_text(json.dumps(state), encoding="utf-8")
         self.write_store(job("a", RUN_3))
         rc, out = self.run_tick()
-        self.assertEqual(self.gh.verbs()[-2:], ["issue list", "issue close"])
-        self.assertIn("42", self.gh.calls[-1])
+        self.assertEqual(self.forge.verbs()[-3:], ["issue-list", "issue-close", "issue-comment"])
+        self.assertEqual(self.forge.calls[-1][1]["number"], 42)
 
     def test_dry_run_writes_nothing_even_when_the_tick_raises(self) -> None:
         self.write_store(job("a", RUN_1))
@@ -575,12 +587,12 @@ class TickTest(WatchCase):
         self.run_tick()
         self.write_store(job("a", RUN_2, HARD_ERROR))
         self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue create")
+        self.assertEqual(self.forge.verbs()[-1], "issue-create")
         with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", lambda: ["a/one", "z/two"]):
             self.write_store(job("a", RUN_3))
             rc, out = self.run_tick()
-        self.assertEqual(self.gh.verbs()[-1], "issue close")
-        self.assertIn(LEDGER_REPO, self.gh.calls[-1])
+        self.assertEqual(self.forge.verbs()[-2:], ["issue-close", "issue-comment"])
+        self.assertEqual(self.forge.calls[-1][2], LEDGER_REPO)
         self.assertIsNone(self.state_data()["ledger"]["issue_number"])
 
     def test_the_tick_survives_a_corrupt_state_file_and_an_unreadable_store(self) -> None:
@@ -599,25 +611,40 @@ class TickTest(WatchCase):
         self.assertEqual(self.state_data()["jobs"]["platform/a"]["streak"], 1)
 
     def test_a_sandbox_outage_degrades_to_the_log_line(self) -> None:
-        def unavailable(argv, repo=None, *, stdin=None):
-            raise sandbox_exec.SandboxUnavailable("ssh: connect refused")
+        """The ledger channel can be down; the log channel is what must not be.
 
-        with mock.patch.object(cdw.forge, "run_gh", unavailable):
+        `forge.call` reaches the broker by forwarding into the shell sandbox,
+        so an unreachable sandbox is an ordinary refusal with a reason code
+        rather than a crash -- and the reason code has to reach the log line,
+        because that line is the only thing anyone will ever see about a
+        ledger that stopped being written.
+        """
+
+        def unreachable(name, payload, repo):
+            raise forge.ForgeError(forge.REASON_SANDBOX_UNREACHABLE, "ssh: connect refused")
+
+        with mock.patch.object(cdw.forge, "call", unreachable):
             self.write_store(job("a", RUN_1, HARD_ERROR))
             self.run_tick()
             self.write_store(job("a", RUN_2, HARD_ERROR))
             rc, out = self.run_tick()
         self.assertEqual(rc, 0)
-        self.assertIn("self=error kind=SandboxUnavailable", out)
-        self.assertIn("ledger=error:SandboxUnavailable", out)
+        self.assertIn("self=error kind=LedgerError", out)
+        self.assertIn(forge.REASON_SANDBOX_UNREACHABLE, out)
+        self.assertIn("ledger=error:LedgerError", out)
+        self.assertIn("job=a profile=platform grade=hard streak=2", out)
         self.assertTrue(self.state_data()["last_tick_ok"])
 
-    def test_an_unexpected_github_failure_still_emits_the_alert_lines(self) -> None:
-        # Seen live: an older image's forge.run_gh has no `stdin` argument and raises TypeError.
-        def old_run_gh(argv, repo=None):
-            raise TypeError("run_gh() got an unexpected keyword argument 'stdin'")
+    def test_an_unexpected_forge_failure_still_emits_the_alert_lines(self) -> None:
+        # Seen live in the `gh` era as image skew: the agent pod called
+        # `forge` with an argument the image's copy of it did not take. The
+        # shape survives the migration -- the agent pod and the sandbox carry
+        # their own copies of forge.py and can be two different builds -- and
+        # a TypeError is not a refusal, so nothing below `tick` catches it.
+        def older_signature(name, payload):
+            raise AssertionError("unreachable: the call above raises first")
 
-        with mock.patch.object(cdw.forge, "run_gh", old_run_gh):
+        with mock.patch.object(cdw.forge, "call", older_signature):
             self.write_store(job("a", RUN_1, HARD_ERROR))
             self.run_tick()
             self.write_store(job("a", RUN_2, HARD_ERROR))

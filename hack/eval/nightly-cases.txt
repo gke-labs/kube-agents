@@ -44,15 +44,17 @@
 # ~63min at its 1250s hint) and the nine this decision moved here, of which
 # eight are deployer: noop and probe-shaped (~200s a repetition, ~10min each
 # at three) and fleet-cost-idle-pool is a full cost audit priced with the
-# 900s audit band (~45min). 2026-09-16 added incident-triage-oom-event-probe
-# (#1023, ~45min at its measured 737s/599s/1357s). Thirty-nine cases,
-# ~775-795min serial. The
+# 900s audit band (~45min). 2026-09-16 added three: incident-triage-oom-event-probe
+# (#1023, ~45min at its measured 737s/599s/1357s) and the consumer
+# migration's two (#1246 PR-2), measured on a live install rather than
+# priced: the resolver 1424s and the read-back 546-654s a repetition, ~100min
+# at three. Forty-one cases, ~875-895min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
 # whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~675-690min, over the deadline; 480m holds only if the nightly,
-# alone on the model quota at that hour and two lanes wider, realises ~1.65x
+# would be ~760-780min, over the deadline; 480m holds only if the nightly,
+# alone on the model quota at that hour and two lanes wider, realises ~1.85x
 # or better, which is priced, not measured. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
@@ -211,3 +213,17 @@
 # than a cluster-agent one because AGENT_SERVICE_NAME is a single global
 # target (A2), which shapes what the case asserts rather than blocking it.
 ./tasks/cluster-agent-crashloop-fix-request/task.yaml
+
+# The consumer migration's two cases (#1246 PR-2). Both write to the eval
+# GitOps repository -- an issue apiece for the first, a pull request apiece
+# for the second -- on the same terms rca-remediation-pr already holds a
+# presubmit seat under: a throwaway repository we own and a token scoped to
+# it. Here rather than the presubmit on cost: each drives a full skill
+# procedure (poll, claim, investigate, transition; prepare, two submits, a
+# read-back) rather than a probe. Measured on `dev-vcs2-20260915a`: the
+# resolver 1424s, the read-back 546-654s. Only the read-back is red on main;
+# the resolver passes there too and is kept as a regression guard over the
+# largest consumer this migration rewrites -- each task.yaml header says
+# which it is and shows its run ids.
+./tasks/vcs-issue-resolver-triage/task.yaml
+./tasks/vcs-review-feedback-read-back/task.yaml

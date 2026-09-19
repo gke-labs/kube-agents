@@ -130,13 +130,15 @@ Sort each request into one of two shapes:
 No commit.
 
 **A change request.** Follow **`submit-suggestion` Step 5** — `prepare --branch
-<head_ref>`, edit, `submit`. Its `--force-with-lease` and protected-branch
-guards apply unchanged, and the change goes on the pull request's own branch.
+<head_ref>`, edit, `submit`. The change goes on the pull request's own branch,
+and `submit` extends it: publishing is fast-forward only, so a branch somebody
+else has pushed to since you read it is refused by name rather than
+overwritten. The protected-branch guard applies unchanged.
 Never open a second pull request for a change to an existing one.
 
 **Stop after that skill's `submit`.** Its Step 5 ends by telling you to reply
-with `gh pr comment` — do not, here. That reply carries no marker, so it does
-not close the request: the sweep hands it back in ten minutes and the reviewer
+in the proposal's own thread — do not, here. That reply carries no marker, so
+it does not close the request: the sweep hands it back in ten minutes and the reviewer
 gets the same answer twice, then three times. Step 4 below is how this skill
 replies, and it is the only way that also records the request as handled.
 
@@ -151,12 +153,14 @@ the edit can miss the file it was aimed at. So after `submit`, read the branch
 back and confirm the change is on it:
 
 ```bash
-cd /opt/data/scratch && gh api "repos/<owner>/<repo>/pulls/<N>/commits" \
-  --jq '.[-1] | "\(.sha) \(.commit.message | split("\n")[0])"'
+python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py \
+  proposal commits <N> --repo <owner>/<repo>
 ```
 
-Then check the value you were asked to change actually reads that way now, on
-that branch — the file, not your memory of having edited it.
+`commits` is oldest first, so the revision you just pushed is the **last**
+entry: read its `sha` and the first line of its `message`. Then check the value
+you were asked to change actually reads that way now, on that branch — the
+file, not your memory of having edited it.
 
 > [!CAUTION] **Never describe a change you have not read back.** A reply is
 > stamped `agent-answered`, which closes the request for good: no later sweep
@@ -199,7 +203,7 @@ would close that request for good, and nobody would be told.
 
 ```bash
 "$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py reply \
-  --repo <owner/repo> --pr <N> --comment-id <node-id> --body-file /opt/data/scratch/pr_<N>_reply.md \
+  --repo <owner/repo> --pr <N> --comment-id <ref from the poll> --body-file /opt/data/scratch/pr_<N>_reply.md \
   --verify-commit <sha from Step 2b>     # or: --no-change
 ```
 

@@ -48,27 +48,52 @@ helper = _load_helper()
 
 SELF = "kube-agents-bot"
 REPO = "acme/toolkit"
+#: A second managed repository, deliberately on another host. Identity is a
+#: property of a forge, so a two-repository test on one forge would not notice a
+#: sweep that asked once and reused the answer.
+OTHER_REPO = "gitlab.example/acme/toolkit"
+OTHER_SELF = "other-agent-bot"
 HEAD_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 
 
 class FakeProvider:
-    supports_acknowledge = True
-
     def __init__(
-        self, prs=None, comments=None, post_error=None, viewer=SELF, commits=None
+        self,
+        prs=None,
+        comments=None,
+        post_error=None,
+        viewer=SELF,
+        commits=None,
+        acknowledges=True,
     ):
         self.prs = prs or []
         self.comments = comments or {}
         self.post_error = post_error
+        #: A login, or a dict keyed by repository for an install serving two
+        #: forges -- which authenticates as two accounts, one per forge.
         self._viewer = viewer
         self.commits = COMMITS if commits is None else commits
         self.posted = []
+        self.acknowledges = acknowledges
+        self.viewer_lookups = []
+        #: What the real provider records when a listing fills its page. Nothing
+        #: in this skill reads it -- `github_scan_gate` is the only caller of
+        #: `truncations()`, and `test_github_scan_gate.py` is where the operator
+        #: warning is pinned. It is here because the fake stands in for the whole
+        #: Protocol, not because a test in this file sets it.
+        self.truncated = []
 
-    def preflight(self):
-        pass
+    def truncations(self):
+        return list(self.truncated)
 
-    def viewer_login(self):
+    def viewer_login(self, repo):
+        self.viewer_lookups.append(repo)
+        if isinstance(self._viewer, dict):
+            return self._viewer.get(repo, "")
         return self._viewer
+
+    def supports_acknowledge(self, repo):
+        return self.acknowledges
 
     def list_open_prs(self, repo):
         return list(self.prs)
@@ -117,7 +142,7 @@ def make_pr(
 
 
 def make_comment(
-    node_id,
+    ref,
     body,
     author="reviewer",
     can_write=True,
@@ -126,9 +151,14 @@ def make_comment(
     path="",
     line=None,
     can_write_known=True,
+    is_bot=False,
 ):
+    # `is_bot` is passed, not derived from `author`, because that is how it
+    # arrives: the forge says whether the author is an automation and the login
+    # is normalised on the way through, so `[bot]` in the string here is only
+    # what a caller would *see*, never what it decides on.
     return forge.Comment(
-        node_id=node_id,
+        ref=ref,
         numeric_id=1,
         author=author,
         body=body,
@@ -138,6 +168,7 @@ def make_comment(
         path=path,
         line=line,
         can_write_known=can_write_known,
+        is_bot=is_bot,
     )
 
 
@@ -161,10 +192,15 @@ class _Harness(unittest.TestCase):
     def run_helper(self, argv, provider, repo=REPO, repo_error=None, provider_error=None):
         if argv and argv[0] in ("reply", "refuse") and "--repo" not in argv:
             argv = [argv[0], "--repo", repo or REPO] + list(argv[1:])
+        # `repo` is one name, a list of them, or None for an install with none.
+        if isinstance(repo, (list, tuple)):
+            managed = list(repo)
+        else:
+            managed = [repo] if repo else []
         managed_mock = (
             mock.Mock(side_effect=repo_error)
             if repo_error
-            else mock.Mock(return_value=[repo] if repo else [])
+            else mock.Mock(return_value=managed)
         )
         # `provider_error` is the only way to reach the raising branch of
         # `provider_for`. Every other test patches it to hand back a provider,
@@ -194,6 +230,44 @@ class PollTest(_Harness):
         )
         _rc, out = self.run_helper(["poll"], provider)
         self.assertEqual(json.loads(out)["status"], "NO_REQUESTS")
+
+    def test_identity_is_asked_of_every_repository(self):
+        """Two forges are two accounts, and only one of them opened this proposal.
+
+        Asking once and reusing the answer is the single-forge assumption in
+        miniature: on the second forge every proposal fails
+        `is_agent_pull_request` against a login from the first, and the poll
+        goes quiet there without saying why.
+        """
+        provider = FakeProvider(viewer={REPO: SELF, OTHER_REPO: OTHER_SELF})
+        self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(set(provider.viewer_lookups), {REPO, OTHER_REPO})
+
+    def test_one_nameless_credential_does_not_silence_the_other_repository(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer={REPO: SELF, OTHER_REPO: ""},
+        )
+        _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        # `FakeProvider` answers the same proposal for either repository, and
+        # only the readable one's contributed a request.
+        self.assertEqual(len(payload["requests"]), 1)
+
+    def test_no_credential_anywhere_names_itself_is_an_error_not_a_quiet_poll(self):
+        """The model must not read "the credential is broken" as "nothing to do"."""
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer="",
+        )
+        _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "VIEWER_UNKNOWN")
+        self.assertIn(OTHER_REPO, payload["value"])
 
     def test_a_trigger_is_reported_with_its_context(self):
         provider = FakeProvider(
@@ -306,9 +380,12 @@ class PollTest(_Harness):
     def test_a_forge_with_no_provider_reports_its_reason_code(self):
         """`provider_for` raising has to land in the payload, not a traceback.
 
-        It could not raise before — an unknown host fell back to
-        `GitHubProvider` — so the call sat above the guard. Selecting the
-        provider is inside it now, and this is what holds it there.
+        It could not raise at all once — an unknown host fell back to the one
+        provider there was — so the call sat above the guard. Selecting the
+        provider is inside it now, and this is what holds it there. Both codes
+        are pinned because they come from different sides of the boundary: an
+        unreadable repository value is refused here, and a host no forge module
+        serves is the broker's refusal arriving through `forge.call`.
         """
         for error in (
             forge.UnknownForgeHost("gitlab.com"),
@@ -669,7 +746,7 @@ class ReplyTest(_Harness):
         self._reply(provider)
         _number, posted = provider.posted[0]
         self.assertEqual(
-            pr_triggers.handled_node_ids(
+            pr_triggers.handled_refs(
                 [make_comment("IC_9", posted, author=f"{SELF}[bot]")], SELF
             ),
             {"IC_1"},
@@ -748,7 +825,7 @@ class ReplyTest(_Harness):
         SKILL.md prints the syntax in order to forbid it and `poll` carries
         every node id, so a body that imitates one is one edit away. Posted
         unchanged it would be a *self-authored* marker naming another request,
-        which `handled_node_ids` reads as that request having been handled —
+        which `handled_refs` reads as that request having been handled —
         closing it at both readers, for good, with nothing said in the thread.
         """
         provider = answerable()
@@ -759,7 +836,7 @@ class ReplyTest(_Harness):
         _number, posted = provider.posted[0]
         self.assertIn("Done.", posted)
         self.assertEqual(
-            pr_triggers.handled_node_ids(
+            pr_triggers.handled_refs(
                 [make_comment("IC_9", posted, author=f"{SELF}[bot]")], SELF
             ),
             {"IC_1"},
@@ -844,7 +921,7 @@ class CommentIdValidationTest(_Harness):
     """`--comment-id` is checked against the forge, not trusted.
 
     A wrong id posts a real, visible answer stamped with a marker that closes
-    nothing: `handled_node_ids` keeps returning the request, so the sweep files
+    nothing: `handled_refs` keeps returning the request, so the sweep files
     the card again on the next tick and the agent answers the same comment
     every ten minutes. Failing before the post is the only place that loop can
     be cut, because after it the comment is already public.
@@ -905,7 +982,7 @@ class CommentIdValidationTest(_Harness):
         """
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]")]},
+            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]", is_bot=True)]},
         )
         with self.assertRaises(SystemExit):
             self._post(provider, "IC_1")
@@ -914,7 +991,7 @@ class CommentIdValidationTest(_Harness):
     def test_an_allowlisted_bot_is_answerable(self):
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]")]},
+            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]", is_bot=True)]},
         )
         with mock.patch.dict(
             "os.environ", {pr_triggers.BOT_ALLOWLIST_ENV: "ci-bot"}, clear=False
