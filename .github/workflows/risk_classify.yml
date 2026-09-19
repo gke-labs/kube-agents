@@ -61,9 +61,11 @@ jobs:
     steps:
       # The default branch, never the pull request head: this job holds a
       # writable token and must not run code from a fork. The `ref:` is
-      # explicit because on `pull_request_target` the fallback is the pull
-      # request's *base* branch -- an unreviewed ref that anyone with push
-      # access could point a PR at to serve this job their own classifier.
+      # explicit because a fallback is not reviewable: `GITHUB_REF` on
+      # `pull_request_target` resolves to the default branch -- it was the
+      # pull request's *base* branch, an unreviewed ref anyone with push
+      # access could point a PR at, until GitHub changed it on 2025-12-08 --
+      # and a ref nobody wrote down is a ref nobody checks against the list.
       - name: Checkout the default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

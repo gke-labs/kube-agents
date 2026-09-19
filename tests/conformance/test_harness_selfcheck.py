@@ -118,6 +118,69 @@ class TheSourcesAreReal(unittest.TestCase):
                 self.assertIn("StatefulSet", kinds)
 
 
+class TheSuitesOwnProseSurvivesThePythonParser(unittest.TestCase):
+    """A docstring is an argument, and an argument has to arrive intact.
+
+    This suite argues in prose: several of its docstrings are longer than the
+    assertion they precede, deliberately, because the reason a rule exists is
+    the part a reviewer needs. Prose about regular expressions contains
+    backslashes, and a non-raw Python string eats them. `"`\\bpull\\b`"` in a
+    docstring is not the word `pull` between two word boundaries -- it is two
+    backspace characters, and nothing says so: the file reads correctly, the
+    tests pass, and `help()`, an editor's tooltip and any doc tooling render
+    something else. That happened here, in the one docstring in this suite
+    that quotes a pattern.
+
+    Cheap to prevent, and only detectable by reading the *parsed* string
+    rather than the source -- which is the same failure mode the suite's
+    source-reading assertions are careful about elsewhere. Any control
+    character counts, not just the backspace: a stray form feed or escape
+    sequence in a docstring is never intended either.
+    """
+
+    #: Docstrings are read from the AST rather than by importing, so this
+    #: covers `hack/conformance-mutations.py` too -- a script with a hyphen in
+    #: its name, in a directory that is not a package, which no import
+    #: statement reaches.
+    _MODULES = sorted(
+        list(Path(__file__).parent.glob("*.py"))
+        + list((Path(__file__).parent / "bucket2").glob("*.py"))
+        + [Path(__file__).resolve().parents[2] / "hack" / "conformance-mutations.py"]
+    )
+
+    def test_no_docstring_in_the_suite_contains_a_control_character(self) -> None:
+        import ast
+
+        self.assertGreater(len(self._MODULES), 5, "the module glob found nothing")
+        for path in self._MODULES:
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(
+                    node,
+                    (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                ):
+                    continue
+                docstring = ast.get_docstring(node, clean=False)
+                if not docstring:
+                    continue
+                offenders = sorted(
+                    {
+                        character
+                        for character in docstring
+                        if ord(character) < 32 and character not in "\n\t"
+                    }
+                )
+                with self.subTest(module=path.name, node=getattr(node, "name", "<module>")):
+                    self.assertEqual(
+                        [],
+                        offenders,
+                        f"{path.name}: a docstring contains "
+                        f"{[hex(ord(c)) for c in offenders]} -- an escape the "
+                        "Python parser consumed. Double the backslashes, or "
+                        "make it a raw string",
+                    )
+
+
 class TheExpectedFailuresAreDeclared(unittest.TestCase):
     """An expected failure is a finding, so it carries a finding's metadata."""
 
