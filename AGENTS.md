@@ -34,9 +34,9 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in eleven places here, with different runners and different answers to "does this catch a
-regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
-did not expect, or nowhere at all, and the suite reports green around it.
+Tests live in eleven places, with different runners and different answers to "does this catch a
+regression before merge". Choosing wrong rarely fails loudly: the test runs somewhere you did not
+expect, or nowhere at all, and the suite reports green around it.
 
 **Decide by asking whether a model call is in the loop.**
 
@@ -45,8 +45,9 @@ did not expect, or nowhere at all, and the suite reports green around it.
   `tests/integration/` when it spans two components — but in `bench/tests/` when one of those
   components is the bench harness, which `tests/integration/` cannot import.
   See [`tests/integration/README.md`](tests/integration/README.md).
-  One carve-out: **security and permissions invariants** go in `tests/conformance/`, whose own
-  README is the contract.
+  Two carve-outs: **security and permissions invariants** go in `tests/conformance/`, whose own
+  README is the contract; and one needing a live cluster stays in `tests/` but gates itself on an
+  opt-in environment variable, so CI runs it and it skips.
 - **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
   `bench/tasks/<name>/task.yaml`, and it runs in CI, so adding one changes what every pull
   request or nightly reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
@@ -55,9 +56,8 @@ did not expect, or nowhere at all, and the suite reports green around it.
   registered — [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
 - **Yes, and it checks an install you already have** — it is a critical user journey, and it goes in
   `bench/cuj/`. **This tier is manual by design**, not pending automation: it needs a real
-  deployment to point at and CI has none, so no job runs it and adding one changes nothing about
-  what CI reports. It plants nothing, so it grades the deployment rather than the agent.
-  See [`bench/cuj/README.md`](bench/cuj/README.md).
+  deployment and CI has none, so no job runs it. It plants nothing, so it grades the deployment
+  rather than the agent. See [`bench/cuj/README.md`](bench/cuj/README.md).
 - **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
   schedule. Adding to it holds up releases rather than pull requests.
 
@@ -66,8 +66,7 @@ One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TE
 suite reports green around it. Add the glob in the same change — `tests/conformance/` excepted,
 deliberately; its README says why.
 
-The eleven homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
-[`docs/testing-map.md`](docs/testing-map.md).
+The eleven homes and what runs each are in [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
 

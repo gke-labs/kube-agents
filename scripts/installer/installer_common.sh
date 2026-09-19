@@ -11,6 +11,11 @@
 # set from the environment (load it first); none of them prompt.
 # ==============================================================================
 
+if [ -n "${_KUBE_AGENTS_INSTALLER_COMMON_SOURCED:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+_KUBE_AGENTS_INSTALLER_COMMON_SOURCED=1
+
 # ─── Shared Installer Defaults ────────────────────────────────────────────────
 # Every default an install gets for saying nothing lives in install.defaults.env
 # at the repository root, beside install.env. One file, one job: this one has
@@ -93,6 +98,83 @@ readonly HELM_SERVED_REVISION_STATUSES="deployed superseded"
 readonly HELM_FAILED_RELEASE_UNINSTALL_TIMEOUT="5m"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET="platform-agent-shell-authorized-keys"
+
+# ─── Capacity Preflight Sizing Constants ─────────────────────────────────────
+# Baseline schedulable resource minimums required on untainted nodes for
+# non-gVisor workloads (controller-manager, LiteLLM replicas, cert-manager, etc.)
+#
+# Every figure below is a copy of a request declared somewhere else:
+# charts/kube-agents/values.yaml for the chart's components, the operator's Go
+# defaults for the agent pod and its sidecars, and the cert-manager values in
+# terraform/examples/full-install/main.tf. Nothing checks that the copy is still
+# true -- the installer cannot render the chart, since helm is not a
+# prerequisite of install.sh -- so a chart or operator bump has to be mirrored
+# here by hand. The direction that hurts is a raised request left uncopied: the
+# check then under-counts and passes a cluster the rollout will hang on.
+# The prose figures in docs/site/src/content/docs/install/prerequisites.md are
+# the same copy again, and move with these.
+readonly PREFLIGHT_MIN_CPU_MILLIS_OPERATOR=10
+readonly PREFLIGHT_MIN_MEM_MIB_OPERATOR=64
+readonly PREFLIGHT_MIN_CPU_MILLIS_LITELLM_REPLICA=100
+readonly PREFLIGHT_MIN_MEM_MIB_LITELLM_REPLICA=2048
+readonly PREFLIGHT_DEFAULT_LITELLM_REPLICAS=2
+readonly PREFLIGHT_MIN_CPU_MILLIS_CERT_MANAGER=30
+readonly PREFLIGHT_MIN_MEM_MIB_CERT_MANAGER=96
+# The Hermes dashboard is a sidecar container in the agent pod rather than a
+# workload of its own: the operator appends `platform-agent-dashboard` to the
+# agent's container list (k8s-operator/internal/controller/platformagent_manifests.go),
+# and no Deployment renders it. Its requests therefore ride wherever the agent
+# pod lands — the tainted sandbox pool when gVisor is on, an untainted node
+# when it is off.
+readonly PREFLIGHT_MIN_CPU_MILLIS_DASHBOARD=256
+readonly PREFLIGHT_MIN_MEM_MIB_DASHBOARD=512
+# Per replica, as charts/kube-agents/values.yaml declares it under
+# githubMinter. The cluster-wide requirement is the product with the replica
+# count; the single-node fit is one replica, because that is the largest unit
+# the scheduler has to place.
+readonly PREFLIGHT_MIN_CPU_MILLIS_MINTER_REPLICA=50
+readonly PREFLIGHT_MIN_MEM_MIB_MINTER_REPLICA=64
+readonly PREFLIGHT_DEFAULT_MINTER_REPLICAS=2
+readonly PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT=2250
+readonly PREFLIGHT_MIN_MEM_MIB_HINDSIGHT=1280
+readonly PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT_API=2000
+readonly PREFLIGHT_MIN_MEM_MIB_HINDSIGHT_API=1024
+readonly PREFLIGHT_MIN_CPU_MILLIS_AGENT_UNSANDBOXED=1250
+readonly PREFLIGHT_MIN_MEM_MIB_AGENT_UNSANDBOXED=2560
+# Workloads created by the operator for every PlatformAgent: credential-proxy
+# Deployment (100m/256Mi in k8s-operator/internal/controller/credential_proxy_manifests.go)
+# and shell-sandbox StatefulSet (200m/512Mi in shell_sandbox_manifests.go).
+# Neither pod carries a runtimeClassName or gVisor toleration, so both schedule
+# on untainted nodes whether gVisor is enabled or disabled.
+readonly PREFLIGHT_MIN_CPU_MILLIS_CREDENTIAL_PROXY=100
+readonly PREFLIGHT_MIN_MEM_MIB_CREDENTIAL_PROXY=256
+readonly PREFLIGHT_MIN_CPU_MILLIS_SHELL_SANDBOX=200
+readonly PREFLIGHT_MIN_MEM_MIB_SHELL_SANDBOX=512
+
+# A node pool that can still scale up answers a deficit by itself: the
+# autoscaler provisions on Pending pods, which is the state the rollout would
+# otherwise sit in. The preflight therefore reads the pool's autoscaling
+# bounds and counts the nodes it may still add before it calls a shortfall
+# fatal. `cloud.google.com/gke-nodepool` is the label GKE stamps on every node
+# and the only link from a node back to the pool that owns it.
+readonly PREFLIGHT_NODE_POOL_LABEL="cloud.google.com/gke-nodepool"
+readonly PREFLIGHT_DAEMONSET_OWNER_KIND="DaemonSet"
+# The namespace the install puts cert-manager in when it installs it. The
+# evaluator discounts every pod running there for the same reason it discounts
+# the install's own namespace: on a re-run those pods are the requirement being
+# checked, not load competing with it. The discount is the whole namespace
+# rather than cert-manager's own pods, so a tenant sharing it is discounted
+# too -- cert-manager owns this namespace by convention and matching by owner
+# would cost a second API call for a case nothing here creates. When the
+# install does not manage cert-manager, they are a tenant like any other and
+# are counted; that is either SKIP_CERT_MANAGER, or the live probe finding an
+# installation somebody else owns.
+readonly PREFLIGHT_CERT_MANAGER_NAMESPACE="cert-manager"
+# Bounds the two kubectl reads the check makes. A control plane that accepts
+# the connection and then stalls would otherwise hang the install at a check
+# whose whole purpose is to fail fast; 30s is long enough for `get pods -A` on
+# a large cluster and short enough to be an interruption rather than a hang.
+readonly PREFLIGHT_KUBECTL_TIMEOUT="30s"
 
 # The image tag the generator and the dev prompt fall back to when none was
 # given. Not an install default: every front door rejects it through
@@ -381,6 +463,7 @@ load_install_env() {
   # the file is read (and whether or not there is one), so the file's own key
   # is the only way in.
   unset NAMESPACE
+  unset HELM_TIMEOUT
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -1525,9 +1608,33 @@ write_tfvars_from_state() {
   # recovery loop below — adoption is exactly the case where the credentials
   # live only in that cluster's Secret (a fresh clone has no install.env values),
   # and recovery is gated on the kubectl context actually being this cluster.
-  if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
+  # This also ensures kubectl config current-context points to the cluster
+  # before enforce_capacity_preflight checks allocatable capacity (#1297).
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    local prior_ctx=""
+    prior_ctx="$(kubectl config current-context 2>/dev/null || true)"
+    local gke_dns_flag=""
+    if type gke_dns_endpoint_flag >/dev/null 2>&1; then
+      GKE_DNS_ENDPOINT_FLAG=""
+      gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" 2>/dev/null || true
+      gke_dns_flag="$GKE_DNS_ENDPOINT_FLAG"
+    fi
+    # shellcheck disable=SC2086
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
-      --project "${PROJECT_ID}" >/dev/null 2>&1 || true
+      --project "${PROJECT_ID}" $gke_dns_flag >/dev/null 2>&1 || true
+    # get-credentials writes the operator's kubeconfig and makes this cluster
+    # the current context. That outlives the install -- their next kubectl in
+    # any shell talks to this cluster -- so it is said out loud, with the way
+    # back, whenever it actually moved.
+    local new_ctx=""
+    new_ctx="$(kubectl config current-context 2>/dev/null || true)"
+    if [ -n "$new_ctx" ] && [ "$new_ctx" != "$prior_ctx" ]; then
+      if [ -n "$prior_ctx" ]; then
+        print_info "kubectl's current context moved from '${prior_ctx}' to '${new_ctx}' when this cluster's credentials were fetched. Restore it afterwards with: kubectl config use-context ${prior_ctx}"
+      else
+        print_info "kubectl's current context is now '${new_ctx}', set by fetching this cluster's credentials."
+      fi
+    fi
   fi
 
   # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
@@ -1630,6 +1737,8 @@ write_tfvars_from_state() {
       fi
     fi
   fi
+  TFVARS_ENABLE_CERT_MANAGER="$enable_cert_manager"
+  export TFVARS_ENABLE_CERT_MANAGER
 
   # Only a mirrored install sets image_registry; the default prefix means
   # "the public registries", which the composition spells as empty.
@@ -1861,6 +1970,9 @@ write_tfvars_from_state() {
     echo "# Optional AgentPlugins"
     echo "enable_pubsub_platform       = $(hcl_bool "${ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}")"
     echo "enable_stockout_investigator = $(hcl_bool "${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}")"
+    echo ""
+    echo "# Helm rollout timeout (seconds)"
+    echo "helm_timeout                 = ${HELM_TIMEOUT:-$DEFAULT_HELM_TIMEOUT}"
   } > "${dest}.tmp"
   chmod 600 "${dest}.tmp"
   mv -f -- "${dest}.tmp" "$dest"
@@ -1885,4 +1997,615 @@ write_tfvars_from_state() {
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"
   export TF_VAR_session_kv_salt="${SESSION_KV_SALT:-}"
+}
+
+# ─── Cluster Schedulable Capacity Preflight Check ────────────────────────────
+# Preflights whether an adopted GKE Standard cluster has sufficient schedulable
+# CPU and memory on untainted nodes before the apply starts (#1297).
+#
+# Because the installer creates a dedicated gvisor-pool carrying the taint
+# 'sandbox.gke.io/runtime=gvisor:NoSchedule', workloads that do not run under
+# gVisor (LiteLLM, the controller-manager, cert-manager) cannot schedule on
+# that pool. If the existing node pool(s) lack capacity, those pods go Pending
+# and the Helm rollout hangs until its timeout expires with a bare
+# 'context deadline exceeded'.
+#
+# Skipped when:
+#   - SKIP_CAPACITY_CHECK is true (--skip-capacity-check)
+#   - fresh cluster creation (create_cluster is true and cluster does not exist in state)
+#   - cluster_mode is autopilot (Autopilot provisions nodes dynamically)
+#   - kubectl is unavailable or cannot query the live cluster
+check_existing_cluster_capacity_preflight() {
+  local cluster_name="${1:-${CLUSTER_NAME:-}}"
+  local region="${2:-${REGION:-}}"
+  local project_id="${3:-${PROJECT_ID:-}}"
+  local gvisor_enabled="${4:-${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}}"
+  local memory_mode="${5:-${MEMORY:-$DEFAULT_MEMORY}}"
+  local webui_enabled="${6:-${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}}"
+  local gitops_org="${7:-${GITOPS_ORG:-}}"
+  local gitops_repo="${8:-${GITOPS_REPO:-}}"
+  local enable_cert_manager="${9:-${TFVARS_ENABLE_CERT_MANAGER:-true}}"
+  local install_namespace="${10:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+
+  if ! type print_info >/dev/null 2>&1; then
+    print_info() { echo "  ℹ $1"; }
+  fi
+  if ! type print_warning >/dev/null 2>&1; then
+    print_warning() { echo "  ⚠ $1" >&2; }
+  fi
+  if ! type print_success >/dev/null 2>&1; then
+    print_success() { echo "  ✓ $1"; }
+  fi
+  if ! type print_error >/dev/null 2>&1; then
+    print_error() { echo "  ✗ $1" >&2; }
+  fi
+
+  if is_truthy "${SKIP_CAPACITY_CHECK:-false}"; then
+    print_info "Skipping cluster capacity preflight check (SKIP_CAPACITY_CHECK=true)."
+    return 0
+  fi
+
+  # Fresh cluster creation provisions a dedicated pool with ample initial capacity.
+  # On an existing cluster (including one created by a prior run and still managed in state),
+  # the pool size is fixed and must be preflighted before applying.
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "true" ] && [ "${TFVARS_CLUSTER_EXISTS:-false}" != "true" ]; then
+    print_info "Skipping cluster capacity preflight check (create_cluster is true)."
+    return 0
+  fi
+  if [ "${TFVARS_CLUSTER_MODE:-${CLUSTER_MODE:-}}" != "standard" ]; then
+    print_info "Skipping cluster capacity preflight check (cluster_mode is not standard)."
+    return 0
+  fi
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    print_warning "kubectl is not installed; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    print_warning "python3 is not installed; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  local expected_ctx="gke_${project_id}_${region}_${cluster_name}"
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [ -n "$project_id" ] && [ -n "$current_ctx" ] && [ "$current_ctx" != "$expected_ctx" ]; then
+    print_warning "kubectl current context ('${current_ctx}') does not match target cluster ('${expected_ctx}'); skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  local tmp_cap_dir
+  tmp_cap_dir="$(mktemp -d 2>/dev/null || mktemp -d -t 'kube-agents-cap')"
+  # Published while it exists so install.sh's on_error can remove it: the pod
+  # dump below is every pod spec in the cluster, plaintext `env` included, and
+  # an abort between here and the rm would leave it behind. mktemp -d gives
+  # 0700, which bounds who could read it in the meantime.
+  export PREFLIGHT_TMP_DIR="$tmp_cap_dir"
+  on_preflight_interrupt() {
+    local sig="$1"
+    trap - INT TERM
+    if [ -n "${PREFLIGHT_TMP_DIR:-}" ] && [ -d "${PREFLIGHT_TMP_DIR}" ]; then
+      rm -rf -- "${PREFLIGHT_TMP_DIR}"
+      unset PREFLIGHT_TMP_DIR
+    fi
+    exit "$sig"
+  }
+  trap 'on_preflight_interrupt 130' INT
+  trap 'on_preflight_interrupt 143' TERM
+
+  kubectl --request-timeout="$PREFLIGHT_KUBECTL_TIMEOUT" get nodes -o json > "${tmp_cap_dir}/nodes.json" 2>/dev/null || true
+  if [ ! -s "${tmp_cap_dir}/nodes.json" ]; then
+    trap - INT TERM
+    rm -rf "$tmp_cap_dir"
+    unset PREFLIGHT_TMP_DIR
+    print_warning "Could not query nodes via kubectl; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  kubectl --request-timeout="$PREFLIGHT_KUBECTL_TIMEOUT" get pods -A --field-selector status.phase!=Failed,status.phase!=Succeeded -o json > "${tmp_cap_dir}/pods.json" 2>/dev/null || true
+  if [ ! -s "${tmp_cap_dir}/pods.json" ]; then
+    trap - INT TERM
+    rm -rf "$tmp_cap_dir"
+    unset PREFLIGHT_TMP_DIR
+    print_warning "Could not query running pods via kubectl; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  # Node-pool autoscaling bounds, read-only. A failure here is not a failure of
+  # the check: the evaluator falls back to the nodes that exist right now, which
+  # is what it did before it could read pools at all. An empty list is the
+  # honest input for that, so write one first and let a successful call
+  # overwrite it.
+  echo '[]' > "${tmp_cap_dir}/pools.json"
+  if command -v gcloud >/dev/null 2>&1 && [ -n "$cluster_name" ] && [ -n "$region" ]; then
+    local -a pool_list_args=(
+      container node-pools list
+      --cluster "$cluster_name"
+      --location "$region"
+      --format json
+    )
+    if [ -n "$project_id" ]; then
+      pool_list_args+=(--project "$project_id")
+    fi
+    gcloud "${pool_list_args[@]}" > "${tmp_cap_dir}/pools.raw.json" 2>/dev/null || true
+    if [ -s "${tmp_cap_dir}/pools.raw.json" ]; then
+      mv "${tmp_cap_dir}/pools.raw.json" "${tmp_cap_dir}/pools.json"
+    fi
+  fi
+
+  local req_cpu=$((PREFLIGHT_MIN_CPU_MILLIS_OPERATOR + PREFLIGHT_MIN_CPU_MILLIS_LITELLM_REPLICA * PREFLIGHT_DEFAULT_LITELLM_REPLICAS + PREFLIGHT_MIN_CPU_MILLIS_CREDENTIAL_PROXY + PREFLIGHT_MIN_CPU_MILLIS_SHELL_SANDBOX))
+  local req_mem=$((PREFLIGHT_MIN_MEM_MIB_OPERATOR + PREFLIGHT_MIN_MEM_MIB_LITELLM_REPLICA * PREFLIGHT_DEFAULT_LITELLM_REPLICAS + PREFLIGHT_MIN_MEM_MIB_CREDENTIAL_PROXY + PREFLIGHT_MIN_MEM_MIB_SHELL_SANDBOX))
+
+  if is_truthy "$enable_cert_manager"; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_CERT_MANAGER))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_CERT_MANAGER))
+  fi
+
+  # Charge for the minter only when it is actually planned. If write_tfvars_from_state
+  # deferred the minter (e.g. missing KMS signing key or PEM), it will not be deployed.
+  if [ -n "$gitops_org" ] && [ -n "$gitops_repo" ] && is_truthy "${TFVARS_ENABLE_GITHUB_MINTER:-true}"; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_MINTER_REPLICA * PREFLIGHT_DEFAULT_MINTER_REPLICAS))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_MINTER_REPLICA * PREFLIGHT_DEFAULT_MINTER_REPLICAS))
+  fi
+
+  if [ "$memory_mode" = "hindsight" ]; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_HINDSIGHT))
+  fi
+
+  local single_pods_spec="[{\"name\":\"LiteLLM\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_LITELLM_REPLICA},\"mem\":${PREFLIGHT_MIN_MEM_MIB_LITELLM_REPLICA}},{\"name\":\"shell-sandbox\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_SHELL_SANDBOX},\"mem\":${PREFLIGHT_MIN_MEM_MIB_SHELL_SANDBOX}}"
+  if [ -n "$gitops_org" ] && [ -n "$gitops_repo" ] && is_truthy "${TFVARS_ENABLE_GITHUB_MINTER:-true}"; then
+    single_pods_spec="${single_pods_spec},{\"name\":\"Minter\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_MINTER_REPLICA},\"mem\":${PREFLIGHT_MIN_MEM_MIB_MINTER_REPLICA}}"
+  fi
+  # The agent pod and its dashboard sidecar are one scheduling unit, so they
+  # are sized as one. Under gVisor that unit lands on the tainted sandbox pool
+  # and costs untainted nodes nothing, dashboard included; without it, the
+  # whole unit has to fit on a single untainted node.
+  if ! is_truthy "$gvisor_enabled"; then
+    local agent_cpu=$PREFLIGHT_MIN_CPU_MILLIS_AGENT_UNSANDBOXED
+    local agent_mem=$PREFLIGHT_MIN_MEM_MIB_AGENT_UNSANDBOXED
+    if is_truthy "$webui_enabled"; then
+      agent_cpu=$((agent_cpu + PREFLIGHT_MIN_CPU_MILLIS_DASHBOARD))
+      agent_mem=$((agent_mem + PREFLIGHT_MIN_MEM_MIB_DASHBOARD))
+    fi
+    req_cpu=$((req_cpu + agent_cpu))
+    req_mem=$((req_mem + agent_mem))
+    single_pods_spec="${single_pods_spec},{\"name\":\"unsandboxed agent\",\"cpu\":${agent_cpu},\"mem\":${agent_mem}}"
+  fi
+
+  if [ "$memory_mode" = "hindsight" ]; then
+    single_pods_spec="${single_pods_spec},{\"name\":\"hindsight-api\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT_API},\"mem\":${PREFLIGHT_MIN_MEM_MIB_HINDSIGHT_API}}"
+  fi
+  single_pods_spec="${single_pods_spec}]"
+
+  # Normalised here rather than inline in the argument list below: the
+  # evaluator compares against the literal "true", and is_truthy accepts more
+  # spellings than that.
+  local cert_manager_managed="false"
+  if is_truthy "$enable_cert_manager"; then
+    cert_manager_managed="true"
+  fi
+
+  local eval_result
+  eval_result="$(python3 -c '
+import sys, json
+
+# A quantity arrives spelled the way whoever wrote the manifest spelled it:
+# the API server returns the suffix it parsed rather than a canonical form, so
+# a pod asking for a quarter of a core can say 250m, 0.25, 250000u or
+# 250000000n and all four are the same request. Anything these two cannot read
+# is worth 0, never an exception: they run per container, outside the only try
+# block this evaluator has, so one unreadable quantity raised here would empty
+# the whole result and skip the check for the entire cluster.
+def parse_cpu(val):
+    if not val: return 0
+    s = str(val).strip()
+    units = {
+        "n": 1/1000000, "u": 1/1000, "m": 1,
+        "k": 1000*1000, "M": 1000**2*1000, "G": 1000**3*1000,
+    }
+    try:
+        for u, factor in units.items():
+            if s.endswith(u):
+                return int(float(s[:-len(u)]) * factor)
+        return int(float(s) * 1000)
+    except Exception:
+        return 0
+
+def parse_mem(val):
+    if not val: return 0
+    s = str(val).strip()
+    units = {
+        "Ki": 1/1024, "Mi": 1, "Gi": 1024, "Ti": 1024*1024,
+        "Pi": 1024**3, "Ei": 1024**4,
+        "k": 1000/(1024*1024), "M": 1000**2/(1024*1024), "G": 1000**3/(1024*1024),
+        "T": 1000**4/(1024*1024), "P": 1000**5/(1024*1024), "E": 1000**6/(1024*1024),
+    }
+    try:
+        for u, factor in units.items():
+            if s.endswith(u):
+                return int(float(s[:-len(u)]) * factor)
+        return int(float(s) / (1024*1024))
+    except Exception:
+        return 0
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        nodes = json.load(f)
+    with open(sys.argv[2], "r", encoding="utf-8") as f:
+        pods = json.load(f)
+    req_cpu = int(sys.argv[3])
+    req_mem = int(sys.argv[4])
+    single_pods = json.loads(sys.argv[5]) if len(sys.argv) > 5 else []
+    try:
+        with open(sys.argv[6], "r", encoding="utf-8") as f:
+            pools = json.load(f)
+    except Exception:
+        pools = []
+    pool_label = sys.argv[7]
+    daemonset_kind = sys.argv[8]
+    install_ns = sys.argv[9] if len(sys.argv) > 9 else ""
+    cert_manager_managed = (sys.argv[10] == "true") if len(sys.argv) > 10 else False
+    cert_manager_ns = sys.argv[11] if len(sys.argv) > 11 else ""
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(0)
+
+if not isinstance(pools, list):
+    pools = []
+
+untainted_nodes = {}
+nodes_per_pool = {}
+skipped_unschedulable = 0
+skipped_not_ready = 0
+for n in nodes.get("items", []):
+    name = n["metadata"]["name"]
+    pool = (n.get("metadata", {}).get("labels", {}) or {}).get(pool_label, "")
+    if pool:
+        nodes_per_pool[pool] = nodes_per_pool.get(pool, 0) + 1
+    taints = n.get("spec", {}).get("taints", []) or []
+    has_nosched = any(t.get("effect") in ("NoSchedule", "NoExecute") for t in taints)
+    is_unschedulable = n.get("spec", {}).get("unschedulable", False)
+    conditions = n.get("status", {}).get("conditions", []) or []
+    is_not_ready = any(c.get("type") == "Ready" and c.get("status") != "True" for c in conditions)
+    # Counted, not just dropped. A node pool part-way through a GKE surge
+    # upgrade looks exactly like this -- cordoned, then NotReady, one node at a
+    # time -- and a refusal that does not say so sends the operator to resize a
+    # cluster that was the right size a minute ago and will be again.
+    if is_unschedulable:
+        skipped_unschedulable += 1
+    elif is_not_ready:
+        skipped_not_ready += 1
+    if not has_nosched and not is_unschedulable and not is_not_ready:
+        alloc_cpu = parse_cpu(n.get("status", {}).get("allocatable", {}).get("cpu", 0))
+        alloc_mem = parse_mem(n.get("status", {}).get("allocatable", {}).get("memory", 0))
+        untainted_nodes[name] = {
+            "pool": pool,
+            "alloc_cpu": alloc_cpu,
+            "alloc_mem": alloc_mem,
+            "req_cpu": 0,
+            "req_mem": 0,
+            "sched_cpu": 0,
+            "sched_mem": 0,
+            "ds_cpu": 0,
+            "ds_mem": 0,
+        }
+
+discounted_pods = 0
+discounted_cpu = 0
+discounted_mem = 0
+for p in pods.get("items", []):
+    node_name = p.get("spec", {}).get("nodeName")
+    if node_name not in untainted_nodes:
+        continue
+    # Pods the install owns are the requirement being checked, not load
+    # competing with it: counting them charges a re-run for its own footprint
+    # twice and refuses a cluster that is already running what is being asked
+    # for.
+    #
+    # The discount is by namespace, so anything else sharing those namespaces is
+    # discounted with them and its requests are credited as free capacity. That
+    # is why the totals are reported: an install into a namespace someone else
+    # is already using can otherwise pass on capacity the cluster does not have.
+    ns = (p.get("metadata", {}) or {}).get("namespace", "")
+    if (install_ns and ns == install_ns) or (
+        cert_manager_managed and cert_manager_ns and ns == cert_manager_ns
+    ):
+        spec = p.get("spec", {})
+        for c in spec.get("containers", []) + (spec.get("initContainers", []) or []):
+            res = c.get("resources", {}).get("requests", {})
+            discounted_cpu += parse_cpu(res.get("cpu", 0))
+            discounted_mem += parse_mem(res.get("memory", 0))
+        discounted_pods += 1
+        continue
+    spec = p.get("spec", {})
+    p_cpu = 0
+    p_mem = 0
+    for c in spec.get("containers", []):
+        res = c.get("resources", {}).get("requests", {})
+        p_cpu += parse_cpu(res.get("cpu", 0))
+        p_mem += parse_mem(res.get("memory", 0))
+    # A restartable init container is a native sidecar: it runs for the whole
+    # life of the pod, so the scheduler adds it to the pod request rather than
+    # treating it as a phase that ends. A regular init container only has to
+    # fit once, alongside the sidecars already started, so the largest of them
+    # competes with the running total instead of adding to it.
+    side_cpu = 0
+    side_mem = 0
+    init_cpu = 0
+    init_mem = 0
+    for c in spec.get("initContainers", []):
+        res = c.get("resources", {}).get("requests", {})
+        c_cpu = parse_cpu(res.get("cpu", 0))
+        c_mem = parse_mem(res.get("memory", 0))
+        if c.get("restartPolicy") == "Always":
+            side_cpu += c_cpu
+            side_mem += c_mem
+        else:
+            init_cpu = max(init_cpu, c_cpu)
+            init_mem = max(init_mem, c_mem)
+    eff_cpu = max(p_cpu + side_cpu, init_cpu + side_cpu)
+    eff_mem = max(p_mem + side_mem, init_mem + side_mem)
+    untainted_nodes[node_name]["req_cpu"] += eff_cpu
+    untainted_nodes[node_name]["req_mem"] += eff_mem
+    owners = p.get("metadata", {}).get("ownerReferences", []) or []
+    if any(o.get("kind") == daemonset_kind for o in owners):
+        untainted_nodes[node_name]["ds_cpu"] += eff_cpu
+        untainted_nodes[node_name]["ds_mem"] += eff_mem
+
+total_sched_cpu = 0
+total_sched_mem = 0
+
+for name, data in untainted_nodes.items():
+    sched_cpu = max(0, data["alloc_cpu"] - data["req_cpu"])
+    sched_mem = max(0, data["alloc_mem"] - data["req_mem"])
+    data["sched_cpu"] = sched_cpu
+    data["sched_mem"] = sched_mem
+    total_sched_cpu += sched_cpu
+    total_sched_mem += sched_mem
+
+# What one more node of each pool would offer: its allocatable less the
+# DaemonSets that land on every node of that pool. CPU and memory are
+# minimised separately, because a pool can mix machine types and the node with
+# the least CPU need not be the node with the least memory -- comparing the
+# pair as a tuple would rank them lexicographically and carry the larger
+# memory figure of the CPU-poorest node into the estimate.
+pool_fresh = {}
+for name, data in untainted_nodes.items():
+    pool = data["pool"]
+    if not pool:
+        continue
+    fresh_cpu = max(0, data["alloc_cpu"] - data["ds_cpu"])
+    fresh_mem = max(0, data["alloc_mem"] - data["ds_mem"])
+    if pool not in pool_fresh:
+        pool_fresh[pool] = (fresh_cpu, fresh_mem)
+    else:
+        have_cpu, have_mem = pool_fresh[pool]
+        pool_fresh[pool] = (min(have_cpu, fresh_cpu), min(have_mem, fresh_mem))
+
+headroom_cpu = 0
+headroom_mem = 0
+scalable_fresh_fits = []
+scalable_pools = []
+for pool in pools:
+    pname = pool.get("name", "")
+    # No untainted, Ready node of this pool to model a new one on. A pool
+    # scaled to zero is the common case, and guessing its machine type from
+    # nothing is how this check would start inventing capacity.
+    if pname not in pool_fresh:
+        continue
+    ptaints = (pool.get("config", {}) or {}).get("taints", []) or []
+    if any(t.get("effect") in ("NoSchedule", "NoExecute", "NO_SCHEDULE", "NO_EXECUTE") for t in ptaints):
+        continue
+    auto = pool.get("autoscaling", {}) or {}
+    if not auto.get("enabled"):
+        continue
+    locations = pool.get("locations", []) or []
+    total_max = auto.get("totalMaxNodeCount") or 0
+    if not total_max:
+        total_max = (auto.get("maxNodeCount") or 0) * (len(locations) if locations else 1)
+    extra = max(0, int(total_max) - int(nodes_per_pool.get(pname, 0)))
+    if extra <= 0:
+        continue
+    fresh_cpu, fresh_mem = pool_fresh[pname]
+    headroom_cpu += extra * fresh_cpu
+    headroom_mem += extra * fresh_mem
+    scalable_fresh_fits.append((fresh_cpu, fresh_mem))
+    scalable_pools.append("%s (+%d node(s))" % (pname, extra))
+
+
+def shortfall(total_cpu, total_mem, node_fits):
+    if total_cpu < req_cpu:
+        return "Insufficient schedulable CPU (%dm < %dm)" % (total_cpu, req_cpu)
+    if total_mem < req_mem:
+        return "Insufficient schedulable Memory (%dMi < %dMi)" % (total_mem, req_mem)
+    for sp in single_pods:
+        sp_cpu = int(sp.get("cpu", 0))
+        sp_mem = int(sp.get("mem", 0))
+        if sp_cpu <= 0 and sp_mem <= 0:
+            continue
+        if not any(c >= sp_cpu and m >= sp_mem for c, m in node_fits):
+            # The node that came closest, and both of its figures together. The
+            # largest CPU and the largest memory in the cluster need not belong
+            # to the same node, and quoting them as a pair produced a refusal
+            # whose own numbers exceeded the request on both axes while nothing
+            # fitted. Ranked the way the test above measures -- the worse of the
+            # two ratios -- so the node named is the one to grow.
+            best_cpu = 0
+            best_mem = 0
+            best_score = None
+            for c, m in node_fits:
+                cpu_ratio = 1.0 if sp_cpu <= 0 else float(c) / float(sp_cpu)
+                mem_ratio = 1.0 if sp_mem <= 0 else float(m) / float(sp_mem)
+                score = min(cpu_ratio, mem_ratio)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_cpu = c
+                    best_mem = m
+            return "No single untainted node has sufficient schedulable capacity for %s pod (requires %dm CPU, %dMi Memory; the closest node has %dm CPU and %dMi Memory free)" % (
+                sp.get("name", "workload"), sp_cpu, sp_mem, best_cpu, best_mem)
+    return ""
+
+
+current_fits = [(d["sched_cpu"], d["sched_mem"]) for d in untainted_nodes.values()]
+autoscale_note = ""
+if len(untainted_nodes) == 0:
+    reason = "No untainted nodes found in cluster"
+else:
+    reason = shortfall(total_sched_cpu, total_sched_mem, current_fits)
+    # A pool that can still grow answers the deficit the way the rollout would
+    # have: pods go Pending, the autoscaler adds a node. Blocking the install
+    # on the nodes that happen to exist right now fails a cluster that was
+    # never going to be short.
+    if reason and (headroom_cpu > 0 or headroom_mem > 0):
+        after_fits = current_fits + scalable_fresh_fits
+        if not shortfall(total_sched_cpu + headroom_cpu, total_sched_mem + headroom_mem, after_fits):
+            autoscale_note = "%s on the nodes running now, within reach of autoscaling: %s" % (
+                reason, ", ".join(scalable_pools))
+            reason = ""
+ok = not reason
+
+discount_note = ""
+if discounted_pods:
+    discounted_from = install_ns or ""
+    if cert_manager_managed and cert_manager_ns:
+        discounted_from = "%s and %s" % (discounted_from, cert_manager_ns) if discounted_from else cert_manager_ns
+    discount_note = "%d pod(s) already running in %s were discounted (%dm CPU, %dMi Memory): on a re-run they are the requirement being measured. Anything else sharing those namespaces is discounted with them." % (
+        discounted_pods, discounted_from, discounted_cpu, discounted_mem)
+
+exclusion_note = ""
+if skipped_unschedulable or skipped_not_ready:
+    exclusion_note = "%d cordoned and %d NotReady node(s) were left out of this calculation; a node pool part-way through an upgrade looks like that and gets its capacity back when the upgrade finishes." % (
+        skipped_unschedulable, skipped_not_ready)
+
+print(json.dumps({
+    "ok": ok,
+    "untainted_count": len(untainted_nodes),
+    "total_sched_cpu": total_sched_cpu,
+    "total_sched_mem": total_sched_mem,
+    "req_cpu": req_cpu,
+    "req_mem": req_mem,
+    "discount_note": discount_note,
+    "exclusion_note": exclusion_note,
+    "autoscale_note": autoscale_note,
+    "reason": reason
+}))
+' "${tmp_cap_dir}/nodes.json" "${tmp_cap_dir}/pods.json" "$req_cpu" "$req_mem" "$single_pods_spec" "${tmp_cap_dir}/pools.json" "$PREFLIGHT_NODE_POOL_LABEL" "$PREFLIGHT_DAEMONSET_OWNER_KIND" "$install_namespace" "$cert_manager_managed" "$PREFLIGHT_CERT_MANAGER_NAMESPACE" 2>"${tmp_cap_dir}/eval.err" || true)"
+
+  # Read while the scratch directory is still there. A traceback on that stderr
+  # is a defect in the evaluator above, and the check fails open either way --
+  # so without this the operator sees a warning that reads like a cluster it
+  # could re-run past, and the bug is never reported.
+  local eval_stderr=""
+  if [ -s "${tmp_cap_dir}/eval.err" ]; then
+    eval_stderr="$(tail -n 1 -- "${tmp_cap_dir}/eval.err" 2>/dev/null || true)"
+  fi
+
+  trap - INT TERM
+  rm -rf "$tmp_cap_dir"
+  unset PREFLIGHT_TMP_DIR
+
+  if [ -z "$eval_result" ]; then
+    if [ -n "$eval_stderr" ]; then
+      print_warning "The capacity evaluator itself failed (${eval_stderr}). That is a bug in the installer rather than a condition of this cluster; please report it. Continuing without the check."
+    else
+      print_warning "Failed to calculate cluster schedulable capacity; continuing."
+    fi
+    return 0
+  fi
+
+  local ok untainted_count total_sched_cpu total_sched_mem
+  local discount_note exclusion_note autoscale_note reason
+  # One parse, and a failed one is a failed check rather than a defaulted one.
+  # The evaluator prints {"error": ...} and exits 0 when it cannot read the
+  # node or pod JSON — a truncated `kubectl get nodes` write clears the [ -s ]
+  # guard above — and a document with no "ok" key read with .get('ok', True)
+  # reports a pass over zero nodes, the same shape the working path fails
+  # hard on.
+  local eval_fields
+  eval_fields="$(python3 -c '
+import sys, json
+
+try:
+    result = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+if "error" in result or "ok" not in result:
+    sys.exit(1)
+print(result["ok"])
+print(result.get("untainted_count", 0))
+print(result.get("total_sched_cpu", 0))
+print(result.get("total_sched_mem", 0))
+print(str(result.get("discount_note", "")).replace("\n", " "))
+print(str(result.get("exclusion_note", "")).replace("\n", " "))
+print(str(result.get("autoscale_note", "")).replace("\n", " "))
+print(str(result.get("reason", "")).replace("\n", " "))
+' "$eval_result" 2>/dev/null)" || eval_fields=""
+
+  if [ -z "$eval_fields" ]; then
+    print_warning "Failed to calculate cluster schedulable capacity; continuing."
+    return 0
+  fi
+
+  {
+    read -r ok
+    read -r untainted_count
+    read -r total_sched_cpu
+    read -r total_sched_mem
+    # Every field from here down can be empty, and command substitution has
+    # already stripped the trailing newlines, so whichever of them are empty at
+    # the end are not lines at all. A read that lands on EOF is expected; only
+    # the value it would have set has to be cleared by hand.
+    read -r discount_note || discount_note=""
+    read -r exclusion_note || exclusion_note=""
+    read -r autoscale_note || autoscale_note=""
+    read -r reason || reason=""
+  } <<EOF
+${eval_fields}
+EOF
+
+  if [ "$ok" != "True" ]; then
+    print_error "Cluster capacity preflight check failed for adopted Standard cluster '${cluster_name}'."
+    print_error "Untainted nodes have insufficient schedulable capacity for non-gVisor workloads (LiteLLM, operator, cert-manager):"
+    print_info "  • Available on untainted nodes: ${total_sched_cpu}m CPU, ${total_sched_mem}Mi Memory (${untainted_count} untainted node(s))"
+    print_info "  • Required minimum capacity:   ${req_cpu}m CPU, ${req_mem}Mi Memory"
+    if [ -n "$reason" ]; then
+      print_info "  • Reason:                      ${reason}"
+    fi
+    if [ -n "$discount_note" ]; then
+      print_info "  • Discounted:                  ${discount_note}"
+    fi
+    if [ -n "$exclusion_note" ]; then
+      print_info "  • Excluded:                    ${exclusion_note}"
+    fi
+    print_info "Note: The installer creates 'gvisor-pool' carrying taint 'sandbox.gke.io/runtime=gvisor:NoSchedule'."
+    print_info "Trusted system workloads cannot schedule on gvisor-pool and require schedulable capacity on untainted nodes."
+    print_info "Autoscaling headroom counts toward this check: a pool that may still add nodes is credited with them."
+    print_info "A pool scaled to zero is not: with no node of its own to measure, its machine shape is unknown, so give it one node and re-run."
+    print_info "To resolve:"
+    print_info "  1. Resize your existing node pool: gcloud container clusters resize ${cluster_name} --node-pool <pool> --num-nodes <count> --location ${region}"
+    print_info "  2. Or raise the autoscaling ceiling: gcloud container clusters update ${cluster_name} --enable-autoscaling --node-pool <pool> --max-nodes <count> --location ${region}"
+    print_info "  3. Or bypass this check: ./install.sh ... --skip-capacity-check"
+    return 1
+  fi
+
+  # Printed on the way past as well as on a refusal: a pass is the case where
+  # what was left out of the sum is invisible, and both of these change what
+  # the number means.
+  if [ -n "$exclusion_note" ]; then
+    print_warning "$exclusion_note"
+  fi
+  if [ -n "$discount_note" ]; then
+    print_info "$discount_note"
+  fi
+
+  if [ -n "$autoscale_note" ]; then
+    print_warning "Cluster capacity preflight check passed on autoscaling headroom, not on current capacity: ${autoscale_note}."
+    print_info "Pods will be Pending until the autoscaler provisions; the Helm timeout must outlast that."
+    return 0
+  fi
+
+  print_success "Cluster capacity preflight check passed (${total_sched_cpu}m CPU, ${total_sched_mem}Mi Memory schedulable across ${untainted_count} untainted node(s))."
+  return 0
 }

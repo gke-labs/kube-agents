@@ -144,7 +144,9 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
-                f"  *\"clusters describe\"*) {describe_stub} ;;\n"
+                f"  *\"clusters describe\"*) {describe_stub} ;;\n" \
+                f"  *\"clusters get-credentials\"*) echo \"GCLOUD_CALL: $*\" >> \"${{GCLOUD_MOCK_LOG}}\" ;;" \
+                "\n"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
                 f"  *\"service-accounts describe\"*) {sa_describe_stub} ;;\n"
                 "esac\n"
@@ -326,13 +328,42 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("create_cluster             = false", content)
             self.assertIn("enable_cert_manager        = true", content)
 
-    def test_tfvars_skips_cert_manager_when_the_state_does_not_manage_it(self):
-        # The existing behaviour, kept: somebody else's cert-manager makes the
-        # composition's own release fail on the existing CRDs.
+    def test_tfvars_writes_helm_timeout(self):
+        # write_tfvars_from_state in installer_common.sh passes HELM_TIMEOUT through to the
+        # generated terraform.tfvars as helm_timeout. Assert both the default (600)
+        # when HELM_TIMEOUT is unset and the explicit value when set.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'unset HELM_TIMEOUT; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub=_autopilot_describe_stub(),
+                kubectl_script=_CERT_MANAGER_PRESENT_KUBECTL,
+                gcloud_stdout=CERT_MANAGER_RELEASE_STATE,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("helm_timeout                 = 600", dest.read_text())
+
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "HELM_TIMEOUT": "720"},
+                describe_stub=_autopilot_describe_stub(),
+                kubectl_script=_CERT_MANAGER_PRESENT_KUBECTL,
+                gcloud_stdout=CERT_MANAGER_RELEASE_STATE,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("helm_timeout                 = 720", dest.read_text())
+
+    def test_tfvars_skips_cert_manager_when_the_state_does_not_manage_it(self):
+        # The existing behaviour, kept: somebody else's cert-manager makes the
+        # composition's own release fail on the existing CRDs.
+        # Also asserts that TFVARS_ENABLE_CERT_MANAGER is exported for downstream callers.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"; bash -c \'echo "CM=$TFVARS_ENABLE_CERT_MANAGER"\'',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub=_autopilot_describe_stub(),
                 kubectl_script=_CERT_MANAGER_PRESENT_KUBECTL,
@@ -340,6 +371,7 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("enable_cert_manager        = false", dest.read_text())
+            self.assertIn("CM=false", proc.stdout)
 
     def test_tfvars_keeps_cert_manager_when_the_state_cannot_be_read(self):
         # The two wrong answers are not symmetric: a wrong true fails the
@@ -348,7 +380,7 @@ class InstallerCommonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"; bash -c \'echo "CM=$TFVARS_ENABLE_CERT_MANAGER"\'',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub=_autopilot_describe_stub(),
                 kubectl_script=_CERT_MANAGER_PRESENT_KUBECTL,
@@ -357,6 +389,7 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("enable_cert_manager        = true", dest.read_text())
+            self.assertIn("CM=true", proc.stdout)
 
     # ── check_service_account_ownership: the 409 a second install hits (#1294) ─
 
@@ -433,6 +466,22 @@ class InstallerCommonTest(unittest.TestCase):
                 env={"NAMESPACE": "stray-from-kubectl-tooling"},
             )
             self.assertIn("NS=from-the-file", proc.stdout, proc.stderr)
+
+    def test_load_install_env_drops_a_shell_exported_helm_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            proc = self._run(
+                f'load_install_env "{env_file}"; echo "HT=${{HELM_TIMEOUT:-unset}}"',
+                env={"HELM_TIMEOUT": "stray-from-ambient-env"},
+            )
+            self.assertIn("HT=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nHELM_TIMEOUT=720\n")
+            proc = self._run(
+                f'load_install_env "{env_file}"; echo "HT=${{HELM_TIMEOUT:-unset}}"',
+                env={"HELM_TIMEOUT": "stray-from-ambient-env"},
+            )
+            self.assertIn("HT=720", proc.stdout, proc.stderr)
 
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(
@@ -1311,6 +1360,31 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("vertex_manage_serving_project = false", dest.read_text())
 
 
+    def test_tfvars_does_not_fetch_credentials_for_missing_cluster(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            log_file = pathlib.Path(out_dir) / "gcloud_mock.log"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GCLOUD_MOCK_LOG": str(log_file)},
+            )
+            self.assertIn("rc=0", proc.stdout)
+            self.assertFalse(log_file.exists())
+
+    def test_tfvars_fetches_credentials_for_existing_cluster(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            log_file = pathlib.Path(out_dir) / "gcloud_mock.log"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GCLOUD_MOCK_LOG": str(log_file)},
+                describe_stub='echo "name: test-cluster"; exit 0',
+                gcloud_stdout=MANAGED_CLUSTER_STATE,
+            )
+            self.assertIn("rc=0", proc.stdout)
+            self.assertTrue(log_file.exists())
+            self.assertIn("GCLOUD_CALL: container clusters get-credentials test-cluster --location us-central1 --project test-project", log_file.read_text())
+
 class InstallDefaultsFileTest(unittest.TestCase):
     """install.defaults.env holds every default, and only defaults.
 
@@ -1972,7 +2046,5 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 
-
 if __name__ == "__main__":
     unittest.main()
-

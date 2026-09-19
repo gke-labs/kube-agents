@@ -495,6 +495,7 @@ main() {
   # node pool goes with the cluster in any case; the only thing these two
   # values change here is whether the floor check gets to abort.
   export ENABLE_GVISOR="false"
+  export HELM_TIMEOUT="${DEFAULT_HELM_TIMEOUT}"
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

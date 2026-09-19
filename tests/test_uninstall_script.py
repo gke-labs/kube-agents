@@ -457,6 +457,23 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
             "which is what runs the floor check.",
         )
 
+    def test_uninstall_forces_helm_timeout_before_generating_tfvars(self):
+        text = _UNINSTALL_SH.read_text()
+        export_at = text.find('export HELM_TIMEOUT="${DEFAULT_HELM_TIMEOUT}"')
+        self.assertNotEqual(
+            export_at,
+            -1,
+            "uninstall.sh must export HELM_TIMEOUT before generating tfvars",
+        )
+        call = re.search(r"^\s*write_tfvars_from_state \"", text, re.MULTILINE)
+        self.assertIsNotNone(call, "write_tfvars_from_state call not found")
+        call_at = call.start()
+        self.assertLess(
+            export_at,
+            call_at,
+            "the HELM_TIMEOUT export must come before write_tfvars_from_state",
+        )
+
 
 class UninstallSummaryDisclosureTest(unittest.TestCase):
     """The uninstall summary discloses preserved cluster-level settings."""

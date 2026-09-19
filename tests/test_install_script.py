@@ -5,6 +5,7 @@ piped stdin (curl | bash) execution, local script path resolution, and the
 NetworkPolicy enablement sequence install.sh runs against adopted clusters.
 """
 
+import json
 import os
 import pathlib
 import pty
@@ -31,6 +32,14 @@ from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
     create_mock_release_bundle_marker,
 )
+
+# The window terraform/examples/full-install/variables.tf admits for the
+# helm_timeout variable, read from the HCL. install.sh validates --helm-timeout
+# against its own copy of those bounds and then writes the value into that
+# variable, so the two have to agree; borrowing the reader rather than adding a
+# second HCL parser keeps one place that knows how the validation block is
+# shaped.
+from tests.test_hindsight_probes import _gate_bounds_seconds as terraform_gate_bounds_seconds
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALL_SH = _REPO_ROOT / "install.sh"
@@ -4131,14 +4140,14 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
     that name, and freezing a stray value would move the release.
     """
 
-    def _bootstrap(self, env):
+    def _bootstrap(self, env, loaded_content=""):
         with tempfile.TemporaryDirectory() as tmp:
             dest = pathlib.Path(tmp) / "new.install.env"
             # An existing, empty input: install.sh refuses a KUBE_AGENTS_INSTALL_ENV
             # that names a missing file, and the point here is the file it
             # CREATES, not the one it loads.
             loaded = pathlib.Path(tmp) / "loaded.install.env"
-            loaded.write_text("")
+            loaded.write_text(loaded_content)
             loaded.chmod(0o600)
             proc = subprocess.run(
                 ["bash", "-c",
@@ -4151,6 +4160,7 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
                 capture_output=True, text=True,
                 env=get_isolated_test_env(overrides={
                     "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                    "KUBE_AGENTS_LEGACY_VARS_FILE": "",
                     "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
                     **env,
                 }),
@@ -4183,6 +4193,24 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
         seen by the same anchored pattern, so their silence means absence."""
         out = self._bootstrap({"GKE_DB_KMS_KEY": "key-two"})
         self.assertRegex(out, re.compile(r"^GKE_DB_KMS_KEY=key-two$", re.MULTILINE))
+
+    def test_the_capacity_bypass_is_not_recorded_but_the_timeout_is(self):
+        """A bypass describes one run, not the install.
+
+        The run that reaches for --skip-capacity-check is the one on an
+        undersized cluster, and this file is written once and read by every
+        run after it: recorded here, the bypass would silently skip the
+        preflight for the upgrade that adds hindsight-api. HELM_TIMEOUT beside
+        it describes what the install IS, and stays.
+        """
+        out = self._bootstrap({"SKIP_CAPACITY_CHECK": "true"}, loaded_content="HELM_TIMEOUT=720\n")
+        self.assertNotRegex(out, re.compile(r"^SKIP_CAPACITY_CHECK=", re.MULTILINE), msg=out)
+        self.assertRegex(out, re.compile(r"^HELM_TIMEOUT=720$", re.MULTILINE), msg=out)
+
+    def test_a_shell_exported_helm_timeout_is_not_recorded(self):
+        out = self._bootstrap({"HELM_TIMEOUT": "720"})
+        self.assertNotRegex(out, re.compile(r"^HELM_TIMEOUT=720$", re.MULTILINE), msg=out)
+        self.assertRegex(out, re.compile(r"^HELM_TIMEOUT=600$", re.MULTILINE), msg=out)
 
 
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
@@ -5017,7 +5045,7 @@ class RunLifecycleApplyTrapTest(unittest.TestCase):
         self._empty_install_env = self._tmp_path / "install.env"
         self._empty_install_env.write_text("")
 
-    def _run_func(self, func_call, cwd=None):
+    def _run_func(self, func_call, cwd=None, env_overrides=None, bin_dir=None):
         setup = f"""
 source "{_INSTALLER_COMMON}"
 KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
@@ -5027,13 +5055,15 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
             "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
         }
-        full_env = get_isolated_test_env(overrides=overrides)
+        overrides.update(env_overrides or {})
+        full_env = get_isolated_test_env(overrides=overrides, bin_dir=bin_dir)
         return subprocess.run(
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
             env=full_env,
             cwd=str(cwd or _REPO_ROOT),
+            timeout=15,
         )
 
     def test_failed_apply_reports_only_command_and_not_tee(self):
@@ -5068,6 +5098,22 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertTrue(log_file.exists())
         self.assertIn("Apply complete", log_file.read_text())
 
+    def test_run_lifecycle_apply_passes_no_color_when_env_set(self):
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text("#!/bin/bash\necho \"ARGS: $*\"\nexit 0\n")
+        lifecycle_sh.chmod(0o755)
+
+        log_file = self._tmp_path / "provision.log"
+        proc = self._run_func(
+            f'run_lifecycle_apply "{repo_dir}" "{log_file}"',
+            env_overrides={"NO_COLOR": "1"},
+        )
+        self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
+        self.assertIn("-no-color", log_file.read_text())
+
     def test_pipeline_status_handles_empty_array_safely_under_set_u(self):
         source = _INSTALL_SH.read_text()
         self.assertIn(
@@ -5078,6 +5124,449 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             'handle_pipeline_status "./lifecycle.sh apply -auto-approve -input=false" "$log_file" "${ps[@]}"',
             source,
         )
+
+    def test_run_lifecycle_apply_fetches_credentials_and_diagnoses_on_rollout_timeout(self):
+        # When lifecycle.sh fails with a Helm rollout timeout on an existing cluster
+        # whose context matches, run_lifecycle_apply must fetch credentials and
+        # invoke diagnose_rollout_failure.
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text("""#!/bin/bash
+cat << 'EOF' >&2
+Error: context deadline exceeded
+
+  with helm_release.kube_agents,
+  on main.tf line 497:
+EOF
+exit 1
+""")
+        lifecycle_sh.chmod(0o755)
+
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir()
+        gcloud_log = self._tmp_path / "gcloud.log"
+        gcloud = bin_dir / "gcloud"
+        gcloud.write_text(f"""#!/usr/bin/env bash
+echo "$@" >> "{gcloud_log}"
+exit 0
+""")
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *current-context*) echo "gke_proj_us-central1_target" ;;
+  *get*pods*) echo "pod-failing" ;;
+  *get*events*) echo "CrashLoopBackOff container died" ;;
+  *) echo "" ;;
+esac
+exit 0
+""")
+        for stub in (gcloud, kubectl):
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+        log_file = self._tmp_path / "provision.log"
+        call = f"""
+export PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=false
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        proc = self._run_func(
+            call,
+            bin_dir=str(bin_dir),
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(gcloud_log.exists())
+        gcloud_calls = gcloud_log.read_text()
+        self.assertIn("container clusters get-credentials target", gcloud_calls)
+        self.assertIn("Pending Pods Detected:", proc.stdout + proc.stderr)
+        self.assertIn("pod-failing", proc.stdout + proc.stderr)
+
+    def test_run_lifecycle_apply_credential_fetch_on_helm_timeout(self):
+        # Credential fetch runs on Helm rollout timeout whenever current context
+        # matches or is empty (including on fresh cluster creation, since the cluster
+        # module has already provisioned before Helm runs), but is skipped when current
+        # context points elsewhere to avoid repointing the operator's kubeconfig.
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text("""#!/bin/bash
+cat << 'EOF' >&2
+Error: context deadline exceeded
+
+  with helm_release.kube_agents,
+  on main.tf line 497:
+EOF
+exit 1
+""")
+        lifecycle_sh.chmod(0o755)
+
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir()
+        gcloud_log = self._tmp_path / "gcloud.log"
+        gcloud = bin_dir / "gcloud"
+        gcloud.write_text(f"""#!/usr/bin/env bash
+echo "$@" >> "{gcloud_log}"
+exit 0
+""")
+        current_ctx_file = self._tmp_path / "current_context.txt"
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text(f"""#!/usr/bin/env bash
+if [ -f "{current_ctx_file}" ]; then
+  cat "{current_ctx_file}"
+else
+  echo "gke_proj_us-central1_target"
+fi
+exit 0
+""")
+        for stub in (gcloud, kubectl):
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+        log_file = self._tmp_path / "provision.log"
+
+        # Case A: TFVARS_CREATE_CLUSTER=true with matching kubectl context.
+        # Proves that credential fetch executes on fresh cluster creation once
+        # Helm has timed out, allowing pod diagnosis to query the cluster.
+        current_ctx_file.write_text("gke_proj_us-central1_target\n")
+        call_a = f"""
+export PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=true
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        self._run_func(
+            call_a,
+            bin_dir=str(bin_dir),
+        )
+        self.assertTrue(gcloud_log.exists(), "gcloud was not called under TFVARS_CREATE_CLUSTER=true with matching context")
+        self.assertIn("clusters get-credentials target", gcloud_log.read_text())
+
+        # Case B: Context mismatch with TFVARS_CREATE_CLUSTER=false.
+        # Proves that mismatched context prevents credential fetch even on adopted cluster.
+        gcloud_log.unlink()
+        current_ctx_file.write_text("gke_other_us-west1_other\n")
+        call_b = f"""
+export PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=false
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        self._run_func(
+            call_b,
+            bin_dir=str(bin_dir),
+        )
+        self.assertFalse(gcloud_log.exists(), "gcloud was called on context mismatch")
+
+        # Case C: Context matches with TFVARS_CREATE_CLUSTER=false (positive control).
+        # Proves that credential fetch DOES execute when context matches on adopted cluster.
+        current_ctx_file.write_text("gke_proj_us-central1_target\n")
+        call_c = f"""
+export PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=false
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        self._run_func(
+            call_c,
+            bin_dir=str(bin_dir),
+        )
+        self.assertTrue(gcloud_log.exists(), "gcloud was not called when context matches and adopted cluster")
+        self.assertIn("clusters get-credentials target", gcloud_log.read_text())
+
+        # Case D: Empty context with TFVARS_CREATE_CLUSTER=true.
+        # Proves that credential fetch executes when current context is unset/empty on fresh create.
+        gcloud_log.unlink()
+        current_ctx_file.write_text("\n")
+        call_d = f"""
+export PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=true
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        self._run_func(
+            call_d,
+            bin_dir=str(bin_dir),
+        )
+        self.assertTrue(gcloud_log.exists(), "gcloud was not called when context is empty")
+        self.assertIn("clusters get-credentials target", gcloud_log.read_text())
+
+    def test_run_lifecycle_apply_reaps_monitor_on_sigint(self):
+        # Under Ctrl-C (SIGINT), run_lifecycle_apply's interrupt handler must terminate
+        # the background monitor_lifecycle_rollout child process so it does not persist
+        # as an orphan.
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        log_file = self._tmp_path / "provision.log"
+        lifecycle_sh.write_text(f"""#!/bin/bash
+echo "APPLY_STARTED" >> "{log_file}"
+trap 'exit 130' INT TERM
+while true; do /bin/sleep 0.1; done
+""")
+        lifecycle_sh.chmod(0o755)
+
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir()
+        monitor_pid_file = self._tmp_path / "monitor.pid"
+        sleep_stub = bin_dir / "sleep"
+        sleep_stub.write_text(f"""#!/usr/bin/env bash
+trap '' INT
+if [ ! -f "{monitor_pid_file}" ]; then
+  echo "$PPID" > "{monitor_pid_file}"
+fi
+exec /bin/sleep 5
+""")
+        sleep_stub.chmod(0o755)
+
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text("""#!/usr/bin/env bash
+exit 0
+""")
+        kubectl.chmod(0o755)
+
+        setup = f"""
+source "{_INSTALLER_COMMON}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+export PROJECT_ID=p REGION=r CLUSTER_NAME=c
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        overrides = {
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
+        }
+        full_env = get_isolated_test_env(overrides=overrides, bin_dir=str(bin_dir))
+        proc = subprocess.Popen(
+            ["bash", "-c", setup],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+            start_new_session=True,
+        )
+
+        try:
+            for _ in range(50):
+                if monitor_pid_file.exists() and log_file.exists() and "APPLY_STARTED" in log_file.read_text():
+                    break
+                time.sleep(0.1)
+
+            self.assertTrue(monitor_pid_file.exists(), "monitor failed to record its pid")
+            mon_pid = int(monitor_pid_file.read_text().strip())
+
+            os.killpg(proc.pid, signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+
+            time.sleep(0.2)
+            try:
+                os.kill(mon_pid, 0)
+                mon_alive = True
+            except OSError:
+                mon_alive = False
+            if mon_alive:
+                try:
+                    os.kill(mon_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            self.assertFalse(mon_alive, f"monitor process {mon_pid} is still alive after SIGINT")
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+
+    def test_run_lifecycle_apply_does_not_defer_sigterm_and_terminates_immediately(self):
+        # A SIGTERM delivered to install.sh alone must not be deferred behind a long-running
+        # foreground pipeline. It retains default termination disposition and dies at once.
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        log_file = self._tmp_path / "provision.log"
+        lifecycle_sh.write_text(f"""#!/bin/bash
+trap 'exit 0' TERM INT
+echo "APPLY_STARTED" >> "{log_file}"
+for _ in $(seq 1 100); do /bin/sleep 0.1; done
+""")
+        lifecycle_sh.chmod(0o755)
+
+        setup = f"""
+source "{_INSTALLER_COMMON}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        overrides = {
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
+        }
+        full_env = get_isolated_test_env(overrides=overrides)
+        proc = subprocess.Popen(
+            ["bash", "-c", setup],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+            start_new_session=True,
+        )
+
+        try:
+            for _ in range(50):
+                if log_file.exists() and "APPLY_STARTED" in log_file.read_text():
+                    break
+                time.sleep(0.1)
+
+            self.assertTrue(log_file.exists())
+            # Deliver SIGTERM to install.sh PID directly (not process group).
+            os.kill(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.fail("run_lifecycle_apply deferred SIGTERM while waiting for foreground command")
+            self.assertIn(proc.returncode, (-signal.SIGTERM, 128 + signal.SIGTERM))
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=2)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+
+    def test_run_lifecycle_apply_closes_lock_fd_200_on_monitor(self):
+        # Asserts that run_lifecycle_apply closes fd 200 (the flock descriptor)
+        # when backgrounding monitor_lifecycle_rollout via 200>&-.
+        if not pathlib.Path("/proc").exists() or not shutil.which("flock"):
+            self.skipTest("Requires Linux /proc and flock")
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        log_file = self._tmp_path / "provision.log"
+        fd_status_file = self._tmp_path / "fd200_status.txt"
+        lifecycle_sh.write_text(f"""#!/bin/bash
+for _ in $(seq 1 50); do
+  if [ -f "{fd_status_file}" ]; then
+    break
+  fi
+  /bin/sleep 0.02
+done
+exit 0
+""")
+        lifecycle_sh.chmod(0o755)
+
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir()
+        sleep_stub = bin_dir / "sleep"
+        # The sleep stub runs inside monitor_lifecycle_rollout. $PPID is the monitor.
+        sleep_stub.write_text(f"""#!/usr/bin/env bash
+if [ -e "/proc/$PPID/fd/200" ]; then
+  echo "OPEN" > "{fd_status_file}.tmp" && mv "{fd_status_file}.tmp" "{fd_status_file}"
+else
+  echo "CLOSED" > "{fd_status_file}.tmp" && mv "{fd_status_file}.tmp" "{fd_status_file}"
+fi
+exit 0
+""")
+        sleep_stub.chmod(0o755)
+
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text("""#!/usr/bin/env bash
+exit 0
+""")
+        kubectl.chmod(0o755)
+
+        lock_file = self._tmp_path / "installer.lock"
+        setup = f"""
+export PROJECT_ID=p REGION=r CLUSTER_NAME=c
+exec 200>"{lock_file}"
+flock -n 200
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+exec 200>&-
+"""
+        proc = self._run_func(setup, bin_dir=str(bin_dir))
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertTrue(fd_status_file.exists(), "sleep stub did not record fd 200 status")
+        self.assertEqual(fd_status_file.read_text().strip(), "CLOSED", "monitor process inherited fd 200")
+
+    def test_monitor_lifecycle_rollout_exits_when_parent_dies(self):
+        # Asserts that monitor_lifecycle_rollout exits cleanly when kill -0 "$parent_pid"
+        # fails, preventing orphaned monitors from looping indefinitely.
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir()
+        sleep_stub = bin_dir / "sleep"
+        sleep_stub.write_text("""#!/usr/bin/env bash
+exit 0
+""")
+        sleep_stub.chmod(0o755)
+
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text("""#!/usr/bin/env bash
+exit 0
+""")
+        kubectl.chmod(0o755)
+
+        # Case 1: Pass an already-dead parent pid directly.
+        dead_pid_script = """
+export PROJECT_ID=p REGION=r CLUSTER_NAME=c
+( exit 0 ) &
+dead_pid=$!
+wait "$dead_pid"
+( monitor_lifecycle_rollout "$dead_pid" )
+rc=$?
+echo "RC=$rc"
+"""
+        proc = self._run_func(dead_pid_script, bin_dir=str(bin_dir))
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("RC=0", proc.stdout)
+
+        # Case 2: Parent process terminates while monitor is sleeping in its loop.
+        parent_death_script = """
+export PROJECT_ID=p REGION=r CLUSTER_NAME=c
+( /bin/sleep 0.15; exit 0 ) &
+parent_pid=$!
+( monitor_lifecycle_rollout "$parent_pid" )
+rc=$?
+echo "LOOP_RC=$rc"
+"""
+        proc2 = self._run_func(parent_death_script, bin_dir=str(bin_dir))
+        self.assertEqual(proc2.returncode, 0, f"stdout: {proc2.stdout}\nstderr: {proc2.stderr}")
+        self.assertIn("LOOP_RC=0", proc2.stdout)
+
+    def test_monitor_lifecycle_rollout_exits_when_max_duration_exceeded(self):
+        # Asserts that monitor_lifecycle_rollout exits when elapsed >= ROLLOUT_MONITOR_MAX_DURATION_SECS.
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir()
+        loop_count_file = self._tmp_path / "loop_count.txt"
+        sleep_stub = bin_dir / "sleep"
+        sleep_stub.write_text(f"""#!/usr/bin/env bash
+count=$(cat "{loop_count_file}" 2>/dev/null || echo 0)
+echo $((count + 1)) > "{loop_count_file}"
+exit 0
+""")
+        sleep_stub.chmod(0o755)
+
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text("""#!/usr/bin/env bash
+exit 0
+""")
+        kubectl.chmod(0o755)
+
+        # Set ROLLOUT_MONITOR_MAX_DURATION_SECS=0 so that after 1 iteration elapsed >= cap.
+        cap_script = """
+export PROJECT_ID=p REGION=r CLUSTER_NAME=c
+( monitor_lifecycle_rollout "$$" )
+rc=$?
+echo "RC=$rc"
+"""
+        proc = self._run_func(
+            cap_script,
+            env_overrides={"ROLLOUT_MONITOR_MAX_DURATION_SECS": "0"},
+            bin_dir=str(bin_dir),
+        )
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("RC=0", proc.stdout)
+        self.assertTrue(loop_count_file.exists())
+        self.assertEqual(loop_count_file.read_text().strip(), "1")
 
 
 class RunWithSpinnerAndRolloutTest(unittest.TestCase):
@@ -5507,6 +5996,1985 @@ echo "$rc" > "{rc_file}"
         self._spawn_on_pty(script)
         self.assertEqual("42", self._await_file(rc_file, "the wrapped command's exit status"))
         self.assertIn("the wrapped output", log_file.read_text())
+
+
+class CapacityPreflightAndRolloutVisibilityTest(unittest.TestCase):
+    """Tests for cluster capacity preflight and rollout monitoring (#1297)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp_path = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp_path / "install.env"
+        self._empty_install_env.write_text("")
+        self._test_report_file = self._tmp_path / "report.json"
+
+    def _run_cmd(self, script_body, env_overrides=None, bin_dir=None):
+        overrides = {
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._test_report_file),
+            # Set, and set empty: install.sh only falls back to the checkout's
+            # k8s-operator/scripts/vars.sh when this name is unset entirely. That
+            # file is untracked, so CI never has one and a developer who has run an
+            # install does -- the difference between a green suite here and there.
+            "KUBE_AGENTS_LEGACY_VARS_FILE": "",
+        }
+        overrides.update(env_overrides or {})
+        full_env = get_isolated_test_env(overrides=overrides, bin_dir=bin_dir)
+        full_script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+trap - ERR
+{script_body}
+"""
+        return subprocess.run(
+            ["bash", "-c", full_script],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+            timeout=20,
+        )
+
+    def test_preflight_skips_on_fresh_cluster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            called_file = pathlib.Path(tmp) / "kubectl.called"
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(f"""#!/usr/bin/env bash
+echo "called" > "{called_file}"
+exit 1
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            body = """
+TFVARS_CREATE_CLUSTER=true check_existing_cluster_capacity_preflight "cluster" "region" "proj"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("Skipping cluster capacity preflight check (create_cluster is true)", proc.stdout)
+            self.assertFalse(called_file.exists(), "kubectl was called on a create_cluster=true skip")
+
+    def test_preflight_runs_on_existing_cluster_when_managed_by_tf_state(self):
+        # On a cluster created and managed by Terraform state (TFVARS_CREATE_CLUSTER=true,
+        # TFVARS_CLUSTER_EXISTS=true), Day-2 apply must preflight capacity because the pool
+        # is fixed in size and cannot auto-grow for new workloads (#1297).
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            called_file = pathlib.Path(tmp) / "kubectl.called"
+            nodes_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "node-1"},
+                    "spec": {"taints": []},
+                    "status": {
+                        "allocatable": {"cpu": "4000m", "memory": "8Gi"}
+                    }
+                }]
+            })
+            pods_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "system-pod"},
+                    "spec": {
+                        "nodeName": "node-1",
+                        "containers": [{
+                            "resources": {"requests": {"cpu": "200m", "memory": "500Mi"}}
+                        }]
+                    }
+                }]
+            })
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(f"""#!/usr/bin/env bash
+echo "called" >> "{called_file}"
+case "$*" in
+  *nodes*-o*json*) cat << 'EOF'
+{nodes_json}
+EOF
+  ;;
+  *pods*-o*json*) cat << 'EOF'
+{pods_json}
+EOF
+  ;;
+esac
+exit 0
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *node-pools*list*) cat << 'EOF'
+[]
+EOF
+  ;;
+  *) exit 1 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = """
+TFVARS_CREATE_CLUSTER=true TFVARS_CLUSTER_EXISTS=true TFVARS_CLUSTER_MODE=standard \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertNotIn("Skipping cluster capacity preflight check (create_cluster is true)", proc.stdout)
+            self.assertIn("Cluster capacity preflight check passed", proc.stdout)
+            self.assertTrue(called_file.exists(), "kubectl was not called on existing cluster in tf state")
+
+    def test_preflight_skips_on_autopilot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            called_file = pathlib.Path(tmp) / "kubectl.called"
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(f"""#!/usr/bin/env bash
+echo "called" > "{called_file}"
+exit 1
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            body = """
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=autopilot check_existing_cluster_capacity_preflight "cluster" "region" "proj"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("Skipping cluster capacity preflight check (cluster_mode is not standard)", proc.stdout)
+            self.assertFalse(called_file.exists(), "kubectl was called on an autopilot skip")
+
+    def test_preflight_skips_when_skip_capacity_check_is_true(self):
+        body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard SKIP_CAPACITY_CHECK=true check_existing_cluster_capacity_preflight "cluster" "region" "proj"
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("Skipping cluster capacity preflight check", proc.stdout)
+
+    def test_preflight_passes_with_sufficient_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "node-1"},
+                    "spec": {"taints": []},
+                    "status": {
+                        "allocatable": {"cpu": "4000m", "memory": "8Gi"}
+                    }
+                }]
+            })
+            pods_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "system-pod"},
+                    "spec": {
+                        "nodeName": "node-1",
+                        "containers": [{
+                            "resources": {"requests": {"cpu": "200m", "memory": "500Mi"}}
+                        }]
+                    }
+                }]
+            })
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("Cluster capacity preflight check passed", proc.stdout)
+
+    def test_preflight_fails_fast_with_insufficient_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1 node with 940m CPU, pods already using 850m -> only 90m free (< required CPU)
+            nodes_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "node-small"},
+                    "spec": {"taints": []},
+                    "status": {
+                        "allocatable": {"cpu": "940m", "memory": "2Gi"}
+                    }
+                }]
+            })
+            pods_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "workload-1"},
+                    "spec": {
+                        "nodeName": "node-small",
+                        "containers": [{
+                            "resources": {"requests": {"cpu": "850m", "memory": "1500Mi"}}
+                        }]
+                    }
+                }]
+            })
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 1, f"Expected preflight failure, got code {proc.returncode}")
+            self.assertIn("Cluster capacity preflight check failed", proc.stdout)
+            self.assertIn("Insufficient schedulable CPU", proc.stdout)
+
+    def test_preflight_ignores_tainted_gvisor_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # node-1 is gVisor tainted; node-2 is untainted but has zero free capacity
+            nodes_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": "node-gvisor"},
+                        "spec": {"taints": [{"key": "sandbox.gke.io/runtime", "value": "gvisor", "effect": "NoSchedule"}]},
+                        "status": {"allocatable": {"cpu": "8000m", "memory": "32Gi"}}
+                    },
+                    {
+                        "metadata": {"name": "node-default"},
+                        "spec": {"taints": []},
+                        "status": {"allocatable": {"cpu": "500m", "memory": "1Gi"}}
+                    }
+                ]
+            })
+            pods_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "busy-pod"},
+                    "spec": {
+                        "nodeName": "node-default",
+                        "containers": [{"resources": {"requests": {"cpu": "450m", "memory": "800Mi"}}}]
+                    }
+                }]
+            })
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("Cluster capacity preflight check failed", proc.stdout)
+            self.assertIn("1 untainted node(s)", proc.stdout)
+
+    def test_preflight_ignores_cordoned_and_not_ready_nodes(self):
+        # Self-Review finding 5: nodes with spec.unschedulable=true or with a
+        # Ready condition of False/Unknown must not be counted as available capacity.
+        # Node 1 is cordoned (unschedulable) and Node 2 is NotReady, each with ample
+        # capacity; Node 3 is ready and untainted but has only 500m/1Gi, with 450m/800Mi
+        # consumed by a pod. The preflight must exclude both cordoned/unready nodes,
+        # find only 1 untainted schedulable node, and fail on insufficient capacity.
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": "node-cordoned"},
+                        "spec": {"unschedulable": True, "taints": []},
+                        "status": {
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                            "allocatable": {"cpu": "8000m", "memory": "32Gi"},
+                        },
+                    },
+                    {
+                        "metadata": {"name": "node-notready"},
+                        "spec": {"taints": []},
+                        "status": {
+                            "conditions": [{"type": "Ready", "status": "False"}],
+                            "allocatable": {"cpu": "8000m", "memory": "32Gi"},
+                        },
+                    },
+                    {
+                        "metadata": {"name": "node-ready"},
+                        "spec": {"taints": []},
+                        "status": {
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                            "allocatable": {"cpu": "500m", "memory": "1Gi"},
+                        },
+                    },
+                ]
+            })
+            pods_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "busy-pod"},
+                    "spec": {
+                        "nodeName": "node-ready",
+                        "containers": [{"resources": {"requests": {"cpu": "450m", "memory": "800Mi"}}}],
+                    },
+                }]
+            })
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = """
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("Cluster capacity preflight check failed", proc.stdout)
+            self.assertIn("1 untainted node(s)", proc.stdout)
+
+    def test_preflight_warns_rather_than_passes_when_the_node_json_is_truncated(self):
+        """A check that could not read its input has not passed.
+
+        The `[ ! -s ]` guard rejects an empty node document, not a partial one,
+        and the evaluator answers a partial one with {"error": ...} and exit 0.
+        Read with a default, that document reports a pass over zero nodes --
+        the same shape the working path fails hard on ("No untainted nodes
+        found in cluster").
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *nodes*-o*json*) printf '%s' '{"items": [{"metadata": {"nam' ;;
+  *pods*-o*json*) printf '%s' '{"items": []}' ;;
+esac
+exit 0
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text("#!/usr/bin/env bash\nexit 0\n")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            self.assertIn("Failed to calculate cluster schedulable capacity", combined)
+            self.assertNotIn("Cluster capacity preflight check passed", combined)
+
+    def test_flags_helm_timeout_and_skip_capacity_check(self):
+        body = """
+parse_args --helm-timeout=720 --skip-capacity-check
+echo "TIMEOUT=$PARAM_HELM_TIMEOUT"
+echo "SKIP=$PARAM_SKIP_CAPACITY_CHECK"
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("TIMEOUT=720", proc.stdout)
+        self.assertIn("SKIP=true", proc.stdout)
+
+    def test_diagnose_rollout_failure_prints_pending_pods_on_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *get*pods*) echo "litellm-abc" ;;
+  *get*events*) echo "FailedScheduling 0/2 nodes available: Insufficient cpu." ;;
+esac
+exit 0
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "Error: context deadline exceeded\n"
+                "\n"
+                "  with helm_release.kube_agents,\n"
+                '  on main.tf line 497, in resource "helm_release" "kube_agents":\n'
+            )
+            body = f"""
+diagnose_rollout_failure "{log_file}"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("Helm rollout timed out waiting for Kubernetes workloads", proc.stdout)
+            self.assertIn("litellm-abc", proc.stdout)
+            self.assertIn("Insufficient cpu", proc.stdout)
+
+    def test_diagnose_rollout_failure_ignores_a_timeout_from_another_provider(self):
+        # "context deadline exceeded" and "timed out waiting" are not Helm's.
+        # The Google provider prints both for its own long API calls, so a
+        # cluster creation that ran out of time carries the same phrase. What
+        # separates them is the resource terraform attributes the error to.
+        # Without this the diagnoser announces a Helm rollout failure and then
+        # queries a cluster the apply never finished building.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            called_file = pathlib.Path(tmp) / "kubectl.called"
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(f"""#!/usr/bin/env bash
+echo "called" > "{called_file}"
+exit 1
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "Error: timed out waiting for the condition\n"
+                "\n"
+                "  with google_container_cluster.primary,\n"
+                '  on main.tf line 120, in resource "google_container_cluster" "primary":\n'
+            )
+            body = f"""
+diagnose_rollout_failure "{log_file}"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertNotIn("Helm rollout timed out", proc.stdout)
+            self.assertFalse(called_file.exists(), "kubectl was called when diagnosing a provider timeout")
+
+    def test_diagnose_rollout_failure_ignores_a_node_pool_timeout_in_a_real_apply_log(self):
+        # The log the predicate actually reads is the tee of `./lifecycle.sh
+        # apply`, and lifecycle.sh runs `terraform apply` with no saved plan, so
+        # terraform prints the refresh and the plan into it first. Both
+        # helm_release addresses are therefore in the log of every apply the
+        # installer runs, whether or not either release started -- which a
+        # substring test for "helm_release" cannot tell apart from a rollout
+        # that timed out. The error block's attribution line can: terraform
+        # prints "with <address>," only under the error it raised.
+        #
+        # The case that matters is this one: the gVisor node pool is created by
+        # the same apply, and the Google provider says "context deadline
+        # exceeded" when it runs long. The fixtures above cannot catch it --
+        # they are four-line error blocks with no plan above them, a shape
+        # terraform does not produce.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            called_file = pathlib.Path(tmp) / "kubectl.called"
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(f"""#!/usr/bin/env bash
+echo "called" > "{called_file}"
+exit 1
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "module.gke_cluster.google_container_cluster.primary: Refreshing state... "
+                "[id=projects/p/locations/us-east4/clusters/platform-agent-host]\n"
+                "helm_release.cert_manager: Refreshing state... [id=cert-manager]\n"
+                "helm_release.kube_agents: Refreshing state... [id=kube-agents]\n"
+                "\n"
+                "Terraform used the selected providers to generate the following execution\n"
+                "plan. Resource actions are indicated with the following symbols:\n"
+                "  + create\n"
+                "\n"
+                "Terraform will perform the following actions:\n"
+                "\n"
+                "  # google_container_node_pool.gvisor_pool will be created\n"
+                '  + resource "google_container_node_pool" "gvisor_pool" {\n'
+                '      + name = "gvisor-pool"\n'
+                "    }\n"
+                "\n"
+                "  # helm_release.kube_agents will be updated in-place\n"
+                '  ~ resource "helm_release" "kube_agents" {\n'
+                '      ~ version = "0.1.0" -> "0.2.0"\n'
+                "    }\n"
+                "\n"
+                "Plan: 1 to add, 1 to change, 0 to destroy.\n"
+                "google_container_node_pool.gvisor_pool: Creating...\n"
+                "google_container_node_pool.gvisor_pool: Still creating... [10m0s elapsed]\n"
+                "\n"
+                "Error: context deadline exceeded\n"
+                "\n"
+                "  with google_container_node_pool.gvisor_pool,\n"
+                '  on main.tf line 284, in resource "google_container_node_pool" "gvisor_pool":\n'
+                "  284: resource \"google_container_node_pool\" \"gvisor_pool\" {\n"
+            )
+            body = f"""
+diagnose_rollout_failure "{log_file}"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertNotIn(
+                "Helm rollout timed out",
+                proc.stdout,
+                "a node-pool timeout in an apply log that names both helm_release "
+                "resources in its plan was diagnosed as a Helm rollout failure",
+            )
+            self.assertFalse(called_file.exists(), "kubectl was called when diagnosing a node-pool timeout")
+
+    def test_helm_rollout_timed_out_still_fires_on_a_release_timeout_in_a_real_apply_log(self):
+        # The mirror of the test above: the same plan and refresh preamble, with
+        # the error attributed to the release instead. Without this, narrowing
+        # the discriminator could pass by rejecting everything.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "helm_release.cert_manager: Refreshing state... [id=cert-manager]\n"
+                "\n"
+                "  # helm_release.kube_agents will be created\n"
+                '  + resource "helm_release" "kube_agents" {\n'
+                "    }\n"
+                "\n"
+                "Plan: 1 to add, 0 to change, 0 to destroy.\n"
+                "helm_release.kube_agents: Creating...\n"
+                "helm_release.kube_agents: Still creating... [10m0s elapsed]\n"
+                "\n"
+                "Error: context deadline exceeded\n"
+                "\n"
+                "  with helm_release.kube_agents,\n"
+                '  on main.tf line 497, in resource "helm_release" "kube_agents":\n'
+            )
+            body = f"""
+if helm_rollout_timed_out "{log_file}"; then echo "PREDICATE=true"; else echo "PREDICATE=false"; fi
+"""
+            proc = self._run_cmd(body)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("PREDICATE=true", proc.stdout)
+
+    def test_helm_rollout_timed_out_matches_real_colored_boxed_terraform_error(self):
+        # Under `lifecycle.sh apply | tee`, Terraform's default diagnostic formatter
+        # emits boxed error blocks with ANSI color sequences and `│` box-drawing rules:
+        # `\x1b[31m│\x1b[0m   with helm_release.kube_agents,`. The predicate must match
+        # this shape so rollout diagnosis fires under real interactive runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "helm_release.cert_manager: Refreshing state... [id=cert-manager]\n"
+                "\n"
+                "\x1b[31m╷\x1b[0m\x1b[0m\n"
+                "\x1b[31m│\x1b[0m \x1b[1m\x1b[31mError: \x1b[0m\x1b[1mcontext deadline exceeded\x1b[0m\n"
+                "\x1b[31m│\x1b[0m \n"
+                "\x1b[31m│\x1b[0m   with helm_release.kube_agents,\n"
+                "\x1b[31m│\x1b[0m   on main.tf line 497, in resource \"helm_release\" \"kube_agents\":\n"
+                "\x1b[31m│\x1b[0m  497: resource \"helm_release\" \"kube_agents\" {\n"
+                "\x1b[31m╵\x1b[0m\x1b[0m\n"
+            )
+            body = f"""
+if helm_rollout_timed_out "{log_file}"; then echo "PREDICATE=true"; else echo "PREDICATE=false"; fi
+"""
+            proc = self._run_cmd(body)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("PREDICATE=true", proc.stdout)
+
+    def test_helm_rollout_timed_out_does_not_fire_on_colored_boxed_node_pool_error(self):
+        # Negative counterpart to ensure ANSI / rule-prefix tolerance does not
+        # match non-Helm resources that failed with context deadline exceeded.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "helm_release.kube_agents: Refreshing state... [id=kube-agents]\n"
+                "\n"
+                "\x1b[31m╷\x1b[0m\x1b[0m\n"
+                "\x1b[31m│\x1b[0m \x1b[1m\x1b[31mError: \x1b[0m\x1b[1mcontext deadline exceeded\x1b[0m\n"
+                "\x1b[31m│\x1b[0m \n"
+                "\x1b[31m│\x1b[0m   with google_container_node_pool.gvisor_pool,\n"
+                "\x1b[31m│\x1b[0m   on main.tf line 284, in resource \"google_container_node_pool\" \"gvisor_pool\":\n"
+                "\x1b[31m╵\x1b[0m\x1b[0m\n"
+            )
+            body = f"""
+if helm_rollout_timed_out "{log_file}"; then echo "PREDICATE=true"; else echo "PREDICATE=false"; fi
+"""
+            proc = self._run_cmd(body)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("PREDICATE=false", proc.stdout)
+
+    def test_helm_rollout_timed_out_distinguishes_split_errors_across_different_blocks(self):
+        # Proves that helm_rollout_timed_out enforces the same-block rule and does
+        # not falsely trigger when "with helm_release." appears in one error block
+        # (for a non-timeout failure) and "context deadline exceeded" appears in a
+        # separate error block (for a non-Helm resource). A naive whole-file grep
+        # would match both and falsely diagnose a rollout failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "╷\n"
+                "│ Error: Resource creation failed\n"
+                "│ \n"
+                "│   with helm_release.kube_agents,\n"
+                '│   on main.tf line 497, in resource "helm_release" "kube_agents":\n'
+                "╵\n"
+                "╷\n"
+                "│ Error: context deadline exceeded\n"
+                "│ \n"
+                "│   with google_container_node_pool.gvisor_pool,\n"
+                '│   on main.tf line 284, in resource "google_container_node_pool" "gvisor_pool":\n'
+                "╵\n"
+            )
+            body = f"""
+if helm_rollout_timed_out "{log_file}"; then echo "PREDICATE=true"; else echo "PREDICATE=false"; fi
+"""
+            proc = self._run_cmd(body)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("PREDICATE=false", proc.stdout)
+
+    def test_helm_rollout_timed_out_survives_a_warning_nested_in_the_same_box(self):
+        # Terraform nests provider warnings in a diagnostic's detail text. The
+        # matcher used to clear its state on any Error:/Warning: line, so a
+        # warning between the attribution and the timeout phrase wiped the
+        # attribution of the very rollout being reported -- and the installer
+        # printed a bare `context deadline exceeded` with no diagnosis.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "╷\n"
+                "│ Error: context deadline exceeded\n"
+                "│ \n"
+                "│   with helm_release.kube_agents,\n"
+                '│   on main.tf line 497, in resource "helm_release" "kube_agents":\n'
+                "│ \n"
+                "│ Warning: Helm release created but has a failed status.\n"
+                "│ timed out waiting for the condition\n"
+                "╵\n"
+            )
+            body = f"""
+if helm_rollout_timed_out "{log_file}"; then echo "PREDICATE=true"; else echo "PREDICATE=false"; fi
+"""
+            proc = self._run_cmd(body)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("PREDICATE=true", proc.stdout)
+
+    def test_helm_rollout_timed_out_does_not_pair_a_closed_box_with_a_later_timeout(self):
+        # The closing ╵ ends a diagnostic. A non-timeout helm_release error
+        # followed by an unboxed timeout from somewhere else is two failures,
+        # and resetting only on the opening ╷ would have joined them.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "╷\n"
+                "│ Error: Resource creation failed\n"
+                "│ \n"
+                "│   with helm_release.kube_agents,\n"
+                '│   on main.tf line 497, in resource "helm_release" "kube_agents":\n'
+                "╵\n"
+                "\n"
+                "Terraform: waiting for the node pool: timed out waiting for the condition\n"
+            )
+            body = f"""
+if helm_rollout_timed_out "{log_file}"; then echo "PREDICATE=true"; else echo "PREDICATE=false"; fi
+"""
+            proc = self._run_cmd(body)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("PREDICATE=false", proc.stdout)
+
+    def test_helm_timeout_rejects_non_positive_integers(self):
+        # Drives install.sh's own validator. The previous version of this test
+        # re-implemented the regex in the bash it ran and asserted on its own
+        # echo, so deleting the check in install.sh left it green.
+        for invalid_val in ["0", "-10", "abc", "12m", "600.5"]:
+            with self.subTest(value=invalid_val):
+                proc = self._run_cmd(f'validate_helm_timeout "{invalid_val}"')
+                self.assertNotEqual(
+                    proc.returncode,
+                    0,
+                    f"install.sh: expected --helm-timeout='{invalid_val}' to be rejected",
+                )
+                self.assertIn("positive integer", proc.stdout + proc.stderr)
+
+    def test_helm_timeout_rejects_values_outside_the_hindsight_window(self):
+        # 539 aborts a cold hindsight-api roll that is loading normally; 900 is
+        # the Deployment's own progressDeadlineSeconds, at which helm stops
+        # waiting whatever it was asked for. tests/test_hindsight_probes.py
+        # holds both numbers against the manifest they come from.
+        for out_of_range in ["1", "300", "539", "900", "1800", "99999999999999999999999999999999"]:
+            with self.subTest(value=out_of_range):
+                proc = self._run_cmd(f'validate_helm_timeout "{out_of_range}"')
+                self.assertNotEqual(
+                    proc.returncode,
+                    0,
+                    f"install.sh: expected --helm-timeout='{out_of_range}' to be out of range",
+                )
+
+    def test_helm_timeout_accepts_the_window_and_an_unset_value(self):
+        for valid_val in ["540", "600", "899", ""]:
+            with self.subTest(value=valid_val):
+                proc = self._run_cmd(f'validate_helm_timeout "{valid_val}"')
+                self.assertEqual(
+                    proc.returncode,
+                    0,
+                    f"install.sh: expected --helm-timeout='{valid_val}' to be accepted, "
+                    f"stdout: {proc.stdout} stderr: {proc.stderr}",
+                )
+
+    def test_the_installer_window_is_the_terraform_variable_window(self):
+        # install.sh validates --helm-timeout and then writes the value into
+        # the full-install composition's helm_timeout variable, whose own
+        # validation block repeats the bounds. Nothing holds the two copies
+        # together. Raise one and miss the other and the installer accepts a
+        # value terraform rejects -- which surfaces at apply, after the
+        # tfvars are written and the cluster has been mutated. The three tests
+        # above pin the installer's behaviour to literals; this one pins those
+        # literals to the file they have to agree with.
+        bounds = terraform_gate_bounds_seconds()
+        self.assertIsNotNone(
+            bounds,
+            "the helm_timeout tfvar lost its validation block, so the installer's "
+            "window is the only check on a value terraform will still accept",
+        )
+        floor, ceiling = bounds
+        for value, accepted in (
+            (floor - 1, False),
+            (floor, True),
+            (ceiling, True),
+            (ceiling + 1, False),
+        ):
+            with self.subTest(value=value, accepted=accepted):
+                proc = self._run_cmd(f'validate_helm_timeout "{value}"')
+                if accepted:
+                    self.assertEqual(
+                        proc.returncode,
+                        0,
+                        f"terraform admits --helm-timeout={value} and install.sh "
+                        f"rejects it: {proc.stdout} {proc.stderr}",
+                    )
+                else:
+                    self.assertNotEqual(
+                        proc.returncode,
+                        0,
+                        f"install.sh accepts --helm-timeout={value}, which the "
+                        "helm_timeout variable's validation block rejects at apply",
+                    )
+
+    def test_capacity_preflight_failure_aborts_a_non_interactive_run(self):
+        body = """
+check_existing_cluster_capacity_preflight() { return 1; }
+write_json_report() { echo "REPORT_STATUS=$1"; }
+PARAM_NON_INTERACTIVE=true PARAM_DRY_RUN=false \\
+  enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Aborting before Terraform apply", proc.stdout + proc.stderr)
+
+    def test_capacity_refusal_writes_a_machine_readable_status(self):
+        # The agent-facing contract: an aborted run leaves a report describing
+        # this run, not whatever the last successful install wrote.
+        body = """
+check_existing_cluster_capacity_preflight() { return 1; }
+write_json_report() { echo "REPORT_STATUS=$1"; }
+PARAM_NON_INTERACTIVE=true PARAM_DRY_RUN=false \\
+  enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+        proc = self._run_cmd(body)
+        self.assertIn("REPORT_STATUS=REFUSED_INSUFFICIENT_CAPACITY", proc.stdout)
+
+    def test_declining_the_capacity_prompt_pauses_rather_than_fails(self):
+        body = """
+check_existing_cluster_capacity_preflight() { return 1; }
+write_json_report() { echo "REPORT_STATUS=$1"; }
+has_controlling_tty() { return 0; }
+prompt_read() { eval "$2=n"; }
+PARAM_NON_INTERACTIVE=false PARAM_DRY_RUN=false \\
+  enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("REPORT_STATUS=PAUSED", proc.stdout)
+
+    def test_capacity_preflight_failure_refuses_when_no_controlling_tty(self):
+        body = """
+check_existing_cluster_capacity_preflight() { return 1; }
+write_json_report() { echo "REPORT_STATUS=$1"; }
+has_controlling_tty() { return 1; }
+PARAM_NON_INTERACTIVE=false PARAM_DRY_RUN=false \\
+  enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("REPORT_STATUS=REFUSED_INSUFFICIENT_CAPACITY", proc.stdout)
+
+    def test_capacity_preflight_failure_only_warns_on_a_dry_run(self):
+        body = """
+check_existing_cluster_capacity_preflight() { return 1; }
+write_json_report() { echo "REPORT_STATUS=$1"; }
+PARAM_NON_INTERACTIVE=true PARAM_DRY_RUN=true \\
+  enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("continuing dry-run validation", proc.stdout + proc.stderr)
+        self.assertNotIn("REPORT_STATUS=", proc.stdout)
+
+    def test_enforce_capacity_preflight_honours_tfvars_enable_cert_manager(self):
+        body = """
+check_existing_cluster_capacity_preflight() {
+  echo "CERT_MGR_ARG=$9"
+  return 0
+}
+TFVARS_ENABLE_CERT_MANAGER=false enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+TFVARS_ENABLE_CERT_MANAGER=true enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+unset TFVARS_ENABLE_CERT_MANAGER
+enforce_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        lines = [line for line in proc.stdout.splitlines() if "CERT_MGR_ARG=" in line]
+        self.assertEqual(lines, ["CERT_MGR_ARG=false", "CERT_MGR_ARG=true", "CERT_MGR_ARG=true"])
+
+    def _preflight_bin_dir(self, tmp, nodes_json, pods_json, pools_json="[]"):
+        """A bin dir whose kubectl and gcloud answer with the given cluster state.
+
+        gcloud is always stubbed, including when the pool list is empty: the
+        preflight shells out to it now, and a real gcloud on PATH would make
+        the test depend on the developer's credentials.
+        """
+        bin_dir = pathlib.Path(tmp) / "bin"
+        bin_dir.mkdir()
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text(f"""#!/usr/bin/env bash
+case "$*" in
+  *nodes*-o*json*) cat << 'EOF'
+{nodes_json}
+EOF
+  ;;
+  *pods*-o*json*) cat << 'EOF'
+{pods_json}
+EOF
+  ;;
+esac
+exit 0
+""")
+        kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+        gcloud = bin_dir / "gcloud"
+        gcloud.write_text(f"""#!/usr/bin/env bash
+case "$*" in
+  *node-pools*list*) cat << 'EOF'
+{pools_json}
+EOF
+  ;;
+  *) exit 1 ;;
+esac
+exit 0
+""")
+        gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+        return bin_dir
+
+    # One 2000m/4096Mi node, which is short of the hindsight profile on its own.
+    _ONE_SMALL_NODE = json.dumps({
+        "items": [{
+            "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}},
+            "spec": {"taints": []},
+            "status": {
+                "allocatable": {"cpu": "2000m", "memory": "4096Mi"},
+                "conditions": [{"type": "Ready", "status": "True"}],
+            },
+        }]
+    })
+
+    def test_preflight_credits_headroom_an_autoscaling_pool_can_still_add(self):
+        # The regression this guards: a pool that scales 1 -> 5 answers a
+        # deficit by itself, and blocking the install on the one node running
+        # right now fails a cluster that was never going to be short.
+        pools = json.dumps([{
+            "name": "default-pool",
+            "autoscaling": {"enabled": True, "maxNodeCount": 5},
+            "locations": ["us-central1-a"],
+            "config": {},
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(
+                tmp, self._ONE_SMALL_NODE, json.dumps({"items": []}), pools)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "hindsight" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("autoscaling headroom", proc.stdout + proc.stderr)
+
+    def test_preflight_still_fails_when_the_pool_is_at_its_ceiling(self):
+        pools = json.dumps([{
+            "name": "default-pool",
+            "autoscaling": {"enabled": True, "maxNodeCount": 1},
+            "locations": ["us-central1-a"],
+            "config": {},
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(
+                tmp, self._ONE_SMALL_NODE, json.dumps({"items": []}), pools)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "hindsight" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 1, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertNotIn("autoscaling headroom", proc.stdout + proc.stderr)
+
+    def test_preflight_counts_native_sidecar_requests_against_a_node(self):
+        # A restartable init container runs for the life of the pod. Treating
+        # it as a phase that ends hides its request, and the check then reports
+        # capacity the scheduler will not find.
+        pods = json.dumps({
+            "items": [{
+                "metadata": {"name": "app", "namespace": "default"},
+                "spec": {
+                    "nodeName": "n1",
+                    "containers": [{"resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}],
+                    "initContainers": [{
+                        "restartPolicy": "Always",
+                        "resources": {"requests": {"cpu": "1500m", "memory": "256Mi"}},
+                    }],
+                },
+                "status": {"phase": "Running"},
+            }]
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(tmp, self._ONE_SMALL_NODE, pods)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "none" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            # 2000m allocatable less 100m container and 1500m sidecar leaves
+            # 400m. Counting the sidecar as a finished phase would leave 500m.
+            self.assertIn("400m", proc.stdout + proc.stderr)
+            self.assertNotIn("500m <", proc.stdout + proc.stderr)
+
+    def test_preflight_reads_the_spellings_a_quantity_can_arrive_in(self):
+        # A quantity comes back spelled the way its author wrote it, not in a
+        # canonical form, so nanocores and plain bytes are both ordinary input.
+        # The parser used to raise on the first of those, and the raise left
+        # the evaluator with no output at all: one tenant pod using a legal
+        # unit skipped the capacity check for the whole cluster, and the only
+        # trace was a warning that reads like a transient kubectl failure.
+        pods = json.dumps({
+            "items": [{
+                "metadata": {"name": "app", "namespace": "default"},
+                "spec": {
+                    "nodeName": "n1",
+                    "containers": [{"resources": {"requests": {
+                        "cpu": "1400000000n",   # 1400m
+                        "memory": "268435456",  # 256Mi, in bytes
+                    }}}],
+                },
+                "status": {"phase": "Running"},
+            }]
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            big_node = self._ONE_SMALL_NODE.replace('"2000m"', '"4000m"').replace('"4096Mi"', '"8192Mi"')
+            bin_dir = self._preflight_bin_dir(tmp, big_node, pods)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "none" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            output = proc.stdout + proc.stderr
+            self.assertNotIn("Failed to calculate cluster schedulable capacity", output)
+            # 4000m less 1400m, and 8192Mi less 256Mi. Reading either quantity
+            # as zero would report the node's full allocatable instead.
+            self.assertIn("2600m CPU", output)
+            self.assertIn("7936Mi Memory", output)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+
+    def test_preflight_reads_allocatable_in_the_Ki_gke_reports_it_in(self):
+        # Every GKE node reports status.allocatable.memory in Ki, so this is
+        # the spelling the check meets on every real cluster and the one branch
+        # of parse_mem that has to be right. Reading it as Mi would credit the
+        # node with a thousand times its memory.
+        node = json.dumps({
+            "items": [{
+                "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}},
+                "spec": {"taints": []},
+                "status": {
+                    "allocatable": {"cpu": "4000m", "memory": "16069588Ki"},
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            }]
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(tmp, node, json.dumps({"items": []}))
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "none" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            output = proc.stdout + proc.stderr
+            # 16069588Ki is 15692Mi. Mis-scaled by 1024 it reads as either
+            # 16069588Mi or 15Mi, and neither is this number.
+            self.assertIn("15692Mi Memory", output)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+
+    def test_preflight_discounts_daemonsets_from_the_node_a_pool_would_add(self):
+        # A DaemonSet lands on every node of the pool, including the one the
+        # autoscaler has yet to create, so a new node offers its allocatable
+        # less that pod -- not its allocatable. Crediting the full figure is
+        # how this check passes a cluster the rollout then leaves Pending.
+        pods = json.dumps({
+            "items": [{
+                "metadata": {
+                    "name": "agent", "namespace": "kube-system",
+                    "ownerReferences": [{"kind": "DaemonSet", "name": "agent"}],
+                },
+                "spec": {
+                    "nodeName": "n1",
+                    "containers": [{"resources": {"requests": {"cpu": "1000m", "memory": "2048Mi"}}}],
+                },
+                "status": {"phase": "Running"},
+            }]
+        })
+        pools = json.dumps([{
+            "name": "default-pool",
+            "autoscaling": {"enabled": True, "maxNodeCount": 2},
+            "locations": ["us-central1-a"],
+            "config": {},
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(tmp, self._ONE_SMALL_NODE, pods, pools)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "none" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            # The one node is 2000m/4096Mi and the DaemonSet takes half of it.
+            # A second node discounted the same way brings the total to
+            # 2000m/4096Mi, still short. Credited undiscounted it would reach
+            # 3000m/6144Mi, clear the requirement, and pass on headroom.
+            self.assertEqual(proc.returncode, 1, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertNotIn("autoscaling headroom", proc.stdout + proc.stderr)
+
+    def test_preflight_reads_totalMaxNodeCount_as_the_ceiling(self):
+        # A pool with locations set reports its ceiling as totalMaxNodeCount
+        # across all of them, and maxNodeCount per zone. Reading only the
+        # second refuses a regional pool that can still add nodes.
+        pools = json.dumps([{
+            "name": "default-pool",
+            "autoscaling": {"enabled": True, "totalMaxNodeCount": 5},
+            "locations": ["us-central1-a"],
+            "config": {},
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(
+                tmp, self._ONE_SMALL_NODE, json.dumps({"items": []}), pools)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "hindsight" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("autoscaling headroom", proc.stdout + proc.stderr)
+
+    def test_diagnose_rollout_failure_guards_the_scan_that_needs_python(self):
+        # The preflight warns and skips where python3 is absent; the diagnoser
+        # piped into it regardless, and the pipeline's own `|| true` turned the
+        # missing interpreter into an empty pod list -- a clean bill of health
+        # for pods that are crash-looping. Asserted against the shell's parse
+        # tree rather than a run, because hiding python3 from a test that has
+        # to source install.sh first would take the rest of PATH with it: this
+        # catches the guard being removed, not every way it could be wrong.
+        proc = self._run_cmd("declare -f diagnose_rollout_failure")
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        body = proc.stdout
+        guard = body.find("command -v python3")
+        self.assertNotEqual(guard, -1, "the unready-pod scan no longer checks for python3")
+        self.assertLess(
+            guard,
+            body.index("python3 -c"),
+            "the python3 check has to run before the scan that needs it",
+        )
+
+
+
+    def test_preflight_single_node_both_cpu_and_mem_required(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Node 1 has 2000m CPU, but only 500Mi memory
+            # Node 2 has 500m CPU, but 8000Mi memory
+            # Total CPU = 2500m, Total Mem = 8500Mi (>= 1790m CPU, 7584Mi Mem total)
+            # Unsandboxed agent needs single node with 1250m CPU AND 2048Mi memory!
+            nodes_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": "node-cpu-only"},
+                        "spec": {"taints": []},
+                        "status": {"allocatable": {"cpu": "2000m", "memory": "500Mi"}}
+                    },
+                    {
+                        "metadata": {"name": "node-mem-only"},
+                        "spec": {"taints": []},
+                        "status": {"allocatable": {"cpu": "500m", "memory": "8000Mi"}}
+                    }
+                ]
+            })
+            pods_json = json.dumps({"items": []})
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 1, f"Expected preflight failure, got code {proc.returncode}")
+            self.assertIn("No single untainted node has sufficient schedulable capacity", proc.stdout)
+
+    def test_preflight_autoscaling_heterogeneous_pools_does_not_synthesize_hybrid_node(self):
+        # Pool A has high CPU, low memory. Pool B has low CPU, high memory.
+        # Neither pool can fit an unsandboxed agent (needs 1250m CPU AND 2560Mi mem).
+        # Autoscaling headroom must not synthesize a hybrid node combining max(CPU)
+        # from Pool A and max(Memory) from Pool B.
+        nodes_json = json.dumps({
+            "items": [
+                {
+                    "metadata": {"name": "node-cpu", "labels": {"cloud.google.com/gke-nodepool": "pool-cpu"}},
+                    "spec": {"taints": []},
+                    "status": {
+                        "allocatable": {"cpu": "4000m", "memory": "1000Mi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                    },
+                },
+                {
+                    "metadata": {"name": "node-mem", "labels": {"cloud.google.com/gke-nodepool": "pool-mem"}},
+                    "spec": {"taints": []},
+                    "status": {
+                        "allocatable": {"cpu": "1000m", "memory": "8000Mi"},
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                    },
+                },
+            ]
+        })
+        pools_json = json.dumps([
+            {
+                "name": "pool-cpu",
+                "autoscaling": {"enabled": True, "maxNodeCount": 5},
+                "locations": ["us-central1-a"],
+                "config": {},
+            },
+            {
+                "name": "pool-mem",
+                "autoscaling": {"enabled": True, "maxNodeCount": 5},
+                "locations": ["us-central1-a"],
+                "config": {},
+            },
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, json.dumps({"items": []}), pools_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 1, f"Expected preflight failure, got code {proc.returncode}: {proc.stdout}")
+            self.assertIn("No single untainted node has sufficient schedulable capacity", proc.stdout)
+
+    def test_preflight_skips_minter_charge_when_minter_deferred(self):
+        # A node with 550m CPU and 4950Mi RAM fits the baseline without minter (510m CPU, 4928Mi mem),
+        # but cannot fit minter (+100m CPU = 610m CPU, +128Mi mem = 5056Mi mem).
+        # When TFVARS_ENABLE_GITHUB_MINTER=false, minter is not deployed and capacity check must pass.
+        node_json = json.dumps({
+            "items": [{
+                "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}},
+                "spec": {"taints": []},
+                "status": {
+                    "allocatable": {"cpu": "550m", "memory": "4950Mi"},
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            }]
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._preflight_bin_dir(tmp, node_json, json.dumps({"items": []}))
+            # 1. When minter is deferred (TFVARS_ENABLE_GITHUB_MINTER=false), check passes
+            body_deferred = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard TFVARS_ENABLE_GITHUB_MINTER=false \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "my-org" "my-repo" "false"
+"""
+            proc_deferred = self._run_cmd(body_deferred, bin_dir=str(bin_dir))
+            self.assertEqual(proc_deferred.returncode, 0, f"stdout: {proc_deferred.stdout}\nstderr: {proc_deferred.stderr}")
+
+            # 2. When minter is enabled (default), check fails on insufficient capacity
+            body_enabled = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard TFVARS_ENABLE_GITHUB_MINTER=true \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "my-org" "my-repo" "false"
+"""
+            proc_enabled = self._run_cmd(body_enabled, bin_dir=str(bin_dir))
+            self.assertEqual(proc_enabled.returncode, 1, f"stdout: {proc_enabled.stdout}\nstderr: {proc_enabled.stderr}")
+            self.assertIn("Insufficient schedulable CPU", proc_enabled.stdout)
+
+    def test_preflight_hindsight_single_pod_constraint_enforced_with_gvisor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 3 nodes with 1500m CPU and 5000Mi memory each -> total 4500m CPU
+            # But hindsight-api single pod requires 2000m CPU on a single node!
+            nodes_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": f"node-{i}"},
+                        "spec": {"taints": []},
+                        "status": {"allocatable": {"cpu": "1500m", "memory": "5000Mi"}},
+                    }
+                    for i in range(3)
+                ]
+            })
+            pods_json = json.dumps({"items": []})
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "hindsight" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=bin_dir)
+            self.assertEqual(proc.returncode, 1, f"Expected failure due to hindsight-api 2000m single-pod requirement, got {proc.returncode}")
+            self.assertIn("No single untainted node has sufficient schedulable capacity", proc.stdout)
+
+    def test_preflight_skips_when_kubectl_context_mismatches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *config*current-context*) echo "gke_other-proj_other-region_other-cluster" ;;
+esac
+exit 0
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text("""#!/usr/bin/env bash
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("does not match target cluster", proc.stdout)
+
+    def test_preflight_multidimensional_pods_fit_separate_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Node 1 fits hindsight-api (2000m CPU, 1024Mi mem): has 3000m CPU, 2500Mi mem (< 2560Mi needed for agent)
+            # Node 2 fits unsandboxed agent (1250m CPU, 2560Mi mem): has 1800m CPU (< 2000m needed for hindsight), 8000Mi mem
+            # Neither node fits a synthesized hybrid (2000m CPU AND 2560Mi mem),
+            # but each pod fits on its own node. Total CPU = 4800m >= 4040m, Total Mem = 10500Mi >= 8864Mi.
+            nodes_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": "node-hindsight-fit"},
+                        "spec": {"taints": []},
+                        "status": {"allocatable": {"cpu": "3000m", "memory": "2500Mi"}},
+                    },
+                    {
+                        "metadata": {"name": "node-agent-fit"},
+                        "spec": {"taints": []},
+                        "status": {"allocatable": {"cpu": "1800m", "memory": "8000Mi"}},
+                    },
+                ]
+            })
+            pods_json = json.dumps({"items": []})
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "hindsight" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=bin_dir)
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("Cluster capacity preflight check passed", proc.stdout)
+
+    def test_preflight_default_litellm_single_node_fit_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 10 nodes with 100m CPU and 600Mi memory each -> total 1000m CPU, 6000Mi mem (> 540m CPU, 5024Mi mem total)
+            # But LiteLLM requires 2048Mi on a single node!
+            nodes_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": f"node-{i}"},
+                        "spec": {"taints": []},
+                        "status": {"allocatable": {"cpu": "100m", "memory": "600Mi"}},
+                    } for i in range(10)
+                ]
+            })
+            pods_json = json.dumps({"items": []})
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" ""
+"""
+            proc = self._run_cmd(body, bin_dir=bin_dir)
+            self.assertEqual(proc.returncode, 1, f"Expected failure due to LiteLLM 2048Mi single-pod requirement, got {proc.returncode}")
+            self.assertIn("No single untainted node has sufficient schedulable capacity for LiteLLM pod", proc.stdout)
+
+    def test_diagnose_rollout_failure_prints_unready_pods_on_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *status.phase=Pending*) echo "" ;;
+  *status.phase=Running*) cat << 'EOF'
+{"items": [{"metadata": {"name": "agent-gateway-xyz"}, "status": {"containerStatuses": [{"ready": false}]}}]}
+EOF
+  ;;
+  *get*events*) echo "CrashLoopBackOff Back-off 10s restarting failed container" ;;
+esac
+exit 0
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "Error: timed out waiting for the condition\n"
+                "\n"
+                "  with helm_release.cert_manager,\n"
+                '  on main.tf line 450, in resource "helm_release" "cert_manager":\n'
+            )
+            body = f"""
+diagnose_rollout_failure "{log_file}"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("Helm rollout timed out waiting for Kubernetes workloads", proc.stdout)
+            self.assertIn("Unready / Crashing Pods Detected", proc.stdout)
+            self.assertIn("agent-gateway-xyz", proc.stdout)
+            self.assertIn("CrashLoopBackOff", proc.stdout)
+
+    def test_diagnose_rollout_failure_detects_unready_native_sidecars_on_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *status.phase=Pending*) echo "" ;;
+  *status.phase=Running*) cat << 'EOF'
+{
+  "items": [
+    {
+      "metadata": {"name": "pod-crashing-sidecar"},
+      "status": {
+        "containerStatuses": [{"name": "app", "ready": true}],
+        "initContainerStatuses": [{"name": "native-sidecar", "ready": false, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]
+      }
+    },
+    {
+      "metadata": {"name": "pod-completed-init"},
+      "status": {
+        "containerStatuses": [{"name": "app", "ready": true}],
+        "initContainerStatuses": [{"name": "init-setup", "ready": false, "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}}]
+      }
+    }
+  ]
+}
+EOF
+  ;;
+  *get*events*) echo "CrashLoopBackOff Back-off restarting failed sidecar" ;;
+esac
+exit 0
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "Error: timed out waiting for the condition\n"
+                "\n"
+                "  with helm_release.cert_manager,\n"
+                '  on main.tf line 450, in resource "helm_release" "cert_manager":\n'
+            )
+            body = f"""
+diagnose_rollout_failure "{log_file}"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("Unready / Crashing Pods Detected", proc.stdout)
+            self.assertIn("pod-crashing-sidecar", proc.stdout)
+            self.assertNotIn("pod-completed-init", proc.stdout)
+            self.assertIn("CrashLoopBackOff", proc.stdout)
+
+    def _monitor_bin_dir(self, tmp, current_context, gcloud_log, polls=2):
+        """Stubs that let monitor_lifecycle_rollout run to completion.
+
+        `sleep` is the loop's clock and its exit status is the loop's only
+        break: `wait` on it failing is what ends the while. Stubbing it to
+        succeed `polls` times and fail on the next call (`[ "$n" -le "$polls" ]`)
+        therefore runs multiple loop iterations and returns, with no background
+        job to reap and no real 20s wait.
+
+        Running multiple polls is load-bearing: it verifies that one-shot actions
+        (like fetching credentials on a context mismatch) execute exactly once
+        across repeated polls rather than firing per-poll.
+        """
+        bin_dir = pathlib.Path(tmp) / "bin"
+        bin_dir.mkdir()
+        counter = pathlib.Path(tmp) / "sleep.count"
+        sleep_stub = bin_dir / "sleep"
+        sleep_stub.write_text(f"""#!/usr/bin/env bash
+n=$(cat "{counter}" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{counter}"
+[ "$n" -le {polls} ]
+""")
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text(f"""#!/usr/bin/env bash
+case "$*" in
+  *current-context*) echo "{current_context}" ;;
+  *) echo "" ;;
+esac
+exit 0
+""")
+        gcloud = bin_dir / "gcloud"
+        gcloud.write_text(f"""#!/usr/bin/env bash
+echo "$@" >> "{gcloud_log}"
+exit 0
+""")
+        for stub in (sleep_stub, kubectl, gcloud):
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        return bin_dir
+
+    def test_monitor_fetches_credentials_once_with_the_dns_flag(self):
+        # The monitor refreshes credentials at most once on an adopted cluster
+        # when the context matches the target cluster (or is empty), carrying
+        # the DNS-endpoint flag without which get-credentials fails on a
+        # private-endpoint cluster.
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            bin_dir = self._monitor_bin_dir(tmp, "gke_proj_us-central1_target", gcloud_log)
+            body = """
+gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"; }
+PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=false \\
+  monitor_lifecycle_rollout
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            calls = [
+                line
+                for line in (gcloud_log.read_text().splitlines() if gcloud_log.exists() else [])
+                if "get-credentials" in line
+            ]
+            self.assertEqual(
+                len(calls), 1, f"expected one get-credentials attempt, got: {calls}"
+            )
+            self.assertIn("--dns-endpoint", calls[0])
+            self.assertIn("target", calls[0])
+
+    def test_monitor_skips_credential_fetch_when_context_mismatches(self):
+        # When kubectl current context points to a different cluster, the background
+        # monitor must NOT fetch credentials or mutate kubeconfig.
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            bin_dir = self._monitor_bin_dir(tmp, "gke_other_proj_us-west1_other", gcloud_log)
+            body = """
+gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"; }
+PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=false \\
+  monitor_lifecycle_rollout
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            calls = [
+                line
+                for line in (gcloud_log.read_text().splitlines() if gcloud_log.exists() else [])
+                if "get-credentials" in line
+            ]
+            self.assertEqual(
+                len(calls), 0, f"expected no get-credentials on context mismatch, got: {calls}"
+            )
+
+    def test_monitor_reports_pending_pods_during_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            counter = pathlib.Path(tmp) / "sleep.count"
+            sleep_stub = bin_dir / "sleep"
+            sleep_stub.write_text(f"""#!/usr/bin/env bash
+n=$(cat "{counter}" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{counter}"
+[ "$n" -le 1 ]
+""")
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *current-context*)
+    echo "gke_proj_us-central1_target"
+    ;;
+  *get*pods*status.phase=Pending*)
+    echo "litellm-pending-pod"
+    ;;
+  *get*events*involvedObject.name=litellm-pending-pod*)
+    echo "0/2 nodes available: 2 Insufficient cpu."
+    ;;
+  *get*pod*litellm-pending-pod*)
+    echo ""
+    ;;
+  *)
+    echo ""
+    ;;
+esac
+exit 0
+""")
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text("#!/usr/bin/env bash\nexit 0\n")
+            for stub in (sleep_stub, kubectl, gcloud):
+                stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            body = """
+gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"; }
+PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=false \\
+  monitor_lifecycle_rollout
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("Pod 'litellm-pending-pod' is Pending: 0/2 nodes available: 2 Insufficient cpu.", proc.stderr)
+
+    def test_monitor_does_not_touch_the_kubeconfig_while_the_cluster_is_being_built(self):
+        # On a create-cluster run the context cannot match until terraform has
+        # built the cluster, so every fetch is churn ending in a silent
+        # context switch the operator did not ask for.
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud_log.write_text("")
+            bin_dir = self._monitor_bin_dir(tmp, "gke_proj_us-central1_target", gcloud_log)
+            body = """
+gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"; }
+PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=true \\
+  monitor_lifecycle_rollout
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertNotIn("get-credentials", gcloud_log.read_text())
+
+    def test_monitor_fetches_credentials_when_existing_cluster_managed_by_tf_state(self):
+        # When a cluster already exists and is managed in Terraform state
+        # (TFVARS_CREATE_CLUSTER=true and TFVARS_CLUSTER_EXISTS=true), the monitor
+        # should fetch credentials rather than skipping as if the cluster were absent.
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            bin_dir = self._monitor_bin_dir(tmp, "gke_proj_us-central1_target", gcloud_log)
+            body = """
+gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"; }
+PROJECT_ID=proj REGION=us-central1 CLUSTER_NAME=target TFVARS_CREATE_CLUSTER=true TFVARS_CLUSTER_EXISTS=true \\
+  monitor_lifecycle_rollout
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            calls = [
+                line
+                for line in (gcloud_log.read_text().splitlines() if gcloud_log.exists() else [])
+                if "get-credentials" in line
+            ]
+            self.assertEqual(len(calls), 1, f"expected one get-credentials attempt, got: {calls}")
+
+    def test_monitor_survives_set_u_with_the_cluster_coordinates_unset(self):
+        # It runs as a background job under `set -u`, and `set -E` carries the
+        # ERR trap into it: dereferencing an unset PROJECT_ID here would not
+        # just lose the monitor, it would run on_error and write a FAILED
+        # install report while the apply was still healthy.
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud_log.write_text("")
+            bin_dir = self._monitor_bin_dir(tmp, "gke_other_proj_us-west1_other", gcloud_log)
+            body = """
+set -uE
+unset PROJECT_ID REGION CLUSTER_NAME
+on_error() { echo "ON_ERROR_RAN"; }
+trap 'on_error' ERR
+monitor_lifecycle_rollout
+echo "MONITOR_RETURNED"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertIn("MONITOR_RETURNED", proc.stdout)
+            self.assertNotIn("ON_ERROR_RAN", proc.stdout)
+            self.assertNotIn("unbound variable", proc.stderr)
+
+    def test_install_script_source_only_re_source_is_safe(self):
+        script = f"""
+set -e
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+echo "SOURCE_OK"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("SOURCE_OK", proc.stdout)
+
+    def test_preflight_ignores_pods_in_install_namespace_and_cert_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "node-1"},
+                    "spec": {"taints": []},
+                    "status": {"allocatable": {"cpu": "1200m", "memory": "8Gi"}},
+                }]
+            })
+            pods_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": "tenant-pod", "namespace": "default"},
+                        "spec": {
+                            "nodeName": "node-1",
+                            "containers": [{"resources": {"requests": {"cpu": "400m", "memory": "500Mi"}}}],
+                        },
+                    },
+                    {
+                        "metadata": {"name": "existing-agent-pod", "namespace": "kubeagents-system"},
+                        "spec": {
+                            "nodeName": "node-1",
+                            "containers": [{"resources": {"requests": {"cpu": "500m", "memory": "500Mi"}}}],
+                        },
+                    },
+                ]
+            })
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+            body = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard TFVARS_ENABLE_GITHUB_MINTER=false NAMESPACE=kubeagents-system \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"Expected preflight to pass by ignoring existing install namespace pods, stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("Cluster capacity preflight check passed", proc.stdout)
+
+    def test_preflight_cert_manager_ignored_when_managed_counted_when_unmanaged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes_json = json.dumps({
+                "items": [{
+                    "metadata": {"name": "node-1"},
+                    "spec": {"taints": []},
+                    "status": {"allocatable": {"cpu": "1000m", "memory": "8Gi"}},
+                }]
+            })
+            pods_json = json.dumps({
+                "items": [
+                    {
+                        "metadata": {"name": "tenant-pod", "namespace": "default"},
+                        "spec": {
+                            "nodeName": "node-1",
+                            "containers": [{"resources": {"requests": {"cpu": "400m", "memory": "500Mi"}}}],
+                        },
+                    },
+                    {
+                        "metadata": {"name": "cert-manager-pod", "namespace": "cert-manager"},
+                        "spec": {
+                            "nodeName": "node-1",
+                            "containers": [{"resources": {"requests": {"cpu": "100m", "memory": "100Mi"}}}],
+                        },
+                    },
+                ]
+            })
+            bin_dir = self._preflight_bin_dir(tmp, nodes_json, pods_json)
+
+            # Managed cert-manager: passes because cert-manager pod is ignored and 600m >= 540m
+            body_managed = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard TFVARS_ENABLE_GITHUB_MINTER=false \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" "" "true"
+"""
+            proc_managed = self._run_cmd(body_managed, bin_dir=str(bin_dir))
+            self.assertEqual(proc_managed.returncode, 0, f"Managed cert-manager should pass: {proc_managed.stdout}\n{proc_managed.stderr}")
+            self.assertIn("Cluster capacity preflight check passed", proc_managed.stdout)
+
+            # Unmanaged cert-manager: fails because cert-manager pod counts as tenant load (500m < 510m)
+            body_unmanaged = f"""
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard TFVARS_ENABLE_GITHUB_MINTER=false \\
+  check_existing_cluster_capacity_preflight "cluster" "region" "proj" "true" "file" "false" "" "" "false"
+"""
+            proc_unmanaged = self._run_cmd(body_unmanaged, bin_dir=str(bin_dir))
+            self.assertEqual(proc_unmanaged.returncode, 1, f"Unmanaged cert-manager should fail: {proc_unmanaged.stdout}\n{proc_unmanaged.stderr}")
+            self.assertIn("Cluster capacity preflight check failed", proc_unmanaged.stdout)
+            self.assertIn("Insufficient schedulable CPU", proc_unmanaged.stdout)
+
+    def test_diagnose_rollout_failure_skips_when_context_mismatches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *config*current-context*) echo "gke_foreign-proj_foreign-reg_foreign-cluster" ;;
+  *get*pods*) echo "foreign-pod-should-not-be-printed" ;;
+esac
+exit 0
+""")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            log_file = pathlib.Path(tmp) / "prov.log"
+            log_file.write_text(
+                "Error: context deadline exceeded\n"
+                "\n"
+                "  with helm_release.kube_agents,\n"
+                '  on main.tf line 497, in resource "helm_release" "kube_agents":\n'
+            )
+            body = f"""
+PROJECT_ID="target-proj" REGION="us-central1" CLUSTER_NAME="target-cluster" diagnose_rollout_failure "{log_file}"
+"""
+            proc = self._run_cmd(body, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+            self.assertIn("does not match target cluster", proc.stderr + proc.stdout)
+            self.assertNotIn("foreign-pod-should-not-be-printed", proc.stdout)
+            self.assertNotIn("Helm rollout timed out waiting for Kubernetes workloads", proc.stdout)
+
+    def _menu_body(self):
+        """run_menu_system() as bash parsed it."""
+        proc = self._run_cmd("declare -f run_menu_system")
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        return proc.stdout
+
+    def _run_menu_option_6_with_preflight_rc(self, preflight_rc_expr):
+        # The coordinates go in install.env, not in the script body. run_menu_system
+        # sources the checkout's k8s-operator/scripts/vars.sh itself -- an untracked
+        # file holding whatever install the developer last ran -- which lands on top
+        # of anything the body assigned; it then re-applies install.env over that, by
+        # design, so install.env is the one input that wins on both machines. Without
+        # this the panel opens on the developer's live project and cluster.
+        menu_env = self._tmp_path / "menu.install.env"
+        menu_env.write_text(
+            "PROJECT_ID=test-project\n"
+            "CLUSTER_NAME=test-cluster\n"
+            "REGION=us-central1\n"
+            "GOOGLE_CHAT_ENABLED=false\n"
+            "SLACK_ENABLED=false\n"
+        )
+        menu_env.chmod(0o600)
+        # project_id falls back to `gcloud config get-value project` when PROJECT_ID
+        # is empty, and the panel's state probes reach for kubectl. Both are stubbed
+        # so a unit test cannot read -- or act on -- the developer's live GCP config.
+        bin_dir = self._tmp_path / "menu-bin"
+        bin_dir.mkdir(exist_ok=True)
+        for tool in ("gcloud", "kubectl"):
+            stub = bin_dir / tool
+            stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+        body = f"""
+has_controlling_tty() {{ return 0; }}
+prompt_menu() {{
+  local var="${{!#}}"
+  printf -v "$var" "%s" "6"
+}}
+resolve_effective_image_tag() {{ return 0; }}
+validate_immutable_ref() {{ return 0; }}
+verify_local_source_ref() {{ return 0; }}
+save_env_var() {{ return 0; }}
+save_secret_env_var() {{ return 0; }}
+write_tfvars_from_state() {{ return 0; }}
+check_service_account_ownership() {{ return 0; }}
+run_lifecycle_apply() {{ echo "APPLY_CALLED"; exit 0; }}
+
+enforce_capacity_preflight() {{ return {preflight_rc_expr}; }}
+
+run_menu_system
+"""
+        proc = self._run_cmd(
+            body,
+            env_overrides={"KUBE_AGENTS_INSTALL_ENV": str(menu_env)},
+            bin_dir=str(bin_dir),
+        )
+        # The isolation is load-bearing for the three assertions below -- a panel
+        # opened on someone's real install is not the scenario any of them describe
+        # -- so it is checked rather than assumed.
+        self.assertIn(
+            "GKE Cluster: test-cluster (us-central1)",
+            proc.stdout,
+            "the control panel did not open on the test coordinates; ambient install "
+            f"state reached the run. stdout: {proc.stdout}",
+        )
+        return proc
+
+    def test_menu_system_option_6_preflight_refusal_exits_one_without_apply(self):
+        # When capacity preflight refuses the apply (RC 1), run_menu_system option 6
+        # must exit 1 immediately and never call run_lifecycle_apply.
+        proc = self._run_menu_option_6_with_preflight_rc("1")
+        self.assertEqual(proc.returncode, 1, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertNotIn("APPLY_CALLED", proc.stdout)
+
+    def test_menu_system_option_6_preflight_pause_exits_zero_without_apply(self):
+        # When capacity preflight is paused by the operator (RC 2), run_menu_system option 6
+        # must exit 0 and never call run_lifecycle_apply.
+        proc = self._run_menu_option_6_with_preflight_rc('"$CAPACITY_PREFLIGHT_RC_PAUSED"')
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertNotIn("APPLY_CALLED", proc.stdout)
+
+    def test_menu_system_option_6_preflight_pass_invokes_apply(self):
+        # When capacity preflight succeeds (RC 0), run_menu_system option 6
+        # must invoke run_lifecycle_apply.
+        proc = self._run_menu_option_6_with_preflight_rc("0")
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("APPLY_CALLED", proc.stdout)
+
+    def _main_body(self):
+        """main() as bash parsed it, not as the file spells it.
+
+        `declare -f` prints the function from the shell's own parse tree, so
+        comments are gone and indentation is bash's. A test that reads
+        install.sh with open() instead is asserting the formatting of the file
+        and goes red on a reflow that changed nothing.
+        """
+        proc = self._run_cmd("declare -f main")
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        return proc.stdout
+
+    def test_main_runs_the_capacity_preflight_before_it_applies(self):
+        # Nothing else fails if the call is deleted: every other test in this
+        # class drives enforce_capacity_preflight directly. Ordering is the
+        # point of the check -- a preflight that runs after the apply has
+        # started reports a deficit the install already committed to.
+        body = self._main_body()
+        self.assertIn(
+            "enforce_capacity_preflight",
+            body,
+            "main() no longer runs the capacity preflight, so an adopted cluster "
+            "without room for the workloads is only found at rollout",
+        )
+        self.assertLess(
+            body.index("enforce_capacity_preflight"),
+            body.index("run_lifecycle_apply"),
+            "the capacity preflight has to run before the apply it is meant to "
+            "stop, not after it",
+        )
+
+    def test_main_validates_and_exports_helm_timeout_and_skip_capacity_check(self):
+        # main() must validate HELM_TIMEOUT, export HELM_TIMEOUT and export
+        # SKIP_CAPACITY_CHECK before the preflight runs.
+        body = self._main_body()
+        self.assertIn("validate_helm_timeout", body)
+        self.assertIn("export HELM_TIMEOUT=", body)
+        self.assertIn("export SKIP_CAPACITY_CHECK=", body)
+        self.assertLess(body.index("validate_helm_timeout"), body.index("enforce_capacity_preflight"))
+        self.assertLess(body.index("export HELM_TIMEOUT="), body.index("enforce_capacity_preflight"))
+        self.assertLess(body.index("export SKIP_CAPACITY_CHECK="), body.index("enforce_capacity_preflight"))
+
+    def test_main_skip_capacity_check_flag_bypasses_preflight(self):
+        # Passing --skip-capacity-check causes the menu or fresh-install path to export
+        # SKIP_CAPACITY_CHECK=true, which check_existing_cluster_capacity_preflight honours.
+        body = """
+has_controlling_tty() { return 0; }
+prompt_menu() { local v="${!#}"; printf -v "$v" "7"; }
+main --menu --skip-capacity-check
+check_existing_cluster_capacity_preflight "cluster" "region" "proj"
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("Skipping cluster capacity preflight check (SKIP_CAPACITY_CHECK=true)", proc.stdout)
+
+    def test_main_does_not_expand_default_helm_timeout_before_helpers_sourced(self):
+        # Under curl | bash without a checkout, DEFAULT_HELM_TIMEOUT is not defined
+        # until step 2 sources the helpers. main() must not expand $DEFAULT_HELM_TIMEOUT
+        # before acquire_source_repo / resolve_shared_defaults under set -u.
+        body = """
+set -u
+unset DEFAULT_HELM_TIMEOUT
+unset HELM_TIMEOUT
+print_banner() { :; }
+resolve_effective_image_tag() { echo "REACHED_PAST_BANNER"; exit 0; }
+main --non-interactive
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("REACHED_PAST_BANNER", proc.stdout)
+
+    def test_menu_system_validates_and_exports_helm_timeout_and_skip_capacity_check(self):
+        # run_menu_system() must validate HELM_TIMEOUT, export HELM_TIMEOUT and export
+        # SKIP_CAPACITY_CHECK before option 6's preflight runs.
+        body = self._menu_body()
+        self.assertIn("validate_helm_timeout", body)
+        self.assertIn("export HELM_TIMEOUT=", body)
+        self.assertIn("export SKIP_CAPACITY_CHECK=", body)
+        self.assertLess(body.index("validate_helm_timeout"), body.index("enforce_capacity_preflight"))
+        self.assertLess(body.index("export HELM_TIMEOUT="), body.index("enforce_capacity_preflight"))
+        self.assertLess(body.index("export SKIP_CAPACITY_CHECK="), body.index("enforce_capacity_preflight"))
+
+    def test_menu_system_rejects_out_of_range_helm_timeout_flag(self):
+        body = """
+has_controlling_tty() { return 0; }
+main --menu --helm-timeout=100
+"""
+        proc = self._run_cmd(body)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--helm-timeout must be at least 540s", proc.stderr + proc.stdout)
+
+    def test_menu_system_rejects_out_of_range_helm_timeout_in_install_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\nHELM_TIMEOUT=9999\n")
+            body = """
+has_controlling_tty() { return 0; }
+prompt_menu() { local v="${!#}"; printf -v "$v" "7"; }
+run_menu_system
+"""
+            proc = self._run_cmd(body, env_overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)})
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("--helm-timeout must be at most 899s", proc.stderr + proc.stdout)
+
+    def test_menu_system_exports_flags_to_environment(self):
+        body = """
+has_controlling_tty() { return 0; }
+prompt_menu() { local v="${!#}"; printf -v "$v" "7"; }
+PARAM_SKIP_CAPACITY_CHECK="true"
+CLI_HELM_TIMEOUT="750"
+run_menu_system
+echo "EXPORTED_SKIP=$SKIP_CAPACITY_CHECK"
+echo "EXPORTED_TIMEOUT=$HELM_TIMEOUT"
+"""
+        proc = self._run_cmd(body)
+        self.assertEqual(proc.returncode, 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("EXPORTED_SKIP=true", proc.stdout)
+        self.assertIn("EXPORTED_TIMEOUT=750", proc.stdout)
+
+    def test_on_error_removes_preflight_tmp_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = pathlib.Path(tmp) / "scratch"
+            scratch.mkdir()
+            self.assertTrue(scratch.exists())
+            body = f"""
+PREFLIGHT_TMP_DIR="{scratch}"
+( on_error 1 42 "false" ) || true
+"""
+            self._run_cmd(body)
+            self.assertFalse(scratch.exists(), "on_error must remove PREFLIGHT_TMP_DIR if it exists")
+
+    def test_main_passes_the_preflight_the_shape_it_checks(self):
+        # The eight arguments decide what gets sized: gvisor moves the agent
+        # pod off the untainted nodes, the memory mode adds hindsight, the
+        # webui flag adds the dashboard sidecar, and the gitops pair adds the
+        # minter. Swap two and the check runs against a cluster shape no
+        # install will produce, passes, and the rollout is what finds out.
+        self.assertRegex(
+            self._main_body(),
+            r'enforce_capacity_preflight\s+"\$cluster_name"\s+"\$region"\s+'
+            r'"\$project_id"\s+"\$enable_gvisor"\s+"\$memory_mode"\s+'
+            r'"\$PARAM_ENABLE_WEBUI"\s+"\$github_org"\s+"\$github_repo"',
+        )
+
+    def test_main_treats_a_declined_capacity_prompt_as_a_pause(self):
+        # The operator said no. That is a choice, not a fault: exiting
+        # non-zero would have the wrapper that ran install.sh report a failed
+        # install and, in CI, fail the job.
+        body = self._main_body()
+        self.assertRegex(
+            body,
+            r'"\$CAPACITY_PREFLIGHT_RC_PAUSED"\)\s*\n?\s*exit 0',
+            "main() must map the declined-prompt status to exit 0; "
+            f"got: {body[body.find('enforce_capacity_preflight'):][:400]}",
+        )
+
+    def test_capacity_preflight_cleans_tmp_dir_on_sigint(self):
+        # On INT or TERM, the preflight's signal handler must remove PREFLIGHT_TMP_DIR.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            tmp_marker_file = pathlib.Path(tmp) / "tmp_dir.path"
+            klog = pathlib.Path(tmp) / "kubectl.log"
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(f"""#!/usr/bin/env bash
+echo "$*" >> "{klog}"
+case "$*" in
+  *current-context*)
+    echo "gke_proj_region_cluster"
+    ;;
+  *get*nodes*)
+    echo '{{"items":[]}}'
+    ;;
+  *get*pods*)
+    if [ -n "$PREFLIGHT_TMP_DIR" ]; then
+      echo "$PREFLIGHT_TMP_DIR" > "{tmp_marker_file}"
+    fi
+    while true; do /bin/sleep 0.1; done
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+""")
+            kubectl.chmod(0o755)
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text("#!/usr/bin/env bash\nexit 0\n")
+            gcloud.chmod(0o755)
+            body = """
+TFVARS_CREATE_CLUSTER=false TFVARS_CLUSTER_MODE=standard check_existing_cluster_capacity_preflight "cluster" "region" "proj" "false" "file" "false" "" ""
+"""
+            setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+trap - ERR
+{body}
+"""
+            full_env = get_isolated_test_env(
+                overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env), "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._test_report_file)},
+                bin_dir=str(bin_dir),
+            )
+            proc = subprocess.Popen(
+                ["bash", "-c", setup],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=full_env,
+                cwd=str(_REPO_ROOT),
+                start_new_session=True,
+            )
+            try:
+                for _ in range(50):
+                    if tmp_marker_file.exists():
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(tmp_marker_file.exists(), "kubectl was not invoked or did not record tmp dir")
+                tmp_dir = pathlib.Path(tmp_marker_file.read_text().strip())
+                self.assertTrue(tmp_dir.exists(), f"tmp_dir {tmp_dir} should exist while running")
+                os.killpg(proc.pid, signal.SIGINT)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                time.sleep(0.2)
+                self.assertFalse(tmp_dir.exists(), f"tmp_dir {tmp_dir} was not cleaned up on SIGINT")
+            finally:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
 
 
 if __name__ == "__main__":
