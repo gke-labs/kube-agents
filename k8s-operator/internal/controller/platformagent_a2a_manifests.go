@@ -292,13 +292,16 @@ const (
 	// outside this number and are not counted anywhere. lib.TasksGet opens an
 	// ordered consumer and its cleanup stops the local subscription only --
 	// the consumer itself waits out its InactiveThreshold, which TasksGet
-	// leaves unset, so nats.go's five-minute default applies. Every call
-	// therefore leaves one consumer on the stream for five minutes after it
-	// returns. That makes the missing term a call RATE over a rolling
-	// five-minute window rather than a concurrency, and the callers are not
-	// just the web rail: the gateway's sweep, reap and relay paths replay
-	// too. gke-labs#1739 owns the term and the number; this constant
-	// deliberately does not move for it here.
+	// sets to five seconds (lib.EphemeralConsumerInactiveThreshold). A call
+	// that finds events therefore leaves one consumer on the stream for five
+	// seconds after it returns. That makes the missing term a call RATE over
+	// a rolling five-second window rather than a concurrency, and the callers
+	// are not just the web rail: the gateway's sweep, reap and relay paths
+	// replay too. The window was five minutes -- nats.go's default, left in
+	// place -- until TasksGet set the threshold, so the rate this constant
+	// absorbs is 60x lower than the number was sized against. gke-labs#1739
+	// owns the term and the number; this constant deliberately does not move
+	// for it here.
 	a2aTasksReservedConsumers = 16
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
@@ -563,9 +566,17 @@ func a2aSeedJetStreamGrants() []string {
 //
 // CONSUMER.DELETE on TASKS is withheld, and it is the one subject nats.go
 // does emit here without a grant. The only emitter is the ordered consumer's
-// reset path, which fires DeleteConsumer in a goroutine and ignores the
-// result; an ephemeral it could not delete is reaped by its own five-minute
-// inactive threshold.
+// reset path, which fires DeleteConsumer for the consumer it is replacing in
+// a goroutine and ignores the result; the ephemeral it could not delete is
+// reaped by the inactive threshold lib.TasksGet sets on it,
+// lib.EphemeralConsumerInactiveThreshold (five seconds -- nats.go's own
+// ordered default is five MINUTES, which is what the replay carried before
+// gke-labs/kube-agents#1739). TasksGet does not delete its own replay
+// consumer, and that is a decision rather than an omission: under this grant
+// the delete is a refused publish on a subject with no reply, so the bridge
+// would pay an Error-level permissions violation on every task it dispatches
+// -- the line an operator is taught to read as a missing grant -- to reclaim
+// the last five seconds of one consumer slot.
 //
 // Withholding it raises the price of reaching another principal's durable and
 // does not close the route, which is the correction to what this comment said
@@ -586,7 +597,9 @@ func a2aSeedJetStreamGrants() []string {
 // NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
 // literally named that. What closes it is the auth callout giving each
 // principal its own user. DELETE stays out as the one destructive verb here
-// that nothing on the bridge path needs.
+// that nothing on the bridge path needs: its one emitter ignores the result
+// and the threshold gets there anyway, so the grant's absence costs a log
+// line on a reset and up to five seconds of a consumer slot, not a behaviour.
 //
 // One route this list narrows but cannot close, because it lives in a request
 // body: a push consumer's deliver_subject. CONSUMER.CREATE on TASKS (or on the
