@@ -1786,6 +1786,18 @@ def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, githu
     assert "pull_requests: read" in res.reason
 
 
+def test_an_expired_token_is_diagnosed_as_the_token_not_the_permission(token, github):
+    """401 is the credential, 403 is its scopes. Reading a one-hour
+    installation token that ran out as a missing permission sends the reader to
+    the App's settings for a fault that is in the mint."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (401, {"message": "Bad credentials"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "not valid" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
 def test_a_repository_the_installation_cannot_see_is_an_error(token, github):
     """The ledger App is `repository_selection: selected`, and a repository
     outside the list answers 404 exactly as a missing number does. Read as

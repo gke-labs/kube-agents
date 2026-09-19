@@ -16,16 +16,16 @@
 
 Four of them answer the half of a task's exact checks that cluster state
 cannot: did the *report* name the thing we planted, did the agent *call* the
-tools it claims to have used, — for the fleet audits, whose SOPs deliberately
-keep the chat reply to one line — does the *ledger issue the run published*
-carry the finding, and did the *pull request* the reply links get opened by
-this run rather than an earlier one. All four read the per-run stash in
-:mod:`kube_agents_bench.transcript`, and all three fail closed: an empty
+tools it claims to have used, does the *ledger issue the run published* carry
+the finding — for the fleet audits, whose SOPs deliberately keep the chat reply
+to one line — and is the *pull request* the reply links one this run opened
+rather than an earlier one. All four read the per-run stash in
+:mod:`kube_agents_bench.transcript`, and all four fail closed: an empty
 stash is ``status="error"`` — the check could not be evaluated — never a pass
 or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
 it.
 
-The fourth, ``fleet_resource_property``, does read cluster state, and exists
+The fifth, ``fleet_resource_property``, does read cluster state, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -981,11 +981,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
         rejected candidate rather than a broken check.
         """
         base = f"https://api.github.com/repos/{owner}/{repo}"
-        status_code, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
+        first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
+        status_code = first
         denied = status_code in (401, 403)
         if denied or status_code == 404:
             status_code, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
-        if status_code in (401, 403) or (status_code == 404 and denied):
+        if 401 in (first, status_code):
+            # 401 is the credential itself, not its scopes: an installation
+            # token lasts an hour, and telling the reader to widen a permission
+            # sends them to the App's settings for a fault that is in the mint.
+            return None, (
+                f"GitHub answered 401 for {owner}/{repo}#{number}: the token in "
+                f"{LEDGER_TOKEN_ENV_VARS[0]} is not valid — an installation token "
+                "expires an hour after it is minted — so this check could not be "
+                "evaluated"
+            )
+        if status_code == 403 or (status_code == 404 and denied):
             # A 404 from the pulls endpoint after a denial is read as the
             # denial, not as absence: grading a real pull request as missing is
             # the one wrong answer a permission gap must not produce.
