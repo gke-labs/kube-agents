@@ -240,3 +240,68 @@ func TestFoldTask_PayloadTaskIDMismatch(t *testing.T) {
 		t.Fatalf("want ProtocolError on payload/envelope taskId mismatch, got %v", err)
 	}
 }
+
+// The fold carries the terminal's message and the subject it arrived on: a
+// reader that materializes a finished task from the stream alone (the
+// gateway's read route, after a lost record write) needs the executor's
+// reason and needs to know whether the executor or the supervisor ended it.
+func TestTasksGet_CarriesTheTerminalsMessageAndSubject(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	const taskID = "task-final-msg"
+	addressee := replayAddressee(taskID)
+	ctx := testCtx(t)
+	c := replayFixture(t, clientURL(s), taskID, []TaskState{StateSubmitted, StateWorking})
+
+	const reason = "reason: hermes-exited-nonzero - exit status 1"
+	payload, err := json.Marshal(StatusUpdate{
+		TaskID: taskID, ContextID: "ctx-" + taskID,
+		Status: TaskStatus{State: StateFailed, Message: &Message{
+			Role: "agent", MessageID: "msg-final", Parts: []Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := NewStatusUpdateEnvelope(Party{Session: addressee}, taskID, "ctx-"+taskID, "corr-rp", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(ctx, TaskEventsSubject(addressee, taskID), env); err != nil {
+		t.Fatal(err)
+	}
+
+	task, subject, err := c.TasksGetAttributed(ctx, addressee, taskID)
+	if err != nil {
+		t.Fatalf("TasksGetAttributed: %v", err)
+	}
+	if !task.Final || task.State != StateFailed {
+		t.Fatalf("folded %s final=%v, want the failed terminal", task.State, task.Final)
+	}
+	if task.FinalMessage == nil || len(task.FinalMessage.Parts) != 1 || task.FinalMessage.Parts[0].Text != reason {
+		t.Fatalf("FinalMessage = %+v, want the terminal's message verbatim", task.FinalMessage)
+	}
+	if subject != TaskEventsSubject(addressee, taskID) {
+		t.Fatalf("terminal subject = %q, want the events subject the executor wrote on", subject)
+	}
+	// The subject rides beside the Task, not in it: the plain TasksGet and
+	// a live FoldTask of the same events stay equal (assertion 11).
+	plain, err := c.TasksGet(ctx, addressee, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.FinalMessage == nil || plain.FinalMessage.Parts[0].Text != reason || plain.State != task.State {
+		t.Fatalf("TasksGet = %+v, want the same fold", plain)
+	}
+
+	// A task still running has no terminal to attribute.
+	running, subject, err := replayFixture(t, clientURL(s), "task-running", []TaskState{StateWorking}).
+		TasksGetAttributed(ctx, replayAddressee("task-running"), "task-running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subject != "" || running.FinalMessage != nil {
+		t.Fatalf("a running task carries a terminal attribution: %q %+v", subject, running)
+	}
+}

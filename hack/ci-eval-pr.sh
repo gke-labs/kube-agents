@@ -1739,6 +1739,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
+  # Which case and which repetition this unit is, for any transport that can
+  # carry an id into the agent's own records. The inject transport sends the
+  # pair as the backend message id, which the gateway's ingress log joins to
+  # the correlationId -- so the audit chain runs from this run directory to
+  # every hop the task took, with nothing else added.
+  export EVAL_CASE_ID="${name}" EVAL_REPETITION="${rep}"
   # The task lock is held for the holder's whole unit, so the wait must
   # outlast one: the unit's delegation ceiling plus grading and teardown
   # (about 300s on the record; 600s here). A fixed 1800s deadline under a

@@ -47,6 +47,66 @@ Environment:
         the single-turn behaviour.
     AGENT_DELEGATION_POLL_INTERVAL: Seconds between status turns (default ``30``).
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
+
+    AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
+        hands the prompt to the agent through the A2A gateway's inject backend
+        instead -- ``POST /inject`` with the prompt, then the conversation's
+        transcript folded until the task's terminal, the way the gateway
+        drives a customer conversation under ``spec.mode: next``
+        (:mod:`kube_agents_bench.inject_transport`). Same harness, same
+        ``AgentResult``, same transcript stash for the verifiers. The inject
+        path reads ``AGENT_NAMESPACE``, ``AGENT_CLUSTER_CONTEXT``, the
+        delegation variables, and:
+    AGENT_INJECT_SERVICE: The Service to port-forward to (default
+        ``<AGENT_SERVICE_NAME>-a2a-inject``, which is what the operator
+        renders under its eval flag).
+    AGENT_INJECT_LOCAL_PORT: Local side of that port-forward (default
+        ``28099``). The remote side is always the Service's 8099.
+    AGENT_INJECT_URL: A gateway base URL to use instead of spawning a
+        port-forward.
+    AGENT_INJECT_TOKEN: The door's bearer token, required. The operator
+        renders it into the ``<agent>-a2a-inject`` Secret under its eval
+        flag, and this is read the way the presubmit reads the agent's own
+        key out of ``platform-agent-secrets``::
+
+            AGENT_INJECT_TOKEN=$(kubectl get secret platform-agent-a2a-inject \
+              -n kubeagents-system -o jsonpath='{.data.token}' | base64 --decode)
+
+    AGENT_INJECT_AUTHOR: The author id the message is sent as, resolved
+        through the door's own principal map (default ``devops-bench``, the
+        entry the operator renders).
+    AGENT_INJECT_TIMEOUT: Seconds one task may run before the harness reads
+        the conversation's record and classifies it (default ``1800``). This
+        is the whole task's budget, not a request's: on the api transport
+        ``AGENT_HTTP_TIMEOUT`` bounds one POST and the work's real budget is
+        ``AGENT_DELEGATION_TIMEOUT``, whereas here a single await covers the
+        work, so it takes the same scale as the latter. Its floor is the
+        gateway's own first-event grace plus a margin, learned from a read
+        of the fresh conversation before the POST, and a budget below the
+        floor is refused before anything is started
+        (:func:`~kube_agents_bench.inject_transport.check_budget`). There is
+        no variable for "how long before I decide nobody took this": that
+        window is the gateway's, and the harness reads it off the read
+        route. At the deadline nothing is sent -- one more read classifies
+        the task, and every outcome that leaves an active task is then
+        followed by a cancel naming it, which bounds a stray run and never
+        changes the classification (see
+        :meth:`KubeAgentsHarness._execute_inject`).
+
+    The conversation key and the backend message id are not configurable.
+    Both are ``<run>/<case>/<rep>``: the run id is a ``devops-bench-<hex>``
+    id minted fresh per invocation (``AGENT_CONVERSATION_ID`` is the api
+    path's and is not honoured here: a pinned id would have the door's
+    dedupe answer a rerun with a previous invocation's task and terminal),
+    and the case and repetition are ``EVAL_CASE_ID`` and ``EVAL_REPETITION``
+    as the presubmit exports them (``adhoc`` and ``1`` outside it). The
+    gateway prefixes the key with ``inject:``. The triple is what makes the
+    key fresh per case and repetition, the message id unique per invocation
+    -- the door dedupes a retried POST on it -- and the ingress log joinable
+    to the eval record, which stores the three beside the task id. Each
+    status turn of the delegation wait carries its own id,
+    ``<run>/<case>/<rep>/status-<n>``, so the dedupe does not fold it into
+    the opening task.
 """
 
 from __future__ import annotations
@@ -67,11 +127,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from devops_bench.agents import AgentHarness, AgentResult
+from devops_bench.agents.result import empty_tokens
 
+from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import transcript
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
@@ -98,6 +161,74 @@ SERVICE_API_PORT = 8642
 # harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
+# HTTP endpoint, which is identical under both modes and therefore says nothing
+# about the next stack; ``inject`` goes through the A2A gateway, which is the
+# stack the mode renders.
+TRANSPORT_API = "api"
+TRANSPORT_INJECT = "inject"
+_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
+
+# The inject transport's port-forward target: the Service the operator renders
+# for the gateway's inject backend under its eval flag, listening on 8099. The
+# local side defaults well away from it so a gateway a developer is already
+# forwarding cannot be mistaken for this tunnel.
+_INJECT_SERVICE_SUFFIX = "-a2a-inject"
+_INJECT_REMOTE_PORT = 8099
+_INJECT_DEFAULT_LOCAL_PORT = 28099
+# The Secret the operator renders the door's bearer token into, named in the
+# message a run without the token fails with. Suffix and key, so the message
+# can spell the whole kubectl read.
+_INJECT_TOKEN_SECRET_SUFFIX = "-a2a-inject"
+_INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a credential
+# Appended to the run's message id on a delegation status turn, with the
+# turn's ordinal after it, so the ingress log tells the opening ask and each
+# follow-up apart -- and so the door's dedupe on the message id cannot fold a
+# second status turn into the first one's task.
+_INJECT_STATUS_TURN_SUFFIX = "/status-"
+# The three budgets both transports share, named here rather than spelled at
+# each _numeric_env call: one default per knob, or the two doors disagree
+# about how long a case may take.
+_DEFAULT_HTTP_TIMEOUT = "600"
+_DEFAULT_DELEGATION_TIMEOUT = "1800"
+_DEFAULT_DELEGATION_POLL_INTERVAL = "30"
+# What ``tokens`` say on an inject record: the gateway reports no usage, and a
+# null bucket is the truthful value rather than a zero (``scoring.py`` reads
+# the task's final ``a2a.status-update`` entry in the trajectory as the
+# liveness signal instead).
+_INJECT_TOKENS_NOTE = "the inject transport carries no token usage; every bucket is null"
+# The case and repetition the presubmit is running (hack/ci-eval-pr.sh exports
+# both), which with the run id become the conversation key and the backend
+# message id so the gateway's ingress log joins to the eval record. Outside
+# the presubmit neither is set; the fallbacks keep the key well-formed, and
+# the run id alone keeps two concurrent runs apart.
+_EVAL_CASE_ID_ENV = "EVAL_CASE_ID"
+_EVAL_REPETITION_ENV = "EVAL_REPETITION"
+_EVAL_CASE_FALLBACK = "adhoc"
+_EVAL_REPETITION_FALLBACK = "1"
+# The agent Service and namespace the inject path assumes when the presubmit
+# has not said otherwise: the operator's defaults, which name the inject
+# Service (<service>-a2a-inject) and the token Secret beside it.
+_DEFAULT_AGENT_SERVICE_NAME = "platform-agent"
+_DEFAULT_AGENT_NAMESPACE = "kubeagents-system"
+# The per-invocation run id: the api path's stateful ``conversation`` field
+# when AGENT_CONVERSATION_ID is unset, and always the inject path's key and
+# message id.
+_RUN_ID_PREFIX = "devops-bench-"
+_RUN_ID_HEX_WIDTH = 12
+# How long one injected task may run before the harness reads the record and
+# classifies it. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
+# there, with AGENT_DELEGATION_TIMEOUT covering the work across status turns;
+# on this path one await covers the work, so the budget has to be of the
+# second kind. Borrowing the first cut every case to 600s, which a ten-minute
+# case reached with no terminal and an empty answer. The floor under it is
+# the gateway's grace plus a margin, and the harness refuses to start below
+# it. Its own budget, not the grace: the bridge queues a task (``submitted``)
+# behind its concurrency cap and spawns it (``working``) when a slot frees,
+# so a deadline of grace plus margin would grade every queued unit of a
+# parallel run as a timeout.
+_INJECT_DEFAULT_TIMEOUT = "1800"
 
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
@@ -192,10 +323,15 @@ def _cleanup_port_forwards() -> None:
             _PF_LOG_DIR = None
 
 
-def _kubectl_target() -> list[str]:
-    """The service, namespace and context flags shared by every kubectl call."""
+def _kubectl_target(service: str | None = None) -> list[str]:
+    """The service, namespace and context flags shared by every kubectl call.
+
+    ``service`` defaults to the agent's own Service; the inject transport
+    passes the gateway's inject Service, which lives in the same namespace and
+    the same context.
+    """
     cmd = [
-        f"svc/{os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
+        f"svc/{service or os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
         "-n",
         os.environ.get("AGENT_NAMESPACE", "kubeagents-system"),
     ]
@@ -205,9 +341,11 @@ def _kubectl_target() -> list[str]:
     return cmd
 
 
-def _port_forward_command(local_port: int) -> list[str]:
-    service, *rest = _kubectl_target()
-    return ["kubectl", "port-forward", service, f"{local_port}:{SERVICE_API_PORT}", *rest]
+def _port_forward_command(
+    local_port: int, service: str | None = None, remote_port: int = SERVICE_API_PORT
+) -> list[str]:
+    target, *rest = _kubectl_target(service)
+    return ["kubectl", "port-forward", target, f"{local_port}:{remote_port}", *rest]
 
 
 def _cluster_hint() -> str:
@@ -271,11 +409,15 @@ def _agent_shell(script: str, timeout: float) -> str:
     return proc.stdout
 
 
-def _ensure_port_forward(local_port: int) -> None:
+def _ensure_port_forward(
+    local_port: int, *, service: str | None = None, remote_port: int = SERVICE_API_PORT
+) -> None:
     """Start a background ``kubectl port-forward`` if the port is closed.
 
     An already-open port is a no-op: the harness never assumes it owns the
     transport. Serialised per port, so different ports establish in parallel.
+    ``service`` and ``remote_port`` default to the agent's HTTP endpoint; the
+    inject transport forwards the gateway's inject Service instead.
 
     Raises:
         RuntimeError: The forward could not be spawned, exited, or did not open
@@ -290,7 +432,7 @@ def _ensure_port_forward(local_port: int) -> None:
         if stale is not None:
             _stop_process(stale)
 
-        cmd = _port_forward_command(local_port)
+        cmd = _port_forward_command(local_port, service, remote_port)
         _log.info("port %d closed; establishing port-forward: %s", local_port, " ".join(cmd))
         stderr_log = _pf_log_dir() / f"pf-{local_port}.log"
         try:
@@ -325,7 +467,9 @@ def _ensure_port_forward(local_port: int) -> None:
             raise
 
 
-def _reset_port_forward(local_port: int) -> None:
+def _reset_port_forward(
+    local_port: int, *, service: str | None = None, remote_port: int = SERVICE_API_PORT
+) -> None:
     """Tear this process's forward down and stand a fresh one up.
 
     ``_ensure_port_forward`` returns immediately when ``_port_open`` is true,
@@ -350,7 +494,12 @@ def _reset_port_forward(local_port: int) -> None:
             _log.info("tearing down the port-forward on port %d before retrying", local_port)
             _stop_process(proc)
     # Outside the lock: _ensure_port_forward takes the same non-reentrant one.
-    _ensure_port_forward(local_port)
+    # The agent's endpoint stays the positional-only call the api path has
+    # always made; only another target spells its service and port out.
+    if service is None and remote_port == SERVICE_API_PORT:
+        _ensure_port_forward(local_port)
+    else:
+        _ensure_port_forward(local_port, service=service, remote_port=remote_port)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -800,6 +949,80 @@ def _infra_failure(detail: str) -> AgentResult:
     )
 
 
+def _mint_run_id() -> str:
+    """A fresh per-invocation run id."""
+    return _RUN_ID_PREFIX + uuid.uuid4().hex[:_RUN_ID_HEX_WIDTH]
+
+
+def _run_id() -> str:
+    """The api path's run id: pinned by ``AGENT_CONVERSATION_ID`` or minted.
+
+    It is the stateful ``conversation`` field, fresh per invocation so no task
+    inherits the previous task's trajectory. The inject path does not use it:
+    see :func:`_inject_identity`.
+    """
+    return os.environ.get("AGENT_CONVERSATION_ID") or _mint_run_id()
+
+
+def _inject_identity() -> tuple[str, str, str]:
+    """The run id, case id and repetition the inject path keys everything on.
+
+    The run id is always minted fresh, never read from ``AGENT_CONVERSATION_ID``:
+    it is the first segment of the backend message id, which the door dedupes
+    on, and a pinned id would make the dedupe answer this invocation's POST
+    with a previous invocation's task and replay its terminal as this run's.
+    The presubmit exports the case and repetition; on a developer's machine
+    neither is set and the fallbacks keep the triple well-formed. The gateway's
+    ingress log joins the backend message id to the correlationId, so the
+    triple there reaches the eval record with nothing else added (the A2A
+    owner's ask on the design doc).
+    """
+    case = os.environ.get(_EVAL_CASE_ID_ENV, "").strip() or _EVAL_CASE_FALLBACK
+    repetition = os.environ.get(_EVAL_REPETITION_ENV, "").strip() or _EVAL_REPETITION_FALLBACK
+    return _mint_run_id(), case, repetition
+
+
+def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> AgentResult:
+    """Map a folded conversation onto the canonical result.
+
+    ``output`` and ``final_message`` are the deliverable -- the posts the
+    conversation received for this task that the relay never rewrote, which is
+    what a customer would read as the answer. The trajectory is the
+    conversation itself plus the task's lifecycle: the relay does not post
+    ``activity`` artifacts, so no transport reading a conversation carries
+    tool calls, and what it carries instead is every executor state the read
+    route showed and the terminal, as ``a2a.status-update`` entries. Tokens
+    stay null -- the gateway reports no usage -- and ``metadata`` says so
+    rather than inventing a number. ``identity`` is the run, case and
+    repetition the key and message id were built from, stored beside the
+    task id so the record joins to the gateway's ingress log.
+    """
+    fold = exchange.fold
+    return AgentResult(
+        output=fold.deliverable,
+        trajectory=list(fold.trajectory),
+        tokens=empty_tokens(),
+        errors=[],
+        metadata={
+            "transport": TRANSPORT_INJECT,
+            "final_message": fold.deliverable,
+            "task_id": exchange.task_id,
+            "conversation": exchange.conversation,
+            "outcome": exchange.outcome,
+            **identity,
+            "terminal_state": fold.terminal or None,
+            "terminal_source": fold.terminal_source or None,
+            "terminal_reason": fold.terminal_reason or None,
+            "reason_token": fold.reason_token or None,
+            "executor_states": list(fold.executor_states),
+            "posts": len(fold.posts),
+            "entries": len(fold.entries),
+            "malformed_entries": fold.malformed,
+            "tokens_note": _INJECT_TOKENS_NOTE,
+        },
+    )
+
+
 class _DelegationTransportExhausted(Exception):
     """The delegation wait lost its transport on every status-turn retry.
 
@@ -853,12 +1076,24 @@ class KubeAgentsHarness(AgentHarness):
         return result
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
+        if transport not in _TRANSPORTS:
+            return AgentResult.errored(
+                f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
+            )
+        if transport == TRANSPORT_INJECT:
+            return self._execute_inject(prompt)
+
         api_path = os.environ.get("AGENT_API_PATH", "/v1/responses")
         try:
             local_port = _numeric_env("AGENT_LOCAL_PORT", str(SERVICE_API_PORT), int)
-            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", "600", float)
-            delegation_timeout = _numeric_env("AGENT_DELEGATION_TIMEOUT", "1800", float)
-            poll_interval = _numeric_env("AGENT_DELEGATION_POLL_INTERVAL", "30", float)
+            timeout = _numeric_env("AGENT_HTTP_TIMEOUT", _DEFAULT_HTTP_TIMEOUT, float)
+            delegation_timeout = _numeric_env(
+                "AGENT_DELEGATION_TIMEOUT", _DEFAULT_DELEGATION_TIMEOUT, float
+            )
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
+            )
         except ValueError as exc:
             return AgentResult.errored(str(exc))
 
@@ -912,8 +1147,7 @@ class KubeAgentsHarness(AgentHarness):
             # The endpoint is stateful and replays the whole conversation's tool
             # calls, so a shared id would make each task inherit the previous
             # task's trajectory and corrupt trajectory scoring.
-            "conversation": os.environ.get("AGENT_CONVERSATION_ID")
-            or f"devops-bench-{uuid.uuid4().hex[:12]}",
+            "conversation": _run_id(),
             "input": prompt,
         }
 
@@ -959,17 +1193,22 @@ class KubeAgentsHarness(AgentHarness):
                     _log.warning("port-forward respawn failed before retry: %s", pf_exc)
 
         if delegation_timeout > 0:
+
+            def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
+                return _post_turn(url, {**body, "input": poll}, headers, turn_timeout)
+
+            def _respawn_tunnel() -> None:
+                _reset_port_forward(local_port)
+
             try:
                 session_id = (
                     self._await_delegated_work(
                         result,
-                        url=url,
-                        body=body,
-                        headers=headers,
+                        turn=_status_turn,
+                        reset=_respawn_tunnel,
                         timeout=timeout,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
-                        local_port=local_port,
                     )
                     or session_id
                 )
@@ -992,17 +1231,481 @@ class KubeAgentsHarness(AgentHarness):
             )
         return result
 
+    def _execute_inject(self, prompt: str) -> AgentResult:
+        """The inject transport: send the prompt through the gateway's front door.
+
+        Mirrors ``_execute``'s retry classes. The tunnel to the inject Service
+        gets the same bounded establishment retry; an exchange that never
+        reaches the gateway is attempted up to :data:`_MAX_TRANSPORT_FAILURES`
+        times in all through a fresh tunnel each time -- the opening POST
+        with the same body and message id, which the door dedupes -- and then
+        classified as infrastructure. The task's deadline is set once, when
+        the POST is first accepted, and a retry rejoins the same wait rather
+        than restarting the budget.
+
+        How a task ended is classified from what the gateway's read route
+        reports, never from a clock of this harness's beside the gateway's
+        grace and never from a message sent to provoke it. Infrastructure,
+        never graded: a task the read shows active with nothing on its stream
+        past the grace (no executor took it); a task that only ever reached
+        ``submitted`` by ``AGENT_INJECT_TIMEOUT`` (queued behind the bridge's
+        cap for the whole budget); a terminal the gateway declared -- about
+        a task it could not put on the bus, or, on the read's fold, the
+        supervisor's word about an executor that died or never ran; a
+        submission the door refused, because the principal map does not carry
+        the author or because the gateway could not publish it; a failed
+        terminal carrying one of the executors' own reasons (bridge-shutdown,
+        spawn-failed and the rest of :data:`inject.INFRASTRUCTURE_REASONS`),
+        a rejected one, or a canceled-before-start; and a deadline the read
+        cannot classify. Graded, in front of the judge with the terminal on
+        ``errors``: a task an executor took and ended ``failed`` or
+        ``canceled`` for any other reason, a task still ``working`` at the
+        budget, graded on what it produced, and a task whose record the
+        relay left active on a finished stream, graded from the fold's
+        result text.
+
+        Every outcome that leaves an active task -- working or queued at the
+        budget, never taken, unclassifiable -- is followed by a cancel that
+        names the task id the POST answered with, after the read and never
+        before it. It bounds a stray run (the submission is on the bus for
+        any bridge that binds later; see :meth:`inject.InjectTask.cancel`
+        for what today's bridge does with it) and leaves the record; the
+        classification is the read's, and only the graded timeout adopts the
+        terminal the cancel brings.
+        """
+        try:
+            timeout = _numeric_env("AGENT_INJECT_TIMEOUT", _INJECT_DEFAULT_TIMEOUT, float)
+            local_port = _numeric_env(
+                "AGENT_INJECT_LOCAL_PORT", str(_INJECT_DEFAULT_LOCAL_PORT), int
+            )
+            delegation_timeout = _numeric_env(
+                "AGENT_DELEGATION_TIMEOUT", _DEFAULT_DELEGATION_TIMEOUT, float
+            )
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
+            )
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+
+        agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
+        service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
+        author = os.environ.get("AGENT_INJECT_AUTHOR", inject.DEFAULT_AUTHOR)
+        token = os.environ.get("AGENT_INJECT_TOKEN", "").strip()
+        if not token:
+            # Infrastructure rather than an error: a run with no token never
+            # reaches the agent, so it is the same class as a tunnel that
+            # will not come up, and grading it would score the install's
+            # configuration as the agent's answer.
+            secret = agent_service + _INJECT_TOKEN_SECRET_SUFFIX
+            return _infra_failure(
+                "AGENT_INJECT_TOKEN is unset and the inject door authenticates every request. "
+                f"Read it from the {secret} Secret's `{_INJECT_TOKEN_SECRET_KEY}` key in "
+                f"{os.environ.get('AGENT_NAMESPACE', _DEFAULT_AGENT_NAMESPACE)}"
+            )
+        run_id, case_id, repetition = _inject_identity()
+        # A fresh conversation per case and repetition: the gateway keeps a
+        # session record per conversation, so a shared key would have each
+        # task inherit the previous task's context and, worse, arrive while
+        # its task is still running and be absorbed as a steer. The message
+        # id is the same triple, unique per invocation, which is what lets
+        # the door dedupe a retried POST on it.
+        conversation = inject.conversation_key(run_id, case_id, repetition)
+        message_id = inject.message_id(run_id, case_id, repetition)
+        identity: dict[str, Any] = {
+            "run_id": run_id,
+            "case_id": case_id,
+            "repetition": repetition,
+            "message_id": message_id,
+        }
+        base_url = os.environ.get("AGENT_INJECT_URL")
+        # A URL given outright is somebody else's tunnel (or a gateway on the
+        # network): nothing to establish and nothing to respawn between
+        # retries.
+        own_tunnel = not base_url
+
+        def _tunnel(reset: bool) -> None:
+            if not own_tunnel:
+                return
+            forward = _reset_port_forward if reset else _ensure_port_forward
+            forward(local_port, service=service, remote_port=_INJECT_REMOTE_PORT)
+
+        # Same establishment retry as the api path's, for the same reason: a
+        # tunnel that cannot come up is the run class, not an answer.
+        transport_failures = 0
+        while True:
+            try:
+                _tunnel(reset=False)
+                break
+            except RuntimeError as exc:
+                transport_failures += 1
+                _log.warning(
+                    "inject: port-forward to svc/%s failed to establish (%d/%d): %s",
+                    service,
+                    transport_failures,
+                    _MAX_TRANSPORT_FAILURES,
+                    exc,
+                )
+                if transport_failures >= _MAX_TRANSPORT_FAILURES:
+                    return _infra_failure(
+                        f"the inject tunnel to svc/{service} failed to establish "
+                        f"{transport_failures} times running; last failure: {exc}"
+                    )
+        if not base_url:
+            # 127.0.0.1 rather than localhost, matching _port_open's probe
+            # host: a v4/v6 mismatch would make the probe and the request
+            # disagree about whether the tunnel is up.
+            base_url = f"http://127.0.0.1:{local_port}"
+
+        def _exchange(task: inject.InjectTask, budget: float, *, opening: bool) -> inject.Exchange:
+            """One task to its terminal, through the transport retry.
+
+            ``budget`` is this exchange's own: the task timeout for the
+            case's prompt, the turn timeout for a status turn. The opening
+            exchange reads the fresh conversation first and refuses a budget
+            below the gateway's floor before anything is started; a status
+            turn's budget is raised to the floor instead, because the case
+            is already running and the floor is not the operator's to set
+            there.
+            """
+            failures = 0
+            # Set once the POST is first accepted and kept across transport
+            # retries: a retry that respawned the tunnel rejoins the same
+            # wait, so two dropped polls late in a task cannot triple its
+            # budget.
+            deadline: float | None = None
+            while True:
+                try:
+                    if not task.task_id:
+                        task.preflight()
+                        floor = inject.budget_floor(task.first_event_grace)
+                        if opening:
+                            inject.check_budget(budget, task.first_event_grace)
+                        elif budget < floor:
+                            budget = floor
+                    task_id = task.submit()
+                    if deadline is None:
+                        deadline = time.monotonic() + budget
+                    if not task_id:
+                        # The door started nothing and said why. No agent saw
+                        # the prompt, so this is the run class rather than an
+                        # answer: an author the principal map does not carry
+                        # or a submission the gateway could not publish, both
+                        # of them a broken install.
+                        if not opening:
+                            # A status turn hands the refusal back as an
+                            # outcome rather than raising, because the
+                            # delegation wait's own retry is what has to see
+                            # it: each of its turns carries a fresh message
+                            # id, so the door's dedupe is not answering, and
+                            # an exhausted wait must end as infrastructure
+                            # rather than as an appended error the judge
+                            # grades (_DelegationTransportExhausted).
+                            return inject.Exchange(
+                                inject.Fold(""),
+                                inject.OUTCOME_NOT_ACCEPTED,
+                                task.conversation,
+                                "",
+                            )
+                        # The opening turn is not retried at all: the door
+                        # answers a repeat of the same message id with the
+                        # same refusal, so a retry cannot change it.
+                        raise _TransportError(
+                            f"{inject.refusal_detail(task.refusal)}, on "
+                            f"{task.conversation}: {task.note}",
+                            retryable=False,
+                        )
+                    return task.await_terminal(task_id, deadline=deadline)
+                except inject.InjectUnavailable as exc:
+                    failures += 1
+                    _log.warning(
+                        "inject: exchange on %s failed in transport (%d/%d): %s",
+                        task.conversation,
+                        failures,
+                        _MAX_TRANSPORT_FAILURES,
+                        exc,
+                    )
+                    if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
+                        raise
+                    try:
+                        _tunnel(reset=True)
+                    except RuntimeError as pf_exc:
+                        # Counted, not raised: the ceiling above ends it.
+                        _log.warning(
+                            "inject: port-forward respawn failed before retry: %s", pf_exc
+                        )
+
+        def _abandon(task: inject.InjectTask) -> str:
+            """Cancel a task the transport gave up on, and say what happened.
+
+            The exchange raises when the gateway cannot be reached at all --
+            the retries spent, or a status the retry set does not cover --
+            and by then the POST may long since have been accepted, so a task
+            is running on the bridge with nobody watching it. It holds a
+            concurrency slot until the bridge's own deadline, and the units
+            behind it in the same run queue. Best effort, on the transport
+            that has just failed: it may fail too, and the run is
+            infrastructure either way.
+            """
+            if not task.task_id:
+                return ""
+            task.cancel(task.task_id, settle=0)
+            if task.cancel_sent:
+                return (
+                    f"; a cancel naming task {task.task_id} was published, so it does not hold a "
+                    "bridge slot for the rest of its budget"
+                )
+            return (
+                f"; task {task.task_id} was left running: the cancel could not be sent over the "
+                "same failed transport (see the log)"
+            )
+
+        def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bool, bool]:
+            """Cancel a task an exchange left active, after the read.
+
+            Every exchange -- the opening turn and each status turn -- goes
+            through this, because each can end with its task still on the
+            bus: an executor has it (working or queued), nobody took it yet
+            (the submission waits for a bridge that binds later), or the
+            gateway could not say. The cancel comes only now, after the read
+            and naming the task the POST answered with, so it reaches the bus
+            even where the gateway's own heal has released the record on
+            this very turn. It never changes the classification. The settle
+            read after it contributes one thing, and only to the graded
+            timeout: the executor's terminal, with its reason. The
+            deliverable stays what the task produced inside its budget --
+            the cancel acknowledgement the gateway posts after it is not the
+            agent's answer -- and anything else the settle says (a transient
+            at that one read, a task that has not confirmed) must not relabel
+            what the first, authoritative read classified.
+
+            Returns ``(timed_out, stop_pending)``: whether the exchange ended
+            at its budget, and whether a stop was already pending on the
+            record so none was sent.
+            """
+            timed_out = exchange.outcome in (inject.OUTCOME_DEADLINE, inject.OUTCOME_QUEUED)
+            leaves_active = timed_out or exchange.outcome in (
+                inject.OUTCOME_NEVER_STARTED,
+                inject.OUTCOME_UNCLASSIFIED,
+            )
+            stop_pending = leaves_active and exchange.probe is not None and exchange.probe.detached
+            if leaves_active and not stop_pending:
+                settled = task.cancel(exchange.task_id, settle=None if timed_out else 0)
+                if timed_out and settled is not None and settled.outcome == inject.OUTCOME_TERMINAL:
+                    exchange.fold.mark_terminal(
+                        settled.fold.terminal,
+                        settled.fold.terminal_source,
+                        settled.fold.terminal_reason,
+                    )
+            return timed_out, stop_pending
+
+        def _stop_word(task: inject.InjectTask, stop_pending: bool) -> str:
+            """How the stray was bounded, for the record.
+
+            Read from what the door said, never assumed from the cancel having
+            been sent: a cancel the gateway refused or could not publish
+            leaves the task holding its bridge slot, and a record that said
+            "cancelled" would tell a reader the stray was bounded when it was
+            not. The never-started branch phrases the same three cases in its
+            own words.
+            """
+            if stop_pending:
+                return "a stop was already pending"
+            if task.cancel_sent:
+                return "cancelled"
+            return "no cancel was published (see the log), so it may still be running"
+
+        task = inject.InjectTask(
+            base_url=base_url,
+            conversation=conversation,
+            prompt=prompt,
+            token=token,
+            author=author,
+            message_id=message_id,
+        )
+        try:
+            exchange = _exchange(task, timeout, opening=True)
+        except inject.BudgetBelowFloor as exc:
+            # Configuration, refused before the POST: the same class as a
+            # non-numeric budget, and nothing ran.
+            return AgentResult.errored(f"AGENT_INJECT_TIMEOUT: {exc}")
+        except inject.InjectUnavailable as exc:
+            return _infra_failure(
+                f"the inject exchange on {conversation} failed: {exc}{_abandon(task)}"
+            )
+        except _TransportError as exc:
+            return _infra_failure(f"{exc}{_abandon(task)}")
+        identity["inject_only"] = task.inject_only
+        identity["backend"] = task.backend
+
+        timed_out, stop_pending = _bound_stray(task, exchange)
+
+        if exchange.outcome == inject.OUTCOME_UNCLASSIFIED:
+            # The read at the deadline could not say -- the gateway could not
+            # look at the stream, or the record no longer held the task and
+            # no terminal was ever seen. Nothing says whether an executor saw
+            # the prompt, so nothing is graded.
+            said = exchange.probe.describe() if exchange.probe else "no answer"
+            return _infra_failure(
+                f"task {exchange.task_id} on {exchange.conversation} could not be classified at "
+                f"the deadline: the gateway's read route said {said}"
+            )
+
+        if exchange.outcome == inject.OUTCOME_NEVER_STARTED or exchange.fold.never_started:
+            # No executor ever touched the task: the read showed it active
+            # with nothing on its stream past the gateway's first-event
+            # grace. An install with no executor on the addressee -- a
+            # `next` install whose bridge sidecar is not declared -- not an
+            # agent that answered badly. The cancel above is on the bus for
+            # whichever bridge binds next.
+            if task.cancel_sent:
+                bounded = (
+                    "; a cancel naming the task was published so a bridge that binds later "
+                    "kills the stale prompt rather than running it to completion"
+                )
+            elif stop_pending:
+                bounded = "; a stop was already pending on the record"
+            else:
+                bounded = "; the cancel naming the task could not be sent (see the log)"
+            return _infra_failure(
+                f"no executor took task {exchange.task_id} on {exchange.conversation}: nothing "
+                f"reached its event stream inside the gateway's {task.first_event_grace:.0f}s "
+                f"first-event grace, so nothing is running on the addressee{bounded}"
+            )
+
+        if exchange.outcome == inject.OUTCOME_QUEUED:
+            # The bridge queued the task (submitted) behind its concurrency
+            # cap and never spawned it inside the budget. Nothing ran, so
+            # there is nothing to grade; the cancel above asked the bridge
+            # to drop it from the queue (it answers canceled-before-start).
+            ended = exchange.fold.terminal or "no terminal inside the settle"
+            bounded = _stop_word(task, stop_pending)
+            return _infra_failure(
+                f"task {exchange.task_id} on {exchange.conversation} sat queued (submitted, "
+                f"never working) for the whole {timeout:.0f}s budget; {bounded}, {ended}. The "
+                "bridge's BRIDGE_CONCURRENCY is below the run's parallelism, or its slots are "
+                "held by earlier tasks"
+            )
+
+        if exchange.fold.gateway_declared:
+            # The gateway declared this terminal rather than an executor:
+            # about a task it could not put on the bus, or -- on the read's
+            # fold -- the supervisor's word about an executor that died or
+            # never ran. Same state on the wire as an executor's failure and
+            # the opposite meaning: grading it would score an outage as the
+            # agent answering badly. Which of the two it was is worth saying,
+            # because they name different broken things.
+            reason = exchange.fold.terminal_reason or "no reason given"
+            if exchange.fold.terminal_source == inject.TERMINAL_SOURCE_SUPERVISOR:
+                whose = "the supervisor ended it, so its executor died or never ran"
+            else:
+                whose = "the gateway failed to publish the submission, so it never reached the bus"
+            return _infra_failure(
+                f"task {exchange.task_id} was ended by the gateway rather than by an executor "
+                f"(state {exchange.fold.terminal}, source {exchange.fold.terminal_source}, "
+                f"reason: {reason}): {whose}, so nothing the agent said is on the record"
+            )
+
+        infrastructure = exchange.fold.infrastructure_terminal
+        if infrastructure and not timed_out:
+            # The executor's own failure around the task, not the persona's:
+            # the terminal's reason names the bridge or the worker adapter
+            # breaking, or the executor refusing the submission. A canceled
+            # terminal after this harness's own cancel is excluded -- that is
+            # the graded timeout, whatever the bridge's reason says.
+            return _infra_failure(
+                f"task {exchange.task_id} ended {exchange.fold.terminal}: {infrastructure} "
+                f"(reason: {exchange.fold.terminal_reason or 'none given'})"
+            )
+
+        result = _inject_result(exchange, identity)
+        if timed_out:
+            # On the record whether or not the cancel was confirmed: a
+            # terminal of `canceled` below says how it ended, this says why --
+            # and whether the stop went, read from the door.
+            how = _stop_word(task, stop_pending)
+            result.errors.append(
+                f"task {exchange.task_id} did not reach a terminal state within "
+                f"{timeout:.0f}s; {how}"
+            )
+        if exchange.fold.terminal and exchange.fold.terminal != inject.STATE_COMPLETED:
+            reason = exchange.fold.reason_token or "no reason given"
+            result.errors.append(
+                f"task {exchange.task_id} ended {exchange.fold.terminal} (reason: {reason})"
+            )
+
+        if delegation_timeout > 0:
+            # The seam for delegated work, and it is the case runner's rather
+            # than the transport's on purpose (the A2A owner's instruction on
+            # #1661): when agent-initiated delegation becomes a child task on
+            # the bus, this whole block goes and the transport is untouched.
+            # Card ids are read from the trajectory, which on this path
+            # carries no tool calls, so the wait finds nothing outstanding and
+            # settles at once. A status turn is a further message on the same
+            # conversation, the way a second message in a chat thread is --
+            # and it is a new task rather than a steer, because the first
+            # task's terminal has already released the conversation. Each
+            # turn gets its own message id, or the door's dedupe would answer
+            # the second turn with the first turn's task.
+            turns = 0
+
+            def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
+                nonlocal turns
+                turns += 1
+                follow = inject.InjectTask(
+                    base_url=base_url,
+                    conversation=exchange.conversation,
+                    prompt=poll,
+                    token=token,
+                    author=author,
+                    message_id=f"{message_id}{_INJECT_STATUS_TURN_SUFFIX}{turns}",
+                )
+                try:
+                    turn_exchange = _exchange(follow, turn_timeout, opening=False)
+                except inject.InjectUnavailable as exc:
+                    raise _TransportError(
+                        f"{exc}{_abandon(follow)}", retryable=exc.retryable
+                    ) from exc
+                if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
+                    # Retryable, and therefore infrastructure once the wait's
+                    # retries are spent: nothing executed this turn, so there
+                    # is no answer to grade. The next attempt carries the
+                    # next status turn's own message id.
+                    raise _TransportError(
+                        f"{inject.refusal_detail(follow.refusal)}, on status turn {turns} of "
+                        f"{follow.conversation}: {follow.note}",
+                        retryable=True,
+                    )
+                # A status turn's task can be left active at its budget the
+                # same as the opening turn's, and the next turn on a key
+                # whose record still holds it would be absorbed as a steer.
+                _bound_stray(follow, turn_exchange)
+                return _inject_result(turn_exchange, identity), ""
+
+            def _respawn_tunnel() -> None:
+                _tunnel(reset=True)
+
+            try:
+                self._await_delegated_work(
+                    result,
+                    turn=_status_turn,
+                    reset=_respawn_tunnel,
+                    timeout=timeout,
+                    delegation_timeout=delegation_timeout,
+                    poll_interval=poll_interval,
+                )
+            except _DelegationTransportExhausted as exc:
+                return _infra_failure(str(exc))
+        return result
+
     def _await_delegated_work(
         self,
         result: AgentResult,
         *,
-        url: str,
-        body: dict[str, Any],
-        headers: dict[str, str],
+        turn: Callable[[str, float], tuple[AgentResult, str]],
+        reset: Callable[[], None],
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
-        local_port: int,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -1012,8 +1715,12 @@ class KubeAgentsHarness(AgentHarness):
 
         The harness cannot read the board itself (in-cluster SQLite, with only
         ``/v1/responses`` and ``/api/sessions`` exposed), so it asks the agent
-        to, re-POSTing the same stateful ``conversation`` so the agent keeps its
-        context. Cards filed *during* a status turn join the wait.
+        to. ``turn`` issues one status turn -- on the api transport a re-POST
+        of the same stateful ``conversation`` so the agent keeps its context,
+        on the inject transport a further message on the same conversation --
+        and returns the parsed reply with its session id; ``reset`` respawns
+        the transport's tunnel between failed turns. Cards filed *during* a
+        status turn join the wait.
 
         A turn that fails in transport is retried up to
         :data:`_MAX_TRANSPORT_FAILURES` times running -- through a fresh
@@ -1076,9 +1783,7 @@ class KubeAgentsHarness(AgentHarness):
 
             poll = _POLL_PROMPT.format(tool=STATUS_TOOL, ids=", ".join(outstanding))
             try:
-                turn, turn_session = _post_turn(
-                    url, {**body, "input": poll}, headers, min(timeout, remaining)
-                )
+                status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
                 transport_failures += 1
                 _log.warning(
@@ -1101,7 +1806,7 @@ class KubeAgentsHarness(AgentHarness):
                     # merely pacing before the slot is asked for again.
                     if exc.retryable:
                         try:
-                            _reset_port_forward(local_port)
+                            reset()
                         except RuntimeError as pf_exc:
                             # Counted, not raised: a forward that will not
                             # come back is the same outage, and the ceiling
@@ -1140,15 +1845,15 @@ class KubeAgentsHarness(AgentHarness):
             # poll, so the cumulative view would let an agent that has stopped
             # reading the board pass as one still answering, and would mark
             # every turn after the first terminal card as settled.
-            fresh_reported = reported_statuses(new_calls(turn, seen_calls))
+            fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
             _fold_status_turn(
                 result,
-                turn,
+                status_turn,
                 settled=any(s in _TERMINAL_STATUSES for s in fresh_reported.values()),
             )
             # ``observed`` needs each distinct result once, so it stays on the
             # content test -- a replayed reading adds nothing to the answer.
-            observed.extend(merge_new(observed, turn.trajectory))
+            observed.extend(merge_new(observed, status_turn.trajectory))
             session_id = turn_session or session_id
 
             if any(task_id in fresh_reported for task_id in outstanding):
@@ -1162,12 +1867,12 @@ class KubeAgentsHarness(AgentHarness):
                     )
                     timed_out = False
                     break
-            statuses.update(reported_statuses(turn.trajectory))
+            statuses.update(reported_statuses(status_turn.trajectory))
             # dict.fromkeys: order-preserving dedupe, so a card the agent
             # re-filed under the same id is awaited once. The overflow is
             # reported only the first time, since the replayed trajectory
             # re-offers the dropped ids on every poll.
-            merged = list(dict.fromkeys(awaited + delegated_task_ids(turn.trajectory)))
+            merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
             awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
             outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]

@@ -241,6 +241,32 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if err := g.reg.DropTask(ctx, taskID); err != nil {
 		g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
 	}
+	// Last, after the deliverable is posted and the rolling line edited, so
+	// an observer that treats this as "the task is over" has already been
+	// handed everything the conversation received for it. See TaskObserver.
+	//
+	// Reported as the executor's. A supervisor terminal reaches this same
+	// path (the relay's durable covers both `…events` and `…supervisor`), and
+	// that one is the gateway's word rather than an executor's -- but only
+	// the envelope's subject distinguishes them, and the fold three calls up
+	// no longer has it. Left as is because every supervisor terminal today
+	// comes from the session-pod paths, which a fixed-route install never
+	// takes; splitting it means threading the subject class through
+	// applyEvent, which is worth doing when session routing is armed
+	// somewhere that grades the answer. Until then the two views of one
+	// supervisor terminal disagree: the read route's fold (probeConversation)
+	// attributes it by subject and says supervisor, this path says executor.
+	//
+	// The reason is the terminal's status message, verbatim: the bridge and
+	// the worker adapter write `reason: <token>[ - detail]` there, and a
+	// program classifying a failed terminal reads the token. Passed through
+	// rather than parsed here, because the tokens are the executors'
+	// definitions and the gateway has no business knowing them.
+	reason := ""
+	if s.Status.Message != nil {
+		reason = joinTextParts(s.Status.Message.Parts)
+	}
+	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, TerminalFromExecutor, reason)
 }
 
 // updateRollingLine edits the task's single status message in place. Under
