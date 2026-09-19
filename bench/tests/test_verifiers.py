@@ -1761,6 +1761,34 @@ def test_the_ticket_linked_beside_the_fix_does_not_sink_it(token, github):
     assert _pr_check().verify(5.0).status == "pass"
 
 
+def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, github):
+    """A repository the installation cannot see is unevaluable, and an agent
+    that mistypes one beside the real URL produces exactly that. Ending the
+    check there would be rung 2, which is admission-blind: one agent typo would
+    red the eval job for every open pull request."""
+    typo = "kube-agents-evals-infra"
+    _stash_pr_report(
+        f"Fix in https://github.com/gke-agentic/{typo}/pull/7 — sorry, {_PR_URL}"
+    )
+    github.routes[_pr_api()] = (200, _pr_payload())
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_an_unreadable_repository_with_nothing_else_to_grade_is_an_error(token, github):
+    """The other half of the same rule: unevaluable still wins over a plain
+    rejection, so an onboarding gap is never graded as the agent's failure."""
+    _stash_pr_report(
+        f"Fix in https://github.com/gke-agentic/kube-agents-evals-infra/pull/7, "
+        f"earlier attempt {_PR_URL}"
+    )
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "add it to the App installation" in res.reason
+    assert "also rejected" in res.reason
+
+
 # --- the credential, which is the open question --------------------------
 
 

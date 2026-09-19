@@ -499,9 +499,12 @@ there for rep 2 and rep 3 to link. The repeats of a case were grading each other
 `TranscriptSnapshot.started_at`, less `max_clock_skew_sec` for the gap between the Prow runner's
 clock and the agent pod's. Created during the run passes, and so does updated during it: the
 skill derives the branch from the change, so a later repetition pushes onto the branch the first
-one used and edits the pull request already open on it. A leftover the run merely quotes moves
-neither stamp. `owner: gke-agentic` pins the organisation, which is a fair exact match across
-every pool project and breaks loudly if the organisation ever moves.
+one used and edits the pull request already open on it. That stamp moves on any write by anyone,
+so what it proves is that the pull request was written to during the run — a repetition that only
+comments on a leftover passes as well. Telling those apart needs the head commit, which the ledger
+App cannot read; sweeping the GitOps repository between repetitions is what removes leftovers.
+`owner: gke-agentic` pins the organisation, which is a fair exact match across every pool project
+and breaks loudly if the organisation ever moves.
 
 It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`
 mints that token for every fan-out unit, not only the audit ones. It asks `/repos/{o}/{r}/issues/{n}`
@@ -510,7 +513,9 @@ carries; `/pulls/{n}` is tried only when that is denied or absent. Denied by bot
 `status: "error"` naming `pull_requests: read` as the permission to add — never a fail, since a
 credential gap is not the agent opening nothing. 404 from both costs one more call, `/repos/{o}/{r}`:
 a repository the installation was never given answers 404 exactly as a missing number does, and
-only the repository's own visibility tells those apart.
+only the repository's own visibility tells those apart. A candidate GitHub cannot answer for ends
+the check only when no other URL in the reply resolves: an error is admission-blind, so a mistyped
+slug beside the real pull request must not red the eval job.
 
 ##### Addressing a seeded-fleet fixture by role
 

@@ -945,9 +945,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
     resolves it; the number is a pull request and not an issue; it lives under
     ``owner`` when one is set; and it was written -- created or updated -- at or
     after this run started, less ``max_clock_skew_sec``. Updating counts because
-    the skill reuses a branch and edits the pull request already open on it. One
-    surviving candidate is enough — a reply may link the ticket it came from
-    beside the fix.
+    the skill reuses a branch and edits the pull request already open on it --
+    which also means the stamp proves only that the pull request was written to
+    during the run, by anyone. One surviving candidate is enough — a reply may
+    link the ticket it came from beside the fix — and a candidate GitHub cannot
+    answer for ends the check only when no other candidate passes.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -1076,6 +1078,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
+        # A candidate the API cannot answer for only ends the check if nothing
+        # else resolves. An agent that mistypes a repository slug beside the
+        # real URL would otherwise error, and an error is rung 2, which reds the
+        # eval job for every open pull request.
+        unresolved: list[str] = []
         for owner, repo, number in seen:
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():
@@ -1084,17 +1091,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
             try:
                 payload, unevaluable = self._resolve(owner, repo, number, token, budget)
             except OSError as exc:
-                return done(
-                    False,
-                    f"could not reach the GitHub API for {slug}: {exc}; this check "
-                    "could not be evaluated",
-                    status="error",
-                )
+                unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                continue
             if payload is None:
                 if unevaluable is None:
                     rejected.append(f"{slug}: no such pull request (404)")
-                    continue
-                return done(False, unevaluable, status="error")
+                else:
+                    unresolved.append(unevaluable)
+                continue
             # `pull_request` is how the issues endpoint marks one; `head` is
             # what the pulls endpoint returns instead. Neither means the URL
             # said /pull/ over a number that is a plain issue.
@@ -1105,13 +1109,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if created is None:
                 rejected.append(f"{slug}: GitHub returned no readable created_at")
                 continue
-            # Creation is not the only way a run owns a pull request. The
+            # Creation is not the only way a run owns a pull request: the
             # submit-suggestion skill derives the branch from the change, so a
             # later rep pushes onto the branch the first one used, `gh pr
             # create` answers "already exists", and the skill edits that pull
-            # request and returns its URL. The work happened; it shows up in
-            # `updated_at`. A run that only quotes a leftover URL moves neither
-            # stamp, which is the case this check exists to fail.
+            # request and returns its URL. That work lands in `updated_at`
+            # alone. The stamp moves on any write by anyone, so a rep that only
+            # comments on a leftover passes too; the head commit would separate
+            # the two and the ledger App cannot read it. Sweeping the GitOps
+            # repository between reps (#1755 item 2) is what removes leftovers.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()
@@ -1134,6 +1140,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 },
             )
 
+        if unresolved:
+            return done(
+                False,
+                "no pull request URL in the report resolved: " + "; ".join(unresolved)
+                + (f"; also rejected: {'; '.join(rejected)}" if rejected else ""),
+                status="error",
+            )
         return done(
             False,
             "none of the pull request URLs the report names is one this run opened: "
