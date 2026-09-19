@@ -94,16 +94,12 @@ verification_spec:
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # Tighter than rca-remediation-pr's ["github.com/", "/pull/"], which
-      # any PR link quoted in the reply would satisfy. The eval GitOps
-      # repositories are decided now — gke-agentic/<project>-infra, per
-      # DRAFTS.md's A1 and docs/site's ci-pool-projects.md — so the org
-      # half is a fair exact match across every pool project, and it
-      # breaks loudly and correctly if the org ever moves (the same
-      # contract class as the seeded-name assertions). rca's looser copy
-      # gates an active case and is deliberately not edited here.
-      required_phrases: ["github.com/gke-agentic/", "/pull/"]
+      # Not report_contains: a substring passes on an invented URL, and on the
+      # PR an earlier rep opened, since nothing sweeps the GitOps repository.
+      type: pull_request_opened
+      # gke-agentic/<project>-infra on every pool project, so the org half is a
+      # fair exact match and breaks loudly if the org moves.
+      owner: gke-agentic
   - name: the-fix-names-the-workload-and-the-budget
     role: objective
     # assert, not the converge default: the transcript is immutable once the

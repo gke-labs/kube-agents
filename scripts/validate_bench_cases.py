@@ -234,6 +234,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, run-reading.
     "report_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    # No field, deliberately: the freshness binding is the assertion and every
+    # field only narrows it. See the empty-tuple rule in _check_assertions.
+    "pull_request_opened": (),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
 }
@@ -457,7 +460,11 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
     # `resource_property`'s `op` is the assertion whatever its value --
     # `absent` and `exists` say something about the match set rather than about
     # a value.
-    if not any(_populated(node.get(field)) for field in fields):
+    #
+    # An empty tuple means the assertion is the check itself and no field can
+    # switch it off: `pull_request_opened` fails on a report naming no pull
+    # request and on one naming a previous run's, with nothing configured.
+    if fields and not any(_populated(node.get(field)) for field in fields):
         problems.append(
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"

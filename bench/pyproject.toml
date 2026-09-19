@@ -53,6 +53,7 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 [project.entry-points."devops_bench.verifiers"]
 fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
+pull_request_opened = "kube_agents_bench.verifiers:PullRequestOpenedVerifier"
 report_contains = "kube_agents_bench.verifiers:ReportContainsVerifier"
 worker_commands = "kube_agents_bench.verifiers:WorkerCommandsVerifier"
 tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
