@@ -14,6 +14,11 @@
 
 package main
 
+import (
+	"log"
+	"time"
+)
+
 // defaultReasons lists the standard Event.Reason values that trigger investigations.
 // These cover typical Kubernetes workload and node failures, but operators can
 // override this list via the --reason flag.
@@ -67,6 +72,23 @@ type filterConfig struct {
 	// still fire on event #1, so the failure modes this does not recognize behave
 	// exactly as they did before it existed.
 	imagePullTransientMinCount int
+	// failedSchedulingMinCount is the backstop for FailedScheduling when
+	// cluster-autoscaler has said nothing about the pod (no autoscaler, or one
+	// that has not evaluated it yet). The scheduler retries a pod it cannot
+	// place on every cluster change and at least every five minutes, so the
+	// count is a number of failed attempts, not a duration: it climbs within
+	// seconds while nodes join and every few minutes on a quiet cluster. The
+	// count alone is a delay, not a discriminator, which is why the
+	// autoscaler's own verdicts take precedence over it below.
+	failedSchedulingMinCount int
+	// scaleUpHold is how long a TriggeredScaleUp mark holds the pod's
+	// FailedScheduling events, measured from the mark's event time to the
+	// event's own last sighting rather than to the wall clock (see
+	// failedSchedulingGate for why the two differ after a restart). A ceiling
+	// on the hold, not a floor on the alert: it is cluster-autoscaler's own
+	// node-provision timeout, past which a pod still pending is stuck whatever
+	// the autoscaler last said, and the count backstop applies again.
+	scaleUpHold time.Duration
 }
 
 // filterThresholds carries the count debounces as a named group. They are all
@@ -77,12 +99,54 @@ type filterThresholds struct {
 	unhealthyMinCount          int
 	backoffMinCount            int
 	imagePullTransientMinCount int
+	failedSchedulingMinCount   int
+	// scaleUpHold is the one duration in the group. It rides here rather than
+	// as a fifth positional argument for the same reason the counts do, and
+	// zero means "the default", as it does for them.
+	scaleUpHold time.Duration
 }
 
-// defaultMinCount applies to every debounce that was left unset. Three is the
-// count at which kubelet's retry schedule has visibly failed to resolve something
-// on its own, and is the value --unhealthy-min-count has always used.
-const defaultMinCount = 3
+const (
+	// defaultMinCount applies to every debounce that was left unset. Three is the
+	// count at which kubelet's retry schedule has visibly failed to resolve something
+	// on its own, and is the value --unhealthy-min-count has always used.
+	defaultMinCount = 3
+	// defaultFailedSchedulingMinCount is five failed scheduling attempts, and
+	// deliberately not a time. On a cluster with cluster-autoscaler the
+	// verdict on a new pod arrives seconds after its first attempt (measured
+	// on Autopilot: TriggeredScaleUp two seconds after the pod, the count at
+	// five fourteen seconds after), so the backstop covers the gap before the
+	// verdict and the pods the autoscaler never rules on; on a cluster without
+	// one, a pod that has failed five attempts is stuck unless capacity frees
+	// on its own. The value is the issue's decision, chosen over three
+	// (defaultMinCount) to sit past a normal scale-up's first attempts.
+	defaultFailedSchedulingMinCount = 5
+	// defaultScaleUpHold is cluster-autoscaler's default max-node-provision-time.
+	// A scale-up the autoscaler has not delivered by then is one it has given
+	// up on, so a pod still pending past it is reported on the count.
+	defaultScaleUpHold = 15 * time.Minute
+	// failedSchedulingStaleAfter is how long the scheduler can go without
+	// re-emitting a pod's FailedScheduling before the event describes a pod
+	// that is no longer pending. kube-scheduler retries every unschedulable
+	// pod at least every five minutes (its unschedulable-queue flush), each
+	// retry bumping the event's count and LastTimestamp, so on the core/v1
+	// recorder a pod still stuck always has a sighting fresher than this. An
+	// events.k8s.io/v1 recorder (upstream kube-scheduler, so GKE Standard)
+	// writes a continuing series back to the API server on a 30-minute
+	// refresh, so there a stuck pod's sighting can read up to 30 minutes old
+	// and this check delays its card to the next refresh (observed live: a
+	// declined pod held at "25m13s ago", fired at the refresh six minutes
+	// later); it never silences it. The check exists for the
+	// informer's initial list: after a restart it replays every event still
+	// inside the API server's TTL, and a FailedScheduling whose pod scheduled
+	// while the watcher was down arrives with a count past the backstop and a
+	// TriggeredScaleUp mark that may by then be older than scaleUpHold. The
+	// watcher defers the list's FailedScheduling events until the marks are
+	// recorded (watcher.go); this check is the other half, for the events
+	// whose mark has aged out of the hold. Three flush intervals, so a slow
+	// retry is not mistaken for a stale event.
+	failedSchedulingStaleAfter = 15 * time.Minute
+)
 
 // newFilterConfig creates a new filterConfig, applying defaults for missing values.
 func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []string, th filterThresholds) filterConfig {
@@ -95,6 +159,14 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 		}
 		return n
 	}
+	failedSchedulingMinCount := th.failedSchedulingMinCount
+	if failedSchedulingMinCount <= 0 {
+		failedSchedulingMinCount = defaultFailedSchedulingMinCount
+	}
+	scaleUpHold := th.scaleUpHold
+	if scaleUpHold <= 0 {
+		scaleUpHold = defaultScaleUpHold
+	}
 	return filterConfig{
 		allowedReasons:             stringSet(reasons),
 		allowedNamespaces:          stringSet(allowNamespaces),
@@ -102,6 +174,8 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 		unhealthyMinCount:          orDefault(th.unhealthyMinCount),
 		backoffMinCount:            orDefault(th.backoffMinCount),
 		imagePullTransientMinCount: orDefault(th.imagePullTransientMinCount),
+		failedSchedulingMinCount:   failedSchedulingMinCount,
+		scaleUpHold:                scaleUpHold,
 	}
 }
 
@@ -120,13 +194,26 @@ func stringSet(xs []string) map[string]struct{} {
 	return out
 }
 
-// filter evaluates triage events using a filterConfig.
+// filter evaluates triage events using a filterConfig. It keeps no state
+// about events, so one instance serves every cluster's dispatcher; the clock
+// is the only thing it reads besides the event, and only for the
+// FailedScheduling gate.
 type filter struct {
 	cfg filterConfig
+	// now is the clock the FailedScheduling gate ages marks and events
+	// against. nil means time.Now; tests set it.
+	now func() time.Time
 }
 
 func newFilter(cfg filterConfig) *filter {
 	return &filter{cfg: cfg}
+}
+
+func (f *filter) clock() time.Time {
+	if f.now != nil {
+		return f.now()
+	}
+	return time.Now()
 }
 
 // filterGate names the rule that rejected an event, or gateAccepted when none did.
@@ -144,6 +231,25 @@ const (
 	gateUnhealthyMinCount   filterGate = "unhealthy_min_count"
 	gateBackoffMinCount     filterGate = "backoff_min_count"
 	gateImagePullTransient  filterGate = "imagepull_transient_min_count"
+	// gateScaleUpMark is a TriggeredScaleUp or NotTriggerScaleUp event: admitted
+	// so the dispatcher records the verdict, never forwarded. Counted as filtered
+	// because it is; the dispatcher's log line says what it was recorded as.
+	gateScaleUpMark filterGate = "scaleup_mark"
+	// gateScaleUpMarkReporter is a TriggeredScaleUp or NotTriggerScaleUp whose
+	// reporter is not cluster-autoscaler (scaleUpReporter): dropped, so it is
+	// neither recorded as a verdict nor forwarded. The dispatcher's log line
+	// names the reporter it came from.
+	gateScaleUpMarkReporter filterGate = "scaleup_mark_reporter"
+	// gateScaleUpHold is a FailedScheduling held because cluster-autoscaler is
+	// provisioning a node for the pod.
+	gateScaleUpHold filterGate = "scaleup_hold"
+	// gateFailedSchedulingMinCount is a FailedScheduling held on the count
+	// backstop, with no autoscaler verdict on record.
+	gateFailedSchedulingMinCount filterGate = "failedscheduling_min_count"
+	// gateFailedSchedulingStale is a FailedScheduling the scheduler stopped
+	// re-emitting long enough ago that the pod is no longer pending; see
+	// failedSchedulingStaleAfter.
+	gateFailedSchedulingStale filterGate = "failedscheduling_stale"
 )
 
 // Decide applies the filtering rules in order and returns the first gate that
@@ -151,8 +257,17 @@ const (
 //  1. Reason is allowed.
 //  2. Namespace is not explicitly excluded (exclude wins).
 //  3. Namespace is in the allowed list (or allowed list is empty).
-//  4. Repeat count threshold is met, for the two families that flap:
-//     "Unhealthy" probe warnings and the crash-loop family.
+//  4. Repeat count threshold is met, for the families that flap: "Unhealthy"
+//     probe warnings, the crash-loop family, and retryable image pulls.
+//  5. FailedScheduling is a stuck pod rather than a scale-up in progress,
+//     read from cluster-autoscaler's verdict on the pod when there is one and
+//     from the repeat count when there is not (failedSchedulingGate). The two
+//     autoscaler verdicts themselves stop here as gateScaleUpMark: they are
+//     admitted so the dispatcher can record them, and are never forwarded.
+//     One that names a reporter other than cluster-autoscaler stops as
+//     gateScaleUpMarkReporter instead and is not recorded: the reason alone
+//     would let any event writer that reused the two names hold or release
+//     a pod's FailedScheduling.
 func (f *filter) Decide(ev TriageEvent) filterGate {
 	if f.cfg.allowedReasons != nil {
 		if _, ok := f.cfg.allowedReasons[ev.Key.Reason]; !ok {
@@ -187,6 +302,110 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 	// anything unrecognized still fire on event #1.
 	if ev.PullClass == pullClassRetryable && belowMinCount(ev.Count, f.cfg.imagePullTransientMinCount) {
 		return gateImagePullTransient
+	}
+	if scaleUpVerdictFor(ev.Key.Reason) != scaleUpNone {
+		if ev.Reporter != scaleUpReporter {
+			return gateScaleUpMarkReporter
+		}
+		return gateScaleUpMark
+	}
+	if ev.Key.Reason == reasonFailedScheduling {
+		return f.failedSchedulingGate(ev)
+	}
+	return gateAccepted
+}
+
+// failedSchedulingGate decides whether a FailedScheduling event is a stuck
+// pod or the scheduler's normal output while capacity arrives. In order:
+//
+//   - An event the scheduler stopped re-emitting more than
+//     failedSchedulingStaleAfter ago is held whatever else is known: the pod
+//     it describes has scheduled or gone, and a pod still pending will be
+//     sighted again within minutes with a fresh timestamp. Unknown timestamps
+//     fail open, as unknown counts do.
+//   - A NotTriggerScaleUp mark passes the event at any count, provided the
+//     event was sighted later than the verdict. The autoscaler has ruled it
+//     cannot help, so waiting for more repeats only delays the incident. A
+//     sighting that does not postdate the verdict is the scheduler's last
+//     attempt before the autoscaler ruled: live it was judged when it
+//     arrived and is bumped again only on the next retry, after the verdict,
+//     but an informer replay after a restart brings it back as it was, and
+//     for a pod that was placed or deleted before that retry it is the only
+//     object there is. It falls through to the count backstop, as it was
+//     judged live, rather than opening a card for a pod that is Running or
+//     gone. Later, not at-or-later: the core/v1 recorder stamps to the
+//     second, the decline follows the attempt that drew it, and on a fast
+//     autoscaler both land in the same second (seen live, both at
+//     01:53:25Z, and the replay opened a card for a pod deleted two seconds
+//     later), so a sighting in the verdict's own second is read as the
+//     attempt that drew it. A retry in that same second waits for the next.
+//   - A TriggeredScaleUp mark holds the event at any count while the event's
+//     last sighting is within scaleUpHold of the mark. A node is on its way;
+//     the scheduler retries the pod on every cluster change while it joins,
+//     and the count reaches any threshold before the node is Ready. The mark
+//     is aged against the sighting and not against the clock because the two
+//     differ after a restart: the scheduler stops re-emitting the event when
+//     the pod schedules, so a replayed event's sighting is fixed at the end
+//     of its scale-up while the clock keeps moving. Aged against the clock,
+//     the mark would expire fifteen minutes after the scale-up triggered
+//     while the sighting stayed under the staleness check for as long again
+//     as the scale-up took, and a restart in that window would open a card
+//     for a pod that had been Running for up to fifteen minutes. For a live
+//     event the sighting is the present, so the two readings are the same;
+//     a pod still pending past the hold is sighted again with a fresh
+//     timestamp and falls through to the count as before.
+//   - Otherwise the count backstop applies, with the same fail-open on zero
+//     as the other debounces. The count is one event object's: both recorders
+//     start a new object at count 1 when the scheduler's message changes, so
+//     a pod whose message churns reaches the threshold later than one whose
+//     message holds still. Summing a pod's objects was tried and withdrawn:
+//     on the live install it reached five across two objects eight seconds
+//     after the pod was created, one second before cluster-autoscaler's
+//     TriggeredScaleUp, and opened a card for a pod that scheduled 37 seconds
+//     later, while no single object had passed four. The per-object count
+//     damps that burst; the price is a slower card on a cluster without an
+//     autoscaler while the message keeps changing.
+//
+// Not a settle timer: a live event is never delayed by wall-clock time, only
+// by what the autoscaler said or by how often the scheduler has repeated it.
+// Each decision logs one line, since the deployed install exposes no metrics.
+func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
+	now := f.clock()
+	if !ev.LastSeen.IsZero() && now.Sub(ev.LastSeen) > failedSchedulingStaleAfter {
+		log.Printf("held %s pod=%s/%s (count=%d): last sighting %s ago, the pod is no longer pending",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.LastSeen).Round(time.Second))
+		return gateFailedSchedulingStale
+	}
+	switch ev.ScaleUp.Verdict {
+	case scaleUpDeclined:
+		if !ev.LastSeen.IsZero() && !ev.LastSeen.After(ev.ScaleUp.At) {
+			log.Printf("%s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, %s after this sighting; the scheduler has not retried since, falling back to the count backstop",
+				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), ev.ScaleUp.At.Sub(ev.LastSeen).Round(time.Second))
+			break
+		}
+		log.Printf("pass %s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, short-circuiting the count backstop",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second))
+		return gateAccepted
+	case scaleUpTriggered:
+		// An event with no timestamp is aged as a live one, as the staleness
+		// check treats it: the present is the only sighting it can claim.
+		sighting := ev.LastSeen
+		if sighting.IsZero() {
+			sighting = now
+		}
+		sinceMark := sighting.Sub(ev.ScaleUp.At)
+		if sinceMark <= f.cfg.scaleUpHold {
+			log.Printf("held %s pod=%s/%s (count=%d): cluster-autoscaler triggered a scale-up %s ago, %s before this sighting, holding up to %s",
+				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), max(sinceMark, 0).Round(time.Second), f.cfg.scaleUpHold)
+			return gateScaleUpHold
+		}
+		log.Printf("%s pod=%s/%s (count=%d): the scale-up triggered %s ago was %s old at this sighting, past the %s hold; falling back to the count backstop",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), sinceMark.Round(time.Second), f.cfg.scaleUpHold)
+	}
+	if belowMinCount(ev.Count, f.cfg.failedSchedulingMinCount) {
+		log.Printf("held %s pod=%s/%s (count=%d < %d, no autoscaler verdict on record)",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, f.cfg.failedSchedulingMinCount)
+		return gateFailedSchedulingMinCount
 	}
 	return gateAccepted
 }

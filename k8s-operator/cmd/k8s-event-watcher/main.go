@@ -75,6 +75,11 @@ type flags struct {
 	// imagePullTransientMinCount gates only the self-clearing half of the
 	// image-pull family; see filter.go.
 	imagePullTransientMinCount int
+	// failedSchedulingMinCount is the FailedScheduling backstop when
+	// cluster-autoscaler has said nothing about the pod; scaleUpHold is how
+	// long its TriggeredScaleUp holds the pod's events. See filter.go.
+	failedSchedulingMinCount int
+	scaleUpHold              time.Duration
 
 	inCluster        bool
 	kubeconfig       string
@@ -111,6 +116,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
 	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event.")
 	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
+	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1 = fire on the first event.")
+	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
 
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
@@ -374,21 +381,32 @@ type dispatcher struct {
 	// dedup, so one cluster churning through pods cannot evict another's entries
 	// out of the shared bound.
 	pullClasses *pullClassMemo
-	injector    *injector
-	metrics     *metrics
-	mode        string // "per-incident" or "shared"
-	targetSid   string // for shared mode
-	dryRun      bool
+	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
+	// records it to the FailedScheduling events it qualifies. Per-cluster for
+	// the same reason; pod UIDs are unique across clusters regardless.
+	scaleUps  *scaleUpMemo
+	injector  *injector
+	metrics   *metrics
+	mode      string // "per-incident" or "shared"
+	targetSid string // for shared mode
+	dryRun    bool
 }
 
 // newDispatcher builds a dispatcher around one cluster's dedup cache. filter,
 // injector, and metrics are shared across every cluster — they are stateless
-// or goroutine-safe — while dedup and the pull-class memo are per-cluster.
+// or goroutine-safe — while dedup and the two memos are per-cluster. The
+// scale-up memo lives as long as the dedup window, and at least as long as a
+// mark can still be consulted (scaleUpMemoTTL): past that the pod's next
+// FailedScheduling is a new incident, and a verdict that old no longer
+// describes a scale-up anyone is waiting on. The hold is read off the
+// filter's config rather than the flag so the default applies when the flag
+// was left at zero.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
 	return &dispatcher{
 		filter:      filter,
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
+		scaleUps:    newScaleUpMemo(scaleUpMemoTTL(f.dedupWindow, filter.cfg.scaleUpHold), defaultScaleUpEntries),
 		injector:    inj,
 		metrics:     m,
 		mode:        f.mode,
@@ -481,6 +499,21 @@ func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent, replay bool) (dedupRes
 	return dedupResult{Kind: dedupNewIncident, Count: 1}, true
 }
 
+// RecordScaleUpMark puts a cluster-autoscaler verdict on record and nothing
+// else: no metric, no log line, no dedup entry. The watcher calls it for the
+// marks a list or watch-list stream carries before the informer delivers
+// that batch (watcher.go, recordMark), and the same event comes through
+// Dispatch when the batch is delivered, where it is counted and logged once.
+// The filter decides admission here as it does there, so the --reason list
+// and the namespace rules still say which verdicts are remembered.
+func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
+	if d.filter.Decide(ev) != gateScaleUpMark {
+		return false
+	}
+	d.scaleUps.Record(ev.Key.UID, scaleUpVerdictFor(ev.Key.Reason), ev.LastSeen)
+	return true
+}
+
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
@@ -499,7 +532,25 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.PullCause = res.Cause
 		}
 	}
+	// Stamped before the filter for the same reason PullClass is: the gate
+	// that reads the verdict runs inside Decide, and the verdict arrived on a
+	// different event. Only FailedScheduling carries it; the marks themselves
+	// are recorded below, once the filter has admitted them, so the --reason
+	// list and the namespace rules decide which verdicts are remembered.
+	if ev.Key.Reason == reasonFailedScheduling {
+		ev.ScaleUp = d.scaleUps.Lookup(ev.Key.UID)
+	}
 	if gate := d.filter.Decide(ev); gate != gateAccepted {
+		if gate == gateScaleUpMark {
+			verdict := scaleUpVerdictFor(ev.Key.Reason)
+			d.scaleUps.Record(ev.Key.UID, verdict, ev.LastSeen)
+			log.Printf("recorded %s pod=%s/%s as scale-up %s (%s); not forwarded",
+				ev.Key.Reason, ev.Namespace, ev.Name, verdict, ev.Message)
+		}
+		if gate == gateScaleUpMarkReporter {
+			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
+				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
+		}
 		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
@@ -688,6 +739,8 @@ func realMain(argv []string) error {
 		unhealthyMinCount:          f.unhealthyMinCount,
 		backoffMinCount:            f.backoffMinCount,
 		imagePullTransientMinCount: f.imagePullTransientMinCount,
+		failedSchedulingMinCount:   f.failedSchedulingMinCount,
+		scaleUpHold:                f.scaleUpHold,
 	})
 	filter := newFilter(filterCfg)
 
