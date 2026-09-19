@@ -618,7 +618,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("create_cluster             = true", content)
 
     def test_tfvars_fresh_create_honours_cluster_mode(self):
-        # --cluster-mode reaches the generator through the exported environment. The probe found
+        # --gke-cluster-mode reaches the generator through the exported environment. The probe found
         # nothing, so the interview's choice is the only shape on offer.
         #
         # Asks for "standard" specifically: autopilot is now DEFAULT_CLUSTER_MODE,
@@ -710,7 +710,7 @@ class InstallerCommonTest(unittest.TestCase):
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
         # gvisor RuntimeClass natively. Passing ENABLE_GVISOR straight through
-        # made --gvisor=true unusable there rather than sandboxing the agent.
+        # made --enable-gvisor=true unusable there rather than sandboxing the agent.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -877,7 +877,7 @@ class InstallerCommonTest(unittest.TestCase):
         )
 
     def test_tfvars_autopilot_floor_names_a_way_out_for_every_caller(self):
-        # The abort's remedy has to work for whoever hit it. --gvisor=false is
+        # The abort's remedy has to work for whoever hit it. --enable-gvisor=false is
         # install.sh's; upgrade.sh rejects that flag and reads install.env
         # instead, so naming only the flag sends its callers to a dead end.
         proc = self._run(
@@ -889,7 +889,7 @@ class InstallerCommonTest(unittest.TestCase):
             describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
-        self.assertIn("--gvisor=false", proc.stderr)
+        self.assertIn("--enable-gvisor=false", proc.stderr)
         self.assertIn("install.env", proc.stderr)
 
     def test_tfvars_gvisor_off_clears_the_floor_on_a_sub_floor_autopilot(self):

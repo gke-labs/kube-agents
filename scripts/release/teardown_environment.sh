@@ -64,7 +64,7 @@ case "${TEARDOWN_STATUS}" in
       "" \
       "Remove it by hand — one line, so it can be copied out of here whole:" \
       "" \
-      "\`./uninstall.sh --non-interactive -y --project-id=${GCP_PROJECT_ID} --region=${GCP_REGION} --cluster-name=${GKE_CLUSTER_NAME}\`" \
+      "\`./uninstall.sh --non-interactive -y --gcp-project-id=${GCP_PROJECT_ID} --gcp-region=${GCP_REGION} --gke-cluster-name=${GKE_CLUSTER_NAME}\`" \
       "" \
       "On the RC pipeline the alternative is the next scheduled run's pre-install" \
       "teardown, three hours away, which will fail the same way if the cause is not" \

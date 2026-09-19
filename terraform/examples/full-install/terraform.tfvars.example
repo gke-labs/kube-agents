@@ -117,6 +117,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # credentials Secret and the CR's slack section turns on. Creating the Slack
 # app (Socket Mode + bot scopes) stays manual — see the README.
 # enable_slack            = true
+# Comma-separate several to serve more than one Slack workspace.
 # slack_bot_token         = "xoxb-..."
 # slack_app_token         = "xapp-..."
 # slack_allowed_users     = ["U01234567"]

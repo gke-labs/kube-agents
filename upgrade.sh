@@ -48,6 +48,9 @@ PARAM_KEEP_IMAGE_TAG="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
+# Empty means "whatever the loaded configuration says", which is how this ran
+# before the flag existed: the namespace came from install.env alone.
+PARAM_AGENT_NAMESPACE=""
 PARAM_IMAGE_TAG="${IMAGE_TAG:-${BAKED_RELEASE_VERSION:-}}"
 TEMP_REPO_DIR=""
 
@@ -115,9 +118,11 @@ Options:
                            install's real Terraform state. Changes nothing.
                            Exit 0 = in sync, 2 = there are changes, 1 = error.
   --dry-run                Preview upgrade plan and configuration state without touching cloud resources
-  --project-id ID          GCP Target Project ID
-  --cluster-name NAME      GKE Target Cluster Name
-  --region REGION          GKE GCP Region
+  --gcp-project-id ID      GCP Target Project ID
+  --gke-cluster-name NAME  GKE Target Cluster Name
+  --gcp-region REGION      GKE GCP Region
+  --agent-namespace NS     Kubernetes namespace the release lives in
+                           (default: the install's own, else kubeagents-system)
   --image-tag TAG          Validated immutable release tag or full commit SHA (required)
   --keep-image-tag         Upgrade everything except the images, leaving them on
                            the tag the install already serves. Use instead of
@@ -126,7 +131,7 @@ Options:
 
 Examples:
   # Perform full atomic upgrade of harness, operator, and skills
-  ./upgrade.sh --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
+  ./upgrade.sh --non-interactive --gcp-project-id="my-gcp-project" --gke-cluster-name="platform-agent-host"
 
   # Dry-run upgrade preview
   ./upgrade.sh --dry-run --upgrade-mode=full
@@ -430,12 +435,14 @@ parse_args() {
       --plan) PARAM_PLAN="true"; shift ;;
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
-      --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
-      --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
-      --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
-      --cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
-      --region=*) PARAM_REGION="${1#*=}"; shift ;;
-      --region) PARAM_REGION="$2"; shift 2 ;;
+      --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
+      --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --gke-cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
+      --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
+      --gcp-region) PARAM_REGION="$2"; shift 2 ;;
+      --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
+      --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --image-tag) PARAM_IMAGE_TAG="$2"; shift 2 ;;
       --help|-h) show_help; exit 0 ;;
@@ -638,7 +645,7 @@ main() {
     target_project="$(gcloud config get-value project 2>/dev/null || true)"
   fi
   if [ -z "$target_project" ]; then
-    print_error "A GCP project is required. Pass --project-id or configure one with gcloud."
+    print_error "A GCP project is required. Pass --gcp-project-id or configure one with gcloud."
     exit 1
   fi
 
@@ -715,7 +722,11 @@ main() {
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project" $GKE_DNS_ENDPOINT_FLAG
 
-  local target_namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  # --agent-namespace beats the loaded configuration for this run, the way the
+  # three coordinates above do. Empty falls through to install.env's NAMESPACE
+  # and then to DEFAULT_NAMESPACE, which is what every run did before the flag.
+  local target_namespace="${PARAM_AGENT_NAMESPACE:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+  export NAMESPACE="$target_namespace"
 
   if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
     # A PLAN's reference point is Terraform state, not the cluster, so the tag

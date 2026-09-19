@@ -320,9 +320,14 @@ jobs:
           # the install to the whole domain, which is the one omission here
           # that WIDENS access rather than removing a feature.
           #
-          # No flags for any of these: install.sh reads them from the
-          # environment, the same mechanism the GITOPS_* pair above already
-          # relies on.
+          # Most of these reach install.sh from the environment, the same
+          # mechanism the GITOPS_* pair above already relies on. The exceptions
+          # are the ones provision_environment.sh turns into flags before it
+          # calls the installer: ALLOWED_USERS, NAMESPACE, CLUSTER_MODE and the
+          # SLACK_* set. A flag beats whatever the rendered install.env says,
+          # which is why that script passes them that way -- so for those, this
+          # block is the source and the flag is the route, not an alternative
+          # to it.
           ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
           # Not install settings — the empty allowlist is already what produces
           # allow-all. Their only job is to let an operator SAY that the open

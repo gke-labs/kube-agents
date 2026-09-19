@@ -83,10 +83,13 @@ teardown_run() {
   local log_file="$1"
   local args=(
     --non-interactive -y
-    --project-id="${GCP_PROJECT_ID}"
-    --region="${GCP_REGION}"
-    --cluster-name="${GKE_CLUSTER_NAME}"
+    --gcp-project-id="${GCP_PROJECT_ID}"
+    --gcp-region="${GCP_REGION}"
+    --gke-cluster-name="${GKE_CLUSTER_NAME}"
   )
+  if [ -n "${AGENT_NAMESPACE:-${NAMESPACE:-}}" ]; then
+    args+=(--agent-namespace="${AGENT_NAMESPACE:-${NAMESPACE}}")
+  fi
 
   local status
   # errexit is lifted around the pipeline rather than the shorter `|| true`:

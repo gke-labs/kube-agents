@@ -113,6 +113,8 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
+          NAMESPACE: ${{ vars.NAMESPACE }}
         # Same rename fallback as deploy-environment.yml, and for the same
         # reason: the workspace is the candidate's tree, and every candidate up
         # to rc_2608310656_cf038a2_validated carries this script as

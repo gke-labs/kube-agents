@@ -92,11 +92,24 @@ exit {uninstall_exit}
         for expected in (
             "--non-interactive",
             "-y",
-            f"--project-id={MOCK_GCP_PROJECT_ID}",
-            f"--region={MOCK_GCP_REGION}",
-            f"--cluster-name={MOCK_GKE_CLUSTER_NAME}",
+            f"--gcp-project-id={MOCK_GCP_PROJECT_ID}",
+            f"--gcp-region={MOCK_GCP_REGION}",
+            f"--gke-cluster-name={MOCK_GKE_CLUSTER_NAME}",
         ):
             self.assertIn(expected, calls[0])
+        self.assertNotIn("--agent-namespace=", calls[0])
+
+    def test_forwards_agent_namespace_when_set(self):
+        proc, calls, _ = self._run(uninstall_exit=0, extra_env={"AGENT_NAMESPACE": "custom-ns"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("--agent-namespace=custom-ns", calls[0])
+
+    def test_forwards_fallback_namespace_when_set(self):
+        proc, calls, _ = self._run(uninstall_exit=0, extra_env={"NAMESPACE": "custom-ns"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("--agent-namespace=custom-ns", calls[0])
 
     def test_a_clean_teardown_reports_the_cluster_gone(self):
         proc, _, summary = self._run(uninstall_exit=0)
@@ -161,8 +174,8 @@ exit {uninstall_exit}
 
     def test_the_summary_names_the_cluster_to_remove_by_hand(self):
         _, _, summary = self._run(uninstall_exit=1)
-        self.assertIn(f"--project-id={MOCK_GCP_PROJECT_ID}", summary)
-        self.assertIn(f"--cluster-name={MOCK_GKE_CLUSTER_NAME}", summary)
+        self.assertIn(f"--gcp-project-id={MOCK_GCP_PROJECT_ID}", summary)
+        self.assertIn(f"--gke-cluster-name={MOCK_GKE_CLUSTER_NAME}", summary)
 
 
 if __name__ == "__main__":

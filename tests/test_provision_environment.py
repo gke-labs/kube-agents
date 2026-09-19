@@ -112,13 +112,13 @@ exit 0
             self.assertEqual(len(calls), 2)
             self.assertEqual(
                 calls[0],
-                f"uninstall: --non-interactive -y --project-id={MOCK_GCP_PROJECT_ID} --region={MOCK_GCP_REGION} --cluster-name={MOCK_GKE_CLUSTER_NAME}",
+                f"uninstall: --non-interactive -y --gcp-project-id={MOCK_GCP_PROJECT_ID} --gcp-region={MOCK_GCP_REGION} --gke-cluster-name={MOCK_GKE_CLUSTER_NAME}",
             )
             expected_install_call = (
                 f"install: --non-interactive -y "
-                f"--project-id={MOCK_GCP_PROJECT_ID} "
-                f"--region={MOCK_GCP_REGION} "
-                f"--cluster-name={MOCK_GKE_CLUSTER_NAME} "
+                f"--gcp-project-id={MOCK_GCP_PROJECT_ID} "
+                f"--gcp-region={MOCK_GCP_REGION} "
+                f"--gke-cluster-name={MOCK_GKE_CLUSTER_NAME} "
                 f"--image-tag={MOCK_IMAGE_TAG_SHA} "
                 f"--enable-google-chat "
                 f"--google-chat-mode={MOCK_GOOGLE_CHAT_MODE} "
@@ -126,7 +126,7 @@ exit 0
                 f"--chat-topic-name={MOCK_CHAT_TOPIC_NAME} "
                 f"--model-provider={MOCK_MODEL_PROVIDER} "
                 f"--model-default-name={MOCK_MODEL_DEFAULT_NAME} "
-                f"--gvisor=true "
+                f"--enable-gvisor=true "
                 f"--permission-set={MOCK_PERMISSION_SET} "
                 f"--registry-prefix={MOCK_REGISTRY_PREFIX} "
                 f"--user-profile-enabled={MOCK_USER_PROFILE_ENABLED} "
@@ -703,6 +703,216 @@ class LongLivedAllowlistGuardTest(GithubMinterInputsTest):
             {"LONG_LIVED_ENVIRONMENT": "true", "GOOGLE_CHAT_ENABLED": "false"}
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
+    """A GitHub variable a human typed still means what it meant in install.env.
+
+    These settings reach install.sh as `--enable-*` flags, whose validator
+    matches exactly true|false and exits 1 naming the flag. The same variables
+    also reach it through the rendered install.env, where is_truthy accepts
+    True/yes/y/1/on. An environment spelled `True` deployed fine on the file
+    route, so it has to keep deploying on the flag route.
+
+    Inherits the harness, not the assertions: `_run` executes the real script
+    against a mock install.sh, so these read the flags it actually built.
+    """
+
+    _TOGGLES = {
+        "ENABLE_GKE_BACKUP_PLAN": "--enable-gke-backup-plan",
+        "ENABLE_GVISOR": "--enable-gvisor",
+        "HERMES_DASHBOARD_ENABLED": "--enable-hermes-dashboard",
+    }
+
+    def _install_call(self, tmp_dir):
+        return (tmp_dir / MOCK_CALLS_LOG).read_text()
+
+    def _run_recording(self, overrides):
+        return self._run(overrides, install_body=f'echo "install: $*" >> "{MOCK_CALLS_LOG}"\n')
+
+    def test_a_truthy_spelling_reaches_the_flag_as_true(self):
+        for name, flag in self._TOGGLES.items():
+            for spelling in TRUTHY_BOOLEAN_INPUTS:
+                with self.subTest(name=name, spelling=spelling):
+                    proc, tmp_dir = self._run_recording({name: spelling})
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn(f"{flag}=true", self._install_call(tmp_dir))
+
+    def test_a_falsy_spelling_reaches_the_flag_as_false(self):
+        for name, flag in self._TOGGLES.items():
+            for spelling in ("false", "False", "no", "0", "off", "OFF"):
+                with self.subTest(name=name, spelling=spelling):
+                    proc, tmp_dir = self._run_recording({name: spelling})
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn(f"{flag}=false", self._install_call(tmp_dir))
+
+    def test_a_spelling_nobody_recognises_is_refused_before_the_teardown(self):
+        """A typo must not cost the environment.
+
+        provision_canonical_bool still returns an unrecognised value untouched
+        rather than folding it into "false" — folding would turn a typo into a
+        silently disabled feature. But the refusal that follows from that used
+        to arrive from install.sh, at the bottom of this script, by which point
+        `teardown_run` had destroyed the environment. The value is knowable
+        before anything is destroyed, so it is checked before anything is
+        destroyed, and the long-lived install stays up over a mistyped GitHub
+        variable.
+        """
+        for name in self._TOGGLES:
+            with self.subTest(name=name):
+                proc, tmp_dir = self._run_recording({name: "ture"})
+                self.assertNotEqual(
+                    proc.returncode, 0, "a non-boolean spelling must not provision"
+                )
+                combined = proc.stdout + proc.stderr
+                self.assertIn(name, combined)
+                self.assertIn("ture", combined)
+                self.assertIn("::error", combined)
+                self.assertNotIn(
+                    "Tearing down the existing environment",
+                    combined,
+                    "the guard must fire before uninstall.sh destroys the environment",
+                )
+                self.assertFalse(
+                    (tmp_dir / MOCK_CALLS_LOG).exists(),
+                    "the guard must fire before install.sh is invoked",
+                )
+
+    def test_a_whitespace_only_value_is_refused_rather_than_read_as_false(self):
+        """A space is not an answer, and `false` is the dangerous guess.
+
+        Both callers skip a genuinely empty variable, so whitespace is the only
+        thing that can reach the canonicaliser looking empty. Folding it into
+        `false` builds `--enable-gvisor=false`, which the validator accepts, and
+        the rebuild puts a long-lived environment back up on the standard
+        runtime — the sandbox off, nothing in the log saying so. Refusing costs
+        a rebuild; guessing costs the isolation boundary.
+
+        Asserted on the calls log rather than the exit code alone: the failure
+        this prevents is a run that succeeds with the wrong flag, so what
+        matters is that no flag was built at all.
+        """
+        for name in self._TOGGLES:
+            for value in (" ", "\t", "  \n  "):
+                with self.subTest(name=name, value=repr(value)):
+                    proc, tmp_dir = self._run_recording({name: value})
+                    self.assertNotEqual(
+                        proc.returncode,
+                        0,
+                        "a whitespace-only value must not provision",
+                    )
+                    combined = proc.stdout + proc.stderr
+                    self.assertIn(name, combined)
+                    self.assertIn("::error", combined)
+                    self.assertNotIn(
+                        "Tearing down the existing environment",
+                        combined,
+                        "the guard must fire before uninstall.sh destroys the environment",
+                    )
+                    self.assertFalse(
+                        (tmp_dir / MOCK_CALLS_LOG).exists(),
+                        "the guard must fire before install.sh is invoked",
+                    )
+
+    def test_a_recognised_spelling_is_not_caught_by_the_guard(self):
+        """The guard judges the canonical form, not the spelling.
+
+        `True` and `off` are values a human types into a GitHub environment
+        form and both routes have always accepted. A guard that read the raw
+        value would refuse every environment configured that way, which is a
+        worse outage than the one it prevents.
+        """
+        for name, flag in self._TOGGLES.items():
+            for spelling in ("True", "off"):
+                with self.subTest(name=name, spelling=spelling):
+                    proc, tmp_dir = self._run_recording({name: spelling})
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn(flag, self._install_call(tmp_dir))
+
+    def test_an_unset_variable_adds_no_flag_at_all(self):
+        """Unset is not false: it leaves install.sh's own default in charge."""
+        proc, tmp_dir = self._run_recording({})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        call = self._install_call(tmp_dir)
+        for flag in self._TOGGLES.values():
+            self.assertNotIn(flag, call)
+
+    def test_enable_webui_fallback_reaches_the_flag(self):
+        proc, tmp_dir = self._run_recording({"ENABLE_WEBUI": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--enable-hermes-dashboard=true", self._install_call(tmp_dir))
+
+
+class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
+    """`--enable-slack` without both tokens is refused above `teardown_run`.
+
+    install.sh refuses this configuration itself, and correctly: the relay
+    cannot open a socket without both. But its guard runs after the
+    Secret-recovery loop that can still supply them off a live install — and by
+    the time this script reaches install.sh it has destroyed that install, so
+    nothing can be recovered and the refusal is certain. Certain and knowable
+    up front means it belongs above the teardown, like the minter guard.
+
+    Inherits the harness, not the assertions.
+    """
+
+    _ENABLED = {"SLACK_ENABLED": "true"}
+    _BOT = "xoxb-mock"
+    _APP = "xapp-mock"
+
+    def _run_recording(self, overrides):
+        return self._run(
+            overrides, install_body=f'echo "install: $*" >> "{MOCK_CALLS_LOG}"\n'
+        )
+
+    def test_slack_without_either_token_refuses_before_the_teardown(self):
+        proc, tmp_dir = self._run_recording(self._ENABLED)
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("SLACK_BOT_TOKEN", combined)
+        self.assertIn("SLACK_APP_TOKEN", combined)
+        self.assertIn("::error", combined)
+        self.assertNotIn(
+            "Tearing down the existing environment",
+            combined,
+            "the guard must fire before uninstall.sh destroys the environment",
+        )
+        self.assertFalse(
+            (tmp_dir / MOCK_CALLS_LOG).exists(),
+            "the guard must fire before install.sh is invoked",
+        )
+
+    def test_half_a_configuration_is_refused_and_only_the_gap_is_named(self):
+        """The `secrets: inherit` failure drops one secret as easily as two."""
+        proc, _ = self._run_recording({**self._ENABLED, "SLACK_BOT_TOKEN": self._BOT})
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("SLACK_APP_TOKEN", combined)
+        self.assertNotIn("SLACK_BOT_TOKEN", combined)
+
+    def test_slack_with_both_tokens_provisions(self):
+        proc, tmp_dir = self._run_recording(
+            {**self._ENABLED, "SLACK_BOT_TOKEN": self._BOT, "SLACK_APP_TOKEN": self._APP}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("install:", (tmp_dir / MOCK_CALLS_LOG).read_text())
+
+    def test_an_environment_without_slack_is_never_asked_for_tokens(self):
+        """Which is every environment but the ones that opt in."""
+        for overrides in ({}, {"SLACK_ENABLED": "false"}):
+            with self.subTest(overrides=overrides):
+                proc, _ = self._run_recording(overrides)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("SLACK_APP_TOKEN", proc.stdout + proc.stderr)
+
+    def test_a_truthy_spelling_of_slack_enabled_still_triggers_the_guard(self):
+        """`True` in a GitHub form enables Slack, so it must also be guarded."""
+        for spelling in TRUTHY_BOOLEAN_INPUTS:
+            with self.subTest(spelling=spelling):
+                proc, _ = self._run_recording({"SLACK_ENABLED": spelling})
+                self.assertNotEqual(
+                    proc.returncode, 0, f"{spelling} enabled Slack but was not guarded"
+                )
 
 
 class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):

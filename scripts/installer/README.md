@@ -104,9 +104,10 @@ reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read t
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run.
-One key is file-only: the front doors clear a shell-exported `NAMESPACE` before reading
-the file, because kubectl tooling exports that name and the value now reaches the Helm
-release's namespace. The dev tooling's `load_state` clears it the same way.
+One key ignores the environment: the front doors clear a shell-exported `NAMESPACE`
+before reading the file, because kubectl tooling exports that name and the value now
+reaches the Helm release's namespace. The file and `--agent-namespace` are the two
+routes in. The dev tooling's `load_state` clears it the same way.
 `KUBE_AGENTS_INSTALL_ENV` points at a different path, which is how CI renders one from
 its own variables rather than keeping install state on an ephemeral runner.
 

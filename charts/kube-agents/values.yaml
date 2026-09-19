@@ -655,7 +655,7 @@ platformAgent:
       # run on the standard container runtime.
       #
       # The Terraform composition always passes this explicitly (from
-      # agent_runtime_class, which install.sh derives from --gvisor), so this
+      # agent_runtime_class, which install.sh derives from --enable-gvisor), so this
       # default is what a direct `helm install` gets -- and what a `helm
       # upgrade` of a release that never set the key adopts, since Helm merges
       # the new chart's defaults. That upgrade path fails quietly where the

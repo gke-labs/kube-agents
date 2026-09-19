@@ -152,7 +152,7 @@ class PersistStateVarTest(unittest.TestCase):
     only if vars.sh existed, so the directory always existed by the time this
     ran. Letting install.env satisfy state_loaded is what exposed the write.
     The invocation that breaks is the one show_help gives as its own example,
-    `./upgrade.sh --non-interactive --project-id=... --cluster-name=...`.
+    `./upgrade.sh --non-interactive --gcp-project-id=... --gke-cluster-name=...`.
     """
 
     def _persist_into(self, state_file):
@@ -428,6 +428,112 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertIn('[ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]', text)
         self.assertIn('kubectl get deployment "$PLATFORM_AGENT_DEPLOYMENT" -n "$target_namespace"', text)
 
+class AgentNamespaceFlagTest(unittest.TestCase):
+    """`--agent-namespace` decides every namespace this script touches.
+
+    It steers the regenerated terraform.tfvars, the Helm release guard, the
+    generator's Secret-recovery reads and every `kubectl -n`. An install in a
+    non-default namespace upgraded from a fresh clone has nothing else to say
+    so: without the flag the run resolves DEFAULT_NAMESPACE, renders tfvars for
+    it, and is refused by lifecycle.sh's guard_release_namespace with a message
+    telling the operator to edit an install.env the clone does not have.
+    """
+
+    def _parse_args(self, *args):
+        quoted = " ".join(args)
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f"parse_args {quoted}\n"
+            'echo "PARAM=[$PARAM_AGENT_NAMESPACE]"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_both_argument_forms_reach_the_parameter(self):
+        """`--flag value` as well as `--flag=value`: this script takes both for
+        its other coordinates, and a half-added flag is the kind that works in
+        the example and not in the operator's wrapper."""
+        for args in (("--agent-namespace=chosen-ns",), ("--agent-namespace", "chosen-ns")):
+            with self.subTest(args=args):
+                proc = self._parse_args(*args)
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("PARAM=[chosen-ns]", proc.stdout)
+
+    def _resolution_line(self):
+        """The `target_namespace` assignment, lifted out of main().
+
+        main() needs gcloud, kubectl and a live cluster before it reaches this
+        line, so the line is evaluated on its own. Taken from the source rather
+        than restated here, which is what makes the evaluation below a check on
+        upgrade.sh and not on a copy of it.
+        """
+        for line in _UPGRADE_SH.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("local target_namespace="):
+                return stripped[len("local ") :]
+        self.fail("upgrade.sh no longer assigns a target_namespace")
+
+    def _resolve(self, **variables):
+        assignments = "".join(f'{key}="{value}"\n' for key, value in variables.items())
+        script = f"{assignments}{self._resolution_line()}\necho \"NS=[$target_namespace]\"\n"
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, cwd=str(_REPO_ROOT)
+        )
+
+    def test_the_flag_beats_the_loaded_configuration(self):
+        proc = self._resolve(
+            PARAM_AGENT_NAMESPACE="from-flag",
+            NAMESPACE="from-install-env",
+            DEFAULT_NAMESPACE="the-default",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("NS=[from-flag]", proc.stdout)
+
+    def test_without_the_flag_the_recorded_value_still_wins_over_the_default(self):
+        """The flag must not cost an install.env-driven run its namespace: that
+        is how every upgrade resolved one before the flag existed, and it is the
+        route reconcile_environment.sh takes, whose UPGRADE_ARGS carry no
+        namespace at all."""
+        proc = self._resolve(
+            PARAM_AGENT_NAMESPACE="",
+            NAMESPACE="from-install-env",
+            DEFAULT_NAMESPACE="the-default",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("NS=[from-install-env]", proc.stdout)
+
+    def test_with_neither_it_falls_back_to_the_default(self):
+        proc = self._resolve(
+            PARAM_AGENT_NAMESPACE="", NAMESPACE="", DEFAULT_NAMESPACE="the-default"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("NS=[the-default]", proc.stdout)
+
+    def test_the_resolved_namespace_is_exported(self):
+        """write_tfvars_from_state reads the environment, not this variable, so
+        the resolution reaching nothing is a distinct way for the flag to have
+        no effect."""
+        self.assertIn(
+            'export NAMESPACE="$target_namespace"', _UPGRADE_SH.read_text()
+        )
+
+    def test_the_help_text_names_the_flag(self):
+        """Nothing in the tree passes it, so `--help` is the only place an
+        operator can find it."""
+        proc = subprocess.run(
+            ["bash", str(_UPGRADE_SH), "--help"],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("--agent-namespace", proc.stdout)
 
 
 if __name__ == "__main__":

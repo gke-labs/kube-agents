@@ -346,7 +346,7 @@ variable "enable_slack" {
 }
 
 variable "slack_bot_token" {
-  description = "SLACK_BOT_TOKEN (xoxb-...) stored in the credentials Secret. Only used when enable_slack is true."
+  description = "SLACK_BOT_TOKEN stored in the credentials Secret: one xoxb-... token, or several comma-separated, one per Slack workspace the agent serves. Only used when enable_slack is true."
   type        = string
   sensitive   = true
   default     = ""

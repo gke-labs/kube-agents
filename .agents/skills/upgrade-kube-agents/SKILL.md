@@ -20,9 +20,9 @@ CI runner supplies one:
 curl -fsSL https://gke-labs.github.io/kube-agents/upgrade.sh | bash -s -- \
   --upgrade-mode="full" \
   --non-interactive \
-  --project-id="<PROJECT_ID>" \
-  --cluster-name="<CLUSTER_NAME>" \
-  --region="<REGION>" \
+  --gcp-project-id="<PROJECT_ID>" \
+  --gke-cluster-name="<CLUSTER_NAME>" \
+  --gcp-region="<REGION>" \
   --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>"
 ```
 
@@ -43,7 +43,7 @@ To preview the upgrade plan and output a JSON status report without modifying cl
 
 ```bash
 ./upgrade.sh --dry-run --upgrade-mode=full \
-  --project-id="<PROJECT_ID>" \
+  --gcp-project-id="<PROJECT_ID>" \
   --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>"
 ```
 

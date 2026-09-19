@@ -815,7 +815,7 @@ provider and the `roles/iam.workloadIdentityUser` grant is the obvious next step
 the cluster's OIDC issuer, which that module does not have today.
 
 The gVisor node pool is the opposite case — it has a full surface, pointed at the wrong
-pod. `install.sh --gvisor` sets `enable_gvisor_node_pool` on Standard, or on Autopilot
+pod. `install.sh --enable-gvisor` sets `enable_gvisor_node_pool` on Standard, or on Autopilot
 takes the built-in RuntimeClass and no pool, and the composition renders the result into
 `deployment.availability.runtimeClassName`. That is the _agent_ pod, the one holding the
 WAL-mode SQLite that gVisor corrupts — see
@@ -824,7 +824,7 @@ which holds no SQLite and is the one running code the model wrote, is left on th
 runtime. Turning the sandbox on through Terraform should point
 `harness.experimental.shellSandbox.runtimeClassName` at the pool as well, and that rewiring
 is not in this change: the flag predates the sandbox and repointing it is a behaviour change
-for installs that already pass `--gvisor`.
+for installs that already pass `--enable-gvisor`.
 
 ---
 
