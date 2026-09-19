@@ -2161,7 +2161,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// Two halves. The name half takes the reserved volume name. The source
 	// half takes any user volume that would deliver the same credential under
 	// another name -- a serviceAccountToken projection for the bus audience,
-	// or the credentials Secret -- and every mount naming it, because a mount
+	// or any of the Secrets the bus renders credentials into -- and every
+	// mount naming it, because a mount
 	// with no volume is a Deployment the API server refuses. Neither half is a
 	// boundary against a hostile sidecar: KSA tokens are pod-scoped and the
 	// callout cannot tell which container presented one. Both are a guard

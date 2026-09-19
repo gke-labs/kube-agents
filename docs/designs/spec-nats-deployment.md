@@ -643,6 +643,46 @@ any readable token in the cluster as proof of that pod's identity. A long-lived 
 MUST re-read the file when it reconnects rather than caching its first read, or it fails
 exactly when the bus restarts, which this spec calls a routine operation.
 
+The audience also has to be reserved, and reserving it is not the same as owning it. The
+projection is the platform-agent container's, but the callout resolves the POD's
+ServiceAccount, so any container in that pod presenting a token for this audience
+authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
+copied into the pod verbatim. The operator therefore refuses and strips user-authored
+volumes by SOURCE as well as by name: a projection of this audience under any name, and a
+`secret` volume or projected `secret` source naming one of the three Secrets the bus
+renders. (Those two source fields only - the ones that mount the Secret into the
+container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef` hand it to a
+node plugin instead, and are not matched.) The three are `<agent>-a2a-nats-creds`,
+which holds the static users' passwords; `<agent>-a2a-nats-config`, whose `nats.conf`
+interpolates every one of those passwords in clear text; and `<agent>-a2a-callout-keys`,
+which signs the bus's own tokens. The Secrets are cheaper than the projection, because
+reading one needs no token at all. All of them are closed together, because closing one
+narrows the expensive route, leaves the cheap ones, and names the class while doing it.
+
+Two layers, and they are not the same layer. The admission refusal is unconditional, is
+the only one that tells the CR's author why, and covers mounts as well as volumes:
+`extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
+against the reserved names. The render strip is gated on the A2A surface, so it runs
+under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
+recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
+on that function). On the mounts it goes further than admission does: besides the
+reserved names it drops any mount naming a volume it has just dropped by source, because
+a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
+layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
+at all; that is deliberate, because it is the supported route for the Hermes bridge
+sidecar, which is meant to hold `bridge-password`.
+
+Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
+pod-scoped and the callout cannot see which container presented one, so this is a guard
+against a misconfigured CR rather than a boundary against a hostile sidecar. It is worth
+having because the CR is authored by the platform operator and not by the agent -
+[`security-requirements.md`](../security-requirements.md) already puts administrator-supplied volumes and mounts outside
+the sandbox guarantee for the same reason. What would change that reading is a change in
+who may write the CR: a tenant-facing role on `platformagents`, or the CR moving into a
+repository the agent can open pull requests against. The only construction that would be
+a boundary is a separate pod for the bus identity, which is also what the `bridge`
+sidecar's static password is waiting on.
+
 The callout service runs in its own `AUTH` account - not `$SYS`, despite subscribing to
 a `$SYS.REQ.*` subject - with 2 replicas, joined in a queue group. The queue group is
 not optional above one replica: with a plain subscription every replica answers every
