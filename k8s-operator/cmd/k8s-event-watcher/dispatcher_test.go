@@ -1180,6 +1180,7 @@ func autoscalerEvent(uid, reason string, at time.Time) TriageEvent {
 	ev := failedSchedulingEvent(uid, 1, at)
 	ev.Key.Reason = reason
 	ev.Type = "Normal"
+	ev.Reporter = scaleUpReporter
 	ev.Message = "pod triggered scale-up"
 	if reason == "NotTriggerScaleUp" {
 		ev.Message = "pod didn't trigger scale-up: 1 max node group size reached"
@@ -1467,5 +1468,55 @@ func TestDispatcherReplayedFailedSchedulingSightedBeforeItsDeclineIsNotPassed(t 
 	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 2, now))
 	if *injectCount != 1 {
 		t.Errorf("a sighting after the decline fired %d injects; want 1", *injectCount)
+	}
+}
+
+// TestDispatcherScaleUpMarkFromAnotherReporterRecordsNoVerdict: a
+// TriggeredScaleUp or NotTriggerScaleUp that names a reporter other than
+// cluster-autoscaler is dropped at the filter, logged with its reporter and
+// remembered as nothing, so it can neither hold a pod's FailedScheduling nor
+// pass it at count one; the pod is judged on the count as if the autoscaler
+// had said nothing. The same event from the autoscaler is the verdict it
+// always was.
+func TestDispatcherScaleUpMarkFromAnotherReporterRecordsNoVerdict(t *testing.T) {
+	logs := captureLog(t)
+	now := time.Unix(1_700_000_000, 0)
+	disp, m, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	forged := autoscalerEvent("pod-1", "TriggeredScaleUp", now)
+	forged.Reporter = "my-operator"
+	disp.Dispatch(ctx, forged)
+	if got := disp.scaleUps.Lookup("pod-1"); got.Verdict != scaleUpNone {
+		t.Fatalf("a mark from %q was recorded as %+v; want none", forged.Reporter, got)
+	}
+	if !strings.Contains(logs.String(), `ignored TriggeredScaleUp pod=default/api reported by "my-operator", not cluster-autoscaler`) {
+		t.Errorf("no ignored line naming the reporter in:\n%s", logs.String())
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateScaleUpMarkReporter))); got != 1 {
+		t.Errorf("filtered{gate=%s} = %v; want 1", gateScaleUpMarkReporter, got)
+	}
+
+	// With no verdict on record the count backstop decides: count 5 fires.
+	now = now.Add(20 * time.Second)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 5, now))
+	if *injectCount != 1 {
+		t.Fatalf("FailedScheduling at count 5 after a foreign TriggeredScaleUp: injects = %d; want 1 (not held)", *injectCount)
+	}
+
+	// A foreign decline does not pass a second pod at count one either.
+	declined := autoscalerEvent("pod-2", "NotTriggerScaleUp", now)
+	declined.Reporter = ""
+	disp.Dispatch(ctx, declined)
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-2", 1, now.Add(time.Second)))
+	if *injectCount != 1 {
+		t.Fatalf("FailedScheduling at count 1 after a foreign NotTriggerScaleUp: injects = %d; want 1 (held on the count)", *injectCount)
+	}
+
+	// The autoscaler's own decline still passes it.
+	disp.Dispatch(ctx, autoscalerEvent("pod-2", "NotTriggerScaleUp", now.Add(2*time.Second)))
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-2", 2, now.Add(3*time.Second)))
+	if *injectCount != 2 {
+		t.Fatalf("FailedScheduling after cluster-autoscaler's decline: injects = %d; want 2", *injectCount)
 	}
 }

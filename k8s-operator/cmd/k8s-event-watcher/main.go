@@ -547,6 +547,10 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			log.Printf("recorded %s pod=%s/%s as scale-up %s (%s); not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, verdict, ev.Message)
 		}
+		if gate == gateScaleUpMarkReporter {
+			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
+				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
+		}
 		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}

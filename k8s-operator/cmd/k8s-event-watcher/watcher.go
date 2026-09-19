@@ -761,7 +761,21 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 		Labels:        labelsFromMeta(ev.ObjectMeta),
 		Count:         count,
 		Type:          ev.Type,
+		Reporter:      reporterFromEvent(ev),
 	}
+}
+
+// reporterFromEvent names the component that recorded an event. The legacy
+// recorder sets Source.Component and, since client-go copies the source onto
+// the newer fields as well, ReportingController to the same name; an
+// events.k8s.io/v1 recorder sets only ReportingController. Read through the
+// core/v1 shape the informer lists, that is Source.Component when present and
+// ReportingController otherwise.
+func reporterFromEvent(ev *corev1.Event) string {
+	if ev.Source.Component != "" {
+		return ev.Source.Component
+	}
+	return ev.ReportingController
 }
 
 // truncateMessage caps the payload's message field. K8s event

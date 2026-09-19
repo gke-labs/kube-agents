@@ -235,6 +235,11 @@ const (
 	// so the dispatcher records the verdict, never forwarded. Counted as filtered
 	// because it is; the dispatcher's log line says what it was recorded as.
 	gateScaleUpMark filterGate = "scaleup_mark"
+	// gateScaleUpMarkReporter is a TriggeredScaleUp or NotTriggerScaleUp whose
+	// reporter is not cluster-autoscaler (scaleUpReporter): dropped, so it is
+	// neither recorded as a verdict nor forwarded. The dispatcher's log line
+	// names the reporter it came from.
+	gateScaleUpMarkReporter filterGate = "scaleup_mark_reporter"
 	// gateScaleUpHold is a FailedScheduling held because cluster-autoscaler is
 	// provisioning a node for the pod.
 	gateScaleUpHold filterGate = "scaleup_hold"
@@ -259,6 +264,10 @@ const (
 //     from the repeat count when there is not (failedSchedulingGate). The two
 //     autoscaler verdicts themselves stop here as gateScaleUpMark: they are
 //     admitted so the dispatcher can record them, and are never forwarded.
+//     One that names a reporter other than cluster-autoscaler stops as
+//     gateScaleUpMarkReporter instead and is not recorded: the reason alone
+//     would let any event writer that reused the two names hold or release
+//     a pod's FailedScheduling.
 func (f *filter) Decide(ev TriageEvent) filterGate {
 	if f.cfg.allowedReasons != nil {
 		if _, ok := f.cfg.allowedReasons[ev.Key.Reason]; !ok {
@@ -295,6 +304,9 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 		return gateImagePullTransient
 	}
 	if scaleUpVerdictFor(ev.Key.Reason) != scaleUpNone {
+		if ev.Reporter != scaleUpReporter {
+			return gateScaleUpMarkReporter
+		}
 		return gateScaleUpMark
 	}
 	if ev.Key.Reason == reasonFailedScheduling {

@@ -33,6 +33,17 @@ const (
 	// trigger scale-up"). It is the point at which an unschedulable pod stops
 	// being a scale-up in progress and becomes an incident.
 	reasonNotTriggerScaleUp = "NotTriggerScaleUp"
+	// scaleUpReporter is the component name cluster-autoscaler records its
+	// events under (source.component on the legacy recorder, which client-go
+	// copies to reportingController as well). A TriggeredScaleUp or
+	// NotTriggerScaleUp from any other reporter is not a verdict: the reason
+	// alone would let any controller that reused the two names, on purpose
+	// or by accident, hold or release a pod's FailedScheduling. The check
+	// authenticates nothing — a principal that can create events in a
+	// namespace writes the reporter field too — so it narrows the marks to
+	// what says it is the autoscaler's; who may write events there is the
+	// cluster's RBAC and admission policy, not this binary's.
+	scaleUpReporter = "cluster-autoscaler"
 
 	// defaultScaleUpTTL bounds how long a verdict is remembered when the
 	// caller passes none. The dispatcher passes scaleUpMemoTTL, the dedup
@@ -148,14 +159,19 @@ func (m *scaleUpMemo) clock() time.Time {
 
 // Record remembers verdict for uid as of at, unless a newer mark is already
 // held. A zero at (an emitter that set no timestamp) is taken as now, which is
-// the most recent reading the mark can honestly claim. Safe on a nil receiver
-// and a no-op for an empty uid or scaleUpNone.
+// the most recent reading the mark can honestly claim, and so is an at in the
+// future: the hold is measured from the mark, so a TriggeredScaleUp stamped
+// ahead of the watcher's clock (skew, or an author who chose the stamp) would
+// otherwise hold the pod's FailedScheduling for the hold plus the lead, and
+// the memo's own expiry, which ages from the same stamp, would keep it for as
+// long again. Safe on a nil receiver and a no-op for an empty uid or
+// scaleUpNone.
 func (m *scaleUpMemo) Record(uid string, verdict scaleUpVerdict, at time.Time) {
 	if m == nil || uid == "" || verdict == scaleUpNone {
 		return
 	}
 	now := m.clock()
-	if at.IsZero() {
+	if at.IsZero() || at.After(now) {
 		at = now
 	}
 	m.mu.Lock()

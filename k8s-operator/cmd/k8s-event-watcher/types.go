@@ -64,6 +64,13 @@ type TriageEvent struct {
 	// counter is separate — see dedup.go.
 	Count int
 	Type  string
+	// Reporter names the component that recorded the event: source.component
+	// on the core/v1 shape, reportingController when only that is set. The
+	// author of an event writes both, so this authenticates nothing; it is
+	// what lets the filter take a TriggeredScaleUp or NotTriggerScaleUp as
+	// cluster-autoscaler's verdict only when it says it is the autoscaler's
+	// (scaleUpReporter in scaleup.go), rather than on the reason alone.
+	Reporter string
 	// PullClass and PullCause are the only fields not read off the
 	// *corev1.Event. The dispatcher fills them in for image-pull failures
 	// by resolving the event's message through pullClassMemo, because the

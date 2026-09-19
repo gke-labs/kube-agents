@@ -149,3 +149,24 @@ func TestScaleUpMemoTTL(t *testing.T) {
 		})
 	}
 }
+
+// TestScaleUpMemoFutureTimestampIsReadAsNow: a mark stamped ahead of the
+// watcher's clock is recorded as of now. The hold is measured from the mark,
+// so a stamp with a lead would hold the pod's FailedScheduling for the hold
+// plus the lead, and the memo's expiry, aged from the same stamp, would keep
+// the mark for as long again.
+func TestScaleUpMemoFutureTimestampIsReadAsNow(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newScaleUpMemo(time.Hour, 0)
+	m.now = func() time.Time { return now }
+
+	m.Record("pod-1", scaleUpTriggered, now.Add(48*time.Hour))
+	if got := m.Lookup("pod-1"); got.Verdict != scaleUpTriggered || !got.At.Equal(now) {
+		t.Fatalf("a future mark was recorded as %+v; want triggered at %v", got, now)
+	}
+	// Clamped to now, it expires with the TTL like any other mark.
+	now = now.Add(time.Hour + time.Second)
+	if got := m.Lookup("pod-1"); got.Verdict != scaleUpNone {
+		t.Errorf("the clamped mark outlived the TTL: %+v", got)
+	}
+}

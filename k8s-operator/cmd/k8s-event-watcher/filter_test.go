@@ -373,7 +373,11 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 // namespace, they stop earlier and the dispatcher records nothing.
 func TestFilterDecideScaleUpMarks(t *testing.T) {
 	mark := func(reason, ns string) TriageEvent {
-		return TriageEvent{Key: EventKey{UID: "pod-1", Reason: reason}, Namespace: ns, Type: "Normal", Count: 1}
+		return TriageEvent{Key: EventKey{UID: "pod-1", Reason: reason}, Namespace: ns, Type: "Normal", Count: 1, Reporter: scaleUpReporter}
+	}
+	reportedBy := func(ev TriageEvent, reporter string) TriageEvent {
+		ev.Reporter = reporter
+		return ev
 	}
 	tests := []struct {
 		name       string
@@ -387,6 +391,11 @@ func TestFilterDecideScaleUpMarks(t *testing.T) {
 		{name: "TriggeredScaleUp off the list is dropped by reason", reasons: []string{"FailedScheduling"}, event: mark("TriggeredScaleUp", "default"), wantGate: gateReason},
 		{name: "a mark from an excluded namespace stops at the namespace gate", reasons: []string{"FailedScheduling", "NotTriggerScaleUp"}, excludedNS: []string{"kube-system"}, event: mark("NotTriggerScaleUp", "kube-system"), wantGate: gateNamespaceExcluded},
 		{name: "the default list carries neither mark", event: mark("NotTriggerScaleUp", "default"), wantGate: gateReason},
+		// The reason alone is not a verdict: a mark that names another reporter,
+		// or none, is dropped before the dispatcher records anything.
+		{name: "a TriggeredScaleUp from another reporter is not a mark", reasons: scaleUpReasons, event: reportedBy(mark("TriggeredScaleUp", "default"), "my-operator"), wantGate: gateScaleUpMarkReporter},
+		{name: "a NotTriggerScaleUp with no reporter is not a mark", reasons: scaleUpReasons, event: reportedBy(mark("NotTriggerScaleUp", "default"), ""), wantGate: gateScaleUpMarkReporter},
+		{name: "the reporter check comes after the namespace gates", reasons: scaleUpReasons, excludedNS: []string{"kube-system"}, event: reportedBy(mark("TriggeredScaleUp", "kube-system"), "my-operator"), wantGate: gateNamespaceExcluded},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

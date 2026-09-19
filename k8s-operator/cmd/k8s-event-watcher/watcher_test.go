@@ -1269,3 +1269,27 @@ func TestRun_PreflightEvaluationErrorIsInconclusive(t *testing.T) {
 		t.Fatal("Run did not return within 2s of cancellation")
 	}
 }
+
+// TestToTriageEvent_Reporter: the reporter is source.component, which the
+// legacy recorder sets, and reportingController when only that is set, which
+// is what an events.k8s.io/v1 recorder writes; an event with neither reads as
+// reported by nobody.
+func TestToTriageEvent_Reporter(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   corev1.Event
+		want string
+	}{
+		{name: "source.component", ev: corev1.Event{Source: corev1.EventSource{Component: "cluster-autoscaler"}}, want: "cluster-autoscaler"},
+		{name: "both set, source wins", ev: corev1.Event{Source: corev1.EventSource{Component: "cluster-autoscaler"}, ReportingController: "other"}, want: "cluster-autoscaler"},
+		{name: "reportingController only", ev: corev1.Event{ReportingController: "cluster-autoscaler"}, want: "cluster-autoscaler"},
+		{name: "neither", ev: corev1.Event{}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := toTriageEvent(&tc.ev, targetCluster{Name: "c"}).Reporter; got != tc.want {
+				t.Errorf("Reporter = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
