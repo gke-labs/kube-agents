@@ -896,6 +896,47 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MANAGE=false", proc.stdout)
 
+    def test_parse_args_model_max_tokens_is_read(self):
+        cmd = 'parse_args --model-max-tokens=4096; echo "MAX=$PARAM_MODEL_MAX_TOKENS"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MAX=4096", proc.stdout)
+
+    def test_model_max_tokens_defaults_to_unset(self):
+        cmd = 'echo "MAX=[$PARAM_MODEL_MAX_TOKENS]"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MAX=[]", proc.stdout)
+
+    def test_validate_model_max_tokens_accepts_whole_numbers_and_empty(self):
+        for value in ("4096", "0", ""):
+            with self.subTest(value=value):
+                proc = self._run_install_func(
+                    _SOURCE_INSTALLER_COMMON
+                    + f"parse_args --model-max-tokens={value}; validate_model_max_tokens"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+
+    def test_validate_model_max_tokens_rejects_anything_else(self):
+        # The same helper the tfvars generator applies, so the interview and
+        # upgrade.sh cannot disagree on what a valid value is.
+        for value in ("4k", "-1", "4096.5", "+1"):
+            with self.subTest(value=value):
+                proc = self._run_install_func(
+                    _SOURCE_INSTALLER_COMMON
+                    + f"parse_args --model-max-tokens={value}; validate_model_max_tokens"
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(
+                    "--model-max-tokens must be a whole number of tokens",
+                    proc.stderr + proc.stdout,
+                )
+        # install.env's recorded value is checked too, not only the flag.
+        proc = self._run_install_func(
+            _SOURCE_INSTALLER_COMMON + 'MODEL_MAX_TOKENS="4k"; validate_model_max_tokens'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+
     def test_parse_args_vertex_location_overrides_the_default(self):
         """An explicit --vertex-location still wins over DEFAULT_VERTEX_LOCATION."""
         cmd = (
@@ -4185,6 +4226,123 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
         self.assertRegex(out, re.compile(r"^GKE_DB_KMS_KEY=key-two$", re.MULTILINE))
 
 
+class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
+    """The flag on the first run, the file on every later one.
+
+    main() exports MODEL_MAX_TOKENS from the flag (or the loaded file),
+    bootstrap_install_env_file records the export in a fresh install.env, and
+    the next run seeds PARAM_MODEL_MAX_TOKENS from the file at source time.
+    Dropping the write_env_var line, the ${MODEL_MAX_TOKENS:-} seed or the
+    export leaves the flag and validator tests green while --model-max-tokens
+    renders model_max_tokens = 0 on the next upgrade, so this walks the file
+    the first run writes into a second run.
+    """
+
+    _RECORDED_VALUE = "4096"
+
+    def _bootstrap_with_export(self, tmp, export_line):
+        dest = pathlib.Path(tmp) / "new.install.env"
+        loaded = pathlib.Path(tmp) / "loaded.install.env"
+        loaded.write_text("")
+        loaded.chmod(0o600)
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             'source scripts/installer/installer_common.sh\n'
+             'resolve_shared_defaults\n'
+             'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+             f'{export_line}\n'
+             f'bootstrap_install_env_file "{dest}" some-tag >/dev/null'],
+            capture_output=True, text=True,
+            env=self._env({
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            }),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+        return dest
+
+    def _read_back(self, env_file, body):
+        proc = subprocess.run(
+            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{body}\n'],
+            capture_output=True, text=True,
+            env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        return proc.stdout
+
+    @staticmethod
+    def _env(overrides):
+        # A developer's own exported value must not stand in for the file.
+        env = get_isolated_test_env(overrides=overrides)
+        env.pop("MODEL_MAX_TOKENS", None)
+        env.update(overrides)
+        return env
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(
+                tmp, f'export MODEL_MAX_TOKENS="{self._RECORDED_VALUE}"'
+            )
+            self.assertIn(f"MODEL_MAX_TOKENS={self._RECORDED_VALUE}\n", dest.read_text())
+            # The parameter block, and the exported environment the tfvars
+            # generator reads (set -a around the load is what carries it).
+            out = self._read_back(
+                dest,
+                'echo "PARAM=[$PARAM_MODEL_MAX_TOKENS]"; '
+                "bash -c 'echo \"EXPORTED=[$MODEL_MAX_TOKENS]\"'",
+            )
+            self.assertIn(f"PARAM=[{self._RECORDED_VALUE}]", out)
+            self.assertIn(f"EXPORTED=[{self._RECORDED_VALUE}]", out)
+
+    def test_an_unset_value_is_recorded_empty_and_reads_back_empty(self):
+        """Empty is what the generator turns into DEFAULT_MODEL_MAX_TOKENS, and
+        the quoted empty string is the spelling the drift check knows."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export MODEL_MAX_TOKENS=""')
+            self.assertIn("MODEL_MAX_TOKENS=''\n", dest.read_text())
+            out = self._read_back(dest, 'echo "PARAM=[$PARAM_MODEL_MAX_TOKENS]"')
+            self.assertIn("PARAM=[]", out)
+
+    def test_a_flag_on_a_later_run_beats_the_recorded_value(self):
+        """Order of authority: flag, then file. 0 is non-empty to ${:-}, so a
+        flag of 0 switches the budget off against a file that records one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(
+                tmp, f'export MODEL_MAX_TOKENS="{self._RECORDED_VALUE}"'
+            )
+            out = self._read_back(
+                dest, 'parse_args --model-max-tokens=0; echo "PARAM=[$PARAM_MODEL_MAX_TOKENS]"'
+            )
+            self.assertIn("PARAM=[0]", out)
+
+    def test_main_validates_then_exports_before_the_generator_and_the_bootstrap(self):
+        """The KUBE_AGENTS_SOURCE_ONLY harness cannot drive main(), so the wiring
+        between parse_args and the export block is pinned by text: the value
+        main() exports is the flag-or-file one the validator checked, and the
+        export comes before the two readers, write_tfvars_from_state and
+        bootstrap_install_env_file."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        seed_line = 'local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"'
+        validate_line = "validate_model_max_tokens || exit 1"
+        export_line = 'export MODEL_MAX_TOKENS="$model_max_tokens"'
+        for line in (seed_line, validate_line, export_line):
+            self.assertIn(line, text[main_start:], f"main() no longer carries: {line}")
+        seed = text.index(seed_line, main_start)
+        validated = text.index(validate_line, main_start)
+        exported = text.index(export_line, main_start)
+        generator = text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', exported)
+        bootstrap = text.index('bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"', exported)
+        self.assertLess(seed, validated)
+        self.assertLess(validated, exported)
+        self.assertLess(exported, generator)
+        self.assertLess(exported, bootstrap)
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""
@@ -4713,6 +4871,21 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
 
     def test_an_unchanged_memory_answer_says_nothing(self):
         proc = self._warn("MEMORY=file\n", {"PARAM_MEMORY": "file"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("does not record", proc.stdout + proc.stderr)
+
+    def test_a_changed_max_tokens_answer_is_named(self):
+        """A --model-max-tokens flag on a run against a file that records a
+        different value: the file still says the old budget, and the next
+        upgrade.sh would render it."""
+        proc = self._warn("MODEL_MAX_TOKENS=4096\n", {"MODEL_MAX_TOKENS": "8192"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("does not record", combined)
+        self.assertIn("MODEL_MAX_TOKENS=8192", combined)
+
+    def test_an_unchanged_max_tokens_answer_says_nothing(self):
+        proc = self._warn("MODEL_MAX_TOKENS=4096\n", {"MODEL_MAX_TOKENS": "4096"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("does not record", proc.stdout + proc.stderr)
 

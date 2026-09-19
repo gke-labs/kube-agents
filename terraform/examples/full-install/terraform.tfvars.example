@@ -94,6 +94,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # provider's default model; set the matching *_api_key above).
 # model_provider     = "gemini"
 # model_default_name = ""
+# Output tokens the gateway asks for on a request that names none; 0 renders
+# nothing. For a self-hosted backend whose prompt and output share one window.
+# model_max_tokens   = 0
 
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
 # vertex_project_id defaults to the install's project; vertex_location defaults

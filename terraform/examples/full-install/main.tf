@@ -544,6 +544,7 @@ resource "helm_release" "kube_agents" {
       {
         modelProvider    = var.model_provider
         modelDefaultName = var.model_default_name
+        maxTokens        = var.model_max_tokens
       },
       local.use_vertex ? {
         vertex = {

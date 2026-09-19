@@ -459,6 +459,9 @@ CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
+# Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
+# as an empty MODEL_DEFAULT_NAME takes the provider's default model.
+PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
 PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
 
 show_help() {
@@ -489,6 +492,11 @@ Flags for AI Agents & Automation:
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
+  --model-max-tokens=N          Output tokens the gateway asks the provider for on a
+                                request that names none, for a self-hosted backend
+                                whose prompt and output share one window
+                                (default: DEFAULT_MODEL_MAX_TOKENS, currently 0:
+                                no max_tokens is rendered)
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
   --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
                                 (default: DEFAULT_VERTEX_LOCATION, currently global)
@@ -609,6 +617,7 @@ parse_args() {
       --cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
+      --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
@@ -1094,7 +1103,7 @@ warn_unrecorded_interview_answers() {
   local key recorded current drifted=""
   for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
-    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME PLATFORM_AGENT_PERMISSION_SET \
+    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET \
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
@@ -1210,6 +1219,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
+  write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
@@ -2819,6 +2829,18 @@ check_existing_cluster_network_policy_preflight() {
   fi
 }
 
+# --model-max-tokens: a whole number of tokens, or empty for none. Refused here
+# rather than left to Terraform's type check so the message names the flag; the
+# tfvars generator checks again for the front doors that regenerate from
+# install.env without this interview. Needs installer_common.sh sourced.
+validate_model_max_tokens() {
+  local value="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
+  if [ -n "$value" ] && ! is_non_negative_integer "$value"; then
+    print_error "--model-max-tokens must be a whole number of tokens (0 or empty leaves the gateway default unset), got '${value}'."
+    return 1
+  fi
+}
+
 # Validates explicit values for existing-cluster opt-in flags (loud like --gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
@@ -3949,6 +3971,8 @@ main() {
   if [ -z "$model_default_name" ]; then
     model_default_name="$(default_model_for_provider "$model_provider")"
   fi
+  local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
+  validate_model_max_tokens || exit 1
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
   # two are the only credentials it needs. The project defaults to the install
@@ -4519,6 +4543,7 @@ main() {
   # ENABLE_GKE_BACKUP_PLAN out of this block.
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
+  export MODEL_MAX_TOKENS="$model_max_tokens"
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"

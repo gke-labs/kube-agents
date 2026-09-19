@@ -63,6 +63,24 @@ make -C k8s-operator deploy-litellm
 
 Either way the agent picks up the new model on its next request without any change to its own config.
 
+### Setting the output-token budget
+
+`MODEL_MAX_TOKENS` is the number of output tokens the gateway asks the provider for on a request that names none. Set it in `install.env` or with `--model-max-tokens=N`; it reaches the chart as `litellm.maxTokens` and the Terraform example as `model_max_tokens`, and the chart renders it as `max_tokens` under every `model_list` alias. With `MODEL_PROVIDER=gemini` and `MODEL_MAX_TOKENS=8192` the first alias reads:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      max_tokens: 8192
+```
+
+The chart is the only path that renders it: the kustomize dev copy above (`make -C k8s-operator deploy-litellm`) carries no `max_tokens`. On an installed system, set the key in `install.env` and re-run `upgrade.sh`, or use `install.sh --menu` and **Save & Apply**, which regenerates from `install.env`; there is no menu entry for it.
+
+At the default of `0` nothing is rendered and the gateway config is what it was. The hosted providers above need no value: the agent's requests carry their own `max_tokens`, and a provider with its own output limit answers a value above it with an error rather than a truncated reply. A self-hosted backend such as vLLM, SGLang, TGI or llama.cpp admits a request only if the prompt and `max_tokens` together fit its served window, so a request that asks for more output than the window holds is refused before the model runs. Set the value below that window, leaving the prompt the room it needs.
+
+The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. The agent image pinned today (Hermes `v2026.8.19`) sends `max_tokens` on every request, so on that image the client's value wins for agent turns and only a request that omits the field, such as a direct call to the gateway's `/v1/chat/completions`, takes the configured one. Upstream Hermes stopped sending the field in `v2026.9.14`, so an image bump past that makes this value the one the agent's requests get.
+
 ### Prompt caching
 
 Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request — so the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in the shipped `config.yaml`:
