@@ -25,6 +25,7 @@ import (
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -100,6 +101,17 @@ const (
 	// preflightInconclusiveFormat is the one line logged when the review
 	// could not decide, before falling through to building the informer.
 	preflightInconclusiveFormat = "watcher: [%s] preflight inconclusive, starting the informer anyway: %v"
+
+	// marksRecordedFormat is the one line logged per list or watch-list
+	// stream that carried cluster-autoscaler marks: the cluster, how many
+	// were put on record ahead of the batch's delivery (see recordMark), and
+	// which of the two sources brought them.
+	marksRecordedFormat = "watcher: [%s] %d autoscaler mark(s) in the %s recorded ahead of its delivery"
+	marksSourceList     = "list"
+	marksSourceStream   = "watch-list stream"
+	// initialEventsEndValue is the value the API server sets on the bookmark
+	// annotation that ends a watch-list stream's initial events.
+	initialEventsEndValue = "true"
 )
 
 // preflightVerbs is the order the preflight asks in (see preflightResource).
@@ -109,6 +121,13 @@ var preflightVerbs = [...]string{preflightListVerb, preflightWatchVerb}
 // Decoupled into an interface to allow injecting mock implementations in tests.
 type eventDispatcher interface {
 	Dispatch(ctx context.Context, ev TriageEvent)
+	// RecordScaleUpMark puts a cluster-autoscaler verdict on record without
+	// forwarding, counting or logging it, and reports whether the event was
+	// admitted as one. The watcher calls it for every mark a list or
+	// watch-list stream carries, before the informer delivers any of that
+	// batch (see recordMark); the same event reaches Dispatch when the batch
+	// is delivered, where it is counted and logged once as it always was.
+	RecordScaleUpMark(ev TriageEvent) bool
 }
 
 // errorHandlerOnce guards registration of the client-go error handler.
@@ -146,22 +165,6 @@ type watcher struct {
 	// transitions reach the callback in the order they happened; a gauge set
 	// from them must end on the latest state, and an atomic flag alone would
 	// not order the calls.
-	// dispatchMu serializes entry into the dispatcher, which holds no lock of
-	// its own on the strength of being entered by one goroutine per cluster.
-	// That was true while every event came through the informer's handler; the
-	// initial-list replay below is flushed from Run's goroutine while the
-	// handler may already be delivering live events, and this keeps the
-	// promise the dispatcher was built on. Uncontended outside that moment.
-	dispatchMu sync.Mutex
-	// replay holds the FailedScheduling events of the informer's initial list
-	// until the list has completed. The list arrives in name order, which for
-	// one pod is creation order, so a pod's FailedScheduling precedes the
-	// TriggeredScaleUp or NotTriggerScaleUp cluster-autoscaler recorded against
-	// it; dispatched as they arrive, the gate that reads the autoscaler's mark
-	// would decide before the mark was on record and open a card for a pod
-	// that scheduled while the watcher was down. Guarded by dispatchMu.
-	replay []*corev1.Event
-
 	stateMu  sync.Mutex
 	synced   bool
 	held     bool
@@ -203,15 +206,11 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	}
 	eventInformer := cache.NewSharedIndexInformer(w.newListWatch(), &corev1.Event{}, w.resyncPeriod, cache.Indexers{})
 
-	handler, err := eventInformer.AddEventHandler(cache.ResourceEventHandlerDetailedFuncs{
-		AddFunc: func(obj any, isInInitialList bool) {
+	handler, err := eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
 			ev, ok := obj.(*corev1.Event)
 			if !ok {
 				log.Printf("watcher: unexpected object type on Add: %T", obj)
-				return
-			}
-			if isInInitialList && ev.Reason == reasonFailedScheduling {
-				w.deferReplay(ev)
 				return
 			}
 			w.dispatch(ctx, ev)
@@ -267,11 +266,6 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	if !cache.WaitForCacheSync(ctx.Done(), handler.HasSynced) {
 		return fmt.Errorf("watcher: cache sync failed (informer stopped before initial list completed)")
 	}
-	// Every initial-list Add has returned by now — the handler's HasSynced
-	// waits for that, not just for the list — so every autoscaler mark the
-	// list carried is recorded and the deferred FailedScheduling events can be
-	// judged against them.
-	w.flushReplay(ctx)
 	// Only now is this cluster actually being watched. Everything before here
 	// is a cluster we are *trying* to watch: WaitForCacheSync has no timeout
 	// and the reflector retries a failed initial list forever, so an
@@ -426,9 +420,11 @@ func (w *watcher) whoAmI(ctx context.Context) string {
 // newListWatch builds the informer's list and watch calls: the same
 // Events(NamespaceAll).List and .Watch the informer factory would make,
 // wrapped the same way so the reflector uses watch-list semantics against a
-// real client and not against the fake one in tests, plus two hooks — a watch
-// call that returns without error reports the cluster as watching again, and
-// a list that does ends a hold without reporting anything.
+// real client and not against the fake one in tests, plus three hooks — a
+// watch call that returns without error reports the cluster as watching
+// again, a list that does ends a hold without reporting anything, and both
+// put the cluster-autoscaler marks they carry on record before the informer
+// delivers them (see recordMark).
 //
 // The watch call is the recovery signal rather than the list because it is
 // the last request the reflector makes before events flow, whichever mode it
@@ -443,6 +439,9 @@ func (w *watcher) newListWatch() cache.ListerWatcher {
 			list, err := w.client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
 			if err == nil {
 				w.listCompleted()
+				if list != nil {
+					w.recordMarksFromList(list)
+				}
 			}
 			return list, err
 		},
@@ -450,6 +449,9 @@ func (w *watcher) newListWatch() cache.ListerWatcher {
 			wi, err := w.client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
 			if err == nil {
 				w.watchEstablished()
+				if opts.SendInitialEvents != nil && *opts.SendInitialEvents {
+					wi = w.recordMarksFromStream(wi)
+				}
 			}
 			return wi, err
 		},
@@ -570,34 +572,118 @@ func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err 
 // is stamped onto the event here, at the point where the source is
 // unambiguous.
 func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
-	w.dispatchMu.Lock()
-	defer w.dispatchMu.Unlock()
 	w.dispatcher.Dispatch(ctx, toTriageEvent(ev, w.cluster))
 }
 
-// deferReplay parks an initial-list FailedScheduling until flushReplay; see
-// the replay field. Everything else in the list is dispatched as it arrives,
-// which is what puts the autoscaler's marks on record first.
-func (w *watcher) deferReplay(ev *corev1.Event) {
-	w.dispatchMu.Lock()
-	defer w.dispatchMu.Unlock()
-	w.replay = append(w.replay, ev)
+// recordMark puts a cluster-autoscaler mark on record ahead of the informer
+// delivering it, and reports whether the event was one. The informer delivers
+// a list in an order that puts a pod's FailedScheduling ahead of the
+// TriggeredScaleUp or NotTriggerScaleUp recorded against it: a plain list is
+// served in name order, which for one pod is creation order, and a watch-list
+// stream is handed to the informer's store in map order. Judged as they
+// arrive, the FailedScheduling would be decided before its mark was on record
+// and open a card for a pod that scheduled while the watcher was not
+// watching. That is true of the initial list and of every relist after a
+// watch the reflector could not resume — a 410 after a disconnect longer
+// than the watch cache retains, an API server upgrade, the hold after a 403
+// (handleWatchError) — and client-go flags only the first of those as the
+// initial list, so a guard on delivery would cover the restart and not the
+// relist. The marks are therefore recorded off the list or the stream itself,
+// as the API server hands it to the reflector, which is before the informer's
+// store is replaced and so before any of the batch reaches the handler.
+// Recording keeps the latest mark by event time and is idempotent, so the
+// informer delivering the same mark afterwards changes nothing; the
+// dispatcher counts and logs it then, once, as it always did.
+func (w *watcher) recordMark(ev *corev1.Event) bool {
+	if scaleUpVerdictFor(ev.Reason) == scaleUpNone {
+		return false
+	}
+	return w.dispatcher.RecordScaleUpMark(toTriageEvent(ev, w.cluster))
 }
 
-// flushReplay dispatches the deferred FailedScheduling events in the order the
-// list delivered them, under the same lock as live dispatch so the dispatcher
-// is still entered one event at a time.
-func (w *watcher) flushReplay(ctx context.Context) {
-	w.dispatchMu.Lock()
-	defer w.dispatchMu.Unlock()
-	if len(w.replay) > 0 {
-		log.Printf("watcher: [%s] initial list complete, dispatching %d deferred %s event(s) against the autoscaler marks it carried",
-			w.cluster.Name, len(w.replay), reasonFailedScheduling)
+// recordMarksFromList records the marks one list page carries (see
+// recordMark); the reflector collects every page before it replaces the
+// store, so a mark on any page is on record before the first is delivered.
+func (w *watcher) recordMarksFromList(list *corev1.EventList) {
+	recorded := 0
+	for i := range list.Items {
+		if w.recordMark(&list.Items[i]) {
+			recorded++
+		}
 	}
-	for _, ev := range w.replay {
-		w.dispatcher.Dispatch(ctx, toTriageEvent(ev, w.cluster))
+	if recorded > 0 {
+		log.Printf(marksRecordedFormat, w.cluster.Name, recorded, marksSourceList)
 	}
-	w.replay = nil
+}
+
+// recordMarksFromStream wraps a watch opened with sendInitialEvents, which is
+// how the reflector's watch-list mode replaces the list, and records each mark
+// as it streams in (see recordMark). The reflector hands the initial events
+// to the informer's store only once the bookmark that ends them has arrived,
+// so every mark is on record before any of the batch is delivered; the count
+// is logged at that bookmark. Events pass through unchanged and in order.
+func (w *watcher) recordMarksFromStream(wi watch.Interface) watch.Interface {
+	recorded := 0
+	return observeWatch(wi, func(in watch.Event) {
+		switch in.Type {
+		case watch.Added, watch.Modified:
+			if ev, ok := in.Object.(*corev1.Event); ok && w.recordMark(ev) {
+				recorded++
+			}
+		case watch.Bookmark:
+			if recorded > 0 && isInitialEventsEnd(in.Object) {
+				log.Printf(marksRecordedFormat, w.cluster.Name, recorded, marksSourceStream)
+				recorded = 0
+			}
+		}
+	})
+}
+
+// isInitialEventsEnd reports whether a bookmark is the one the API server
+// annotates as ending a watch-list stream's initial events.
+func isInitialEventsEnd(obj k8sruntime.Object) bool {
+	m, err := meta.Accessor(obj)
+	if err != nil {
+		return false
+	}
+	return m.GetAnnotations()[metav1.InitialEventsAnnotationKey] == initialEventsEndValue
+}
+
+// observedWatch forwards a watch's events unchanged and in order, calling
+// observe on each before it is forwarded, on a goroutine of its own.
+// watch.Filter would do the same but sends on an unbuffered channel with no
+// way out, so a reflector that stops the watch with an event in flight would
+// leave that goroutine blocked for the life of the process; this one selects
+// on its own stop as well.
+type observedWatch struct {
+	incoming watch.Interface
+	result   chan watch.Event
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func observeWatch(wi watch.Interface, observe func(watch.Event)) watch.Interface {
+	ow := &observedWatch{incoming: wi, result: make(chan watch.Event), stop: make(chan struct{})}
+	go func() {
+		defer close(ow.result)
+		for ev := range wi.ResultChan() {
+			observe(ev)
+			select {
+			case ow.result <- ev:
+			case <-ow.stop:
+				return
+			}
+		}
+	}()
+	return ow
+}
+
+func (ow *observedWatch) ResultChan() <-chan watch.Event { return ow.result }
+
+// Stop stops the upstream watch and releases the forwarding goroutine.
+func (ow *observedWatch) Stop() {
+	ow.stopOnce.Do(func() { close(ow.stop) })
+	ow.incoming.Stop()
 }
 
 // toTriageEvent flattens a *corev1.Event to the internal payload

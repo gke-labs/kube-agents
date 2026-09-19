@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -151,6 +152,8 @@ func captureLog(t *testing.T) *lockedBuffer {
 type nopDispatcher struct{}
 
 func (nopDispatcher) Dispatch(context.Context, TriageEvent) {}
+
+func (nopDispatcher) RecordScaleUpMark(TriageEvent) bool { return false }
 
 // preflightStub answers the preflight's SelfSubjectAccessReviews on a fake
 // clientset, which has no answer of its own for the resource. deny names the
@@ -315,6 +318,8 @@ func TestToTriageEvent_SeriesFallbacks(t *testing.T) {
 }
 
 // orderDispatcher records the reason of every event it is handed, in order.
+// orderDispatcher records the sequence of calls the watcher makes: a reason
+// per Dispatch, and "mark:<reason>" per RecordScaleUpMark.
 type orderDispatcher struct {
 	mu      sync.Mutex
 	reasons []string
@@ -326,33 +331,56 @@ func (d *orderDispatcher) Dispatch(_ context.Context, ev TriageEvent) {
 	d.reasons = append(d.reasons, ev.Key.Reason)
 }
 
+func (d *orderDispatcher) RecordScaleUpMark(ev TriageEvent) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.reasons = append(d.reasons, "mark:"+ev.Key.Reason)
+	return true
+}
+
 func (d *orderDispatcher) snapshot() []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]string(nil), d.reasons...)
 }
 
-// TestRun_InitialListFailedSchedulingIsDispatchedAfterTheMarks pins the
+// listedEvent is one event of a fake list: a pod's events are named in
+// creation order, which is the order the API server lists them in.
+func listedEvent(uid, reason, name string) corev1.Event {
+	return corev1.Event{
+		ObjectMeta:     metav1.ObjectMeta{Name: name, Namespace: "default", ResourceVersion: "1"},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: "api", Namespace: "default", UID: types.UID(uid)},
+		Reason:         reason,
+		Count:          5,
+		LastTimestamp:  metav1.Time{Time: time.Now()},
+	}
+}
+
+// awaitDispatches waits until the dispatcher has recorded at least n calls.
+func awaitDispatches(t *testing.T, rec *orderDispatcher, n int, what string) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for len(rec.snapshot()) < n {
+		select {
+		case <-deadline:
+			t.Fatalf("%s; order = %v", what, rec.snapshot())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// TestRun_InitialListMarksAreRecordedBeforeTheListIsDelivered pins the
 // restart case. The API server lists a pod's events in name order, which is
 // creation order, so the FailedScheduling the scheduler emitted at pod
 // creation precedes the TriggeredScaleUp cluster-autoscaler recorded two
-// seconds later. The list is served in exactly that order here, and the
-// dispatcher must still see the mark first, with the FailedScheduling
-// arriving once the list has completed; a live FailedScheduling after the
-// sync is dispatched as it comes.
-func TestRun_InitialListFailedSchedulingIsDispatchedAfterTheMarks(t *testing.T) {
-	captureLog(t)
+// seconds later. The list is served in exactly that order here, and the mark
+// must be on record before the first event of the list is dispatched; a live
+// FailedScheduling after the sync is dispatched as it comes.
+func TestRun_InitialListMarksAreRecordedBeforeTheListIsDelivered(t *testing.T) {
+	logs := captureLog(t)
 	client := fake.NewClientset()
 	allowPreflight(client)
-	pod := func(reason, name string) corev1.Event {
-		return corev1.Event{
-			ObjectMeta:     metav1.ObjectMeta{Name: name, Namespace: "default", ResourceVersion: "1"},
-			InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: "api", Namespace: "default", UID: types.UID("pod-1")},
-			Reason:         reason,
-			Count:          5,
-			LastTimestamp:  metav1.Time{Time: time.Now()},
-		}
-	}
+	pod := func(reason, name string) corev1.Event { return listedEvent("pod-1", reason, name) }
 	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, &corev1.EventList{
 			ListMeta: metav1.ListMeta{ResourceVersion: "10"},
@@ -390,12 +418,16 @@ func TestRun_InitialListFailedSchedulingIsDispatchedAfterTheMarks(t *testing.T) 
 		t.Fatal("the informer never synced")
 	}
 
-	want := []string{"BackOff", "TriggeredScaleUp", "FailedScheduling", "FailedScheduling"}
+	awaitDispatches(t, rec, 5, "the initial list was not delivered in full")
+	want := []string{"mark:TriggeredScaleUp", "FailedScheduling", "BackOff", "TriggeredScaleUp", "FailedScheduling"}
 	if got := rec.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("dispatch order after the initial list = %v; want %v", got, want)
+		t.Fatalf("call order after the initial list = %v; want %v", got, want)
+	}
+	if !strings.Contains(logs.String(), "1 autoscaler mark(s) in the list recorded ahead of its delivery") {
+		t.Errorf("no record line for the list's mark in:\n%s", logs.String())
 	}
 
-	// A live event after the sync is not deferred.
+	// A live event after the sync is dispatched as it comes.
 	deadline := time.After(10 * time.Second)
 	for openWatch.Load() == nil {
 		select {
@@ -407,13 +439,85 @@ func TestRun_InitialListFailedSchedulingIsDispatchedAfterTheMarks(t *testing.T) 
 	live := pod("FailedScheduling", "api.5")
 	live.ResourceVersion = "11"
 	openWatch.Load().Add(&live)
-	deadline = time.After(10 * time.Second)
-	for len(rec.snapshot()) < 5 {
+	awaitDispatches(t, rec, 6, "live FailedScheduling never dispatched")
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run returned %v; want nil on shutdown", err)
+	}
+}
+
+// TestRun_RelistMarksAreRecordedBeforeTheRelistIsDelivered pins the same
+// ordering for a relist, which client-go does not flag as an initial list. The
+// watch is ended with a 410, the reflector lists again, and the list now
+// carries a pod created in the gap whose FailedScheduling is already at the
+// count threshold and precedes its TriggeredScaleUp; the mark must be on
+// record before the FailedScheduling is dispatched.
+func TestRun_RelistMarksAreRecordedBeforeTheRelistIsDelivered(t *testing.T) {
+	captureLog(t)
+	client := fake.NewClientset()
+	allowPreflight(client)
+	var lists atomic.Int64
+	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if lists.Add(1) == 1 {
+			return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
+		}
+		return true, &corev1.EventList{
+			ListMeta: metav1.ListMeta{ResourceVersion: "20"},
+			Items: []corev1.Event{
+				listedEvent("pod-2", "FailedScheduling", "api.1"),
+				listedEvent("pod-2", "TriggeredScaleUp", "api.2"),
+			},
+		}, nil
+	})
+	var openWatch atomic.Pointer[watch.FakeWatcher]
+	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		fw := watch.NewFakeWithChanSize(1, false)
+		openWatch.Store(fw)
+		return true, fw, nil
+	})
+	rec := &orderDispatcher{}
+	w := newWatcher(client, rec, targetCluster{Name: "relisted"}, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	synced := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Run(ctx, func(watching bool) {
+			if watching {
+				close(synced)
+			}
+		})
+	}()
+	select {
+	case <-synced:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the informer never synced")
+	}
+	deadline := time.After(10 * time.Second)
+	for openWatch.Load() == nil {
 		select {
 		case <-deadline:
-			t.Fatalf("live FailedScheduling never dispatched; order = %v", rec.snapshot())
+			t.Fatal("the reflector never opened its watch")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+
+	// The watch cannot be resumed: the reflector lists again.
+	openWatch.Load().Error(&metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    http.StatusGone,
+		Reason:  metav1.StatusReasonExpired,
+		Message: "too old resource version",
+	})
+	awaitDispatches(t, rec, 3, "the relist was not delivered in full")
+	if got := lists.Load(); got < 2 {
+		t.Fatalf("want a second list after the 410, got %d list(s)", got)
+	}
+	want := []string{"mark:TriggeredScaleUp", "FailedScheduling", "TriggeredScaleUp"}
+	if got := rec.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("call order after the relist = %v; want %v", got, want)
 	}
 
 	cancel()

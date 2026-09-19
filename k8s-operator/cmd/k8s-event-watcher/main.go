@@ -499,6 +499,21 @@ func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent, replay bool) (dedupRes
 	return dedupResult{Kind: dedupNewIncident, Count: 1}, true
 }
 
+// RecordScaleUpMark puts a cluster-autoscaler verdict on record and nothing
+// else: no metric, no log line, no dedup entry. The watcher calls it for the
+// marks a list or watch-list stream carries before the informer delivers
+// that batch (watcher.go, recordMark), and the same event comes through
+// Dispatch when the batch is delivered, where it is counted and logged once.
+// The filter decides admission here as it does there, so the --reason list
+// and the namespace rules still say which verdicts are remembered.
+func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
+	if d.filter.Decide(ev) != gateScaleUpMark {
+		return false
+	}
+	d.scaleUps.Record(ev.Key.UID, scaleUpVerdictFor(ev.Key.Reason), ev.LastSeen)
+	return true
+}
+
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
