@@ -1666,6 +1666,7 @@ def _stash_pr_report(final_message: str = "", started_at: float = _RUN_START) ->
 
 def _pr_check(**kw):
     kw.setdefault("owner", "gke-agentic")
+    kw.setdefault("repo_pattern", r"kube-agents-evals(-\d+)?-infra")
     return PullRequestOpenedVerifier(type="pull_request_opened", **kw)
 
 
@@ -1759,6 +1760,24 @@ def test_the_ticket_linked_beside_the_fix_does_not_sink_it(token, github):
     github.routes[_pr_api(number=3)] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     github.routes[_pr_api()] = (200, _pr_payload())
     assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
+    """The shape this check exists to catch. A name outside the pool's own
+    `<project>-infra` is the agent's, not an onboarding gap, so it must not
+    reach the 404 probe: an error is rung 2, admission-blind, and would red the
+    eval job for every open pull request over one hallucination."""
+    _stash_pr_report("Fix proposed: https://github.com/gke-agentic/payments-infra/pull/3")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "not an eval GitOps repository" in res.reason
+    # Rejected on its name: no request was spent on it.
+    assert github.calls == []
+    # And the match is the whole name, so a pool name with something appended
+    # -- a fork, a mirror, a typo that grew -- is rejected the same way.
+    _stash_pr_report(f"Fix proposed: https://github.com/gke-agentic/{_PR_REPO}-old/pull/3")
+    assert _pr_check().verify(5.0).status == "fail"
+    assert github.calls == []
 
 
 def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, github):

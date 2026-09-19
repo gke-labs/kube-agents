@@ -109,6 +109,10 @@ verification_spec:
       type: pull_request_opened
       # Closes the TODO this check carried: the repositories are decided.
       owner: gke-agentic
+      # `<pool project>-infra` on every pool project. Without it a repository
+      # the agent invents answers 404 like one the App was never given, and
+      # that has to be an error -- which reds the eval job for everyone.
+      repo_pattern: kube-agents-evals(-\d+)?-infra
   - name: rca-names-the-planted-cause
     role: objective
     # assert, not the converge default: the transcript is immutable once the

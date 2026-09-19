@@ -943,7 +943,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
-    ``owner`` when one is set; and it was written -- created or updated -- at or
+    ``owner`` in a repository matching ``repo_pattern`` when those are set; and
+    it was written -- created or updated -- at or
     after this run started, less ``max_clock_skew_sec``. Updating counts because
     the skill reuses a branch and edits the pull request already open on it --
     which also means the stamp proves only that the pull request was written to
@@ -969,10 +970,23 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # a fair exact match across every pool project and breaks loudly if the org
     # moves.
     owner: str = ""
+    # What the repository half of the slug must match in full, "" for any. The
+    # owner gate leaves that half to the agent, and a repository it invents
+    # answers 404 exactly as one the App installation was never given does --
+    # which has to be an error. Pinning the shape the pool actually uses
+    # (`<pool project>-infra`, `gitops_repo_for_project` in hack/ci-deploy.sh)
+    # keeps an invented name a fail, where it belongs.
+    repo_pattern: str = ""
     # Tolerance between GitHub's creation stamp and the harness's run-start
     # clock, which are two different machines. Small on purpose: every second
     # of it is a second of a previous rep's pull request reading as this one's.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @field_validator("repo_pattern")
+    @classmethod
+    def _repo_pattern_compiles(cls, pattern: str) -> str:
+        re.compile(pattern)
+        return pattern
 
     def _resolve(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -1087,6 +1101,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():
                 rejected.append(f"{slug}: not under {self.owner}")
+                continue
+            if self.repo_pattern and not re.fullmatch(self.repo_pattern, repo):
+                rejected.append(
+                    f"{slug}: {repo} is not an eval GitOps repository "
+                    f"({self.repo_pattern})"
+                )
                 continue
             try:
                 payload, unevaluable = self._resolve(owner, repo, number, token, budget)
