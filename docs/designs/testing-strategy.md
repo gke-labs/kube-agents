@@ -122,7 +122,7 @@ Whether a check blocks on a single run or only across the three depends on who c
 - the agent called the tool it says it read;
 - asked to run an audit, it triggered the job (`hermes cron run`) instead of re-enacting the audit in the session.
 
-The trajectory we record is the router's, so worker mutations are caught by cluster state instead.
+`tool_called` counts the router's calls only (the workers' calls sit in the same trajectory, tagged and skipped), so worker mutations are caught by cluster state instead.
 
 **The agent chose the words, so the score is judged and blocks only across the three runs:** the case's scores must be non-inferior to its own baseline on `main`. Not must-improve. A ratchet on a stochastic metric deadlocks on the first docs change and teaches people to game the metric.
 
