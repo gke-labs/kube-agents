@@ -250,8 +250,10 @@ the callout itself, which cannot authenticate through the thing it is; the chato
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web`, because a browser never can; `seed`, because
 the hand-applied seed tooling is applied rather than rendered and dropping its user
-would refuse an object already running; `sys`, a human at a port-forward; and `bridge`,
-the Hermes bridge sidecar.
+would refuse an object already running; `sys`, a human at a port-forward; `eval`, the
+bench harness's diagnostic bus transport, a process outside the cluster with no
+ServiceAccount to present, rendered only when the operator runs with
+`A2A_EVAL_PRINCIPAL=true`; and `bridge`, the Hermes bridge sidecar.
 
 The shared `worker` user is gone. It was one credential held by two workloads that
 happen to share a pod — the bridge sidecar, which drives the task plane, and the `a2a`
@@ -259,9 +261,10 @@ CLI in the agent container, which reads and writes the topic blackboard — so i
 set was the union of two unrelated jobs, and either workload could do the other's. It
 split into `agent` and `bridge`, and neither holds the other's streams.
 
-Four of those static users are permanent - the callout, which cannot authenticate
+Five of those static users are permanent - the callout, which cannot authenticate
 through itself; `web`, because a browser never can; `sys`, which is a human rather than
-a workload; and `bridge`, for a reason worth stating because it looks like an omission.
+a workload; `eval`, which runs outside the cluster; and `bridge`, for a reason worth
+stating because it looks like an omission.
 The callout keys its map on the ServiceAccount username `TokenReview` returns, and a
 sidecar shares its pod's ServiceAccount. A token presented by the bridge would therefore
 resolve to the `agent` entry rendered for the container beside it, and each would hold

@@ -33,6 +33,17 @@ func identityTestAgent() *agentv1alpha1.PlatformAgent {
 	}
 }
 
+// withEvalPrincipal puts the eval principal in the list a package-wide
+// invariant iterates. The flag-on list is a superset of the default one, so a
+// property that holds over it holds over both renders, and without this the
+// invariants below would never see eval at all: a2aIdentities appends it only
+// under A2A_EVAL_PRINCIPAL=true, and nothing else in the package sets that.
+// TestTheEvalPrincipalRendersOnlyUnderItsFlag owns the flag-off render.
+func withEvalPrincipal(t *testing.T) {
+	t.Helper()
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
+}
+
 // The inbox trap, pinned. Push delivery and every JetStream API request come
 // back on an inbox subject, each principal is granted only its own prefix, and
 // the client sets that prefix from its user name. A principal whose subscribe
@@ -41,6 +52,7 @@ func identityTestAgent() *agentv1alpha1.PlatformAgent {
 // succeed; no consumer could ever ack). This asserts the property rather than
 // the spelling of any one grant.
 func TestEveryPrincipalMaySubscribeToItsOwnInbox(t *testing.T) {
+	withEvalPrincipal(t)
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.account == a2aAccountSys {
 			// $SYS holds no application inbox grants; its user is a
@@ -78,6 +90,7 @@ func TestEveryPrincipalMaySubscribeToItsOwnInbox(t *testing.T) {
 // subscribe to another's inbox reads what that principal's subject grants
 // withheld.
 func TestNoPrincipalHoldsAnotherPrincipalsInbox(t *testing.T) {
+	withEvalPrincipal(t)
 	ids := a2aIdentities(identityTestAgent())
 	for _, id := range ids {
 		for _, other := range ids {
@@ -93,6 +106,7 @@ func TestNoPrincipalHoldsAnotherPrincipalsInbox(t *testing.T) {
 }
 
 func TestPrincipalsAreDistinct(t *testing.T) {
+	withEvalPrincipal(t)
 	seenUser := map[string]bool{}
 	seenSA := map[string]bool{}
 	for _, id := range a2aIdentities(identityTestAgent()) {
@@ -120,6 +134,7 @@ func TestPrincipalsAreDistinct(t *testing.T) {
 // cannot be resolved, and a static one with no creds key renders a password of
 // "" — a user anyone can log in as, which is W6 finding #9 in a new costume.
 func TestEachPrincipalCarriesWhatItsAuthModeNeeds(t *testing.T) {
+	withEvalPrincipal(t)
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		switch id.auth {
 		case a2aAuthCallout:
@@ -150,6 +165,7 @@ func TestEachPrincipalCarriesWhatItsAuthModeNeeds(t *testing.T) {
 // list is built from exactly this set. A static user missing from auth_users is
 // refused at connect by a callout that has never heard of it.
 func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	all := a2aIdentities(agent)
 	static := staticIdentities(agent)
@@ -179,18 +195,95 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 // entry would hand it the agent container's grants as well, which is the union
 // A5 broke up; sys is a human; gateway could move today but its client program lands
 // separately from this render, so moving the identity first would refuse it at
-// connect on every install; and seed is applied rather than rendered, so
-// dropping its user would break an object already running on installs today. A
-// sixth name here means someone added a principal without asking whether it
-// could have an identity.
+// connect on every install; seed is applied rather than rendered, so dropping
+// its user would break an object already running on installs today; and eval
+// is the bench harness outside the cluster, over a port-forward, with no
+// ServiceAccount here to present, and rendered only when an operator opts in.
+// A name beyond these means someone added a principal without asking whether
+// it could have an identity.
 func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
-	var got []string
-	for _, id := range staticIdentities(identityTestAgent()) {
-		got = append(got, id.user)
+	statics := func() []string {
+		var got []string
+		for _, id := range staticIdentities(identityTestAgent()) {
+			got = append(got, id.user)
+		}
+		return got
 	}
+	t.Setenv(a2aEvalPrincipalEnvVar, "")
 	want := []string{"gateway", a2aBridgeUser, "seed", "web", "sys"}
-	if !slices.Equal(got, want) {
+	if got := statics(); !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
+	}
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
+	want = []string{"gateway", a2aBridgeUser, "seed", "web", "eval", "sys"}
+	if got := statics(); !slices.Equal(got, want) {
+		t.Errorf("static principals with the eval flag = %v, want %v", got, want)
+	}
+}
+
+// The eval principal is opt-in. Its static grants reach every platform task,
+// the gateway's included (a holder of eval-password can cancel or steer one it
+// did not start), so an install that runs no eval must carry neither the user
+// nor the key. Asserted at every layer the flag governs: the identity list,
+// the creds keys the Secret is repaired to, the rendered nats.conf user block
+// and the auth_users exemption; and against the near-miss, which must fall on
+// the side of no credential.
+func TestTheEvalPrincipalRendersOnlyUnderItsFlag(t *testing.T) {
+	agent := identityTestAgent()
+	render := func() (users []string, keys []string, conf string) {
+		t.Helper()
+		for _, id := range a2aIdentities(agent) {
+			users = append(users, id.user)
+		}
+		conf = string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+		return users, a2aCredsKeys(), conf
+	}
+	authUsers := func(conf string) string {
+		t.Helper()
+		i := strings.Index(conf, "auth_users:")
+		if i < 0 {
+			t.Fatal("rendered nats.conf has no auth_users line")
+		}
+		return conf[i : i+strings.Index(conf[i:], "\n")]
+	}
+
+	for _, off := range []string{"", "TRUE", "1", "yes"} {
+		t.Setenv(a2aEvalPrincipalEnvVar, off)
+		users, keys, conf := render()
+		if slices.Contains(users, "eval") {
+			t.Errorf("%s=%q renders the eval identity; the principal is opt-in", a2aEvalPrincipalEnvVar, off)
+		}
+		if slices.Contains(keys, a2aEvalPasswordKey) {
+			t.Errorf("%s=%q mints %s into the creds Secret", a2aEvalPrincipalEnvVar, off, a2aEvalPasswordKey)
+		}
+		if strings.Contains(conf, "user: eval") {
+			t.Errorf("%s=%q renders a `user: eval` block into nats.conf", a2aEvalPrincipalEnvVar, off)
+		}
+		if strings.Contains(authUsers(conf), "eval") {
+			t.Errorf("%s=%q lists eval in auth_users with no user block behind it", a2aEvalPrincipalEnvVar, off)
+		}
+		// Not the user block and the auth_users entry alone: no byte of the
+		// render may mention the principal. a2aConfigRolloutHash digests the
+		// whole placeholder render, so a comment that changed with the flag
+		// off would roll the bus on every install that never opted in.
+		if strings.Contains(conf, "eval") {
+			t.Errorf("%s=%q leaves the word eval in nats.conf; the flag-off render must not change for an install that never opted in", a2aEvalPrincipalEnvVar, off)
+		}
+	}
+
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
+	users, keys, conf := render()
+	if !slices.Contains(users, "eval") {
+		t.Error("the flag set renders no eval identity")
+	}
+	if !slices.Contains(keys, a2aEvalPasswordKey) {
+		t.Errorf("the flag set mints no %s key", a2aEvalPasswordKey)
+	}
+	if !strings.Contains(conf, "user: eval") {
+		t.Error("the flag set renders no `user: eval` block")
+	}
+	if !strings.Contains(authUsers(conf), "eval") {
+		t.Error("the flag set renders the eval user but leaves it out of auth_users, so the callout would refuse it at connect")
 	}
 }
 
@@ -225,6 +318,7 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 // and this package's RBAC together for exactly that reason. If the spawner ever
 // stops projecting the token, this test keeps passing and C1 is what fails.
 func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
+	withEvalPrincipal(t)
 	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.auth == a2aAuthCallout {
@@ -275,6 +369,7 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // principal's. That is not a list to grow without an argument in the identity's
 // own comment for why it cannot be enumerated instead.
 func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
+	withEvalPrincipal(t)
 	const bare = "$JS.API.>"
 	expected := []string{"gateway"}
 
@@ -298,6 +393,7 @@ func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
 // ServiceAccount the map is keyed on, and the narrowing the callout switches on
 // — and they are rendered from three different places.
 func TestTheSessionPrincipalIsNarrowedAndOtherwiseEmpty(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	var session *a2aIdentity
 	for _, id := range a2aIdentities(agent) {
@@ -335,6 +431,7 @@ func TestTheSessionPrincipalIsNarrowedAndOtherwiseEmpty(t *testing.T) {
 // A5 retired `worker-password`, and a test that named it would have gone
 // vacuous at that rename while still reporting a pass.
 func TestNoSessionPrincipalSharesAStaticCredential(t *testing.T) {
+	withEvalPrincipal(t)
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.user != "session" {
 			continue
@@ -366,6 +463,7 @@ func TestNoSessionPrincipalSharesAStaticCredential(t *testing.T) {
 // bridge that inherits the static half publishes `…events` for its own
 // addressee only, so it does not reach another addressee's.
 func TestTheSupervisorSubjectHasExactlyOneWriterAndItIsNotAnEventsWriter(t *testing.T) {
+	withEvalPrincipal(t)
 	const (
 		supervisorProbe = "a2a.tasks.chat-otter-1a2b.task-0001.supervisor"
 		eventsProbe     = "a2a.tasks.chat-otter-1a2b.task-0001.events"
@@ -441,6 +539,7 @@ func TestTheEventsWriterCheckIsTightenedByConfigNotByCode(t *testing.T) {
 // against the strings rather than against a deleted symbol — a deleted symbol
 // is exactly what a re-add restores.
 func TestTheWorkerCredentialIsGone(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	for _, id := range a2aIdentities(agent) {
 		if id.user == "worker" {
@@ -450,7 +549,7 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 			t.Errorf("%s reads worker-password; that key is retired", id.user)
 		}
 	}
-	if slices.Contains(a2aCredsKeys, "worker-password") {
+	if slices.Contains(a2aCredsKeys(), "worker-password") {
 		t.Error("worker-password is back in a2aCredsKeys; the operator would mint a password nothing authenticates with")
 	}
 
@@ -484,6 +583,7 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 // than at the apply. A5 is what makes this reachable: `agent` is the first
 // callout identity keyed on a user-settable field.
 func TestAnOverriddenServiceAccountThatCollidesIsRefused(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := identityTestAgent()
 	collide := a2aSessionServiceAccountName(agent)
 	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: collide}

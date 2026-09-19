@@ -168,6 +168,19 @@ const (
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
 	defaultA2AWorkerImage       = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
 
+	// a2aEvalPrincipalEnvVar is read from the CONTROLLER's environment, the
+	// same flip shape as the strict-writer override above. Set to exactly
+	// "true" it renders the bench harness's `eval` principal (evalIdentity)
+	// into nats.conf and auth_users and mints its `eval-password` key into the
+	// creds Secret; unset, an install carries neither. Opt-in because the
+	// principal's static grants reach every `platform` task, the gateway's
+	// included, and a credential that can cancel and steer any of them should
+	// exist only on an install that runs an eval. Anything but "true" leaves
+	// it off: a typo withholds a diagnostic rather than minting a credential.
+	// The inject side door will carry an eval flag of its own; folding the two
+	// into one is the follow-up once it lands.
+	a2aEvalPrincipalEnvVar = "A2A_EVAL_PRINCIPAL"
+
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
 	// the key name so moving a credential from one user to another is still a
@@ -216,6 +229,7 @@ const (
 	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+	a2aEvalPasswordKey    = "eval-password"    // #nosec G101 -- Secret key name, not a credential
 
 	// a2aProvisionJobNameInfix sits between the agent's name and the digest in
 	// the provision Job's name; a2aProvisionJobNameHashLength is how much of
@@ -350,6 +364,26 @@ func a2aStrictEventsWriter() string {
 	return "false"
 }
 
+// a2aEvalPrincipalEnabled reports whether the controller was told to render
+// the eval principal and its Secret key. Exactly "true", for the reason the
+// strict-writer flip gives: the near-miss must fall on the safe side.
+func a2aEvalPrincipalEnabled() bool {
+	return os.Getenv(a2aEvalPrincipalEnvVar) == "true"
+}
+
+// renderA2AEvalAuthUsersNote is the eval principal's clause in the auth_users
+// comment of nats.conf, rendered only when the principal is. The flag-off
+// render has to stay byte-identical to the render before the principal
+// existed: a2aConfigRolloutHash covers every non-secret byte of nats.conf, so
+// a comment naming a user the install does not carry would roll the bus once
+// on every next-mode install that never opted in.
+func renderA2AEvalAuthUsersNote() string {
+	if !a2aEvalPrincipalEnabled() {
+		return ""
+	}
+	return ", the bench harness's eval principal running\n    # outside the cluster"
+}
+
 // a2aNATSName and a2aCredsSecretName are spelled in the API package, because
 // the validating webhook recognises the credentials Secret by name and must
 // agree with the render on what that name is.
@@ -428,10 +462,23 @@ func randomA2APassword() (string, error) {
 // auth callout they hold no shared secret at all, which is the point. The
 // gateway and seed keys survive so an install that predates the callout keeps a
 // valid Secret shape through the upgrade, and so the hand-applied seed tooling
-// still has a credential.
-var a2aCredsKeys = []string{
+// still has a credential. The eval key is the bench harness's own principal
+// (evalIdentity) and is minted only while a2aEvalPrincipalEnabled: an
+// existing Secret gains it on the first reconcile after the flag is set,
+// which is how the repair loop below is meant to be used. Unsetting the flag
+// leaves the key behind, inert, because nats.conf no longer names a user
+// that reads it; the loop repairs shape and never removes a key.
+var a2aCredsBaseKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
 	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+}
+
+func a2aCredsKeys() []string {
+	keys := append([]string(nil), a2aCredsBaseKeys...)
+	if a2aEvalPrincipalEnabled() {
+		keys = append(keys, a2aEvalPasswordKey)
+	}
+	return keys
 }
 
 // a2aProvisionedStreams is every JetStream stream the provision Job creates, and
@@ -704,7 +751,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 		if existing.Data == nil {
 			existing.Data = map[string][]byte{}
 		}
-		for _, key := range a2aCredsKeys {
+		for _, key := range a2aCredsKeys() {
 			if a2aCredsValueRe.Match(existing.Data[key]) {
 				continue
 			}
@@ -727,7 +774,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 	}
 
 	data := map[string][]byte{}
-	for _, key := range a2aCredsKeys {
+	for _, key := range a2aCredsKeys() {
 		pw, err := randomA2APassword()
 		if err != nil {
 			return nil, err
@@ -941,7 +988,7 @@ authorization {
     # A name is here for one of three reasons, and each identity's own comment
     # above says which. It can hold no projected token at all — the browser
     # read user, the $SYS login held by a person, the seed tooling that is
-    # applied rather than run. Or it is a sidecar, which a ServiceAccount
+    # applied rather than run` + renderA2AEvalAuthUsersNote() + `. Or it is a sidecar, which a ServiceAccount
     # token cannot name apart from the container beside it — the bridge, whose
     # own comment above says what a callout entry there would merge. Or it
     # could move and has not: gateway, which is the remaining migration. The

@@ -50,6 +50,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench.a2a_transport import EVENT_ENTRY_STATUS, shows_a_run
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
@@ -395,6 +396,38 @@ class RepResult:
         return self.outcome in ("pass", "fail")
 
 
+def _a2a_liveness_event(trajectory: list[Any]) -> bool:
+    """Whether the trajectory carries an a2a executor's evidence that it ran.
+
+    The bus carries no token usage, so an a2a record's ``tokens`` are all
+    null and the task's lifecycle events, recorded as trajectory entries
+    under ``EVENT_ENTRY_STATUS``, stand in. A final one means an executor
+    took the task and ended it (a terminal the executor wrote for its own
+    fault never reaches a record: the harness classifies those by reason
+    token as infrastructure first); a ``working`` one means it took the task and
+    started, which is all a graded timeout carries when the run was cancelled
+    at its budget before the terminal landed. ``submitted`` alone is the
+    bridge queueing the task, not a model running, and does not count
+    (docs/designs/eval-next-transport.md, stage 1), nor does
+    ``input-required`` or ``auth-required`` with no ``working`` before it.
+    The predicate is the transport's ``shows_a_run``, which ``Fold.started``
+    applies first, so the harness records such a repetition as
+    infrastructure before it gets here and this is the backstop for a record
+    that arrives another way. The names are imported
+    where the marker above is duplicated because the transport module brings
+    in neither ``devops_bench`` nor ``nats`` at import time.
+    """
+    for entry in trajectory:
+        if not isinstance(entry, dict) or entry.get("name") != EVENT_ENTRY_STATUS:
+            continue
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            continue
+        if shows_a_run(args.get("state"), args.get("final") is True):
+            return True
+    return False
+
+
 def _liveness_failures(record: RunRecord) -> list[str]:
     """Rung 3's signals. Every one must hold for the record to be a real run.
 
@@ -421,10 +454,14 @@ def _liveness_failures(record: RunRecord) -> list[str]:
 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
-    # so the log says which one happened.
+    # so the log says which one happened. The one record that legitimately
+    # carries null buckets is an a2a-transport run: the bus reports no usage,
+    # and its liveness is the executor's own events in the trajectory
+    # instead (see _a2a_liveness_event).
     total = record.tokens.get("total")
     if total is None:
-        failures.append("no token accounting on the record (tokens.total is null)")
+        if not _a2a_liveness_event(record.trajectory):
+            failures.append("no token accounting on the record (tokens.total is null)")
     elif not isinstance(total, bool) and _as_float(total) == 0:
         failures.append("tokens.total is 0: no model call was billed")
 

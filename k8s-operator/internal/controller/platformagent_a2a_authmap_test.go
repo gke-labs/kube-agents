@@ -47,6 +47,7 @@ func authMapTestAgent() *agentv1alpha1.PlatformAgent {
 }
 
 func TestRenderedAuthMapCarriesEveryCalloutPrincipalAndNoStaticOne(t *testing.T) {
+	withEvalPrincipal(t)
 	agent := authMapTestAgent()
 	cm, version, err := buildA2AAuthMapConfigMap(agent)
 	if err != nil {

@@ -194,10 +194,12 @@ func a2aServiceAccountName(namespace, name string) string {
 //
 // Ordering is stable and meaningful: it is the order the map and the config are
 // rendered in, so a diff of either is a diff of intent rather than of map
-// iteration.
+// iteration. The eval principal is the one conditional entry: it sits between
+// web and sys when the controller runs with A2A_EVAL_PRINCIPAL=true and is
+// absent otherwise, so the two renders differ by exactly that block.
 func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	ns := agent.Namespace
-	return []a2aIdentity{
+	ids := []a2aIdentity{
 		gatewayIdentity(agent, ns),
 		provisionIdentity(agent, ns),
 		sessionIdentity(agent, ns),
@@ -205,8 +207,11 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		bridgeIdentity(),
 		seedIdentity(),
 		webIdentity(),
-		sysIdentity(),
 	}
+	if a2aEvalPrincipalEnabled() {
+		ids = append(ids, evalIdentity())
+	}
+	return append(ids, sysIdentity())
 }
 
 // gateway: task requester, chat-session supervisor, session-registry owner.
@@ -648,6 +653,75 @@ func webIdentity() a2aIdentity {
 		subscribe: []string{
 			"a2a.>",
 			"_INBOX.web.>",
+		},
+	}
+}
+
+// eval: the bench harness's diagnostic bus transport
+// (bench/kube_agents_bench/a2a_transport.py, AGENT_TRANSPORT=a2a), which
+// submits one task to the platform executor and awaits its terminal.
+//
+// STATIC, permanently, for the web user's reason: the holder is a process
+// outside the cluster - devops-bench on a workstation or in a Prow pod, over a
+// kubectl port-forward - and it has no ServiceAccount in THIS cluster to
+// present, so the callout could never resolve it. It exists so the harness
+// never touches the gateway's credential: the gateway's grant list is the one
+// that may publish on every addressee's `in` subject, and a second process
+// holding it would be a second requester indistinguishable from the first on
+// replay.
+//
+// The grants are the subjects a requester of the platform executor needs and
+// nothing else: publish on `platform`'s `in` (the submission, and a cancel),
+// subscribe on `platform`'s `events` (the executor's status and artifact
+// updates, including the terminal) and on its `supervisor`, where a task's
+// supervisor writes the synthesized terminal when the executor dies without
+// one - the pair lib.TaskReplaySubjects folds. The harness reads both and
+// never publishes on `supervisor`: it is not the task's supervisor. Be exact
+// about what the wildcards reach, because "a requester's subjects" understates
+// it: the events subscription shows every `platform` task's id, the gateway's
+// included, and the `in` publish takes a cancel or a message for any of them -
+// the bridge cannot tell one requester from another (`from` is display-only).
+// A static NATS grant cannot name one task, so whoever holds `eval-password`
+// can cancel a task they did not start; the key is held like the gateway's,
+// and it exists only where an operator asked for it: the user and the key are
+// rendered under A2A_EVAL_PRINCIPAL=true (a2aEvalPrincipalEnabled) and on no
+// other install. No JetStream API at all: the harness subscribes with a core
+// subscription taken before it publishes, so it needs no consumer, and a
+// CONSUMER.CREATE on TASKS would let it deliver any addressee's task plane
+// into its own inbox (a2aJetStreamSurfaceRationale). A core subscription has
+// no replay, so the
+// harness treats a dropped connection as a failed attempt and resubmits, which
+// is the trade a diagnostic can make. The inbox pair is what makes a reply to
+// this principal deliverable: a publish that carries a reply subject gets the
+// stream's PubAck there with no JetStream grant, and it is also the file's
+// invariant (every principal may answer its own requests). The harness
+// publishes without a reply subject today and learns the server took the frame
+// from its flush.
+func evalIdentity() a2aIdentity {
+	return a2aIdentity{
+		user:    "eval",
+		account: a2aAccountApp,
+		comment: "the bench harness's diagnostic bus transport: one task to the platform\n" +
+			"executor, its terminal awaited. STATIC permanently: the holder runs outside\n" +
+			"the cluster over a port-forward and has no ServiceAccount here to present.\n" +
+			"Publish on platform's in subject and subscribe on its events and supervisor\n" +
+			"(the pair a task's terminal may land on), nothing else: no JetStream API (a\n" +
+			"core subscription needs no consumer, and CONSUMER.CREATE on TASKS would read\n" +
+			"every addressee's task plane). The wildcards reach every platform task, the\n" +
+			"gateway's included: a holder reads every task's result off its events and\n" +
+			"can cancel one it did not start, so the key is held like the gateway's, and\n" +
+			"this block is rendered only while the operator runs with\n" +
+			"A2A_EVAL_PRINCIPAL=true.",
+		auth:     a2aAuthStatic,
+		credsKey: a2aEvalPasswordKey,
+		publish: []string{
+			"a2a.tasks.platform.*.in",
+			"_INBOX.eval.>",
+		},
+		subscribe: []string{
+			"a2a.tasks.platform.*.events",
+			"a2a.tasks.platform.*.supervisor",
+			"_INBOX.eval.>",
 		},
 	}
 }

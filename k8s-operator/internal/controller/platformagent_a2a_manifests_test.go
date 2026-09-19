@@ -63,6 +63,7 @@ func a2aTestCreds() *corev1.Secret {
 			"bridge-password":  []byte("pw-bridge"),
 			"seed-password":    []byte("pw-seed"),
 			"web-password":     []byte("pw-web"),
+			"eval-password":    []byte("pw-eval"),
 			"sys-password":     []byte("pw-sys"),
 			"callout-password": []byte("pw-callout"),
 		},
@@ -219,6 +220,8 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 // diff.
 func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 	agent := a2aTestAgent()
+	// With the opt-in eval principal rendered, so its row is checked too.
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
 
 	// Asserted against the principal list, which spans both renders: gateway
 	// and bridge are static entries in nats.conf, while the agent and session
@@ -238,7 +241,10 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		"session": nil,
 		"seed":    nil,
 		"web":     nil,
-		"sys":     nil,
+		// eval takes a core subscription and never creates a consumer, so
+		// there is nothing for it to ack.
+		"eval": nil,
+		"sys":  nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -532,7 +538,7 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 	if string(got.Data[a2aBridgePasswordKey]) == injected {
 		t.Error("a malformed key survived repair; its value reaches nats.conf inside quotes")
 	}
-	for _, key := range a2aCredsKeys {
+	for _, key := range a2aCredsKeys() {
 		if !a2aCredsValueRe.Match(got.Data[key]) {
 			t.Errorf("key %q was not repaired to the generated shape: %q", key, got.Data[key])
 		}
@@ -877,6 +883,7 @@ func TestSubjectMatches(t *testing.T) {
 // what keeps that true: re-widening any publish grant to `a2a.topics.>`
 // fails here rather than silently making the probe writable.
 func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
+	withEvalPrincipal(t)
 	const probe = "a2a.topics.shared.probe"
 	agent := a2aTestAgent()
 
@@ -2449,7 +2456,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 // one appears nowhere in the render.
 func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 	data := map[string][]byte{}
-	for i, key := range a2aCredsKeys {
+	for i, key := range a2aCredsKeys() {
 		data[key] = []byte(strings.Repeat(nibble, 31) + fmt.Sprintf("%x", i))
 	}
 	return &corev1.Secret{
@@ -2576,7 +2583,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 		t.Fatalf("creds Secret missing after reconcile: %v", err)
 	}
 	forbidden := map[string]string{}
-	for _, key := range a2aCredsKeys {
+	for _, key := range a2aCredsKeys() {
 		password := string(stored.Data[key])
 		if !a2aCredsValueRe.MatchString(password) {
 			t.Fatalf("seeded creds key %q was re-rolled into an unexpected shape: %q", key, password)
@@ -3750,6 +3757,9 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 // widening gets.
 func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	agent := a2aTestAgent()
+	// With the opt-in eval principal rendered: the table covers every
+	// principal an install can carry, and the default render is a subset.
+	t.Setenv(a2aEvalPrincipalEnvVar, "true")
 	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
 	const (
@@ -3805,6 +3815,12 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
 			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"},
 		},
+		// eval reaches no stream and no account-level discovery: the bench
+		// harness's diagnostic transport publishes on platform's in subject
+		// and takes core subscriptions on its events and supervisor, so a
+		// JetStream grant of any kind would be capability it does not use (and
+		// CONSUMER.CREATE on TASKS would read every addressee's task plane).
+		"eval": {},
 		"session": {
 			// sessionIdentity lists nothing: the callout derives each
 			// connection's grants from the attested pod, and a grant

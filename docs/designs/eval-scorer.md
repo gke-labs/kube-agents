@@ -84,7 +84,16 @@ checks are broken, which is the state it is most likely to be in.
 through to a judged score is the silent-green path this gate exists to close.
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
-non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. There is no `metadata` block on a
+non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
+a record the harness's a2a transport produced carries no usage at all (the bus reports none), so
+its liveness signal is the executor's own events instead — a trajectory entry named
+`a2a.status-update` whose `args.final` is true, or whose `args.state` is `working`, stands in for
+a null total (the executor took the task and ended it, or took it and was cancelled at the budget
+before its terminal landed); a `submitted` entry alone, a null total with no such entry, and a
+total of zero still fail the rung. The harness itself records a task that reached neither `working` nor a terminal
+by its deadline (`Fold.started` is this rung's predicate, so the two cannot disagree), and a terminal the executor wrote for its own fault (the bridge's and the worker
+adapter's `reason:` tokens, or a `rejected` submission), as infrastructure before a record exists,
+so those entries reaching the rung is the backstop. There is no `metadata` block on a
 devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a
