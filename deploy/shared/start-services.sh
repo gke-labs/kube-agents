@@ -124,8 +124,7 @@ WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
 # verdict on the pod: five failed scheduling attempts, a count rather than a
 # time, since the scheduler retries on every cluster change and at least
-# every five minutes. Counted across the event objects the scheduler's
-# changing message spreads a pod's attempts over, not on one object. The autoscaler's own events take precedence over it: a
+# every five minutes. The autoscaler's own events take precedence over it: a
 # NotTriggerScaleUp on the pod fires at any count, a TriggeredScaleUp holds at
 # any count for WATCHER_SCALEUP_HOLD, and on a cluster with an autoscaler one
 # or the other arrives seconds after the pod's first attempt. Both are in the

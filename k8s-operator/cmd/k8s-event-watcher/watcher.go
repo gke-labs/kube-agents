@@ -675,7 +675,6 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 		Labels:        labelsFromMeta(ev.ObjectMeta),
 		Count:         count,
 		Type:          ev.Type,
-		EventUID:      string(ev.UID),
 	}
 }
 

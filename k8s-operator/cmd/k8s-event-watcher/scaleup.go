@@ -45,8 +45,8 @@ const (
 	defaultScaleUpEntries = 4096
 )
 
-// scaleUpMemoTTL is how long a dispatcher remembers a pod's marks and its
-// attempt tally: the dedup window, past which the pod's next FailedScheduling
+// scaleUpMemoTTL is how long a dispatcher remembers a pod's marks: the dedup
+// window, past which the pod's next FailedScheduling
 // is a new incident anyway, but never less than the hold plus the staleness
 // check. The floor is what the hold needs. A TriggeredScaleUp holds any
 // FailedScheduling sighted within scaleUpHold of it, and such an event is

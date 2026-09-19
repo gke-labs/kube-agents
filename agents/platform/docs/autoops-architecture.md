@@ -376,7 +376,7 @@ The GKE-events path is live end to end:
   `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's
   `TriggeredScaleUp` and `NotTriggerScaleUp`, which the watcher records against the pod and never
   forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
-  count once the autoscaler has declined to help, and otherwise held until its fifth attempt, so a
+  count once the autoscaler has declined to help, and otherwise held until its fifth repeat, so a
   pod waiting for a node the cluster is already adding opens no card and a pod nothing will place
   opens one. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
   `Evicted` — applies only when `--reason` is left unset, so it does not describe an install.

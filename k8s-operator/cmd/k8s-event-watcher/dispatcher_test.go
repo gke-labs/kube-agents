@@ -1160,8 +1160,6 @@ func newScaleUpDispatcher(t *testing.T, th filterThresholds, now *time.Time) (*d
 	disp.filter.now = func() time.Time { return *now }
 	disp.scaleUps = newScaleUpMemo(24*time.Hour, 0)
 	disp.scaleUps.now = func() time.Time { return *now }
-	disp.attempts = newAttemptTally(24*time.Hour, 0)
-	disp.attempts.now = func() time.Time { return *now }
 	return disp, m, injectCount
 }
 
@@ -1392,20 +1390,15 @@ func TestDispatcherStaleFailedSchedulingReplayDoesNotFire(t *testing.T) {
 // defaults (a 5m dedup window, a 15m hold) the memo used to expire a mark
 // five minutes after the scale-up triggered, so the sixth minute's
 // FailedScheduling read as having no verdict and fired on the count. The memo
-// and the tally now live at least the hold plus the staleness check.
+// now lives at least the hold plus the staleness check.
 func TestNewDispatcherScaleUpMemoOutlivesAShortDedupWindow(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
 	f := &flags{dedupWindow: 5 * time.Minute, mode: "per-incident"}
-	built := newDispatcher(f, disp.filter, disp.dedup, disp.injector, disp.metrics)
-	disp.scaleUps, disp.attempts = built.scaleUps, built.attempts
+	disp.scaleUps = newDispatcher(f, disp.filter, disp.dedup, disp.injector, disp.metrics).scaleUps
 	disp.scaleUps.now = func() time.Time { return now }
-	disp.attempts.now = func() time.Time { return now }
 	if got, want := disp.scaleUps.entries.ttl, defaultScaleUpHold+failedSchedulingStaleAfter; got != want {
 		t.Fatalf("scale-up memo ttl = %v; want %v", got, want)
-	}
-	if got, want := disp.attempts.entries.ttl, defaultScaleUpHold+failedSchedulingStaleAfter; got != want {
-		t.Fatalf("attempt tally ttl = %v; want %v", got, want)
 	}
 	ctx := context.Background()
 	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now))
@@ -1444,44 +1437,5 @@ func TestDispatcherReplayedFailedSchedulingInsideTheHoldWindowIsHeld(t *testing.
 	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 16, now))
 	if *injectCount != 1 {
 		t.Errorf("a fresh sighting past the hold fired %d injects; want 1", *injectCount)
-	}
-}
-
-// TestDispatcherFailedSchedulingAttemptsSumAcrossEventObjects: the recorder
-// starts a new event object, count 1, whenever the scheduler's message
-// changes, so a pod whose predicate text shifts every couple of retries never
-// reaches the threshold on any one object. The backstop counts the pod's
-// attempts across them.
-func TestDispatcherFailedSchedulingAttemptsSumAcrossEventObjects(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	disp, m, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
-	ctx := context.Background()
-	object := func(eventUID, msg string, count int, at time.Time) TriageEvent {
-		ev := failedSchedulingEvent("pod-1", count, at)
-		ev.EventUID = eventUID
-		ev.Message = msg
-		return ev
-	}
-
-	disp.Dispatch(ctx, object("evt-a", "0/3 nodes are available: 3 Insufficient cpu.", 1, now))
-	disp.Dispatch(ctx, object("evt-a", "0/3 nodes are available: 3 Insufficient cpu.", 2, now.Add(10*time.Second)))
-	disp.Dispatch(ctx, object("evt-b", "0/4 nodes are available: 3 Insufficient cpu, 1 node(s) had untolerated taint.", 1, now.Add(20*time.Second)))
-	disp.Dispatch(ctx, object("evt-b", "0/4 nodes are available: 3 Insufficient cpu, 1 node(s) had untolerated taint.", 2, now.Add(30*time.Second)))
-	if *injectCount != 0 {
-		t.Fatalf("four attempts over two objects fired %d injects; want 0", *injectCount)
-	}
-	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateFailedSchedulingMinCount))); got != 4 {
-		t.Errorf("events_filtered_total{gate=failedscheduling_min_count} = %v; want 4", got)
-	}
-	disp.Dispatch(ctx, object("evt-c", "0/3 nodes are available: 3 Insufficient cpu.", 1, now.Add(40*time.Second)))
-	if *injectCount != 1 {
-		t.Errorf("the fifth attempt, on a third object at count 1, fired %d injects; want 1", *injectCount)
-	}
-	// The tally is per pod: another pod's objects start from nothing.
-	ev := object("evt-d", "0/3 nodes are available: 3 Insufficient cpu.", 1, now.Add(50*time.Second))
-	ev.Key.UID = "pod-2"
-	disp.Dispatch(ctx, ev)
-	if *injectCount != 1 {
-		t.Errorf("pod-2's first attempt fired; pod-1's tally is not its own")
 	}
 }

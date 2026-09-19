@@ -384,11 +384,7 @@ type dispatcher struct {
 	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
-	scaleUps *scaleUpMemo
-	// attempts sums a pod's FailedScheduling count across the event objects
-	// the recorder splits it over, for the count backstop. Per-cluster and
-	// as long-lived as scaleUps.
-	attempts  *attemptTally
+	scaleUps  *scaleUpMemo
 	injector  *injector
 	metrics   *metrics
 	mode      string // "per-incident" or "shared"
@@ -398,21 +394,19 @@ type dispatcher struct {
 
 // newDispatcher builds a dispatcher around one cluster's dedup cache. filter,
 // injector, and metrics are shared across every cluster — they are stateless
-// or goroutine-safe — while dedup, the two memos and the attempt tally are
-// per-cluster. The scale-up memo and the tally live as long as the dedup
-// window, and at least as long as a mark can still be consulted
-// (scaleUpMemoTTL): past that the pod's next FailedScheduling is a new
-// incident, and a verdict that old no longer describes a scale-up anyone is
-// waiting on. The hold is read off the filter's config rather than the flag
-// so the default applies when the flag was left at zero.
+// or goroutine-safe — while dedup and the two memos are per-cluster. The
+// scale-up memo lives as long as the dedup window, and at least as long as a
+// mark can still be consulted (scaleUpMemoTTL): past that the pod's next
+// FailedScheduling is a new incident, and a verdict that old no longer
+// describes a scale-up anyone is waiting on. The hold is read off the
+// filter's config rather than the flag so the default applies when the flag
+// was left at zero.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
-	memoTTL := scaleUpMemoTTL(f.dedupWindow, filter.cfg.scaleUpHold)
 	return &dispatcher{
 		filter:      filter,
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
-		scaleUps:    newScaleUpMemo(memoTTL, defaultScaleUpEntries),
-		attempts:    newAttemptTally(memoTTL, defaultScaleUpEntries),
+		scaleUps:    newScaleUpMemo(scaleUpMemoTTL(f.dedupWindow, filter.cfg.scaleUpHold), defaultScaleUpEntries),
 		injector:    inj,
 		metrics:     m,
 		mode:        f.mode,
@@ -527,12 +521,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	// that reads the verdict runs inside Decide, and the verdict arrived on a
 	// different event. Only FailedScheduling carries it; the marks themselves
 	// are recorded below, once the filter has admitted them, so the --reason
-	// list and the namespace rules decide which verdicts are remembered. The
-	// attempt tally is stamped here too: the count backstop reads the pod's
-	// attempts across every event object, and this event is one of them.
+	// list and the namespace rules decide which verdicts are remembered.
 	if ev.Key.Reason == reasonFailedScheduling {
 		ev.ScaleUp = d.scaleUps.Lookup(ev.Key.UID)
-		ev.Attempts = d.attempts.Observe(ev.Key.UID, ev.EventUID, ev.Count, ev.LastSeen)
 	}
 	if gate := d.filter.Decide(ev); gate != gateAccepted {
 		if gate == gateScaleUpMark {

@@ -289,10 +289,6 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		ev.LastSeen = at
 		return ev
 	}
-	attempts := func(ev TriageEvent, n int) TriageEvent {
-		ev.Attempts = n
-		return ev
-	}
 
 	tests := []struct {
 		name     string
@@ -328,12 +324,6 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		{name: "replayed event sighted just inside the hold is held however old the mark", event: sightedAt(fs(50, triggered(defaultScaleUpHold+14*time.Minute)), now.Add(-14*time.Minute)), wantGate: gateScaleUpHold},
 		{name: "replayed event sighted past the hold falls through to the count", event: sightedAt(fs(5, triggered(defaultScaleUpHold+time.Minute)), now.Add(-30*time.Second)), wantGate: gateAccepted},
 		{name: "event sighted before its mark is held", event: sightedAt(fs(5, triggered(time.Minute)), now.Add(-2*time.Minute)), wantGate: gateScaleUpHold},
-
-		// The count backstop reads the pod's attempts across event objects
-		// when the dispatcher has that tally, and the object's count otherwise.
-		{name: "attempts across objects reach the threshold on a count 1 object", event: attempts(fs(1, scaleUpMark{}), 5), wantGate: gateAccepted},
-		{name: "attempts across objects short of the threshold hold", event: attempts(fs(1, scaleUpMark{}), 4), wantGate: gateFailedSchedulingMinCount},
-		{name: "a tally never lowers the object's own count", event: attempts(fs(5, scaleUpMark{}), 1), wantGate: gateAccepted},
 
 		// NotTriggerScaleUp short-circuits the count.
 		{name: "declined mark passes count 1", event: fs(1, declined(time.Second)), wantGate: gateAccepted},
