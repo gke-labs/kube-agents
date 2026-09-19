@@ -311,9 +311,16 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //     it describes has scheduled or gone, and a pod still pending will be
 //     sighted again within minutes with a fresh timestamp. Unknown timestamps
 //     fail open, as unknown counts do.
-//   - A NotTriggerScaleUp mark passes the event at any count. The autoscaler
-//     has ruled it cannot help, so waiting for more repeats only delays the
-//     incident.
+//   - A NotTriggerScaleUp mark passes the event at any count, provided the
+//     event was sighted after the verdict. The autoscaler has ruled it cannot
+//     help, so waiting for more repeats only delays the incident. A sighting
+//     that predates the verdict is the scheduler's last attempt before the
+//     autoscaler ruled: live it was judged when it arrived and is bumped
+//     again only on the next retry, after the verdict, but an informer
+//     replay after a restart brings it back as it was, and for a pod that
+//     was placed or deleted before that retry it is the only object there
+//     is. It falls through to the count backstop, as it was judged live,
+//     rather than opening a card for a pod that is Running or gone.
 //   - A TriggeredScaleUp mark holds the event at any count while the event's
 //     last sighting is within scaleUpHold of the mark. A node is on its way;
 //     the scheduler retries the pod on every cluster change while it joins,
@@ -353,6 +360,11 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 	}
 	switch ev.ScaleUp.Verdict {
 	case scaleUpDeclined:
+		if !ev.LastSeen.IsZero() && ev.LastSeen.Before(ev.ScaleUp.At) {
+			log.Printf("%s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, %s after this sighting; the scheduler has not retried since, falling back to the count backstop",
+				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), ev.ScaleUp.At.Sub(ev.LastSeen).Round(time.Second))
+			break
+		}
 		log.Printf("pass %s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, short-circuiting the count backstop",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second))
 		return gateAccepted

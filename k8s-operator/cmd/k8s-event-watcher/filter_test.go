@@ -285,6 +285,8 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 	untimed.LastSeen = time.Time{}
 	staleButDeclined := fs(9, declined(time.Minute))
 	staleButDeclined.LastSeen = now.Add(-failedSchedulingStaleAfter - time.Second)
+	untimedDeclined := fs(1, declined(time.Minute))
+	untimedDeclined.LastSeen = time.Time{}
 	sightedAt := func(ev TriageEvent, at time.Time) TriageEvent {
 		ev.LastSeen = at
 		return ev
@@ -329,6 +331,16 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		{name: "declined mark passes count 1", event: fs(1, declined(time.Second)), wantGate: gateAccepted},
 		{name: "declined mark passes count 0", event: fs(0, declined(time.Second)), wantGate: gateAccepted},
 		{name: "declined mark passes however old", event: fs(1, declined(23*time.Hour)), wantGate: gateAccepted},
+		{name: "declined mark passes an untimed event", event: untimedDeclined, wantGate: gateAccepted},
+
+		// The verdict qualifies only a sighting made after it. After a
+		// restart the informer replays the object the scheduler last bumped
+		// before the autoscaler ruled; for a pod placed or deleted before the
+		// next retry it is the only one, and passing it on the decline would
+		// open a card for a pod that is no longer pending.
+		{name: "event sighted before its decline falls through to the count and is held", event: sightedAt(fs(1, declined(time.Minute)), now.Add(-2*time.Minute)), wantGate: gateFailedSchedulingMinCount},
+		{name: "event sighted before its decline falls through to the count and fires", event: sightedAt(fs(5, declined(time.Minute)), now.Add(-2*time.Minute)), wantGate: gateAccepted},
+		{name: "event sighted at the instant of its decline passes", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute)), wantGate: gateAccepted},
 
 		// An event the scheduler stopped re-emitting describes a pod that is
 		// no longer pending, whatever the count or the marks say.
