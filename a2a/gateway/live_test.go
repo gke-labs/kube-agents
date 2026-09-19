@@ -141,7 +141,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	})
 
 	// Beat 2 shape: "what is it doing" answered by replay under the gateway
-	// user's grants (ordered consumer + stream msg-get on TASKS).
+	// user's grants (ordered consumer + direct get on TASKS).
 	adapter.inbox <- InboundMessage{
 		Conversation: "discord:live/thread-livetest", Kind: "group",
 		AuthorID: "1001", MessageID: "live-2", Text: "what is it doing",

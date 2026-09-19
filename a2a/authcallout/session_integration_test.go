@@ -45,6 +45,15 @@ const (
 // sessionMap is one ordinary entry and one narrowed one. The narrowed entry
 // carries no grants at all — that is the shape the operator renders and the
 // shape ParseIdentityMap insists on.
+//
+// The `gateway` entry is a stage prop and does not track the rendered gateway,
+// which is worth saying because it is now the only place in the tree where a
+// principal of that name holds `$JS.API.>`: the operator's gateway was scoped
+// to TASKS and its session registry (gke-labs/kube-agents#1666, the operator's
+// a2aGatewayJetStreamGrants). What this entry needs the wildcard for is the
+// test harness's own setup — it creates the TASKS stream the session cases run
+// against — and the subject under test here is what the CALLOUT derives for a
+// session, not what any map says about a gateway.
 const sessionMap = `{
   "version": "session-itest-1",
   "identities": [
@@ -184,7 +193,9 @@ func TestASessionIsRefusedEverythingBeyondItsOwnTask(t *testing.T) {
 		"$JS.API.STREAM.DELETE.TASKS":  true,
 		"$JS.API.STREAM.PURGE.TASKS":   true,
 
-		// The blanket the shared worker user holds today.
+		// The blanket the shared worker user used to hold: #1393 enumerated
+		// it, and A5 then retired that user entirely. Neither subject is in
+		// any rendered principal's list now.
 		"$JS.API.CONSUMER.LIST.TASKS": true,
 		"$JS.API.STREAM.LIST":         true,
 
