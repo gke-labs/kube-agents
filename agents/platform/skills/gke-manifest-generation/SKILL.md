@@ -71,6 +71,10 @@ following rules:
     `runAsNonRoot: true`, `runAsUser: 10000`, `runAsGroup: 10000`, `fsGroup:
     10000`). This is strictly enforced on GKE Autopilot and is a critical
     security baseline for GKE Standard.
+    *OpenShift adaptation*: On Red Hat OpenShift, namespaces enforce dynamic UID
+    ranges under the `restricted-v2` SCC. Omit explicit `runAsUser`, `runAsGroup`,
+    and `fsGroup`—specifying only `runAsNonRoot: true`—to allow OpenShift admission
+    to assign valid UIDs, unless the target ServiceAccount has the `nonroot` SCC.
 -   **Minimal Privileges**: Always set `allowPrivilegeEscalation: false` and
     `seccompProfile: {type: RuntimeDefault}`.
 -   **Read-Only Root Filesystem**: Set `readOnlyRootFilesystem: true` to prevent
@@ -118,10 +122,11 @@ following rules:
 -   **Port Naming**: Always assign clear, standard names to service and
     container ports (e.g., `name: http-web` or `name: grpc-api`) to enable
     automatic protocol discovery, tracing, and Web App routing.
--   **Prefer Gateway API**: When exposing APIs externally, prioritize using GKE
-    Gateway API (`Gateway` and `HTTPRoute` resources) over legacy `Ingress`
-    objects to enable advanced L7 routing and security features (e.g., Cloud
-    Armor).
+-   **Prefer Gateway API (GKE) / Routes (OpenShift)**: When exposing APIs externally
+    on GKE, prioritize using GKE Gateway API (`Gateway` and `HTTPRoute` resources)
+    over legacy `Ingress` objects to enable advanced L7 routing and security features
+    (e.g., Cloud Armor). On OpenShift clusters, expose public services via native
+    `Route` (`route.openshift.io/v1`) with edge TLS termination and HTTP redirect.
 
 ### 6. Volume Mounts, StorageClasses & subPath Safety
 
@@ -131,13 +136,15 @@ following rules:
     *Caveat*: Note that containers using `subPath` volume mounts do not receive
     automatic configuration updates if the underlying ConfigMap or Secret is
     modified; pods must be restarted manually to pick up changes.
--   **StorageClass Selection**: Use the correct GKE storage class in
+-   **StorageClass Selection**: Use the correct cluster storage class in
     PersistentVolumeClaims:
-    -   *CSI Driver Clusters (Autopilot & Modern Standard)*: Use `standard-rwo`
+    -   *GKE CSI Driver Clusters (Autopilot & Modern Standard)*: Use `standard-rwo`
         (default balanced PD) or `premium-rwo` (SSD PD).
+    -   *OpenShift on GCE Clusters*: Use `standard-csi` (default balanced PD)
+        or `ssd-csi` (SSD PD) via `pd.csi.storage.gke.io`.
     -   *Legacy Standard Clusters*: Use `standard` (default PD) or `premium`
         (SSD PD) if `standard-rwo`/`premium-rwo` are not configured.
-    -   *Database rule*: Use SSD storage classes (`premium-rwo` or `premium`)
+    -   *Database rule*: Use SSD storage classes (`premium-rwo`, `ssd-csi`, or `premium`)
         only when the prompt explicitly requests high IOPS, low latency, or
         database storage.
 
