@@ -571,7 +571,10 @@ measured data. Config belongs where it gets reviewed.
 
 The reader lists the whole prefix once, groups the object names by case and then by key directory,
 takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200) **per case per key**, and concatenates
-what survives in one `cat`. 200 objects is roughly 600 runs, two orders of magnitude past the 20
+what survives in one `cat` per case. Those per-case `cat`s run concurrently, at most
+`EVAL_BASELINE_CAT_WORKERS` (default 16) at a time: the cost of a read is one `gcloud` process
+startup per case and almost nothing else, so serially it grew with the matrix. 200 objects is
+roughly 600 runs, two orders of magnitude past the 20
 the admission bar wants, so the cap never binds in practice — but it bounds a read that would
 otherwise grow without limit as one key accumulates years of history, and when it does bind the
 gate says which case was capped and by how much. A cap that is silent reads as "I considered
@@ -597,9 +600,10 @@ that is invisible. If it ever stops being invisible, the fix is to scope the lis
 the key being read rather than the whole prefix, which the layout now makes a one-line change; see
 [Open items](#open-items).
 
-Costs are not the constraint at any of these scales. Standard storage bills actual bytes with no
+Money is not the constraint at any of these scales. Standard storage bills actual bytes with no
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
-run.
+run. Wall clock was: the gate reads the whole store once per graded case, which is why the fetches
+are concurrent.
 
 The key partition also retires a caveat this section used to carry. Under a flat layout and a
 per-case window, a version key that went A → B → A could push the revert's own evidence at key A

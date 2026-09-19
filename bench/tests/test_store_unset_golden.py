@@ -80,6 +80,7 @@ def _clean_env(monkeypatch):
         "RC_COMMIT_SHA",
         "EVAL_BASELINE_STORE",
         "EVAL_BASELINE_MAX_OBJECTS",
+        "EVAL_BASELINE_CAT_WORKERS",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)

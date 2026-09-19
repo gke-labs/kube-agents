@@ -81,6 +81,7 @@ def _clean_env(monkeypatch):
         "GIT_COMMIT",
         "EVAL_BASELINE_STORE",
         "EVAL_BASELINE_MAX_OBJECTS",
+        "EVAL_BASELINE_CAT_WORKERS",
         "BUILD_ID",
         "PROW_JOB_ID",
     ):
