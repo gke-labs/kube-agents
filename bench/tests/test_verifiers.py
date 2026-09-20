@@ -1794,14 +1794,35 @@ def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
 
 
 def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, github):
-    """A repository the installation cannot see is unevaluable, and an agent
-    that mistypes one beside the real URL produces exactly that. Ending the
-    check there would be rung 2, which is admission-blind: one agent typo would
-    red the eval job for every open pull request."""
-    typo = "kube-agents-evals-infra"
+    """A candidate the API refuses, named BEFORE the real pull request, must
+    not end the check: ending it there would be rung 2, which is
+    admission-blind, so one bad slug would red the eval job for every open
+    pull request. A denial and not a 404 -- 404 is a rejected candidate, and
+    the ticket-beside-the-fix test already covers that path."""
+    other = "kube-agents-evals-9-infra"
     _stash_pr_report(
-        f"Fix in https://github.com/gke-agentic/{typo}/pull/7 — sorry, {_PR_URL}"
+        f"Fix in https://github.com/gke-agentic/{other}/pull/7 — sorry, {_PR_URL}"
     )
+    denied = (403, {"message": "Resource not accessible"})
+    github.routes[_pr_api(repo=other)] = denied
+    github.routes[_pr_api("pulls", repo=other)] = denied
+    github.routes[_pr_api()] = (200, _pr_payload())
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_transport_failure_before_the_real_one_does_not_sink_it(token, github):
+    """The same ordering for the `OSError` arm, which is the one a flaky
+    network reaches rather than a bad slug."""
+    other = "kube-agents-evals-9-infra"
+    _stash_pr_report(
+        f"Fix in https://github.com/gke-agentic/{other}/pull/7 — sorry, {_PR_URL}"
+    )
+
+    def boom():
+        raise OSError("connection reset")
+
+    github.routes[_pr_api(repo=other)] = boom
     github.routes[_pr_api()] = (200, _pr_payload())
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
