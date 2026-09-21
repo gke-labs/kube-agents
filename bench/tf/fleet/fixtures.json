@@ -183,12 +183,12 @@
       "cluster_slot": "b",
       "namespace": null,
       "probes": [
-        "node?seeded-role=no-surge"
+        "node?cloud.google.com/gke-nodepool=no-surge-pool"
       ],
       "fixture": "no-surge-pool node pool with max_surge 0 and max_unavailable 1, so an upgrade takes its only node away rather than adding a replacement first",
       "state": [
         {
-          "subject": "node?seeded-role=no-surge",
+          "subject": "node?cloud.google.com/gke-nodepool=no-surge-pool",
           "path": "status.conditions[?(@.type=='Ready')].status",
           "op": "any_eq",
           "value": "True",

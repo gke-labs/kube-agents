@@ -69,14 +69,6 @@ resource "google_container_node_pool" "no_surge_pool" {
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
 
-    # The label the pinned workload below selects on. A node pool's own name
-    # is readable as `cloud.google.com/gke-nodepool`, but selecting on a
-    # label we set keeps the fixture's intent legible in the manifest rather
-    # than resting on a GKE-managed key.
-    labels = {
-      "seeded-role" = "no-surge"
-    }
-
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
@@ -99,9 +91,12 @@ resource "kubernetes_namespace_v1" "seeded_upgrade" {
 }
 
 # Defect (upgrade readiness): a workload pinned to the pool that cannot
-# surge. The nodeSelector names the one pool in the cluster that carries the
-# label, so when that pool is drained these pods have nowhere to go — they do
-# not move to the default pool, they go Pending and stay there.
+# surge. The nodeSelector names the pool itself, through the
+# `cloud.google.com/gke-nodepool` label GKE puts on every node, so when that
+# pool is drained these pods have nowhere to go — they do not move to the
+# default pool, they go Pending and stay there. The fleet's other node-level
+# fixture (`idle-nodepool`) addresses its pool the same way, and the harness
+# resolves a node selector to a Terraform-declared pool name.
 #
 # This is the pair to the fixture above and the reason both exist: a check
 # that reports the surge setting alone is reporting a configuration, while a
@@ -132,7 +127,7 @@ resource "kubernetes_deployment_v1" "pinned_batch_runner" {
 
       spec {
         node_selector = {
-          "seeded-role" = "no-surge"
+          "cloud.google.com/gke-nodepool" = "no-surge-pool"
         }
 
         container {

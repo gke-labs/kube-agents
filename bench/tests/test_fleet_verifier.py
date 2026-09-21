@@ -1605,6 +1605,7 @@ def _provision(shell, tmp_path, **env) -> Path:
         ),
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity"
+            " seeded-upgrade"
         ),
     }
     settings.update(env)

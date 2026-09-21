@@ -226,7 +226,7 @@ def healthy_world(*projects):
             # the finding is what a drain WOULD do, which is only meaningful
             # while they are healthy.
             "namespace/seeded-upgrade": {"metadata": {"name": "seeded-upgrade"}},
-            "node?seeded-role=no-surge": {"items": [{"spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            "node?cloud.google.com/gke-nodepool=no-surge-pool": {"items": [{"spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
             "deployment/pinned-batch-runner": {"status": {"readyReplicas": 2, "replicas": 2}},
             "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
             "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail"}]},
