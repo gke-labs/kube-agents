@@ -12,12 +12,13 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
 - `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
-- `kube_agents_bench/selection.py`, `stats.py`, `priors.py` — the pieces of a local eval run: which cases a selector names and what each needs to run (a tofu stack, the seeded fleet, a GitHub token); exact small-sample statistics for pass rates (Wilson interval, Fisher exact test, repetitions needed to show a change); and where a case's pass rate on record comes from (the eval dashboard's `data.json`, preferring the nightly's record of `main` once it holds the admission window, or an earlier run's summary).
+- `kube_agents_bench/runner.py`, `execution.py`, `report.py` — `bench-run`, the local runner described under [Running evals](#running-evals): the CLI, the repetition loop with the presubmit's locks and ceilings, and the verdict per case.
+- `kube_agents_bench/selection.py`, `stats.py`, `priors.py` — its pieces: which cases a selector names and what each needs to run (a tofu stack, the seeded fleet, a GitHub token); exact small-sample statistics for pass rates (Wilson interval, Fisher exact test, repetitions needed to show a change); and where a case's pass rate on record comes from (the eval dashboard's `data.json`, preferring the nightly's record of `main` once it holds the admission window, or an earlier run's summary).
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. The rest are the Phase 2 domain scenarios; [`tasks/DRAFTS.md`](tasks/DRAFTS.md) is their status page.
 - `baselines/` — screening evidence and `VERSIONS.json`, one append-only JSONL file per case, one batch of runs per line, each keyed on the five software versions a score depends on. Written by runs on `main`, read by every pull request. See [baselines/README.md](baselines/README.md).
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
-- `tests/` — offline tests: the harness against a local HTTP stub, and the gate against real run records captured from a live cluster (`tests/fixtures/runs/`).
+- `tests/` — offline tests: the harness against a local HTTP stub, the gate against real run records captured from a live cluster (`tests/fixtures/runs/`), and `bench-run` against a scripted `devops-bench` (`tests/fake_devops_bench.py`) that copies those records into place.
 - `tools/` — operator-run scripts that are neither tasks nor tests. `live_check_fleet_safeguards.py` drives every `fleet_resource_property` check in the cluster-debugging cases against a live cluster, through the real verifier, without running an agent.
 
 To add a task or plug in a different agent, see
@@ -58,9 +59,57 @@ To run the agent unsandboxed: `ENABLE_GVISOR=false` at install time, or in `inst
 
 ## Running evals
 
+`bench-run` is the local runner: it selects cases, runs each one several times against your
+install, grades every repetition the way the gate does, and prints a verdict per case with the
+statistics a merge decision needs. It needs an install to point at
+([`INSTALL.md`](../INSTALL.md)); it does not build or deploy the agent
+(`scripts/dev/dev_rebuild_agent.sh` does).
+
 ```bash
 cd bench
 uv sync
+export AGENT_CLUSTER_CONTEXT=<kubectl context>      # the token is read from the install's secret
+export JUDGE_PROVIDER=google JUDGE_MODEL=gemini-3.1-pro-preview GCP_PROJECT_ID=<gcp project>
+
+uv run bench-run run cost-idle-pool-probe            # three repetitions, the presubmit's number
+uv run bench-run run --roster blocking --parallel 4  # what can red a pull request, as the presubmit runs it
+uv run bench-run summarize results/bench-run/<stamp>
+```
+
+Selectors combine: case ids, globs on ids (`cost-*`), `task.yaml` paths, `--roster
+presubmit|blocking|nightly|all` (the files under `hack/eval/` the presubmit and the nightly read),
+and `--domain <slug>`. Nothing is selected by default. A case that reads the seeded fleet is skipped
+with a reason until `BENCH_FLEET_KUBECONFIG_DIR` is set (`hack/fleet-kubeconfigs.sh`), and a case that
+provisions a tofu stack until `--include-infra` is passed with `PROJECT_ID` and `CLUSTER_NAME`.
+
+`run` prints, per case, `k/n` with a Wilson 95% interval, the two-sided Fisher exact p-value against
+the case's record, `better`/`worse`/`undecided`, and which checks failed how often. The record comes
+from the eval dashboard's `data.json` (`--baseline`; `none` works offline, and a previous run set's
+`summary.json` makes it an A/B against `main` built and run on the same install). The dashboard
+carries two records per case: the nightly's, which runs `main`, and the pooled record of every
+pull-request presubmit. The runner takes the nightly once it holds twenty runs and the presubmit
+record until then, and the `src` column says which (`main` or `prs`). Three passes on a case at
+0.87 on record are what the record produces most days, and the p-value says so. Every run set is a
+directory (`results/bench-run/<stamp>/` by default) holding, per case, one log and one devops-bench
+run directory per repetition (`<case>/rep1.log`, and `<case>/rep1/run_<stamp>_<case>-rep1/` as
+devops-bench names it), plus `summary.json` and `summary.md` at the root; the summary lists the run
+directories a pull request's Live validation section quotes. Ctrl-C (or any SIGINT to the runner)
+drops the queue, sends each in-flight unit one SIGINT, waits for it, and writes the summary of what
+completed; each unit runs in its own session, so nothing else signals it, and a unit that was
+provisioning a tofu stack gets fifteen minutes to finish its own teardown, which a second Ctrl-C
+does not cut short.
+
+Repetitions of one case run in series, as the presubmit runs them; different cases overlap up to
+`--parallel`. `--overlap-reps` lets a case's repetitions overlap for speed, which the presubmit never
+does and which makes them less comparable. Each unit gets the presubmit's delegation ceiling (2700s,
+3000s for the audit-shaped cases) unless `AGENT_DELEGATION_TIMEOUT` is already set. A case whose
+checks read GitHub (`ledger_issue_contains`, `pull_request_opened`) is skipped until
+`BENCH_GITHUB_TOKEN` or `GITHUB_TOKEN` is set.
+
+Underneath, each repetition is the stock `devops-bench` command the presubmit runs, and it can be
+invoked directly when one run is all that is wanted:
+
+```bash
 export PROJECT_ID=<gcp project> CLUSTER_NAME=<cluster> AGENT_CLUSTER_CONTEXT=<kubectl context>
 export BENCH_TF_ROOT=./tf
 PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> \
@@ -69,7 +118,7 @@ PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> 
   uv run devops-bench ./tasks/<id> --agent-type kubeagents
 ```
 
-This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional, and `./tasks` runs every case. The exports are what `hack/ci-eval-pr.sh` sets, so a local run grades the way the presubmit does; a case with `fixtures:` also needs `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh`. `--no-infra` smokes the agent path only: it skips the deterministic checks, so such a run can neither pass nor fail the gate. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses this. See `--help` for the rest.
+`source` is positional, and `./tasks` runs every case. The exports are what `hack/ci-eval-pr.sh` sets, so a local run grades the way the presubmit does; a case with `fixtures:` also needs `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh`. `--no-infra` smokes the agent path only: it skips the deterministic checks, so such a run can neither pass nor fail the gate. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses this. See `--help` for the rest.
 
 ## The gate
 
@@ -179,4 +228,4 @@ uv sync
 uv run pytest tests
 ```
 
-No cluster or `kubectl` required — the suite drives the full request → parse → `AgentResult` path against a local stub, and grades the gate against run records captured from a live cluster and then mutated. Every gate failure mode is a mutation of a real record rather than a hand-written dict, so a test cannot agree with the scorer about a field devops-bench does not actually emit; `tests/fixtures/runs/README.md` records where the captures came from.
+No cluster or `kubectl` required — the suite drives the full request → parse → `AgentResult` path against a local stub, grades the gate against run records captured from a live cluster and then mutated, and drives `bench-run` through a scripted `devops-bench` (`tests/fake_devops_bench.py`) that copies those same records into place. Every gate failure mode is a mutation of a real record rather than a hand-written dict, so a test cannot agree with the scorer about a field devops-bench does not actually emit; `tests/fixtures/runs/README.md` records where the captures came from.

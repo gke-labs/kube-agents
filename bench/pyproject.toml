@@ -29,6 +29,9 @@ dependencies = [
 # instead of an inline `python3 -c` heredoc.
 [project.scripts]
 bench-gate = "kube_agents_bench.gate:main"
+# The local runner: repetitions, parallelism, a plan and a verdict per case,
+# for a developer's own install (bench/README.md "Running evals").
+bench-run = "kube_agents_bench.runner:main"
 
 # The sole registration path. devops-bench scans this group lazily on the first
 # unresolved agent lookup, so `devops-bench --agent-type kubeagents` works with

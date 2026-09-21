@@ -66,7 +66,9 @@ token, a 429) is not red, it is broken; fix that first or pick another case.
 
 **3. Green.** Deploy the branch to the same install (take the lease first if the install is
 shared: [`pre_pr_review.md`](pre_pr_review.md), "Live validation") and run the same case three
-times, the presubmit's repetition count; `devops-bench` runs a task once per invocation. All three
+times, the presubmit's repetition count; `devops-bench` runs a task once per invocation, and
+`bench-run run <id>` (`bench/README.md`, "Running evals") is the loop that runs it three times and
+keeps the run directories (`--include-infra` for a case with a tofu stack). All three
 must pass on the deterministic checks; a judged score moving is not a pass. The check that was red
 is the one that goes green: loosening the check in between is a new red, not a green. Keep the three
 run directories; the pull request cites them.
