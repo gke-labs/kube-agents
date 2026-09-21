@@ -15,7 +15,10 @@
 # The upgrade-readiness defects, on seeded-b because that is the upgrade
 # cluster: it already carries the held-back control plane the readiness
 # checks read, and a drain that cannot finish is the same subject. Each block
-# names the scenario that asserts on it.
+# names the CATALOGUE ROLE that addresses it — not a scenario, unlike
+# defects-a.tf: no case reads these yet. Renaming a workload here breaks that
+# role's probe and state assertions in fixtures.json, which surfaces as
+# fixture drift on the hourly scan rather than as a red case.
 #
 # Upgrading a node means draining it, and most upgrade failures are really
 # drain failures. What the fleet could already show was a workload that
@@ -45,7 +48,7 @@ provider "kubernetes" {
 # produces an undeclared `pool-skew` finding on a fleet whose premise is that
 # every finding is known in advance.
 #
-# Asserted by readiness-surge-blocked.
+# Addressed by the readiness-surge-blocked role.
 resource "google_container_node_pool" "no_surge_pool" {
   name       = "no-surge-pool"
   location   = var.zone
@@ -79,6 +82,17 @@ resource "google_container_node_pool" "no_surge_pool" {
       "seeded-role" = "no-surge"
     }
 
+    # Tainted for the same reason idle-batch-pool and pinned-inference-pool
+    # are: kube-scheduler prefers empty nodes, so a system Deployment landing
+    # here would change what the cost audit's idle-nodepool check sees on a
+    # pool whose only declared occupant requests 10m. Only the pinned
+    # workload tolerates it.
+    taint {
+      key    = "seeded-role"
+      value  = "no-surge"
+      effect = "NO_SCHEDULE"
+    }
+
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
@@ -108,9 +122,12 @@ resource "kubernetes_namespace_v1" "seeded_upgrade" {
 # One replica, and that is a constraint rather than a preference. At two it
 # would be a multi-replica workload with no PodDisruptionBudget, which is
 # byte-for-byte the obtainability SOP 3.3 shape that `checkout-gateway`
-# plants on slot a — and `obtainability-fleet-exposure-sweep` requires that
-# workload to be the fleet's ONLY right answer, so a second one fails the
-# case for an agent that reports it correctly. SOP 3.3 does not flag
+# plants on slot a, and `obtainability-fleet-exposure-sweep`'s header rests
+# on that workload being the fleet's only one: "the sweep has exactly one
+# right answer". Its objectives are `report_contains`, so a reply naming both
+# still passes — the cost lands on the case's premise and its judge rather
+# than as a deterministic red. One replica avoids the question. SOP 3.3
+# does not flag
 # `replicas <= 1`, and a single pinned pod still has nowhere to land, so the
 # fixture keeps its property and adds no finding. `inference-server` in
 # defects-a.tf carries a PDB for the same reason.
@@ -126,7 +143,7 @@ resource "kubernetes_namespace_v1" "seeded_upgrade" {
 # check that joins it to what runs there is reporting an outage. The two
 # together are what let a case ask whether the agent made that join.
 #
-# Asserted by readiness-pinned-workload.
+# Addressed by the readiness-pinned-workload role.
 resource "kubernetes_deployment_v1" "pinned_batch_runner" {
   provider = kubernetes.seeded_b
 
@@ -151,6 +168,13 @@ resource "kubernetes_deployment_v1" "pinned_batch_runner" {
       spec {
         node_selector = {
           "seeded-role" = "no-surge"
+        }
+
+        toleration {
+          key      = "seeded-role"
+          operator = "Equal"
+          value    = "no-surge"
+          effect   = "NoSchedule"
         }
 
         # Compliance SOP 2.7.
@@ -228,15 +252,15 @@ resource "kubernetes_network_policy_v1" "seeded_upgrade_default_deny" {
 # seeded-b, not only for this fixture — the fleet is read-only for
 # evaluations, and a fixture that can break unrelated runs is not worth the
 # fidelity. So the namespaceSelector confines it to the seeded-upgrade
-# namespace, and the check is expected to flag `failurePolicy: Fail` with no
-# `timeoutSeconds`; the scope dimension is left to a unit test with a
+# namespace, and the check is expected to flag `failurePolicy: Fail` with a
+# timeout long enough to stall a drain; the scope dimension is left to a unit test with a
 # recorded manifest, where nothing can be broken by it.
 #
 # `clientConfig` names a Service that does not exist, which is what makes the
 # fail-closed behaviour real rather than theoretical — and is safe precisely
 # because the selector above bounds what it can reject.
 #
-# Asserted by readiness-failclosed-webhook.
+# Addressed by the readiness-failclosed-webhook role.
 resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
   provider = kubernetes.seeded_b
 
@@ -258,6 +282,17 @@ resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
         namespace = kubernetes_namespace_v1.seeded_upgrade.metadata[0].name
         path      = "/validate"
       }
+    }
+
+    # Without this the rule matches every ConfigMap CREATE in the namespace,
+    # including the kube-root-ca.crt that kube-controller-manager's
+    # root-ca-cert-publisher writes into every namespace. A fail-closed
+    # webhook with no backend would reject that permanently, and the symptom
+    # — later pods stuck on a missing ConfigMap — never names the webhook.
+    # The fixture needs to BE a dangerous webhook, not to reject anything
+    # real.
+    object_selector {
+      match_labels = local.fleet_labels
     }
 
     namespace_selector {

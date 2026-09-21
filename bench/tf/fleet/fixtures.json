@@ -12,9 +12,7 @@
     "crashloop-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-debug",
-      "probes": [
-        "deployment/payments-api"
-      ],
+      "probes": ["deployment/payments-api"],
       "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit",
       "state": [
         {
@@ -36,9 +34,7 @@
     "no-pdb-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-reliability",
-      "probes": [
-        "deployment/checkout-gateway"
-      ],
+      "probes": ["deployment/checkout-gateway"],
       "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace",
       "state": [
         {
@@ -84,9 +80,7 @@
     "rbac-overgrant": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": [
-        "clusterrolebinding/debug-binding"
-      ],
+      "probes": ["clusterrolebinding/debug-binding"],
       "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount",
       "state": [
         {
@@ -108,9 +102,7 @@
     "idle-nodepool": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": [
-        "node?cloud.google.com/gke-nodepool=idle-batch-pool"
-      ],
+      "probes": ["node?cloud.google.com/gke-nodepool=idle-batch-pool"],
       "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint",
       "state": [
         {
@@ -182,9 +174,7 @@
     "readiness-surge-blocked": {
       "cluster_slot": "b",
       "namespace": null,
-      "probes": [
-        "node?cloud.google.com/gke-nodepool=no-surge-pool"
-      ],
+      "probes": ["node?cloud.google.com/gke-nodepool=no-surge-pool"],
       "fixture": "no-surge-pool node pool with max_surge 0 and max_unavailable 1, so an upgrade takes its only node away rather than adding a replacement first",
       "state": [
         {
@@ -206,9 +196,7 @@
     "readiness-pinned-workload": {
       "cluster_slot": "b",
       "namespace": "seeded-upgrade",
-      "probes": [
-        "deployment/pinned-batch-runner"
-      ],
+      "probes": ["deployment/pinned-batch-runner"],
       "fixture": "pinned-batch-runner Deployment (one replica), nodeSelector seeded-role=no-surge, so its pod runs only on the pool that cannot surge and has nowhere to go when it drains",
       "state": [
         {
@@ -230,9 +218,7 @@
     "readiness-failclosed-webhook": {
       "cluster_slot": "b",
       "namespace": null,
-      "probes": [
-        "validatingwebhookconfiguration/seeded-fail-closed-gate"
-      ],
+      "probes": ["validatingwebhookconfiguration/seeded-fail-closed-gate"],
       "fixture": "seeded-fail-closed-gate ValidatingWebhookConfiguration: failurePolicy Fail with the API's maximum 30-second timeout, pointing at a Service that does not exist, confined by namespaceSelector to seeded-upgrade",
       "state": [
         {

@@ -960,8 +960,8 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
     seen = 0
     for role, entry in _catalog()["roles"].items():
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
-        # Slots b and c carry GKE-level defects only, declared in main.tf, so
-        # they have no defects file and no probes to check.
+        # Slot c carries GKE-level defects only, declared in main.tf, so it
+        # has no defects file; a slot without one contributes no probes.
         body = main + (defects.read_text() if defects.is_file() else "")
         for probe in entry["probes"]:
             seen += 1
