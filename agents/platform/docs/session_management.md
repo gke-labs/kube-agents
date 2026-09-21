@@ -45,15 +45,19 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one it displays as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
-| Severity   | Env var                      | Default |
-| ---------- | ---------------------------- | ------- |
-| `Critical` | `ALERT_DAILY_LIMIT_CRITICAL` | `10`    |
-| `Warning`  | `ALERT_DAILY_LIMIT_WARNING`  | `5`     |
-| `Info`     | `ALERT_DAILY_LIMIT_INFO`     | `5`     |
+| Bucket        | Env var                      | Default |
+| ------------- | ---------------------------- | ------- |
+| `Critical`    | `ALERT_DAILY_LIMIT_CRITICAL` | `10`    |
+| `Warning`     | `ALERT_DAILY_LIMIT_WARNING`  | `5`     |
+| `Info`        | `ALERT_DAILY_LIMIT_INFO`     | `5`     |
+| `GitOpsDrift` | `ALERT_DAILY_LIMIT_DRIFT`    | `5`     |
+
+Three of the four are severities and the fourth is not; `GitOpsDrift` is what drift records bill,
+whatever they display as.
 
 `Info` events do arrive — nothing on the path from the kubelet to `inject_message` filters on `Event.Type`, and `BackOff` is on the watcher's default reason list emitted as `type: Normal` for image-pull back-off — but none of them ever bills this bucket, because the [severity gate](#severity-gate) drops every `Info` event before the claim. The `Info` row is kept regardless: deleting it would turn the entry into a `.get(severity, 0)` miss, and `_claim_alert_quota` treats that miss exactly as it treats a limit of `0` — allowed through, uncapped. Narrowing that gate afterwards would therefore send an unbounded `Info` stream to chat rather than restore a ceiling. Setting a limit to `0` turns that severity's cap off entirely, by the same branch.
 
-All three are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped:
+All four are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped, and a ceiling left off that allowlist is an override that renders, validates and silently does nothing:
 
 ```yaml
 spec:

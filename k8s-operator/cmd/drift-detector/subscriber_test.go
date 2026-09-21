@@ -183,12 +183,14 @@ func TestProcessBatchSettlesAfterContextCancelled(t *testing.T) {
 	if !equalStrings(source.nacked, []string{"ack-parsed", "ack-failed"}) {
 		t.Errorf("nacked = %v, want [ack-parsed ack-failed]", source.nacked)
 	}
-	if source.ackCtxErr != nil {
-		t.Errorf("Ack ran on a cancelled context (%v); it must survive shutdown", source.ackCtxErr)
-	}
 	if source.nackCtxErr != nil {
 		t.Errorf("Nack ran on a cancelled context (%v); it must survive shutdown", source.nackCtxErr)
 	}
+	// The matching assertion for Ack is not here, and deliberately: nothing in
+	// this batch is acked, so `fakeSource.Ack` records no context state to
+	// assert on and the check would pass whatever settleContext did. It lives
+	// in TestProcessBatchReturnsTheRestOfTheBatchOnShutdown, where the record
+	// handled before the cancellation gives Ack something to carry.
 }
 
 func TestProcessBatchReturnsTheRestOfTheBatchOnShutdown(t *testing.T) {
@@ -228,6 +230,16 @@ func TestProcessBatchReturnsTheRestOfTheBatchOnShutdown(t *testing.T) {
 	}
 	if !equalStrings(source.nacked, []string{"ack-1", "ack-2", "ack-3", "ack-4"}) {
 		t.Errorf("nacked = %v, want the four unhandled records returned to the subscription", source.nacked)
+	}
+	// This batch is the one that settles both ways on a cancelled parent, so it
+	// is where settleContext is worth asserting on: an Ack aborted by the
+	// cancellation would put ack-0 -- genuinely handled, inject and all -- back
+	// on the subscription for the next instance to handle again.
+	if source.ackCtxErr != nil {
+		t.Errorf("Ack ran on a cancelled context (%v); it must survive shutdown", source.ackCtxErr)
+	}
+	if source.nackCtxErr != nil {
+		t.Errorf("Nack ran on a cancelled context (%v); it must survive shutdown", source.nackCtxErr)
 	}
 }
 

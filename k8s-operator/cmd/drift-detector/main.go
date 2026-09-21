@@ -383,8 +383,11 @@ func realMain(argv []string) error {
 
 	// Cancelled on SIGINT or SIGTERM, which stops the pull loop. Settling the
 	// batch it was working on does not run on this context -- see
-	// subscriber.settleContext, which is why an interrupted batch is acked
-	// rather than redelivered.
+	// subscriber.settleContext -- so the records the loop had not reached when
+	// the signal arrived are nacked and redelivered to the next instance
+	// rather than acked undelivered. Only a non-graceful exit, where nothing
+	// settles at all, leaves the whole batch to the subscription's ack
+	// deadline.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

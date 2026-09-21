@@ -499,9 +499,12 @@ that arithmetic.
 **The inject spends that same budget, and it is the slowest thing in it.** With `--daemon-url` set,
 a surviving record makes two more calls after the join — `POST /sessions` then
 `POST /sessions/<id>/inject` — each with its own ten-second client timeout and one retry behind a
-250ms delay. Left at those numbers one hung daemon would spend around forty seconds of a
-thirty-second batch, which is the whole batch on record one: every record behind it then fails its
-lookup on an expired context and is acked anyway. So the escalation gets a sub-budget of its own,
+250ms delay. How much of the batch one hung daemon spends depends on where it hangs: a daemon that
+never answers `POST /sessions` costs two client timeouts plus the retry delay, about 20.25s, because
+the inject is never reached; one that accepts the session and then hangs the inject costs twice
+that, around forty seconds against a thirty-second batch. Either way it is most or all of the batch
+on record one, and every record behind it then fails its lookup on an expired context and is acked
+anyway. So the escalation gets a sub-budget of its own,
 `perRecordInjectBudget`, five seconds derived from the handler's context — small enough that a
 batch survives several slow records, and derived rather than independent so a SIGTERM or an
 exhausted batch still cuts it short.

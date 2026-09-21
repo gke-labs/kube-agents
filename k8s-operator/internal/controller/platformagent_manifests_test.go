@@ -1199,9 +1199,11 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// so an operator has to be able to tune or disable them on the CR. Without
 	// these names on the allowlist the documented override silently does
 	// nothing and the only way to change a limit is a new image. One name per
-	// severity the server caps, Info included.
+	// bucket the server caps: the three severities, Info included, and the
+	// drift detector's own bucket, which is not a severity.
 	custom := []corev1.EnvVar{
 		{Name: "ALERT_DAILY_LIMIT_CRITICAL", Value: "25"},
+		{Name: "ALERT_DAILY_LIMIT_DRIFT", Value: "50"},
 		{Name: "ALERT_DAILY_LIMIT_INFO", Value: "3"},
 		{Name: "ALERT_DAILY_LIMIT_WARNING", Value: "0"},
 		{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
@@ -1225,6 +1227,15 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 
 	if values["ALERT_DAILY_LIMIT_CRITICAL"] != "25" {
 		t.Errorf("expected the critical ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_CRITICAL"])
+	}
+	// Drift bills a bucket of its own rather than the Warning one it displays
+	// as, so its ceiling is a fourth variable and has to be overridable by the
+	// same route. Off the allowlist, one multi-object `kubectl apply` spends
+	// the default of 5 and every later drift record that day is lost for good
+	// — the detector cannot re-offer one — with no way to raise the cap short
+	// of a new image.
+	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {
+		t.Errorf("expected the drift ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_DRIFT"])
 	}
 	// Info is capped too — nothing on the watcher path filters on Event.Type,
 	// so Normal-type events with an allowlisted reason arrive as Info.

@@ -1594,7 +1594,14 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
             f"unavailable — do not treat the absence as evidence that no other manager owns these fields."
         )
 
-    owners = [owner for owner in (payload.get("owners") or []) if isinstance(owner, dict)]
+    # `or []` alone is not enough, and the difference is a 500 rather than a
+    # card: `owners: 5` is truthy, survives it, and raises TypeError on the
+    # iteration -- after `_inject_drift` has already claimed the quota and
+    # posted the chat alert, so the reader gets an alert whose card never
+    # arrives. The detector always sends a list; an authenticated caller with a
+    # malformed payload is what this guards.
+    raw_owners = payload.get("owners")
+    owners = [owner for owner in raw_owners if isinstance(owner, dict)] if isinstance(raw_owners, list) else []
     if not owners:
         return (
             "- **Field ownership:** read, and the live object records no `managedFields` entries at all. "
@@ -1606,7 +1613,8 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
         manager = _defang_drift_field(owner.get("manager")) or DRIFT_UNKNOWN_FIELD
         operation = _defang_drift_field(owner.get("operation"))
         updated_at = _defang_drift_field(owner.get("updated_at"))
-        paths = [path for path in (owner.get("paths") or []) if isinstance(path, str)]
+        raw_paths = owner.get("paths")
+        paths = [path for path in raw_paths if isinstance(path, str)] if isinstance(raw_paths, list) else []
 
         qualifiers = ", ".join(part for part in (operation, updated_at) if part)
         if paths:
