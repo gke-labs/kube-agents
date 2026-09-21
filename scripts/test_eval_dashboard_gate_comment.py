@@ -528,7 +528,7 @@ class WhenItComments(Harness):
         rc, err = self.tick(data(*greens, aborted, setup, emptied), green_health())
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.calls, [])
-        self.assertIn("gate comments: 0 red runs", err)
+        self.assertIn("gate comments: 0 runs (red, lost or not evaluated)", err)
         self.assertEqual(self.recorded()["last_comment_tick"], NOW.isoformat())
 
     def test_only_runs_since_the_last_tick_and_the_first_tick_looks_back_an_hour(self):
@@ -741,12 +741,24 @@ class NotEvaluatedComment(Harness):
         self.assertEqual(self.recorded()["comments"]["1300"]["build_id"], "101")
         self.assertTrue(self.gh.bodies()[-1].split("\n")[1].startswith("### ❌ Smoke gate: failed · 1 of"), "the retest's real red replaces it in place")
 
+    def test_a_gate_case_that_collapsed_on_the_same_run_is_named_under_the_white_heading(self):
+        # The suite's roster is the branch's and the dashboard's can be
+        # newer: the suite said not evaluated, the dashboard sees a collapse.
+        # The verdict stays the suite's; the author is told what to read.
+        tasks = [task(n, "iii" if n == "security-overgrant-probe" else "fff" if n == "agent-kanban-smoke" else "ppp") for n in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        mine.update({"eval_outcome": "not_evaluated", "not_evaluated": ["security-overgrant-probe"]})
+        self.tick(data(mine, *green_others()), green_health())
+        lines = self.gh.bodies()[0].split("\n")
+        self.assertEqual(lines[1], "### ⚪ Smoke gate: run not evaluated")
+        self.assertIn("Retest once the environment is healthy. `agent-kanban-smoke` also failed every graded repetition here; read its transcript before retesting. [Details →]", lines[3])
+
     def test_dry_run_prints_it(self):
         rc, err = self.tick(data(not_evaluated(100, 1300, NOW - timedelta(minutes=5)), *green_others()), green_health(), dry_run=True)
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.writes(), [])
         self.assertIn("### ⚪ Smoke gate: run not evaluated", err)
-        self.assertIn("gate comments: 1 red run", err)
+        self.assertIn("gate comments: 1 run (red, lost or not evaluated)", err)
 
 
 if __name__ == "__main__":

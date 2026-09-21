@@ -221,6 +221,10 @@ BOX_NOT_EVALUATED_EVERY = (
 # While health.json's condition is storm: the same line post_health.py
 # draws, so the comment and the brief agree on what the weather is.
 BOX_NOT_EVALUATED_STORM = " — a quota storm is declared on the gate right now"
+# A gate case that failed every graded repetition on the same run. The suite
+# did not count it (its roster is the branch's; the dashboard's can be
+# newer), so the heading stays ⚪, but the author is told before retesting.
+BOX_NOT_EVALUATED_COLLAPSED = " {cases} also failed every graded repetition here; read {its} transcript before retesting."
 FOOTER_NOT_EVALUATED = "Ran {minutes} min on {project} · [build log]({url})"
 CONDITION_STORM = health.STORM
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
@@ -537,6 +541,9 @@ def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dic
     else:
         named = join_names([{"case": c} for c in lost]) or "An admitted case"
         box = BOX_NOT_EVALUATED.format(cases=named, storm=storm, them=plural(len(lost) or 1, "it", "them"))
+    collapsed = [c for c in verdict.get("cases") or [] if c.get("outcome") == OUTCOME_FAILED and c.get("admitted", True)]
+    if collapsed:
+        box += BOX_NOT_EVALUATED_COLLAPSED.format(cases=join_names(collapsed), its=plural(len(collapsed), "its", "their"))
     links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
     if in_storm:
         links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
@@ -684,7 +691,7 @@ def main(argv=None, runner=subprocess.run, gh_runner=None) -> int:
         if args.dry_run:
             log(f"--dry-run: would comment on #{pr} (build {build_id})\n{body}")
     post_health.write_state(args.state, new_state, runner)
-    log(f"gate comments: {len(rendered)} red {plural(len(rendered), 'run')} since {state.get('last_comment_tick') if state else 'the first tick'}")
+    log(f"gate comments: {len(rendered)} {plural(len(rendered), 'run')} (red, lost or not evaluated) since {state.get('last_comment_tick') if state else 'the first tick'}")
     return 0
 
 

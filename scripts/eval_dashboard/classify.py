@@ -62,14 +62,18 @@ timeout -- and the one that may carry cases: the harness records each case
 as it finishes (#1875), so the cases graded before Prow stopped the run are
 classified and shown, under the kill's headline and ``do``.
 
-``not_evaluated`` is the fourth verdict, and the only one the run brings
+``not_evaluated`` is a verdict of its own, and the only one the run brings
 with it: the suite itself said so (``runs[].eval_outcome``, SCHEMA.md --
 an admitted case, or every case, lost every repetition to infrastructure,
 so the job exited 2 and could certify nothing). It is read before every
 rule above and is never folded into ``red`` or ``infra``: red would send
 the author to a build log for an absolute check that did not trip, and
 infra would count it among the gate's failures when nothing was graded.
-The cases are still classified, so the page can list what was lost.
+The cases are still classified, so the page can list what was lost -- and
+so a gate case that failed every graded repetition on the same run is
+named in the lede: the suite's roster is the branch's and the dashboard's
+can be newer, so the suite may not have counted it. The verdict stays the
+suite's; the author is told what to read before retesting.
 
 ``runs`` may carry the nightly periodic's runs beside the presubmit's
 (SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
@@ -911,6 +915,9 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         cases = [c for c in cases if c["outcome"] is not None]
         lost = not_evaluated_cases(run, cases)
         headline, lede, verdict = not_evaluated_headline(lost, cases)
+        collapsed = [c["case"] for c in cases if c["admitted"] and c["outcome"] == OUTCOME_FAILED]
+        if collapsed:
+            lede += f" {', '.join(collapsed)} also failed every graded repetition here; read {'its' if len(collapsed) == 1 else 'their'} transcript before retesting."
         return dict(
             base,
             headline=headline,

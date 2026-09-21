@@ -872,15 +872,16 @@ function numbers(sinceMs, untilMs) {
   const green = done.filter(isGreen);
   const reds = done.length - green.length;
   const own = done.filter((r) => !isGreen(r) && r.verdict === "red").length;
-  // Counted apart from the gate's reds: the suite graded nothing, so the run
-  // is neither the PR's nor a failure of the gate's cases.
+  // Named inside the gate's reds, where health.py's infra_reds (the daily
+  // digest's "N infra") also counts them, so the two surfaces agree on the
+  // number; the tile just says how many of them the suite could not evaluate.
   const notEvaluated = done.filter((r) => r.verdict === "not_evaluated").length;
   const deaths = all.filter((r) => r.setup_death).length;
   const walls = done.map((r) => (parseIso(r.finished) ?? 0) - (parseIso(r.started) ?? 0)).filter((w) => w > 0).sort((a, b) => a - b);
   const p = (q) => (walls.length ? walls[Math.round(q * (walls.length - 1))] : null);
   let reps = 0, lost = 0;
   for (const run of full) for (const c of run.cases || []) { reps += repTotal(c.reps); lost += c.reps.infra; }
-  return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own - notEvaluated + deaths, notEvaluated, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
+  return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own + deaths, notEvaluated, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
 }
 
 function tile(key, value, detail) {
@@ -892,7 +893,7 @@ function numbersHtml(sinceMs, untilMs) {
   return `<div class="tiles">` +
     tile("Runs", `${n.full}`, `${plural(n.prs, "PR")} · ${n.aborted} aborted or unfinished`) +
     tile("Green", n.full ? `${n.green}<small>/ ${n.green + n.reds}</small>` : "—", n.green + n.reds ? `${pct(n.green / (n.green + n.reds))} of concluded runs` : "no concluded runs") +
-    tile("Reds", `${n.reds}`, `${n.own} look like the PR · ${n.infra} the gate's (incl. ${n.deaths} setup ${n.deaths === 1 ? "death" : "deaths"})${n.notEvaluated ? ` · ${n.notEvaluated} not evaluated` : ""}`) +
+    tile("Reds", `${n.reds}`, `${n.own} look like the PR · ${n.infra} the gate's (incl. ${n.deaths} setup ${n.deaths === 1 ? "death" : "deaths"}${n.notEvaluated ? `, ${n.notEvaluated} not evaluated` : ""})`) +
     tile("Wall clock", n.p50 != null ? `${Math.round(n.p50 / 60000)}<small>min p50</small>` : "—", n.p90 != null ? `${Math.round(n.p90 / 60000)} min p90` : "no timings") +
     tile("Reps lost", n.lostShare != null ? `${(100 * n.lostShare).toFixed(1)}<small>%</small>` : "—", "429s and empty records, over all repetitions") +
     `</div>`;

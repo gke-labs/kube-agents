@@ -295,6 +295,10 @@ CONTAINER_RUNNING = "running"
 # The build log is the largest object read; a transient gsutil failure on it
 # alone would otherwise look exactly like a pod that never uploaded one.
 LOG_READ_ATTEMPTS = 2
+# The verdict artifact gets the same second attempt: a transient miss on it
+# would otherwise record a not-evaluated run as the hard red for good, since
+# a recorded build is never re-read.
+VERDICT_READ_ATTEMPTS = LOG_READ_ATTEMPTS
 # Prow's job verdict for a failed build, as finished.json spells it (also
 # seen lowercase in the wild; compared case-insensitively).
 FINISHED_FAILURE = "FAILURE"
@@ -719,7 +723,12 @@ def build_run(
     # back into a hard failure.
     suite: dict = {}
     if parsed["not_evaluated_line"]:
-        lost = parse_eval_verdict(read(EVAL_VERDICT_FILE))
+        verdict_text = None
+        for _attempt in range(VERDICT_READ_ATTEMPTS):
+            verdict_text = read(EVAL_VERDICT_FILE)
+            if verdict_text is not None:
+                break
+        lost = parse_eval_verdict(verdict_text)
         if lost is None:
             print(
                 f"warning: build {build_id}: the final line says {NOT_EVALUATED_MARKER} but"
