@@ -73,6 +73,8 @@ PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> 
 
 This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional, and `./tasks` runs every case. The exports are what `hack/ci-eval-pr.sh` sets, so a local run grades the way the presubmit does; a case with `fixtures:` also needs `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh`. `--no-infra` smokes the agent path only: it skips the deterministic checks, so such a run can neither pass nor fail the gate. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses this. See `--help` for the rest.
 
+Without a GCP project, `hack/kind-up.sh` (see [`INSTALL.md`](../INSTALL.md), Method 3) installs the agent in a local kind cluster and prints the exports for this command. `tasks/chat-routing-own-cluster-namespaces` is a simple eval that should work on kind.
+
 ## Transports
 
 The harness reaches the agent through one of two doors, selected by `AGENT_TRANSPORT`. Everything else about a run is the same: the same `KubeAgentsHarness`, the same `AgentResult`, the same transcript stash the verifiers read.

@@ -387,3 +387,6 @@
 # repetition, the 200s default. Enters when a re-derived record clears the
 # bar in docs/eval-gate-roster.md.
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
+
+# A simple case that can run on kind.
+./tasks/chat-routing-own-cluster-namespaces/task.yaml
