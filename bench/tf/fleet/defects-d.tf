@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # The zonal-skew defects, all on seeded-d because the skew needs the
-# multi-zonal shape seeded-d.tf gives it. Each block names the scenario that
+# multi-zonal shape main.tf gives it. Each block names the scenario that
 # asserts on it; change a name here and that scenario's exact check goes red,
 # which is the intended failure mode.
 #

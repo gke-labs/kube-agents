@@ -980,7 +980,7 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
 def test_every_catalog_role_is_a_legal_name_and_a_known_slot():
     catalog = _catalog()
     slots = set(catalog["cluster_slots"])
-    assert slots == {"a", "b", "c"}
+    assert slots == {"a", "b", "c", "d"}
     for role, entry in catalog["roles"].items():
         assert fleet.ROLE_PATTERN.fullmatch(role), role
         assert entry["cluster_slot"] in slots, role
@@ -1601,10 +1601,12 @@ def _provision(shell, tmp_path, **env) -> Path:
         "FLEET_CATALOG": str(_CATALOG),
         "BENCH_FLEET_KUBECONFIG_DIR": str(out),
         "STUB_CLUSTERS": (
-            "seeded-a\tus-central1-a\nseeded-b\tus-central1-a\nseeded-c\tus-central1-a\n"
+            "seeded-a\tus-central1-a\nseeded-b\tus-central1-a\n"
+            "seeded-c\tus-central1-a\nseeded-d\tus-central1-a\n"
         ),
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity"
+            " seeded-topology"
         ),
     }
     settings.update(env)
