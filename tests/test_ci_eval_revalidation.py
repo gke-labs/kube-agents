@@ -353,6 +353,50 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("code.py", proc.stdout)
 
+    def test_no_inert_directory_reaches_a_run(self):
+        """The list is only safe while nothing on it can reach a run.
+
+        A directory earns a place by being unreachable: no COPY in a
+        root-context Dockerfile draws from it, and no eval driver reads it.
+        This asserts that property against the sources rather than trusting
+        the comment, so adding `agents/` or `bench/` to the list -- or a
+        Dockerfile starting to copy out of `tests/` -- fails here.
+        """
+        repo = pathlib.Path(__file__).resolve().parent.parent
+        pattern = re.search(
+            r"^readonly REVALIDATION_INERT_PATHS='(.+)'$",
+            (repo / "hack" / "ci-eval-pr.sh").read_text(), re.M
+        ).group(1)
+        reachable = set()
+        for name in ("deploy/docker/Dockerfile", "deploy/sandbox/Dockerfile"):
+            text = re.sub(r"\\\s*\n\s*", " ", (repo / name).read_text())
+            for line in re.findall(r"^\s*(?:COPY|ADD)\s+(.+)$", text, re.M):
+                if "--from=" in line:
+                    continue
+                words = [w for w in line.split() if not w.startswith("--")]
+                reachable.update(words[:-1])
+        for driver in ("ci-eval-pr.sh", "ci-deploy.sh", "ci-env.sh", "ci-teardown.sh"):
+            script = repo / "hack" / driver
+            if not script.is_file():
+                continue
+            for line in script.read_text().splitlines():
+                if line.lstrip().startswith("#") or "REVALIDATION_INERT_PATHS" in line:
+                    continue
+                reachable.update(
+                    f"scripts/{m}" for m in
+                    re.findall(r"scripts/([A-Za-z0-9_.-]+)", line.split("#", 1)[0])
+                )
+        self.assertTrue(reachable, "found nothing reachable; the parser has drifted")
+        skippable = sorted(
+            path for path in reachable
+            if subprocess.run(["grep", "-Eq", pattern], input=path, text=True).returncode == 0
+        )
+        self.assertEqual(
+            skippable, [],
+            "these reach a run but the inert list would let a change to them "
+            "revalidate against a green that never exercised them",
+        )
+
     def test_the_inert_regex_is_root_anchored(self):
         """docs-evil.go must not ride the docs/ branch, a .md below the root
         is prompt content, and bench/OWNERS is not the root OWNERS file."""

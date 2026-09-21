@@ -95,6 +95,15 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # tolerates that shape -- aborted runs produce taskless builds today -- and
 # keys nothing on this job exiting through its normal tail.
 
+# Two entries were added on evidence rather than by guess: tests/ is the
+# repository's own suite and terraform/ provisions the projects a run leases
+# rather than taking part in one. Neither can reach a run as a DIRECTORY --
+# no COPY in deploy/docker/Dockerfile or deploy/sandbox/Dockerfile draws from
+# them and no hack/ci-*.sh reads them -- which is the test an entry has to
+# pass to be here. Directories whose contents could later grow a file the
+# eval path reads (scripts/, .agents/, admin_console/) are deliberately
+# absent: the saving is not worth betting on what a directory will hold.
+#
 # The inert-path predicate. This list may be STRICTER than the Prow yaml's
 # skip_if_only_changed (prow/prowjobs/gke-labs/kube-agents/
 # kube-agents-presubmits.yaml in GoogleCloudPlatform/oss-test-infra), and it
@@ -104,7 +113,7 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # docs/ branch, `bench/OWNERS` must not match the OWNERS one, and a .md file
 # below the root (agents/**/*.md is prompt content shipped in the image)
 # must still run the eval.
-readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
+readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples|tests|terraform)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|\.gitattributes|\.prettierignore)$)'
 # Where the job history lives and how a human opens a build from the log.
 readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
 readonly REVALIDATION_JOB_NAME="pull-kube-agents-smoke-test"
