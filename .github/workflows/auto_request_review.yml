@@ -44,7 +44,7 @@ jobs:
     permissions:
       contents: read # check out the default branch: the script and its config
       pull-requests: write # request the reviewer
-      issues: write # 👀 on the /request-review comment that asked for it
+      issues: write # 👀 (requested) or 😕 (declined) on the /request-review comment that asked for it
     # Two entry points, and nothing else gets a runner:
     #   - the bot's own `AI Review` check finishing (app id 4437198 -- the name
     #     alone is not an identity, any App can post a check run called

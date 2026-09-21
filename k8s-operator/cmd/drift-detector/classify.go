@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -394,10 +395,12 @@ func (c *Classifier) isHuman(principal string) bool {
 // ownership argument that admits ephemeralcontainers does not carry over to
 // it: evicting a Deployment-owned pod changes nothing in Git, but evicting a
 // pod applied from a manifest of its own removes the very object Git declares.
-// A subresource name cannot tell the two apart -- only the owner references on
-// the live object can, which is T3's managedFields join. Until then an
-// eviction is reported, so a `kubectl drain` produces a line per pod. That is
-// the wrong trade to make blind in the other direction.
+// A subresource name cannot tell the two apart -- only the live object's owner
+// references can, and nothing reads those: T3's join reads managedFields, which
+// says who owns which field and not which controller created the object, so it
+// does not close this. An eviction is therefore reported, and a `kubectl drain`
+// produces a line per pod. That is the wrong trade to make blind in the other
+// direction.
 var nonDeclarativeSubresources = map[string]bool{
 	"exec":                true,
 	"attach":              true,
@@ -485,7 +488,7 @@ func (u *UnattributedPrincipals) Sorted() []string {
 		return out[i] < out[j]
 	})
 	for i, p := range out {
-		// %q, matching every other site that prints a principal (logActionable
+		// %q, matching every other site that prints a principal (logDriftEvent
 		// and logDroppedRecord both use it). These are the two lines that print
 		// a principal no rule recognised, which is the population most likely
 		// to hold something unusual: a username from a customer OIDC provider
@@ -522,8 +525,8 @@ type driftFilter struct {
 	// because it advances even for a tier that is not being counted yet.
 	handled int
 
-	// next receives the records that survive. T3 joins managedFields here and
-	// T4 injects; T2 ships logActionable.
+	// next receives the records that survive. T3's joiner.Handle sits here;
+	// T4 replaces the terminal handler behind it with the inject.
 	next recordHandler
 
 	// logDropped reports every record the filter discards. Off by default:
@@ -569,9 +572,9 @@ func newDriftFilter(classifier *Classifier, next recordHandler, logDropped bool)
 // in, so that the per-tier counts it prints include the record it is counting.
 // Printed first, the line reports handled=10000 beside tiers summing to 9999
 // and cannot be used to check itself.
-func (d *driftFilter) Handle(record AuditRecord) {
+func (d *driftFilter) Handle(ctx context.Context, record AuditRecord) {
 	d.handled++
-	d.tally(record)
+	d.tally(ctx, record)
 	if d.countsLogDue() {
 		// The principal names go out with the counts, not only at shutdown.
 		// They are the half of the report an operator can act on, and a
@@ -605,7 +608,7 @@ func (d *driftFilter) countsLogDue() bool {
 // rather than passing it to a helper that discards it. Over 99% of the stream
 // is dropped, so formatting a reason nobody reads is an allocation per record
 // on the hot path.
-func (d *driftFilter) tally(record AuditRecord) {
+func (d *driftFilter) tally(ctx context.Context, record AuditRecord) {
 	tier := d.classifier.Classify(record.Principal)
 	d.counts.ByTier[tier]++
 
@@ -642,7 +645,7 @@ func (d *driftFilter) tally(record AuditRecord) {
 	}
 
 	d.counts.Actionable++
-	d.next(record)
+	d.next(ctx, record)
 }
 
 // Counts reports the tally so far.

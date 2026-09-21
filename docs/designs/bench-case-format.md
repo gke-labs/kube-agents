@@ -166,12 +166,14 @@ matched objects, with `op` one of eq/ne/gt/gte/lt/lte/exists/absent/contains/mat
 `pod_healthy` (pods matching a selector reach Ready), and `scaling_complete` (a
 deployment's ready replicas land in a range).
 
-Four read what the run produced, from this repository
+Five read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published), and `worker_commands` (regular expressions over the terminal commands
+published), `pull_request_opened` (the remediation pull request the run opened,
+resolved through GitHub and required to be this run's rather than an earlier
+repetition's), and `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it).
 

@@ -19,6 +19,23 @@ spec:
       labels:
         app: github-token-minter
     spec:
+      # Kept in step with charts/kube-agents/templates/_helpers.tpl's
+      # kube-agents.topologySpreadConstraints, which owns the rationale: the PDB
+      # beside this file stalls a drain that would take both replicas, but a
+      # node that fails takes whatever is on it, and nothing else keeps the two
+      # apart. ScheduleAnyway rather than DoNotSchedule so a single-node pool
+      # does not leave the second replica Pending forever. matchLabelKeys so a
+      # rollout measures the skew over the new ReplicaSet alone rather than
+      # old and new pods together, which can leave both new replicas on one node.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              app: github-token-minter
       serviceAccountName: ${GITHUB_MINTER_KSA_NAME}
       securityContext:
         runAsNonRoot: true
@@ -71,10 +88,15 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Kept in step with charts/kube-agents/values.yaml, which owns the
+          # rationale: at 5-minute resolution this minter peaks at 0.71m of
+          # CPU and 12.17Mi of memory per replica on the reference install and
+          # at 2.7m / 20Mi on the one other install that runs it, and 50m/64Mi
+          # is the smallest request the cost audit's resize rule will write.
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
+              cpu: "50m"
+              memory: "64Mi"
             limits:
               cpu: "500m"
               memory: "256Mi"

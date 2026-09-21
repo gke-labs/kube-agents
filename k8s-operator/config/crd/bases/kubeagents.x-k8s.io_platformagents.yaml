@@ -1259,9 +1259,13 @@ spec:
                         - name
                       x-kubernetes-list-type: map
                     extraVolumeMounts:
-                      description:
-                        ExtraVolumeMounts specifies custom volume mounts
-                        for the main container.
+                      description: |-
+                        ExtraVolumeMounts specifies custom volume mounts for the main container.
+                        Appended to platform-agent and platform-agent-dashboard both, so an entry
+                        naming a reserved volume is refused at admission, and dropped from the
+                        render on an install running the A2A surface. The render drops one more
+                        shape admission does not: an entry naming a user volume that was itself
+                        dropped for the credential its source carries.
                       items:
                         description:
                           VolumeMount describes a mounting of a Volume within
@@ -1341,9 +1345,13 @@ spec:
                         - name
                       x-kubernetes-list-type: map
                     extraVolumes:
-                      description:
-                        ExtraVolumes specifies custom volumes to mount for
-                        the main container.
+                      description: |-
+                        ExtraVolumes specifies custom volumes to mount for the main container.
+                        The same reserved names and reserved sources as SidecarVolumes are refused
+                        at admission -- a ServiceAccount token projection for the "a2a-bus"
+                        audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
+                        or <agent>-a2a-callout-keys -- and dropped from the render on an install
+                        running the A2A surface.
                       items:
                         description:
                           Volume represents a named volume in a pod that
@@ -3478,9 +3486,10 @@ spec:
                       type: array
                       x-kubernetes-list-type: atomic
                     initContainers:
-                      description:
-                        InitContainers specifies standard Kubernetes initContainers
-                        to run before the agent starts.
+                      description: |-
+                        InitContainers specifies standard Kubernetes initContainers to run before the agent starts.
+                        A volumeMounts entry naming a reserved volume is refused at admission, and
+                        dropped from the render on an install running the A2A surface.
                       items:
                         description:
                           A single application container that you want to
@@ -5215,9 +5224,21 @@ spec:
                         true (useful for saving costs during idle periods).
                       type: boolean
                     sidecarVolumes:
-                      description:
-                        SidecarVolumes specifies custom volumes to mount
-                        for the sidecar containers.
+                      description: |-
+                        SidecarVolumes specifies custom volumes to mount for the sidecar containers.
+                        An entry is refused at admission if it takes a reserved volume name, or if
+                        its source is one of the routes to the agent's A2A bus credentials: a
+                        ServiceAccount token projection for the "a2a-bus" audience, or a reference
+                        to one of the Secrets the operator renders bus credentials into
+                        (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+                        as either a secret volume or a projected secret source. The refusal is on
+                        the name and the shape of the source, not on what a given Secret happens to
+                        hold at the time. Reading those Secrets through env is not refused here. On
+                        an install running the A2A surface the same entries are dropped from the
+                        render as well, which is the half that holds when admission does not run:
+                        a default chart install does not register the webhooks at all
+                        (operator.webhooks.enabled=false), and one that does registers them at
+                        failurePolicy Ignore by default.
                       items:
                         description:
                           Volume represents a named volume in a pod that
@@ -7303,9 +7324,10 @@ spec:
                         - name
                       x-kubernetes-list-type: map
                     sidecars:
-                      description:
-                        Sidecars specifies standard Kubernetes sidecar/application
-                        containers to run alongside the agent.
+                      description: |-
+                        Sidecars specifies standard Kubernetes sidecar/application containers to run alongside the agent.
+                        A volumeMounts entry naming a reserved volume is refused at admission, and
+                        dropped from the render on an install running the A2A surface.
                       items:
                         description:
                           A single application container that you want to
@@ -9413,7 +9435,7 @@ spec:
                             hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
                             preemption.
 
-                            The number lands in two places that deliberately differ. The gateway's
+                            The number lands in three places that deliberately differ. The gateway's
                             A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
                             delegation is refused with a chat reply naming the numbers, never queued,
                             never dropped. The namespace ResourceQuota is rendered a fixed headroom
@@ -9425,7 +9447,32 @@ spec:
                             bounds everything else in the namespace: an install whose namespace
                             carries many non-session pods can see unrelated pod creation refused at
                             admission before sessions reach this cap, and the headroom is an
-                            operator constant, not a CR field.
+                            operator constant, not a CR field. The third is the bus: the TASKS
+                            stream's max_consumers is provisioned from this number, because each
+                            session pod creates three named consumers there and a stream that
+                            cannot hold the configured concurrency refuses a legitimate session's
+                            consumer create at load. That one is capacity, not a control - it is
+                            sized to fit this cap rather than to enforce it - and because
+                            provisioning never edits an existing stream, an install whose TASKS
+                            stream is too small for the configured cap makes the provision Job
+                            fail rather than letting the shortfall surface later as a legitimate
+                            session's consumer create being refused and reported as a task
+                            failure. What that refusal names is the two ways out, and neither is
+                            a stream edit, because max_consumers is the one limit nats-server
+                            will not change on a stream that already exists: lower this number
+                            until it fits the stream, or delete TASKS and let provisioning
+                            recreate it at the width this number asks for, paying the task
+                            history the stream was holding. The two do not finish the same way.
+                            Lowering this number re-renders the provision Job, so it re-runs by
+                            itself. Recreating the stream also needs the provision Job re-run,
+                            and then the A2A gateway restarted - deleting a stream deletes the
+                            durable consumers on it, the gateway's event relay and any Hermes
+                            bridge sidecar do not re-create theirs, and a gateway in that state
+                            still accepts delegations and spawns session pods while relaying no
+                            events. The refusal names the order. An operator upgrade reaches that
+                            refusal as readily as an edit here does: a stream created before the
+                            derivation existed holds whatever it was created with, whatever this
+                            field says.
 
                             Raising it buys concurrent delegations at the per-pod price plus model
                             concurrency against the shared LiteLLM endpoint; the quota lifts with it.

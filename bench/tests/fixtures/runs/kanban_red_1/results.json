@@ -1,7 +1,7 @@
 [
   {
     "input": "Create a kanban task titled exactly \"devops-bench smoke probe\", then state in one sentence the id that was assigned to it.",
-    "output": "Delegated to the platform agent \u2014 the task was created with id t_bbbebbd5.\n\n[Redacted: the captured report embedded a live fleet inventory. No scorer code reads this field \u2014 see fixtures/runs/README.md.]",
+    "output": "Delegated to the platform agent \u2014 the task was created with id t_bbbebbd5.\n\n[Redacted: the captured report embedded a live fleet inventory. No rung reads this field; the gate quotes its first 300 characters into the build log \u2014 see fixtures/runs/README.md.]",
     "latency": 133.12637670803815,
     "tokens": {
       "input": 18,

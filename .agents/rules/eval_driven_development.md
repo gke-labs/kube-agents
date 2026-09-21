@@ -22,8 +22,10 @@ INSTALL.md "Method 3" is the local-iteration path). `hack/ci-deploy.sh` itself i
 secrets. For cases that read the seeded fleet, whether through `fixtures:` or by naming
 `seeded-a`/`-b`/`-c` directly, the fleet must be applied to the dev project once
 ([`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)). Every contributor, human or
-agent, is expected to have one. There is no path around the loop: a pull request that changes
-agent behaviour without eval evidence is not ready for review.
+agent, is expected to have one. A stock install sandboxes the agent, which the harness's
+`kubectl port-forward` cannot reach; [`bench/README.md`](../../bench/README.md#sandboxed-installs)
+has the ways round that. There is no path around the loop: a pull request that changes agent
+behaviour without eval evidence is not ready for review.
 
 ## The loop
 

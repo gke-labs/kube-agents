@@ -12,6 +12,7 @@ cell click opens. Every asserted time is America/Toronto.
 """
 
 import contextlib
+import copy
 import gzip
 import html
 import io
@@ -203,6 +204,31 @@ class HealthInputsTest(unittest.TestCase):
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
+        # The rule-8 note, same treatment: the fields the lede reads, and a
+        # verdict the page does not know about is dropped rather than shown.
+        self.assertIsNone(minimal["pool"])
+        note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "waiting_now": True, "over_threshold": 2,
+                "threshold_p50_s": 900, "threshold_p95_s": 2700, "free": 0, "total": 30, "cause": "CAPACITY"}
+        self.assertEqual(
+            render.normalize_health(health_doc("GREEN", pool=note))["pool"],
+            {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
+             "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
+             "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
+        )
+        # Dated like every other timestamp the page renders: a string that is
+        # not one drops rather than reaching `new Date`.
+        self.assertEqual("2026-09-08T16:45:00+00:00", render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"}))["pool"]["waiting_since"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "this afternoon"}))["pool"]["waiting_since"])
+        # Tri-state: the page reads null as "Deck was not read", so a field that
+        # is not a real bool has to arrive as null rather than as a truthy string.
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"waiting_now": "yes"}))["pool"]["waiting_now"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"verdict": "WEDGED"}))["pool"]["verdict"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"p50_s": "ages"}))["pool"]["p50_s"])
+        # `day` is printed verbatim, so it is shape-checked and not merely
+        # type-checked.
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"day": "yesterday"}))["pool"]["day"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=[]))["pool"])
 
     def test_load_health_degrades_on_absent_or_broken_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -355,7 +381,7 @@ class RenderedFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = render_to(tmp, data, health=health_doc())
             names = sorted(p.name for p in out.iterdir())
-            self.assertEqual(names, ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html"])
+            self.assertEqual(names, ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "trend.html", "trend.json"])
             brief = json.loads((out / "brief.json").read_text())
             self.assertEqual(brief["health"]["state"], "OUTAGE")
             index = (out / "index.html").read_text()
@@ -375,7 +401,7 @@ class RenderedFilesTest(unittest.TestCase):
             self.assertNotIn("__LOGO__", index)
             run_page = (out / "run.html").read_text()
             self.assertIn('data-page="run"', run_page)
-            for name in ("grid.html", "cases.html", "nightly.html"):
+            for name in ("grid.html", "cases.html", "nightly.html", "trend.html"):
                 page = (out / name).read_text()
                 self.assertIn(f'data-page="{name[:-5]}"', page)
                 self.assertIn('<a href="index.html" >Brief</a>', page)
@@ -394,7 +420,9 @@ class RenderedFilesTest(unittest.TestCase):
             for name in ("index.html", "run.html"):
                 page = (out / name).read_text()
                 head = page.split("<body", 1)[0]
-                self.assertEqual(inline_blob(head, render.INLINE_BRIEF_ID), brief, f"{name}: the inline brief is brief.json")
+                # Less the trend block, which only trend.html reads (it grows
+                # every night; test_eval_dashboard_trend covers that page).
+                self.assertEqual(inline_blob(head, render.INLINE_BRIEF_ID), {**brief, "trend": None}, f"{name}: the inline brief is brief.json")
                 self.assertEqual(inline_blob(head, render.INLINE_HEALTH_ID), brief["health"], f"{name}: the inline verdict")
                 self.assertEqual(page.count('id="inline-brief">'), 1, f"{name}: one copy of the document, not two")
                 raw = re.search(r'id="inline-brief">(.*?)</script>', head, re.DOTALL).group(1)
@@ -413,10 +441,10 @@ class RenderedFilesTest(unittest.TestCase):
         data["generated_at"] = NOW
         with tempfile.TemporaryDirectory() as tmp:
             out = render_to(tmp, data)
-            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
+            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html", "trend.html"):
                 self.assertNotIn("<base", (out / name).read_text(), f"{name}: a local render keeps relative links")
             out = render_to(pathlib.Path(tmp) / "pub", data, extra_args=["--public-url", "https://example.test/evals"])
-            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
+            for name in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html", "trend.html"):
                 page = (out / name).read_text()
                 self.assertEqual(page.count("<base "), 1, name)
                 self.assertIn('<base href="https://example.test/evals/">', page.split("<body", 1)[0], f"{name}: in <head>, with the trailing slash")
@@ -460,7 +488,7 @@ class RenderedFilesTest(unittest.TestCase):
         script = PAGES_JS.read_text()
         for token in ('param("cases")', 'param("since")', 'param("until")', 'param("build")', 'param("view")', "location.search", "location.hash",
                       "shared_break", "storm", "setup_deaths", "only-this-pr", "#build=", 'pick("window"', 'pick("sort"', 'pick("show"', 'pick("rows"',
-                      "grid.html", "cases.html", "nightly.html", "health.json", "brief.json"):
+                      "grid.html", "cases.html", "nightly.html", "trend.html", 'param("domain")', 'param("metric")', "health.json", "brief.json"):
             self.assertIn(token, script)
         self.assertNotIn("run.html?build=", script, "the pages write the fragment form only")
         self.assertNotIn("index.html?", script)
@@ -529,6 +557,49 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Release candidates", app)
         self.assertNotIn(" UTC", app, "no UTC clock text on the page")
         self.assertNotIn("legacy", app.lower())
+
+    def test_the_brief_quotes_the_agents_report_when_the_log_carried_one(self):
+        """reps[].excerpt, the agent's own words from the build log, is quoted
+        in "What the agent saw" and on the run page's case card; without it
+        the Brief says nothing is quoted rather than inventing a quote."""
+        app = dom_text(self.index)
+        self.assertIn("nothing here is quoted from the agent", app)
+        self.assertNotIn('<div class="q">', app)
+        words = "I checked every namespace and found no pod in CrashLoopBackOff; the deployment looks healthy to me."
+        data = copy.deepcopy(self.data)
+        quoted = 0
+        for run in data["runs"]:
+            for task in run.get("tasks") or []:
+                if task.get("name") not in CRASHLOOP_TRIO:
+                    continue
+                for rep in task.get("reps") or []:
+                    if rep.get("result") == "fail":
+                        rep["excerpt"] = words
+                        quoted += 1
+        self.assertGreater(quoted, 0)
+        out = render_to(pathlib.Path(self.tmp.name) / "excerpt", data, health=health_doc())
+        app = dom_text(out / "index.html")
+        self.assertIn(f'<div class="q">“{words}”', app)
+        self.assertIn("From the agent's report on", app)
+        self.assertNotIn("nothing here is quoted from the agent", app)
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn(f'<div class="quote">“{words}”</div>', run_page)
+
+    def test_the_quote_links_the_transcript_of_the_repetition_it_came_from(self):
+        """A case whose rep 1 was lost to infra shows rep 2's reason and
+        quote; the transcript link beside them must be rep 2's, not rep 1's."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        self.assertGreaterEqual(len(task["reps"]), 2)
+        task["reps"][0] = {"n": 1, "result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE: agent transport"}
+        task["reps"][1] = dict(task["reps"][1], n=2, result="fail", excerpt="Rep two's own words.")
+        out = render_to(pathlib.Path(self.tmp.name) / "rep2", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("“Rep two's own words.”", page)
+        self.assertIn(f"artifacts/eval_{CRASHLOOP_TRIO[0]}_rep2.log", page)
+        self.assertIn("transcript (rep 2)", page)
+        self.assertNotIn(f"artifacts/eval_{CRASHLOOP_TRIO[0]}_rep1.log", page)
 
     def test_storm_brief(self):
         app = self.render_state(health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[],
@@ -620,6 +691,93 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
         control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notslow", self.data, health=health_doc("GREEN")) / "index.html")
         self.assertNotIn("Runs are slow", control)
+
+    def test_brief_says_when_runs_are_waiting_to_start(self):
+        # health.py's rule-8 note, dated 8:00 AM ET on the page's Tuesday.
+        # Unlike 🐢 it also rides on an incident lede, so both are rendered.
+        note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
+                "threshold_p50_s": 900, "threshold_p95_s": 2700}
+        sentence = ("Runs are waiting to start since Tue 8:00 AM ET: on 2026-09-07 the median wait was 22 min against"
+                    " a 15 min limit, p95 61 min against 45. Runs still pass; /retest makes the queue longer.")
+        healthy = dom_text(render_to(pathlib.Path(self.tmp.name) / "pool", self.data, health=health_doc("GREEN", pool=note)) / "index.html")
+        self.assertIn("Smoke gate is healthy", healthy)
+        self.assertIn(sentence, healthy)
+        # During an incident it rides on the agent view, which is where the ⏳
+        # message's own link lands; the incident brief keeps its own lede.
+        out = render_to(pathlib.Path(self.tmp.name) / "poolred", self.data, health=health_doc("OUTAGE", pool=note))
+        self.assertIn(sentence, dom_text(out / "index.html", fragment="#view=agent"))
+        # The gate breaches on p50 or p95, so a p95-only breach carries an
+        # ordinary median -- sub-minute here, which whole minutes would print
+        # as "0 min". The sentence has to carry the half that breached; the
+        # median alone reads as a passing number offered as the evidence.
+        quick = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolquick", self.data,
+                                   health=health_doc("GREEN", pool=note | {"p50_s": 24})) / "index.html")
+        self.assertIn("on 2026-09-07 the median wait was 24s against a 15 min limit, p95 61 min against 45", quick)
+        # A day and the live queue can breach together, as the ⏳ message's two
+        # lines do; the lede has one sentence, so it joins them.
+        both = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolboth", self.data,
+                                  health=health_doc("GREEN", pool=note | {"over_threshold": 2})) / "index.html")
+        self.assertIn("p95 61 min against 45; 2 runs queued past the 45 min limit.", both)
+        # The usual case: the periodic judged the recent stretch, so the
+        # sentence names it rather than a day up to a week old.
+        recent = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrecent", self.data,
+                                    health=health_doc("GREEN", pool=note | {"day": None, "window_hours": 3})) / "index.html")
+        self.assertIn("over the last 3h the median wait was 22 min against a 15 min limit", recent)
+        # A breach with no bad day in the week -- one run stuck past p95 right
+        # now -- has no median to quote and counts the queue instead.
+        live = dom_text(render_to(pathlib.Path(self.tmp.name) / "poollive", self.data,
+                                  health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", live)
+        # A `day` that is not a date never reaches the sentence -- render.py
+        # drops it on shape, pages.js again on the way in -- and the live queue
+        # is what is left to quote.
+        junk = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooljunk", self.data,
+                                  health=health_doc("GREEN", pool=note | {"day": "yesterday", "over_threshold": 3})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", junk)
+        self.assertNotIn("yesterday", junk)
+        # The verdict lasts a week, so most renders of an episode find the queue
+        # already drained. The lede keeps the episode but stops claiming a jam.
+        drained = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooldrained", self.data,
+                                     health=health_doc("GREEN", pool=note | {"waiting_now": False})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET: on 2026-09-07 the median wait was 22 min", drained)
+        self.assertIn("p95 61 min against 45. No backlog right now.", drained)
+        self.assertNotIn("Runs are waiting", drained)
+        # Deck unread is not the same answer: past tense, because nothing
+        # measured a queue this tick, but no claim that it cleared either.
+        unread = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolunread", self.data,
+                                    health=health_doc("GREEN", pool=note | {"waiting_now": None})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET", unread)
+        self.assertNotIn("No backlog", unread)
+        # A jam is dated from its own oldest queued run, not from the episode:
+        # the verdict spans a week, so "since Tue 8:00 AM" can sit over a jam
+        # that formed this afternoon and claim hours nothing measured.
+        dated = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooldated", self.data,
+                                   health=health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 12:45 PM ET", dated)
+        self.assertNotIn("since Tue 8:00 AM ET", dated)
+        # Once it has drained there is no backlog to date, so the episode is
+        # what the past tense is about.
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET", drained)
+        # A stopped periodic says so instead of quoting a reading hours old.
+        stale = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolstale", self.data,
+                                   health=health_doc("GREEN", pool={"verdict": "STALE", "measured_at": "2026-09-08T13:23:00+00:00"})) / "index.html")
+        self.assertIn("No pool numbers since Tue 9:23 AM ET: the hourly pool check has stopped reporting.", stale)
+        self.assertNotIn("median wait", stale)
+        # ... and a periodic that ran and published nothing has no reading to
+        # date, so the sentence drops the clause rather than printing a blank.
+        blind = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolblind", self.data,
+                                   health=health_doc("GREEN", pool={"verdict": "STALE"})) / "index.html")
+        self.assertIn("No pool numbers: the hourly pool check has stopped reporting.", blind)
+        # UNMEASURED is the periodic running and failing to sweep the window,
+        # which is a different sentence from the periodic going away.
+        unmeasured = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolunmeasured", self.data,
+                                        health=health_doc("GREEN", pool=note | {"verdict": "UNMEASURED"})) / "index.html")
+        self.assertIn("The queue wait is unknown: the hourly pool check ran but could not read"
+                      " how long recent runs waited.", unmeasured)
+        self.assertNotIn("median wait", unmeasured)
+        control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notpool", self.data, health=health_doc("GREEN")) / "index.html")
+        self.assertNotIn("Runs are waiting to start", control)
 
     def test_healthy_brief_without_any_health_files(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohealth", self.data)

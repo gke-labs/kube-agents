@@ -152,7 +152,7 @@ func TestADegradedChangeStillWrites(t *testing.T) {
 
 	degrade := func(step, reason, message string, wantWrites int) {
 		t.Helper()
-		if err := r.updateStatusDegraded(ctx, agent, reason, message); err != nil {
+		if err := r.updateStatusDegraded(ctx, agent, reason, message, workloadNotRendered); err != nil {
 			t.Fatalf("updateStatusDegraded (%s) failed: %v", step, err)
 		}
 		if counter.writes != wantWrites {
@@ -227,7 +227,7 @@ func TestAPhaseChangeAloneWritesDegraded(t *testing.T) {
 	counter := &statusWriteCounter{}
 	r := observedGenerationReconciler(agent, counter)
 
-	if err := r.updateStatusDegraded(context.Background(), agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured"); err != nil {
+	if err := r.updateStatusDegraded(context.Background(), agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured", workloadNotRendered); err != nil {
 		t.Fatalf("updateStatusDegraded failed: %v", err)
 	}
 	if counter.writes != 1 {
@@ -268,7 +268,7 @@ func TestAPrunedObservedGenerationDoesNotWriteDegradedEveryPass(t *testing.T) {
 
 	degrade := func() {
 		t.Helper()
-		if err := r.updateStatusDegraded(ctx, agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured"); err != nil {
+		if err := r.updateStatusDegraded(ctx, agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured", workloadNotRendered); err != nil {
 			t.Fatalf("updateStatusDegraded failed: %v", err)
 		}
 	}

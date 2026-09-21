@@ -13,10 +13,19 @@ why this is a Pub/Sub consumer and not an informer like its sibling
 
 ## What ships today
 
-Ingestion and classification: pull, parse, assign a tier, forward the records that represent a real
-human change. Nothing builds this binary into an image and nothing launches it, so no installation
-runs it yet. The `managedFields` join and the inject are still to come; `recordHandler` in
-`subscriber.go` is the seam they plug into, and `driftFilter.next` is where they attach.
+Ingestion, classification, and the `managedFields` join: pull, parse, assign a tier, forward the
+records that represent a real human change, and enrich each with what the live object says owns the
+fields. Nothing builds this binary into an image and nothing launches it, so no installation runs it
+yet. The inject is still to come — `logDriftEvent` in `join.go` is the terminal handler it replaces.
+
+The join has two credential sources and they are additive. `--in-cluster` or `--kubeconfig` gives it
+the one directly reachable cluster; `--profiles-dir` gives it every cluster in `--project` that has
+a Cluster Agent profile, reached as the pod's own Google identity through
+[`internal/clusterprofiles`](../../internal/clusterprofiles/) — one shared token source, not a
+credential per cluster. With neither set the join reaches nothing and every record naming a live
+object comes out `unreachable`. The subscription is project-wide, so any cluster in the project
+that neither source covers still comes out `unreachable`, and the shutdown line names those
+clusters.
 
 ## Running it
 
@@ -25,16 +34,49 @@ go run ./k8s-operator/cmd/drift-detector --project "$PROJECT_ID"
 ```
 
 Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
-agent pod, the Workload Identity the `drift-pubsub` module grants it to.
+agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
+for the startup ack-deadline check described under
+[Three things to know before changing it](#three-things-to-know-before-changing-it): subscriber does
+not carry `subscriptions.get`. The module grants both, so this is a note for a
+hand-made subscription or a local run, where the check is skipped with a log line rather than
+failing the process.
 
-| Flag                      | Default                          | Notes                                                                                                                                                |
-| ------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--project`               | —                                | Required. The project holding the subscription.                                                                                                      |
-| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                      |
-| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                        |
-| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                |
-| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain. |
-| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                   |
+The join needs Kubernetes permissions on top of that, and they are not the same grant. With
+`--in-cluster` the Pod's ServiceAccount has to be able to `get` every resource a human might change
+— a cluster-wide `get` on `*` is the honest shape of it, since the audit stream names arbitrary
+groups including CRDs. A resource it cannot read comes out `failed` with the RBAC error on the
+line, not silently unenriched.
+
+`--profiles-dir` needs two more grants, and they attach to the pod's **Google** identity rather
+than to its ServiceAccount, because that is what a profile cluster is reached as. Addressing the
+cluster at all takes `container.clusters.get` — `roles/container.viewer` is the usual shape — in
+`--project`, and only there: a profile naming a cluster in another project is dropped on its
+identity before anything is spent on reaching it, so no grant outside `--project` is wanted or
+used. Without the grant every profile is skipped at startup with
+`asking the GKE API where … is: 403` and the detector joins nothing it did not already reach — with
+one exception, and it is the cluster that matters most on a single-cluster install: the profile for
+the cluster `--in-cluster`/`--kubeconfig` already reaches is declined before it is addressed, so
+that cluster is still joined, through a credential that needs no Google grant at all.
+Reading the objects then takes the same cluster-wide `get` as above, bound to that Google identity
+on every cluster in the fleet. A cluster where only the second is missing still starts: its records
+come out `failed` with the RBAC error, which is the difference between a cluster that was not
+addressed and one that was and refused.
+
+| Flag                      | Default                          | Notes                                                                                                                                                                                                                                                                 |
+| ------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--project`               | —                                | Required. The project holding the subscription. With the join on it must be the project **ID**, not the project number: a Pub/Sub path accepts either, but the join matches this against each record's `project_id`, so a number matches nothing. Refused at startup. |
+| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                                                                                                                                       |
+| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                                                                                                                                         |
+| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                                                                                                                                 |
+| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain.                                                                                                                  |
+| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                                                                                                                                    |
+| `--in-cluster`            | `false`                          | Read live objects with the Pod's own ServiceAccount. Mutually exclusive with `--kubeconfig`.                                                                                                                                                                          |
+| `--kubeconfig`            | empty                            | Read live objects through this kubeconfig. Mutually exclusive with `--in-cluster`; with no `--profiles-dir` either, the join is disabled.                                                                                                                             |
+| `--cluster-name`          | empty                            | The GKE cluster those credentials reach. Required with either of the two above, and an error without them. Checked at startup against the cluster they actually reach; a disagreement stops the process.                                                              |
+| `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                                                                                                                                   |
+| `--profiles-dir`          | empty                            | Hermes profiles directory, normally `/opt/data/profiles`. Every Cluster Agent profile whose cluster is in `--project` becomes a joinable cluster. Combines with the two above; a profile naming the cluster they already reach is dropped in favour of them.          |
+| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource, in a second later than the audited change. Empty means no reconciliation claim is made.                 |
+| `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                             |
 
 ## Classification
 
@@ -100,7 +142,8 @@ by another route — they name no object, so the parser already discards them. `
 `eviction` can destroy a Git-side object where the six above cannot. Evicting a Deployment-owned
 pod changes nothing in Git, but evicting a pod applied from a manifest of its own removes the
 object Git declares, and a subresource name cannot tell the two apart — only the live object's
-owner references can, which is T3's join. Until then a `kubectl drain` produces a line per pod.
+owner references can. The join below reads `managedFields` and not `ownerReferences`, so it does not
+close this: a `kubectl drain` still produces a line per pod.
 
 A server-side dry run is the same category and is **not** handled. No `dryRun` marker appeared in
 seven days of Admin Activity logs across three projects, which leaves it open whether GKE surfaces
@@ -162,7 +205,251 @@ could be shipped, so the method, permission and `resourceName` of a captured env
 with the exec form. It is the only fixture that exercises a `resourceName` carrying a subresource,
 which is what the subresource rule turns on, so replacing it with a real capture is worth doing.
 
-## Two things to know before changing it
+## The join
+
+Classification says a person changed something. The join says what, by fetching the live object and
+decoding `metadata.managedFields` — the API server's record of which field manager owns which field.
+One `GET` per forwarded record, which the tier filter has already cut to roughly ten a day per
+project: the 879 human calls above are 29 a day across all three, and the outcome and
+non-declarative filters take a further slice off that before the join sees anything.
+
+`ResourceRef` already carries the group, version and plural resource, so the lookup goes straight to
+a dynamic client with no RESTMapper: `resourcename.go` keeps the audit log's plural rather than
+converting to a Kind precisely so that this stays a struct copy. The subresource is deliberately not
+requested. A write to `status` changes the parent object, whose `managedFields` carries the status
+claim as an entry of its own, so fetching the parent gets both; asking for the subresource returns a
+body with no `managedFields` at all.
+
+**Which cluster serves a record is decided on the full `project/location/cluster` triple**, not on
+the cluster name. The join holds a map keyed on that triple, and a record is routed by the triple it
+carries in `resource.labels` — the control plane's own account of which cluster served the call.
+Keying on the name alone would read `prod/deployments/api` from `europe-west1`'s `prod` when the
+audited change happened on `us-central1`'s, and that lookup does not fail: it returns a real object
+and reports its ownership as though it were the audited one. The same reasoning drives
+`targetCluster.identity` in `k8s-event-watcher`. A record whose triple is incomplete is refused
+before the lookup rather than left to miss on its own, so a partially labelled record can never be
+served by a cluster that happens to share the parts it does carry.
+
+**Two sources fill that map, and the direct one wins an overlap.** `--profiles-dir` contributes one
+entry per Cluster Agent profile; `--in-cluster`/`--kubeconfig` contributes the cluster the process
+itself can reach. They overlap on every install, because reconcile gives the management cluster a
+profile like any other cluster, and the direct credential is kept: it reaches
+`kubernetes.default.svc` as the pod's Kubernetes service account and never leaves the cluster, where
+a profile authenticates as the pod's Google identity against the control-plane endpoint, which IAM
+without `roles/container.viewer` or a master authorized network can refuse. That profile is declined
+during the scan rather than dropped after it, on the same grounds as the out-of-project drop below:
+addressing it costs a GKE describe for a getter that is discarded, and on an install without
+`container.clusters.get` the describe fails and the profile is reported as skipped — telling an
+operator that a cluster this detector enriches normally will not be joined. The absorbed cluster is
+named at startup, and separately from the skip count, so a profile count that does not match the
+cluster count has its explanation in the same place as the counts without inflating the number that
+reads as lost coverage.
+
+**A profile for a cluster outside `--project` is dropped, and that is correctness rather than
+economy.** The subscription is a project-level sink, so a record can only ever name a cluster in
+that project; a profile for a cluster elsewhere — which the Platform Agent legitimately writes,
+since a fleet can span projects — produces a client no record can match. Dropping it also keeps the
+real misconfiguration visible: an operator who pointed `--project` at the wrong project sees eight
+profiles skipped as outside it, rather than a detector that starts cleanly and enriches nothing.
+
+Profile discovery follows `internal/clusterprofiles`' failure policy, which is the watcher's: a
+`--profiles-dir` that was given and is not there is fatal, because discovery runs once and a restart
+fixes it; an unreadable one degrades to a log line; and a single bad profile is skipped so one
+unparseable `config.yaml` cannot cost the whole fleet. A profile whose dynamic client will not build
+is skipped on the same grounds. Every skip is logged by profile name and counted, and the count is
+reported at startup — a fan-in that silently reached six of seven clusters otherwise looks exactly
+like a fleet of six.
+
+The unreadable directory is the exception to that counting, and it is carried separately rather than
+added to the total: the number of clusters behind a directory nobody can open is unknown, so calling
+it one skipped profile would understate it. It is tracked at all so that the line naming why the
+join has no clusters can tell it from an empty directory: both end the scan with no clusters and
+nothing skipped, and reporting the first as the second sends an operator whose mount is broken, or
+whose `fsGroup` is wrong, to wait on `cluster-agent-reconcile` for profiles it has already written.
+Discovery runs once, so that line is the whole account of why the fan-in is off for the life of the
+pod.
+
+**Startup checks the direct cluster's triple against the cluster its credentials actually reach, and
+refuses to run if they disagree.** The triple decides which records that cluster serves; the
+credentials decide where it reads them from, and nothing else connects the two. A Pod in `us-east4`
+started from the `us-central1` manifest, or a local run against the wrong `kubectl` context, would
+otherwise pass every flag check and enrich one cluster's records from the other's objects — the
+failure the triple exists to prevent, reached from the other end. It is the one startup check that
+stops the process rather than logging, because it is the only one whose failure produces confident
+wrong output: every lookup succeeds, so no outcome is counted `failed` or `unreachable` and the
+shutdown counts read healthy. Where the ack-deadline check costs redelivery, this one costs
+correctness.
+
+The two credential modes are checked from different evidence. `--in-cluster` reads the node's
+`cluster-name` and `cluster-location` metadata attributes, which is exact — the Pod reads its own
+cluster, and that needs no IAM grant. `--kubeconfig` has no such channel, so the check parses the
+`gke_<project>_<location>_<cluster>` context name `gcloud container clusters get-credentials`
+writes. Either source failing is "not established", never "mismatch": a kind cluster publishes no
+GKE attributes and a renamed or hand-written context parses as nothing, and both log a line saying
+the identity went unverified and carry on, because refusing there would break the local runs
+`--kubeconfig` exists for.
+
+The profile clusters are not checked this way and need not be: a profile's identity is read from the
+same `cluster_identity` that addressed its endpoint, so there are not two claims to disagree. The
+flags are the only place a human states which cluster a credential reaches. The check runs before
+the profile scan, so a run with both sources configured still refuses on a mismatch without first
+minting a token per profile.
+
+Five outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
+them, not in the order `join` decides them — and one of those decisions is worth knowing on its own:
+the `no_object` test runs before the cluster lookup, so a delete is `no_object` whether or not the
+join has a cluster to read. "The join is off" therefore does not mean "everything is `unreachable`".
+
+`unreachable` is the one whose count stopped being self-explanatory when the fan-in landed. With one
+cluster the missing set was inferable — everything else in the project — and with a fan-in it is
+not, so the shutdown report names each unreachable cluster with a count, capped at
+`maxUnreachableClusters` with the rest collected under a label. Not every entry is a
+misconfiguration: a project holding a cluster nobody intends to onboard reports it every run, and
+the detector cannot tell that from one whose profile failed to write.
+
+| Outcome       | Means                                                                                                                                                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `enriched`    | The object was read and `owners=` carries its field ownership.                                                                                                                                                                 |
+| `no_object`   | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                               |
+| `gone`        | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                            |
+| `unreachable` | The record names a live object this process cannot read: a cluster in the project with neither credentials nor a Cluster Agent profile, or any cluster at all when neither source is configured. The shutdown line names them. |
+| `failed`      | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                                                                                                  |
+
+A 404 answers both of the last two, so they are told apart by what the error names rather than by
+its status code: a genuine absence names the group, resource and object that were looked up, while
+a refusal of the path names nothing. Without the distinction a CRD uninstalled — or a served
+version retired — between the audited write and the lookup would be reported `gone`, which says the
+object was deleted about an object still standing under another version.
+
+**The join fails open, and that is the opposite of what classification does.** The tier filter drops
+anything it cannot prove is a human change, because a false report costs an operator's attention.
+The join forwards every outcome, because what it adds is detail: dropping a confirmed human change
+on a lookup error would discard the finding to protect the annotation on it. An outcome other than
+`enriched` is a `DRIFT` line without an `owners=` field, never a missing line.
+
+**`reconciled_by=` is a positive claim only.** With `--gitops-managers` set, a named manager whose
+`managedFields` timestamp falls in a later second than the audited change marks the event
+`Reconciled` — the GitOps controller has written since, so there may be nothing left to revert. A
+missing time on _either_ side declines the claim rather than guessing at it: guessing "after" hides
+real drift, guessing "before" invents a reconcile that never happened. Both sides matter because the
+zero time sorts before every real one, so a record that arrived without a `timestamp` — an absent or
+null key decodes to the zero time without error — would otherwise read as earlier than any
+configured manager that had ever touched the object, and report that manager's last write as the
+reconcile for a change the detector cannot place in time. With the flag unset the detector cannot
+tell a GitOps controller from any other client, so `Reconciled` is false everywhere and means "not
+shown to be reconciled", never "shown not to be".
+
+**Both sides are floored to the second first, and the comparison is strict.** The two timestamps
+come from different components and are not recorded at the same precision: `metav1.Time` marshals as
+RFC 3339 with no fractional part, so every `managedFields` timestamp arrives floored to the whole
+second, while the audit timestamp keeps its nanoseconds from Cloud Logging. Flooring the audit side
+to match is what stops which of them sorts first turning on how much of the second had elapsed.
+
+On that shared grid, a write in the change's own second does not claim — because it may _be_ the
+change. A manager name is self-declared: the API server copies whatever the client passed in
+`--field-manager` and verifies nothing, so `kubectl apply --server-side
+--field-manager=kustomize-controller` run by a person produces a single entry carrying the
+configured name, no subresource, and a time floored into the audited change's own second. Under an
+at-or-after rule that entry satisfies the claim by construction, and the change goes out
+`Reconciled` on the strength of being itself. It needs no intent: configure a manager name that
+ordinary `kubectl` also emits and every human apply self-marks. The price of the strict comparison
+is the reconcile that genuinely lands inside the same second, which is now missed — a false claim
+suppresses the report, a missed one only leaves it noisy, and this is the direction every other
+judgment here fails in. A reconcile that crosses the second boundary, which is the ordinary one,
+still claims.
+
+**A claim made through a subresource does not count.** `managedFields` records a write to `status`
+as its own entry, and every GitOps controller writes `.status` on its own custom resources — a
+`Kustomization`, a `HelmRelease`, an `Application` — under the same manager name, on every
+reconcile loop. Counting those would make the wrong answer the systematic one rather than the rare
+one: `flux suspend kustomization apps` patches `spec.suspend`, the controller writes its conditions
+four seconds later, and the change goes out `Reconciled` while the suspension still stands. Entries
+with a subresource are therefore skipped, and the manager's own write to the object — a separate
+entry — is what can still make the claim.
+
+The reverse case is the price: a person patching `/status` directly, answered by the controller's
+own status write, is a reconcile this declines. Matching the entry's subresource against the
+audited change's own would catch it, and is wrong for `kubectl scale` — the audit record carries
+subresource `scale`, while the controller answers it by re-applying the object under no subresource
+at all, so the two would never line up. Declining reports the drift, which is the direction every
+other judgment here fails in.
+
+It is also the weakest claim the data supports. `managedFields` keeps no previous value, so it
+cannot say the person's change was reverted — the controller may have written an unrelated field.
+The flag exists so the agent is told when there is reason to look.
+
+Manager names are matched exactly and case-sensitively. A field manager is a free string the client
+chooses rather than a DNS name, so there is no case-folding rule to appeal to here the way there is
+for a service-account domain, and `argocd-controller` and `ArgoCD-Controller` really can be two
+clients. The names your fleet uses are worth reading off a live object (`kubectl get <obj> -o
+yaml --show-managed-fields`) rather than assumed.
+
+**Attribution quality depends on Server-Side Apply.** A client that does `Update` rather than
+`Apply` still gets an entry, but a coarser one. An entry whose `FieldsV1` blob is missing or does
+not decode is kept with no paths rather than dropped: "nobody owns this field" is exactly the false
+positive the join exists to avoid, and a manager rendered with an empty path list is visibly a gap
+in the data instead.
+
+Field paths are rendered from `FieldsV1` with the list selector intact —
+`spec.containers[name=app].image`, not `spec.containers.image`, which does not say which container
+drifted. A manager that owns a whole object owns hundreds of leaves, so `maxReportedPaths` truncates
+the rendered list at twelve and appends `...` as a thirteenth entry — behind a comma, because a path
+can itself end in a selector and `containers[name=app]...` would read as a path rather than as the
+marker. The cap is on the output only, and the ownership decision reads every path.
+
+**Those selectors put object field values in the log.** Two of the three `FieldsV1` list forms carry
+data rather than structure: `k:` holds the merge key's value and `v:` holds a whole scalar entry, so
+a rendered path can read `spec.ports[name=admin-postgres].port` or `spec.rules["10.1.2.3/32"]` —
+the `v:` form keeps the entry's JSON quoting and carries no `v` marker into the output.
+The drift line goes to this process's stdout and from there to Cloud Logging, which is a different
+place from the cluster whose object it came out of. Merge keys are names, ports and protocols on
+the resources this join reads, so nothing high-value has turned up in practice — but the join reads
+whatever the audit stream names, CRDs included, and a CRD is free to pick a merge key that carries
+something an operator would not put in a log. Worth knowing before pointing this at a fleet whose
+CRDs you did not write; dropping the value half of a selector would cost the thing the selector is
+for, which is saying which entry drifted.
+
+## Three things to know before changing it
+
+**The join happens before the ack, inside the batch's deadline.** Synchronous pull does not extend
+the ack deadline while a handler runs, so every `GET` a batch makes has to finish inside the
+subscription's deadline or the whole batch is redelivered — and a redelivered batch is re-enriched
+and re-logged, not resumed. `--batch-join-budget` caps a batch's handling, defaulting to thirty
+seconds against the sixty the `drift-pubsub` module sets on the subscription. It is a flag rather
+than a constant because the deadline it is sized against is a Terraform variable: a hand-created
+subscription carries Pub/Sub's own ten-second default, and `--batch-join-budget 4s` is how that
+install stays inside it without rebuilding the image. The budget wraps the whole per-record
+handler, classification included, not the lookup alone — classification is CPU-bound and the
+lookup is the part that can hang, but the deadline covers both. Exceeding it fails open like any
+other lookup error: the records that would have reached a `GET` come out `failed` and are still
+acked, while a delete or a foreign-cluster record is unaffected, since both are settled before the
+context is consulted. Adding retries, a second `GET`, or a per-record backoff means re-checking
+that arithmetic.
+
+For the budget to be the bound, it has to be the only one, and client-go supplies a second by
+default: a `rest.Config` that leaves `QPS` unset gets 5 requests a second with a burst of 10, and
+every lookup waits on that token bucket before it touches the network. Against a batch of 100
+human writes that is eighteen seconds of the thirty spent queueing on the client, and the
+`--batch-join-budget 4s` above would stop enriching after about thirty records — while reporting
+them as lookup failures, because a budget that runs out mid-throttle surfaces as a plain context
+deadline, indistinguishable from a slow control plane. `cluster.go` therefore sets both to
+`--max-messages`' own ceiling, so a full batch is issued without the client ever waiting. Raising
+that ceiling raises the throttle with it; leaving them out of step puts part of the budget back out
+of reach.
+
+The flag's own validation cannot do that re-checking for you: it is bounded by a fixed ceiling of
+5m — half Pub/Sub's 600-second maximum deadline — not by whatever this subscription is set to, so
+`--batch-join-budget 120s` is accepted against a stock 60-second install. What closes the gap is one
+`subscriptions.get` at startup, which reads the configured deadline and warns when the budget takes
+more than half of it — half because the deadline starts at delivery and the batch is settled only
+once its `Ack` returns, so the remainder is what that round trip runs in. Half is the margin rather
+than the cliff: a budget past it has spent the room the `Ack` was meant to run in, which is why the
+warning says Pub/Sub _may_ redeliver rather than that it will. The warning is advisory in both
+directions. A budget that overruns costs redelivery rather than correctness, so it does not refuse
+to start; and the probe needs `pubsub.subscriptions.get`, which `roles/pubsub.subscriber` does not
+carry but `roles/pubsub.viewer` does, so a probe that fails says the budget went unchecked and the
+detector pulls anyway. The `drift-pubsub` module grants viewer alongside subscriber, so the check is
+live in an install built from it.
 
 **Settling is three-way.** A record that parses is handled and acked. One that is understood and
 not actionable — another service's audit entry, or a call that named no object, such as a subject

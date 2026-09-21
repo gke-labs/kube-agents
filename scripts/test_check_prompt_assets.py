@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import re
 import unittest
 from pathlib import Path
@@ -203,6 +204,7 @@ class ProfileFixture:
                 + cpa.check_skill_refs(files, skills)
                 + cpa.check_skill_manifests(skills)
                 + cpa.check_cron_assets()
+                + cpa.check_cron_delivery()
             )
 
     def rules(self) -> list[str]:
@@ -366,6 +368,108 @@ class SyntheticProfileTests(unittest.TestCase):
             "\"Run 'skills/thing/scripts/run.py'.\"}]}",
         )
         self.assertEqual([], self.fixture.rules())
+
+    def test_a_cron_path_with_an_argument_after_it_is_still_checked(self):
+        """The old pattern demanded the closing quote right after the extension.
+
+        So `'collect.py <stream>'` matched nothing and the reference went
+        unchecked: a prompt that names a script and then its argument would
+        keep `make prompt-check` at exit 0 after the script was renamed.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": '
+            "\"Run 'skills/thing/scripts/collect.py compliance-audit'.\"}]}",
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_a_cron_path_behind_an_interpreter_is_still_checked(self):
+        """Same gap from the other side: a prefix before the path, not after.
+
+        A prompt that spells an interpreter before the script,
+        `'/opt/hermes/.venv/bin/python3 skills/.../waste.py'`, is the shape the
+        old pattern also skipped.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "cost", "prompt": '
+            "\"Run '/opt/hermes/.venv/bin/python3 skills/thing/scripts/waste.py'.\"}]}",
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_an_absolute_interpreter_is_not_itself_an_asset(self):
+        """The interpreter ships in the image, not in the profile.
+
+        Reporting `/opt/hermes/.venv/bin/python3` as missing would be a false
+        finding on every roster that spells an interpreter out in full, so the
+        path pattern requires the first segment to be a name rather than the
+        empty string a leading `/` produces.
+        """
+        self.fixture.write("agents/platform/skills/thing/scripts/waste.py", "x = 1\n")
+        self.fixture.skill("thing")
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "cost", "prompt": '
+            "\"Run '/opt/hermes/.venv/bin/python3 skills/thing/scripts/waste.py'.\"}]}",
+        )
+        self.assertEqual([], self.fixture.rules())
+
+    def test_an_apostrophe_before_a_quoted_path_does_not_hide_it(self):
+        """A contraction earlier in the prose is an unpaired quote.
+
+        An extractor that paired quotes first -- any kind with the next of any
+        kind -- read `Don't … 'governance/…'` as a span from the apostrophe to
+        the path's opening quote, and the path fell outside every span. The
+        reference went unchecked: `make prompt-check` at exit 0 over a missing
+        SOP, for any prompt with a possessive before the path.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": '
+            "\"Don't skip it. Read 'governance/gone_sop.md' now.\"}]}",
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_a_bare_path_in_the_prompt_is_checked_too(self):
+        """Quotes are the rosters' house style, not the rule.
+
+        The extension list is specific enough that a slash-joined token ending
+        in `.md` is a reference whether or not the prompt quotes it, and the
+        worker it sends to that file fails the same way either way.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": '
+            '"Read governance/gone_sop.md before anything else."}]}',
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_a_bare_path_ending_a_clause_is_still_checked(self):
+        """Sentence punctuation after the extension is not part of the path.
+
+        The boundary used to be whitespace, a quote or the end of the prompt,
+        so `Read governance/x.md.` -- the full stop touching the extension --
+        matched nothing and the reference went unchecked. The punctuation has
+        to be followed by a boundary of its own, or `x/y.md.bak` would be read
+        as `x/y.md`.
+        """
+        for prompt in (
+            "Read governance/gone_sop.md.",
+            "See skills/thing/scripts/gone.py, then report.",
+            "Follow the SOP (governance/gone_sop.md) and stop.",
+            "Is governance/gone_sop.md current? Check.",
+        ):
+            with self.subTest(prompt=prompt):
+                self.fixture.write(
+                    "agents/platform/cron/jobs.json",
+                    json.dumps({"jobs": [{"id": "audit", "prompt": prompt}]}),
+                )
+                self.assertEqual(["cron-asset"], self.fixture.rules())
+        self.assertEqual(
+            cpa.cron_prompt_refs("Restore governance/x_sop.md.bak first."),
+            set(),
+            "a suffix after the extension is one token, not a path and a full stop",
+        )
 
     def test_a_roster_that_moves_within_agents_is_still_found(self):
         """Two hardcoded paths behind is_file() made both cron rules no-ops.
@@ -914,6 +1018,58 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(discovered - on_disk, set(), "rosters the checker invented")
         self.assertGreater(jobs, 0, "rosters found but every one of them is empty")
 
+    def _roster_repo(self, directory, document):
+        root = Path(directory)
+        home = root / "agents" / "platform" / "cron"
+        home.mkdir(parents=True)
+        (home / "jobs.json").write_text(json.dumps(document), encoding="utf-8")
+        return root
+
+    def test_a_roster_with_no_jobs_list_names_the_file(self):
+        """The glob's own consequence: a file this script has never seen.
+
+        Discovery exists so a roster that moves is still checked, which means
+        the first thing the loader does is index into a file nobody vetted.
+        `["jobs"]` on one without that key raised a bare `KeyError: 'jobs'`,
+        naming the line of this script that died and not the file that is
+        wrong -- and every rule downstream reads rosters, so it takes the whole
+        run with it.
+        """
+        for document in ({"job": []}, [], {"jobs": {}}, {"jobs": None}):
+            with self.subTest(document=document), TemporaryDirectory() as directory:
+                root = self._roster_repo(directory, document)
+                with mock.patch.object(cpa, "REPO", root):
+                    with self.assertRaises(SystemExit) as caught:
+                        cpa.cron_rosters()
+                self.assertIn("agents/platform/cron/jobs.json", str(caught.exception))
+                self.assertIn("jobs", str(caught.exception))
+
+    def test_a_job_with_no_id_names_the_file_and_the_index(self):
+        """Every message the cron rules print interpolates `job['id']`.
+
+        A job missing it therefore turned a finding into a traceback from
+        whichever rule reached it first, which is neither the finding nor a
+        clue about where to look.
+        """
+        for jobs in ([{"deliver": "chat"}], [{"id": "  "}], ["chat"]):
+            with self.subTest(jobs=jobs), TemporaryDirectory() as directory:
+                root = self._roster_repo(directory, {"jobs": jobs})
+                with mock.patch.object(cpa, "REPO", root):
+                    with self.assertRaises(SystemExit) as caught:
+                        cpa.cron_rosters()
+                message = str(caught.exception)
+                self.assertIn("agents/platform/cron/jobs.json", message)
+                self.assertIn("index 0", message)
+
+    def test_a_well_formed_roster_still_loads(self):
+        """The guards must not refuse the shape the repository actually ships."""
+        with TemporaryDirectory() as directory:
+            root = self._roster_repo(directory, {"jobs": [{"id": "audit"}]})
+            with mock.patch.object(cpa, "REPO", root):
+                self.assertEqual(
+                    [jobs for _, jobs in cpa.cron_rosters()], [[{"id": "audit"}]]
+                )
+
     def test_it_is_actually_looking_at_something(self):
         """A checker whose scope silently empties reports a clean repository.
 
@@ -953,6 +1109,162 @@ class RepositoryTests(unittest.TestCase):
                 f"{design} reaches no profile; checking it demands a rewrite "
                 "that breaks the citation for its only reader",
             )
+
+
+class CronDeliveryTests(unittest.TestCase):
+    """A `deliver` part the scheduler drops beside one it resolves.
+
+    An unresolvable part is skipped by `_resolve_delivery_targets` rather than
+    raising. Alone it becomes a recorded `no delivery target resolved` error the
+    delivery watch grades; next to a part that resolves, the run posts to the
+    good half, records `ok`, and the dropped half is invisible. `gchat` stands
+    in for that typo throughout: it is the abbreviation someone reaches for, it
+    is not a registered platform, and nothing outside this check would object.
+    """
+
+    def _findings(self, *jobs):
+        roster = [(REPO / "agents/platform/cron/jobs.json", list(jobs))]
+        with mock.patch.object(cpa, "REPO", REPO), mock.patch.object(
+            cpa, "cron_rosters", return_value=roster
+        ):
+            return cpa.check_cron_delivery()
+
+    def test_a_target_that_resolves_to_nothing_is_caught(self):
+        findings = self._findings({"id": "compliance-audit", "deliver": "gchat"})
+        self.assertEqual(len(findings), 1, findings)
+        message = str(findings[0])
+        self.assertIn("compliance-audit", message)
+        self.assertIn("'gchat'", message)
+        self.assertIn("post", message.lower())
+
+    def test_chat_is_this_repositorys_own_relay_and_not_a_typo(self):
+        """The check shipped with `chat` missing, calling nine live jobs broken.
+
+        `deploy/docker/plugins/chat/` posts the report through the Session KV
+        server, which runs a Chat Agent turn over it and delivers the result --
+        so `chat` is the value eight of the fleet audits are supposed to carry.
+        It looks dead from outside a cron child, because `profile_cron_tick.py`
+        is the only setter of its `CHAT_HOME_CHANNEL`; that is what a checker
+        author sees, and it is what this test exists to contradict.
+        """
+        self.assertEqual(self._findings({"id": "compliance-audit", "deliver": "chat"}), [])
+
+    def test_the_values_that_mean_something_all_pass(self):
+        for deliver in ("all", "chat", "local", "origin", "slack", "google_chat"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
+
+    def test_a_null_deliver_is_the_absent_key_the_runtime_reads_it_as(self):
+        """`raw = job.get("deliver") or ""` -- null and absent are one shape.
+
+        A `get` default fires on absence only, so an explicit `null` reached
+        the splitter as the string `None` and was reported as a job delivering
+        to `'None'`. That failed `make prompt-check` over a roster the
+        scheduler runs exactly as it runs one with no `deliver` key at all.
+        """
+        for job in ({"id": "j"}, {"id": "j", "deliver": None}):
+            with self.subTest(job=job):
+                self.assertEqual(self._findings(job), [])
+
+    def test_an_explicit_target_names_its_own_destination(self):
+        """`platform:chat_id` carries an install-specific id. Nothing to check."""
+        self.assertEqual(
+            self._findings({"id": "j", "deliver": "slack:D0BKGRBM6RH:17"}), []
+        )
+
+    def test_a_misspelled_prefix_drops_exactly_as_a_misspelled_bare_value_does(self):
+        """Skipping a part on sight of a colon let this shape through.
+
+        `gchat:spaces/AAA` resolves to no platform and drops silently, which
+        is the same silence a bare `gchat` buys -- so the prefix is checked
+        the same way the bare value is.
+        """
+        for deliver in ("gchat:spaces/AAA", "gchat:spaces/AAA:thread-1"):
+            with self.subTest(deliver=deliver):
+                findings = self._findings({"id": "j", "deliver": deliver})
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn(f"'{deliver}'", str(findings[0]))
+
+    def test_an_empty_prefix_is_caught_where_an_empty_part_is_not(self):
+        """Two different things that both look like "nothing before the colon".
+
+        `"chat,,slack"` is a stray comma -- the scheduler ignores it and no
+        delivery is lost. `":C123"` names no platform, resolves to nothing and
+        drops silently, so it is the failure this check exists for. One
+        emptiness test cannot serve both.
+        """
+        self.assertEqual(self._findings({"id": "j", "deliver": "chat,,slack"}), [])
+        for deliver in (":C123", ":", "slack:C1,:C2"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(len(self._findings({"id": "j", "deliver": deliver})), 1)
+
+    def test_the_gate_is_no_stricter_than_the_parser_it_guards(self):
+        """`_resolve_delivery_targets` case-folds the platform and takes `:`.
+
+        Both shapes deliver; flagging them would block a pull request over a
+        value the runtime handles fine.
+        """
+        for deliver in ("Slack:C123", "ALL"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
+
+    def test_a_semicolon_is_not_a_separator_and_is_reported(self):
+        """The gate must mirror the parser that *delivers*, not the relay's.
+
+        `cron/scheduler.py::_resolve_delivery_targets` splits on `,` alone, so
+        `chat;slack` is one part it cannot resolve, and beside a part that
+        does it drops silently while the job records `ok`. Splitting on `;`
+        here -- on the authority of the chat relay's token reader, which only
+        decides what the relay subtracts -- passed exactly that roster through
+        `make prompt-check`. Read out of the running pod on 2026-09-01.
+        """
+        for deliver in ("chat;slack", "chat; slack", "chat;gchat", ["chat;slack"]):
+            with self.subTest(deliver=deliver):
+                findings = self._findings({"id": "j", "deliver": deliver})
+                self.assertEqual(len(findings), 1, findings)
+
+    def test_every_part_of_a_comma_separated_list_is_checked(self):
+        """One good part must not vouch for a bad one.
+
+        This is the shape the bug would most plausibly come back in: someone
+        adds `all` alongside the value that was already there.
+        """
+        findings = self._findings({"id": "j", "deliver": "all,gchat"})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("'gchat'", str(findings[0]))
+
+    def test_a_list_is_flattened_the_way_the_scheduler_flattens_it(self):
+        """`_normalize_deliver_value` accepts a list, so reading one is not a bug.
+
+        Reporting the shape rather than the value would send someone to fix
+        something the scheduler runs happily.
+        """
+        self.assertEqual(self._findings({"id": "j", "deliver": ["all"]}), [])
+        self.assertEqual(len(self._findings({"id": "j", "deliver": ["gchat"]})), 1)
+
+    def test_a_list_entry_that_carries_a_separator_is_split_like_the_scheduler(self):
+        """`_normalize_deliver_value` joins the list on `,` and *then* splits.
+
+        Checking each list entry whole instead reads `"google_chat,slack"` as
+        one unknown target and fails the roster over a value the scheduler
+        resolves into two working ones. `make prompt-check` gates every pull
+        request here, so the false positive is repository-wide, not
+        roster-local.
+        """
+        self.assertEqual(
+            self._findings({"id": "j", "deliver": ["chat", "google_chat,slack"]}), []
+        )
+        # Still finds the bad half, rather than passing the whole entry.
+        findings = self._findings({"id": "j", "deliver": ["chat", "slack,gchat"]})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("'gchat'", str(findings[0]))
+
+    def test_an_absent_deliver_is_local_and_not_a_finding(self):
+        self.assertEqual(self._findings({"id": "j"}), [])
+
+    def test_the_rosters_in_this_tree_all_deliver_somewhere(self):
+        with mock.patch.object(cpa, "REPO", REPO):
+            self.assertEqual(cpa.check_cron_delivery(), [])
 
 
 class ProfileIsolationTests(unittest.TestCase):
@@ -1083,6 +1395,30 @@ class AnnotationTests(unittest.TestCase):
             ):
                 self.assertEqual(cpa.main(argv), 1)
         return buffer.getvalue()
+
+    def test_a_bad_deliver_part_fails_the_run_through_main(self):
+        """The gate is `main()`'s sum; a rule missing from it does not run.
+
+        `check_cron_delivery` has its own tests and the fixture runner calls it
+        by name, so dropping it from the sum left all of them green while
+        `make prompt-check` -- the one path the Makefile takes -- stopped
+        grading `deliver`. This goes through `main()` and nothing else.
+        """
+        with TemporaryDirectory() as directory:
+            fixture = ProfileFixture(Path(directory))
+            fixture.write(
+                "agents/platform/cron/jobs.json",
+                '{"jobs": [{"id": "audit", "deliver": "gchat", "risk": "low"}]}',
+            )
+            errors = io.StringIO()
+            with mock.patch.object(cpa, "REPO", fixture.root), mock.patch.dict(
+                cpa.os.environ, {}, clear=True
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                errors
+            ):
+                self.assertEqual(cpa.main([]), 1)
+        self.assertIn("cron-deliver", errors.getvalue())
+        self.assertIn("'gchat'", errors.getvalue())
 
     def test_a_broken_reference_is_annotated_under_actions(self):
         """End to end, and through the env rather than the flag.

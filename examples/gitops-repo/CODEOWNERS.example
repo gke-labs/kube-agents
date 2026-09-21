@@ -19,3 +19,7 @@
 # Declared intent: a knowledge/ note can move an audit posture off the ledger
 # (README, "Declared intent"), so it carries the same review as provisioning/
 /knowledge/                       @your-org/platform-admins
+
+# Intent bounds: .kube-agents/intent.yaml decides which paths' notes the audit reads, and
+# removing it opens the whole repository to them, so it carries the same review as knowledge/
+/.kube-agents/                    @your-org/platform-admins

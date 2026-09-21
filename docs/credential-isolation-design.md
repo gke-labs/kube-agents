@@ -109,7 +109,8 @@ directory.
 
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
-OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, and the `ALERT_DAILY_LIMIT_*` alert ceilings —
+OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, and the
+`FEEDBACK_PROMPT_*` switch and delay —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or change what code runs; `safeSandboxEnvOverrides` in
@@ -158,6 +159,8 @@ and the route table it feeds
 - PlatformAgent only.
 - Credentials managed by the operator.
 - CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
+- Read-only Google Cloud REST relay for the reads no CLI exposes
+  ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)).
 - Slack and Google Chat credentialed relays.
 - PlatformAgent API bearer-key termination in the `agent-api-auth` sidecar.
 - GitHub installation tokens minted through Minty.
@@ -720,6 +723,19 @@ Consequences:
   `SIGSEGV` on a deeply nested document, where the Python loader raises a
   catchable error. The input is chosen by the sandbox, so this is a
   denial-of-service boundary rather than a performance choice.
+
+### Cloud API reads
+
+`GET /v1/gcp/<host>/<path>?<query>` relays one Google REST read the sandbox cannot
+make itself. The credential runtime holds the request to normal form, checks the
+host, method and path against the code allowlist in
+`agents/platform/scripts/api_policy.py`, forwards it on its own identity with
+only its own `Authorization` and `Accept` headers and the credential-substituting
+query keys removed, and returns the upstream status, `Content-Type` and body
+unchanged under a response cap and a deadline. The shell role alone may call it;
+token-issuing hosts are refused before the table, redirects are not followed, and
+a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
+[`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
 
 ### Chat
 

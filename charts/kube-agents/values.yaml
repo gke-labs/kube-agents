@@ -105,6 +105,26 @@ operator:
     # and the audit SOP this project ships rules it out at every replica count
     # (obtainability_audit_sop.md 3.3).
     enabled: true
+  # Spread this workload's pods across nodes — the canonical home for this
+  # argument; litellm.topologySpread and githubMinter.topologySpread defer here.
+  #
+  # Renders nothing at replicaCount 1, which is the operator's default, so this
+  # knob only does anything on an install that raised it. A constraint over a
+  # single pod is satisfied by construction.
+  #
+  # At two or more replicas it renders maxSkew: 1 over kubernetes.io/hostname
+  # with whenUnsatisfiable: ScheduleAnyway. A PodDisruptionBudget does not cover
+  # this: maxUnavailable: 1 stalls a *drain* that would take every replica, but
+  # a node that fails takes whatever is on it, and without a constraint nothing
+  # keeps two replicas off one node. obtainability_audit_sop.md 3.8 is the
+  # source for both the hostname key and ScheduleAnyway — DoNotSchedule leaves
+  # the second replica Pending forever on a pool that cannot satisfy the skew,
+  # which is worse than the co-location it would prevent.
+  #
+  # Set to false where the scheduler is already constrained by something the
+  # chart cannot see and the hint would fight it.
+  topologySpread:
+    enabled: true
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
@@ -211,6 +231,16 @@ litellm:
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
+  # Output-token budget the gateway asks the provider for on a request that
+  # names none, rendered as max_tokens under every model_list alias. 0 leaves
+  # the key out, so the rendered config and its rollout checksum are what they
+  # were. Set it for a backend with one combined prompt-plus-output budget
+  # (vLLM, SGLang, TGI, llama.cpp), which refuses a request whose max_tokens
+  # alone fills the served window. A request that carries its own max_tokens
+  # keeps it: what that means for the agent's own traffic is on the site's
+  # inference-gateway page, "Setting the output-token budget". Chart-only;
+  # the kustomize dev base carries no such key.
+  maxTokens: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity, so the chart always creates this KSA — no operator reconciles it.
@@ -236,7 +266,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.100.0
+    tag: v1.100.1
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -279,13 +309,42 @@ litellm:
     # and the audit SOP this project ships rules it out at every replica count
     # (obtainability_audit_sop.md 3.3).
     enabled: true
+  topologySpread:
+    # Renders maxSkew: 1 over kubernetes.io/hostname at the default
+    # replicaCount of 2, same rationale as operator.topologySpread.
+    enabled: true
+  # The memory request is sized from this gateway's Cloud Monitoring history,
+  # not from a round number. A week on the reference install put it at p50
+  # 870Mi, p95 978Mi, peak 1098Mi per replica; thirty days across six more
+  # installs, Standard and Autopilot, idle to steadily loaded, put every p50
+  # between 725Mi and 1123Mi and the busiest install's mid-life peak at 1485Mi,
+  # load-driven and recurring rather than a leak. At the 512Mi it used to ask
+  # for, steady-state use was above the request everywhere, which is not a
+  # burst Burstable QoS absorbs — the scheduler under-books every node the
+  # gateway lands on, and kubelet ranks Burstable pods for eviction by exactly
+  # that overage, so the model gateway was first out under any node pressure.
+  # 2Gi is ceil(peak x 1.3) of the busiest install, rounded up to a multiple of
+  # 512Mi: it clears that install's 30-day peak by about 38% and its p95 by
+  # about 52%. The limit moves to 3Gi with it so the pod keeps burst room above
+  # the request rather than sitting at its limit. That is deliberately not the
+  # cost audit's ceil(peak x 2) resize rule (fleet_wide_cost_analysis_sop.md
+  # 3.1), which would put the request near 3Gi; 1.3x clears the observed peak
+  # with headroom at a lower standing cost.
+  #
+  # CPU stays at 100m on Standard: p50 is 3–6m on every install read and the
+  # 5-minute peaks, up to about 316m, sit under the 500m limit, so the request
+  # sits at the working level and the limit absorbs the spike. Autopilot
+  # enforces a CPU:memory ratio between 1:1 and 1:6.5 per vCPU and raises the
+  # smaller request to meet it, so there this 2Gi request is billed at roughly
+  # 315m of CPU per replica whatever this line says; that is accepted rather
+  # than fought with a request Standard does not need.
   resources:
     requests:
       cpu: 100m
-      memory: 512Mi
+      memory: 2Gi
     limits:
       cpu: 500m
-      memory: 2Gi
+      memory: 3Gi
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
   # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
   # dynamically by the operator with cluster-discovered DNS VIPs. When either
@@ -420,7 +479,8 @@ githubMinter:
   # KSA the chart renders.
   ksaName: kubeagents-github-minter
   gsaName: kubeagents-github-minter-gsa
-  # The GSA email allowed to request platform-agent-scope tokens. Empty
+  # The GSA email allowed to request tokens from either scope in the minty
+  # rule (platform-agent-scope and platform-agent-read-scope). Empty
   # derives kubeagents-platform-gsa@<harness.projectId>.iam.gserviceaccount.com.
   allowedServiceAccount: ""
   kms:
@@ -439,10 +499,23 @@ githubMinter:
     tag: v2.7.1-amd64
     pullPolicy: IfNotPresent
   replicaCount: 2
+  # Sized from Cloud Monitoring history at 5-minute resolution: a week on the
+  # reference install puts this minter at 0.71m of CPU and 12.17Mi of memory
+  # per replica, and thirty days on the one other install that runs it at a
+  # 2.7m / 20Mi peak. It is a Go binary that wakes to sign a token and goes
+  # back to sleep, so the old 100m/128Mi reserved roughly 140x the CPU and 10x
+  # the memory it has ever used, on every node both replicas land on.
+  #
+  # 50m/64Mi is the smallest request the cost audit's own resize rule will
+  # write (`ceil(peak x 2)` clamped up to that floor). The audit itself would
+  # never flag this workload -- its reclaimable delta is far under the 2 vCPU /
+  # 4 GiB floor in fleet_wide_cost_analysis_sop.md 3.1 -- so both dimensions
+  # move on the measurement alone, to what the rule would write if it applied.
+  # The limits are untouched, so a burst still has 500m to reach into.
   resources:
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 50m
+      memory: 64Mi
     limits:
       cpu: 500m
       memory: 256Mi
@@ -450,6 +523,10 @@ githubMinter:
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. Deliberately not
     # configurable, same rationale as operator.podDisruptionBudget.
+    enabled: true
+  topologySpread:
+    # Renders maxSkew: 1 over kubernetes.io/hostname at the default
+    # replicaCount of 2, same rationale as operator.topologySpread.
     enabled: true
 
 # The logging sidecar the operator injects into every agent pod. The chart

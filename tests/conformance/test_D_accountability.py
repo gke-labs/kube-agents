@@ -382,10 +382,36 @@ class D5AvailabilityAndCostAreSecurityProperties(unittest.TestCase):
     refusal rather than to a weaker model, a weaker check, a longer cache or a
     permissive fallback.
 
-    No budget of any kind is enforced in this repository. Without one, the
-    "degrades to refusal" clause has no subject: there is no exhaustion event
-    to assert the behaviour of. Writing a test that model routing exists and is
-    configured would assert a fact about LiteLLM, not the invariant.
+    Amended 9/16: two budgets now exist on the A2A bus, and neither makes this
+    bucket 1. They are recorded here so that "no budget of any kind" does not
+    quietly stay written after it stopped being true.
+
+    TASKS is created with max_msgs_per_subject, which bounds one task's own
+    event history so a runaway cannot evict every other session's. Created
+    with, not converged to: provisioning never edits an existing stream, so an
+    install whose stream predates the limit is told about the gap and left to
+    apply it, because applying it evicts. It is a budget,
+    and crossing it DEGRADES rather than refuses: discard=old evicts the head,
+    so a truncated task replays without its `submitted` event. That is the
+    behaviour this invariant says exhaustion must not have, so pinning it as a
+    D5 control would encode the gap as an intention. What the change does do is
+    make the degradation visible -- lib.Task.SubmittedMissing reports it -- and
+    that is pinned in the a2a module's own tests, where the fold is.
+
+    TASKS also derives max_consumers from spec.harness.tuning.maxSessions, and
+    that one IS a refusal: the provision Job fails at configuration time when
+    the live stream cannot hold the configured concurrency, and the server
+    refuses the consumer create past the cap. It is still not this invariant.
+    The budget is per-install capacity with the operator as its owner, not the
+    per-tenant, per-principal budget over tokens, sessions and tool invocations
+    that D5 names, and asserting install capacity here would answer a narrower
+    question while reading as though it answered this one.
+
+    Otherwise no budget is enforced in this repository, and without one the
+    "degrades to refusal" clause has no subject for the surfaces that matter:
+    there is no exhaustion event on tokens or tool calls to assert the
+    behaviour of. Writing a test that model routing exists and is configured
+    would assert a fact about LiteLLM, not the invariant.
 
     One adjacent property *is* asserted, in test_C_enforcement.py: the read-only
     decision is a pure function of argv, so no model, tier or budget state can

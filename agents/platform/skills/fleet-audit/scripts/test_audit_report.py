@@ -12,6 +12,7 @@ commands that do touch the network are driven through a single recorded seam
 
 import contextlib
 import copy
+import importlib.util
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +41,7 @@ import content_workspace  # noqa: E402
 import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import workspace_paths  # noqa: E402
 
 
 @dataclass
@@ -319,6 +322,26 @@ def ran(check, cluster="prod-us-east"):
     }
 
 
+def resolved_for(previous_body):
+    """A `resolved_because` entry for every finding a previous body carries.
+
+    A clean run over a ledger that carried findings has to account for each
+    one (#1683): the fixture's full-roster `checks_run` says every check ran
+    again, so without these the close is held. Tests about the close itself
+    use this; tests about the hold build the silence on purpose.
+    """
+    return [
+        {
+            "check": fid.split(".", 1)[0],
+            "cluster": where["cluster"],
+            "namespace": where["namespace"],
+            "object": where["object"],
+            "reason": "Re-ran the check on this cluster; the object is gone from the listing.",
+        }
+        for fid, where in audit_report.parse_finding_locations(previous_body).items()
+    ]
+
+
 def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
     if clusters is None:
         clusters = [
@@ -403,6 +426,7 @@ class Recorder:
         # what a caller asserts about a body should not change with how the
         # body reaches `gh`. See `bodies_for` for why the seam exists at all.
         self.bodies: list[str | None] = []
+        self.envs: list[dict | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # `git diff --cached --quiet` is the harness's commit classifier: rc 0
@@ -416,9 +440,11 @@ class Recorder:
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None, env=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
+        # The environment the call named, None when it inherited the process's.
+        self.envs.append(env)
         self.bodies.append(self._read_body(cmd, stdin))
         joined = " ".join(cmd)
         for key, code in self.failures.items():
@@ -641,6 +667,11 @@ class HarnessTestCase(BaseTestCase):
         context = patch.object(gitops_workspace, "get_context_github_repos", lambda: [])
         context.start()
         self.addCleanup(context.stop)
+        entries = patch.object(
+            gitops_workspace, "get_context_github_repo_entries", lambda: []
+        )
+        entries.start()
+        self.addCleanup(entries.stop)
         # Most tests describe a pod that has audited before, so the clone
         # already exists and `ensure_workspace` takes the fetch path. Tests
         # about the first run call `self.unclone()` to remove it.
@@ -1777,6 +1808,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "kanban-board-health",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
+                "feedback-prompt",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
@@ -1993,6 +2025,54 @@ class TestAuditCatalogue(unittest.TestCase):
                     audit_report.audit_declarable_checks(audit_id),
                     frozenset(spec.declarable),
                 )
+
+    def test_scopes_partition_the_roster(self):
+        """Every check a partitioned stream defines is owed by some target kind.
+
+        The union has to be exactly `checks`. A slug in the roster and in no
+        kind is owed by nobody: it would drop out of every denominator and the
+        stream would report full coverage without it ever running — the same
+        silent hole `checks` itself exists to close, reintroduced one level
+        down. A slug in a kind and not the roster is a typo that would quietly
+        widen that kind's denominator by a check no SOP defines. Holds
+        trivially while no roster declares `scopes`; it is here for the first
+        one that does.
+        """
+        for audit_id, spec in audit_report.AUDITS.items():
+            if not spec.scopes:
+                continue
+            with self.subTest(audit=audit_id):
+                kinds = [kind for kind, _ in spec.scopes]
+                self.assertEqual(
+                    sorted(kinds),
+                    sorted(set(kinds)),
+                    f"{audit_id} declares a target kind twice: {kinds}",
+                )
+                owned: set[str] = set()
+                for kind, checks in spec.scopes:
+                    self.assertTrue(checks, f"{audit_id}/{kind} owns no checks")
+                    owned |= set(checks)
+                self.assertEqual(
+                    owned,
+                    set(spec.checks),
+                    f"AUDITS[{audit_id!r}].scopes and .checks disagree: "
+                    f"unowned={sorted(set(spec.checks) - owned)} "
+                    f"unknown={sorted(owned - set(spec.checks))}",
+                )
+
+    def test_every_scope_kind_is_one_a_target_name_can_resolve_to(self):
+        """A kind no `scope.clusters` name can ever resolve to owns nothing.
+
+        `audit_target_checks` maps a name to a kind with `target_kind`, so a
+        `scopes` entry keyed anything else is dead data — and worse than dead,
+        because the checks parked under it are absent from the kinds that do
+        resolve, leaving them owed by nobody in practice while
+        `test_scopes_partition_the_roster` still sees them in the union.
+        """
+        for audit_id, spec in audit_report.AUDITS.items():
+            for kind, _ in spec.scopes:
+                with self.subTest(audit=audit_id, kind=kind):
+                    self.assertIn(kind, audit_report.TARGET_KINDS)
 
     def test_check_rosters_match_the_sops(self):
         """The roster is the SOP's check list, or it is a lie the validator tells.
@@ -2468,10 +2548,31 @@ class TestAuditCatalogue(unittest.TestCase):
 
 class TestProtectedBranches(unittest.TestCase):
     def test_refuses_to_push_protected_branch(self):
-        for branch in ("main", "master", "production", "MAIN", " main "):
+        for branch in (
+            "main", "master", "production", "MAIN", " main ",
+            "refs/heads/main", "heads/main", "refs/heads/master",
+        ):
             with self.subTest(branch=branch):
                 with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
                     audit_report.assert_pushable(branch)
+
+        # Run branches are refused unconditionally without env overrides (#1498)
+        for branch in (
+            "run/test-cluster/fix-task",
+            "refs/heads/run/test-cluster/fix-task",
+            "heads/run/test-cluster/fix-task",
+        ):
+            with self.subTest(branch=branch):
+                with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                    audit_report.assert_pushable(branch)
+
+        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
+            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                audit_report.assert_pushable("custom-gitops-base")
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
+            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
+                audit_report.assert_pushable("custom-broker-base")
 
     def test_remediation_branch_is_pushable(self):
         # The audit report branch is gone; the only branch the harness ever
@@ -2681,6 +2782,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -2741,6 +2843,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -2885,7 +2988,9 @@ class TestPublishedBodies(HarnessTestCase):
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": previous_body}),
         }
-        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
 
         comments = self.harness.bodies_for("issue", "comment")
         self.assertEqual(len(comments), 1)
@@ -2995,7 +3100,9 @@ class TestFinishClean(HarnessTestCase):
             "--json body": json.dumps({"body": previous_body}),
         }
 
-        rc = self.run_finish(make_doc(findings=[]))
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc)
         self.assertEqual(rc, 0)
 
         self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
@@ -3023,6 +3130,7 @@ class TestFinishClean(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -3056,6 +3164,7 @@ class TestFinishClean(HarnessTestCase):
                 "coverage_gaps": [],
                 "declared": 0,
                 "postures_withheld": [],
+                "unaccounted": [],
             },
         )
 
@@ -3103,6 +3212,467 @@ class TestFinishClean(HarnessTestCase):
         self.assertIn("Autopilot: node-level checks did not run", comment)
 
 
+class TestCleanCommentEvidence(BaseTestCase):
+    """The clean comment carries the commands behind the all-clear.
+
+    A clean run closes the ledger without rewriting it, so the comment used to
+    be the only durable trace of the run — and it named the date and the
+    clusters, nothing else. On 2026-09-16 evals-6 ledger #29 was closed as
+    clean over a live cluster-admin binding, and nothing on the issue said
+    what the run had asked the fleet (#1683).
+    """
+
+    def test_the_closing_comment_carries_the_evidence_table(self):
+        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW)
+        self.assertIn("closed as completed", comment)
+        self.assertIn("How this run checked the fleet", comment)
+        for cluster in ("prod-us-east", "stage-eu"):
+            self.assertIn(ran("netpol-missing", cluster)["command"], comment)
+
+    def test_the_gap_comment_carries_it_too(self):
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "prod-eu-1", "reason": "API server unreachable"}],
+        )
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        self.assertIn("the ledger stays open", comment.lower())
+        self.assertIn("How this run checked the fleet", comment)
+
+    def test_the_table_is_dropped_whole_rather_than_clipped(self):
+        # 900 clusters times the full roster does not fit under the limit. The
+        # comment still posts, and carries no table rather than half of one.
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": f"c-{i:04d}", "location": "us-east1", "project": "acme"}
+                for i in range(900)
+            ],
+        )
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        self.assertLess(len(comment), GITHUB_BODY_LIMIT)
+        self.assertNotIn("How this run checked the fleet", comment)
+        self.assertNotIn("truncated by audit_report.py", comment)
+
+
+# The finding the 2026-09-16 false clean was about: a cluster-scoped binding,
+# named by the command that would show it.
+HELD_CHECK = "cluster-admin-binding"
+HELD_OBJECT = "ClusterRoleBinding/debug-binding"
+NAMING_COMMAND = (
+    "kubectl --context prod-us-east get clusterrolebinding debug-binding -o yaml"
+)
+
+
+def held_finding():
+    return make_finding(
+        fid="debug",
+        check=HELD_CHECK,
+        namespace="",
+        obj=HELD_OBJECT,
+        title="debug-binding grants cluster-admin to a default service account",
+        command=NAMING_COMMAND,
+        remediation={"kind": "manual", "note": "Delete the binding."},
+    )
+
+
+def held_id():
+    return derived_id(check=HELD_CHECK, namespace="", obj=HELD_OBJECT)
+
+
+def naming_doc(findings=None, command=NAMING_COMMAND, **kwargs):
+    """A document whose prod-us-east `cluster-admin-binding` command names the binding."""
+    doc = make_doc(findings=findings if findings is not None else [], **kwargs)
+    for cluster in doc["scope"]["clusters"]:
+        if cluster["name"] != "prod-us-east":
+            continue
+        for entry in cluster["checks_run"]:
+            if entry["check"] == HELD_CHECK:
+                entry["command"] = command
+    return doc
+
+
+def without_held_check(**kwargs):
+    """A clean document whose prod-us-east did not run `cluster-admin-binding`.
+
+    Declared not applicable there rather than left out, so coverage stays
+    complete and the clean path is the one exercised, not the gap.
+    """
+    doc = make_doc(findings=[], **kwargs)
+    for cluster in doc["scope"]["clusters"]:
+        if cluster["name"] != "prod-us-east":
+            continue
+        cluster["checks_run"] = [e for e in cluster["checks_run"] if e["check"] != HELD_CHECK]
+        cluster["checks_not_applicable"] = [
+            {
+                "check": HELD_CHECK,
+                "reason": "GKE Autopilot: user ClusterRoleBindings to cluster-admin are rejected by admission.",
+            }
+        ]
+    return doc
+
+
+def resolved_entry(**overrides):
+    entry = {
+        "check": HELD_CHECK,
+        "cluster": "prod-us-east",
+        "object": HELD_OBJECT,
+        "reason": (
+            "kubectl get clusterrolebinding debug-binding returned NotFound; "
+            "the binding was deleted on 2026-09-16."
+        ),
+    }
+    entry.update(overrides)
+    return entry
+
+
+class TestUnaccountedJoin(unittest.TestCase):
+    """The pure half of the held close: reading the body and joining on the check."""
+
+    def test_locations_are_read_back_off_the_body(self):
+        body = published_body(
+            make_doc(findings=[make_finding(fid="a"), held_finding()]), generated_at=NOW
+        )
+        locations = audit_report.parse_finding_locations(body)
+        self.assertEqual(
+            locations[derived_id(fid="a")],
+            {
+                "title": "Namespace has no NetworkPolicy",
+                "cluster": "prod-us-east",
+                "namespace": "payments",
+                "object": "Namespace/a",
+            },
+        )
+        scoped = locations[held_id()]
+        self.assertEqual(scoped["namespace"], "")
+        self.assertEqual(scoped["object"], HELD_OBJECT)
+
+    def test_an_empty_or_unreadable_body_has_no_locations(self):
+        self.assertEqual(audit_report.parse_finding_locations(""), {})
+        self.assertEqual(audit_report.parse_finding_locations(None), {})
+
+    def test_the_join_holds_what_was_checked_again_and_left_unexplained(self):
+        body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
+
+        # The SOP's own fleet-wide listing counts as having checked the
+        # binding: the join is on the check, not on the command naming the
+        # object (compliance_audit_sop.md's command for this check is
+        # `kubectl get clusterrolebindings -o json | jq …`, which names none).
+        listing = make_doc(findings=[])
+        held = audit_report.unaccounted_previous_findings(body, listing)
+        self.assertEqual([entry["id"] for entry in held], [held_id()])
+        self.assertEqual(held[0]["object"], HELD_OBJECT)
+        self.assertEqual(held[0]["check"], HELD_CHECK)
+        self.assertEqual(
+            held[0]["commands"],
+            [
+                entry["command"]
+                for cluster in listing["scope"]["clusters"]
+                if cluster["name"] == "prod-us-east"
+                for entry in cluster["checks_run"]
+                if entry["check"] == HELD_CHECK
+            ],
+        )
+        # A targeted command holds the same way.
+        held = audit_report.unaccounted_previous_findings(body, naming_doc())
+        self.assertEqual(held[0]["commands"], [NAMING_COMMAND])
+
+        # Reported again: not held.
+        self.assertEqual(
+            audit_report.unaccounted_previous_findings(
+                body, naming_doc(findings=[held_finding()])
+            ),
+            [],
+        )
+        # Explained: not held.
+        explained = naming_doc()
+        explained["resolved_because"] = [resolved_entry()]
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, explained), [])
+        # The check did not run on that cluster this run: not held — the
+        # harness cannot say the run looked.
+        self.assertEqual(
+            audit_report.unaccounted_previous_findings(body, without_held_check()), []
+        )
+        # The cluster was not read this run: not held.
+        elsewhere = naming_doc(
+            clusters=[{"name": "stage-eu", "location": "europe-west1", "project": "acme"}]
+        )
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, elsewhere), [])
+        # No body to join against: nothing held.
+        self.assertEqual(audit_report.unaccounted_previous_findings(None, naming_doc()), [])
+
+    def test_a_carried_posture_that_moved_under_declared_is_accounted_for(self):
+        # The designed retirement path for a posture finding: a declaration
+        # appears in a linked repository and the next run moves the object
+        # under `declared`. Present and accounted for, not "not written down".
+        body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
+        doc = make_doc(findings=[])
+        doc["declared"] = [make_declared(check=HELD_CHECK, namespace="", obj=HELD_OBJECT)]
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, doc), [])
+
+    def test_the_held_comment_carries_the_declared_and_resolved_entries(self):
+        # A held run is not rewritten either, so the comment is where a
+        # declaration's pointer and a resolved reason get published.
+        doc = make_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        doc["resolved_because"] = [resolved_entry(object="ClusterRoleBinding/other")]
+        held = [
+            {
+                "id": held_id(),
+                "title": "t",
+                "check": HELD_CHECK,
+                "cluster": "prod-us-east",
+                "namespace": "",
+                "object": HELD_OBJECT,
+                "commands": ["kubectl get clusterrolebindings -o json"],
+            }
+        ]
+        comment = audit_report.render_held_comment(AUDIT, doc, held, NOW)
+        self.assertIn("declared at `acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
+        self.assertIn("confirmed gone, in its own words", comment)
+        self.assertIn(resolved_entry()["reason"], comment)
+        self.assertLess(comment.index("stays open"), comment.index("confirmed gone"))
+
+    def test_the_check_must_have_run_on_the_previous_cluster(self):
+        # The check ran on stage-eu only; the finding was on prod-us-east. A
+        # different cluster's check says nothing about it.
+        body = published_body(make_doc(findings=[held_finding()]), generated_at=NOW)
+        doc = without_held_check()
+        self.assertTrue(
+            any(
+                entry["check"] == HELD_CHECK
+                for cluster in doc["scope"]["clusters"]
+                if cluster["name"] == "stage-eu"
+                for entry in cluster["checks_run"]
+            )
+        )
+        self.assertEqual(audit_report.unaccounted_previous_findings(body, doc), [])
+
+
+class TestResolvedBecauseValidation(unittest.TestCase):
+    def doc(self, *entries, findings=()):
+        doc = make_doc(findings=list(findings))
+        doc["resolved_because"] = list(entries)
+        return doc
+
+    def rejects(self, doc, *needles):
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        for needle in needles:
+            self.assertIn(needle, str(exc.exception))
+
+    def test_a_well_formed_entry_validates(self):
+        audit_report.validate_findings(self.doc(resolved_entry()), AUDIT)
+        audit_report.validate_findings(
+            self.doc(resolved_entry(namespace="payments", object="Namespace/payments")),
+            AUDIT,
+        )
+
+    def test_an_empty_list_and_an_absent_key_are_the_same(self):
+        audit_report.validate_findings(self.doc(), AUDIT)
+        audit_report.validate_findings(make_doc(findings=[]), AUDIT)
+
+    def test_not_a_list_is_rejected(self):
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_entry()
+        self.rejects(doc, "resolved_because: must be a list")
+
+    def test_an_unknown_check_is_rejected_without_the_roster(self):
+        doc = self.doc(resolved_entry(check="rbac-2.4"))
+        self.rejects(doc, "resolved_because[0].check", "rbac-2.4")
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertNotIn("privileged-container", str(exc.exception))
+
+    def test_a_cluster_this_run_did_not_read_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(cluster="dr-west")),
+            "resolved_because[0].cluster",
+            "not in scope.clusters",
+        )
+
+    def test_a_short_reason_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(reason="gone")),
+            "resolved_because[0].reason",
+            "too short",
+        )
+
+    def test_an_object_that_names_nothing_is_rejected(self):
+        self.rejects(self.doc(resolved_entry(object="///")), "resolved_because[0].object")
+
+    def test_an_entry_that_is_also_a_finding_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(), findings=[held_finding()]),
+            "resolved_because[0]",
+            "same identity as findings[0]",
+        )
+
+    def test_a_duplicate_entry_is_rejected(self):
+        self.rejects(
+            self.doc(resolved_entry(), resolved_entry(reason="Deleted; second copy of the same line.")),
+            "resolved_because[1]",
+            "duplicate",
+        )
+
+
+class TestHeldClose(HarnessTestCase):
+    """A clean run is not closed over a finding it looked at again and did not explain.
+
+    Rep 2 of the 2026-09-16 nightly closed evals-6 ledger #29 with "0 findings
+    across 4 audited cluster(s)" while the planted binding was live. From the
+    document alone the harness cannot tell a fixed finding from an omitted
+    one, so when the previous body carried a finding and this run says the
+    same check ran on that cluster again, the run is asked to say which (#1683).
+    """
+
+    def previous_ledger(self, *findings):
+        body = published_body(
+            make_doc(findings=list(findings) or [held_finding()]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": body}),
+        }
+
+    def test_the_close_is_refused_when_the_check_ran_on_that_cluster_again(self):
+        self.previous_ledger()
+        # The fixture's default `checks_run` is the SOP's fleet-wide listing,
+        # which is exactly what rep 2 of 2026-09-16 would have written.
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        comments = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(comments), 1)
+        comment = comments[0]
+        self.assertIn("the ledger stays open", comment)
+        self.assertNotIn("closed as completed", comment)
+        self.assertIn(held_id(), comment)
+        self.assertIn("debug-binding grants cluster-admin", comment)
+        self.assertIn(f"`{HELD_OBJECT}`", comment)
+        self.assertIn("_cluster-scoped_", comment)
+        self.assertIn(f"`{HELD_CHECK}` ran there as", comment)
+        self.assertIn("resolved_because", comment)
+        self.assertIn("`carried`", comment)
+        # The evidence table travels with the refusal too.
+        self.assertIn("How this run checked the fleet", comment)
+
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["issue_url"], "https://github.com/acme/fleet/issues/42")
+        self.assertEqual(payload["resolved"], 0)
+        self.assertFalse(payload["silent_ok"])
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["coverage_gaps"], [])
+        self.assertEqual(payload["unaccounted"], [held_id()])
+        self.assertIn("UNACCOUNTED:", self.err)
+        self.assertIn("stays open", self.err)
+
+    def test_a_refused_close_retires_no_remediation_pull_request(self):
+        self.previous_ledger(held_finding(), make_finding(fid="a"))
+        self.harness.replies["pr list"] = json.dumps(
+            [
+                pr(
+                    8,
+                    "platform-agent/fix-x-gone",
+                    body=audit_report.delta_block([derived_id(fid="a")]),
+                )
+            ]
+        )
+        self.assertEqual(self.run_finish(naming_doc()), 0)
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+
+    def test_a_resolved_because_entry_lets_the_ledger_close(self):
+        self.previous_ledger()
+        doc = naming_doc()
+        doc["resolved_because"] = [resolved_entry()]
+        self.assertEqual(self.run_finish(doc), 0)
+
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        comments = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(comments), 1)
+        self.assertIn("closed as completed", comments[0])
+        # The reason that retired the finding is published with the close,
+        # next to the evidence table; validated-and-dropped would be a claim
+        # made to the harness and nobody else.
+        self.assertIn("confirmed gone, in its own words", comments[0])
+        self.assertIn(f"`{held_id()}` — {resolved_entry()['reason']}", comments[0])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["resolved"], 1)
+        self.assertFalse(payload["silent_ok"])
+        self.assertEqual(payload["unaccounted"], [])
+
+    def test_a_check_that_did_not_run_on_that_cluster_holds_nothing(self):
+        # Declared not applicable on prod-us-east: the run did not look, so
+        # the harness cannot say it saw the finding gone or left it out. The
+        # excuse is published in the evidence table for a reviewer to weigh.
+        self.previous_ledger()
+        self.assertEqual(self.run_finish(without_held_check()), 0)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["unaccounted"], [])
+
+    def test_an_unreadable_previous_body_holds_nothing_and_closes_nothing(self):
+        # Same rule as the delta: nothing can be joined against a body that
+        # could not be read, so nothing is claimed either way — and, since the
+        # collector contract landed, nothing is closed over it either: the
+        # ledger body is the only memory of what a collector holds, so a run
+        # that cannot read it leaves it as it was and reports partial. (This
+        # test asserted the close before that change; it is the one place the
+        # manifest-less path moved, deliberately — see the collector design.)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"issue view": 1}
+        self.assertEqual(self.run_finish(naming_doc()), 0)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertTrue(payload["partial"])
+        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertEqual(payload["unaccounted"], [])
+
+    def test_a_gap_takes_precedence_over_the_hold(self):
+        # Over a gap the ledger stays open anyway and the comment says why; the
+        # hold is not computed on top of it, so the JSON says one thing.
+        self.previous_ledger()
+        doc = naming_doc(skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
+        self.assertEqual(self.run_finish(doc), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["unaccounted"], [])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_a_standing_remediate_is_told_the_ledger_stays_open(self):
+        self.previous_ledger()
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {held_id()}")]}
+        )
+        self.assertEqual(self.run_finish(naming_doc()), 0)
+        answers = [
+            b for b in self.harness.bodies_for("issue", "comment") if "/remediate" in b
+        ]
+        self.assertEqual(len(answers), 1)
+        self.assertNotIn("closing as completed", answers[0])
+        self.assertIn("stays open", answers[0])
+        # The held reason, not the coverage one: this run read the whole fleet.
+        self.assertIn("did not account for", answers[0])
+        self.assertNotIn("could not see the whole fleet", answers[0])
+        # And not the clean one either: the target is one of the findings the
+        # run did not account for, so it has not "stopped reproducing".
+        self.assertNotIn("no longer reproduces", answers[0])
+        self.assertNotIn("nobody needs", answers[0])
+        self.assertIn(f"`{held_id()}`", answers[0])
+
+    def test_a_finding_that_stays_on_the_ledger_carries_the_field_empty(self):
+        self.previous_ledger()
+        self.assertEqual(self.run_finish(naming_doc(findings=[held_finding()])), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "UPDATED")
+        self.assertEqual(payload["unaccounted"], [])
+
+
 # --------------------------------------------------------------------------- #
 # start
 # --------------------------------------------------------------------------- #
@@ -3122,6 +3692,10 @@ class TestStart(HarnessTestCase):
         self.patch_attr(
             "run_record_path_for",
             lambda audit_id: str(self.tmp_path / f"run_{audit_id}.json"),
+        )
+        self.patch_attr(
+            "declarations_path_for",
+            lambda audit_id: str(self.tmp_path / f"declarations_{audit_id}.json"),
         )
 
     def test_emits_one_json_line(self):
@@ -3143,8 +3717,18 @@ class TestStart(HarnessTestCase):
                 "workspace": str(self.workspace),
                 "findings_path": str(self.tmp_path / "findings_compliance-audit.json"),
                 "pending_remediation_requests": [],
+                "carried": [],
                 "context_repos": [],
                 "declared_intent_repos": ["acme/fleet"],
+                # A stream with no declared-intent step searches nothing on
+                # the harness's behalf, and says so with empty lists rather
+                # than by leaving the keys out.
+                "declared_intent_searched": [],
+                "declared_intent_sources": [],
+                "declared_intent_unsearched": [],
+                "declarations_path": str(
+                    self.tmp_path / "declarations_compliance-audit.json"
+                ),
                 "sop": "governance/compliance_audit_sop.md",
                 "checks": list(audit_report.audit_checks(AUDIT)),
             },
@@ -3161,6 +3745,46 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+
+    def test_start_hands_over_the_findings_the_ledger_carries(self):
+        # The worker cannot write `resolved_because` for a finding it was
+        # never told about; `start` is the one place it is told.
+        body = published_body(
+            make_doc(findings=[held_finding(), make_finding(fid="a")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": body}),
+        }
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        carried = json.loads(self.out.strip())["carried"]
+        self.assertEqual([entry["id"] for entry in carried], sorted([held_id(), derived_id(fid="a")]))
+        held = next(entry for entry in carried if entry["id"] == held_id())
+        self.assertEqual(
+            held,
+            {
+                "id": held_id(),
+                "check": HELD_CHECK,
+                "title": "debug-binding grants cluster-admin to a default service account",
+                "cluster": "prod-us-east",
+                "namespace": "",
+                "object": HELD_OBJECT,
+            },
+        )
+        # And the entry is what `resolved_because` takes, minus the reason.
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = [
+            {k: v for k, v in held.items() if k in ("check", "cluster", "namespace", "object")}
+            | {"reason": "kubectl get clusterrolebinding debug-binding: NotFound."}
+        ]
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_an_unreadable_body_hands_over_nothing_and_says_so(self):
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json body": 1}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(self.out.strip())["carried"], [])
+        self.assertIn("could not read issue #42", self.err)
 
     def test_start_hands_over_the_roster(self):
         """Coverage must not depend on how far into the SOP the worker read.
@@ -3199,8 +3823,8 @@ class TestStart(HarnessTestCase):
         self.harness.replies = {"issue list": "[]"}
         with patch.object(
             gitops_workspace,
-            "get_context_github_repos",
-            lambda: ["acme/terraform-live", "acme/fleet"],
+            "get_context_github_repo_entries",
+            lambda: context_entries("acme/terraform-live", "acme/fleet"),
         ):
             self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         payload = json.loads(self.out)
@@ -3218,7 +3842,7 @@ class TestStart(HarnessTestCase):
         def unreadable():
             raise RuntimeError("kubectl failed: Forbidden")
 
-        with patch.object(gitops_workspace, "get_context_github_repos", unreadable):
+        with patch.object(gitops_workspace, "get_context_github_repo_entries", unreadable):
             self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(self.out)["context_repos"], [])
         self.assertIn("could not read context_repos", self.err)
@@ -3485,6 +4109,19 @@ SEARCH_SHA = "0123456789abcdef0123456789abcdef01234567"
 def searched(*slugs, sha=SEARCH_SHA):
     """A `declared_intent_searched` list: each slug read at one sha."""
     return [f"{slug}@{sha}" for slug in slugs]
+
+
+def context_entries(*slugs, ref=None, refused_ref=None):
+    """What `get_context_github_repo_entries` returns for `slugs`, each at `ref`.
+
+    `refused_ref` is what the entry carries instead when its pin failed the
+    branch-name check: `ref` is then None and the value rides beside it.
+    """
+    entries = [{"repo": slug, "ref": ref} for slug in slugs]
+    if refused_ref is not None:
+        for entry in entries:
+            entry["refused_ref"] = refused_ref
+    return entries
 
 
 def searched_doc(findings=None, repos=("acme/fleet",), **kwargs):
@@ -4297,24 +4934,32 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         real = audit_report.write_run_record
         printed_before_write = []
 
-        def spy(audit_id, repo, context):
+        def spy(audit_id, repo, context, **kwargs):
             # A crash between the write and the print leaves a record; one
             # between the print and a write would leave none, and the run
             # would go on to withhold. Only the first order is acceptable.
             printed_before_write.append(sys.stdout.getvalue())
-            return real(audit_id, repo, context)
+            return real(audit_id, repo, context, **kwargs)
 
         self.patch_attr("write_run_record", spy)
         with patch.object(
             gitops_workspace,
-            "get_context_github_repos",
-            lambda: ["acme/terraform-live", "acme/fleet"],
+            "get_context_github_repo_entries",
+            lambda: context_entries("acme/terraform-live", "acme/fleet"),
         ):
             self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(printed_before_write, [""])
+        # The recorder answers `git rev-parse HEAD` and the context clone with
+        # nothing, so the harness's own search read neither repository and
+        # the record says so: `TestDeclaredIntentDiscovery` is where it reads.
         self.assertEqual(
             audit_report.read_run_record(DECLARING_AUDIT),
-            {"repo": "acme/fleet", "context_repos": ["acme/terraform-live", "acme/fleet"]},
+            {
+                "repo": "acme/fleet",
+                "context_repos": ["acme/terraform-live", "acme/fleet"],
+                "searched": [],
+                "sources": [],
+            },
         )
         payload = json.loads(self.out)
         self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
@@ -4498,8 +5143,1555 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(
             audit_report.read_run_record(DECLARING_AUDIT),
-            {"repo": "acme/fleet", "context_repos": []},
+            {"repo": "acme/fleet", "context_repos": [], "searched": [], "sources": []},
         )
+
+
+# --------------------------------------------------------------------------- #
+# Harness-side declaration discovery and matching (the obtainability SOP's §4a)
+# --------------------------------------------------------------------------- #
+
+
+def note(declares=None, *, type_="observation", title="checkout-gateway runs unbudgeted", body="", raw=None):
+    """One OKF note: frontmatter carrying `type` and, when given, `declares`."""
+    if raw is not None:
+        return raw
+    front = []
+    if type_ is not None:
+        front.append(f"type: {type_}")
+    if title is not None:
+        front.append(f"title: {title}")
+    if declares is not None:
+        front.append("declares:")
+        for item in declares:
+            if not isinstance(item, dict):
+                front.append(f"  - {json.dumps(item)}")
+                continue
+            first = True
+            for key, value in item.items():
+                prefix = "  - " if first else "    "
+                first = False
+                front.append(f"{prefix}{key}: {json.dumps(value)}")
+    return "---\n" + "\n".join(front) + "\n---\n" + body
+
+
+def declaration(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway", cluster=None):
+    """One `declares:` item."""
+    item = {"check": check, "namespace": namespace, "object": obj}
+    if cluster is not None:
+        item["cluster"] = cluster
+    return item
+
+
+DECLARABLE = audit_report.audit_declarable_checks(DECLARING_AUDIT)
+
+
+# Deep enough that PyYAML's recursive composer overruns Python's default
+# recursion limit of 1000 while composing the frontmatter's flow collection.
+NESTED_FRONTMATTER_DEPTH = 500
+# A heading line of this many ` #` pairs (a hundred kilobytes, under the
+# broker's per-file ceiling) took the quadratic heading scan the better part
+# of a minute; the linear one reads it in milliseconds, so the bound is loose.
+LONG_HEADING_PAIRS = 50_000
+LONG_HEADING_SECONDS = 5.0
+
+
+def parse(text, path="knowledge/checkout.md", repo="acme/fleet"):
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        entries = audit_report.parse_declarations(
+            text, repo=repo, path=path, declarable=DECLARABLE
+        )
+    return entries, err.getvalue()
+
+
+class TestDeclarationParsing(unittest.TestCase):
+    """`declares:` frontmatter is the whole declaration format; the body is never scanned."""
+
+    def test_each_item_is_one_entry_with_the_note_as_its_pointer(self):
+        entries, err = parse(
+            note([declaration(), declaration(check="no-hpa", obj="Deployment/api", cluster="prod-us-east")])
+        )
+        self.assertEqual(err, "")
+        self.assertEqual(
+            entries,
+            [
+                {
+                    "check": "no-pdb",
+                    "namespace": "payments",
+                    "object": "Deployment/checkout-gateway",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                },
+                {
+                    "check": "no-hpa",
+                    "namespace": "payments",
+                    "object": "Deployment/api",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                    "cluster": "prod-us-east",
+                },
+            ],
+        )
+        # A fleet-wide item carries no `cluster` key at all, not a null one.
+        self.assertNotIn("cluster", entries[0])
+
+    def test_a_cluster_scoped_object_declares_an_empty_namespace(self):
+        entries, _ = parse(note([declaration(namespace="", obj="Node/pool-a")]))
+        self.assertEqual(entries[0]["namespace"], "")
+
+    def test_whitespace_around_the_slash_is_a_hand_typed_kind_name(self):
+        # The join is an exact lookup against the finding's `Kind/name`, so an
+        # item that passed the shape check with the spaces kept would match
+        # nothing and the posture would publish under a note that covers it.
+        for spelling in ("Deployment / checkout-gateway", "Deployment/ checkout-gateway", " Deployment /checkout-gateway "):
+            with self.subTest(spelling=spelling):
+                entries, err = parse(note([declaration(obj=spelling)]))
+                self.assertEqual(err, "")
+                self.assertEqual([e["object"] for e in entries], ["Deployment/checkout-gateway"])
+        # Whitespace where a side should be is still a missing side.
+        for bad in ("Deployment/ ", " /api", "Deployment / "):
+            with self.subTest(bad=bad):
+                entries, err = parse(note([declaration(obj=bad)]))
+                self.assertEqual(entries, [])
+                self.assertIn("object must be Kind/name", err)
+
+    def test_an_indented_delimiter_inside_a_block_scalar_does_not_close_the_frontmatter(self):
+        # YAML's document markers start at column 0; an indented `---` in a
+        # `notes: |` block is content. Closing the frontmatter there handed
+        # PyYAML the prefix and dropped every `declares:` item after it, with
+        # the note read and the repository counted as searched.
+        text = (
+            "---\n"
+            "type: runbook\n"
+            "title: DB\n"
+            "notes: |\n"
+            "  Step 1:\n"
+            "  ---\n"
+            "  Step 2:\n"
+            "  ...\n"
+            "declares:\n"
+            "  - check: no-pdb\n"
+            "    namespace: default\n"
+            "    object: Deployment/api\n"
+            "---\n"
+            "# Body\n"
+        )
+        entries, err = parse(text)
+        self.assertEqual(err, "")
+        self.assertEqual([(e["check"], e["object"], e["excerpt"]) for e in entries], [("no-pdb", "Deployment/api", "DB")])
+        # Trailing whitespace on the delimiter is still the delimiter; leading
+        # whitespace on the opening line is not frontmatter at all.
+        self.assertEqual(audit_report.split_frontmatter("---  \ntype: x\n---\t\nbody\n"), "type: x")
+        self.assertIsNone(audit_report.split_frontmatter("  ---\ntype: x\n---\n"))
+
+    def test_notes_that_are_not_declarations_yield_nothing_quietly(self):
+        for text in (
+            "# No frontmatter\n\nDeployment/checkout-gateway no-pdb\n",
+            note([declaration()], type_=None),
+            note(None),
+            "---\ntype: runbook\n",
+        ):
+            with self.subTest(text=text[:30]):
+                entries, err = parse(text)
+                self.assertEqual(entries, [])
+                self.assertEqual(err, "")
+
+    def test_body_text_naming_the_object_and_the_slug_is_not_a_declaration(self):
+        entries, _ = parse(note(None, body="payments/Deployment/checkout-gateway is `no-pdb` on purpose.\n"))
+        self.assertEqual(entries, [])
+
+    def test_a_bad_item_is_skipped_by_name_and_the_rest_of_the_note_counts(self):
+        cases = {
+            "a fault slug": declaration(check="blocking-pdb"),
+            "an unknown slug": declaration(check="no-such-check"),
+            "a missing field": {"check": "no-pdb", "object": "Deployment/x"},
+            "a non-string field": {"check": "no-pdb", "namespace": 3, "object": "Deployment/x"},
+            "an object that is not Kind/name": declaration(obj="checkout-gateway"),
+            "an object with a path in it": declaration(obj="apps/Deployment/x"),
+            "an empty cluster": declaration(cluster=""),
+            "a non-object item": "no-pdb",
+        }
+        for label, bad in cases.items():
+            with self.subTest(label):
+                entries, err = parse(note([bad, declaration(check="no-hpa", obj="Deployment/api")]))
+                self.assertEqual([e["check"] for e in entries], ["no-hpa"])
+                self.assertIn("WARNING: acme/fleet:knowledge/checkout.md declares[0]", err)
+                self.assertIn("skipped", err)
+
+    def test_declares_that_is_not_a_list_reads_nothing_with_a_warning(self):
+        entries, err = parse("---\ntype: observation\ndeclares: no-pdb\n---\n")
+        self.assertEqual(entries, [])
+        self.assertIn("`declares` must be a list", err)
+
+    def test_unparseable_frontmatter_reads_nothing_with_a_warning(self):
+        entries, err = parse("---\ntype: [unclosed\ndeclares:\n  - check: no-pdb\n---\n")
+        self.assertEqual(entries, [])
+        self.assertIn("not valid YAML", err)
+        self.assertIn("acme/fleet:knowledge/checkout.md", err)
+
+    def test_an_impossible_date_in_the_frontmatter_costs_the_note_only(self):
+        # PyYAML resolves an unquoted date as a timestamp and builds it with
+        # `datetime`, which raises a plain ValueError rather than a YAMLError;
+        # uncaught, it would leave `parse_declarations` and cost the whole
+        # repository its `searched` entry. `timestamp:` is the OKF convention.
+        for label, line in {
+            "a day past the month": "timestamp: 2026-02-30T00:00:00Z",
+            "a thirteenth month": "updated: 2026-13-01",
+            "a twenty-fifth hour": "timestamp: 2026-07-23T25:00:00Z",
+        }.items():
+            with self.subTest(label):
+                entries, err = parse(
+                    f"---\ntype: observation\n{line}\ndeclares:\n"
+                    "  - check: no-pdb\n    namespace: payments\n"
+                    "    object: Deployment/checkout-gateway\n---\n"
+                )
+                self.assertEqual(entries, [])
+                self.assertIn("WARNING: acme/fleet:knowledge/checkout.md: frontmatter is not valid YAML", err)
+        # A real timestamp parses as any note does.
+        entries, err = parse(
+            "---\ntype: observation\ntimestamp: 2026-07-23T23:00:00Z\ndeclares:\n"
+            "  - check: no-pdb\n    namespace: payments\n"
+            "    object: Deployment/checkout-gateway\n---\n"
+        )
+        self.assertEqual(err, "")
+        self.assertEqual([e["check"] for e in entries], ["no-pdb"])
+
+    def test_a_pathologically_nested_frontmatter_costs_the_note_only(self):
+        # PyYAML composes nested flow collections recursively, so a note whose
+        # frontmatter nests a few hundred `[` raises RecursionError, a
+        # RuntimeError rather than a YAMLError or ValueError; uncaught, it
+        # would leave `parse_declarations` and cost the whole repository its
+        # `searched` entry without naming the note that did it.
+        nested = "[" * NESTED_FRONTMATTER_DEPTH + "]" * NESTED_FRONTMATTER_DEPTH
+        entries, err = parse(
+            f"---\ntype: {nested}\ndeclares:\n"
+            "  - check: no-pdb\n    namespace: payments\n"
+            "    object: Deployment/checkout-gateway\n---\n"
+        )
+        self.assertEqual(entries, [])
+        self.assertIn("WARNING: acme/fleet:knowledge/checkout.md: frontmatter is not valid YAML", err)
+        self.assertIn("recursion", err)
+
+    def test_an_unclosed_frontmatter_block_is_not_frontmatter(self):
+        self.assertIsNone(audit_report.split_frontmatter("---\ntype: x\n"))
+        self.assertEqual(audit_report.split_frontmatter("---\ntype: x\n...\n"), "type: x")
+
+    def test_a_utf8_byte_order_mark_before_the_delimiter_is_not_part_of_it(self):
+        # `str.strip()` leaves U+FEFF in place, so without the explicit strip the
+        # note would read as having no frontmatter and declare nothing, quietly.
+        entries, err = parse("\ufeff" + note([declaration()]))
+        self.assertEqual(err, "")
+        self.assertEqual([e["check"] for e in entries], ["no-pdb"])
+        self.assertEqual(entries[0]["excerpt"], "checkout-gateway runs unbudgeted")
+        self.assertEqual(audit_report.split_frontmatter("\ufeff---\ntype: x\n---\n"), "type: x")
+        # Only a leading mark is the encoder's; one inside the text stays text.
+        self.assertIsNone(audit_report.split_frontmatter("x\ufeff---\ntype: x\n---\n"))
+
+    def test_the_excerpt_falls_back_to_the_first_heading_then_the_path(self):
+        heading, _ = parse(note([declaration()], title=None, body="\n# Checkout runs without a budget\n"))
+        self.assertEqual(heading[0]["excerpt"], "Checkout runs without a budget")
+        # A heading inside a fence is code, not a heading.
+        fenced, _ = parse(note([declaration()], title=None, body="```\n# not a heading\n```\n"))
+        self.assertEqual(fenced[0]["excerpt"], "knowledge/checkout.md")
+
+    def test_a_heading_line_of_any_length_is_read_in_linear_time(self):
+        # A heading whose tail is a long run of blanks and hashes before one
+        # other character is what a lazy `.*?` followed by `[ \t#]*$` reads in
+        # the square of its length; one such line in one note held `start`,
+        # which has no timeout. The scan is linear now, and the excerpt is
+        # the heading's text clipped as any long title is.
+        line = "# x" + " #" * LONG_HEADING_PAIRS + "y"
+        started = time.monotonic()
+        entries, _ = parse(note([declaration()], title=None, body=f"\n{line}\n"))
+        self.assertLess(time.monotonic() - started, LONG_HEADING_SECONDS)
+        self.assertTrue(entries[0]["excerpt"].startswith("x # #"))
+        self.assertTrue(entries[0]["excerpt"].endswith("…(truncated)"))
+        # A closing sequence is still trimmed, and a heading that is nothing
+        # but one is no excerpt: the next heading, then the path, stand in.
+        trimmed, _ = parse(note([declaration()], title=None, body="\n# Budget ##\n"))
+        self.assertEqual(trimmed[0]["excerpt"], "Budget")
+        empty, _ = parse(note([declaration()], title=None, body="\n# ###\n\n## Real\n"))
+        self.assertEqual(empty[0]["excerpt"], "Real")
+        only, _ = parse(note([declaration()], title=None, body="\n# ###\n"))
+        self.assertEqual(only[0]["excerpt"], "knowledge/checkout.md")
+
+    def test_the_excerpt_is_redacted_and_clipped(self):
+        token = "ghp_" + "a" * 36
+        entries, _ = parse(note([declaration()], title=f"pinned with token {token}"))
+        self.assertNotIn(token, entries[0]["excerpt"])
+        long, _ = parse(note([declaration()], title="x" * 1000))
+        self.assertLess(len(long[0]["excerpt"]), 1000)
+        self.assertTrue(long[0]["excerpt"].endswith("…(truncated)"))
+
+
+class TestIntentPaths(unittest.TestCase):
+    """`.kube-agents/intent.yaml` bounds the search; anything wrong with it means the whole tree."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tree = Path(tmp.name)
+
+    def write(self, relative, text):
+        target = self.tree / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def read(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            paths = audit_report.read_intent_paths(self.tree, "acme/fleet")
+        return paths, err.getvalue()
+
+    def test_a_byte_order_mark_before_the_list_still_bounds_the_walk(self):
+        # PyYAML drops a leading U+FEFF itself; this pins that the intent file
+        # written by a BOM-emitting editor is the owner's bound, not a warning.
+        self.write(".kube-agents/intent.yaml", "\ufeffpaths:\n  - knowledge/\n")
+        paths, err = self.read()
+        self.assertEqual(paths, ["knowledge"])
+        self.assertEqual(err, "")
+
+    def test_a_valid_list_bounds_the_walk(self):
+        self.write(".kube-agents/intent.yaml", "paths:\n  - knowledge/\n  - docs/intent.md\n")
+        self.write("knowledge/a.md", "")
+        self.write("knowledge/deep/b.md", "")
+        self.write("knowledge.md", "")
+        self.write("docs/intent.md", "")
+        self.write("docs/other.md", "")
+        self.write("clusters/prod/c.md", "")
+        paths, err = self.read()
+        # The trailing slash is accepted and dropped; the prefix is a prefix.
+        self.assertEqual(paths, ["knowledge", "docs/intent.md"])
+        self.assertEqual(err, "")
+        self.assertEqual(
+            audit_report.note_paths(self.tree, paths),
+            (["docs/intent.md", "knowledge/a.md", "knowledge/deep/b.md"], []),
+        )
+
+    def test_an_absent_file_is_the_whole_tree(self):
+        paths, err = self.read()
+        self.assertEqual(paths, [])
+        self.assertIn("acme/fleet:.kube-agents/intent.yaml: absent", err)
+
+    def test_anything_wrong_with_the_file_is_the_whole_tree_with_a_warning(self):
+        cases = {
+            "invalid YAML": "paths: [unclosed\n",
+            "not a mapping": "- knowledge/\n",
+            "no paths key": "prefixes:\n  - knowledge/\n",
+            "a scalar": "paths: knowledge/\n",
+            "an empty list": "paths: []\n",
+            "a non-string entry": "paths:\n  - 3\n",
+            "an escaping path": "paths:\n  - knowledge/../secrets\n",
+            "an absolute path": "paths:\n  - /etc\n",
+            "a .git path": "paths:\n  - sub/.git\n",
+            "a glob": "paths:\n  - knowledge/*\n",
+            # An unquoted date `datetime` refuses: PyYAML raises ValueError,
+            # not YAMLError, and it must still be the whole tree, not a crash.
+            "an impossible date": "updated: 2026-02-30\npaths:\n  - knowledge/\n",
+            # A flow collection nested past the recursion limit: PyYAML raises
+            # RecursionError, a RuntimeError, and it is still the whole tree.
+            "a pathologically nested value": (
+                "updated: " + "[" * NESTED_FRONTMATTER_DEPTH + "]" * NESTED_FRONTMATTER_DEPTH
+                + "\npaths:\n  - knowledge/\n"
+            ),
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.write(".kube-agents/intent.yaml", text)
+                paths, err = self.read()
+                self.assertEqual(paths, [])
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
+                self.assertIn("searching the whole tree", err)
+
+    def test_a_path_the_broker_refuses_is_the_whole_tree_with_a_warning(self):
+        # The remediation-path rules accept each of these; the broker's
+        # validator, which a content-mode `clone --prefix` runs the prefix
+        # through, refuses each. Refused here, the bound falls to the whole
+        # tree in both modes rather than failing closed in one.
+        cases = {
+            "trailing whitespace": 'paths:\n  - "knowledge/ "\n',
+            "leading whitespace": 'paths:\n  - " knowledge"\n',
+            "a control character": 'paths:\n  - "know\\tledge"\n',
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.write(".kube-agents/intent.yaml", text)
+                paths, err = self.read()
+                self.assertEqual(paths, [], err)
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml: paths[0]", err)
+                self.assertIn("searching the whole tree", err)
+        # A name the broker accepts stays a bound, a leading `-` included; the
+        # copy is what has to pass it as a value.
+        self.write(".kube-agents/intent.yaml", 'paths:\n  - "-notes/"\n')
+        paths, err = self.read()
+        self.assertEqual(paths, ["-notes"])
+        self.assertEqual(err, "")
+
+    def test_a_symlinked_intent_file_or_directory_is_never_followed(self):
+        # git materialises a committed symlink in a directory-mode clone, and
+        # `is_file` and `read_text` both follow one. The bound must come from
+        # inside the copy, so a link at either component is the whole tree
+        # with a warning — and the target, however valid, is never read.
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        outside = Path(elsewhere.name) / "intent.yaml"
+        outside.write_text("paths:\n  - knowledge/\n", encoding="utf-8")
+        for label, link, target in (
+            ("the file", ".kube-agents/intent.yaml", outside),
+            ("its directory", ".kube-agents", outside.parent),
+        ):
+            with self.subTest(label):
+                (self.tree / link).parent.mkdir(parents=True, exist_ok=True)
+                (self.tree / link).symlink_to(target)
+                paths, err = self.read()
+                (self.tree / link).unlink()
+                if (self.tree / link).parent != self.tree:
+                    (self.tree / link).parent.rmdir()
+                self.assertEqual(paths, [])
+                self.assertIn("WARNING: acme/fleet:.kube-agents/intent.yaml", err)
+                self.assertIn(f"`{link}` is a symbolic link", err)
+                self.assertIn("searching the whole tree", err)
+
+    def test_the_walk_skips_git_and_symlinks(self):
+        self.write("knowledge/a.md", "")
+        self.write(".git/HOOKS.md", "")
+        self.write("sub/.git/x.md", "")
+        outside = self.write("outside/o.md", "")
+        (self.tree / "knowledge" / "link.md").symlink_to(outside)
+        (self.tree / "linked").symlink_to(self.tree / "outside", target_is_directory=True)
+        self.assertEqual(
+            audit_report.note_paths(self.tree, []), (["knowledge/a.md", "outside/o.md"], [])
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "root can list any directory")
+    def test_a_directory_the_walk_cannot_enter_is_reported_when_the_bound_reaches_it(self):
+        self.write("knowledge/a.md", "")
+        self.write("knowledge/deep/b.md", "")
+        self.write("manifests/sub/c.md", "")
+        for locked in ("knowledge/deep", "manifests/sub"):
+            (self.tree / locked).chmod(0)
+            self.addCleanup((self.tree / locked).chmod, 0o755)
+        # Under the bound: the notes in it were never seen.
+        self.assertEqual(
+            audit_report.note_paths(self.tree, ["knowledge"]), (["knowledge/a.md"], ["knowledge/deep"])
+        )
+        # Outside it: nothing the search reads could be there.
+        self.assertEqual(audit_report.note_paths(self.tree, ["knowledge/a.md"]), (["knowledge/a.md"], []))
+        # No bound: every directory is in reach.
+        self.assertEqual(
+            audit_report.note_paths(self.tree, []),
+            (["knowledge/a.md"], ["knowledge/deep", "manifests/sub"]),
+        )
+
+
+def _broker_parser():
+    """The sibling script's own argument parser, loaded from where the harness runs it."""
+    spec = importlib.util.spec_from_file_location("inspect_repository", audit_report.CLONE_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_parser()
+
+
+class DiscoveryTestCase(HarnessTestCase):
+    """The declaring stream's `start`, with a workspace the harness can read."""
+
+    def setUp(self):
+        super().setUp()
+        self.workspace = self.gitops_root / DECLARING_AUDIT / "acme__fleet"
+        (self.workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(self.workspace)
+        self.patch_attr("repo_root", lambda: self.workspace)
+        self.scratch = Path(audit_report.SCRATCH_DIR)
+        self.harness.replies = {"issue list": "[]"}
+
+    def write(self, root, relative, text):
+        target = Path(root) / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def context(self, *slugs, ref=None, refused_ref=None):
+        patcher = patch.object(
+            gitops_workspace,
+            "get_context_github_repo_entries",
+            lambda: context_entries(*slugs, ref=ref, refused_ref=refused_ref),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def copy_reply(self, into, sha=SEARCH_SHA, complete=True, mode="content", **extra):
+        reply = {"mode": mode, "repo": "acme/terraform-live", "complete": complete, **extra}
+        if mode == "content":
+            reply.update({"into": str(into), "sha": sha, "skipped": [], "stopped": None, **extra})
+        else:
+            reply["workspace"] = str(into)
+        return json.dumps(reply) + "\n"
+
+    def start(self):
+        rc = self.run_main(["start", "--audit", DECLARING_AUDIT])
+        self.assertEqual(rc, 0, self.err)
+        return json.loads(self.out)
+
+    def clone_calls(self):
+        return [c for c in self.harness.calls if "clone" in c and str(audit_report.CLONE_SCRIPT) in c]
+
+    def broker_prefix(self, cmd):
+        """The `--prefix` the sibling script reads from `cmd`, or None when it carries none.
+
+        Through the script's own parser and the broker's path validator, so a
+        prefix the harness passes is one the copy accepts: argparse reads
+        `--prefix -notes` as a flag with no value and exits before the broker
+        is asked, and the broker refuses every spelling `validate_path` does.
+        """
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = _broker_parser().parse_args(cmd[2:])
+        except SystemExit:
+            self.fail(f"the sibling script's parser refused {cmd[2:]}")
+        if args.prefix is not None:
+            workspace_paths.validate_path(args.prefix)
+        return args.prefix
+
+    def filed(self):
+        return audit_report.read_declarations(DECLARING_AUDIT)
+
+    def temp_dirs(self):
+        return sorted(p.name for p in self.scratch.glob(f"{audit_report.CLONE_TMP_PREFIX}*"))
+
+
+class TestDeclaredIntentDiscovery(DiscoveryTestCase):
+    """`start` reads every repository the step owes and records what it read."""
+
+    def test_directory_mode_walks_the_reset_workspace_and_takes_the_sha_from_git(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}]
+        )
+        self.assertEqual(payload["declarations_path"], str(self.scratch / f"declarations_{DECLARING_AUDIT}.json"))
+        self.assertEqual(
+            self.filed(),
+            [
+                {
+                    "check": "no-pdb",
+                    "namespace": "payments",
+                    "object": "Deployment/checkout-gateway",
+                    "repo": "acme/fleet",
+                    "path": "knowledge/checkout.md",
+                    "excerpt": "checkout-gateway runs unbudgeted",
+                }
+            ],
+        )
+        record = audit_report.read_run_record(DECLARING_AUDIT)
+        self.assertEqual(record["searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(record["sources"], payload["declared_intent_sources"])
+        rev = [c for c in self.harness.calls if c[:3] == ["git", "rev-parse", "HEAD"]]
+        self.assertEqual(len(rev), 1)
+        self.assertEqual(self.harness.cwds[self.harness.calls.index(rev[0])], str(self.workspace))
+        # Nothing was cloned: the tree was already there.
+        self.assertEqual(self.clone_calls(), [])
+        self.assertIn("searched acme/fleet@0123456 (whole tree): 1 declaration(s)", self.err)
+
+    def test_the_intent_file_bounds_the_walk_and_is_reported(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - knowledge/\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        payload = self.start()
+        self.assertEqual(
+            payload["declared_intent_sources"],
+            [{"repo": "acme/fleet", "ref": None, "paths": ["knowledge"]}],
+        )
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_named_path_with_nothing_behind_it_means_the_whole_tree_and_says_so(self):
+        # `knowlege/` is the typo the shape check cannot see: it passed, the
+        # walk found nothing under it, and the repository was credited with a
+        # complete search while every note under `knowledge/` went unread.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - knowlege/\n  - docs/\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}])
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "knowledge/checkout.md"])
+        self.assertIn(
+            "WARNING: acme/fleet:.kube-agents/intent.yaml: `knowlege` names nothing in the "
+            "repository at this commit; searching the whole tree.",
+            self.err,
+        )
+        # A symlinked prefix is never followed, so it too has nothing behind it.
+        (self.workspace / ".kube-agents" / "intent.yaml").write_text("paths: [linked/]\n", encoding="utf-8")
+        (self.workspace / "linked").symlink_to(self.workspace / "knowledge", target_is_directory=True)
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_sources"][0]["paths"], [])
+        self.assertIn("`linked` names nothing", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "knowledge/checkout.md"])
+
+    def test_a_prefix_behind_a_symlinked_directory_means_the_whole_tree(self):
+        # `Path.is_symlink` sees only the last component: `linked/sub` exists
+        # through the link, so the bound stood while the walk, which never
+        # enters a link, read nothing under it, and the repository was
+        # credited with a complete search of zero notes.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths:\n  - linked/sub\n")
+        self.write(self.workspace, "real/sub/checkout.md", note([declaration()]))
+        self.write(self.workspace, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        (self.workspace / "linked").symlink_to(self.workspace / "real", target_is_directory=True)
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}])
+        self.assertEqual([e["path"] for e in self.filed()], ["docs/api.md", "real/sub/checkout.md"])
+        self.assertIn(
+            "WARNING: acme/fleet:.kube-agents/intent.yaml: `linked/sub` names nothing in the "
+            "repository at this commit; searching the whole tree.",
+            self.err,
+        )
+
+    def test_a_note_saved_with_a_byte_order_mark_still_declares(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        target = self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        target.write_bytes(b"\xef\xbb\xbf" + target.read_bytes())
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            [(e["path"], e["check"], e["excerpt"]) for e in self.filed()],
+            [("knowledge/checkout.md", "no-pdb", "checkout-gateway runs unbudgeted")],
+        )
+        self.assertNotIn("WARNING", self.err)
+
+    def test_no_sha_for_the_checkout_leaves_it_unsearched(self):
+        # The recorder answers `git rev-parse HEAD` with nothing.
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(payload["declared_intent_sources"], [])
+        # The GitOps repository's pin is never honoured, so none is handed over.
+        self.assertEqual(payload["declared_intent_unsearched"], [{"repo": "acme/fleet", "ref": None}])
+        self.assertEqual(self.filed(), [])
+        self.assertIn("WARNING: acme/fleet: no commit sha for the checkout; not searched", self.err)
+
+    def test_content_mode_clones_the_gitops_repository_through_the_sibling_script(self):
+        self.patch_attr("detect_content_mode", lambda: True)
+        copy = self.tmp_path / "copy"
+        self.write(copy, "knowledge/checkout.md", note([declaration()]))
+        self.harness.replies["--repo acme/fleet"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertEqual(payload["mode"], "content")
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(self.filed()[0]["path"], "knowledge/checkout.md")
+        calls = self.clone_calls()
+        # Two copies into one tree: `.kube-agents/` for the bound, then — with
+        # no intent file in it — the whole tree.
+        self.assertEqual(len(calls), 2)
+        for cmd in calls:
+            self.assertEqual(cmd[0], sys.executable)
+            self.assertEqual(cmd[2:6], ["clone", "--repo", "acme/fleet", "--depth"])
+            self.assertEqual(cmd[6], "1")
+            self.assertIn("--into", cmd)
+            self.assertIn("--lease", cmd)
+            self.assertEqual(cmd[cmd.index("--lease") + 1], f"{DECLARING_AUDIT}-declared-intent")
+            self.assertNotIn("--ref", cmd)
+        self.assertEqual(self.broker_prefix(calls[0]), ".kube-agents")
+        self.assertNotIn("--force", calls[0])
+        self.assertIsNone(self.broker_prefix(calls[1]))
+        self.assertIn("--force", calls[1])
+        self.assertEqual(calls[0][calls[0].index("--into") + 1], calls[1][calls[1].index("--into") + 1])
+        self.assertEqual([c for c in self.harness.calls if c[:2] == ["git", "rev-parse"]], [])
+        # The temporary destination is gone once the read is done.
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_ref_on_the_gitops_repository_itself_is_ignored_in_content_mode(self):
+        # Directory mode reads the GitOps repository from the checkout `start`
+        # just reset, so a `ref` on a context entry naming it changes nothing
+        # there. Content mode clones it through the sibling script, where a
+        # `--ref` would read, and credit as `acme/fleet@<sha>`, a branch the
+        # run does not publish against. The pin is dropped: no `--ref` on
+        # either step, the repository owed and read once, its source unpinned.
+        self.patch_attr("detect_content_mode", lambda: True)
+        self.context("acme/fleet", ref="release-2026")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "knowledge/checkout.md", note([declaration()]))
+        self.harness.replies["--repo acme/fleet"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet"])
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(
+            payload["declared_intent_sources"], [{"repo": "acme/fleet", "ref": None, "paths": []}]
+        )
+        self.assertEqual(payload["declared_intent_unsearched"], [])
+        calls = self.clone_calls()
+        self.assertEqual(len(calls), 2)
+        for cmd in calls:
+            self.assertEqual(cmd[2:5], ["clone", "--repo", "acme/fleet"])
+            self.assertNotIn("--ref", cmd)
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_context_repository_is_cloned_with_its_ref_and_read(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live", ref="release-2026")
+        copy = self.tmp_path / "copy"
+        sha = "89abcdef" * 5
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.write(copy, "README.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy, sha=sha)
+        payload = self.start()
+        self.assertEqual(
+            payload["declared_intent_searched"],
+            [f"acme/fleet@{SEARCH_SHA}", f"acme/terraform-live@{sha}"],
+        )
+        self.assertEqual(
+            payload["declared_intent_sources"][1],
+            {"repo": "acme/terraform-live", "ref": "release-2026", "paths": ["intent"]},
+        )
+        self.assertEqual(payload["declared_intent_unsearched"], [])
+        calls = self.clone_calls()
+        self.assertEqual([c[c.index("--ref") + 1] for c in calls], ["release-2026"] * 2)
+        # The bound is read from the first copy and the second fetches only it.
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", "intent"])
+        self.assertEqual(
+            [(e["repo"], e["path"]) for e in self.filed()],
+            [("acme/terraform-live", "intent/api.md")],
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_content_mode_copy_fetches_each_named_path_and_nothing_else(self):
+        # The sibling script's default caps count every file in the repository,
+        # so a whole-tree copy of a GitOps repository that vendors charts would
+        # be stopped by files the search never opens. Only the intent
+        # directory and the paths it names are copied.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths:\n  - intent/\n  - docs/intent.md\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.write(copy, "docs/intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["intent", "docs/intent.md"])
+        calls = self.clone_calls()
+        self.assertEqual(
+            [self.broker_prefix(c) for c in calls], [".kube-agents", "intent", "docs/intent.md"]
+        )
+        self.assertEqual([("--force" in c) for c in calls], [False, True, True])
+        self.assertEqual(len({c[c.index("--into") + 1] for c in calls}), 1)
+        self.assertEqual(
+            [e["path"] for e in self.filed()], ["docs/intent.md", "intent/api.md"]
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_named_path_beginning_with_a_dash_reaches_the_copy_as_a_value(self):
+        # `--prefix -notes` reads to argparse as a flag with no value, so the
+        # copy exits 2 before the broker sees the path and the repository is
+        # never searched; the harness passes the prefix in the one form
+        # argparse reads as a value, and the broker, which accepts the name,
+        # copies it.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", 'paths:\n  - "-notes/"\n')
+        self.write(copy, "-notes/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["-notes"])
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", "-notes"])
+        self.assertEqual([e["path"] for e in self.filed()], ["-notes/api.md"])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_named_path_the_broker_refuses_is_the_whole_tree_in_content_mode(self):
+        # A trailing space inside a quoted scalar passes the remediation-path
+        # rules and fails the broker's: handed to `clone --prefix`, the copy
+        # exits non-zero and the repository is left unsearched every run with
+        # the clone blamed, where directory mode reads the whole tree with the
+        # intent-file warning. The bound is refused before any copy is asked
+        # for, in both modes, and the whole tree is fetched with the reason.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", 'paths:\n  - "knowledge/ "\n')
+        self.write(copy, "knowledge/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual([self.broker_prefix(c) for c in calls], [".kube-agents", None])
+        self.assertIn("--force", calls[1])
+        self.assertIn("acme/terraform-live:.kube-agents/intent.yaml: paths[0]", self.err)
+        self.assertIn("leading or trailing whitespace", self.err)
+        self.assertIn("searching the whole tree", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/api.md"])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_repository_that_moved_between_copies_is_not_searched(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        moved = "89abcdef" * 5
+        # The recorder answers with the first key that matches, so the
+        # specific one goes first.
+        self.harness.replies = {
+            "--prefix=.kube-agents": self.copy_reply(copy),
+            "--repo acme/terraform-live": self.copy_reply(copy, sha=moved),
+            **self.harness.replies,
+        }
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn(
+            "WARNING: acme/terraform-live: the copy of intent is at 89abcde, not 0123456: "
+            "the repository moved between copies; not searched",
+            self.err,
+        )
+        self.assertEqual(self.filed(), [])
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_note_the_harness_cannot_read_costs_the_repository_its_entry(self):
+        # The local twin of a note the broker withheld: a cp1252 byte in a note
+        # under the searched paths, and the repository must not be recorded
+        # as read around it.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths: [knowledge/]\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        legacy = self.workspace / "knowledge" / "legacy.md"
+        legacy.write_bytes(note([declaration(check="no-hpa", obj="Deployment/api")]).encode("utf-8") + b"caf\xe9\n")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(payload["declared_intent_sources"], [])
+        self.assertEqual(self.filed(), [])
+        self.assertIn("WARNING: acme/fleet:knowledge/legacy.md: unreadable", self.err)
+        self.assertIn(
+            "WARNING: acme/fleet: 1 path(s) under the searched paths could not be read "
+            "(knowledge/legacy.md); not searched",
+            self.err,
+        )
+        # Outside the bound, the same file costs nothing.
+        legacy.rename(self.workspace / "docs.md")
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+
+    def test_a_note_with_an_impossible_date_costs_its_declaration_not_the_repository(self):
+        # One typo in one note's `timestamp:` silences that note; the
+        # repository is still read completely and its other notes filed.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.write(self.workspace, ".kube-agents/intent.yaml", "paths: [knowledge/]\n")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        self.write(
+            self.workspace,
+            "knowledge/api.md",
+            "---\ntype: observation\ntimestamp: 2026-02-30T00:00:00Z\ndeclares:\n"
+            "  - check: no-hpa\n    namespace: payments\n    object: Deployment/api\n---\n",
+        )
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/checkout.md"])
+        self.assertIn("WARNING: acme/fleet:knowledge/api.md: frontmatter is not valid YAML", self.err)
+        self.assertNotIn("declared-intent search failed", self.err)
+
+    def test_a_directory_mode_copy_is_the_leased_workspace_the_clone_names(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        leased = self.tmp_path / "leased" / "acme__terraform-live"
+        self.write(leased, "intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            leased, mode="directory", depthIgnored=True
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        rev = [i for i, c in enumerate(self.harness.calls) if c[:3] == ["git", "rev-parse", "HEAD"]]
+        self.assertEqual([self.harness.cwds[i] for i in rev], [str(self.workspace), str(leased)])
+        # The leased checkout is left in place; only the scratch destination goes.
+        self.assertTrue(leased.is_dir())
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_the_copies_run_without_the_gitops_base_branch_override(self):
+        # `resolve_base_branch` consults the override before the remote's
+        # HEAD, and a directory-mode clone with no `--ref` asks it which
+        # branch to check out, so a context repository copied with the
+        # variable in the environment was read at the GitOps repository's
+        # branch, not its own default. Every copy the search makes runs
+        # without the two variables and with the rest of the environment.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        leased = self.tmp_path / "leased" / "acme__terraform-live"
+        self.write(leased, "intent.md", note([declaration()]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            leased, mode="directory", depthIgnored=True
+        )
+        override = {"GITOPS_BASE_BRANCH": "release", "CREDENTIAL_PROXY_BASE_BRANCH": "release"}
+        with patch.dict(os.environ, {**override, "LIVE_1576_MARKER": "kept"}):
+            payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        clones = [i for i, c in enumerate(self.harness.calls) if str(audit_report.CLONE_SCRIPT) in c]
+        self.assertTrue(clones)
+        for index in clones:
+            env = self.harness.envs[index]
+            self.assertIsNotNone(env, "the copy inherited the process environment")
+            self.assertEqual(sorted(set(env) & set(override)), [])
+            self.assertEqual(env.get("LIVE_1576_MARKER"), "kept")
+
+    def test_a_copy_the_harness_cannot_call_searched_is_left_out_with_a_warning(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "intent.md", note([declaration()]))
+        cases = {
+            "stopped at a bound": (
+                self.copy_reply(copy, complete=False, stopped="maxBytes"),
+                "copy stopped at 'maxBytes'",
+            ),
+            "incomplete with nothing named": (
+                self.copy_reply(copy, complete=False),
+                "copy reported incomplete without saying what is missing",
+            ),
+            "no json": ("cloning...\n", "clone printed no JSON line"),
+            "no sha": (self.copy_reply(copy, sha=""), "no commit sha for the copy"),
+            "no such tree": (self.copy_reply(self.tmp_path / "missing"), "clone named"),
+        }
+        for label, (reply, expected) in cases.items():
+            with self.subTest(label):
+                self.harness.replies["--repo acme/terraform-live"] = reply
+                self.out = ""
+                payload = self.start()
+                self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+                self.assertIn(f"WARNING: acme/terraform-live: {expected}", self.err)
+                self.assertEqual(self.filed(), [])
+                self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_skipped_file_that_is_not_a_searched_note_does_not_cost_the_repository(self):
+        # The broker never sends a file over its per-file ceiling, and a
+        # repository that vendors one CRD bundle would otherwise never be
+        # searched. A skipped file that is not a note under the searched
+        # paths could not have carried a declaration.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        skipped = [
+            {"path": "crds/bundle.yaml", "reason": "tooLarge"},
+            {"path": "README.md", "reason": "tooLarge"},
+            {"path": "docs/link.md", "reason": "symlink"},
+        ]
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=skipped
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual([e["path"] for e in self.filed()], ["intent/api.md"])
+        self.assertIn("3 file(s) the broker did not send lie outside the searched notes", self.err)
+
+    def test_a_skipped_link_under_the_searched_paths_is_not_a_note_the_broker_withheld(self):
+        # The broker will not follow a symlink and says so with its own
+        # reason; the walk in directory mode never yields one either. A link
+        # named `.md` under the searched paths is therefore not a note the
+        # harness missed, in either mode, and the repository keeps its entry
+        # and its bound. A tracked name that is not a regular file (a
+        # submodule) is the same case. A note over the ceiling is not.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        for reason in ("symlink", "notAFile"):
+            with self.subTest(reason):
+                self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+                    copy, complete=False, skipped=[{"path": "intent/link.md", "reason": reason}]
+                )
+                self.out = ""
+                payload = self.start()
+                self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+                self.assertEqual(payload["declared_intent_sources"][1]["paths"], ["intent"])
+                self.assertEqual([e["path"] for e in self.filed()], ["intent/api.md"])
+                self.assertNotIn("did not send 1 note(s)", self.err)
+                self.assertIn("1 file(s) the broker did not send lie outside the searched notes", self.err)
+        # The link beside a note the broker withheld: the note still costs the entry.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy,
+            complete=False,
+            skipped=[
+                {"path": "intent/link.md", "reason": "symlink"},
+                {"path": "intent/big.md", "reason": "tooLarge"},
+            ],
+        )
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+
+    def test_a_skipped_note_under_the_searched_paths_costs_the_repository_its_entry(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "intent/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "intent/big.md", "reason": "tooLarge"}]
+        )
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+        # And with no bound at all, a skipped note anywhere is a note not read.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "elsewhere/x.md", "reason": "tooLarge"}]
+        )
+        (copy / ".kube-agents" / "intent.yaml").unlink()
+        self.out = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+
+    def test_a_content_mode_copy_of_a_path_with_nothing_behind_it_fetches_the_whole_tree(self):
+        # The bounded copy of a misspelt prefix comes back empty and complete
+        # at the same sha, which read as a search that found nothing. The
+        # bound is unusable, as a misspelt file is, so the whole tree is
+        # fetched under the caps and read.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, ".kube-agents/intent.yaml", "paths: [intent/]\n")
+        self.write(copy, "knowledge/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        self.assertEqual([e["path"] for e in self.filed()], ["knowledge/api.md"])
+        self.assertIn("`intent` names nothing in the repository at this commit; searching the whole tree", self.err)
+        calls = [c for c in self.clone_calls() if "acme/terraform-live" in c]
+        self.assertEqual(
+            [self.broker_prefix(c) for c in calls],
+            [".kube-agents", "intent", None],
+        )
+        self.assertIn("--force", calls[2])
+        self.assertEqual(self.temp_dirs(), [])
+        # A prefix the broker skipped a file under is a prefix the repository
+        # has: the bound stands, and the skipped note costs the entry as before.
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": "intent/big.md", "reason": "tooLarge"}]
+        )
+        self.out = ""
+        self.err = ""
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertNotIn("names nothing", self.err)
+        self.assertIn("did not send 1 note(s) under the searched paths (intent/big.md)", self.err)
+        self.assertEqual(len([c for c in self.clone_calls() if "acme/terraform-live" in c]), 3 + 2)
+
+    def test_a_skipped_intent_file_means_the_whole_tree_and_says_so(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        copy = self.tmp_path / "copy"
+        self.write(copy, "anywhere/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
+            copy, complete=False, skipped=[{"path": ".kube-agents/intent.yaml", "reason": "tooLarge"}]
+        )
+        payload = self.start()
+        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
+        self.assertEqual(payload["declared_intent_sources"][1]["paths"], [])
+        self.assertIn("did not send .kube-agents/intent.yaml, so the search bound is unknown", self.err)
+        self.assertEqual([e["path"] for e in self.filed()], ["anywhere/api.md"])
+
+    def test_a_clone_that_exits_non_zero_is_not_searched_and_does_not_end_the_run(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.harness.failures = {"--repo acme/terraform-live": 1}
+        self.context("acme/terraform-live", ref="release-2026")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertIn("WARNING: acme/terraform-live: clone at release-2026 exited 1; not searched", self.err)
+        # The worker's own copy needs the pin: the entry names it, because
+        # `context_repos` is slugs and `declared_intent_sources` lists only
+        # what was searched, so nowhere else in the payload carries it.
+        self.assertEqual(
+            payload["declared_intent_unsearched"],
+            [{"repo": "acme/terraform-live", "ref": "release-2026"}],
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_refused_ref_skips_the_repository_rather_than_reading_its_default_branch(self):
+        # `release/2026+hotfix` is a branch name git accepts and the shape
+        # check does not. The pin exists so a curated branch is what silences
+        # a posture, so the repository is not read at HEAD in its place: no
+        # clone is attempted, it stays out of `searched`, the warning names
+        # the refused value, and the worker's entry carries it under
+        # `refused_ref` so the worker does not copy at HEAD either.
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        copy = self.tmp_path / "copy"
+        self.write(copy, "docs/api.md", note([declaration(check="no-hpa", obj="Deployment/api")]))
+        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(copy)
+        self.context("acme/terraform-live", refused_ref="release/2026+hotfix")
+        payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [f"acme/fleet@{SEARCH_SHA}"])
+        self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
+        self.assertEqual(
+            payload["declared_intent_unsearched"],
+            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": "release/2026+hotfix"}],
+        )
+        self.assertEqual([c for c in self.clone_calls() if "acme/terraform-live" in c], [])
+        self.assertEqual(self.filed(), [])
+        self.assertIn(
+            "WARNING: acme/terraform-live: ref 'release/2026+hotfix' is not a git branch "
+            "name; not searched, and not read at its default branch instead.",
+            self.err,
+        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_yesterdays_declarations_are_cleared_before_anything_can_fail(self):
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(DECLARING_AUDIT, "acme/fleet", [{"check": "no-pdb"}])
+
+        def boom(repo, audit_id):
+            raise RuntimeError("gh label create: 502")
+
+        self.patch_attr("ensure_labels", boom)
+        self.assertNotEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
+        self.assertEqual(self.filed(), [])
+        self.assertFalse(Path(audit_report.declarations_path_for(DECLARING_AUDIT)).exists())
+
+    def test_without_pyyaml_nothing_is_searched_and_the_run_says_so(self):
+        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
+        self.context("acme/terraform-live")
+        self.write(self.workspace, "knowledge/checkout.md", note([declaration()]))
+        with patch.dict(sys.modules, {"yaml": None}):
+            payload = self.start()
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(self.clone_calls(), [])
+        self.assertIn("PyYAML is not importable", self.err)
+
+    def test_a_stream_with_no_declared_intent_step_clones_nothing(self):
+        self.context("acme/terraform-live")
+        self.workspace = self.gitops_root / AUDIT / "acme__fleet"
+        rc = self.run_main(["start", "--audit", AUDIT])
+        self.assertEqual(rc, 0, self.err)
+        payload = json.loads(self.out)
+        self.assertEqual(payload["context_repos"], ["acme/terraform-live"])
+        self.assertEqual(payload["declared_intent_searched"], [])
+        self.assertEqual(self.clone_calls(), [])
+
+
+class TestHarnessDeclarationJoin(HarnessTestCase):
+    """`finish` and `remediate` apply what `start` filed, before the withhold."""
+
+    CONTEXT = ("acme/terraform-live",)
+    OTHER_SHA = "89abcdef" * 5
+
+    def setUp(self):
+        super().setUp()
+        self.workspace = self.gitops_root / DECLARING_AUDIT / "acme__fleet"
+        (self.workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(self.workspace)
+        self.patch_attr("repo_root", lambda: self.workspace)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.touch("clusters/prod-us-east/payments-db-pdb.yaml")
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
+    def record(self, searched=("acme/fleet", "acme/terraform-live"), context=CONTEXT, sources=()):
+        shas = {"acme/fleet": SEARCH_SHA, "acme/terraform-live": self.OTHER_SHA}
+        audit_report.write_run_record(
+            DECLARING_AUDIT,
+            "acme/fleet",
+            list(context),
+            searched=[f"{slug}@{shas[slug]}" for slug in searched],
+            sources=list(sources),
+        )
+
+    def file(self, *entries, repo="acme/fleet"):
+        audit_report.write_declarations(DECLARING_AUDIT, repo, list(entries))
+
+    @staticmethod
+    def entry(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway", cluster=None,
+              repo="acme/fleet", path="knowledge/checkout.md", excerpt="checkout runs unbudgeted"):
+        entry = {"check": check, "namespace": namespace, "object": obj,
+                 "repo": repo, "path": path, "excerpt": excerpt}
+        if cluster is not None:
+            entry["cluster"] = cluster
+        return entry
+
+    def doc(self, findings=None):
+        return declaring_doc(findings=posture_and_fault_findings() if findings is None else findings)
+
+    def finish(self, doc, *extra):
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=extra)
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json() if not extra else None
+
+    def ledger_body(self):
+        bodies = self.harness.bodies_for("issue", "create")
+        self.assertEqual(len(bodies), 1, bodies)
+        return bodies[0]
+
+    PDB_ID = staticmethod(lambda: derived_id(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway"))
+
+    def test_a_matching_finding_moves_to_declared_with_the_findings_cluster_and_title(self):
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc())
+        self.assertFalse(payload["partial"], payload["coverage_gaps"])
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["postures_withheld"], [])
+        # Five findings in, one declared: four publish.
+        self.assertEqual(payload["new"], 4)
+        body = self.ledger_body()
+        self.assertIn("## Declared intent", body)
+        self.assertIn(
+            "| `no-pdb` | `prod-us-east` | `payments/Deployment/checkout-gateway` "
+            "| `acme/fleet:knowledge/checkout.md` | checkout-gateway runs 3 replicas with no "
+            "PodDisruptionBudget: `checkout runs unbudgeted` |",
+            body,
+        )
+        self.assertNotIn(self.PDB_ID(), audit_report.parse_delta_block(body))
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        self.assertIn("acme/fleet:knowledge/checkout.md", self.err)
+        # And the harness's search record renders as the model's would have.
+        self.assertIn(f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`", body)
+
+    def test_the_join_is_case_blind_as_the_finding_id_is(self):
+        # `deployment/checkout-gateway` is what kubectl prints and what the
+        # finding id `no-pdb.<cluster>.payments.deployment-checkout-gateway`
+        # shows; the shape check passes it, and an exact lookup matched
+        # nothing, so the posture published under a note that covers it.
+        self.record()
+        self.file(self.entry(obj="deployment/checkout-gateway", cluster="PROD-US-EAST"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The moved entry carries the finding's own spelling, not the note's.
+        self.assertIn("| `payments/Deployment/checkout-gateway` |", self.ledger_body())
+
+    def test_the_join_trims_whitespace_as_the_finding_id_does(self):
+        # The validator keeps a finding field's surrounding whitespace and
+        # `derive_finding_id` strips it, so `"payments "` is the same finding
+        # as `"payments"` on the ledger; the key has to read it the same way.
+        findings = posture_and_fault_findings()
+        pdb = next(f for f in findings if f["check"] == "no-pdb")
+        pdb["namespace"] = "payments "
+        pdb["object"] = " Deployment/checkout-gateway"
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc(findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The pointer cell drops the whitespace the moved entry keeps.
+        self.assertIn("| `payments/Deployment/checkout-gateway` |", self.ledger_body())
+
+    def test_the_join_folds_whitespace_around_the_slash_as_the_finding_id_does(self):
+        # `Deployment / checkout-gateway` reduces to `deployment-checkout-gateway`
+        # in the finding id, the same segment `Deployment/checkout-gateway`
+        # gives, so the ledger already treats the two as one finding; a key
+        # that only trimmed the ends matched nothing for the spaced spelling.
+        findings = posture_and_fault_findings()
+        pdb = next(f for f in findings if f["check"] == "no-pdb")
+        pdb["object"] = "Deployment / checkout-gateway"
+        self.record()
+        self.file(self.entry())
+        payload = self.finish(self.doc(findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        # The moved entry keeps the finding's spelling, the spaces around the
+        # slash included; the rendered cell strips only its two ends, so the
+        # column carries no margin and the spelling stays the finding's.
+        self.assertIn("| `payments/Deployment / checkout-gateway` |", self.ledger_body())
+
+    def test_a_cluster_scoped_entry_matches_only_its_cluster(self):
+        self.record()
+        self.file(self.entry(cluster="stage-eu"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertEqual(payload["new"], 5)
+        self.harness.calls.clear()
+        self.harness.bodies.clear()
+        self.file(self.entry(cluster="prod-us-east"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+
+    def test_a_scoped_entry_wins_over_a_fleet_wide_one_for_its_cluster(self):
+        self.record()
+        self.file(self.entry(path="knowledge/fleet.md"), self.entry(cluster="prod-us-east", path="knowledge/prod.md"))
+        self.finish(self.doc())
+        self.assertIn("`acme/fleet:knowledge/prod.md`", self.ledger_body())
+
+    def test_a_non_matching_entry_leaves_the_finding_alone(self):
+        self.record()
+        self.file(
+            self.entry(namespace="other"),
+            self.entry(obj="Deployment/checkout"),
+            self.entry(check="no-hpa"),
+        )
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertNotIn("## Declared intent", self.ledger_body())
+
+    def test_a_fault_is_never_moved_whatever_the_file_says(self):
+        # `parse_declarations` would not have written this entry; a file that
+        # carries one anyway still cannot silence a fault.
+        self.record()
+        self.file(self.entry(check="blocking-pdb", obj="PodDisruptionBudget/payments-db"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertIn("`blocking-pdb`", self.ledger_body())
+
+    def test_a_standing_hpa_declaration_does_not_move_the_dangling_target_fault(self):
+        # `hpa-cannot-scale` is a posture at `major` (`min == max`) and a fault
+        # at `minor` (a dangling target). The fixture's is the fault; a
+        # declaration filed for the HPA must leave it a finding, and say so.
+        self.record()
+        self.file(self.entry(check="hpa-cannot-scale", namespace="web", obj="HorizontalPodAutoscaler/web"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        dangling = derived_id(check="hpa-cannot-scale", namespace="web", obj="HorizontalPodAutoscaler/web")
+        self.assertIn(
+            f"DECLARATION NOT APPLIED: {dangling} — hpa-cannot-scale at severity 'minor' is the "
+            "dangling-target fault (SOP §3.6(b)), which no declaration excuses",
+            self.err,
+        )
+        self.assertIn("acme/fleet:knowledge/checkout.md stands and the finding publishes", self.err)
+        self.assertIn(f"[`{dangling}`]", self.ledger_body())
+        # The same declaration moves the posture shape.
+        self.harness.calls.clear()
+        self.harness.bodies.clear()
+        findings = self.doc()["findings"]
+        for finding in findings:
+            if finding["check"] == "hpa-cannot-scale":
+                finding["severity"] = "major"
+        payload = self.finish(self.doc(findings=findings))
+        self.assertEqual(payload["declared"], 1)
+        self.assertIn(f"DECLARED: {dangling}", self.err)
+
+    def test_a_model_written_entry_survives_beside_a_harness_one(self):
+        self.record()
+        self.file(self.entry())
+        doc = self.doc()
+        doc["declared"] = [make_declared(obj="Deployment/web")]
+        payload = self.finish(doc)
+        self.assertEqual(payload["declared"], 2)
+        body = self.ledger_body()
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", body)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", body)
+
+    def test_a_complete_harness_record_lifts_the_withhold_without_a_model_record(self):
+        self.record()
+        payload = self.finish(self.doc())
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["postures_withheld"], [])
+        self.assertIn(
+            f"Declared-intent search: `acme/fleet@{SEARCH_SHA}`, `acme/terraform-live@{self.OTHER_SHA}`",
+            self.ledger_body(),
+        )
+
+    def test_a_partial_harness_record_withholds_and_names_the_unread_repository(self):
+        self.record(searched=("acme/fleet",))
+        self.file(self.entry())
+        payload = self.finish(self.doc())
+        self.assertTrue(payload["partial"])
+        gap = [g for g in payload["coverage_gaps"] if g.startswith("declared intent:")][0]
+        self.assertIn("repositories not searched: acme/terraform-live", gap)
+        self.assertNotIn("acme/fleet,", gap)
+        # The declared posture is its own record and is not among the withheld.
+        self.assertEqual(payload["declared"], 1)
+        self.assertNotIn(self.PDB_ID(), payload["postures_withheld"])
+        self.assertEqual(len(payload["postures_withheld"]), 2)
+
+    def test_the_model_record_and_the_harness_record_are_unioned(self):
+        self.record(searched=("acme/fleet",))
+        doc = self.doc()
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/terraform-live")
+        payload = self.finish(doc)
+        self.assertFalse(payload["partial"])
+
+    def test_a_file_for_another_repository_joins_nothing(self):
+        self.record()
+        self.file(self.entry(), repo="acme/other")
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+
+    def test_the_dry_run_applies_the_same_join(self):
+        self.record()
+        self.file(self.entry())
+        self.finish(self.doc(), "--dry-run")
+        self.assertIn(f"DECLARED: {self.PDB_ID()}", self.err)
+        self.assertIn("DECLARED: 1 posture(s)", self.err)
+        self.assertIn("## Declared intent", self.out)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", self.out)
+        self.assertEqual(self.harness.gh_calls("issue"), [])
+
+    def test_remediate_refuses_a_declared_id_by_name(self):
+        self.record()
+        self.file(self.entry())
+        findings_file = self.write_findings(self.doc())
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                rc = self.run_main(
+                    ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+                     "--finding", self.PDB_ID(), *extra]
+                )
+                self.assertEqual(rc, 2, self.err)
+                self.assertIn("declared", self.err)
+                self.assertIn("Declared intent", self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+
+    def test_remediate_still_opens_a_fault_beside_a_declared_posture(self):
+        self.record()
+        self.file(self.entry())
+        findings_file = self.write_findings(self.doc())
+        fault = derived_id(check="blocking-pdb", namespace="payments", obj="PodDisruptionBudget/payments-db")
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file, "--finding", fault]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(self.stdout_json()["prs_opened"]), 1)
+
+    # -- a standing /remediate on a declared posture ---------------------------
+
+    def ledger_with(self, *comments):
+        self.harness.replies.update(
+            {
+                "issue list": self.issue_list(),
+                "--json comments": json.dumps({"comments": list(comments)}),
+            }
+        )
+
+    def test_a_ledger_request_for_a_declared_posture_is_refused_with_the_file_named(self):
+        """The id was right and the posture is declared: neither "typo" nor a hold.
+
+        The join takes the posture out of `findings` before the ledger's
+        comments are parsed, so read against `findings` alone the request
+        would fall to "not a finding in the current report". It is refused on
+        the permanent marker with the declaring file named, as the CLI path
+        refuses `--finding`, because a declaration is the owner's standing
+        choice and the request does not stay open against it.
+        """
+        self.record()
+        self.file(self.entry())
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
+        self.assertIn("Declared intent", refusals[0])
+        self.assertNotIn("typo", refusals[0])
+        self.assertNotIn("may have been resolved", refusals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+        self.assertNotIn(
+            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+        )
+
+    def test_a_clean_run_refuses_a_request_for_a_declared_posture(self):
+        # The one finding was the declared posture, so the run lands on the
+        # CLEAN branch with no gap. "No longer reproduces" would be false — it
+        # reproduces and is listed under Declared intent — so the request is
+        # refused there too, with the file named, and not acked.
+        self.record()
+        self.file(self.entry())
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        postures = [f for f in posture_and_fault_findings() if f["check"] == "no-pdb"]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn("no longer reproduces", body)
+
+    def test_the_refusal_names_the_declaring_file_through_the_cell_sanitiser(self):
+        # A note's filename comes from the tree walk or the broker listing,
+        # neither of which refuses a backtick, and the refusal wraps
+        # `repo:path` in a code span: one backtick in the name would close it
+        # and leave the rest of the comment, marker included, as live
+        # Markdown. The pointer goes through `_cell`, as the ledger table's
+        # does, so the two never name one declaration two different ways.
+        self.record()
+        self.file(self.entry(path="knowledge/check`out.md"))
+        self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        posted = self.harness.bodies_for("issue", "comment")
+        refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1, posted)
+        self.assertIn("`acme/fleet:knowledge/check'out.md`", refusals[0])
+        self.assertNotIn("check`out", refusals[0])
+
+    def test_a_declared_posture_with_a_shortened_id_is_refused_and_not_a_typo(self):
+        # The id a finding carries, the ledger prints and a requester copies
+        # is `_shorten_id` of the derived string once the four fields overrun
+        # `MAX_FINDING_ID`; a 63-character namespace, the RFC 1123 maximum,
+        # does it alone. Keyed on the full id, the lookup missed the posture
+        # and the request fell through to the typo refusal.
+        namespace = "n" * 63
+        entry = make_declared(check="no-pdb", namespace=namespace, obj="Deployment/checkout-gateway",
+                              repo="acme/fleet", path="knowledge/long.md")
+        full = audit_report.derive_finding_id(entry)
+        target = audit_report._shorten_id(full)
+        self.assertNotEqual(target, full)
+        self.assertLessEqual(len(target), audit_report.MAX_FINDING_ID)
+        requests = audit_report.parse_remediate_commands(
+            [comment(f"/remediate {target}")], findings=[], declared=[entry]
+        )
+        self.assertEqual(requests.targets, [])
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertFalse(requests.refusals[0].get("deferred"))
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`acme/fleet:knowledge/long.md`", reason)
+        self.assertNotIn("typo", reason)
+        # The clean branch reads the same map.
+        self.assertIn(target, audit_report.declared_by_id([entry]))
+
+    def test_a_model_written_declared_entry_refuses_a_request_the_same_way(self):
+        # The classifier reads `declared[]` whole, not only what the harness
+        # moved: an entry the model wrote covers its posture just as well.
+        entry = make_declared(check="no-pdb", obj="Deployment/checkout-gateway",
+                              repo="acme/fleet", path="knowledge/model.md")
+        target = derived_id(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway")
+        requests = audit_report.parse_remediate_commands(
+            [comment(f"/remediate {target}")], findings=[], declared=[entry]
+        )
+        self.assertEqual(requests.targets, [])
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertFalse(requests.refusals[0].get("deferred"))
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`acme/fleet:knowledge/model.md`", reason)
+        self.assertNotIn("typo", reason)
+        # Without `declared` the same request reads as a typo: the fixture
+        # shows what the argument changes.
+        bare = audit_report.parse_remediate_commands([comment(f"/remediate {target}")], findings=[])
+        self.assertIn("typo", bare.refusals[0]["reasons"][0])
+
+    def test_a_run_with_nothing_but_declared_postures_is_clean(self):
+        self.record()
+        self.file(self.entry(), self.entry(check="no-hpa", obj="Deployment/api"))
+        postures = [f for f in posture_and_fault_findings() if f["check"] in ("no-pdb", "no-hpa")]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["declared"], 2)
+        self.assertIn("2 declared posture(s) were not reported as findings", self.err)
+
 
 
 class TestAiSecurityAuditStream(BaseTestCase):
@@ -10095,6 +12287,3758 @@ class ContentModeTestCase(BaseTestCase):
         self.assertTrue(
             [c for c in self.harness.calls if c[:2] == ["git", "clone"]]
         )
+
+
+# --------------------------------------------------------------------------- #
+# The collector manifest — docs/designs/fleet-audit-collector-manifest.md
+# --------------------------------------------------------------------------- #
+
+
+def _cand(check, cluster, obj, namespace=""):
+    return {"check": check, "cluster": cluster, "object": obj, "namespace": namespace}
+
+
+def _manifest(*clusters):
+    return {"clusters": [{"name": n, "candidates": c} for n, c in clusters]}
+
+
+def _ran(cluster, *slugs, candidates=None, rc=0, outcome="collected"):
+    """A manifest entry recording that the collector ran these checks here.
+
+    `outcome` is explicit because only a `collected` target vouches for its
+    commands; a test about the other outcomes says which one it means.
+    """
+    return {
+        "name": cluster,
+        "outcome": outcome,
+        "commands": [{"check": s, "rc": rc, "command": f"kubectl get {s}"} for s in slugs],
+        "candidates": list(candidates or []),
+    }
+
+
+def _pub(fid, check, cluster, obj, namespace=""):
+    """A published finding whose derived id lines up with `_cand`'s.
+
+    Both sides of the join are `(check, cluster, namespace, object)`, and
+    `_cand` leaves the namespace empty; `make_finding` defaults it to
+    `payments`, which would put every finding here in a different bucket from
+    the candidate it is meant to match.
+    """
+    return make_finding(fid=fid, check=check, cluster=cluster, obj=obj, namespace=namespace)
+
+
+def _titled(fid, title):
+    """A manifest finding with a title of its own, which the ledger renders."""
+    return manifest_finding(fid, f"{fid}.yaml") | {"title": title}
+
+
+def _full_manifest(names=("prod-us-east", "stage-eu"), candidates=(), audit=AUDIT, command=None):
+    """A manifest that collected every roster check on every named cluster.
+
+    `candidates` land on the first cluster. `command` is what the manifest
+    records for `netpol-missing`, the check `make_finding` files under.
+    """
+    checks = list(audit_report.audit_checks(audit))
+    return {
+        "clusters": [
+            {
+                "name": name,
+                "outcome": "collected",
+                "commands": [
+                    {
+                        "check": c,
+                        "command": command if command and c == "netpol-missing" else f"ran {c}",
+                        "rc": 0,
+                    }
+                    for c in checks
+                ],
+                "candidates": list(candidates) if index == 0 else [],
+            }
+            for index, name in enumerate(names)
+        ]
+    }
+
+
+class TestLoadManifest(BaseTestCase):
+    def write(self, text):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_a_missing_file_is_a_validation_error(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.load_manifest(str(self.tmp_path / "absent.json"))
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_malformed_json_is_a_validation_error(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.load_manifest(self.write("not json"))
+        self.assertIn("not valid JSON", str(ctx.exception))
+
+    def test_a_non_object_is_refused(self):
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.load_manifest(self.write("[]"))
+
+    def test_clusters_must_be_a_list_when_present(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.load_manifest(self.write('{"clusters": {"a": 1}}'))
+        self.assertIn("`clusters` must be a list", str(ctx.exception))
+
+    def test_an_empty_envelope_loads(self):
+        self.assertEqual(audit_report.load_manifest(self.write("{}")), {})
+
+
+class TestCrossCheckManifest(unittest.TestCase):
+    """Manifest-scoped attestation: see `audit_report.cross_check_manifest`."""
+
+    def manifest(self, **cluster_overrides):
+        cluster = {
+            "name": "prod-us-east",
+            "outcome": "collected",
+            "commands": [{"check": "no-requests", "rc": 0}, {"check": "no-memory-limit", "rc": 0}],
+        }
+        cluster.update(cluster_overrides)
+        return {"clusters": [cluster]}
+
+    def doc(self, checks_run):
+        return {
+            "audit": "obtainability-audit",
+            "scope": {
+                "clusters": [
+                    {"name": "prod-us-east", "checks_run": [{"check": c, "command": "x"} for c in checks_run]}
+                ]
+            },
+        }
+
+    def test_a_check_the_manifest_verified_passes(self):
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), self.manifest())
+
+    def test_a_check_the_manifest_never_ran_is_rejected(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-pdb"]), self.manifest())
+        self.assertIn("no-pdb", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+
+    def test_a_check_that_ran_but_failed_is_rejected(self):
+        manifest = self.manifest(commands=[{"check": "no-requests", "rc": 1}])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+
+    def with_limitations(self, checks_run, text="collector gate-failed; re-read by hand"):
+        doc = self.doc(checks_run)
+        doc["scope"]["clusters"][0]["limitations"] = text
+        return doc
+
+    def test_an_unreachable_clusters_checks_are_not_matched_against_commands(self):
+        # The SOP's manual fallback applies here -- attestation, not
+        # manifest-verification, exactly as it does for streams with no
+        # collector at all. `no-pdb` and `no-hpa` appear in no manifest command
+        # and are accepted anyway; the declared limitation is what buys that.
+        manifest = self.manifest(outcome="unreachable", commands=[])
+        audit_report.cross_check_manifest(self.with_limitations(["no-requests", "no-pdb", "no-hpa"]), manifest)
+
+    def test_a_gate_failed_clusters_checks_are_not_matched_either(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        audit_report.cross_check_manifest(self.with_limitations(["no-requests"]), manifest)
+
+    def test_a_target_the_collector_could_not_read_cannot_report_a_clean_full_read(self):
+        """Every rule here asks the manifest to confirm the document, and the
+        one target the manifest actively contradicted was the one a
+        `collected`-only cross-check skipped: a project entry published with
+        three checks run, no limitations and no gap, over a manifest marking
+        it `gate-failed`."""
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                manifest = self.manifest(outcome=outcome, commands=[], error="disks list rc=2")
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+                self.assertIn("prod-us-east", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
+    def test_the_refusal_quotes_the_collectors_own_error(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[], error="PERMISSION_DENIED on compute.disks.list")
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("PERMISSION_DENIED", str(ctx.exception))
+
+    def test_an_unreadable_target_claiming_nothing_is_left_alone(self):
+        """No claim, no contradiction. A target the collector could not read and
+        the document does not say it checked needs no limitation -- the roster
+        rules already count it as uncovered."""
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        audit_report.cross_check_manifest(self.doc([]), manifest)
+
+    def test_whitespace_does_not_pass_for_a_limitation(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(self.with_limitations(["no-requests"], text="   "), manifest)
+
+    def test_a_cluster_absent_from_the_manifest_is_ignored(self):
+        # A stream only partially covered, or a manifest scoped narrower than
+        # the findings document -- not this function's concern. The manifest's
+        # own cluster stays in the document, so this isolates the extra one
+        # rather than also tripping the omitted-cluster rule below.
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"].append(
+            {"name": "some-other-cluster", "checks_run": [{"check": "no-pdb", "command": "x"}]}
+        )
+        audit_report.cross_check_manifest(doc, self.manifest())
+
+    def test_an_empty_manifest_cross_checks_nothing(self):
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), {"clusters": []})
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), {})
+
+    def test_a_collected_cluster_the_document_omits_is_rejected(self):
+        """The direction a document-first check cannot see: the collector read
+        four clusters, the document named one, and the run published a
+        full-fleet all-clear off a quarter of the fleet."""
+        manifest = {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": "collected", "commands": [{"check": "no-requests", "rc": 0}]},
+            ]
+        }
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("prod-eu-west", str(ctx.exception))
+        self.assertNotIn("prod-us-east", str(ctx.exception))
+
+    def unreadable(self, outcome, error="boom"):
+        return {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": outcome, "error": error, "commands": []},
+            ]
+        }
+
+    def test_a_cluster_the_collector_could_not_read_may_not_be_omitted(self):
+        """The rule that an unreadable target claiming checks must carry
+        `limitations` only reaches a target the document mentions. Omitting it
+        evades that as thoroughly as it evades everything else, and a collector
+        failure is the likeliest place for a finding to be hiding.
+        """
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(
+                        self.doc(["no-requests"]), self.unreadable(outcome)
+                    )
+                self.assertIn("prod-eu-west", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
+    def test_the_refusal_to_omit_quotes_the_collectors_error(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(
+                self.doc(["no-requests"]),
+                self.unreadable("gate-failed", error="node-pools list rc=1: code=400"),
+            )
+        self.assertIn("code=400", str(ctx.exception))
+
+    def test_scope_skipped_accounts_for_an_unreadable_cluster(self):
+        """The honest shape when nobody covered it by hand: `coverage_gaps`
+        already renders a skipped entry as "not audited — <reason>", which is
+        the gap this rule exists to force."""
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                doc = self.doc(["no-requests"])
+                doc["scope"]["skipped"] = [
+                    {"cluster": "prod-eu-west", "reason": "collector could not reach it"}
+                ]
+                audit_report.cross_check_manifest(doc, self.unreadable(outcome))
+
+    def test_scope_clusters_with_limitations_also_accounts_for_it(self):
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"].append(
+            {
+                "name": "prod-eu-west",
+                "checks_run": [{"check": "no-requests", "command": "x"}],
+                "limitations": "collector gate-failed; no-requests checked by hand, the rest unread",
+            }
+        )
+        audit_report.cross_check_manifest(doc, self.unreadable("gate-failed"))
+
+    def test_a_collected_cluster_is_still_reported_as_the_collected_case(self):
+        """The two refusals must not collapse into one: a `collected` cluster
+        omitted from the document is a defect in the document, and its message
+        says so rather than telling the author to declare a gap they do not
+        have."""
+        manifest = {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": "collected", "commands": []},
+            ]
+        }
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("marks 'collected'", str(ctx.exception))
+
+    def not_applicable(self, checks_run, slug, reason="Autopilot cluster; Google owns the node pools"):
+        doc = self.doc(checks_run)
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = [{"check": slug, "reason": reason}]
+        return doc
+
+    def test_an_inapplicable_check_the_collector_declared_is_accepted(self):
+        """The corroborated path: the collector declares the disposition, so
+        the manifest answers for it."""
+        manifest = self.manifest(
+            checks_not_applicable=[{"check": "no-memory-limit", "reason": "no user node pools"}]
+        )
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), manifest)
+
+    def test_an_inapplicable_check_the_collector_never_ran_is_accepted(self):
+        """Nothing to contradict. A slug the collector does not carry, or a
+        target it could not read, still takes the model's judgment."""
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-pdb"), self.manifest())
+
+    def test_a_check_the_manifest_ran_cleanly_cannot_be_declared_inapplicable(self):
+        """The contradiction: the collector ran the check and completed it,
+        and the document takes it out of the coverage denominator anyway."""
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), self.manifest())
+        self.assertIn("no-memory-limit", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+
+    def test_a_check_the_manifest_ran_and_failed_may_be_declared_inapplicable(self):
+        """rc != 0 is not a successful command, so there is no claim to
+        contradict — and a collector that tried and failed has said nothing
+        about whether the check applies."""
+        manifest = self.manifest(commands=[{"check": "no-requests", "rc": 0}, {"check": "no-memory-limit", "rc": 1}])
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), manifest)
+
+    def test_an_unreachable_cluster_may_declare_anything_inapplicable(self):
+        """A `gate-failed` target never reaches the corroboration rule: the
+        manual fallback returns before it, and there are no successful
+        commands to contradict in any case."""
+        manifest = self.manifest(outcome="gate-failed", commands=[], error="denied")
+        doc = self.not_applicable([], "no-memory-limit")
+        doc["scope"]["clusters"][0]["limitations"] = "collector gate-failed; re-read by hand"
+        audit_report.cross_check_manifest(doc, manifest)
+
+    def test_a_check_the_collector_declared_inapplicable_cannot_be_reported_as_run(self):
+        """The mirror of the rule above, and the hole `commands` leaves. One
+        command is routinely recorded against every slug it feeds, so the
+        rc=0 match alone corroborates a claim that `no-memory-limit` ran here.
+        Only the collector's own `checks_not_applicable` can tell the two
+        apart."""
+        manifest = self.manifest(
+            checks_not_applicable=[{"check": "no-memory-limit", "reason": "no user node pools"}]
+        )
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests", "no-memory-limit"]), manifest)
+        self.assertIn("no-memory-limit", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+
+    def test_an_entry_with_no_outcome_is_not_cross_checked_and_says_so(self):
+        """`load_manifest` promises a malformed entry degrades to "not
+        cross-checked". An entry with a name and no outcome the document does
+        not list used to fail the run at the outcome test instead."""
+        for outcome in ({}, {"outcome": None}, {"outcome": "   "}, {"outcome": 3}):
+            with self.subTest(outcome=outcome):
+                manifest = {"clusters": [self.manifest()["clusters"][0], {"name": "prod-eu-west", **outcome}]}
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+                self.assertIn("WARNING", err.getvalue())
+                self.assertIn("prod-eu-west", err.getvalue())
+                self.assertIn("no outcome", err.getvalue())
+
+    def test_the_collectors_error_is_redacted_in_the_refusal(self):
+        manifest = self.manifest(
+            outcome="gate-failed", commands=[], error="gcloud failed: password: hunter2correcthorse"
+        )
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn(audit_report.REDACTED, str(ctx.exception))
+        self.assertNotIn("hunter2correcthorse", str(ctx.exception))
+
+    def test_malformed_manifest_entries_are_skipped_rather_than_raising(self):
+        manifest = {"clusters": ["not-a-dict", {"outcome": "collected"}, {"name": "prod-us-east", "outcome": "collected", "commands": ["x", {"check": "no-requests", "rc": 0}]}]}
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+
+
+class TestCollectorFlaggedIds(unittest.TestCase):
+    """A candidate the collector still emits is the condition still holding."""
+
+    def entry(self, name, candidates):
+        return {"name": name, "outcome": "collected", "commands": [], "candidates": candidates}
+
+    def test_a_still_emitted_candidate_yields_its_finding_id(self):
+        manifest = {
+            "clusters": [
+                self.entry(
+                    "drift-peer-std-1",
+                    [
+                        {
+                            "check": "no-maintenance-window",
+                            "namespace": "",
+                            "object": "Cluster/drift-peer-std-1",
+                            "severity": "major",
+                        }
+                    ],
+                )
+            ]
+        }
+        flagged = audit_report.collector_flagged_ids(manifest)
+        expected = audit_report.derive_finding_id(
+            {
+                "check": "no-maintenance-window",
+                "cluster": "drift-peer-std-1",
+                "namespace": "",
+                "object": "Cluster/drift-peer-std-1",
+            }
+        )
+        self.assertEqual(flagged, {expected})
+
+    def test_the_cluster_name_comes_from_the_enclosing_entry(self):
+        """A collector that builds the cluster name into `object` and never
+        writes a `cluster` key still joins; an id derived from the candidate
+        alone would match nothing and the guard would hold nothing back."""
+        candidate = {
+            "check": "no-maintenance-window",
+            "namespace": "",
+            "object": "Cluster/spot-capacity-test",
+            "severity": "major",
+        }
+        self.assertNotIn("cluster", candidate)
+        flagged = audit_report.collector_flagged_ids(
+            {"clusters": [self.entry("spot-capacity-test", [candidate])]}
+        )
+        finding = make_finding(
+            check="no-maintenance-window",
+            cluster="spot-capacity-test",
+            namespace="",
+            obj="Cluster/spot-capacity-test",
+        )
+        self.assertEqual(flagged, {audit_report.derive_finding_id(finding)})
+
+    def test_no_manifest_flags_nothing(self):
+        for manifest in (None, {}, {"clusters": []}, {"clusters": None}):
+            with self.subTest(manifest=manifest):
+                self.assertEqual(audit_report.collector_flagged_ids(manifest), set())
+
+    def test_malformed_entries_are_skipped_rather_than_raising(self):
+        manifest = {
+            "clusters": [
+                "not-a-dict",
+                {"name": "c1", "candidates": None},
+                {"name": "c2", "candidates": ["not-a-dict"]},
+            ]
+        }
+        self.assertEqual(audit_report.collector_flagged_ids(manifest), set())
+
+    def test_ids_are_spelled_as_the_ledger_spells_them(self):
+        """A derived id over `MAX_FINDING_ID` is clipped on the ledger, and the
+        ids this set is subtracted from were read off a ledger body. Compared
+        unclipped, a long-named object never matched and the hold never fired.
+        """
+        long_object = "Deployment/" + "very-long-workload-name-segment-" * 4
+        finding = make_finding(fid="long", obj=long_object)
+        self.assertGreater(len(audit_report.derive_finding_id(finding)), audit_report.MAX_FINDING_ID)
+        ledger_id = audit_report.published_id(finding)
+        self.assertNotEqual(ledger_id, audit_report.derive_finding_id(finding))
+        candidate = {"check": "netpol-missing", "namespace": "payments", "object": long_object}
+        flagged = audit_report.collector_flagged_ids(
+            {"clusters": [self.entry("prod-us-east", [candidate])]}
+        )
+        self.assertEqual(flagged, {ledger_id})
+
+
+class TestAdoptCollectorEvidence(unittest.TestCase):
+    """`evidence` is observed, so the collector authors it — see
+    `audit_report.adopt_collector_evidence`.
+    """
+
+    COMMAND = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
+
+    def candidate(self, **overrides):
+        cand = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "zero NetworkPolicies",
+            "impact": "collector-authored impact",
+            "needs_triage": None,
+        }
+        cand.update(overrides)
+        return cand
+
+    def manifest(self, candidates, rc=0, name="prod-us-east", check="netpol-missing"):
+        return {
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [{"check": check, "command": self.COMMAND, "rc": rc}],
+                    "candidates": candidates,
+                }
+            ]
+        }
+
+    def test_the_collectors_excerpt_and_command_replace_the_models(self):
+        finding = make_finding()
+        adopted = audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate()])
+        )
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["evidence"]["excerpt"], "zero NetworkPolicies")
+        self.assertEqual(finding["evidence"]["command"], self.COMMAND)
+
+    def test_a_candidate_without_a_cluster_field_still_joins(self):
+        """The shape a collector that builds the cluster name into `object`
+        emits. The enclosing manifest entry names the cluster in both shapes,
+        which is why this is fixed here and not in every collector."""
+        cand = {
+            "check": "logging-components",
+            "namespace": "",
+            "object": "Cluster/drift-peer-std-4",
+            "severity": "minor",
+            "excerpt": "loggingConfig.componentConfig.enableComponents=[SYSTEM_COMPONENTS]",
+            "impact": "x",
+            "needs_triage": None,
+        }
+        self.assertNotIn("cluster", cand)
+        finding = make_finding(
+            check="logging-components",
+            cluster="drift-peer-std-4",
+            namespace="",
+            obj="Cluster/drift-peer-std-4",
+            excerpt="logging is partly off",
+        )
+        adopted = audit_report.adopt_collector_evidence(
+            [finding],
+            self.manifest([cand], name="drift-peer-std-4", check="logging-components"),
+        )
+        self.assertEqual(len(adopted), 1)
+        self.assertEqual(finding["evidence"]["excerpt"], cand["excerpt"])
+
+    def test_a_finding_the_collector_did_not_propose_is_left_alone(self):
+        """The manual fallback. A target the collector could not read yields no
+        candidates, and the agent's hand-run command is the only evidence there
+        is — overwriting or blanking it would delete the finding's only proof.
+        """
+        finding = make_finding(cluster="stage-eu")
+        before = json.loads(json.dumps(finding["evidence"]))
+        self.assertEqual(
+            audit_report.adopt_collector_evidence([finding], self.manifest([self.candidate()])),
+            [],
+        )
+        self.assertEqual(finding["evidence"], before)
+
+    def test_a_candidate_the_collector_cannot_back_is_left_whole(self):
+        """Half a swap is worse than none: `rc != 0` produced no output, so it
+        is not what the excerpt came from, and an empty candidate excerpt has
+        nothing to offer. Either way the finding keeps *both* of the model's
+        fields."""
+        for manifest in (
+            self.manifest([self.candidate()], rc=1),
+            self.manifest([self.candidate(excerpt="   ")]),
+        ):
+            finding = make_finding()
+            self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+            self.assertEqual(
+                finding["evidence"],
+                {
+                    "command": "kubectl get networkpolicy -n payments",
+                    "excerpt": "No resources found in payments namespace.",
+                },
+            )
+
+    def test_adoption_is_idempotent(self):
+        manifest = self.manifest([self.candidate()])
+        finding = make_finding()
+        self.assertEqual(len(audit_report.adopt_collector_evidence([finding], manifest)), 1)
+        self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+
+    def test_nothing_but_evidence_is_taken_from_the_candidate(self):
+        """The candidate also carries `severity` and `impact`, and neither may
+        cross here. Severity is re-judged against the fleet's context and
+        impact is prose about consequence; only the command and the output it
+        produced are observations.
+        """
+        finding = make_finding(severity="critical", impact="model-authored impact")
+        audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate()])
+        )
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["impact"], "model-authored impact")
+
+    def test_no_manifest_changes_nothing(self):
+        finding = make_finding()
+        for manifest in (None, {}, {"clusters": []}):
+            self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+
+    def test_a_candidates_own_command_beats_the_per_slug_record(self):
+        """A check that issues one command per sub-target can record only one
+        of them under `commands`; the candidate's own command is the one that
+        produced this excerpt."""
+        own = (
+            "gcloud beta compute advice capacity-history --region us-east4 "
+            "--machine-type e2-standard-4 --provisioning-model SPOT --types PREEMPTION,PRICE"
+        )
+        finding = make_finding()
+        adopted = audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate(command=own)])
+        )
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["evidence"]["command"], own)
+        self.assertEqual(finding["evidence"]["excerpt"], "zero NetworkPolicies")
+
+    def test_a_candidate_with_no_command_of_its_own_still_takes_the_slugs(self):
+        finding = make_finding()
+        audit_report.adopt_collector_evidence([finding], self.manifest([self.candidate()]))
+        self.assertEqual(finding["evidence"]["command"], self.COMMAND)
+
+    def test_a_blank_candidate_command_falls_back_rather_than_blanking(self):
+        """An empty string is not an override — it is the absence of one, and
+        the half-swap guard would otherwise drop the whole adoption."""
+        finding = make_finding()
+        adopted = audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate(command="  ")])
+        )
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["evidence"]["command"], self.COMMAND)
+
+
+class TestAdoptArmImpact(unittest.TestCase):
+    """A multi-arm check's `impact` reports *which arm fired*, so the collector
+    authors it — see `audit_report.adopt_arm_impact`. Everywhere else the
+    model's sentence stands, which is the narrowness this class defends.
+    """
+
+    ARM = (
+        "Node pool is locked to a single zone: a stockout in that zone halts "
+        "scale-up of this pool, and pods only this pool can host stay Pending."
+    )
+
+    def candidate(self, **overrides):
+        cand = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "zero NetworkPolicies",
+            "impact": self.ARM,
+            "impact_authoritative": True,
+            "needs_triage": None,
+        }
+        cand.update(overrides)
+        return cand
+
+    def manifest(self, candidates, name="prod-us-east"):
+        return {"clusters": [{"name": name, "outcome": "collected", "candidates": candidates}]}
+
+    def test_the_collectors_arm_sentence_replaces_the_models(self):
+        finding = make_finding(impact="model guessed the other arm")
+        adopted = audit_report.adopt_arm_impact([finding], self.manifest([self.candidate()]))
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["impact"], self.ARM)
+
+    def test_an_unflagged_candidate_leaves_the_models_impact_alone(self):
+        """The reason this function is not `adopt_collector_evidence` for
+        prose: the model's rewrite of a single-arm check's constant is usually
+        the better sentence, and adopting the table everywhere would delete it.
+        """
+        cand = self.candidate()
+        del cand["impact_authoritative"]
+        finding = make_finding(impact="names the actual ResourceQuota")
+        self.assertEqual(audit_report.adopt_arm_impact([finding], self.manifest([cand])), [])
+        self.assertEqual(finding["impact"], "names the actual ResourceQuota")
+
+    def test_nothing_but_impact_is_taken_from_the_candidate(self):
+        finding = make_finding(severity="critical", excerpt="model excerpt")
+        audit_report.adopt_arm_impact([finding], self.manifest([self.candidate()]))
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["evidence"]["excerpt"], "model excerpt")
+
+    def test_a_candidate_without_a_cluster_field_still_joins(self):
+        cand = self.candidate()
+        del cand["cluster"]
+        finding = make_finding(impact="model guessed the other arm")
+        self.assertEqual(
+            audit_report.adopt_arm_impact([finding], self.manifest([cand])),
+            ["no-network-policy"],
+        )
+        self.assertEqual(finding["impact"], self.ARM)
+
+    def test_a_blank_arm_impact_adopts_nothing(self):
+        """A flag over an empty string would blank the finding's only statement
+        of consequence — worse than the sentence it was meant to correct.
+        """
+        for impact in ("", "   ", None):
+            finding = make_finding(impact="model sentence")
+            self.assertEqual(
+                audit_report.adopt_arm_impact(
+                    [finding], self.manifest([self.candidate(impact=impact)])
+                ),
+                [],
+            )
+            self.assertEqual(finding["impact"], "model sentence")
+
+    def test_adoption_is_idempotent(self):
+        manifest = self.manifest([self.candidate()])
+        finding = make_finding(impact="model guessed the other arm")
+        self.assertEqual(len(audit_report.adopt_arm_impact([finding], manifest)), 1)
+        self.assertEqual(audit_report.adopt_arm_impact([finding], manifest), [])
+
+    def test_a_finding_the_collector_did_not_propose_is_left_alone(self):
+        finding = make_finding(cluster="stage-eu", impact="model sentence")
+        self.assertEqual(
+            audit_report.adopt_arm_impact([finding], self.manifest([self.candidate()])), []
+        )
+        self.assertEqual(finding["impact"], "model sentence")
+
+    def test_no_manifest_changes_nothing(self):
+        finding = make_finding(impact="model sentence")
+        for manifest in (None, {}, {"clusters": []}):
+            self.assertEqual(audit_report.adopt_arm_impact([finding], manifest), [])
+            self.assertEqual(finding["impact"], "model sentence")
+
+
+class TestUnpublishedCandidates(BaseTestCase):
+    """A candidate the document never mentions used to leave no trace at all."""
+
+    def test_published_candidate_is_not_reported(self):
+        m = _manifest(("c1", [_cand("unsized-workload", "c1", "deploy/a")]))
+        findings = [_cand("unsized-workload", "c1", "deploy/a")]
+        self.assertEqual(audit_report.unpublished_candidates(findings, m), [])
+
+    def test_dropped_candidate_is_reported(self):
+        m = _manifest(("c1", [_cand("unsized-workload", "c1", "deploy/a")]))
+        rows = audit_report.unpublished_candidates([], m)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["check"], "unsized-workload")
+        self.assertEqual(rows[0]["cluster"], "c1")
+        self.assertEqual(rows[0]["object"], "deploy/a")
+
+    def test_cluster_comes_from_the_enclosing_entry(self):
+        bare = {"check": "unsized-workload", "object": "deploy/a", "namespace": ""}
+        m = {"clusters": [{"name": "c1", "candidates": [bare]}]}
+        rows = audit_report.unpublished_candidates([], m)
+        self.assertEqual(rows[0]["cluster"], "c1")
+        # And the id it derives matches a finding on that cluster, so the
+        # finding is recognised as published rather than reported as dropped.
+        published = [_cand("unsized-workload", "c1", "deploy/a")]
+        self.assertEqual(audit_report.unpublished_candidates(published, m), [])
+
+    def test_no_manifest_reports_nothing(self):
+        self.assertEqual(audit_report.unpublished_candidates([], None), [])
+        self.assertEqual(audit_report.wholly_unpublished_checks([], None), [])
+
+    def test_duplicate_candidates_report_once(self):
+        c = _cand("unsized-workload", "c1", "deploy/a")
+        m = _manifest(("c1", [c, dict(c)]))
+        self.assertEqual(len(audit_report.unpublished_candidates([], m)), 1)
+
+    def test_rows_are_sorted_by_id(self):
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/z"),
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                ],
+            )
+        )
+        rows = audit_report.unpublished_candidates([], m)
+        self.assertEqual([r["id"] for r in rows], sorted(r["id"] for r in rows))
+
+
+class TestWhollyUnpublishedChecks(BaseTestCase):
+    """The narrower signal: a check that published none of what it flagged."""
+
+    def test_partial_drop_is_not_wholly_unpublished(self):
+        """One rejection out of two is the mechanism working, not a drop."""
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                    _cand("unsized-workload", "c1", "deploy/b"),
+                ],
+            )
+        )
+        findings = [_cand("unsized-workload", "c1", "deploy/a")]
+        self.assertEqual(len(audit_report.unpublished_candidates(findings, m)), 1)
+        self.assertEqual(audit_report.wholly_unpublished_checks(findings, m), [])
+
+    def test_total_drop_is_reported(self):
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                    _cand("unsized-workload", "c1", "deploy/b"),
+                ],
+            )
+        )
+        groups = audit_report.wholly_unpublished_checks([], m)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["cluster"], "c1")
+        self.assertEqual(groups[0]["check"], "unsized-workload")
+        self.assertEqual(groups[0]["objects"], ["deploy/a", "deploy/b"])
+
+    def test_one_check_dropped_beside_one_published(self):
+        """The drop is per (cluster, check), not per cluster."""
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                    _cand("overrequest", "c1", "deploy/b"),
+                ],
+            )
+        )
+        findings = [_cand("overrequest", "c1", "deploy/b")]
+        groups = audit_report.wholly_unpublished_checks(findings, m)
+        self.assertEqual([g["check"] for g in groups], ["unsized-workload"])
+
+    def test_same_check_dropped_on_one_cluster_only(self):
+        m = _manifest(
+            ("c1", [_cand("unsized-workload", "c1", "deploy/a")]),
+            ("c2", [_cand("unsized-workload", "c2", "deploy/b")]),
+        )
+        findings = [_cand("unsized-workload", "c2", "deploy/b")]
+        groups = audit_report.wholly_unpublished_checks(findings, m)
+        self.assertEqual([(g["cluster"], g["check"]) for g in groups], [("c1", "unsized-workload")])
+
+    def test_seven_dropped_on_one_cluster_is_one_group(self):
+        argo = [
+            "statefulset/argocd-application-controller",
+            "deployment/argocd-applicationset-controller",
+            "deployment/argocd-dex-server",
+            "deployment/argocd-notifications-controller",
+            "deployment/argocd-redis",
+            "deployment/argocd-repo-server",
+            "deployment/argocd-server",
+        ]
+        m = _manifest(
+            (
+                "kube-agents-host",
+                [_cand("unsized-workload", "kube-agents-host", o, "argocd") for o in argo],
+            )
+        )
+        self.assertEqual(len(audit_report.unpublished_candidates([], m)), 7)
+        groups = audit_report.wholly_unpublished_checks([], m)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]["objects"]), 7)
+
+
+class TestUncorroboratedFindings(BaseTestCase):
+    """A finding filed under a check the collector ran and did not flag it for."""
+
+    def test_a_finding_matching_its_candidate_is_corroborated(self):
+        m = {"clusters": [_ran("c1", "overrequest", candidates=[_cand("overrequest", "c1", "deploy/a")])]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "overrequest", "c1", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_the_reslug_is_caught(self):
+        """Published under a slug whose check ran and passed."""
+        m = {"clusters": [_ran("c1", "overrequest", "idle-workload", candidates=[_cand("overrequest", "c1", "deploy/a")])]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c1", "deploy/a")], m
+            ),
+            {"f1"},
+        )
+
+    def test_a_check_the_collector_never_ran_is_silent(self):
+        """The manual fallback. A slug absent from `commands` corroborates
+        nothing either way, and every stream depends on the model being able to
+        publish there.
+        """
+        m = {"clusters": [_ran("c1", "overrequest")]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "probes-liveness", "c1", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_failed_command_is_not_corroboration(self):
+        m = {"clusters": [_ran("c1", "idle-workload", rc=1)]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c1", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_check_run_on_another_cluster_does_not_reach_this_one(self):
+        m = {"clusters": [_ran("c1", "idle-workload"), _ran("c2")]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c2", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_second_object_under_a_check_that_did_flag_one(self):
+        """Exhaustiveness is the premise: a check that ran flagged everything it
+        found, so an object it omitted is one it passed, not one it missed.
+        """
+        m = {"clusters": [_ran("c1", "no-pdb", candidates=[_cand("no-pdb", "c1", "deploy/a")])]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [
+                    _pub("a", "no-pdb", "c1", "deploy/a"),
+                    _pub("b", "no-pdb", "c1", "deploy/b"),
+                ],
+                m,
+            ),
+            {"b"},
+        )
+
+    def test_no_manifest_corroborates_nothing_and_blocks_nothing(self):
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c1", "deploy/a")], None
+            ),
+            set(),
+        )
+
+    def test_the_sweep_passes_over_it_and_says_so(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("backed", "a.yaml"), manifest_finding("unbacked", "b.yaml")],
+            {},
+            uncorroborated={"unbacked"},
+        )
+        self.assertEqual(plan.promote, ["backed"])
+        self.assertEqual(plan.uncorroborated, ["unbacked"])
+        self.assertEqual(plan.withheld, [])
+
+    def test_an_explicit_remediate_still_opens_it(self):
+        """A person who reads the finding and names it has supplied the
+        judgement the collector withheld."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("unbacked", "b.yaml")],
+            {},
+            ["unbacked"],
+            uncorroborated={"unbacked"},
+        )
+        self.assertEqual(plan.promote, ["unbacked"])
+        self.assertEqual(plan.uncorroborated, [])
+
+    def test_a_finding_the_sweep_would_not_open_anyway_is_not_named(self):
+        """The two lists name only what the sweep would otherwise have opened:
+        a `major` finding, a `gcloud` fix, or one with a live pull request
+        drops out on the earlier tests and must not land in a block that
+        invites `/remediate` on it."""
+        plan = audit_report.promotion_candidates(
+            [
+                manifest_finding("minor", "a.yaml", severity="major"),
+                make_finding(fid="cli", remediation={"kind": "gcloud", "note": "x"}),
+                manifest_finding("open", "c.yaml"),
+            ],
+            {"open": {"number": 9, "state": "OPEN", "labels": []}},
+            uncorroborated={"minor", "cli", "open"},
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.uncorroborated, [])
+
+    def test_without_a_sweep_nothing_is_named(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("unbacked", "b.yaml")],
+            {},
+            auto_promote=False,
+            uncorroborated={"unbacked"},
+        )
+        self.assertEqual(plan.uncorroborated, [])
+
+    def test_the_ledger_names_it_apart_from_the_cap(self):
+        body = "\n".join(
+            audit_report._render_withheld(
+                ["capped"],
+                [_titled("capped", "A capped thing"), _titled("unbacked", "A stand-down")],
+                uncorroborated=["unbacked"],
+            )
+        )
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn("held back by the cap", body)
+        self.assertIn("Read these before asking", body)
+        self.assertIn("`unbacked` — A stand-down", body)
+        self.assertIn("`capped` — A capped thing", body)
+        # The cap's sentence must not annex the uncorroborated one: they are
+        # separate blocks because one invites `/remediate` and one warns first.
+        self.assertLess(body.index("held back by the cap"), body.index("Read these before asking"))
+
+    def test_the_cap_block_alone_renders_as_it_always_did(self):
+        with_cap = audit_report._render_withheld(["capped"], [_titled("capped", "A capped thing")])
+        self.assertEqual(
+            with_cap,
+            audit_report._render_withheld(
+                ["capped"], [_titled("capped", "A capped thing")], uncorroborated=[], needs_triage=[]
+            ),
+        )
+        self.assertEqual(with_cap[-1], "- `capped` — A capped thing")
+
+    def test_nothing_renders_when_all_three_are_empty(self):
+        self.assertEqual(audit_report._render_withheld([], [], [], []), [])
+
+    def test_a_target_the_collector_could_not_read_vouches_for_nothing(self):
+        """An `rc == 0` command on a `gate-failed` entry ran before the read
+        failed, and the finding on such a target is the SOP's hand-collected
+        fallback — the one thing this must not call uncorroborated."""
+        for outcome in ("gate-failed", "unreachable", "out-of-scope"):
+            with self.subTest(outcome=outcome):
+                m = {"clusters": [_ran("c1", "idle-workload", outcome=outcome)]}
+                self.assertEqual(
+                    audit_report.uncorroborated_findings(
+                        [_pub("f1", "idle-workload", "c1", "deploy/a")], m
+                    ),
+                    set(),
+                )
+
+
+class TestTriageMarkedFindings(BaseTestCase):
+    """A finding the collector stands behind whose *fix* it cannot vouch for.
+
+    Distinct from `TestUncorroboratedFindings` in the direction of the doubt:
+    there the collector declined to make the finding; here it made it, graded
+    it, and marked the fix.
+    """
+
+    def marked(self, obj="Deployment/a", marker="service-fronted"):
+        return {
+            "clusters": [
+                _ran(
+                    "c1",
+                    "idle-workload",
+                    candidates=[{**_cand("idle-workload", "c1", obj), "needs_triage": marker}],
+                )
+            ]
+        }
+
+    def test_a_marked_candidate_marks_its_finding(self):
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], self.marked()
+            ),
+            {"f1"},
+        )
+
+    def test_an_unmarked_candidate_does_not(self):
+        m = {"clusters": [_ran("c1", "idle-workload", candidates=[_cand("idle-workload", "c1", "Deployment/a")])]}
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_marker_this_gate_does_not_own_is_ignored(self):
+        """Other markers are the model's triage cue, not the sweep's. Only what
+        `NO_SWEEP_TRIAGE` names stops a pull request."""
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")],
+                self.marked(marker="guaranteed-qos"),
+            ),
+            set(),
+        )
+
+    def test_a_marked_candidate_on_another_object_does_not_reach_this_finding(self):
+        m = self.marked()
+        m["clusters"][0]["candidates"].append(_cand("idle-workload", "c1", "Deployment/b"))
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [
+                    _pub("a", "idle-workload", "c1", "Deployment/a"),
+                    _pub("b", "idle-workload", "c1", "Deployment/b"),
+                ],
+                m,
+            ),
+            {"a"},
+        )
+
+    def test_no_manifest_marks_nothing(self):
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], None
+            ),
+            set(),
+        )
+
+    def test_the_sweep_passes_over_it(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("free", "a.yaml"), manifest_finding("fronted", "b.yaml")],
+            {},
+            triage_marked={"fronted"},
+        )
+        self.assertEqual(plan.promote, ["free"])
+        self.assertEqual(plan.needs_triage, ["fronted"])
+        self.assertEqual(plan.uncorroborated, [])
+
+    def test_an_explicit_remediate_still_opens_it(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("fronted", "b.yaml")],
+            {},
+            ["fronted"],
+            triage_marked={"fronted"},
+        )
+        self.assertEqual(plan.promote, ["fronted"])
+        self.assertEqual(plan.needs_triage, [])
+
+    def test_a_live_pull_request_still_wins(self):
+        """The live-PR test runs first, so a marked finding that already has
+        one drops out silently instead of landing in the awaiting block."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("fronted", "b.yaml")],
+            {"fronted": {"number": 9, "state": "OPEN", "labels": []}},
+            triage_marked={"fronted"},
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.needs_triage, [])
+
+    def test_the_ledger_names_it_and_does_not_call_it_unbacked(self):
+        body = "\n".join(
+            audit_report._render_withheld(
+                [],
+                [_titled("unbacked", "A reslug"), _titled("fronted", "A stand-down")],
+                uncorroborated=["unbacked"],
+                needs_triage=["fronted"],
+            )
+        )
+        self.assertIn("`fronted` — A stand-down", body)
+        self.assertIn("its fix is what needs a decision", body)
+        # The two blocks say opposite things about the collector, so the
+        # `unbacked` sentence must not be the one covering `fronted`.
+        self.assertLess(
+            body.index("Read these before asking"),
+            body.index("its fix is what needs a decision"),
+        )
+
+
+class TestScopedCoverage(unittest.TestCase):
+    """Coverage is measured against what a target owes, not the whole roster.
+
+    No shipped roster declares `scopes` yet, so these run against a copy of
+    the stockout and networking specs partitioned the way their SOPs read: the
+    project entry owes the quota and reservation checks, every cluster owes
+    the rest plus the reservation check's cluster form, and a networking
+    subnet owes IP exhaustion alone. Rated against the whole roster, a project
+    entry that ran both of its checks read "10 of 12 applicable checks did not
+    run", and the stream was `partial` on every run because of it.
+    """
+
+    STOCKOUT = "stockout-prevention"
+    NETWORKING = "gcp-networking-fabric-audit"
+    PROJECT_CHECKS = ("quota-exhaustion-risk", "reservation-mismatch-risk")
+
+    def setUp(self):
+        stockout = audit_report.AUDITS[self.STOCKOUT]
+        networking = audit_report.AUDITS[self.NETWORKING]
+        partitioned = {
+            self.STOCKOUT: stockout._replace(
+                scopes=(
+                    ("cluster", tuple(c for c in stockout.checks if c != "quota-exhaustion-risk")),
+                    ("project", self.PROJECT_CHECKS),
+                )
+            ),
+            self.NETWORKING: networking._replace(
+                scopes=(
+                    ("project", tuple(c for c in networking.checks if c != "subnet-ip-exhaustion")),
+                    ("subnet", ("subnet-ip-exhaustion",)),
+                )
+            ),
+        }
+        patcher = patch.dict(audit_report.AUDITS, partitioned)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _doc(self, clusters):
+        return make_doc(findings=[], audit=self.STOCKOUT, clusters=clusters)
+
+    def _project(self, **extra):
+        base = {"name": "project/acme-prod", "location": "-", "project": "acme-prod"}
+        base.update(extra)
+        return base
+
+    def _clean_project(self):
+        """A project entry that owes nothing, so a cluster test isolates itself.
+
+        Omitting one of the two kinds is a gap in its own right — see
+        `test_a_kind_with_no_targets_is_a_gap` — and would leave these
+        assertions counting that instead of the thing under test.
+        """
+        return self._project(checks_run=list(self.PROJECT_CHECKS))
+
+    def _clean_cluster(self, name="stage-eu"):
+        return {
+            "name": name,
+            "location": "europe-west1",
+            "project": "acme-stage",
+            "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, name)),
+        }
+
+    def test_target_kind_reads_the_name_the_sop_asks_for(self):
+        self.assertEqual(audit_report.target_kind("project/acme-prod"), "project")
+        self.assertEqual(audit_report.target_kind("acme-prod/us-east4/gke-nodes"), "subnet")
+        self.assertEqual(audit_report.target_kind("prod-us-east"), "cluster")
+
+    def test_a_project_target_owes_only_the_project_scoped_checks(self):
+        gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster()]))
+        self.assertEqual(gaps, [])
+
+    def test_a_project_target_missing_a_project_scoped_check_is_still_a_gap(self):
+        """Narrowing the denominator must not excuse the checks that remain."""
+        gaps = audit_report.coverage_gaps(
+            self._doc([self._project(checks_run=["reservation-mismatch-risk"]), self._clean_cluster()])
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("1 of 2 applicable checks did not run", gaps[0])
+        self.assertIn("quota-exhaustion-risk", gaps[0])
+
+    def test_a_cluster_is_not_charged_with_a_project_scoped_check(self):
+        cluster_owed = audit_report.audit_target_checks(self.STOCKOUT, "prod-us-east")
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                        "checks_run": list(cluster_owed),
+                    },
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+        self.assertNotIn("quota-exhaustion-risk", cluster_owed)
+
+    def test_a_check_the_sop_gives_both_kinds_is_owed_by_both(self):
+        for name in ("prod-us-east", "project/acme-prod"):
+            with self.subTest(target=name):
+                self.assertIn(
+                    "reservation-mismatch-risk",
+                    audit_report.audit_target_checks(self.STOCKOUT, name),
+                )
+
+    def test_a_subnet_target_owes_the_ipam_check_alone(self):
+        owed = audit_report.audit_target_checks(self.NETWORKING, "acme-prod/us-east4/gke-nodes")
+        self.assertEqual(owed, ("subnet-ip-exhaustion",))
+
+    def test_an_unpartitioned_stream_still_owes_its_whole_roster(self):
+        """The streams that enumerate only clusters must be untouched by this."""
+        for audit_id in ("compliance-audit", "obtainability-audit"):
+            with self.subTest(audit=audit_id):
+                self.assertEqual(
+                    audit_report.audit_target_checks(audit_id, "prod-us-east"),
+                    audit_report.audit_checks(audit_id),
+                )
+                self.assertEqual(
+                    audit_report.audit_target_checks(audit_id, "project/acme-prod"),
+                    audit_report.audit_checks(audit_id),
+                )
+
+    def test_an_unknown_stream_owes_nothing(self):
+        self.assertEqual(audit_report.audit_target_checks("no-such-audit", "x"), ())
+
+    def test_an_undeclared_target_kind_owes_everything(self):
+        """A partitioned stream that meets an unexpected target must not go
+        quiet: the safe reading is that the target owes the whole roster and
+        shows up as a gap — the alternative, an empty denominator, reports the
+        target as fully audited."""
+        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/us-east4/net")
+        self.assertEqual(owed, audit_report.audit_checks(self.STOCKOUT))
+
+    def test_a_kind_with_no_targets_is_a_gap(self):
+        """The hole the partition itself opens: one project entry, no subnet
+        entries, `subnet-ip-exhaustion` owed by nobody."""
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                findings=[],
+                audit=self.NETWORKING,
+                clusters=[
+                    self._project(
+                        checks_run=[
+                            c
+                            for c in audit_report.audit_checks(self.NETWORKING)
+                            if c != "subnet-ip-exhaustion"
+                        ]
+                    )
+                ],
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no subnet targets were audited", gaps[0])
+        self.assertIn("subnet-ip-exhaustion", gaps[0])
+
+    def test_a_run_that_enumerates_every_kind_has_no_kind_gap(self):
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                findings=[],
+                audit=self.NETWORKING,
+                clusters=[
+                    self._project(
+                        checks_run=[
+                            c
+                            for c in audit_report.audit_checks(self.NETWORKING)
+                            if c != "subnet-ip-exhaustion"
+                        ]
+                    ),
+                    {
+                        "name": "acme-prod/us-east4/gke-nodes",
+                        "location": "us-east4",
+                        "project": "acme-prod",
+                        "checks_run": ["subnet-ip-exhaustion"],
+                    },
+                ],
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_an_unpartitioned_stream_never_reports_a_kind_gap(self):
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps("compliance-audit", [{"name": "prod-us-east"}]),
+            [],
+        )
+
+    def test_an_empty_scope_does_not_trigger_a_gap_per_kind(self):
+        self.assertEqual(audit_report._unenumerated_kind_gaps(self.NETWORKING, []), [])
+
+    def test_the_scope_table_rates_a_project_row_against_its_own_checks(self):
+        """The rendered `Checks` column had the same scope-blind denominator."""
+        out = "\n".join(
+            audit_report._render_scope(
+                [
+                    self._project(
+                        checks_run=[
+                            {"check": "quota-exhaustion-risk", "command": "gcloud x"},
+                            {"check": "reservation-mismatch-risk", "command": "gcloud y"},
+                        ]
+                    )
+                ],
+                [],
+                NOW,
+                self.STOCKOUT,
+            )
+        )
+        self.assertIn("2/2", out)
+        self.assertNotIn("2/12", out)
+        self.assertNotIn("⚠", out)
+
+
+class TestFinishManifestFlag(HarnessTestCase):
+    """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
+
+    Both flags are optional, and `TestFinishWithoutAManifestIsUnchanged` holds
+    the run without either to its recorded transcript; this class is about
+    what each flag adds.
+    """
+
+    NETPOL_COMMAND = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def netpol_candidate(self, **overrides):
+        cand = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "zero NetworkPolicies in payments",
+            "impact": "x",
+            "needs_triage": None,
+        }
+        cand.update(overrides)
+        return cand
+
+    def test_a_passing_manifest_lets_the_run_publish(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+
+    def test_without_either_flag_the_payload_carries_no_collector_keys(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        payload = self.stdout_json()
+        for key in ("unpublished_candidates", "wholly_unpublished_checks", "uncorroborated_findings"):
+            self.assertNotIn(key, payload)
+
+    def test_a_manifest_adds_the_collector_keys_to_the_payload(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["unpublished_candidates"], [])
+        self.assertEqual(payload["wholly_unpublished_checks"], [])
+        self.assertEqual(payload["uncorroborated_findings"], [])
+        self.assertEqual(payload["status"], "CLEAN")
+
+    def test_a_clean_document_over_a_still_flagging_collector_is_disclosed(self):
+        """The false clean: nothing published, the collector still emitting.
+        Every other field agrees the fleet is healthy; these two do not."""
+        self.harness.replies = {"issue list": "[]"}
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+        payload = self.stdout_json()
+        self.assertEqual(len(payload["unpublished_candidates"]), 1)
+        self.assertEqual(payload["unpublished_candidates"][0]["check"], "netpol-missing")
+        self.assertEqual(
+            payload["wholly_unpublished_checks"],
+            [{"cluster": "prod-us-east", "check": "netpol-missing", "objects": ["Namespace/no-network-policy"]}],
+        )
+        self.assertIn("every candidate for check 'netpol-missing'", self.err)
+        # A dropped check is news; the WARNING above is discarded on `[SILENT]`.
+        self.assertFalse(payload["silent_ok"])
+
+    def test_the_collectors_evidence_is_what_reaches_the_ledger(self):
+        """The wiring, asserted on the wire rather than on the return value:
+        this is the only thing that fails if the call is dropped from
+        `handle_finish` or moved after the body is rendered."""
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(candidates=[self.netpol_candidate()], command=self.NETPOL_COMMAND)
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("zero NetworkPolicies in payments", body)
+        self.assertIn(self.NETPOL_COMMAND, body)
+        # The model's two strings are gone, not merely joined by the truth.
+        self.assertNotIn("No resources found in payments namespace.", body)
+        self.assertNotIn("kubectl get networkpolicy -n payments\n", body)
+        self.assertIn("adopted the collector's command and excerpt for 1 of 1", self.err)
+
+    def test_the_real_run_publishes_the_collectors_arm_sentence(self):
+        corrected = "Node pool is locked to a single zone: a stockout there halts scale-up."
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate(impact=corrected, impact_authoritative=True)],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(
+            make_doc(findings=[make_finding(impact="the model's own guess")]),
+            ["--manifest-file", self.manifest_file(manifest)],
+        )
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn(corrected, body)
+        self.assertNotIn("the model's own guess", body)
+
+    def test_the_dry_run_previews_the_collectors_arm_sentence(self):
+        """The preview is read to check exactly the line the model gets wrong
+        most often, so it has to show the sentence the real run will publish."""
+        corrected = "Node pool is locked to a single zone: a stockout there halts scale-up."
+        guess = "the model's own guess at which arm fired"
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate(impact=corrected, impact_authoritative=True)]
+        )
+        rc = self.run_finish(
+            make_doc(findings=[make_finding(impact=guess)]),
+            ["--dry-run", "--manifest-file", self.manifest_file(manifest)],
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(corrected, self.out)
+        self.assertNotIn(guess, self.out)
+
+    def test_a_failing_manifest_rejects_before_any_publish(self):
+        manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "commands": []}]}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 2)
+        self.assertIn("FINDINGS REJECTED", self.err)
+        self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertFalse(self.harness.matching("issue", "edit"))
+
+    def test_a_missing_manifest_file_is_rejected(self):
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", "/nonexistent.json"])
+        self.assertEqual(rc, 2)
+        self.assertIn("does not exist", self.err)
+
+    def test_a_malformed_manifest_file_is_rejected(self):
+        path = self.tmp_path / "bad.json"
+        path.write_text("not json", encoding="utf-8")
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", str(path)])
+        self.assertEqual(rc, 2)
+
+    def test_a_waived_manifest_publishes_but_reports_a_coverage_gap(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            ["--no-collector-manifest", "collector found no readable project"],
+        )
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertIn(
+            "the collector manifest was waived — collector found no readable project",
+            payload["coverage_gaps"],
+        )
+        # The waiver alone reports nothing about candidates: there is no
+        # collector output to report against.
+        self.assertNotIn("unpublished_candidates", payload)
+
+    def test_a_waived_clean_run_holds_the_ledger_open_and_says_why(self):
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        rc = self.run_finish(make_doc(findings=[]), ["--no-collector-manifest", "collector crashed"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertFalse(self.harness.gh_calls("issue", "close"))
+        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertIn("did not see the whole fleet", comment)
+        self.assertIn("the collector manifest was waived — collector crashed", comment)
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+
+    def test_a_waived_dry_run_previews_the_same_hold(self):
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--dry-run", "--no-collector-manifest", "collector crashed"]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("COVERAGE GAP: the collector manifest was waived — collector crashed", self.err)
+        self.assertIn("left OPEN, not closed", self.err)
+        self.assertIn("the collector manifest was waived — collector crashed", self.out)
+
+    def test_a_blank_waiver_reason_is_rejected(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]), ["--no-collector-manifest", "   "])
+        self.assertEqual(rc, 2)
+        self.assertIn("give the reason", self.err)
+        self.assertFalse(self.harness.matching("issue"))
+
+    def test_an_empty_manifest_path_is_not_the_same_as_no_flag(self):
+        self.harness.replies = {"issue list": "[]"}
+        for path in ("", "   "):
+            with self.subTest(path=repr(path)):
+                rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", path])
+                self.assertEqual(rc, 2)
+                self.assertIn("--manifest-file: give the path", self.err)
+                self.assertFalse(self.harness.matching("issue"))
+
+    def test_a_pull_request_on_a_finding_the_last_body_never_rendered_is_kept(self):
+        """The stale-close pass reads the whole still-flagged set, not only the
+        ids the last body rendered: a pull request can cover a finding that
+        body had no room for, or that `/remediate` opened outside it."""
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.open_pr_for_a()
+        manifest = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+
+    def test_a_clean_run_with_no_ledger_keeps_a_still_flagged_pull_request(self):
+        """The CLEAN branch's own stale-close call reads the same set."""
+        self.harness.replies = {"issue list": "[]"}
+        self.open_pr_for_a()
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/a")])
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["prs_closed"], [])
+        # And the control: a collector that no longer flags it lets it retire.
+        self.harness = type(self.harness)()
+        self.harness.replies = {"issue list": "[]"}
+        self.patch_attr("run_cmd", self.harness)
+        self.open_pr_for_a()
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.harness.gh_calls("pr", "close"))
+
+    def test_a_dropped_candidate_makes_the_run_speak(self):
+        """An unchanged ledger is the usual silent run; a candidate the model
+        dropped is the one thing about it an operator needs to hear."""
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        corroborated = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(corroborated)])
+        self.assertEqual(rc, 0, self.err)
+        quiet = self.stdout_json()
+        self.assertEqual((quiet["new"], quiet["resolved"]), (0, 0))
+        self.assertTrue(quiet["silent_ok"])
+
+        self.harness = type(self.harness)()
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.patch_attr("run_cmd", self.harness)
+        dropped = _full_manifest(
+            candidates=[self.netpol_candidate(), self.netpol_candidate(object="Namespace/other")]
+        )
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(dropped)])
+        self.assertEqual(rc, 0, self.err)
+        loud = self.stdout_json()
+        self.assertEqual((loud["new"], loud["resolved"]), (0, 0))
+        self.assertFalse(loud["silent_ok"])
+        self.assertEqual(len(loud["unpublished_candidates"]), 1)
+
+    def test_the_json_line_and_the_ledger_name_the_same_uncorroborated_findings(self):
+        """One set under one name: what the sweep would otherwise have opened.
+        A `major` finding the collector did not flag is uncorroborated too, but
+        the sweep would not have opened it, so neither surface names it."""
+        self.promotion_replies()
+        doc = make_doc(
+            findings=[make_finding(), make_finding(fid="m", severity="major", title="Major one")]
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["uncorroborated_findings"], [derived_id()])
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn(f"`{derived_id()}`", body)
+        self.assertNotIn(f"`{derived_id(fid='m')}` —", body)
+
+    def declaring_replies(self, previous_body=None):
+        self.record_run()
+        self.harness.replies = {"issue list": self.issue_list()}
+        if previous_body is not None:
+            self.harness.replies["--json body"] = json.dumps({"body": previous_body})
+
+    def posture_candidate(self):
+        return {
+            "check": "no-pdb",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "no PodDisruptionBudget selects it",
+        }
+
+    def test_a_declared_posture_releases_the_collector_hold_on_a_clean_run(self):
+        """The collector reads the fleet, not the repository, so it emits a
+        declared posture for as long as the declaration stands; held, the
+        ledger would never close again."""
+        previous_body = published_body(
+            searched_doc(findings=[make_finding(check="no-pdb")]), generated_at=NOW
+        )
+        self.declaring_replies(previous_body)
+        doc = searched_doc(findings=[])
+        doc["declared"] = [make_declared(check="no-pdb", obj="Namespace/no-network-policy")]
+        manifest = _full_manifest(audit=DECLARING_AUDIT, candidates=[self.posture_candidate()])
+        rc = self.run_finish(
+            doc, ["--manifest-file", self.manifest_file(manifest)], audit=DECLARING_AUDIT
+        )
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["unaccounted"], [])
+        self.assertEqual(payload["declared"], 1)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertNotIn("STILL FLAGGED", self.err)
+
+    def test_a_declared_posture_resolves_and_retires_its_pull_request(self):
+        posture = make_finding(check="no-pdb", title="Posture")
+        fault = make_finding(fid="f", check="no-requests", title="Fault")
+        previous_body = published_body(searched_doc(findings=[posture, fault]), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        self.harness.replies["pr list"] = json.dumps(
+            [pr(8, "platform-agent/fix-posture", body=audit_report.delta_block([derived_id(check="no-pdb")]))]
+        )
+        doc = searched_doc(findings=[make_finding(fid="f", check="no-requests", title="Fault")])
+        doc["declared"] = [make_declared(check="no-pdb", obj="Namespace/no-network-policy")]
+        manifest = _full_manifest(audit=DECLARING_AUDIT, candidates=[self.posture_candidate()])
+        rc = self.run_finish(
+            doc, ["--manifest-file", self.manifest_file(manifest)], audit=DECLARING_AUDIT
+        )
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 1)
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertTrue(self.harness.gh_calls("pr", "close"))
+        self.assertNotIn("NOT being announced as resolved", self.err)
+
+    def replay_ledger(self, body):
+        """A fresh recorder whose open ledger carries `body`."""
+        self.harness = Recorder()
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": body}),
+        }
+        self.patch_attr("run_cmd", self.harness)
+
+    def test_a_held_finding_persists_on_the_ledger_until_the_collector_drops_it(self):
+        """The ledger body is the only memory between runs, so the hold has to
+        be written into it: a held finding keeps its row and its hidden-block
+        id, is not `new`, is not swept, and the next run reads it back."""
+        self.previous_a_and_b()
+        both = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        a_id = derived_id(fid="a")
+
+        # Run N: the document drops a, the collector still flags it.
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
+        self.assertEqual(rc, 0, self.err)
+        body_n = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn("## Held by the collector", body_n)
+        self.assertIn(f"<!-- finding:{a_id} -->", body_n)
+        self.assertIn("Alpha finding", body_n)
+        self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+        self.assertIn(a_id, audit_report.parse_finding_locations(body_n))
+        payload = self.stdout_json()
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+        # b, corroborated and critical, is promoted; the held a is not swept.
+        opened = [" ".join(c) for c in self.harness.gh_calls("pr", "create")]
+        self.assertEqual(len(opened), 1)
+        self.assertNotIn("Alpha finding", opened[0])
+        self.assertIn("HELD:", self.err)
+
+        # Run N+1, findings again: still carried, still not new.
+        self.replay_ledger(body_n)
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
+        self.assertEqual(rc, 0, self.err)
+        body_n1 = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(f"<!-- finding:{a_id} -->", body_n1)
+        payload = self.stdout_json()
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+
+        # Run N+2, clean, every previous finding explained, collector still
+        # flags a: the ledger is held, not closed.
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body_n1)
+        self.assertIn(a_id, {audit_report.published_id(e) for e in clean["resolved_because"]})
+        only_a = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/a")])
+        self.replay_ledger(body_n1)
+        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(only_a)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [a_id])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertIn("still flagged by the collector", self.harness.bodies_for("issue", "comment")[-1])
+
+        # Control: the collector drops a, and the same clean run closes.
+        self.replay_ledger(body_n1)
+        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["resolved"], 2)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+
+    def test_a_declared_posture_is_not_a_dropped_candidate(self):
+        """Exempt from the hold and from the disclosure alike: the collector
+        emits a declared posture for as long as the declaration stands, and a
+        run that reports it dropped every morning is never silent again."""
+        self.record_run()
+        self.harness.replies = {"issue list": "[]"}
+        doc = searched_doc(findings=[])
+        doc["declared"] = [make_declared(check="no-pdb", obj="Namespace/no-network-policy")]
+        manifest = self.manifest_file(
+            _full_manifest(audit=DECLARING_AUDIT, candidates=[self.posture_candidate()])
+        )
+        rc = self.run_finish(doc, ["--manifest-file", manifest], audit=DECLARING_AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertTrue(payload["silent_ok"])
+        self.assertEqual(payload["unpublished_candidates"], [])
+        self.assertEqual(payload["wholly_unpublished_checks"], [])
+        self.assertNotIn("every candidate", self.err)
+        self.assertNotIn("NOTE:", self.err)
+        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", manifest], audit=DECLARING_AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("every candidate", self.err)
+        self.assertNotIn("NOTE:", self.err)
+
+    def test_the_dry_run_names_every_dropped_candidate(self):
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--dry-run", "--manifest-file", self.manifest_file(manifest)]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("NOTE: 1 collector candidate(s) are absent", self.err)
+        self.assertIn(derived_id(), self.err)
+        self.assertIn("DRY RUN: every candidate for check 'netpol-missing'", self.err)
+
+    def test_a_remediate_on_a_held_finding_is_deferred_not_refused(self):
+        """A held id is absent from the document by construction, so read
+        against the document alone it is "not a finding in the current
+        report" — a refusal with a false reason under the permanent marker."""
+        self.previous_a_and_b()
+        a_id = derived_id(fid="a")
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {a_id}")]}
+        )
+        both = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
+        self.assertEqual(rc, 0, self.err)
+        posted = self.harness.bodies_for("issue", "comment")
+        deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferrals), 1, posted)
+        self.assertIn("on hold, not refused", deferrals[0])
+        self.assertIn("collector still emits", deferrals[0])
+        self.assertNotIn("typo", deferrals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+        opened = " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+        self.assertNotIn("Alpha finding", opened)
+
+    def test_a_remediate_on_a_held_finding_is_deferred_on_a_clean_run_too(self):
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+            "--json comments": json.dumps({"comments": [comment(f"/remediate {derived_id()}")]}),
+        }
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(previous_body)
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        posted = self.harness.bodies_for("issue", "comment")
+        deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferrals), 1, posted)
+        self.assertIn("collector still emits", deferrals[0])
+        self.assertFalse([b for b in posted if "no longer reproduces" in b])
+
+    def test_remediate_refuses_a_held_id_as_held_not_as_unknown(self):
+        """The CLI path: with the manifest it names the hold; without it the
+        id is simply not in the file, as before."""
+        a_id = derived_id(fid="a")
+        findings_file = self.write_findings(
+            make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        )
+        manifest = self.manifest_file(
+            _full_manifest(candidates=[self.netpol_candidate(object="Namespace/a")])
+        )
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", findings_file,
+             "--finding", a_id, "--manifest-file", manifest]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("collector manifest still emits", self.err)
+        self.assertNotIn("Held by the collector", self.err)
+        self.assertNotIn("known ids are", self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", findings_file, "--finding", a_id]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("known ids are", self.err)
+
+    def held_entry(self, index, **overrides):
+        entry = {
+            "id": derived_id(fid=f"held-{index}"),
+            "title": f"Held finding {index}",
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": f"Namespace/held-{index}",
+            "commands": ["kubectl get networkpolicy -A -o json | jq '.items'"],
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_every_held_finding_keeps_its_identity_past_the_detail_cap(self):
+        """Past `MAX_HELD_DETAIL_ROWS` only the detail lines stop; the anchor,
+        heading and Where line — what the next run reads the location from —
+        render for every held finding."""
+        held = [self.held_entry(i) for i in range(audit_report.MAX_HELD_DETAIL_ROWS + 5)]
+        rendered = audit_report.render_issue_body(
+            make_doc(), generated_at=NOW, audit_id=AUDIT, held=held
+        )
+        locations = audit_report.parse_finding_locations(rendered.body)
+        for entry in held:
+            self.assertIn(entry["id"], locations)
+            self.assertEqual(locations[entry["id"]]["object"], entry["object"])
+            self.assertIn(entry["id"], audit_report.parse_delta_block(rendered.body))
+        self.assertEqual(rendered.body.count("- **Check:**"), audit_report.MAX_HELD_DETAIL_ROWS)
+        # An unvalidated fixture keeps its handle as the id; the document's one
+        # finding rendered, whatever the held rows needed.
+        self.assertEqual(rendered.rendered_ids, ["no-network-policy"])
+
+    def test_held_rows_never_displace_the_documents_findings(self):
+        doc = make_doc(findings=[make_finding(fid=f"f{i}", title=f"Finding {i}") for i in range(20)])
+        held = [self.held_entry(i) for i in range(50)]
+        rendered = audit_report.render_issue_body(doc, generated_at=NOW, audit_id=AUDIT, held=held)
+        self.assertEqual(rendered.omitted, [])
+        self.assertEqual(len(rendered.rendered_ids), 20)
+        self.assertIn("## Held by the collector", rendered.body)
+        self.assertIn("- **Check:**", rendered.body)
+        self.assertLessEqual(len(rendered.body), audit_report.BODY_BUDGET)
+
+    def test_held_rows_at_field_caps_degrade_rather_than_raise(self):
+        long_title = "T" * audit_report.MAX_TITLE_CHARS
+        long_object = "Deployment/" + "o" * 300
+        long_command = "kubectl get pods -A -o json | jq " + "x" * audit_report.MAX_COMMAND_CHARS
+        held = [
+            self.held_entry(i, title=long_title, object=long_object, commands=[long_command])
+            for i in range(50)
+        ]
+        rendered = audit_report.render_issue_body(
+            make_doc(), generated_at=NOW, audit_id=AUDIT, held=held
+        )
+        self.assertLessEqual(len(rendered.body), audit_report.BODY_BUDGET)
+        # An unvalidated fixture keeps its handle as the id; the document's one
+        # finding rendered, whatever the held rows needed.
+        self.assertEqual(rendered.rendered_ids, ["no-network-policy"])
+        self.assertIn("## Held by the collector", rendered.body)
+        for entry in held:
+            self.assertIn(entry["id"], audit_report.parse_delta_block(rendered.body))
+        # Full rows cannot fit, so the detail is the first thing to go.
+        self.assertNotIn("- **Check:**", rendered.body)
+
+    def test_a_carried_row_round_trips_through_the_same_reader_as_a_finding(self):
+        entry = self.held_entry(1, namespace="")
+        carried = "\n".join(audit_report._render_collector_held([entry]))
+        finding = make_finding(fid="held-1", obj=entry["object"], namespace="", title=entry["title"])
+        finding["id"] = entry["id"]
+        direct = "\n".join(audit_report.render_finding(finding))
+        self.assertEqual(
+            audit_report.parse_finding_locations(carried), audit_report.parse_finding_locations(direct)
+        )
+        self.assertEqual(
+            audit_report.parse_finding_locations(carried)[entry["id"]],
+            {"title": entry["title"], "cluster": "prod-us-east", "namespace": "", "object": entry["object"]},
+        )
+
+    def test_a_held_rows_command_is_not_pipe_escaped(self):
+        rendered = audit_report.render_issue_body(
+            make_doc(), generated_at=NOW, audit_id=AUDIT, held=[self.held_entry(1)]
+        )
+        self.assertIn("`kubectl get networkpolicy -A -o json | jq '.items'`", rendered.body)
+        self.assertNotIn("\\|", rendered.body)
+
+    def test_the_waiver_reason_renders_whole_and_unescaped(self):
+        reason = (
+            "the collector crashed on `gcloud container clusters list | jq .` after the "
+            "project's API quota was exhausted; every check below came from the manual "
+            "fallback and none of the numbers were re-derived"
+        )
+        self.assertGreater(len(reason), audit_report.MAX_CELL_CHARS)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--no-collector-manifest", reason])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn(f"- the collector manifest was waived — {reason}", body)
+        self.assertNotIn("\\|", body)
+
+    def test_the_hold_survives_a_body_that_rendered_no_heading_for_it(self):
+        """Persistence is keyed on the hidden marker, not on the headings a body
+        under budget pressure drops first. A previous body whose marker names
+        the held id and whose text has no heading for it — the note tier and
+        the empty tier alike — still holds on the next run."""
+        a_id, b_id = derived_id(fid="a"), derived_id(fid="b")
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        squeezed = published_body(doc_b, generated_at=NOW)
+        marker = audit_report.delta_block([b_id])
+        self.assertIn(marker, squeezed)
+        squeezed = squeezed.replace(marker, audit_report.delta_block([b_id, a_id]))
+        self.assertNotIn(a_id, audit_report.parse_finding_locations(squeezed))
+        self.assertIn(a_id, audit_report.parse_delta_block(squeezed))
+        both = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        # A findings run: the row comes back from the candidate's identity.
+        self.replay_ledger(squeezed)
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(f"<!-- finding:{a_id} -->", body)
+        self.assertIn("netpol-missing on Namespace/a", body)
+        self.assertIn(a_id, audit_report.parse_delta_block(body))
+        payload = self.stdout_json()
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+
+        # A clean run: held, and the id is not counted resolved.
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(squeezed)
+        only_a = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/a")])
+        self.replay_ledger(squeezed)
+        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(only_a)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [a_id])
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertIn("netpol-missing on Namespace/a", self.harness.bodies_for("issue", "comment")[-1])
+
+        # Control: the collector drops it, and the same clean run closes.
+        self.replay_ledger(squeezed)
+        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+
+    def test_a_remediate_on_a_still_flagged_id_is_deferred_on_a_partial_clean_run(self):
+        """The deferral needs neither a previous heading nor complete coverage:
+        a standing request on a still-flagged id is on hold, never "no longer
+        reproduces" under the acked marker."""
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+            "--json comments": json.dumps({"comments": [comment(f"/remediate {derived_id()}")]}),
+        }
+        partial = make_doc(
+            findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}]
+        )
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(partial, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.stdout_json()["partial"])
+        posted = self.harness.bodies_for("issue", "comment")
+        deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferrals), 1, posted)
+        self.assertIn("collector still emits", deferrals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn("no longer reproduces", body)
+
+    def test_the_manifest_less_held_comment_is_byte_identical_to_base(self):
+        """`render_held_comment` predates this contract; its command cell keeps
+        `_cell`, pipes escaped and 120 characters wide, exactly as the base
+        harness rendered it. The expectation is base's own output."""
+        data = {
+            "audit": AUDIT,
+            "scope": {
+                "clusters": [
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                        "checks_run": [
+                            {
+                                "check": "cluster-admin-binding",
+                                "command": "kubectl get clusterrolebindings -o json | jq '.items[]'",
+                            }
+                        ],
+                    }
+                ],
+                "skipped": [],
+            },
+            "findings": [],
+        }
+        held = [
+            {
+                "id": "cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding",
+                "title": "debug-binding grants cluster-admin",
+                "check": "cluster-admin-binding",
+                "cluster": "prod-us-east",
+                "namespace": "",
+                "object": "ClusterRoleBinding/debug-binding",
+                "commands": [
+                    "kubectl get clusterrolebindings -o json | jq '.items[] | "
+                    'select(.roleRef.name=="cluster-admin")\' ' + "x" * 130
+                ],
+            }
+        ]
+        self.assertEqual(
+            audit_report.render_held_comment(AUDIT, data, held, NOW), BASE_HELD_COMMENT
+        )
+
+    def test_a_code_span_flattens_newlines(self):
+        self.assertEqual(
+            audit_report._code_span("kubectl get\n  pods -A | jq\t'.items'"),
+            "kubectl get pods -A | jq '.items'",
+        )
+
+    def test_a_whitespace_namespace_is_cluster_scoped(self):
+        lines = "\n".join(audit_report.render_finding(make_finding(namespace="   ")))
+        self.assertIn("/ _cluster-scoped_ — ", lines)
+        self.assertNotIn("/ `   `", lines)
+
+    def test_remediate_refuses_an_empty_manifest_path(self):
+        findings_file = self.write_findings(make_doc())
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", findings_file,
+             "--finding", derived_id(), "--manifest-file", ""]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("--manifest-file: give the path", self.err)
+
+    def test_unpublished_candidate_ids_are_spelled_as_the_ledger_spells_them(self):
+        long_object = "Deployment/" + "very-long-workload-name-segment-" * 4
+        self.harness.replies = {"issue list": "[]"}
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object=long_object)])
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        rows = self.stdout_json()["unpublished_candidates"]
+        expected = audit_report.published_id(make_finding(obj=long_object))
+        self.assertEqual([r["id"] for r in rows], [expected])
+        self.assertLessEqual(len(expected), audit_report.MAX_FINDING_ID)
+
+    def replay_unreadable_ledger(self):
+        """A fresh recorder whose open ledger's body cannot be read."""
+        self.harness = Recorder()
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json body": 1}
+        self.patch_attr("run_cmd", self.harness)
+
+    def test_an_unreadable_ledger_body_is_left_as_it_was(self):
+        """The ledger is the persistence, and a run that cannot read it must not
+        overwrite it: no body edit on the unreadable run, a coverage gap saying
+        so, and the marker's held id survives to the next readable run — while
+        a candidate the ledger never carried is not turned into a hold."""
+        self.previous_a_and_b()
+        a_id, c_id = derived_id(fid="a"), derived_id(fid="c")
+        both = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
+        self.assertEqual(rc, 0, self.err)
+        body_n = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+
+        # Run N+1: `gh issue view` fails; the collector now also flags c, which
+        # the model has been rejecting and no ledger ever carried.
+        with_c = _full_manifest(
+            candidates=both["clusters"][0]["candidates"] + [self.netpol_candidate(object="Namespace/c")]
+        )
+        self.replay_unreadable_ledger()
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(with_c)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.bodies_for("issue", "edit"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "UPDATED")
+        self.assertTrue(payload["partial"])
+        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertIn("left as it was", self.err)
+        self.assertNotIn("] HELD:", self.err)
+        self.assertEqual(payload["resolved"], 0)
+
+        # Run N+2 reads the untouched body: a is held, c never became one.
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body_n)
+        a_and_c = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/c"),
+            ]
+        )
+        self.replay_ledger(body_n)
+        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(a_and_c)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [a_id])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertIn(c_id, [r["id"] for r in payload["unpublished_candidates"]])
+
+    def test_a_clean_run_over_an_unreadable_body_does_not_close(self):
+        self.replay_unreadable_ledger()
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertTrue(payload["partial"])
+        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["prs_closed"], [])
+
+    def test_a_scheme_bump_rewrites_the_body_and_the_next_run_is_whole(self):
+        """A marker under another identity scheme is not an unreadable ledger:
+        the stamp is refreshed only by the rewrite, so freezing the body over
+        it would freeze it for good. The bump costs one run's re-spelled holds
+        and nothing after it."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->", "<!-- audit-id-scheme: 1 -->"
+        )
+        self.assertEqual(audit_report.parse_id_scheme(previous_body), 1)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        rewritten = self.harness.bodies_for("issue", "edit")[0]
+        self.assertEqual(audit_report.parse_id_scheme(rewritten), audit_report.ID_SCHEME)
+        payload = self.stdout_json()
+        self.assertFalse(payload["partial"])
+        self.assertNotIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        # The next run reads a current stamp and is whole.
+        self.replay_ledger(rewritten)
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertFalse(payload["partial"])
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+        self.assertTrue(payload["silent_ok"])
+
+    def test_the_unreadable_ledger_path_touches_only_what_it_may(self):
+        """The inventory: no body or title edit, no label, no promotion, no
+        acknowledgement, no delta comment — refusals and deferrals answered."""
+        a_id = derived_id(fid="a")
+        self.replay_unreadable_ledger()
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {a_id}")]}
+        )
+        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/8\n"
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(),
+            ]
+        )
+        # The document's own critical manifest finding would otherwise promote.
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        posted = self.harness.bodies_for("issue", "comment")
+        self.assertFalse([b for b in posted if "audit delta" in b])
+        self.assertFalse([b for b in posted if audit_report.acked_marker("IC_1") in b])
+        deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferrals), 1, posted)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "UPDATED")
+        self.assertTrue(payload["partial"])
+        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertEqual(payload["prs_opened"], [])
+        self.assertIn("body, title, label and promotions wait", self.err)
+
+    def test_a_manifest_for_another_audit_is_refused(self):
+        self.harness.replies = {"issue list": "[]"}
+        manifest = _full_manifest()
+        manifest["audit"] = "obtainability-audit"
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 2)
+        self.assertIn("'obtainability-audit'", self.err)
+        self.assertIn(f"'{AUDIT}'", self.err)
+        self.assertFalse(self.harness.matching("issue"))
+        # Naming this stream, or naming none, both pass.
+        for declared in (AUDIT, None):
+            with self.subTest(audit=declared):
+                manifest = _full_manifest()
+                if declared:
+                    manifest["audit"] = declared
+                self.harness = Recorder()
+                self.harness.replies = {"issue list": "[]"}
+                self.patch_attr("run_cmd", self.harness)
+                rc = self.run_finish(
+                    make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)]
+                )
+                self.assertEqual(rc, 0, self.err)
+
+    def test_an_out_of_scope_target_is_neither_owed_nor_cross_checked(self):
+        """The collector saying "not this audit's target": the document need
+        not list it, and if it does the claims are not held to the manifest."""
+        manifest = _full_manifest()
+        manifest["clusters"].append(
+            {"name": "alpha-cluster", "outcome": "out-of-scope", "error": "alpha clusters cannot upgrade"}
+        )
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("INFO: the collector manifest marks 'alpha-cluster' out of scope", self.err)
+        payload = self.stdout_json()
+        self.assertFalse(payload["partial"])
+        self.assertNotIn("alpha-cluster", " ".join(payload["coverage_gaps"]))
+        # Listed by the document with checks and no limitations: not rejected.
+        doc = make_doc(findings=[])
+        doc["scope"]["clusters"].append(
+            {"name": "alpha-cluster", "location": "us-east1", "project": "acme-prod",
+             "checks_run": [ran(c, "alpha-cluster") for c in audit_report.audit_checks(AUDIT)]}
+        )
+        self.harness = Recorder()
+        self.harness.replies = {"issue list": "[]"}
+        self.patch_attr("run_cmd", self.harness)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+
+    def test_a_partial_clean_run_over_a_held_finding_posts_the_held_comment(self):
+        """Status and comment agree: `HELD` on the line, the finding named as
+        still flagged in the comment, and the coverage shortfall under it."""
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        partial = make_doc(
+            findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}]
+        )
+        partial["resolved_because"] = resolved_for(previous_body)
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(partial, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["unaccounted"], [derived_id()])
+        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertIn("still flagged by the collector", comment)
+        self.assertIn("Not covered by this run (1):", comment)
+        self.assertIn("dr-west: not audited", comment)
+        self.assertNotIn("reads the whole fleet and still finds nothing", comment)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_the_dry_run_previews_the_manifests_hold(self):
+        manifest = self.manifest_file(_full_manifest(candidates=[self.netpol_candidate()]))
+        rc = self.run_finish(make_doc(findings=[]), ["--dry-run", "--manifest-file", manifest])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("STATUS: would be HELD if the ledger's marker carries any of the 1", self.err)
+        self.assertIn("still flagged by the collector", self.out)
+        self.assertNotIn("would be closed", self.err)
+        self.assertIn("shown from the manifest's candidates", self.err)
+
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc_b, ["--dry-run", "--manifest-file", manifest])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("## Held by the collector", self.out)
+        self.assertIn("the real run holds only if the ledger's hidden marker carries them", self.out)
+        self.assertIn(f"<!-- finding:{derived_id()} -->", self.out)
+        self.assertIn("The real run holds only those the ledger's hidden marker already carries", self.err)
+
+    def test_a_withheld_posture_is_neither_held_nor_in_the_marker(self):
+        """The model published it and `finish` took it out for want of a
+        search: it is the document's, not the collector's, and withheld ids
+        enter no delta block."""
+        posture_id = derived_id(check="no-pdb")
+        previous_body = published_body(
+            declaring_doc(findings=[make_finding(check="no-pdb")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        doc = declaring_doc(
+            findings=[
+                make_finding(check="no-pdb"),
+                make_finding(fid="f", check="no-requests", title="Fault"),
+            ]
+        )
+        manifest = _full_manifest(audit=DECLARING_AUDIT, candidates=[self.posture_candidate()])
+        rc = self.run_finish(
+            doc, ["--manifest-file", self.manifest_file(manifest)], audit=DECLARING_AUDIT
+        )
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["postures_withheld"], [posture_id])
+        body = self.harness.bodies_for("issue", "edit")[0]
+        self.assertNotIn("## Held by the collector", body)
+        self.assertNotIn(posture_id, audit_report.parse_delta_block(body))
+        self.assertNotIn("] HELD:", self.err)
+        self.assertNotIn("NOT being announced as resolved", self.err)
+
+    def marker_with_held(self, held_objects):
+        """A previous body carrying b plus a marker naming every held object."""
+        b_id = derived_id(fid="b")
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        body = published_body(doc_b, generated_at=NOW)
+        marker = audit_report.delta_block([b_id])
+        self.assertIn(marker, body)
+        held_ids = [derived_id(obj=o) for o in held_objects]
+        return doc_b, body.replace(marker, audit_report.delta_block([b_id] + held_ids)), held_ids
+
+    def held_cap_run(self, count):
+        objects = [f"Namespace/h-{i:03d}" for i in range(count)]
+        doc_b, previous_body, held_ids = self.marker_with_held(objects)
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate(object=o) for o in objects]
+            + [self.netpol_candidate(object="Namespace/b")]
+        )
+        self.replay_ledger(previous_body)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "edit")[0]
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+        return body, sorted(held_ids)
+
+    def test_held_ids_at_the_cap_all_ride_the_marker(self):
+        body, held_ids = self.held_cap_run(audit_report.MAX_HELD_IDS)
+        marker = audit_report.parse_delta_block(body)
+        self.assertEqual(sorted(set(marker) & set(held_ids)), held_ids)
+        self.assertNotIn("stops tracking", self.err)
+        self.assertNotIn("has stopped tracking", body)
+
+    def test_held_ids_past_the_cap_are_bounded_and_the_overflow_is_said(self):
+        body, held_ids = self.held_cap_run(audit_report.MAX_HELD_IDS + 1)
+        marker = audit_report.parse_delta_block(body)
+        carried = sorted(set(marker) & set(held_ids))
+        self.assertEqual(carried, held_ids[: audit_report.MAX_HELD_IDS])
+        self.assertIn("stops tracking 1 finding(s)", self.err)
+        self.assertIn(held_ids[audit_report.MAX_HELD_IDS], self.err)
+        self.assertIn("this ledger has stopped tracking", body)
+        self.assertIn("`unpublished_candidates`", body)
+
+    def test_a_remediate_on_a_never_ledgered_candidate_points_at_the_json_line(self):
+        c_id = derived_id(fid="c")
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+            "--json comments": json.dumps({"comments": [comment(f"/remediate {c_id}")]}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/b"),
+                self.netpol_candidate(object="Namespace/c"),
+            ]
+        )
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        posted = self.harness.bodies_for("issue", "comment")
+        deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferrals), 1, posted)
+        self.assertIn("`unpublished_candidates`", deferrals[0])
+        self.assertNotIn("Held by the collector", deferrals[0])
+        self.assertNotIn("## Held by the collector", self.harness.bodies_for("issue", "edit")[0])
+
+    def held_run(self):
+        """Run N: the ledger a,b; the document b; the collector flags a,b.
+        Returns the body it wrote, which carries a's held row."""
+        self.previous_a_and_b()
+        both = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
+        return body, doc_b
+
+    def test_parse_held_rows_reads_back_what_the_body_carries(self):
+        body, _ = self.held_run()
+        rows = audit_report.parse_held_rows(body)
+        self.assertEqual([r["id"] for r in rows], [derived_id(fid="a")])
+        row = rows[0]
+        self.assertEqual(row["title"], "Alpha finding")
+        self.assertEqual(row["check"], "netpol-missing")
+        self.assertEqual((row["cluster"], row["namespace"], row["object"]), ("prod-us-east", "payments", "Namespace/a"))
+        self.assertEqual(row["commands"], ["ran netpol-missing"])
+
+    def test_a_previous_body_without_a_held_section_parses_to_nothing(self):
+        """The manifest-less run's byte-for-byte claim rests on this: main never
+        wrote a held section, so a body it wrote carries nothing to carry."""
+        for body in (
+            published_body(make_doc(), generated_at=NOW),
+            published_body(make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]), generated_at=NOW),
+            "",
+            None,
+        ):
+            self.assertEqual(audit_report.parse_held_rows(body), [])
+
+    def assert_carried_without_manifest(self, extra_args):
+        body_n, doc_b = self.held_run()
+        a_id = derived_id(fid="a")
+        self.replay_ledger(body_n)
+        self.open_pr_for_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(doc_b, extra_args)
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn("## Held by the collector", body)
+        self.assertIn(f"<!-- finding:{a_id} -->", body)
+        self.assertIn("Alpha finding", body)
+        self.assertIn(a_id, audit_report.parse_delta_block(body))
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["prs_closed"], [])
+        self.assertIn("released only by a manifest run", self.err)
+        return payload, body
+
+    def test_a_held_row_survives_a_run_without_flags(self):
+        payload, body = self.assert_carried_without_manifest([])
+        self.assertFalse(payload["partial"])
+        # The carried rendering: nothing reads as this run's observation.
+        self.assertIn("held from a previous run's manifest; this run passed none", body)
+        self.assertIn("- **Last recorded:** `netpol-missing` — `ran netpol-missing`", body)
+        self.assertNotIn("there this run and still flags this object", body)
+        self.assertNotIn("unpublished_candidates", payload)
+        # And the carried row parses back identically for the run after.
+        self.assertEqual([r["id"] for r in audit_report.parse_held_rows(body)], [derived_id(fid="a")])
+
+    def test_a_held_row_survives_a_waived_run(self):
+        payload, _ = self.assert_carried_without_manifest(
+            ["--no-collector-manifest", "collector crashed"]
+        )
+        self.assertTrue(payload["partial"])
+
+    def test_a_clean_run_without_flags_is_held_by_previous_held_rows(self):
+        body_n, _ = self.held_run()
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body_n)
+        self.replay_ledger(body_n)
+        rc = self.run_finish(clean)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [derived_id(fid="a")])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertIn("held from a previous manifest run", comment)
+        self.assertIn("this run passed no manifest", comment)
+        self.assertNotIn("still flagged by the collector", comment)
+        self.assertIn("STILL HELD:", self.err)
+
+    def test_a_later_manifest_run_that_no_longer_emits_the_id_releases_it(self):
+        _, body_n1 = self.assert_carried_without_manifest([])
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body_n1)
+        self.replay_ledger(body_n1)
+        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["unaccounted"], [])
+        self.assertEqual(payload["resolved"], 2)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+
+    def with_held_ids(self, body, held_ids, rendered_ids):
+        """`body` as the fourth tier leaves it: the held span with only its id
+        list, no visible row, and the marker carrying the held ids too."""
+        marker = audit_report.delta_block(rendered_ids)
+        self.assertIn(marker, body)
+        span = "\n".join(
+            ["", audit_report.HELD_SECTION_BEGIN, "", audit_report.held_ids_comment(held_ids),
+             audit_report.HELD_SECTION_END, ""]
+        )
+        return body.replace(marker, span + audit_report.delta_block(rendered_ids + held_ids))
+
+    def squeezed_previous(self):
+        """A previous body whose held span lists an id its text has no row for
+        — what the note and fourth tiers leave behind."""
+        a_id, b_id = derived_id(fid="a"), derived_id(fid="b")
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        body = self.with_held_ids(published_body(doc_b, generated_at=NOW), [a_id], [b_id])
+        self.assertNotIn(a_id, audit_report.parse_finding_locations(body))
+        self.assertEqual(audit_report.parse_held_ids(body), [a_id])
+        self.assertIn(a_id, audit_report.parse_delta_block(body))
+        return body, doc_b, a_id
+
+    def assert_marker_id_carried_without_manifest(self, extra_args):
+        body, doc_b, a_id = self.squeezed_previous()
+        self.replay_ledger(body)
+        self.open_pr_for_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(doc_b, extra_args)
+        self.assertEqual(rc, 0, self.err)
+        edited = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(a_id, audit_report.parse_delta_block(edited))
+        self.assertIn(f"<!-- finding:{a_id} -->", edited)
+        self.assertIn("not recorded on the previous ledger; carried by id", edited)
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["prs_closed"], [])
+        return payload, edited
+
+    def test_a_marker_only_held_id_survives_a_run_without_flags(self):
+        payload, edited = self.assert_marker_id_carried_without_manifest([])
+        self.assertFalse(payload["partial"])
+        # An id-only row derives no location; the held list is what persists,
+        # and the next run carries from it.
+        self.assertNotIn(derived_id(fid="a"), audit_report.parse_finding_locations(edited))
+        self.assertEqual(audit_report.parse_held_ids(edited), [derived_id(fid="a")])
+        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(edited))
+
+    def test_a_marker_only_held_id_survives_a_waived_run(self):
+        payload, _ = self.assert_marker_id_carried_without_manifest(
+            ["--no-collector-manifest", "collector crashed"]
+        )
+        self.assertTrue(payload["partial"])
+
+    def test_a_clean_run_without_flags_is_held_by_a_marker_only_id(self):
+        body, _, a_id = self.squeezed_previous()
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body)
+        self.replay_ledger(body)
+        rc = self.run_finish(clean)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [a_id])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_an_undecomposable_marker_id_is_carried_by_id_alone(self):
+        row = audit_report.held_row_from_id("odd-id-with-no-segments")
+        self.assertTrue(row["location_unrecorded"])
+        lines = "\n".join(audit_report._render_collector_held([row]))
+        self.assertIn("<!-- finding:odd-id-with-no-segments -->", lines)
+        self.assertIn("not recorded on the previous ledger; carried by id", lines)
+
+    def test_a_flagless_run_over_an_unreadable_body_leaves_it_as_it_was(self):
+        """The one deliberate change to manifest-less behaviour: main rewrote
+        the body over an unreadable one, dropping every held id its marker
+        carried and retiring their pull requests."""
+        body_n, doc_b = self.held_run()
+        a_id = derived_id(fid="a")
+        self.replay_unreadable_ledger()
+        self.open_pr_for_a()
+        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/9\n"
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(doc_b)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertEqual(payload["status"], "UPDATED")
+        # The next readable run finds the marker intact and carries a on.
+        self.replay_ledger(body_n)
+        rc = self.run_finish(doc_b)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(a_id, audit_report.parse_delta_block(self.harness.bodies_for("issue", "edit")[0]))
+
+    def test_the_carried_rendering_names_the_last_recorded_command_or_nothing(self):
+        recorded = self.held_entry(1)
+        unrecorded = self.held_entry(2, commands=[audit_report.COLLECTOR_COMMAND_UNRECORDED])
+        carried = "\n".join(audit_report._render_collector_held([recorded, unrecorded], carried=True))
+        self.assertIn("this run passed none and cannot release them", carried)
+        self.assertEqual(carried.count("- **Last recorded:**"), 1)
+        self.assertNotIn(audit_report.COLLECTOR_COMMAND_UNRECORDED, carried)
+        self.assertNotIn("still flags this object", carried)
+        self.assertEqual(carried.count("- **Finding id:**"), 2)
+        vouched = "\n".join(audit_report._render_collector_held([recorded]))
+        self.assertIn("the collector ran `kubectl get networkpolicy -A -o json | jq '.items'` there this run", vouched)
+        self.assertNotIn("Last recorded", vouched)
+
+    def assert_free_text_cannot_manufacture_a_hold(self, first):
+        """`first` renders before `second`; whatever `first`'s free text holds,
+        `second` is rendered, and a flagless run that drops it announces it
+        resolved with no held row."""
+        second = make_finding(fid="second", title="Second", severity="major")
+        previous_body = published_body(make_doc(findings=[first, second]), generated_at=NOW)
+        self.assertEqual(audit_report.parse_held_ids(previous_body), [])
+        self.assertEqual(audit_report.parse_held_rows(previous_body), [])
+        self.assertNotIn(audit_report.HELD_SECTION_BEGIN, previous_body)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc(findings=[first])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 1)
+        edited = self.harness.bodies_for("issue", "edit")[0]
+        self.assertNotIn(audit_report.HELD_SECTION_BEGIN, edited)
+        self.assertNotIn(derived_id(fid="second"), audit_report.parse_delta_block(edited))
+
+    def test_a_heading_line_in_a_multi_line_impact_cannot_manufacture_a_hold(self):
+        first = make_finding(fid="first", title="First", impact="line one\n## not a heading")
+        previous_body = published_body(make_doc(findings=[first]), generated_at=NOW)
+        self.assertIn("\n## not a heading", previous_body)
+        self.assert_free_text_cannot_manufacture_a_hold(first)
+
+    def test_an_unbalanced_fence_in_a_recommendation_cannot_manufacture_a_hold(self):
+        first = make_finding(
+            fid="first",
+            title="First",
+            recommendation={"action": "apply\n~~~\nthis", "rationale": "because", "risk": "none"},
+        )
+        previous_body = published_body(make_doc(findings=[first]), generated_at=NOW)
+        self.assertIn("\n~~~\n", previous_body)
+        self.assert_free_text_cannot_manufacture_a_hold(first)
+
+    def test_the_held_heading_inside_an_excerpt_cannot_manufacture_a_hold(self):
+        first = make_finding(
+            fid="first", title="First", excerpt=f"output:\n{audit_report.HELD_SECTION_HEADING}\nmore"
+        )
+        previous_body = published_body(make_doc(findings=[first]), generated_at=NOW)
+        self.assertIn(f"\n{audit_report.HELD_SECTION_HEADING}\n", previous_body)
+        self.assert_free_text_cannot_manufacture_a_hold(first)
+
+    LONG_OBJECT = "Deployment/" + "very-long-workload-name-segment-" * 4
+
+    def held_run_with_long_object(self):
+        """Run N holds a long-named finding whose current id is clipped."""
+        long_a = make_finding(fid="a", title="Alpha finding", obj=self.LONG_OBJECT)
+        b = make_finding(fid="b", title="Bravo finding")
+        previous_body = published_body(make_doc(findings=[long_a, b]), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object=self.LONG_OBJECT),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc_b = make_doc(findings=[b])
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        body_n = self.harness.bodies_for("issue", "edit")[0]
+        current = audit_report.published_id(long_a)
+        self.assertNotEqual(current, audit_report.derive_finding_id(long_a))
+        self.assertIn(current, audit_report.parse_delta_block(body_n))
+        # Scheme 1 is scheme 2 without the digest `_shorten_id` now appends, so
+        # the old spelling is the derived id clipped and nothing else. It is
+        # still an id: `validate_finding_id` held scheme 1 to `FINDING_ID_RE`
+        # too, which is why the held list can require that shape of what it
+        # reads back. The unclipped derivation is not a spelling any scheme
+        # published.
+        old = audit_report.derive_finding_id(long_a)[: audit_report.MAX_FINDING_ID].rstrip(".-")
+        self.assertNotEqual(old, current)
+        self.assertRegex(old, audit_report.FINDING_ID_RE)
+        return body_n, doc_b, manifest, current, old
+
+    def under_scheme_one(self, body, current, old):
+        """The same ledger as an earlier scheme would have spelled it."""
+        forged = body.replace(current, old).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->", "<!-- audit-id-scheme: 1 -->"
+        )
+        self.assertEqual(audit_report.parse_id_scheme(forged), 1)
+        self.assertIn(old, audit_report.parse_delta_block(forged))
+        self.assertIn(old, audit_report.parse_held_ids(forged))
+        self.assertNotIn(current, forged)
+        return forged
+
+    def test_a_hold_survives_an_identity_scheme_bump(self):
+        body_n, doc_b, manifest, current, old = self.held_run_with_long_object()
+        forged = self.under_scheme_one(body_n, current, old)
+        # The bump run: the row is re-derived from its Where line.
+        self.replay_ledger(forged)
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        bumped = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(current, audit_report.parse_delta_block(bumped))
+        self.assertIn(f"<!-- finding:{current} -->", bumped)
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+        self.assertNotIn("had no rendered row", self.err)
+        # And the run after, under the current scheme.
+        self.replay_ledger(bumped)
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(current, audit_report.parse_delta_block(self.harness.bodies_for("issue", "edit")[0]))
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+        # A manifest-less bump run carries it the same way.
+        self.replay_ledger(forged)
+        rc = self.run_finish(doc_b)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(current, audit_report.parse_delta_block(self.harness.bodies_for("issue", "edit")[0]))
+
+    def test_a_marker_only_id_is_the_residual_of_a_scheme_bump(self):
+        body_n, doc_b, manifest, current, old = self.held_run_with_long_object()
+        forged = self.under_scheme_one(body_n, current, old)
+        # `delta_block` renders the current stamp beside the marker, so the
+        # marker comment alone is what gets the extra id here — and the held
+        # list too, since the residual is counted over what was held.
+        marker = audit_report.parse_delta_block(forged)
+        forged = re.sub(
+            r"<!-- audit-findings: \[.*?\] -->",
+            lambda _: f"<!-- audit-findings: {json.dumps(marker + ['gone.old.spelling'])} -->",
+            forged,
+            count=1,
+            flags=re.S,
+        )
+        held = audit_report.parse_held_ids(forged)
+        forged = forged.replace(
+            audit_report.held_ids_comment(held), audit_report.held_ids_comment(held + ["gone.old.spelling"])
+        )
+        self.assertIn("gone.old.spelling", audit_report.parse_delta_block(forged))
+        self.assertIn("gone.old.spelling", audit_report.parse_held_ids(forged))
+        self.replay_ledger(forged)
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("WARNING: 1 id(s) in the previous marker had no rendered row", self.err)
+        bumped = self.harness.bodies_for("issue", "edit")[0]
+        self.assertNotIn("gone.old.spelling", audit_report.parse_delta_block(bumped))
+        self.assertIn(current, audit_report.parse_delta_block(bumped))
+
+    def test_a_flagless_unreadable_run_answers_no_remediate(self):
+        """Without a manifest and without the body, the held set is unknown,
+        so a standing `/remediate` gets no answer this run — not a refusal,
+        not a deferral, not an acknowledgement — and the next readable run
+        defers it."""
+        body_n, doc_b = self.held_run()
+        a_id = derived_id(fid="a")
+        request = comment(f"/remediate {a_id}")
+        self.replay_unreadable_ledger()
+        self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(doc_b)
+        self.assertEqual(rc, 0, self.err)
+        for body in self.harness.bodies_for("issue", "comment"):
+            for marker in (
+                audit_report.refused_marker("IC_1"),
+                audit_report.deferred_marker("IC_1"),
+                audit_report.acked_marker("IC_1"),
+            ):
+                self.assertNotIn(marker, body)
+        self.assertIn("no /remediate is answered", self.err)
+        # The clean variant answers nothing either.
+        self.replay_unreadable_ledger()
+        self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
+        rc = self.run_finish(make_doc(findings=[]))
+        self.assertEqual(rc, 0, self.err)
+        for body in self.harness.bodies_for("issue", "comment"):
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn("no longer reproduces", body)
+        # The next readable run defers it.
+        self.replay_ledger(body_n)
+        self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
+        rc = self.run_finish(doc_b)
+        self.assertEqual(rc, 0, self.err)
+        posted = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len([b for b in posted if audit_report.deferred_marker("IC_1") in b]), 1, posted)
+
+    def test_a_manifest_still_answers_remediate_over_an_unreadable_body(self):
+        self.held_run()
+        a_id = derived_id(fid="a")
+        self.replay_unreadable_ledger()
+        self.harness.replies["--json comments"] = json.dumps({"comments": [comment(f"/remediate {a_id}")]})
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate(object="Namespace/a"), self.netpol_candidate(object="Namespace/b")]
+        )
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        posted = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len([b for b in posted if audit_report.deferred_marker("IC_1") in b]), 1, posted)
+
+    def test_an_id_only_row_never_derives_a_location(self):
+        """Clipped or not, an id's segments are spellings, not a location; no
+        shape test tells a digest suffix from a ReplicaSet hash, so no id-only
+        row gets a Where line."""
+        long_a = make_finding(fid="a", obj=self.LONG_OBJECT)
+        for fid in (audit_report.published_id(long_a), derived_id(fid="a"), "odd-id"):
+            with self.subTest(fid=fid):
+                row = audit_report.held_row_from_id(fid)
+                self.assertTrue(row["location_unrecorded"])
+                self.assertEqual(row["check"], fid.split(".", 1)[0])
+                self.assertEqual((row["cluster"], row["namespace"], row["object"]), ("", "", ""))
+                lines = "\n".join(audit_report._render_collector_held([row]))
+                self.assertIn(f"<!-- finding:{fid} -->", lines)
+                self.assertIn("not recorded on the previous ledger; carried by id", lines)
+                self.assertNotIn(fid, audit_report.parse_finding_locations(lines))
+
+    def test_a_clipped_marker_only_id_is_carried_by_id_alone(self):
+        """A clipped id's segments are a truncated spelling, not a location; a
+        Where line built from them would be read back as identity next run
+        and no `resolved_because` could ever match it."""
+        long_a = make_finding(fid="a", obj=self.LONG_OBJECT)
+        clipped = audit_report.published_id(long_a)
+        b_id = derived_id(fid="b")
+        doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        body = self.with_held_ids(published_body(doc_b, generated_at=NOW), [clipped], [b_id])
+        self.replay_ledger(body)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(doc_b)
+        self.assertEqual(rc, 0, self.err)
+        edited = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(f"<!-- finding:{clipped} -->", edited)
+        self.assertIn("not recorded on the previous ledger; carried by id", edited)
+        self.assertNotIn(clipped, audit_report.parse_finding_locations(edited))
+        self.assertIn(clipped, audit_report.parse_delta_block(edited))
+        # A `resolved_because` naming the real object releases nothing: the
+        # id is marker-held, not something the document can explain away.
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = [
+            {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
+             "object": self.LONG_OBJECT, "reason": "Re-ran the check; the object is gone from the listing."}
+        ] + resolved_for(edited)
+        self.replay_ledger(edited)
+        rc = self.run_finish(clean)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertIn(clipped, payload["unaccounted"])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_a_multi_line_title_cannot_manufacture_a_hold(self):
+        """The premise the carry must not rest on: a title with a newline puts
+        the finding marker on a continuation line the heading regex never
+        matches, while the marker still lists the id. Only what the renderer
+        recorded as held is carried, so the dropped finding resolves."""
+        multi = make_finding(fid="first", title="Namespace has no\nNetworkPolicy")
+        second = make_finding(fid="second", title="Second", severity="major")
+        previous_body = published_body(make_doc(findings=[multi, second]), generated_at=NOW)
+        self.assertIn(derived_id(fid="first"), audit_report.parse_delta_block(previous_body))
+        self.assertNotIn(derived_id(fid="first"), audit_report.parse_finding_titles(previous_body))
+        self.assertEqual(audit_report.parse_held_ids(previous_body), [])
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc(findings=[second])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 1)
+        edited = self.harness.bodies_for("issue", "edit")[0]
+        self.assertNotIn(audit_report.HELD_SECTION_BEGIN, edited)
+        self.assertNotIn(derived_id(fid="first"), audit_report.parse_delta_block(edited))
+
+    def note_tier_body(self, **kwargs):
+        """A body squeezed to the third tier: `MAX_HELD_IDS` held findings put
+        even the identity-lines tier over the budget, and the note fits."""
+        held = [self.held_entry(i) for i in range(audit_report.MAX_HELD_IDS)]
+        body = audit_report.render_issue_body(
+            make_doc(findings=[]), generated_at=NOW, audit_id=AUDIT, held=held, **kwargs
+        ).body
+        self.assertIn("## Held by the collector", body)
+        self.assertIn("The body had no room for their rows", body)
+        self.assertEqual(
+            audit_report.parse_held_ids(body), [e["id"] for e in held]
+        )
+        return body
+
+    def test_the_note_tier_says_only_what_its_run_observed(self):
+        """The third tier is the row tiers' sentence in one paragraph, so it
+        makes the same three claims: a manifest run says the collector still
+        emits each, a carry says the hold is a previous run's, and a dry run
+        says it is previewing. A squeezed body that claims an observation the
+        run never made is read back by next run's worker as one."""
+        observed = "the collector still emits a candidate for"
+        fresh = self.note_tier_body()
+        self.assertIn(observed, fresh)
+        carried = self.note_tier_body(held_carried=True)
+        self.assertIn("held from a previous run's manifest; this run passed none", carried)
+        self.assertNotIn(observed, carried)
+        preview = self.note_tier_body(held_preview=True)
+        self.assertIn("the real run holds only if the ledger's hidden marker carries them", preview)
+        self.assertNotIn("kept on this ledger", preview)
+
+    def test_the_fourth_tier_still_carries_its_ids(self):
+        """With no room for even the note, the span and its list are written,
+        nothing visible; the next flagless run and the next manifest run both
+        carry from it."""
+        held = [self.held_entry(i) for i in range(3)]
+        held_ids = [e["id"] for e in held]
+        # A budget the first finding alone exhausts: the findings still render
+        # (the first always does) and every visible held tier is squeezed out.
+        self.patch_attr("BODY_BUDGET", 1)
+        rendered = audit_report.render_issue_body(make_doc(), generated_at=NOW, audit_id=AUDIT, held=held)
+        body = rendered.body
+        self.assertIn(audit_report.HELD_SECTION_BEGIN, body)
+        self.assertIn(audit_report.HELD_SECTION_END, body)
+        self.assertNotIn("## Held by the collector", body)
+        self.assertEqual(audit_report.parse_held_ids(body), held_ids)
+        for fid in held_ids:
+            self.assertIn(fid, audit_report.parse_delta_block(body))
+        carried = audit_report.carried_held_entries(body, exclude=set())
+        self.assertEqual([e["id"] for e in carried], held_ids)
+        self.assertTrue(all(e["location_unrecorded"] for e in carried))
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate(object=e["object"]) for e in held]
+        )
+        via_manifest = audit_report.collector_held_entries(
+            manifest, make_doc(findings=[]), exclude=set(), previous_body=body
+        )
+        self.assertEqual([e["id"] for e in via_manifest], held_ids)
+
+    def test_a_row_carried_by_id_stops_naming_the_finding_once_it_is_recovered(self):
+        """Fourth tier, then a flagless run, then a manifest run: the chain the
+        id-only row's placeholder heading used to survive. Run C has the
+        candidate and so the real location; the heading it writes must be the
+        candidate's and not run B's sentence saying no location was recorded."""
+        entry = self.held_entry(0)
+        fid = entry["id"]
+        # Run B carries the id alone, because run A's body was squeezed past
+        # the row that would have recorded where the finding is.
+        body_b = audit_report.render_issue_body(
+            make_doc(findings=[]),
+            generated_at=NOW,
+            audit_id=AUDIT,
+            held=[audit_report.held_row_from_id(fid)],
+            held_carried=True,
+        ).body
+        placeholder = "carried by id; location not recorded"
+        self.assertIn(placeholder, body_b)
+        self.assertIn(fid, audit_report.parse_delta_block(body_b))
+        # Run C: a manifest still emitting the candidate.
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate(object=entry["object"])]
+        )
+        recovered = audit_report.collector_held_entries(
+            manifest, make_doc(findings=[]), exclude=set(), previous_body=body_b
+        )
+        self.assertEqual([e["id"] for e in recovered], [fid])
+        self.assertEqual(recovered[0]["title"], f"netpol-missing on {entry['object']}")
+        body_c = audit_report.render_issue_body(
+            make_doc(findings=[]), generated_at=NOW, audit_id=AUDIT, held=recovered
+        ).body
+        self.assertNotIn(placeholder, body_c)
+        # And the run after C reads that heading back, so the name stays put
+        # rather than reverting on the next carry.
+        self.assertEqual(
+            audit_report.parse_finding_titles(body_c)[fid],
+            f"netpol-missing on {entry['object']}",
+        )
+
+    def test_an_inline_begin_marker_does_not_open_a_held_span(self):
+        """Part 1. The renderer writes each bracket alone on its line, so one
+        quoted mid-heading is text; reading it as a span would let a heading
+        open a hold over everything printed after it."""
+        forged = derived_id(fid="forged")
+        body = published_body(
+            make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW
+        )
+        heading = "#### Bravo finding"
+        self.assertIn(heading, body)
+        body = body.replace(
+            heading,
+            f"{heading} {audit_report.HELD_SECTION_BEGIN} "
+            f"{audit_report.held_ids_comment([forged])}",
+            1,
+        )
+        self.assertIn(audit_report.HELD_SECTION_BEGIN, body)
+        self.assertIsNone(audit_report._held_span(body))
+        self.assertEqual(audit_report.parse_held_ids(body), [])
+        self.assertEqual(audit_report.parse_held_rows(body), [])
+        self.assertEqual(audit_report.carried_held_entries(body, exclude=set()), [])
+
+    def test_two_begin_markers_carry_no_ids_at_all(self):
+        """Part 2. A second bracket means the body is not one this renderer
+        wrote, and picking either span would let whoever wrote the other one
+        choose what the next run holds. Nothing is carried."""
+        body, _doc_b, a_id = self.squeezed_previous()
+        forged = derived_id(fid="forged")
+        tampered = (
+            "\n".join(
+                ["", audit_report.HELD_SECTION_BEGIN, "",
+                 audit_report.held_ids_comment([forged]), ""]
+            )
+            + body
+        )
+        self.assertEqual(audit_report.parse_held_ids(body), [a_id])
+        self.assertEqual(audit_report.parse_held_ids(tampered), [])
+        self.assertEqual(audit_report.parse_held_rows(tampered), [])
+        self.assertEqual(audit_report.carried_held_entries(tampered, exclude=set()), [])
+        # Two ends, and an end ahead of its begin, fail the same way.
+        self.assertEqual(
+            audit_report.parse_held_ids(body + "\n" + audit_report.HELD_SECTION_END), []
+        )
+        self.assertEqual(
+            audit_report.parse_held_ids(audit_report.HELD_SECTION_END + "\n" + body.replace(
+                audit_report.HELD_SECTION_END, "", 1)),
+            [],
+        )
+
+    def test_a_title_carrying_a_whole_forged_span_holds_nothing(self):
+        """Part 3, the one that holds. A multi-line title can spell a complete
+        begin/list/end trio on lines of its own, which defeats parts 1 and 2 —
+        so the opener never reaches the body, and the flagless run that reads
+        the body back carries nothing."""
+        forged = derived_id(fid="forged")
+        trio = "\n".join(
+            [audit_report.HELD_SECTION_BEGIN,
+             audit_report.held_ids_comment([forged]),
+             audit_report.HELD_SECTION_END]
+        )
+        doc = make_doc(findings=[make_finding(fid="b", title=f"Bravo finding\n{trio}\ntail")])
+        body = published_body(doc, generated_at=NOW)
+        self.assertIsNone(
+            audit_report._held_span(body), "a forged trio in a title opened a held span"
+        )
+        self.assertEqual(
+            audit_report.parse_held_ids(body), [], "a forged trio in a title parsed as a hold"
+        )
+        self.assertIn(audit_report.COMMENT_OPENER_ESCAPED, body)
+        # And read back by a run that passes no manifest, which has nothing but
+        # the body to contradict a hold with.
+        self.replay_ledger(body)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        edited = self.harness.bodies_for("issue", "edit")[0]
+        self.assertEqual(
+            audit_report.parse_held_ids(edited), [], "a forged hold survived into the next body"
+        )
+        self.assertNotIn(forged, audit_report.parse_delta_block(edited))
+        self.assertNotIn(forged, self.stdout_json()["unaccounted"])
+
+    def test_the_escape_survives_the_render_round_trip(self):
+        """Part 3 end to end: the reader sees the four characters the author
+        wrote, the parsers see no comment, and the renderer's own markers are
+        untouched."""
+        opener = audit_report.COMMENT_OPENER
+        doc = make_doc(
+            findings=[
+                make_finding(
+                    fid="b",
+                    title=f"Bravo {opener} audit-held:begin -->",
+                    excerpt=f"{opener} audit-held-ids: [\"x\"] -->",
+                    command=f"kubectl get ns # {opener} audit-findings: [] -->",
+                )
+            ]
+        )
+        body = published_body(doc, generated_at=NOW)
+        escaped = audit_report.COMMENT_OPENER_ESCAPED
+        self.assertIn(f"Bravo {escaped} audit-held:begin -->", body)
+        self.assertIn(f"{escaped} audit-held-ids:", body)
+        self.assertIn(f"{escaped} audit-findings:", body)
+        self.assertNotIn(f"{opener} audit-held", body)
+        self.assertIsNone(audit_report._held_span(body))
+        self.assertEqual(audit_report.parse_held_ids(body), [])
+        # The renderer's own hidden blocks still read, so the escape is spent
+        # on the free text and nothing else.
+        self.assertEqual(audit_report.parse_delta_block(body), [derived_id(fid="b")])
+        self.assertEqual(audit_report.parse_id_scheme(body), audit_report.ID_SCHEME)
+
+    def test_a_held_list_carries_only_the_entries_shaped_like_ids(self):
+        """The list is the one input to the carry and nothing downstream
+        re-checks it, so an entry that is not an id is dropped and named in
+        the log rather than carried into a deferral and the next marker."""
+        good = derived_id(fid="a")
+        junk = [
+            "Not An Id",
+            "trailing-",
+            "gone.old.spelling.that.runs.on." + "x" * 90,
+            "../../etc/passwd",
+            "/remediate all",
+        ]
+        body = "\n".join(
+            ["", audit_report.HELD_SECTION_BEGIN, "",
+             audit_report.held_ids_comment(junk[:2] + [good] + junk[2:]),
+             audit_report.HELD_SECTION_END, "", audit_report.delta_block([good]), ""]
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(audit_report.parse_held_ids(body), [good])
+        self.assertIn("are not spelled like a finding id", err.getvalue())
+        for bad in junk:
+            self.assertIn(repr(bad), err.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            carried = audit_report.carried_held_entries(body, exclude=set())
+        self.assertEqual([entry["id"] for entry in carried], [good])
+
+    def test_every_id_shape_the_renderer_mints_survives_the_held_list(self):
+        """The filter must not be tighter than the id grammar. Re-derived from
+        the code that mints ids: a four-segment id, one whose namespace is the
+        `_` sentinel because the finding is cluster-scoped, a one-character
+        segment, and a clipped id carrying `_shorten_id`'s digest tail."""
+        shapes = {
+            "plain": make_finding(fid="a"),
+            "cluster-scoped": make_finding(fid="a", namespace=""),
+            "one-character": make_finding(
+                fid="a", check="x", cluster="c", namespace="n", obj="o"
+            ),
+            "clipped": make_finding(fid="a", obj=self.LONG_OBJECT),
+            "dotted-object": make_finding(fid="a", obj="CustomResource/widgets.example.com"),
+        }
+        ids = []
+        for name, finding in shapes.items():
+            with self.subTest(shape=name):
+                fid = audit_report.published_id(finding)
+                self.assertRegex(fid, audit_report.FINDING_ID_RE)
+                ids.append(fid)
+        self.assertEqual(
+            len(audit_report.published_id(shapes["clipped"])), audit_report.MAX_FINDING_ID
+        )
+        body = "\n".join(
+            ["", audit_report.HELD_SECTION_BEGIN, "",
+             audit_report.held_ids_comment(ids), audit_report.HELD_SECTION_END, "",
+             audit_report.delta_block(ids), ""]
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(audit_report.parse_held_ids(body), ids)
+        self.assertNotIn("not spelled like a finding id", err.getvalue())
+        self.assertEqual(
+            sorted(entry["id"] for entry in audit_report.carried_held_entries(body, exclude=set())),
+            sorted(ids),
+        )
+
+    def test_a_manifest_and_a_waiver_together_are_refused_by_the_parser(self):
+        with self.assertRaises(SystemExit):
+            self.run_finish(
+                make_doc(findings=[]),
+                [
+                    "--manifest-file",
+                    self.manifest_file(_full_manifest()),
+                    "--no-collector-manifest",
+                    "x",
+                ],
+            )
+        self.assertFalse(self.harness.calls)
+
+    def test_a_still_flagged_candidate_is_not_announced_resolved(self):
+        """A finding absent from the document while the collector still emits
+        its candidate is the condition still holding, not a fix."""
+        previous_body = published_body(
+            make_doc(
+                findings=[
+                    make_finding(fid="a", title="Alpha finding"),
+                    make_finding(fid="b", title="Bravo finding"),
+                ]
+            ),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        still_there = self.netpol_candidate(object="Namespace/a")
+        manifest = _full_manifest(candidates=[still_there, self.netpol_candidate(object="Namespace/b")])
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "UPDATED")
+        self.assertEqual(payload["resolved"], 0)
+        self.assertIn("NOT being announced as resolved", self.err)
+        self.assertIn(derived_id(fid="a"), self.err)
+        for comment in self.harness.bodies_for("issue", "comment"):
+            self.assertNotIn("Alpha finding", comment)
+
+    def test_a_dropped_finding_the_collector_also_dropped_still_resolves(self):
+        previous_body = published_body(
+            make_doc(
+                findings=[
+                    make_finding(fid="a", title="Alpha finding"),
+                    make_finding(fid="b", title="Bravo finding"),
+                ]
+            ),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+
+    def promotion_replies(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+    def test_a_corroborated_critical_still_gets_its_pull_request(self):
+        self.promotion_replies()
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(self.stdout_json()["uncorroborated_findings"], [])
+
+    def test_an_uncorroborated_critical_is_published_but_not_auto_promoted(self):
+        """The collector ran `netpol-missing` on this cluster and flagged
+        nothing there; the finding is published, named in the ledger, and
+        left for `/remediate`."""
+        self.promotion_replies()
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "OPENED")
+        self.assertEqual(payload["uncorroborated_findings"], [derived_id()])
+        self.assertEqual(payload["prs_opened"], [])
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("Read these before asking", body)
+        self.assertIn(f"`{derived_id()}`", body)
+        self.assertIn("the sweep will not open a pull request", self.err)
+
+    def test_a_triage_marked_critical_is_published_but_not_auto_promoted(self):
+        self.promotion_replies()
+        manifest = _full_manifest(candidates=[self.netpol_candidate(needs_triage="service-fronted")])
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("its fix is what needs a decision", body)
+        self.assertNotIn("Read these before asking", body)
+        self.assertEqual(self.stdout_json()["uncorroborated_findings"], [])
+
+    def test_the_dry_run_names_what_the_sweep_would_pass_over(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(
+            make_doc(), ["--dry-run", "--manifest-file", self.manifest_file(_full_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("THE COLLECTOR RAN THIS CHECK AND DID NOT FLAG THESE (1)", self.err)
+        self.assertIn("WOULD OPEN: (no remediation pull requests)", self.err)
+        self.assertIn("Read these before asking", self.out)
+
+    def previous_a_and_b(self):
+        previous_body = published_body(
+            make_doc(
+                findings=[
+                    make_finding(fid="a", title="Alpha finding"),
+                    make_finding(fid="b", title="Bravo finding"),
+                ]
+            ),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        return previous_body
+
+    def open_pr_for_a(self):
+        self.harness.replies["pr list"] = json.dumps(
+            [
+                pr(
+                    8,
+                    "platform-agent/fix-a",
+                    body=audit_report.delta_block([derived_id(fid="a")]),
+                )
+            ]
+        )
+
+    def test_a_still_flagged_finding_keeps_its_pull_request_open(self):
+        """The stale-close pass reads the same hold as the delta: a pull
+        request whose finding the collector still flags is not retired with
+        "no longer reproduces" while `resolved` says it was not resolved."""
+        self.previous_a_and_b()
+        self.open_pr_for_a()
+        manifest = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object="Namespace/a"),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["prs_closed"], [])
+        self.assertEqual(payload["resolved"], 0)
+        self.assertIn("NOT being announced as resolved", self.err)
+        self.assertIn(derived_id(fid="a"), self.err)
+
+    def test_a_pull_request_the_collector_also_dropped_is_retired(self):
+        """The control for the test above: same ledger, same open pull
+        request, and a collector that no longer flags the finding."""
+        self.previous_a_and_b()
+        self.open_pr_for_a()
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.harness.gh_calls("pr", "close"))
+        payload = self.stdout_json()
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(payload["resolved"], 1)
+
+    def test_a_long_named_object_is_still_held(self):
+        """The ledger clips an id over `MAX_FINDING_ID`; the hold has to be
+        spelled the same way or the longest-named objects slip through it."""
+        long_object = "Deployment/" + "very-long-workload-name-segment-" * 4
+        long_finding = make_finding(fid="long", obj=long_object, title="Long finding")
+        self.assertGreater(
+            len(audit_report.derive_finding_id(long_finding)), audit_report.MAX_FINDING_ID
+        )
+        previous_body = published_body(
+            make_doc(findings=[long_finding, make_finding(fid="b", title="Bravo finding")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(
+            candidates=[
+                self.netpol_candidate(object=long_object),
+                self.netpol_candidate(object="Namespace/b"),
+            ]
+        )
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+        self.assertIn(audit_report.published_id(long_finding), self.err)
+
+    def clean_over_previous_ledger(self):
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        return doc
+
+    def test_a_clean_run_over_a_still_flagging_collector_is_held_not_closed(self):
+        """A `resolved_because` entry satisfies the clean-close hold and
+        contradicts the collector, which is the one thing in the run that
+        looked. The finding is unaccounted for the purposes of the close."""
+        doc = self.clean_over_previous_ledger()
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate()], command=self.NETPOL_COMMAND
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["prs_closed"], [])
+        self.assertEqual(payload["unaccounted"], [derived_id()])
+        self.assertFalse(payload["silent_ok"])
+        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertIn("the ledger stays open", comment)
+        self.assertIn("still flagged by the collector", comment)
+        self.assertIn("A `resolved_because` entry does not release one of these", comment)
+        self.assertIn(self.NETPOL_COMMAND, comment)
+        self.assertIn("STILL FLAGGED:", self.err)
+        self.assertNotIn("UNACCOUNTED:", self.err)
+
+    def test_a_clean_run_the_collector_agrees_with_closes(self):
+        doc = self.clean_over_previous_ledger()
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["resolved"], 1)
+        self.assertEqual(payload["unaccounted"], [])
+
+    def test_a_findings_run_with_a_waiver_publishes_the_reason(self):
+        """The Scope table shows full coverage on a waived findings run — the
+        document authored no gap — so the waiver gets the section's own list."""
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--no-collector-manifest", "collector crashed"])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("### Coverage", body)
+        self.assertIn("the collector manifest was waived — collector crashed", body)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["status"], "OPENED")
+
+    def test_the_delta_comment_carries_the_waiver(self):
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(
+            findings=[
+                make_finding(fid="a", title="Alpha finding"),
+                make_finding(fid="c", title="Charlie finding"),
+            ]
+        )
+        rc = self.run_finish(doc, ["--no-collector-manifest", "collector crashed"])
+        self.assertEqual(rc, 0, self.err)
+        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertIn("audit delta", comment)
+        self.assertIn("Coverage of this run is partial", comment)
+        self.assertIn("the collector manifest was waived — collector crashed", comment)
+        body = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn("### Coverage", body)
+
+    def test_a_document_gap_does_not_reach_the_delta_comment(self):
+        """Document-authored gaps have always been read off the Scope table;
+        only a hold the document cannot express rides the comment."""
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(
+            findings=[
+                make_finding(fid="a", title="Alpha finding"),
+                make_finding(fid="c", title="Charlie finding"),
+            ],
+            skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertNotIn("Coverage of this run is partial", comment)
+        self.assertNotIn("### Coverage", self.harness.bodies_for("issue", "edit")[0])
+
+    def test_the_waiver_reason_is_redacted(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            ["--no-collector-manifest", "collector died with password: hunter2correcthorse"],
+        )
+        self.assertEqual(rc, 0, self.err)
+        gap = self.stdout_json()["coverage_gaps"][0]
+        self.assertIn(audit_report.REDACTED, gap)
+        self.assertNotIn("hunter2correcthorse", gap)
+        self.assertNotIn("hunter2correcthorse", self.err)
+
+    def test_a_posture_the_harness_withheld_is_not_a_dropped_candidate(self):
+        """The model did publish it; `finish` took it out for want of a
+        declared-intent search. Reporting it as a candidate the model dropped
+        blames the wrong party for the right absence."""
+        self.harness.replies = {"issue list": "[]"}
+        doc = declaring_doc()
+        posture = doc["findings"][0]
+        manifest = _full_manifest(
+            audit=DECLARING_AUDIT,
+            candidates=[
+                {
+                    "check": "no-pdb",
+                    "cluster": posture["cluster"],
+                    "namespace": posture["namespace"],
+                    "object": posture["object"],
+                    "severity": "major",
+                    "excerpt": "no PodDisruptionBudget selects it",
+                }
+            ],
+        )
+        rc = self.run_finish(
+            doc, ["--manifest-file", self.manifest_file(manifest)], audit=DECLARING_AUDIT
+        )
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["postures_withheld"], [derived_id(check="no-pdb")])
+        self.assertEqual(payload["unpublished_candidates"], [])
+        self.assertEqual(payload["wholly_unpublished_checks"], [])
+
+    def test_the_drop_warning_only_claims_the_check_ran_where_checks_run_says_so(self):
+        self.harness.replies = {"issue list": "[]"}
+        manifest = _full_manifest(candidates=[self.netpol_candidate()])
+        attested = make_doc(findings=[])
+        rc = self.run_finish(attested, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("yet the check is reported as having run", self.err)
+
+        # The same drop on a cluster that admits the check did not run there:
+        # a `collected` cluster owes the manifest every check, so the manifest
+        # must not record it either.
+        silent = make_doc(findings=[])
+        silent["scope"]["clusters"][0]["checks_run"] = [
+            ran(c) for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"
+        ]
+        manifest["clusters"][0]["commands"] = [
+            c for c in manifest["clusters"][0]["commands"] if c["check"] != "netpol-missing"
+        ]
+        self.harness = type(self.harness)()
+        self.harness.replies = {"issue list": "[]"}
+        self.patch_attr("run_cmd", self.harness)
+        rc = self.run_finish(silent, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("every candidate for check 'netpol-missing'", self.err)
+        self.assertNotIn("yet the check is reported as having run", self.err)
+
+
+# --------------------------------------------------------------------------- #
+# The no-manifest path is frozen
+# --------------------------------------------------------------------------- #
+
+# Set to any non-empty value to rewrite the transcripts below from the current
+# code instead of comparing against them. Only ever do that on purpose, for a
+# change that is *meant* to alter what a manifest-less `finish` does.
+GOLDEN_RECORD_ENV = "FLEET_AUDIT_RECORD_GOLDEN"
+GOLDEN_DIR = Path(__file__).with_name("testdata") / "finish_without_manifest"
+GOLDEN_TMP_TOKEN = "<TMP>"
+# `log()` stamps each line with the wall clock, outside the frozen `datetime`.
+GOLDEN_LOG_STAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ", re.M)
+GOLDEN_LOG_STAMP_TOKEN = "[<TS>] "
+
+
+class _FrozenDatetime(datetime):
+    """`datetime` with `now()` pinned, so a transcript is comparable run to run."""
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: D102 -- the stdlib signature
+        return NOW if tz is None else NOW.astimezone(tz)
+
+
+BASE_HELD_COMMENT = '### `compliance-audit` found nothing — but did not account for 1 previous finding, so the ledger stays open\n\nThe Security & RBAC Posture Audit run on 2026-08-01 09:30 UTC found **0 findings** across 1 audited cluster(s): `prod-us-east`.\n\n**This is not an all-clear.** This ledger reported each finding below, and this run\'s own `checks_run` says the check that found it ran again on that cluster — yet the document neither reports the finding again nor carries a `resolved_because` entry saying what that check showed. From here "fixed" and "not written down" are the same absence, so nothing has been reported as resolved, no remediation pull request has been closed, and the ledger stays open. It closes on the next run that reports each of these again, or says per finding why it is gone; `start` lists them under `carried`.\n\n- `cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding` — debug-binding grants cluster-admin — `ClusterRoleBinding/debug-binding` in `prod-us-east` / _cluster-scoped_; `cluster-admin-binding` ran there as `kubectl get clusterrolebindings -o json \\| jq \'.items[] \\| select(.roleRef.name=="cluster-admin")\' xxxxxxxxxxxxxxxxxxxx…`\n\n<details>\n<summary>How this run checked the fleet (1 checks)</summary>\n\nOne row per check that ran, with the command that ran it, as reported by the audit. The harness cannot confirm a command was issued — these are re-runnable so that it does not have to be taken on trust.\n\n| Cluster | Check | Command |\n| ------- | ----- | ------- |\n| `prod-us-east` | `cluster-admin-binding` | `kubectl get clusterrolebindings -o json \\| jq \'.items[]\'` |\n\n</details>'
+
+
+class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
+    """`finish` without `--manifest-file` is, byte for byte, what it was before
+    the collector contract landed.
+
+    The contract is meant to be inert until a stream passes a manifest, and
+    "inert" is a claim about every byte the run emits rather than about a
+    payload key or two: the `gh` argv sequence, the bodies each call carried,
+    the JSON line on stdout and the log on stderr. Each scenario below records
+    all of that against a frozen clock and compares it with a transcript
+    captured from the harness *before* the contract was added. A key added
+    unconditionally to the payload, a log line that now prints on every run,
+    a renderer that reorders a section -- each fails here, naming the byte.
+
+    Five scenarios, chosen to pass through every branch a manifest could
+    touch: the findings path with a delta and an auto-promoted pull request,
+    the clean path that closes the ledger, the clean path held over a previous
+    finding the document did not account for, the clean-over-a-gap path that
+    leaves the ledger open, and the dry run that renders both bodies to stdout.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("datetime", _FrozenDatetime)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.touch("clusters/stage-eu/psp.yaml")
+
+    def _normalise(self, text):
+        if text is None:
+            return None
+        text = text.replace(str(self.tmp_path), GOLDEN_TMP_TOKEN)
+        return GOLDEN_LOG_STAMP_RE.sub(GOLDEN_LOG_STAMP_TOKEN, text)
+
+    def transcript(self, rc):
+        return {
+            "rc": rc,
+            "calls": [[self._normalise(a) for a in call] for call in self.harness.calls],
+            "cwds": [self._normalise(c) for c in self.harness.cwds],
+            "bodies": [self._normalise(b) for b in self.harness.bodies],
+            "stdout": self._normalise(self.out),
+            "stderr": self._normalise(self.err),
+        }
+
+    def check(self, name, rc):
+        actual = self.transcript(rc)
+        path = GOLDEN_DIR / f"{name}.json"
+        if os.environ.get(GOLDEN_RECORD_ENV):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(actual, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+            return
+        self.assertTrue(path.is_file(), f"no recorded transcript at {path}; see {GOLDEN_RECORD_ENV}")
+        expected = json.loads(path.read_text(encoding="utf-8"))
+        # Field by field, so a failure names the surface that moved before it
+        # prints the whole transcript.
+        for key in expected:
+            with self.subTest(surface=key):
+                self.assertEqual(expected[key], actual[key])
+        self.assertEqual(sorted(expected), sorted(actual))
+
+    def two_findings(self):
+        return [
+            make_finding(fid="b", title="Bravo finding"),
+            make_finding(
+                fid="c",
+                title="Charlie finding",
+                severity="major",
+                remediation={"kind": "manifest", "path": "clusters/stage-eu/psp.yaml", "note": "n"},
+            ),
+        ]
+
+    def test_findings_path_with_a_delta_and_a_promoted_pull_request(self):
+        previous_body = published_body(
+            make_doc(
+                findings=[
+                    make_finding(fid="a", title="Alpha finding"),
+                    make_finding(fid="b", title="Bravo finding"),
+                ]
+            ),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        rc = self.run_finish(make_doc(findings=self.two_findings()))
+        self.check("findings_delta_and_promotion", rc)
+
+    def test_clean_path_closes_the_ledger(self):
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        # Every previous finding explained, so the close is not held (#1691)
+        # and the transcript is the all-clear branch rather than `HELD`.
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc)
+        self.check("clean_closes_ledger", rc)
+
+    def test_clean_path_held_over_an_unaccounted_finding(self):
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        rc = self.run_finish(make_doc(findings=[]))
+        self.check("clean_held_over_unaccounted", rc)
+
+    def test_clean_over_a_coverage_gap_leaves_the_ledger_open(self):
+        previous_body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}],
+        )
+        doc["scope"]["clusters"][1]["checks_run"] = [ran("netpol-missing", "stage-eu")]
+        rc = self.run_finish(doc)
+        self.check("clean_over_gap_stays_open", rc)
+
+    def test_dry_run_renders_the_same_bodies(self):
+        rc = self.run_finish(make_doc(findings=self.two_findings()), ["--dry-run"])
+        self.check("dry_run", rc)
+
 
 
 if __name__ == "__main__":

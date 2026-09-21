@@ -83,6 +83,15 @@
             }
           }
         },
+        "topologySpread": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -137,6 +146,10 @@
         "modelDefaultName": {
           "type": "string"
         },
+        "maxTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
         "vertex": {
           "type": "object",
           "additionalProperties": false,
@@ -187,6 +200,15 @@
           }
         },
         "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "topologySpread": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -390,6 +412,15 @@
           "type": "boolean"
         },
         "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "topologySpread": {
           "type": "object",
           "additionalProperties": false,
           "properties": {

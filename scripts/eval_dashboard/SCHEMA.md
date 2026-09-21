@@ -102,7 +102,12 @@ the same layout and is collected from the moment it starts running.
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
 - `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
   the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
-  `RED`. `null` when the log has no such line — the job ended before its
+  `RED`. A run the suite could not evaluate (an admitted case lost every
+  repetition to infrastructure; the job exits `2` and the line carries
+  `NOT EVALUATED` between the anchors) records as `RED` here, because the
+  collector reads the `Failed` word and not the words after it; the
+  verdict's own `outcome` is in the run's `eval-verdict.json`, which nothing
+  on the dashboard reads yet. `null` when the log has no such line — the job ended before its
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
   `ABORTED`; build 2092688354838581248 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
@@ -130,7 +135,8 @@ the same layout and is collected from the moment it starts running.
   - `reps` — **optional, additive**: per-repetition grading detail, one
     entry per indented `rep N: <verdict> -- <text>` grading line under the
     task's verdict line, in log order:
-    `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`.
+    `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
+    plus `"excerpt": <string>` when the log carried one (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -140,6 +146,28 @@ the same layout and is collected from the moment it starts running.
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
       dump stripped, truncated to 300 chars. `null` for passing reps and
       when nothing remains.
+    - `excerpt` — **optional, additive**: the agent's own words — the text
+      of the `rep N report: <text>` line `bench-gate case` prints right
+      under the grading line of a repetition that did not pass (since
+      2026-09-15): the first 300 characters of the agent's final report
+      (`results.json`'s `output`, the "Actual Output" the judge grades),
+      whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
+      last position where it was cut; capped at 300 again here. The
+      collector consumes the line whole before any other pattern reads it,
+      so text the agent wrote cannot pose as the lease line, a grading line
+      or the final verdict. The key is
+      **absent** — never `null` or `""` — when the log carries no such line:
+      a passing rep, an empty report (a transport failure's), a report line
+      for a rep the log never graded (dropped, never an entry of its own),
+      and every build graded before the line existed. `classify.py`'s
+      `excerpt_of` reads it into the Brief's "What the agent saw" quote, the
+      run page's case card and a case's `last_failure`, always from the
+      repetition whose `reason` is shown, so the quote and the check beside
+      it come from the same run of the agent; nothing is quoted when that
+      rep has none (when no rep carries a reason, the first rep with an
+      excerpt is the one the row is about, link included). The PR gate comment's Reason line stays the grader's
+      `reason` and falls back to the excerpt only for a rep that has no
+      reason at all.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
@@ -323,9 +351,12 @@ Additive, optional, and safe to omit — consumers must default them.
   so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
   config's doing — it runs the driver under `|| true` — not the driver's, so
   a future config that drops the `|| true` would make the two agree without
-  anything here changing. `NOT RUN` is
-  the deploy-failed path — nothing was measured, so it is not a judgement
-  on the candidate.
+  anything here changing. `NOT RUN` is written on two paths, and on
+  neither is it a judgement on the candidate: the deploy failed, so nothing
+  was measured; or the eval ran and could not be evaluated (`ci-eval-pr.sh`
+  exited `2` and `eval-verdict.json` says `outcome: not_evaluated` — an
+  admitted case lost every repetition to infrastructure), so the candidate
+  was not measured on it.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
   may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
   line. `baseline_rate` and `margin` are `null` while the baseline store
@@ -481,7 +512,7 @@ what the renderer does with them.
 
 ## The rendered pages
 
-`render.py` writes five pages beside `data.json`. Every time shown is
+`render.py` writes six pages beside `data.json`. Every time shown is
 America/Toronto ("ET"), formatted in the browser with
 `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
@@ -492,14 +523,18 @@ America/Toronto ("ET"), formatted in the browser with
 | `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
 | `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
 | `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it.                                          |
+| `trend.html`   | **The Trend page** ("Scores over time on main"): the store's nightly records per case and domain — pass rate by night with the trailing admission window and the bar, judged quality by night with the spread the store supports (a case: the range of its nightly means over seven nights at one key; a domain: the range across its cases), a marker on each night the version key changed, a table under each chart, a banner when the store was not read. `#cases=`, `#domain=`, `#since=` (incident). `trend.py`, from `store.json`.   |
 
 The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
 `<script type="application/json" id="inline-brief">` (the verdict it read,
 the same document as `brief.health`, again as `inline-health`), so a page
-needs no request beyond itself;
+needs no request beyond itself (the `trend` block, which grows every night,
+is inlined into `trend.html` only; the other pages and `brief.json` itself
+carry `trend: null`, and the block is published as `trend.json` beside it);
 the poll of the published `brief.json` and `health.json` every 60 seconds
-is a best-effort refresh on top. That matters on `storage.cloud.google.com`, which answers an XHR
+(and of `trend.json`, on the Trend page alone) is a best-effort refresh on
+top. That matters on `storage.cloud.google.com`, which answers an XHR
 with a login redirect: the pages still render whole there. The header
 badge says `updated <time> · Nm ago`, plus `· regenerated every 15 min`
 while no poll has succeeded (the workflow republishes every page on that
@@ -520,6 +555,7 @@ the question imports it.
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
 `cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
 `nightly.html[#build=<prow build id>]`
+`trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
 
 Every parameter travels in the URL fragment as `key=value` pairs joined
 by `&`. `storage.cloud.google.com` answers an unauthenticated request with
@@ -562,20 +598,28 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
   last night's.
 - `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
   chips as parameters; a value outside the vocabulary is the default.
+- On the Trend page `cases` scopes to those cases (the case-id grammar
+  above), `domain` to a domain slug (same grammar), `metric` to a judged
+  metric (`[A-Za-z][A-Za-z0-9_]{0,39}`, and one the store carries, else the
+  default); `since` and `until` draw the incident's start and end as
+  markers. No parameter is the overview of every domain.
 
 ### `brief.json` (written by `render.py`)
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
-pending[], releases[], nightly{}}`. `runs[]` is the **presubmit's** last `run_days` of
+pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
 `setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
-also_failing_prs, pass_rate_30d, reason, excerpt, do, admitted, reps,
+also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
 nightly_failed_recent}`) and `health_at` (the verdict in force when it
-finished, from history; `null` without history). `also_failing_prs` and
+finished, from history; `null` without history). `rep_n` is the 1-based
+repetition the row is about — the one whose `reason` is shown, else the
+one whose `excerpt` is (`null` when there is neither); the pages link that
+repetition's transcript, rep 1's when it is `null`. `also_failing_prs` and
 `pass_rate_30d` count presubmit runs only; `nightly_failed_recent` is
 `true` / `false` when the newest nightly run within two days of this one
 graded the case and failed / did not fail it on every repetition, `null`
@@ -647,6 +691,86 @@ and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
+`trend` is `null` in the published `brief.json` (every page polls that
+file every minute and only the Trend page reads the block, which grows a
+night's records every night); the block is inlined into `trend.html` and
+published beside `brief.json` as **`trend.json`**, which the Trend page
+polls. It is `trend.py`'s block from `store.json` (below), the evidence
+store's read: `{source, read_at, error, window_days, lead_days, max_objects,
+truncated{case: n}, partial, warnings[], records, metrics[], default_metric,
+spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{}}`.
+Without a `--store` every field is empty or `null` and the page says the
+store was not read; `error` set means the last read failed or was not
+attempted and the rest is the read before it. The page draws the
+`window_days` before `read_at`; the `lead_days` before that were read too
+(store.py) and their records feed the first drawn nights' windows and
+spreads and appear nowhere else (not as points, nights, key changes or in
+`records`). `keys{}` maps a key id
+(`<setup_id>/<judge_model>/<scoring_version>-f<fleet>-v<verifiers>`) to its
+five components. `nights[]` is every night inside the drawn window the
+store holds a record for, oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
+`build:<prow build id>` from the object name (or `at:<recorded_at>` for a
+record without one), `started` and `log_url` the collector's when that
+build is a nightly run in `data.json` (`null` otherwise); the page dates
+every night by `at`, the stamp its points and markers are placed by, and
+uses `build` only for the link to the report. `cases{}` is per case `{domain, points[],
+key_changes[], record}` (a case recorded in the lead-in only is absent):
+`points[]` oldest first, one per record inside the drawn window, `{night,
+at, build, commit, key, runs, passes, blocked, infra, judged{metric:
+{mean, n, spread{low, high, nights}}}, window{runs, passes, lines, full,
+cut}}` — `window` is what computed admission reads at that night (the
+newest whole records at the same key pooled to `bar.min_runs`; `full` when
+reached; `cut` when the pool is short while `store.json`'s `older` shows
+objects at that key the read left behind, older than the span or trimmed
+by the cap, so the store holds records that admission pools and this read
+did not reach) and `spread` the range of the case's nightly means
+over the last `spread_nights` at the same key (`nights` 1 is no spread);
+`key_changes[]` is `{night, at, from, to, changed[]}` for every record
+inside the drawn window whose key differs from the one before; `record` is
+`{state, key, runs, passes, lines, rate, bar, as_of}` with `state` in
+`would-admit|would-demote|collecting|cut`, the newest window against the
+bar (`cut`: the window is not knowable from this read). `domains{}` is per domain `{cases[],
+points[], key_changes[]}` with `points[]` the cases pooled per night
+`{night, at, runs, passes, cases, keys[], judged{metric: {mean, n, low,
+high, cases}}}` (`mean` weighted by `n`, `low`/`high` the range of the
+cases' means). Only nightly records exist in the store (a pull request's
+run never writes it), so nothing here is a presubmit's.
+
+### `store.json` (written by `store.py`, read by `render.py --store`)
+
+The evidence store (`docs/designs/eval-scorer.md`, "What is stored")
+as one document: `{schema_version, source, read_at, window_days,
+lead_days, max_objects, listed, fetched, truncated{case: n}, older{case:
+{key: n}}, partial, warnings[], error, records[]}`. `records[]` is every object read inside the last
+`window_days` plus `lead_days` (90 and 14: the page draws the window and
+pools the lead-in into its first nights) and under `max_objects` per case per key
+(`EVAL_BASELINE_MAX_OBJECTS`, 200, the gate's own cap), each the JSON line
+as written — `{case, recorded_at, commit, key{setup_id, scoring_version,
+judge_model, fleet, verifiers}, runs, passes, blocked?, infra?, judged?}` —
+plus `object` (its URL) and `build` (the Prow build id from the object
+name, `null` when the name carries none). `truncated` says per case how
+many older objects the cap left out, and `older` per case and version key
+how many objects the listing showed and the read left behind, older than
+the span or trimmed by the cap, which is how the Trend page tells a short
+window it cannot see the bottom of (`cut`) from one that is genuinely
+short. `older`'s case and key are the directories the writer filed them
+under (`evidence_store._key_segments`: each component sanitised, `unkeyed`
+for a record without a key, `""` for an object filed directly under its
+case), not the record's own spelling; `trend.py` maps a record's key to
+that path the same way before the lookup. `partial` is `null`, or
+`{fetched, remaining}` when the read stopped at its deadline
+(`--deadline-s`) between waves of fetches with objects left for the next
+tick, which finds them absent from its `--prior` and reads them first;
+`warnings[]` names each line that
+would not parse (skipped, never fatal); `error` is set when the read did
+not happen — the listing failed, or the workflow called `--fail-with` for a
+read its `timeout` killed or its wall clock could not fit — and the
+document is the prior read written back with the reason. The reader lists
+the prefix once and fetches only the objects the prior `store.json`
+(`--prior`, the copy `render.py` published beside `data.json`) does not
+hold: objects are immutable and the store append-only, so a record once
+read is final.
+
 ### `health.json` and `health-history.jsonl` (optional inputs)
 
 `health.json` is the CI health adjudicator's verdict, published beside
@@ -654,7 +778,7 @@ block, the report page and the digest say instead of "no night".
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods|fixture_drift`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -674,6 +798,48 @@ baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
 it is set.
+
+`pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
+pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
+window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
+threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+longest run has been waiting for a project right now, `0` for an empty queue
+and `null` when Deck was not read; `over_threshold` is the count already past
+the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
+live backlog — and `null` when Deck was unread or no limit was given. A verdict
+lasts a week, so every present-tense reader asks it: the alert is withheld on
+`false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
+Brief go past tense on either. `waiting_since` dates the backlog from its
+oldest queued run, and is `null` when there is none; the Brief's present-tense
+sentence prefers it to `since`, which can be days older.
+`breach_seen` says whether the open episode has ever measured a breach, and
+`since` is the episode's start except that a `BREACH` does not inherit one from
+a stretch that only ever said the queue could not be read. `metrics` carries
+both across a tick that read no artifact, as `pool_since` and
+`pool_breach_seen`. The two
+figures are never the seven-day window's — the periodic breaches on a day's row
+or on runs queued past p95 right now, and the window sits back inside its own
+limit after one bad day. Exactly one of `window_hours` and `day` says which
+stretch they cover: the periodic's recent window when it had the runs to judge
+it and went over a limit, the worst breached day otherwise. A verdict lasts a
+week, so the recent window comes first — a Thursday incident evidenced by
+Monday reads as a contradiction — but a compliant stretch is the same
+contradiction, only newer. Both are `null` when only the live queue breached;
+`over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
+periodic stopped publishing, and the last reading is not evidence about now.
+Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
+`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
+`threshold_p50_s` and `threshold_p95_s` for one sentence on the Brief's healthy
+headline and on the last-24-hours view.
+`metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
+`null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
+the artifact was there at all. Nothing else answers that: `pool` is `null` for a
+healthy pool and for a failed fetch alike, and `queue_wait_p50_s` is `null` on a
+day with no runs. The poster needs the difference — going blind must not read as
+the episode ending. `metrics.pool_since` is the open episode's start, held
+across the ticks that read no artifact and so write no `pool`, and `null` once
+a tick reads one and writes none, which is the episode ending.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
@@ -769,6 +935,24 @@ asserts it reads as `lost_pods` and not as setup deaths.
 baseline needs, ending on the afternoon every run was green and three hours
 long (#1586); the test asserts the `slow` note from 18:00Z that day and none
 over the 09-12/13 weekend.
+
+`testdata_store/` holds four **real** objects from the evidence store's
+first recording night (2026-09-17, build 2100374258805903360, commit
+`b458323d`), in the store's own layout under an `evidence/` root — the case,
+the setup, the judge, the `<scoring>-f<fleet>-v<verifiers>` directory and the
+`<stamp>-<build>.jsonl` name — one record per object, verbatim:
+
+| case                            | why it is here                                         |
+| ------------------------------- | ------------------------------------------------------ |
+| `agent-kanban-smoke`            | 3/3, `ToolInvocation` 0.67: a clean night              |
+| `rca-remediation-pr`            | 2/3: a partial night with judged means below 1         |
+| `cluster-agent-crashloop-debug` | 3/3 with `OutcomeValidity` 0.9: a pass that is not 1.0 |
+| `upgrades-fleet-version-table`  | 3/3, `OutcomeValidity` 0.8                             |
+
+`scripts/test_eval_dashboard_store.py` serves them through a fake `gsutil`
+(`ls` of the tree, `cat` of the files) and pins the parse, the window, the
+per-key cap and the incremental read; `scripts/test_eval_dashboard_trend.py`
+derives the trend from them and renders the page.
 
 `testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;

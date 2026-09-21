@@ -32,7 +32,16 @@ baseline it is judged against and may never move it.
 EXIT CODES. ``case`` exits 0 whenever it produced a verdict, including a
 blocking one: the loop must keep going so the summary covers every task, and
 the blocking flag rides in the JSON. It exits 2 when it could not grade at all
-(an unreadable task file, a bad flag). ``suite`` exits 0 green, 1 red.
+(an unreadable task file, a bad flag). ``suite`` exits 0 green, 1 red, and 2
+when the run could not be evaluated: an admitted case lost every repetition
+to infrastructure, or every case did, so the run cannot certify green and
+has no finding against the change either. That is the same code ``case``
+uses for "could not grade", and for the same reason -- could not check is
+not a pass -- and it is distinct from 1 so the shell, the artifact and the
+dashboards can say "rerun when the environment is healthy" instead of
+"debug the change". ``suite`` also exits 1 on what it cannot read -- a case
+result the loop never wrote, a store that will not parse -- because those
+are the job's failures, not the environment's, and must not read as weather.
 ``record`` exits 0 unless it was asked to write somewhere it cannot — it is
 bookkeeping, and bookkeeping must never be the reason a merge to main reds.
 """
@@ -43,6 +52,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -68,6 +78,9 @@ from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     DEFAULT_JUDGED_METRICS,
     MISSING,
+    SUITE_OUTCOME_GREEN,
+    SUITE_OUTCOME_NOT_EVALUATED,
+    SUITE_OUTCOME_RED,
     Rung,
     grade_case,
     grade_suite,
@@ -77,6 +90,19 @@ from kube_agents_bench.scoring import (
 __all__ = ["main"]
 
 _DEFAULT_BASELINE_DIR = "baselines"
+
+#: What ``suite`` exits when the run could not be evaluated (see the module
+#: docstring's EXIT CODES): the code ``case`` uses for "could not grade",
+#: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
+#: verdict. 0 green and 1 red are the literals they have always been.
+SUITE_EXIT_NOT_EVALUATED = 2
+
+#: The verdict headline per outcome, the first thing the markdown says.
+SUITE_HEADLINES = {
+    SUITE_OUTCOME_GREEN: "GREEN",
+    SUITE_OUTCOME_RED: "RED",
+    SUITE_OUTCOME_NOT_EVALUATED: "NOT EVALUATED",
+}
 
 #: Set to one of these (case-insensitive) and the suite aggregate may red the
 #: job. Unset, the aggregate rule still runs and is still reported -- it just
@@ -105,6 +131,19 @@ ADMISSION_CELL_UNKNOWN = "--"
 RECORD_COLUMN = "Record says"
 #: A hand-off that predates `record_verdict`.
 RECORD_CELL_UNKNOWN = "--"
+
+# How much of the agent's final report the build log quotes per failing
+# repetition. The dashboard's Brief shows it as "what the agent saw" beside
+# the grader's reason; the collector (scripts/eval_dashboard/collect.py)
+# caps at the same figure, so the two never disagree about the cut.
+REPORT_EXCERPT_MAX_CHARS = 300
+
+# What must not reach the log line: C0 and C1 controls and DEL (a captured
+# kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
+# which a JSON `\ud8xx` escape in results.json turns into a str that print()
+# cannot encode -- and an exception there would end `bench-gate case` before
+# its hand-off is written.
+_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -238,6 +277,22 @@ def _label(case: dict[str, Any]) -> str:
     return "UNSTABLE"
 
 
+def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
+    """The agent's final report as one build-log line, or "" when it said nothing.
+
+    Control characters and lone surrogates become spaces and whitespace is
+    collapsed to single spaces, so the line is one printable line whatever
+    the report held; ``<`` is dropped, so a report can neither forge the
+    log's ``<<< finished`` marker nor open a tag in anything that renders
+    the log as HTML; anything past ``limit`` is cut, with an ellipsis in the
+    last position to say so.
+    """
+    flat = " ".join(_UNPRINTABLE.sub(" ", str(text or "")).replace("<", "").split())
+    if len(flat) > limit:
+        return flat[: limit - 1].rstrip() + "…"
+    return flat
+
+
 def _cmd_case(args: argparse.Namespace) -> int:
     try:
         spec = load_case(args.task)
@@ -352,6 +407,15 @@ def _cmd_case(args: argparse.Namespace) -> int:
     for rep in verdict.reps:
         judged = " ".join(f"{k}={v}" for k, v in sorted(rep.judged.items()))
         print(f"  rep {rep.index}: {rep.outcome} -- {rep.reason}" + (f" [{judged}]" if judged else ""))
+        # The agent's own words, one line under the grading line of every
+        # repetition that did not pass, so the dashboard can quote the report
+        # beside the check that failed. A pass needs no quote; an empty
+        # report (a transport failure's, typically) prints nothing rather
+        # than an empty line. Its own shape -- `rep N report:` -- so nothing
+        # that greps for `rep N:` matches it.
+        excerpt = _report_excerpt(rep.report) if rep.outcome != "pass" else ""
+        if excerpt:
+            print(f"  rep {rep.index} report: {excerpt}")
     print(f"  admission: {admission_reason}")
     # stderr, not stdout: this is the one line that says the judged rung is
     # quieter than the configuration claims, and it must survive a reader who
@@ -386,12 +450,26 @@ def _record_says(case: dict[str, Any]) -> str:
 def _markdown(
     verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
 ) -> str:
+    not_evaluated = verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
     lines = [
         "## Evaluation verdict",
         "",
-        f"**{'GREEN' if verdict.green else 'RED'}**",
+        f"**{SUITE_HEADLINES[verdict.outcome]}**",
         "",
     ]
+    if not_evaluated:
+        # The banner says what to do, because the headline alone invites the
+        # wrong action: a pull request author who sees a red job debugs the
+        # change, and there is nothing in this run about the change to debug.
+        named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
+        lines += [
+            "> **NOT EVALUATED — rerun when the environment is healthy.** "
+            f"{named}: every repetition was excluded as infrastructure, so this "
+            "run evaluated nothing about the case and cannot certify green. "
+            "This is not a finding against the change under test: do not debug "
+            "the change for it; rerun once the eval environment is healthy.",
+            "",
+        ]
     if verdict.pass_rate is not None:
         rate = f"{verdict.pass_rate:.1%}"
         if verdict.baseline_rate is not None:
@@ -402,7 +480,8 @@ def _markdown(
     for note in getattr(verdict, "notes", None) or []:
         lines += [f"_{note}_", ""]
     if verdict.reasons:
-        lines += ["### Why it is red", ""]
+        heading = "Why it cannot report green" if not_evaluated else "Why it is red"
+        lines += [f"### {heading}", ""]
         lines += [f"- {r}" for r in verdict.reasons]
         lines += [""]
     extra_header = f" {ADMISSION_COLUMN} | {RECORD_COLUMN} |" if admission_column else ""
@@ -579,6 +658,8 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(verdict.to_dict(), indent=2) + "\n", encoding="utf-8")
 
+    if verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED:
+        return SUITE_EXIT_NOT_EVALUATED
     return 0 if verdict.green else 1
 
 

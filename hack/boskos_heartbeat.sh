@@ -18,6 +18,8 @@
 # Usage (backgrounded, killed by the caller's EXIT trap):
 #   ./hack/boskos_heartbeat.sh & HEARTBEAT_PID=$!
 #   trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true' EXIT
+# If the caller dies without running that trap, the daemon notices at its
+# next beat and stops itself (see the loop), so it cannot outlive the job.
 #
 # Disabled (single notice, exit 0) unless BOSKOS_HOST, BOSKOS_RESOURCE_NAME,
 # and BOSKOS_OWNER_NAME are all set. Pool resource names are DNS-safe, so
@@ -46,20 +48,57 @@ UPDATE_URL="${BOSKOS_HOST}/update?name=${BOSKOS_RESOURCE_NAME}&owner=${BOSKOS_OW
 
 beats_sent=0
 beats_failed=0
+# Beats Boskos answered 401: ranch's OwnerNotMatch, i.e. the lease is no
+# longer this job's. Counted apart from other failures because it is the one
+# outcome the stop summary must shout about (see summary below).
+beats_401=0
 # "" until the first beat resolves, then ok|fail; transitions are the only
 # per-beat events worth a line on the job log.
 last_status=""
 
 summary() {
+  # One loud line when the lease was lost under this daemon. The Prow
+  # wrapper's release that follows will get the same 401 and its `|| true`
+  # swallows it, so this is the end-of-run signal that the project was not
+  # handed back: the first full nightly (build 2100374258805903360,
+  # 2026-09-17) lost kube-agents-evals-6 that way when the wrapper's
+  # boskosctl heartbeat hit its default 5h --timeout (#1491).
+  if [ "${beats_401}" -gt 0 ]; then
+    echo "${LOG_PREFIX} WARNING: lease on ${BOSKOS_RESOURCE_NAME} is lost (Boskos answered 401 owner-mismatch on ${beats_401} of ${beats_sent} beats); the release will fail the same way and ${BOSKOS_RESOURCE_NAME} stays leased until Boskos's reaper frees it"
+  fi
   echo "${LOG_PREFIX} stopping for ${BOSKOS_RESOURCE_NAME}: ${beats_sent} beats sent, ${beats_failed} failed (detail: ${BOSKOS_HEARTBEAT_LOG})"
   exit 0
 }
 trap summary TERM INT
 
+# True while the process that started this daemon still exists. Compares the
+# kernel's current parent pid with $PPID (fixed at startup): the kernel
+# reparents a child the moment its parent dies, before anyone reaps it, so
+# this also catches a caller that sits as a zombie -- where `kill -0 $PPID`
+# would still say alive. Reads /proc where it exists (the Prow image) and
+# falls back to ps elsewhere; if neither answers, the caller is assumed
+# alive, so a missing tool can only keep the lease beating, never drop it.
+caller_alive() {
+  local parent_now=""
+  if [ -r "/proc/$$/status" ]; then
+    parent_now="$(awk '/^PPid:/ { print $2 }' "/proc/$$/status" 2>/dev/null)"
+  else
+    parent_now="$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')"
+  fi
+  [ -z "${parent_now}" ] || [ "${parent_now}" = "${PPID}" ]
+}
+
 mkdir -p "$(dirname "${BOSKOS_HEARTBEAT_LOG}")" 2>/dev/null || true
 echo "${LOG_PREFIX} started for ${BOSKOS_RESOURCE_NAME} (owner ${BOSKOS_OWNER_NAME}, every ${BOSKOS_HEARTBEAT_INTERVAL_SECONDS}s, detail: ${BOSKOS_HEARTBEAT_LOG})"
 
 while true; do
+  # The caller's EXIT trap is the normal stop. If the caller died without
+  # running it (SIGKILL), stop anyway: this process inherits the job's log
+  # pipe, and Prow's entrypoint waits in command.Wait() for every holder of
+  # that pipe to exit, so an orphan that never exits holds the job open
+  # until the decoration timeout and turns a finished run into a "timed
+  # out" one.
+  caller_alive || summary
   # curl -w emits a code even on failure ("000", or "200000" when the
   # connection dies after headers), so normalise to the LAST three digits
   # rather than appending a fallback that doubles it up.
@@ -73,6 +112,7 @@ while true; do
   else
     status="fail"
     beats_failed=$((beats_failed + 1))
+    [ "${http_code}" = "401" ] && beats_401=$((beats_401 + 1))
   fi
   echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ${status} http=${http_code}" >>"${BOSKOS_HEARTBEAT_LOG}"
   if [ "${status}" != "${last_status}" ]; then

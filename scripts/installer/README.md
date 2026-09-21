@@ -27,6 +27,7 @@ their own copies:
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
 | `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `litellm.yaml` mirrors them     |
+| `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
 | `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
 | `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
@@ -203,8 +204,12 @@ requires Workload Identity (`GKE_METADATA`).
 
 `ENABLE_NETWORK_POLICY=true` (or `--enable-network-policy`) authorizes enabling the legacy Calico
 NetworkPolicy addon and enforcement on pre-existing GKE Standard clusters lacking Dataplane V2.
-Enabling Calico may recreate nodes and restart workloads. Without opt-in, the install aborts before
-making any cluster changes because kube-agents requires NetworkPolicy enforcement.
+Enabling Calico may recreate nodes and restart workloads. `ACCEPT_NO_NETWORK_POLICY=true` (or
+`--accept-no-network-policy`) is the other answer: install without enforcement and leave the cluster
+as it is. The generator emits it as `accept_no_network_policy` in `terraform.tfvars`, which is what
+gets the plan past the gke-cluster module's postcondition, so the key has to stay in `install.env`
+for `upgrade.sh` and the Day-2 menu to regenerate an applicable file. Without either, the install
+aborts before making any cluster changes.
 
 `ALLOW_UNENCRYPTED_SECRETS=true` skips the out-of-band Cloud KMS CMEK database encryption on
 pre-existing clusters (testing environments only).

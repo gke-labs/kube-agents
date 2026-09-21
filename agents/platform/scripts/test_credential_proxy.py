@@ -1,4 +1,7 @@
+import argparse
 import base64
+import contextlib
+import http.client
 import io
 import json
 import logging
@@ -7,6 +10,7 @@ import queue
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -252,8 +256,17 @@ class AgentAPIProxyTest(unittest.TestCase):
                 ("127.0.0.1", self.proxy.server_port),
                 timeout=_STALLED_CLIENT_READ_TIMEOUT_SECONDS,
             ) as client:
-                client.sendall(request)
+                # The clock starts before the request leaves, not after. The
+                # server's drain window opens once it has read the partial body,
+                # and that can happen before sendall returns to this thread: the
+                # bytes reach the kernel inside sendall, and the server thread can
+                # wake, parse, and block in its timed read first. A clock started
+                # here precedes the bytes leaving this socket, so elapsed brackets
+                # whatever window the server enforced. Started after sendall it
+                # could sit inside that window, and a loaded runner read 0.2495
+                # against the 0.25 deadline (#1740).
                 started = time.monotonic()
+                client.sendall(request)
                 status = self._read_status_line(client)
                 elapsed = time.monotonic() - started
         self.assertIn(b"401", status)
@@ -1099,6 +1112,95 @@ class GitHardeningTest(unittest.TestCase):
             git_argument_violation(["git", "push", "-f", "origin", "audit"])
         )
 
+    def test_git_push_to_protected_or_base_branch_is_refused(self):
+        for argv in (
+            ["git", "push", "origin", "main"],
+            ["git", "push", "origin", "master"],
+            ["git", "push", "origin", "production"],
+            ["git", "push", "origin", "refs/heads/main"],
+            ["git", "push", "origin", "heads/main"],
+            ["git", "push", "origin", "HEAD:main"],
+            ["git", "push", "origin", "HEAD:refs/heads/master"],
+            ["git", "push", "origin", "HEAD:heads/main"],
+            ["git", "push", "--force-with-lease", "origin", "main"],
+            ["git", "--attr-source", "HEAD", "push", "origin", "main"],
+            ["git", "--attr-source", "commit", "push", "origin", "main"],
+            # Refspec-less pushes
+            ["git", "push"],
+            ["git", "push", "origin"],
+            # Global option desync protection: -C push push origin (#1498)
+            ["git", "-C", "push", "push", "origin"],
+            # --repo option variants (#1498)
+            ["git", "push", "--repo", "x", "origin"],
+            ["git", "push", "--repo=x", "origin"],
+            ["git", "push", "--repo", "origin"],
+            ["git", "push", "--repo", "x", "origin", "main"],
+            # Bulk and pattern pushes
+            ["git", "push", "--all", "origin"],
+            ["git", "push", "--mirror", "origin"],
+            ["git", "push", "origin", ":"],
+            ["git", "push", "origin", "refs/heads/*:refs/heads/*"],
+            # End-of-options '--' delimiter before protected refspecs (#1498)
+            ["git", "push", "origin", "--", "HEAD:main", "platform-agent/y"],
+            ["git", "push", "origin", "--", "HEAD:main"],
+            ["git", "push", "origin", "--", "main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+        # Run branch pushes are refused unconditionally without needing env overrides (#1498)
+        self.assertIsNotNone(
+            git_argument_violation(["git", "push", "origin", "run/test-cluster/fix-task"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "push", "origin", "HEAD:run/test-cluster/fix-task"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "HEAD", "push", "origin", "run/test-cluster/fix-task"])
+        )
+
+        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release-branch-override"}):
+            self.assertIsNotNone(
+                git_argument_violation(["git", "push", "origin", "release-branch-override"])
+            )
+            self.assertIsNotNone(
+                git_argument_violation(["git", "push", "origin", "HEAD:release-branch-override"])
+            )
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
+            self.assertIsNotNone(
+                git_argument_violation(["git", "push", "origin", "custom-broker-base"])
+            )
+
+        # Bare HEAD pushes without destination branch are refused
+        self.assertIsNotNone(git_argument_violation(["git", "push", "origin", "HEAD"]))
+        self.assertIsNotNone(git_argument_violation(["git", "push", "origin", "@"]))
+
+        # Legitimate feature branch pushes are allowed
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "origin", "platform-agent/my-fix"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "origin", "HEAD:platform-agent/my-fix"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "-C", "push", "push", "origin", "HEAD:platform-agent/my-fix"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "--force-with-lease", "origin", "HEAD:platform-agent/my-fix"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "origin", "--", "HEAD:platform-agent/my-fix"])
+        )
+
+        # Positional pathspecs named 'push' after '--' are not treated as push subcommands
+        self.assertIsNone(
+            git_argument_violation(["git", "checkout", "--", "push"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "blame", "--", "push"])
+        )
+
     def test_a_subcommand_that_runs_a_command_is_refused(self):
         # `git bisect run <cmd>` executes <cmd> in the credential container.
         # Demonstrated through the proxy from inside a valid lease, in two
@@ -1232,7 +1334,7 @@ class GitHardeningTest(unittest.TestCase):
         # Scanning every token cannot disagree with git about where the
         # subcommand is.
         self.assertEqual(
-            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "HEAD"
+            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "help"
         )
         self.assertIsNotNone(
             git_argument_violation(["git", "--attr-source", "HEAD", "help", "-m", "git"])
@@ -1299,6 +1401,394 @@ class GitHardeningTest(unittest.TestCase):
         self.assertIsNone(
             git_argument_violation(["git", "config", "--get", "remote.origin.url"])
         )
+
+    def test_alias_configuration_and_repo_local_execution_are_refused(self):
+        # Configuring aliases via git config is refused by git_argument_violation (#1498).
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.p", "push origin main"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.co", "checkout"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--add", "alias.st", "status"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "include.path", "/opt/data/scratch/aliases"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--add", "include.path", "more.cfg"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "includeIf.gitdir:foo.path", "more.cfg"])
+        )
+
+        # In a repository with repo-local aliases in .git/config, executing an alias that
+        # resolves to a push to a protected or run branch is refused by git_lease_violation (#1498).
+        executor = self.executor()
+        repo = self.repository(executor)
+        self.append_repository_config(
+            repo,
+            "\n[alias]\n\tp-main = push origin main\n\tp-run = push origin HEAD:refs/heads/run/test/task\n\tp-feature = push origin HEAD:platform-agent/valid\n\tshell-push = !sh -c 'git push origin HEAD:refs/heads/main'\n\tbad-bisect = bisect run /payload.sh\n",
+        )
+        # Aliases resolving to protected/run pushes are refused even without a lease
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "p-main"], cwd=str(repo))
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "p-run"], cwd=str(repo))
+        )
+        # Shell aliases with ! are refused (Thread 1)
+        v = executor.git_lease_violation(["git", "shell-push"], cwd=str(repo))
+        self.assertIsNotNone(v)
+        self.assertIn("shell aliases cannot be executed", v or "")
+
+        # Alias expanding to refused subcommand (bisect run) is refused (Thread 1)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "bad-bisect"], cwd=str(repo))
+        )
+
+        # Alias checks run even when require_git_lease is False (Thread 9)
+        executor.require_git_lease = False
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "p-main"], cwd=str(repo))
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "shell-push"], cwd=str(repo))
+        )
+        executor.require_git_lease = True
+
+        # Capitalized [Alias] header, duplicate keys, and % in value (Thread 5)
+        repo2 = self.repository(executor)
+        self.append_repository_config(
+            repo2,
+            "\n[Alias]\n\tcap-p = push origin main\n\tremote.origin.fetch = +refs/heads/*:refs/remotes/origin/*\n\tremote.origin.fetch = +refs/pull/*:refs/remotes/pull/*\n\tpercent = log --format=%H\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "cap-p"], cwd=str(repo2))
+        )
+
+        # include.path is followed and aliases inside it are checked (Thread 6)
+        inc_file = repo2 / "extra.inc"
+        inc_file.write_text("[alias]\n\tinc-p = push origin main\n", encoding="utf-8")
+        self.append_repository_config(
+            repo2,
+            f"\n[include]\n\tpath = {inc_file}\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "inc-p"], cwd=str(repo2))
+        )
+
+        # Bare 'push' token before '--' in non-subcommand position is NOT refused as push (Thread 2)
+        self.assertIsNone(
+            credential_proxy.git_push_violation(["git", "stash", "push", "-m", "wip"])
+        )
+        self.assertIsNone(
+            credential_proxy.git_push_violation(["git", "commit", "-m", "push"])
+        )
+        self.assertIsNone(
+            credential_proxy.git_push_violation(["git", "checkout", "-b", "push"])
+        )
+
+        # --attr-source push push origin is refused as refspec-less push (Thread 8)
+        v_attr = credential_proxy.git_push_violation(["git", "--attr-source", "push", "push", "origin"])
+        self.assertIsNotNone(v_attr)
+        self.assertIn("explicit destination refspec", v_attr or "")
+
+        # An alias resolving to a mutating push to a valid feature branch requires a lease
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "p-feature"], cwd=str(repo))
+        )
+        # With lease established, the valid feature branch alias is permitted
+        leased_dir = self.leased(executor)
+        subprocess.run(["git", "init", "--quiet"], cwd=leased_dir, check=True, capture_output=True)
+        self.append_repository_config(
+            leased_dir,
+            "\n[alias]\n\tp-feature = push origin HEAD:platform-agent/valid\n",
+        )
+        self.assertIsNone(
+            executor.git_lease_violation(["git", "p-feature"], cwd=str(leased_dir))
+        )
+
+        # Recursive alias resolution (Thread 3)
+        self.append_repository_config(
+            repo,
+            "\n[alias]\n\trec-a = rec-b\n\trec-b = push origin main\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "rec-a"], cwd=str(repo))
+        )
+
+        # Builtin subcommands cannot be shadowed by alias (Thread 4)
+        self.append_repository_config(
+            repo,
+            "\n[alias]\n\tpush = status\n",
+        )
+        # Real push outside lease is still mutating and requires a lease (not shadowed to status)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:platform-agent/valid"], cwd=str(repo))
+        )
+
+        # Config parsing edge cases (Thread 7): comments, inline keys, continuations, quotes
+        self.append_repository_config(
+            repo,
+            "\n[alias] ; comment\n\tp-comment = push origin main\n[alias]p-inline = push origin main\n\tp-cont = push \\\n  origin main\n\tp-quote = pu\"sh origin\" main\n",
+        )
+        for alias_name in ("p-comment", "p-inline", "p-cont", "p-quote"):
+            with self.subTest(alias=alias_name):
+                self.assertIsNotNone(
+                    executor.git_lease_violation(["git", alias_name], cwd=str(repo))
+                )
+
+        # --shallow-file and --attr-source in _git_plan (Thread 2 & Thread 6)
+        sub_shallow, _ = credential_proxy._git_plan(["git", "--shallow-file", "x", "push", "origin", "main"])
+        self.assertEqual("push", sub_shallow)
+        sub_attr, _ = credential_proxy._git_plan(["git", "--attr-source", "HEAD", "push", "origin", "main"])
+        self.assertEqual("push", sub_attr)
+        self.assertIsNotNone(
+            credential_proxy.git_argument_violation(["git", "--shallow-file", "/tmp/shallow", "status"])
+        )
+
+        # Directory mode remote default branch protection (Thread 9)
+        repo_trunk = self.repository(executor, name="repo_trunk")
+        remotes_dir = repo_trunk / ".git" / "refs" / "remotes" / "origin"
+        remotes_dir.mkdir(parents=True, exist_ok=True)
+        (remotes_dir / "HEAD").write_text("ref: refs/remotes/origin/release-trunk\n", encoding="utf-8")
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(repo_trunk))
+        )
+
+        # Colliding -C value and alias name (Thread 1)
+        sub_dir = repo / "myalias"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        self.append_repository_config(
+            repo,
+            "\n[alias]\n\tmyalias = push\n",
+        )
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "-C", "myalias", "myalias", "origin", "main"], cwd=str(repo))
+        )
+
+        # 11-deep alias chain fails closed (Thread 4)
+        alias_chain = "\n[alias]\n"
+        for i in range(1, 11):
+            alias_chain += f"\ta{i} = a{i+1}\n"
+        alias_chain += "\ta11 = push origin main\n"
+        self.append_repository_config(repo, alias_chain)
+        v_depth = executor.git_lease_violation(["git", "a1"], cwd=str(repo))
+        self.assertIsNotNone(v_depth)
+        self.assertIn("exceeding depth", v_depth or "")
+
+        # Directory mode remote default branch protection via ref inspection (#1498)
+        bare_remote = Path(self.temp_dir.name) / "bare_remote.git"
+        subprocess.run(["git", "init", "--bare", "-b", "release-trunk", str(bare_remote)], check=True, capture_output=True)
+        seed_work = Path(self.temp_dir.name) / "seed_work"
+        subprocess.run(["git", "clone", str(bare_remote), str(seed_work)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(seed_work), "config", "user.name", "Test User"], check=True)
+        subprocess.run(["git", "-C", str(seed_work), "config", "user.email", "test@example.com"], check=True)
+        (seed_work / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(seed_work), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(seed_work), "commit", "-m", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(seed_work), "push", "origin", "release-trunk"], check=True, capture_output=True)
+
+        clone_dir = Path(executor.workspace_dir) / "clone_trunk"
+        subprocess.run(["git", "clone", str(bare_remote), str(clone_dir)], check=True, capture_output=True)
+        # Push to release-trunk is detected and refused as a protected rollout/base branch even without lease checks
+        executor.require_git_lease = False
+        v = executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
+        self.assertIsNotNone(v)
+        self.assertIn("to protected branch 'release-trunk' is refused", v or "")
+
+        # Pushing to platform-agent/* feature branch is allowed
+        self.assertIsNone(
+            executor.git_lease_violation(["git", "push", "origin", "HEAD:platform-agent/fix-bug"], cwd=str(clone_dir))
+        )
+        executor.require_git_lease = True
+
+        # Content workspace store honours base_branch argument (#1498, Thread 5)
+        import content_workspace
+        store_flag = content_workspace.ContentWorkspaceStore(
+            Path(self.temp_dir.name) / "trees_flag",
+            Path(self.temp_dir.name) / "agent_flag",
+            executor.execute_workspace_git,
+            base_branch="custom-cli-base",
+        )
+        h = "a" * 32
+        store_flag._workspaces[h] = content_workspace.Workspace(h, "acme/repo", Path(self.temp_dir.name), "main", "sha", shallow=False)
+        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx:
+            store_flag.commit(h, "custom-cli-base", "msg", [])
+        self.assertIn("custom-cli-base", str(ctx.exception))
+        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx:
+            store_flag.push(h, "custom-cli-base")
+        self.assertIn("custom-cli-base", str(ctx.exception))
+
+        # Checked alias expansion is returned by resolve_git_command and executed directly (Thread 8)
+        repo_alias = self.repository(executor, name="repo_alias")
+        self.append_repository_config(
+            repo_alias,
+            "\n[alias]\n\tstatus-alias = status --short\n\tbroken-chain = undefined-target\n",
+        )
+        violation, exec_argv = executor.resolve_git_command(["git", "status-alias"], cwd=str(repo_alias))
+        self.assertIsNone(violation)
+        self.assertEqual(["git", "status", "--short"], exec_argv)
+
+        # Alias chain ending in an undefined target is refused as an undefined alias (#1498)
+        violation, _ = executor.resolve_git_command(["git", "broken-chain"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("undefined alias target (undefined_alias)", violation or "")
+
+        # Recognized builtins that are not aliases are permitted and execute directly (#1498)
+        violation, exec_argv = executor.resolve_git_command(["git", "gc"], cwd=str(repo_alias))
+        self.assertIsNone(violation)
+        self.assertEqual(["git", "gc"], exec_argv)
+
+        # Unknown subcommands that are not recognized git builtins or defined aliases fail closed (#1498)
+        violation, _ = executor.resolve_git_command(["git", "zz-unknown"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("not a recognized git subcommand or alias", violation or "")
+
+        # Abbreviated push options like --rep consume separate values and refuse refspec-less pushes (#1498)
+        v_rep = executor.git_lease_violation(["git", "push", "--rep", "custom_remote", "origin"], cwd=str(repo_alias))
+        self.assertIsNotNone(v_rep)
+        self.assertIn("without an explicit destination refspec is refused", v_rep or "")
+
+        # Pushes from a subdirectory with -C .. redirect resolve cwd correctly without double redirect (#1498)
+        sub_dir = clone_dir / "subdir"
+        sub_dir.mkdir()
+        executor.require_git_lease = False
+        v_sub = executor.git_lease_violation(["git", "-C", "..", "push", "origin", "HEAD:release-trunk"], cwd=str(sub_dir))
+        self.assertIsNotNone(v_sub)
+        self.assertIn("to protected branch 'release-trunk' is refused", v_sub or "")
+        executor.require_git_lease = True
+
+        # Alias expansion whose head is a case-variant of a builtin canonicalizes to lowercase
+        # and undergoes push violation and lease checks (#1498, Thread 13)
+        self.append_repository_config(
+            repo_alias,
+            "\n[alias]\n\tp = Push origin HEAD:main\n\tpush = push\n",
+        )
+        violation, _ = executor.resolve_git_command(["git", "p"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("to protected branch 'main' is refused", violation or "")
+
+        # Direct uppercase variant is rejected as not a recognized git subcommand (#1498)
+        violation, _ = executor.resolve_git_command(["git", "Push", "origin", "HEAD:main"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("not a recognized git subcommand or alias", violation or "")
+
+        # lfs is not a git builtin and falls back to alias inspection (#1498, Thread 14)
+        self.append_repository_config(
+            repo_alias,
+            "\n[alias]\n\tlfs = push origin HEAD:main\n",
+        )
+        violation, _ = executor.resolve_git_command(["git", "lfs"], cwd=str(repo_alias))
+        self.assertIsNotNone(violation)
+        self.assertIn("to protected branch 'main' is refused", violation or "")
+
+        # Unaliased non-builtin lfs fails closed as unrecognized subcommand
+        repo_no_lfs = self.repository(executor, name="repo_no_lfs")
+        violation, _ = executor.resolve_git_command(["git", "lfs"], cwd=str(repo_no_lfs))
+        self.assertIsNotNone(violation)
+        self.assertIn("not a recognized git subcommand or alias", violation or "")
+
+        # Bounded file reads: oversized refs/remotes/<remote>/HEAD or .git files are skipped (#1498, Thread 15)
+        oversized_head = repo_alias / ".git" / "refs" / "remotes" / "origin" / "HEAD"
+        oversized_head.parent.mkdir(parents=True, exist_ok=True)
+        oversized_head.write_text("ref: refs/remotes/origin/main\n" + "x" * 8192, encoding="utf-8")
+        from credential_proxy import _detect_repo_default_branch, _find_repo_root
+        self.assertIsNone(_detect_repo_default_branch(repo_alias, "origin"))
+
+        # Valid small HEAD ref is detected
+        oversized_head.write_text("ref: refs/remotes/origin/release-trunk\n", encoding="utf-8")
+        self.assertEqual(_detect_repo_default_branch(repo_alias, "origin"), "release-trunk")
+
+        # Oversized .git file is skipped by _find_repo_root
+        fake_sub = repo_alias / "subproject"
+        fake_sub.mkdir()
+        fake_git = fake_sub / ".git"
+        fake_git.write_text("gitdir: ../.git\n" + "y" * 8192, encoding="utf-8")
+        self.assertEqual(_find_repo_root(fake_sub), repo_alias)
+
+    def test_the_push_remote_cannot_name_a_head_file_outside_refs_remotes(self):
+        # CodeQL alert #38, py/path-injection. The `<repository>` argument of
+        # `git push` went into `refs/remotes/<repository>/HEAD` unchecked, so
+        # a path in that slot read a file of the agent's choosing and the gate
+        # took whatever branch it named as the remote's default. Verified on
+        # the pre-fix module with the files below planted: each of the five
+        # traversals lands on one of them, and each turned `HEAD:feature` into
+        # a refused push.
+        from credential_proxy import (
+            _detect_repo_default_branch,
+            _is_git_remote_name,
+            _remote_head_path,
+            git_push_violation,
+        )
+
+        executor = self.executor()
+        repo = self.repository(executor)
+        remotes = repo / ".git" / "refs" / "remotes"
+        for name, head in (("origin", "release-trunk"), ("upstream", "trunk")):
+            (remotes / name).mkdir(parents=True)
+            (remotes / name / "HEAD").write_text(
+                f"ref: refs/remotes/{name}/{head}\n", encoding="utf-8"
+            )
+        outside = Path(self.temp_dir.name) / "planted"
+        for planted in (
+            outside / "HEAD",  # `../../../../planted` and the absolute path
+            repo / ".git" / "refs" / "HEAD",  # `..`
+            repo / ".git" / "refs" / "planted" / "HEAD",  # `origin/../../planted`, `team/../../planted`
+        ):
+            planted.parent.mkdir(parents=True, exist_ok=True)
+            planted.write_text("ref: refs/heads/feature\n", encoding="utf-8")
+
+        traversal = os.path.relpath(outside, remotes)
+        for remote in (traversal, str(outside), "..", "origin/../../planted", "team/../../planted"):
+            with self.subTest(remote=remote):
+                self.assertIsNone(_remote_head_path(remotes, remote))
+                # Not looked up, so origin decides -- not the planted file.
+                self.assertEqual(_detect_repo_default_branch(repo, remote), "release-trunk")
+                self.assertIsNone(
+                    git_push_violation(["git", "push", remote, "HEAD:feature"], cwd=repo)
+                )
+
+        # A remote name still reads its own tracking HEAD, origin included.
+        self.assertEqual(_remote_head_path(remotes, "upstream"), remotes / "upstream" / "HEAD")
+        self.assertEqual(_detect_repo_default_branch(repo, "upstream"), "trunk")
+        self.assertIn(
+            "protected branch 'trunk'",
+            git_push_violation(["git", "push", "upstream", "HEAD:trunk"], cwd=repo) or "",
+        )
+        self.assertIn(
+            "protected branch 'release-trunk'",
+            git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=repo) or "",
+        )
+        # A URL in the repository slot has no tracking HEAD and is judged
+        # against origin, as it was before.
+        self.assertIn(
+            "protected branch 'release-trunk'",
+            git_push_violation(
+                ["git", "push", "https://example.invalid/acme/fleet.git", "HEAD:release-trunk"],
+                cwd=repo,
+            )
+            or "",
+        )
+
+        # The pre-check is thin on purpose -- containment is the sink's job --
+        # so every name git accepts is still looked up, slash-named remotes and
+        # the ones an ASCII allowlist would have dropped included.
+        for accepted in ("origin", "upstream", "my-fork_2", "fork.v2", "gh+fork", "my@fork", "fôrk", "team/upstream"):
+            self.assertTrue(_is_git_remote_name(accepted), accepted)
+        for refused in ("", ".", "..", "a\\b", "a\0b"):
+            self.assertFalse(_is_git_remote_name(refused), repr(refused))
+        # And those names keep their protection: each resolves its own HEAD.
+        for name, head in (("gh+fork", "plus-trunk"), ("team/upstream", "team-trunk")):
+            (remotes / name).mkdir(parents=True)
+            (remotes / name / "HEAD").write_text(f"ref: refs/remotes/{name}/{head}\n", encoding="utf-8")
+            self.assertEqual(_remote_head_path(remotes, name), remotes / name / "HEAD")
+            self.assertIn(
+                f"protected branch '{head}'",
+                git_push_violation(["git", "push", name, f"HEAD:{head}"], cwd=repo) or "",
+            )
 
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
         # `_execute` refuses a cwd outside the shared workspace and the lease
@@ -1545,6 +2035,34 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         # gate let it through rather than answering 403 itself.
         self.assertEqual(200, status)
         self.assertEqual("completed", body["status"])
+
+    def test_an_alias_in_leased_repo_is_expanded_and_executed_over_v1_exec(self):
+        workspace = (
+            CredentialProxyHandler.executor.workspace_dir / "gitops" / "t_card"
+        )
+        repo_dir = workspace / "acme__fleet"
+        subprocess.run(["git", "init", "--quiet", str(repo_dir)], check=True)
+        subprocess.run(["git", "-C", str(repo_dir), "config", "alias.status-short", "status --porcelain"], check=True)
+        (workspace / ".lease").write_text('{"lease": "t_card"}', encoding="utf-8")
+
+        executed_argvs = []
+        original_execute = CredentialProxyHandler.executor.execute
+
+        def recording_execute(argv, **kwargs):
+            executed_argvs.append(argv)
+            return original_execute(argv, **kwargs)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", side_effect=recording_execute):
+            status, body = self.post(
+                {
+                    "argv": ["git", "status-short"],
+                    "cwd": str(repo_dir),
+                }
+            )
+        self.assertEqual(200, status)
+        self.assertEqual("completed", body["status"])
+        self.assertTrue(len(executed_argvs) > 0)
+        self.assertEqual(["git", "status", "--porcelain"], executed_argvs[0])
 
 
 class CommandExecutorTest(unittest.TestCase):
@@ -3216,6 +3734,72 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
     def test_serve_leaves_the_gate_armed_on_a_typo(self):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with("banana"))
+
+    def test_serve_wires_base_branch_and_refuses_push_with_env_cleared(self):
+        # Wires --base-branch CLI argument into CredentialProxyHandler.base_branch
+        # and CredentialProxyHandler.vcs.base_branch, and verifies git_push_violation
+        # enforces the configured base branch even with environment variables clear (#1498).
+        args = argparse.Namespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=str(Path(self.tmp.name) / "backend.sock"),
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+            role="full",
+            base_branch="release/custom-base",
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+        }
+        bound = []
+
+        class FakeServer:
+            def __init__(self, *a, **k):
+                bound.append(self)
+
+            def serve_forever(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        class FakeThread:
+            def __init__(self, target, daemon=True):
+                pass
+
+            def start(self):
+                pass
+
+        def stop(*_):
+            raise self._Stop()
+
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                with self.assertRaises(self._Stop):
+                    credential_proxy.serve(args)
+
+            self.assertEqual("release/custom-base", CredentialProxyHandler.base_branch)
+            self.assertIsNotNone(CredentialProxyHandler.vcs)
+            assert CredentialProxyHandler.vcs is not None
+            self.assertEqual("release/custom-base", CredentialProxyHandler.vcs.base_branch)
+
+            # With environment cleared, push to release/custom-base is refused via CredentialProxyHandler.base_branch
+            with mock.patch.dict(os.environ, {}, clear=True):
+                violation = git_argument_violation(["git", "push", "origin", "release/custom-base"])
+                self.assertIsNotNone(violation)
+                self.assertIn("protected branch 'release/custom-base' is refused", violation or "")
+        finally:
+            CredentialProxyHandler.base_branch = ""
+            for s in bound:
+                s.server_close()
 
 
 class ReadOnlyOverTheSocketTest(unittest.TestCase):
@@ -6379,6 +6963,1144 @@ class ChatRelaySubscriptionsTest(unittest.TestCase):
                 credential_proxy.chat_relay_subscriptions("q"),
                 ("chat-sub", "projects/p/subscriptions/chat-sub"),
             )
+
+class RepositoryRoleTest(unittest.TestCase):
+    """Which list a repository is in decides what its clone presents, and nothing else."""
+
+    def setUp(self):
+        # Both lists are cached for thirty seconds; each test here reads its own.
+        for attribute in ("_managed_repository_cache", "_context_repository_cache"):
+            patcher = mock.patch.object(credential_proxy, attribute, None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _lists(self, managed=(), context=()):
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch("gitops_workspace.get_managed_github_repos", return_value=list(managed))
+        )
+        stack.enter_context(
+            mock.patch("gitops_workspace.get_context_github_repos", return_value=list(context))
+        )
+        return stack
+
+    def test_managed_wins_context_is_second_and_neither_is_unregistered(self):
+        with self._lists(managed=["acme/gitops"], context=["acme/gitops", "acme/tf-live"]):
+            self.assertEqual("managed", credential_proxy.repository_role("acme/gitops"))
+            # Case-insensitive on both sides, as `repository_is_managed` is.
+            self.assertEqual("context", credential_proxy.repository_role("Acme/TF-Live"))
+            self.assertEqual("unregistered", credential_proxy.repository_role("someone/else"))
+
+    def test_an_unreadable_context_list_raises_rather_than_answering(self):
+        with mock.patch("gitops_workspace.get_managed_github_repos", return_value=[]):
+            with mock.patch(
+                "gitops_workspace.get_context_github_repos",
+                side_effect=RuntimeError("kubectl exited 1"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    credential_proxy.repository_role("acme/tf-live")
+
+    def test_the_write_gate_and_the_refresh_route_never_see_the_context_list(self):
+        """The property the issue asked to keep: a context repository stays unwritable.
+
+        `repository_is_managed` is the only question every write path asks,
+        and it reads `managed_repos` alone. A repository registered only under
+        `context_repos` is therefore refused by `commit`, `push`, the API
+        routes and `/v1/forge/refresh` exactly as an unregistered one is --
+        with a token for it now existing in the minter, which is why this is
+        worth a test rather than an assumption.
+        """
+        import content_workspace
+
+        with self._lists(managed=["acme/gitops"], context=["acme/tf-live"]):
+            self.assertFalse(credential_proxy.repository_is_managed("acme/tf-live"))
+            self.assertEqual("context", credential_proxy.repository_role("acme/tf-live"))
+
+            # commit / push: the workspace gate reads the repository off the handle.
+            store = mock.Mock()
+            store.get.return_value = mock.Mock(repo="acme/tf-live")
+            with self.assertRaises(content_workspace.RepositoryNotManaged):
+                credential_proxy.require_managed_workspace(store, "h")
+
+            # The API routes and the refresh route share one gate.
+            handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+            handler.replies = []
+            handler._json = lambda status, payload: handler.replies.append((status, payload))
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertFalse(handler._repository_is_permitted("acme/tf-live"))
+            status, payload = handler.replies[0]
+            self.assertEqual(HTTPStatus.FORBIDDEN, status)
+            self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
+
+            # The write token's refresh is refused before the helper runs.
+            executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+            executor.execute_internal = lambda argv: self.fail("helper was run")
+            with self.assertRaises(PermissionError):
+                executor.refresh_forge_credential("github", "acme/tf-live")
+
+            # Paired: the managed repository passes every one of them.
+            self.assertTrue(credential_proxy.repository_is_managed("acme/gitops"))
+            store.get.return_value = mock.Mock(repo="acme/gitops")
+            credential_proxy.require_managed_workspace(store, "h")
+            self.assertTrue(handler._repository_is_permitted("acme/gitops"))
+
+
+class ReadCredentialMintTest(unittest.TestCase):
+    """The read-only mint: admitted by role, spelled with the helper's flag, token never logged."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        helpers = Path(self.temp_dir.name)
+        (helpers / "github_token_refresh.py").write_text("#!/usr/bin/env python3\n")
+        patcher = mock.patch.object(credential_proxy, "FORGE_REFRESH_HELPER_DIR", str(helpers))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _result(exit_code, stdout="", stderr=""):
+        return credential_proxy.ExecutionResult(
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=5,
+            truncated=False,
+            timed_out=False,
+        )
+
+    def _executor(self, result=None):
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.calls = []
+
+        def run(argv):
+            executor.calls.append(list(argv))
+            return result
+
+        executor.execute_internal = run
+        return executor
+
+    def test_only_a_context_repository_is_minted_for(self):
+        # A managed repository has the write credential and must keep riding
+        # it; an unregistered one gets no credential of either kind. Neither
+        # reaches the helper.
+        for role in ("managed", "unregistered"):
+            with self.subTest(role=role):
+                executor = self._executor()
+                with mock.patch.object(credential_proxy, "repository_role", return_value=role):
+                    with self.assertRaises(PermissionError):
+                        executor.mint_read_credential("github", "acme/gitops")
+                self.assertEqual([], executor.calls)
+
+        # Paired: a context repository runs the helper in read-only mode and
+        # the token comes back from stdout, whitespace and all.
+        token = "ghs_" + "A" * 36
+        executor = self._executor(self._result(0, stdout=token + "\n"))
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            self.assertEqual(token, executor.mint_read_credential("github", "acme/tf-live"))
+        (argv,) = executor.calls
+        self.assertTrue(argv[0].endswith("/github_token_refresh.py"), argv)
+        self.assertEqual(["--read-only", "acme/tf-live"], argv[1:])
+
+    def test_the_flag_is_the_one_the_helper_parses(self):
+        # Two copies of one string, kept in step here because the broker
+        # cannot import the helper for it without importing its CLI side.
+        import github_token_refresh
+
+        self.assertEqual(github_token_refresh.READ_ONLY_FLAG, credential_proxy.FORGE_READ_ONLY_FLAG)
+
+    def test_a_failed_mint_logs_the_detail_redacted_and_raises_without_it(self):
+        token = "ghs_" + "B" * 36
+        executor = self._executor(
+            self._result(1, stderr=f"Minty returned error (HTTP 403): echoed {token}\n")
+        )
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                with self.assertRaises(RuntimeError) as raised:
+                    executor.mint_read_credential("github", "acme/tf-live")
+        self.assertEqual("read-only credential mint failed", str(raised.exception))
+        self.assertIn("HTTP 403", logs.output[0])
+        self.assertNotIn(token, logs.output[0])
+        self.assertIn("[REDACTED]", logs.output[0])
+
+    def test_an_empty_token_is_a_failure_not_a_credential(self):
+        executor = self._executor(self._result(0, stdout="  \n"))
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertRaises(RuntimeError):
+                executor.mint_read_credential("github", "acme/tf-live")
+
+    def test_a_provider_name_cannot_reach_out_of_the_helper_directory(self):
+        executor = self._executor()
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            for provider in ("../../bin/sh", "git hub", "", "GitHub"):
+                with self.subTest(provider=provider):
+                    with self.assertRaises(ValueError):
+                        executor.mint_read_credential(provider, "acme/tf-live")
+        self.assertEqual([], executor.calls)
+
+    def test_an_absent_helper_is_a_refusal(self):
+        executor = self._executor()
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertRaises(RuntimeError):
+                executor.mint_read_credential("gitlab", "acme/tf-live")
+        self.assertEqual([], executor.calls)
+
+
+class ReadCredentialSelectionTest(unittest.TestCase):
+    """What the store is handed per role, and how it reaches git."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def test_only_a_context_repository_gets_a_credential(self):
+        registry = providers.Registry({"mint": lambda provider, repo: "token"})
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
+        self.assertIsInstance(credential, providers.MintedReadCredential)
+        self.assertIn("repo=acme/tf-live role=context", logs.output[0])
+        for role in ("managed", "unregistered"):
+            with self.subTest(role=role):
+                with mock.patch.object(credential_proxy, "repository_role", return_value=role):
+                    with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                        credential = credential_proxy.read_credential_for(registry, "acme/x")
+                self.assertIsInstance(credential, providers.NoCredential)
+                self.assertIn(f"role={role}", logs.output[0])
+
+    def test_an_unreadable_list_means_no_credential_not_a_refusal(self):
+        # `open` has no gate by design; a ConfigMap read that failed must not
+        # take `inspect-repository` away from every public repository.
+        registry = providers.Registry({"mint": lambda provider, repo: "token"})
+        with mock.patch.object(
+            credential_proxy, "repository_role", side_effect=RuntimeError("kubectl exited 1")
+        ):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
+        self.assertIsInstance(credential, providers.NoCredential)
+        self.assertIn("role=unknown", logs.output[0])
+
+    def _executor(self):
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+            return CommandExecutor(
+                timeout_seconds=10,
+                max_output_bytes=1 << 16,
+                state_dir=str(Path(self.temp_dir.name) / "state"),
+            )
+
+    def test_the_store_the_broker_builds_mints_through_the_executor(self):
+        executor = self._executor()
+        store = credential_proxy.build_workspace_store(executor)
+        minted = []
+
+        def mint(provider, repository):
+            minted.append((provider, repository))
+            return "s3cret"
+
+        executor.mint_read_credential = mint
+        # Bound at construction: the registry was built with the executor's
+        # method, so swapping the attribute afterwards must not matter for the
+        # property under test -- rebuild to pick the stub up.
+        store = credential_proxy.build_workspace_store(executor)
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+            credential = store._credential_for("acme/tf-live")
+        credential.ensure("acme/tf-live")
+        self.assertEqual([("github", "acme/tf-live")], minted)
+        config = dict(credential.git_config("acme/tf-live"))
+        header = config["http.https://github.com/.extraheader"]
+        self.assertEqual(
+            "x-access-token:s3cret",
+            base64.b64decode(header.split()[-1]).decode("utf-8"),
+        )
+        self.assertEqual("", config["credential.helper"])
+
+    def test_the_workspace_git_path_carries_the_credential_layer_ahead_of_the_pins(self):
+        executor = self._executor()
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text("#!/bin/bash\nenv\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["git"] = str(stub)
+        tree = executor.content_workspace_root / "repo"
+        tree.mkdir(parents=True, exist_ok=True)
+
+        def environment(config=()):
+            result = executor.execute_workspace_git(
+                ["git", "rev-parse", "HEAD"], tree, config=config
+            )
+            self.assertEqual(0, result.exit_code, result.stderr)
+            self.assertFalse(result.truncated)
+            return dict(
+                line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+            )
+
+        def layer(env):
+            count = int(env["GIT_CONFIG_COUNT"])
+            return [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(count)]
+
+        credential = (
+            ("http.https://github.com/.extraheader", "AUTHORIZATION: basic eDp5"),
+            ("credential.helper", ""),
+        )
+        with_credential = layer(environment(credential))
+        self.assertEqual(list(credential), with_credential[:2])
+        self.assertEqual("core.hooksPath", with_credential[2][0])
+        self.assertEqual(
+            list(credential_proxy.GIT_FORCED_CONFIG), with_credential[3:],
+            "the forced pins must follow the credential so they still win",
+        )
+        # The token is in the environment of that one process and nowhere in
+        # its argv.
+        self.assertNotIn("eDp5", " ".join(environment(credential).get("_", "")))
+
+        # Paired: with nothing to add, the layer is exactly what it always was.
+        without = layer(environment())
+        self.assertEqual("core.hooksPath", without[0][0])
+        self.assertEqual(list(credential_proxy.GIT_FORCED_CONFIG), without[1:])
+        self.assertNotIn("http.https://github.com/.extraheader", dict(without))
+
+class ApiRelayOverTheSocketTest(unittest.TestCase):
+    """The read-only Cloud API relay, driven over a real socket.
+
+    A fake upstream stands in for monitoring.googleapis.com and records what
+    reached it, so every property the design's security review claims is
+    checked at the edge: which headers leave the broker, which query keys do
+    not, which callers are turned away, and what the audit trail says about
+    each. `GoogleApiRelay.fetch` runs for real; only the connection is pointed
+    at the fake and the token is fixed.
+    """
+
+    CALLER = "system:serviceaccount:kubeagents-system:kubeagents-platform-agent-shell"
+    ALLOWED = "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries"
+
+    def setUp(self):
+        owner = self
+        self.upstream_requests = []
+        self.reply = {"status": 200, "content_type": "application/json; charset=UTF-8",
+                      "body": b'{"timeSeries":[]}', "headers": {}, "delay": 0.0,
+                      # (pieces, seconds between them): send the body a piece at
+                      # a time, flushing each, for the deadline tests.
+                      "trickle": None,
+                      # Announce the full Content-Length, send this many bytes,
+                      # then close the connection.
+                      "truncate_to": None,
+                      # Write this exact byte string as the whole response and
+                      # close, for responses BaseHTTPRequestHandler cannot frame.
+                      "raw": None}
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # noqa: N802
+                owner.upstream_requests.append((self.path, dict(self.headers)))
+                reply = owner.reply
+                time.sleep(reply["delay"])
+                try:
+                    if reply["raw"] is not None:
+                        self.wfile.write(reply["raw"])
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return
+                    self.send_response(reply["status"])
+                    if reply["content_type"]:
+                        self.send_header("Content-Type", reply["content_type"])
+                    for name, value in reply["headers"].items():
+                        self.send_header(name, value)
+                    self.send_header("Content-Length", str(len(reply["body"])))
+                    self.end_headers()
+                    if reply["truncate_to"] is not None:
+                        self.wfile.write(reply["body"][: reply["truncate_to"]])
+                        self.wfile.flush()
+                        self.close_connection = True
+                    elif reply["trickle"] is None:
+                        self.wfile.write(reply["body"])
+                    else:
+                        pieces, gap = reply["trickle"]
+                        for piece in pieces:
+                            self.wfile.write(piece)
+                            self.wfile.flush()
+                            time.sleep(gap)
+                except OSError:
+                    # The broker gave up on us (the deadline test); nothing to report.
+                    pass
+
+            def log_message(self, _message, *_args):
+                return
+
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
+        self.addCleanup(self.upstream.server_close)
+        self.addCleanup(self.upstream.shutdown)
+
+        class FakeRelay(credential_proxy.GoogleApiRelay):
+            """The real fetch over a plain connection to the fake upstream."""
+
+            def __init__(self, port):
+                super().__init__()
+                self.port = port
+                self.hosts = []
+
+            def authorization_header(self):
+                return "Bearer broker-token"
+
+            def connection(self, host):
+                self.hosts.append(host)
+                return http.client.HTTPConnection(
+                    "127.0.0.1", self.port, timeout=credential_proxy.API_RELAY_CONNECT_TIMEOUT_S
+                )
+
+        self.relay = FakeRelay(self.upstream.server_address[1])
+
+        for attribute in ("api_relay", "authenticator", "policy", "executor",
+                          "max_request_bytes", "enforce_read_only"):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        CredentialProxyHandler.api_relay = self.relay
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        # Above _BODY_LARGER_THAN_SOCKET_BUFFERS, so the refused-POST drain test
+        # exercises a body the drain actually reads rather than declines.
+        CredentialProxyHandler.max_request_bytes = 16 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                "kubeagents-credential-proxy": credential_proxy.CALLER_ROLE_SHELL,
+                "kubeagents-credential-proxy-chat": credential_proxy.CALLER_ROLE_CHAT,
+            },
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+        roles = {
+            "shell-token": credential_proxy.CALLER_ROLE_SHELL,
+            "chat-token": credential_proxy.CALLER_ROLE_CHAT,
+        }
+        caller = self.CALLER
+
+        def fake_review(token):
+            if token not in roles:
+                raise credential_proxy.AuthenticationError("not our token")
+            return credential_proxy.Principal(workload=caller, uid="sa-uid", role=roles[token])
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _request(self, path, token="shell-token", method="GET", headers=None, body=None):
+        # http.client rather than urllib: the request target goes on the wire
+        # exactly as written, which is what the normal-form tests need.
+        sent = dict(headers or {})
+        if token is not None:
+            sent["Authorization"] = f"Bearer {token}"
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        try:
+            connection.request(method, path, body=body, headers=sent)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def _raw(self, target: bytes, token=b"shell-token"):
+        """Send a request line as bytes; for targets http.client itself refuses to send."""
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"GET " + target + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer " + token + b"\r\n\r\n"
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            return response.status, dict(response.getheaders()), response.read()
+
+    def _json_request(self, *args, **kwargs):
+        status, headers, body = self._request(*args, **kwargs)
+        return status, headers, json.loads(body)
+
+    # -- the happy path --------------------------------------------------
+
+    def test_a_permitted_read_reaches_the_upstream_with_exactly_two_headers(self):
+        query = (
+            "filter=metric.type%3D%22kubernetes.io%2Fcontainer%2Fcpu%2Fcore_usage_time%22"
+            "&interval.startTime=2026-09-08T00%3A00%3A00Z&key=AIzaFAKE&access_token=x"
+            "&oauth_token=y&bearer_token=z&pageSize=1000"
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, body = self._request(
+                f"{self.ALLOWED}?{query}",
+                headers={"X-Goog-User-Project": "someone-else", "Accept": "text/plain",
+                         "Cookie": "session=1"},
+            )
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"timeSeries":[]}', body)
+        self.assertEqual("application/json; charset=UTF-8", headers["Content-Type"])
+
+        self.assertEqual(["monitoring.googleapis.com"], self.relay.hosts)
+        self.assertEqual(1, len(self.upstream_requests))
+        path, upstream_headers = self.upstream_requests[0]
+        # The three credential keys are gone; every other pair is byte-for-byte.
+        self.assertEqual(
+            "/v3/projects/kagents-dev/timeSeries"
+            "?filter=metric.type%3D%22kubernetes.io%2Fcontainer%2Fcpu%2Fcore_usage_time%22"
+            "&interval.startTime=2026-09-08T00%3A00%3A00Z&pageSize=1000",
+            path,
+        )
+        self.assertEqual(
+            {"Host", "Authorization", "Accept"},
+            set(upstream_headers),
+            "the upstream request carries the broker's two headers and Host, nothing else",
+        )
+        self.assertEqual("Bearer broker-token", upstream_headers["Authorization"])
+        self.assertEqual("application/json", upstream_headers["Accept"])
+
+        lines = [record.getMessage() for record in logs.records]
+        opened = [line for line in lines if line.startswith("api request_id=")]
+        self.assertEqual(1, len(opened))
+        self.assertIn(f"principal={self.CALLER}", opened[0])
+        self.assertIn(" host=monitoring.googleapis.com path=v3/projects/kagents-dev/timeSeries", opened[0])
+        forwarded = [line for line in lines if line.startswith("api forwarded request_id=")]
+        self.assertEqual(1, len(forwarded))
+        self.assertIn(" host=monitoring.googleapis.com status=200 bytes=17 duration_ms=", forwarded[0])
+        request_id = opened[0].split()[1]
+        self.assertIn(request_id, forwarded[0], "the two lines share one request id")
+
+    def test_the_upstream_status_and_body_come_back_unchanged(self):
+        for status, content_type, body in (
+            (403, "application/json; charset=UTF-8", b'{"error":{"code":403,"status":"PERMISSION_DENIED"}}'),
+            (429, "application/json", b'{"error":{"code":429}}'),
+            (404, "text/html", b"<html>gone</html>"),
+        ):
+            with self.subTest(status=status):
+                self.reply.update(status=status, content_type=content_type, body=body)
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    got_status, headers, got_body = self._request(self.ALLOWED)
+                self.assertEqual(status, got_status)
+                self.assertEqual(content_type, headers["Content-Type"])
+                self.assertEqual(body, got_body)
+                self.assertTrue(
+                    any(f"api forwarded request_id=" in r.getMessage() and f"status={status}" in r.getMessage()
+                        for r in logs.records)
+                )
+
+    def test_a_close_delimited_upstream_response_is_relayed_in_full(self):
+        # getresponse() sets connection.sock to None when the upstream says
+        # Connection: close; the body is still readable through the response's
+        # own handle. Re-arming the deadline on connection.sock raised
+        # AttributeError on the first read, which no clause caught: a
+        # traceback, no response, and a request line with no verdict.
+        body = b'{"timeSeries":[' + b"x" * 200_000 + b"]}"
+        self.reply.update(body=body, headers={"Connection": "close"})
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(body, got)
+        self.assertEqual("application/json; charset=UTF-8", headers["Content-Type"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api forwarded request_id="), lines[1])
+        self.assertIn(f" status=200 bytes={len(body)} ", lines[1])
+
+    def test_an_http10_upstream_without_content_length_is_read_to_eof(self):
+        body = b'{"metricDescriptors":[' + b"y" * 70_000 + b"]}"
+        self.reply.update(raw=b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n" + body)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(body, got)
+        self.assertEqual("application/json", headers["Content-Type"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api forwarded request_id="), lines[1])
+
+    def test_a_front_end_414_with_connection_close_passes_through(self):
+        self.reply.update(status=414, content_type="text/html; charset=UTF-8",
+                          body=b"<html>414 Request-URI Too Large</html>",
+                          headers={"Connection": "close"})
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(414, status)
+        self.assertEqual(b"<html>414 Request-URI Too Large</html>", got)
+        self.assertEqual("text/html; charset=UTF-8", headers["Content-Type"])
+        self.assertTrue(any("api forwarded request_id=" in r.getMessage() and "status=414" in r.getMessage()
+                            for r in logs.records))
+
+    def test_a_query_over_the_length_cap_never_leaves_the_broker(self):
+        cap = credential_proxy.API_RELAY_MAX_QUERY_BYTES
+        over = "filter=" + "a" * (cap - len("filter=") + 1)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(f"{self.ALLOWED}?{over}")
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertIn(str(cap), payload["error"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertTrue(any("api rejected request_id=" in r.getMessage() and "code=API_RELAY_BAD_QUERY" in r.getMessage()
+                            for r in logs.records))
+        # Exactly at the cap is forwarded.
+        at_cap = "filter=" + "a" * (cap - len("filter="))
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._request(f"{self.ALLOWED}?{at_cap}")
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+        self.assertEqual(f"/v3/projects/kagents-dev/timeSeries?{at_cap}", self.upstream_requests[0][0])
+
+    def test_an_upstream_response_with_no_content_type_still_passes(self):
+        self.reply.update(content_type="", body=b"raw")
+        status, headers, body = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(b"raw", body)
+        self.assertNotIn("Content-Type", headers)
+
+    # -- who may call ----------------------------------------------------
+
+    def test_the_route_demands_the_shell_role(self):
+        # Through the constant as well as the literal path: required_roles()
+        # answers () on a miss and the role check then admits everyone, so
+        # the table entry has to be spelled from the same constant the
+        # dispatch uses.
+        for path in (self.ALLOWED, credential_proxy.API_RELAY_PREFIX + "x"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    (credential_proxy.CALLER_ROLE_SHELL,),
+                    credential_proxy.required_roles(path),
+                )
+        self.assertEqual("/v1/gcp/", credential_proxy.API_RELAY_PREFIX)
+
+    def test_the_chat_gateway_is_refused_before_anything_is_read(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED, token="chat-token")
+        self.assertEqual(403, status)
+        self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertFalse(any("api request_id=" in r.getMessage() for r in logs.records),
+                         "a caller the role table turns away never opens an api line")
+
+    def test_an_unauthenticated_caller_is_401(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(self.ALLOWED, token=None)
+        self.assertEqual(401, status)
+        self.assertEqual([], self.upstream_requests)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, _ = self._json_request(self.ALLOWED, token="forged")
+        self.assertEqual(401, status)
+        self.assertEqual([], self.upstream_requests)
+
+    # -- normal form -----------------------------------------------------
+
+    def test_a_path_not_in_normal_form_is_400_and_names_the_reason(self):
+        PATH, HOST, QUERY = "API_RELAY_BAD_PATH", "API_RELAY_BAD_HOST", "API_RELAY_BAD_QUERY"
+        cases = (
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/../other/timeSeries", PATH, "`..`"),
+            ("/v1/gcp/monitoring.googleapis.com/v3//projects/kagents-dev/timeSeries", PATH, "empty"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/./projects/kagents-dev/timeSeries", PATH, "`.`"),
+            ("/v1/gcp/monitoring.googleapis.com/v3%2Fprojects/kagents-dev/timeSeries", PATH, "percent-encoded slash"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries%2f", PATH, "percent-encoded slash"),
+            ("/v1/gcp/https://monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "scheme"),
+            ("/v1/gcp/monitoring.googleapis.com:443/v3/projects/kagents-dev/timeSeries", HOST, "port"),
+            ("/v1/gcp/user@monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "user info"),
+            ("/v1/gcp/Monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "lower-case"),
+            ("/v1/gcp/monitoring%2egoogleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "encoding"),
+            ("/v1/gcp//v3/projects/kagents-dev/timeSeries", HOST, "no upstream host"),
+            ("/v1/gcp/", HOST, "no upstream host"),
+            ("/v1/gcp/monitoring.googleapis.com", PATH, "no API path"),
+            ("/v1/gcp/monitoring.googleapis.com/", PATH, "no API path"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?filter=%zz", QUERY, "percent-escapes"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?filter=a%2", QUERY, "percent-escapes"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a={b}", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=\\b", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=b|c", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=%22b%22&c=\"d\"", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=<b>", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=b^c", QUERY, "query characters"),
+        )
+        for path, code, reason in cases:
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._json_request(path)
+                self.assertEqual(400, status)
+                self.assertEqual(code, payload["code"])
+                self.assertIn(reason, payload["error"])
+                self.assertEqual([], self.upstream_requests)
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api request_id=") for line in lines))
+                rejected = [line for line in lines if line.startswith("api rejected request_id=")]
+                self.assertEqual(1, len(rejected))
+                self.assertIn(f" code={code} reason=", rejected[0])
+
+    def test_brackets_in_the_query_are_forwarded_byte_for_byte(self):
+        # `[` and `]` are RFC 3986 gen-delims, but http.client sends them raw
+        # and Google accepts them; the Managed Prometheus routes need them
+        # (`match[]=`, and `[5m]` in every range vector), and `requests` and
+        # `curl -g` leave them unquoted. An earlier shape refused them, which
+        # refused the routes.
+        prometheus = "/v1/gcp/monitoring.googleapis.com/v1/projects/kagents-dev/location/global/prometheus/api/v1"
+        for path, upstream_target in (
+            (f"{prometheus}/series?match[]=up&match[]=node_cpu_seconds_total",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/series?match[]=up&match[]=node_cpu_seconds_total"),
+            (f"{prometheus}/query?query=rate(container_cpu_usage_seconds_total[5m])",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/query?query=rate(container_cpu_usage_seconds_total[5m])"),
+            (f"{prometheus}/query?query=up[5m]",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/query?query=up[5m]"),
+            (f"{self.ALLOWED}?a=[b]", "/v3/projects/kagents-dev/timeSeries?a=[b]"),
+        ):
+            with self.subTest(path=path):
+                self.upstream_requests.clear()
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, _ = self._request(path)
+                self.assertEqual(200, status)
+                self.assertEqual([upstream_target], [p for p, _ in self.upstream_requests])
+                self.assertTrue(any(r.getMessage().startswith("api forwarded request_id=") for r in logs.records))
+
+    def test_a_query_byte_http_client_cannot_send_is_400_not_a_dropped_connection(self):
+        # http.client's own client side refuses these targets, so they go on
+        # the wire raw. Before the query check, a raw UTF-8 byte reached
+        # putrequest as UnicodeEncodeError -- a ValueError neither except
+        # clause caught -- and the caller read zero bytes while the log held a
+        # request line with no verdict; a DEL reached it as InvalidURL and was
+        # misreported as an unreachable upstream.
+        allowed = self.ALLOWED.encode()
+        for suffix in (b"?filter=caf\xc3\xa9", b"?filter=\xff", b"?filter=a\x7fb", b"?filter=a\x01b"):
+            with self.subTest(suffix=suffix):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, headers, body = self._raw(allowed + suffix)
+                self.assertEqual(400, status)
+                payload = json.loads(body)
+                self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts)
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api rejected request_id=") and "code=API_RELAY_BAD_QUERY" in line
+                                    for line in lines))
+
+    def test_a_value_error_from_the_upstream_request_line_is_still_a_400(self):
+        # The second line of defence: if a target ever reaches fetch that
+        # http.client will not send, the answer is the same 400, not a
+        # traceback on the server and a reset on the client.
+        def raising_fetch(host, target, authorization):
+            raise UnicodeEncodeError("ascii", "\xe9", 0, 1, "ordinal not in range(128)")
+
+        self.relay.fetch = raising_fetch
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertTrue(any("api rejected request_id=" in r.getMessage() and "reason=UnicodeEncodeError" in r.getMessage()
+                            for r in logs.records))
+
+        def raising_invalid_url(host, target, authorization):
+            raise http.client.InvalidURL("URL can't contain control characters")
+
+        self.relay.fetch = raising_invalid_url
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+
+    # -- the policy, over the wire ---------------------------------------
+
+    def test_a_policy_refusal_is_403_in_the_exec_shape_with_its_audit_line(self):
+        cases = (
+            ("GET", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/alertPolicies", "gcp.api.path"),
+            ("GET", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries/x", "gcp.api.path"),
+            ("GET", "/v1/gcp/iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/x:generateAccessToken",
+             "gcp.api.host-refused"),
+            ("GET", "/v1/gcp/metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+             "gcp.api.host-refused"),
+            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries", "gcp.api.host"),
+            ("GET", "/v1/gcp/evil.example.com/anything", "gcp.api.host"),
+            ("POST", self.ALLOWED, "gcp.api.method"),
+            ("POST", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries:query", "gcp.api.method"),
+        )
+        for method, path, rule in cases:
+            with self.subTest(method=method, path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._json_request(path, method=method)
+                self.assertEqual(403, status)
+                self.assertEqual(
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": rule},
+                    {key: payload[key] for key in ("status", "code", "rule")},
+                )
+                self.assertTrue(payload["message"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts, "a refused request never opens a connection")
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api request_id=") for line in lines))
+                blocked = [line for line in lines if line.startswith("api blocked request_id=")]
+                self.assertEqual(1, len(blocked))
+                self.assertTrue(blocked[0].endswith(f" rule={rule}"), blocked[0])
+
+    def test_a_refused_post_with_a_large_body_still_receives_its_403(self):
+        # A body larger than the socket buffers is still being written when
+        # the handler answers; closing on it sends a reset that swallows the
+        # response unless the body is drained first.
+        body = b"x" * _BODY_LARGER_THAN_SOCKET_BUFFERS
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(
+                self.ALLOWED, method="POST", body=body,
+                headers={"Content-Type": "application/json"},
+            )
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.method", payload["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    # -- the upstream misbehaving ----------------------------------------
+
+    def test_a_body_one_byte_over_the_cap_is_502(self):
+        cap = 4096
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            self.reply.update(body=b"x" * (cap + 1))
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, _, payload = self._json_request(self.ALLOWED)
+            self.assertEqual(502, status)
+            self.assertEqual("UPSTREAM_RESPONSE_TOO_LARGE", payload["code"])
+            self.assertIn("pageSize", payload["error"])
+            self.assertTrue(any("api response too large request_id=" in r.getMessage() for r in logs.records))
+
+            self.reply.update(body=b"x" * cap)
+            status, _, body = self._request(self.ALLOWED)
+            self.assertEqual(200, status)
+            self.assertEqual(cap, len(body), "a body exactly at the cap passes")
+
+    def test_a_redirect_is_not_followed(self):
+        self.reply.update(status=302, content_type="text/html", body=b"",
+                          headers={"Location": "https://evil.example/collect"})
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, headers, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_REDIRECTED", payload["code"])
+        self.assertNotIn("Location", headers)
+        self.assertEqual(1, len(self.upstream_requests), "one request, no follow")
+        self.assertEqual(["monitoring.googleapis.com"], self.relay.hosts)
+        self.assertTrue(any("api redirect refused request_id=" in r.getMessage() and "status=302" in r.getMessage()
+                            for r in logs.records))
+
+    def test_an_upstream_that_outlives_the_deadline_is_504(self):
+        self.reply.update(delay=2.0)
+        with mock.patch.object(credential_proxy, "API_RELAY_DEADLINE_S", 0.3):
+            started = time.monotonic()
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(504, status)
+        self.assertEqual("UPSTREAM_TIMEOUT", payload["code"])
+        self.assertLess(time.monotonic() - started, 1.5, "the deadline, not the upstream, ended the wait")
+        self.assertTrue(any("api upstream timeout request_id=" in r.getMessage() for r in logs.records))
+
+    def test_a_connect_that_hangs_is_502_naming_the_connect_timeout(self):
+        # A dropped SYN raises TimeoutError from connect() after the connect
+        # timeout. That is "unreachable", not the read deadline, and the log
+        # names the timeout that fired.
+        class HangingConnection(http.client.HTTPConnection):
+            def connect(self):
+                raise TimeoutError("timed out")
+
+        self.relay.connection = lambda host: HangingConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        connect_lines = [r.getMessage() for r in logs.records
+                         if r.getMessage().startswith("api upstream connect timeout request_id=")]
+        self.assertEqual(1, len(connect_lines))
+        self.assertIn(f"connect_timeout_s={credential_proxy.API_RELAY_CONNECT_TIMEOUT_S}", connect_lines[0])
+        self.assertFalse(any("deadline_s=" in r.getMessage() for r in logs.records))
+
+    def test_a_trickling_upstream_is_cut_at_the_deadline_not_at_the_end_of_the_body(self):
+        # Ten pieces, 0.2 s apart: two seconds of body. With read(n) each
+        # recv re-armed the socket timeout, so the whole body arrived and the
+        # deadline never fired; with read1 the deadline is checked per recv.
+        pieces = [b"x" * 1024] * 10
+        self.reply.update(body=b"".join(pieces), trickle=(pieces, 0.2))
+        with mock.patch.object(credential_proxy, "API_RELAY_DEADLINE_S", 0.5):
+            started = time.monotonic()
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, _, payload = self._json_request(self.ALLOWED)
+            elapsed = time.monotonic() - started
+        self.assertEqual(504, status)
+        self.assertEqual("UPSTREAM_TIMEOUT", payload["code"])
+        self.assertLess(elapsed, 1.2, f"answered after {elapsed:.2f}s; the deadline was 0.5s")
+
+    def test_a_tls_verification_failure_is_502_not_a_400(self):
+        # ssl.SSLCertVerificationError is a ValueError as well as an SSLError,
+        # so a belt clause written for ValueError answered a broken CA bundle
+        # or a TLS-intercepting egress as a bad query. It is the upstream's
+        # fault and is answered as one.
+        class UnverifiableConnection(http.client.HTTPConnection):
+            def connect(self):
+                raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+        self.relay.connection = lambda host: UnverifiableConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        verdicts = [r.getMessage() for r in logs.records if r.getMessage().startswith("api upstream unreachable")]
+        self.assertEqual(1, len(verdicts))
+        self.assertIn("type=SSLCertVerificationError", verdicts[0])
+        self.assertFalse(any("API_RELAY_BAD_QUERY" in r.getMessage() for r in logs.records))
+
+    def test_a_target_putrequest_will_not_send_is_still_a_400_at_the_connection(self):
+        # The belt path, pinned at the level it protects: putrequest refusing
+        # the target, after a successful connect.
+        class RefusingConnection(http.client.HTTPConnection):
+            def putrequest(self, method, url, **kwargs):
+                raise UnicodeEncodeError("ascii", "\xe9", 0, 1, "ordinal not in range(128)")
+
+        self.relay.connection = lambda host: RefusingConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertTrue(any("reason=UnicodeEncodeError" in r.getMessage() for r in logs.records))
+
+    def test_an_upstream_that_closes_short_of_its_content_length_is_502(self):
+        # read1 returns b"" on an early EOF without raising for a
+        # Content-Length-framed body; without the owed-bytes check a page cut
+        # short relayed as a well-framed 200.
+        body = b'{"timeSeries":[' + b"x" * 4096 + b"]}"
+        self.reply.update(body=body, truncate_to=1000)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_TRUNCATED", payload["code"])
+        self.assertNotIn("timeSeries", json.dumps(payload), "none of the partial body is relayed")
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api upstream truncated request_id="), lines[1])
+        self.assertIn(f" received=1000 expected={len(body)}", lines[1])
+        self.assertFalse(any(line.startswith("api forwarded") for line in lines))
+
+    def test_an_unreachable_upstream_is_502(self):
+        # Point the relay at a port nothing listens on.
+        spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        self.relay.port = spare.server_address[1]
+        spare.server_close()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        self.assertTrue(any("api upstream unreachable request_id=" in r.getMessage() for r in logs.records))
+
+    # -- the broker's own side -------------------------------------------
+
+    def test_no_relay_armed_is_503_after_the_policy_has_answered(self):
+        CredentialProxyHandler.api_relay = None
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(503, status)
+        self.assertEqual("API_RELAY_DISABLED", payload["code"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[0].startswith("api request_id="))
+        self.assertTrue(lines[1].startswith("api disabled request_id="), lines[1])
+        self.assertTrue(lines[1].endswith(" rule=gcp.api.monitoring.timeseries-list"))
+        # The policy still answers first: a refusal reads as a refusal, not an outage.
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request("/v1/gcp/logging.googleapis.com/v2/entries")
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.host", payload["rule"])
+
+    def test_a_relayed_content_type_cannot_split_the_response(self):
+        # The one upstream header the relay re-emits is upstream text, so it
+        # gets the same CR/LF strip the agent API proxy gives every header.
+        def injecting_fetch(host, target, authorization):
+            return credential_proxy.ApiRelayResponse(
+                200, "application/json\r\nX-Injected: 1\r\nSet-Cookie: a=b", b"{}"
+            )
+
+        self.relay.fetch = injecting_fetch
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, headers, body = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(b"{}", body)
+        self.assertNotIn("X-Injected", headers)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual("application/jsonX-Injected: 1Set-Cookie: a=b", headers["Content-Type"])
+
+    def test_the_tls_context_is_built_once_per_relay(self):
+        relay = credential_proxy.GoogleApiRelay()
+        first = relay.connection("monitoring.googleapis.com")
+        second = relay.connection("monitoring.googleapis.com")
+        self.assertIs(first._context, second._context)
+
+    def test_a_credential_the_broker_cannot_obtain_is_503_and_names_only_the_type(self):
+        def failing():
+            raise RuntimeError("could not read /var/run/secrets/tokens/gcp-ksa/token")
+
+        self.relay.authorization_header = failing
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(503, status)
+        self.assertEqual("RELAY_CREDENTIAL_UNAVAILABLE", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        joined = "\n".join(r.getMessage() for r in logs.records)
+        self.assertIn("api credential unavailable request_id=", joined)
+        self.assertIn("type=RuntimeError", joined)
+        self.assertNotIn("/var/run/secrets", joined)
+
+
+class ApiRelayAuditLineCannotBeForgedTest(unittest.TestCase):
+    """Caller text in the api lines goes through the same sanitizer as argv[0].
+
+    Driven on a handler object rather than over the socket: `urlsplit` strips
+    `\\n` and `\\r` from a request target, but not the vertical tab or the
+    Unicode line separator, and `str.splitlines` treats both as record
+    boundaries. Whatever the transport lets through, the record stays one line.
+    """
+
+    FORGERY = (
+        "\x0b2026-01-01 00:00:00,000 INFO credential-proxy api request_id=y "
+        "principal=system:serviceaccount:kubeagents-system:other host=x path=y "
+    )
+
+    def _handler(self, path, command="GET"):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.command = command
+        handler.path = path
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:agent-shell",
+            uid="u",
+            role=credential_proxy.CALLER_ROLE_SHELL,
+        )
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        return handler
+
+    def _assert_one_line_each(self, logs):
+        for record in logs.records:
+            message = record.getMessage()
+            self.assertEqual([message], message.splitlines(), message)
+
+    def test_a_forged_host_stays_on_one_line(self):
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com{self.FORGERY}/v3/projects/p/timeSeries")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        self.assertEqual(HTTPStatus.BAD_REQUEST, handler.replies[0][0])
+        self._assert_one_line_each(logs)
+
+    def test_a_forged_path_stays_on_one_line(self):
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com/v3/projects/p/timeSeries{self.FORGERY}")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        # The segment carrying the forgery is not in normal form; either way,
+        # the line that already logged it is intact.
+        self.assertIn(handler.replies[0][0], (HTTPStatus.BAD_REQUEST, HTTPStatus.FORBIDDEN))
+        self._assert_one_line_each(logs)
+
+    def test_the_path_is_logged_wider_than_the_default_but_still_capped(self):
+        long_path = "v3/projects/kagents-dev/" + "a" * 600
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com/{long_path}")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        opened = next(r.getMessage() for r in logs.records if r.getMessage().startswith("api request_id="))
+        logged = opened.split(" path=", 1)[1]
+        self.assertEqual(credential_proxy.API_RELAY_PATH_LOG_LENGTH, len(logged))
+
+
+class GoogleApiRelayCredentialTest(unittest.TestCase):
+    """The relay's token is google-auth's, obtained once and refreshed by it."""
+
+    def _google(self, credentials, defaults):
+        google = types.ModuleType("google")
+        auth = types.ModuleType("google.auth")
+        transport = types.ModuleType("google.auth.transport")
+        requests_transport = types.ModuleType("google.auth.transport.requests")
+
+        def default(scopes=None):
+            defaults.append(scopes)
+            return credentials, "kagents-dev"
+
+        auth.default = default
+        requests_transport.Request = lambda: "request"
+        google.auth = auth
+        auth.transport = transport
+        transport.requests = requests_transport
+        return {
+            "google": google,
+            "google.auth": auth,
+            "google.auth.transport": transport,
+            "google.auth.transport.requests": requests_transport,
+        }
+
+    def test_default_once_refresh_only_when_lapsed(self):
+        class FakeCredentials:
+            def __init__(self):
+                self.valid = False
+                self.token = None
+                self.refreshed_with = []
+
+            def refresh(self, request):
+                self.refreshed_with.append(request)
+                self.token = f"tok{len(self.refreshed_with)}"
+                self.valid = True
+
+        credentials = FakeCredentials()
+        defaults = []
+        with mock.patch.dict(sys.modules, self._google(credentials, defaults)):
+            relay = credential_proxy.GoogleApiRelay()
+            self.assertEqual("Bearer tok1", relay.authorization_header())
+            self.assertEqual("Bearer tok1", relay.authorization_header(), "a valid token is reused")
+            credentials.valid = False
+            self.assertEqual("Bearer tok2", relay.authorization_header(), "a lapsed one is refreshed")
+        self.assertEqual(1, len(defaults), "google.auth.default is called once")
+        self.assertEqual([credential_proxy.scoped_sa_pool.CLOUD_PLATFORM_SCOPE], defaults[0])
+        self.assertEqual(["request", "request"], credentials.refreshed_with)
+
+    def test_construction_imports_nothing(self):
+        # A broker without the cloud libraries still starts; the route answers
+        # 503 on first use instead.
+        with mock.patch.dict(sys.modules, {"google": None, "google.auth": None}):
+            relay = credential_proxy.GoogleApiRelay()
+            with self.assertRaises(ImportError):
+                relay.authorization_header()
+
+    def test_the_upstream_connection_is_tls_on_443_with_a_bounded_connect(self):
+        connection = credential_proxy.GoogleApiRelay().connection("monitoring.googleapis.com")
+        self.assertIsInstance(connection, http.client.HTTPSConnection)
+        self.assertEqual("monitoring.googleapis.com", connection.host)
+        self.assertEqual(credential_proxy.API_RELAY_UPSTREAM_PORT, connection.port)
+        self.assertEqual(credential_proxy.API_RELAY_CONNECT_TIMEOUT_S, connection.timeout)
+
+
+class ApiRelayQueryStrippingTest(unittest.TestCase):
+    """The credential keys go; every other pair is forwarded as written."""
+
+    def test_the_four_keys_are_removed_wherever_they_sit(self):
+        strip = credential_proxy.strip_credential_query_keys
+        self.assertEqual("", strip("key=a"))
+        self.assertEqual("filter=x", strip("key=a&filter=x"))
+        self.assertEqual("filter=x", strip("filter=x&access_token=b"))
+        self.assertEqual("filter=x&pageSize=5", strip("filter=x&oauth_token=c&pageSize=5"))
+        self.assertEqual("filter=x", strip("bearer_token=d&filter=x"))
+        self.assertEqual("filter=x", strip("key&filter=x&access_token"))
+        self.assertEqual("filter=x", strip("k%65y=a&filter=x"), "the key is compared decoded")
+
+    def test_everything_else_is_byte_for_byte(self):
+        query = "filter=metric.type%3D%22a%2Fb%22+AND+x&interval.endTime=2026-09-15T00%3A00%3A00Z&&pageSize=1000"
+        self.assertEqual(query.replace("&&", "&"), credential_proxy.strip_credential_query_keys(query))
+
+    def test_a_key_that_merely_contains_a_stripped_one_stays(self):
+        self.assertEqual(
+            "keyed=1&my_access_token=2&oauth_token_x=3",
+            credential_proxy.strip_credential_query_keys("keyed=1&my_access_token=2&oauth_token_x=3"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

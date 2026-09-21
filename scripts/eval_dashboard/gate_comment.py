@@ -350,9 +350,13 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
             note = "" if case["admitted"] else HELD_OUT_CELL
             lines.append(TABLE_ROW.format(case=case["case"], note=note, result=result_cell(case), also=also_text(case.get("also_failing_prs"))))
         lines.append("")
-    reasons = [c for c in red.yours() + red.unclear() if (c.get("excerpt") or c.get("reason"))]
+    # The Reason line is the grader's check (`reps[].reason`). The agent's own
+    # words (`reps[].excerpt`, the Brief's quote) stand in only when a rep
+    # carries no reason at all, so the comment never trades the check that
+    # failed for the report's opening boilerplate.
+    reasons = [c for c in red.yours() + red.unclear() if (c.get("reason") or c.get("excerpt"))]
     for case in reasons:
-        text = (case.get("excerpt") or case.get("reason") or "").replace("`", "'")[:EXCERPT_CHARS]
+        text = (case.get("reason") or case.get("excerpt") or "").replace("`", "'")[:EXCERPT_CHARS]
         lines.append((REASON_LINE if len(reasons) == 1 else REASON_LINE_NAMED).format(case=case["case"], reason=text))
     if reasons:
         lines.append("")

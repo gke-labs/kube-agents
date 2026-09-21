@@ -17,8 +17,11 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"reflect"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestSensitiveEnvVars(t *testing.T) {
@@ -225,6 +228,76 @@ func TestCleanRepoURLWithOrg(t *testing.T) {
 			}
 			if out != tc.expected {
 				t.Errorf("CleanRepoURLWithOrg(%q, %q) = %q, expected %q", tc.input, tc.org, out, tc.expected)
+			}
+		})
+	}
+}
+
+// BusCredentialRoutes is the source half of the bus-token reservation, shared
+// by the webhook (refuse) and the render (strip). The literals here are the
+// wire values the callout and the render use, spelled out rather than taken
+// from the constants, so a typo in a constant fails here instead of matching
+// itself.
+func TestBusCredentialRoutes(t *testing.T) {
+	if got := A2ACredsSecretName("test-agent"); got != "test-agent-a2a-nats-creds" {
+		t.Fatalf("A2ACredsSecretName(test-agent) = %q, want test-agent-a2a-nats-creds", got)
+	}
+	// The three Secrets the render writes bus credentials into, spelled as the
+	// render spells them (a2aTestCreds, buildA2ANATSConfigSecret, ensureA2ACalloutKeys).
+	if got := A2ACredentialSecretNames("test-agent"); !reflect.DeepEqual(got, []string{
+		"test-agent-a2a-nats-creds", "test-agent-a2a-nats-config", "test-agent-a2a-callout-keys"}) {
+		t.Fatalf("A2ACredentialSecretNames(test-agent) = %v", got)
+	}
+	if A2ABusTokenAudience != "a2a-bus" {
+		t.Fatalf("A2ABusTokenAudience = %q, want a2a-bus (what the callout's TokenReview asks for)", A2ABusTokenAudience)
+	}
+	tokenFor := func(aud string) corev1.VolumeProjection {
+		return corev1.VolumeProjection{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: aud, Path: "token"}}
+	}
+	secretSource := func(name string) corev1.VolumeProjection {
+		return corev1.VolumeProjection{Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: name}}}
+	}
+	projected := func(sources ...corev1.VolumeProjection) corev1.VolumeSource {
+		return corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: sources}}
+	}
+	cases := []struct {
+		name string
+		vol  corev1.Volume
+		want []BusCredentialRoute
+	}{
+		{"bus audience under another name", corev1.Volume{Name: "innocuous-cache", VolumeSource: projected(tokenFor("a2a-bus"))},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteAudience, Source: 0}}},
+		{"bus audience behind a configMap source", corev1.Volume{Name: "bundle", VolumeSource: projected(
+			corev1.VolumeProjection{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "ca"}}},
+			tokenFor("a2a-bus"))},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteAudience, Source: 1}}},
+		{"another audience", corev1.Volume{Name: "vault-token", VolumeSource: projected(tokenFor("vault"))}, nil},
+		{"the API server's default audience", corev1.Volume{Name: "sa-token", VolumeSource: projected(tokenFor(""))}, nil},
+		{"the creds Secret as a secret volume", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: "test-agent-a2a-nats-creds"}}},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: "test-agent-a2a-nats-creds"}}},
+		{"the nats.conf Secret, which carries every password inline", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: "test-agent-a2a-nats-config"}}},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: "test-agent-a2a-nats-config"}}},
+		{"the callout keys Secret, which holds the issuer seed", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: "test-agent-a2a-callout-keys"}}},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: "test-agent-a2a-callout-keys"}}},
+		{"another Secret", corev1.Volume{Name: "tls", VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: "my-tls"}}}, nil},
+		{"the creds Secret of a different agent", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: "other-agent-a2a-nats-creds"}}}, nil},
+		{"the creds Secret as a projected source", corev1.Volume{Name: "bundle", VolumeSource: projected(secretSource("test-agent-a2a-nats-creds"))},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteSecret, Source: 0, Secret: "test-agent-a2a-nats-creds"}}},
+		{"both routes in one projection", corev1.Volume{Name: "bundle", VolumeSource: projected(tokenFor("a2a-bus"), secretSource("test-agent-a2a-nats-creds"))},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteAudience, Source: 0}, {Kind: BusCredentialRouteSecret, Source: 1, Secret: "test-agent-a2a-nats-creds"}}},
+		{"an emptyDir", corev1.Volume{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}, nil},
+		{"the reserved name with an innocent source", corev1.Volume{Name: "a2a-bus-token", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := BusCredentialRoutes(tc.vol, "test-agent")
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("BusCredentialRoutes(%s) = %+v, want %+v", tc.vol.Name, got, tc.want)
 			}
 		})
 	}

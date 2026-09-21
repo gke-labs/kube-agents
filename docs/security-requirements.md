@@ -75,13 +75,13 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 
 ### 6. Credential Isolation
 
-- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee. The one operator-managed exception is the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker; see the discussion below.
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee, with one operator-enforced carve-out inside it: an administrator-supplied volume whose source would deliver the A2A bus credential to a second container, or a volume or mount named `a2a-bus-token`, is refused at admission, and on an install running the A2A surface stripped from the render as well (the same Secrets read through `env` are not, which is the supported route for the bridge sidecar). The operator-managed exceptions are the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker and, under the unsupported `mode: next` toggle, a second one bound to the `a2a-bus` audience; see the discussion below.
 - Credentialed commands execute in the credential broker Pod, not in the agent sandbox.
 - The credential broker receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
-- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
+- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support. The one non-CLI interface is the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by a code allowlist (`agents/platform/scripts/api_policy.py`) and open to the shell role only; see [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md).
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the broker for this reason.
 
 The sandbox and the credential runtime must not share a process namespace, and must not run as the
@@ -161,7 +161,7 @@ The selected configuration is accepted when:
 2. Kubernetes and infrastructure-provider operations execute as the AgentSA;
 3. the required AgentSA preflight, and optional UserSA preflight, authorize an operation before it executes;
 4. operator-managed persisted state is scoped to its `PlatformAgent`;
-5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds fully for the `<agent>-shell` Pod, which runs model-authored code. The gateway's `platform-agent` container carries the exceptions: it mounts an audience-bound projected ServiceAccount token so it can authenticate to the broker across the network — a deliberate trade described in section 6 — and, under the unsupported `mode: next` toggle, it also receives the A2A bus's `worker` password by SecretKeyRef, which appears and disappears with the A2A stack;
+5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds fully for the `<agent>-shell` Pod, which runs model-authored code. The gateway's `platform-agent` container carries the exceptions: it mounts an audience-bound projected ServiceAccount token so it can authenticate to the broker across the network — a deliberate trade described in section 6 — and, under the unsupported `mode: next` toggle, it also receives a second audience-bound projected ServiceAccount token for the A2A bus, which appears and disappears with the A2A stack. That second token replaced a shared static password: what the container now holds names only itself, and the bus's auth callout resolves it to one principal's grants;
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 

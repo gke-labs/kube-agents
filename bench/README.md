@@ -4,7 +4,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 
 ## Layout
 
-- `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. Environment variables are documented in the module docstring.
+- `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. That transport needs either a standard-runtime install or a relay pre-opened on its local port — see [Sandboxed installs](#sandboxed-installs). Environment variables are documented in the module docstring.
 - `kube_agents_bench/parsing.py` — pure payload and trajectory reading: maps a response onto devops-bench's canonical `AgentResult`, and reads back which kanban cards a turn filed, what statuses it reported, and what a finished card delivered.
 - `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
   `/api/v1` interaction contract. It waits for aggregate terminal state before
@@ -27,6 +27,33 @@ seat on the merge-blocking roster — see [CONTRIBUTING.md](CONTRIBUTING.md).
 **Domain coverage.** `docs/designs/domains.yaml` lists eleven domains and an `allowlist` of the ones known to be uncovered; `scripts/test_domain_coverage.py` fails the build both for an uncovered domain missing from that list and for a listed domain that is in fact covered, so the list cannot rot in either direction. A domain counts as covered only when a task carries its `domain:` slug **and** a non-empty `verification_spec` **and** is an entry in `hack/eval/presubmit-cases.txt` — covered means running on every pull request.
 
 All eleven are covered and the allowlist is empty, which is Phase 2's exit criterion: `chat-and-routing` by the two kanban probes, `cluster-debugging` by `cluster-agent-crashloop-debug` (#939), `reliability`, `capacity`, `security`, `upgrades`, `consistency` and `cost` by the six domain probes, `fleet-audits` by the `compliance-rbac-overgrant` canary — the probe-plus-canary recast the 2026-08-26 smoke run forced, after it priced a full audit at 600–1300s ([`tasks/DRAFTS.md`](tasks/DRAFTS.md) has the run and the reasoning) — `remediation` by `rca-remediation-pr`, and `incident-triage` by `autoops-warning-event-triage`, which #1045 activated by giving it a scenario driver (`tf/prebuilt/autoops-incident`) that plants its own incident.
+
+## Sandboxed installs
+
+The harness reaches the agent with `kubectl port-forward`, which cannot reach a pod running under GKE Sandbox (gVisor) — the forward is set up in the host-side network namespace, and the listener lives in the sandbox's own. [`platformagent-crd.md`](../docs/site/src/content/docs/operator/platformagent-crd.md#specharness) is canonical on the constraint. `ENABLE_GVISOR` defaults to `true`, so a stock install is sandboxed.
+
+The forward comes up anyway. `kubectl port-forward` binds its local port before anything dials the pod, so the port opens and the harness takes the tunnel for established; each request then dies inside the sandbox, and the harness treats that as it treats any dropped connection — three attempts with a tunnel reset between them, then a run recorded as infrastructure:
+
+```
+opening turn failed in transport (1/3): RemoteDisconnected: Remote end closed connection without response
+```
+
+What that leaves in `results.json` is an empty answer with `KUBE_AGENTS_INFRA_FAILURE` at the head of `errors`, which the judge grades as the agent's non-answer. ([The gate](#the-gate) reads the marker and calls the repetition infrastructure, but that is the presubmit, not a local run.) Nothing in it names the sandbox, and an agent pod that went away mid-run reports the same thing.
+
+To run against a sandboxed install, pre-open the harness's local port with the `kubectl exec` relay:
+
+```bash
+python3 ../scripts/hermes-dashboard-tunnel.py \
+  --container agent-api-auth --remote-port 8643 --local-port "${AGENT_LOCAL_PORT:-8642}"
+```
+
+Leave it running alongside the eval. `_ensure_port_forward` treats an already-open port as a no-op — it never assumes it owns the transport — so the harness rides the relay instead of spawning a forward that cannot work. The script is named for the dashboard, but the relay under it ([`scripts/exec_tunnel.py`](../scripts/exec_tunnel.py)) is general, and these flags point it at the credential-proxy sidecar that fronts the agent API.
+
+The relay resolves the pod against whichever kubectl context is current, where the harness pins `AGENT_CLUSTER_CONTEXT` on every call, so point the current context at the agent's cluster before starting it. A task that provisions a cluster then repoints that context under you — `gcloud container clusters get-credentials`, the hazard `AGENT_CLUSTER_CONTEXT` exists for — and since the relay opens a `kubectl exec` per connection, every request from there on lands on the task cluster and fails the way the sandbox does. Give those tasks an unsandboxed agent.
+
+Above one replica, pass `--pod` too. A pod that does not hold the leader lease never starts the gateway, and the operator reports it Ready on purpose — its probe counts a refused connection as healthy while leader election is on — so the relay, which takes the first Ready pod matching the label, can settle on one with nothing listening.
+
+To run the agent unsandboxed: `ENABLE_GVISOR=false` at install time, or in `install.env` before a full `upgrade.sh`, which re-renders the runtime class from it — read [`scripts/installer/README.md`](../scripts/installer/README.md) on what else that apply rewrites before you run it on an install you care about. CI reaches the same place by overriding the chart value directly, which a throwaway cluster can afford: `hack/ci-deploy.sh` pins `runtimeClassName` empty before `hack/ci-eval-pr.sh` runs, and says why.
 
 ## Running evals
 
@@ -52,11 +79,11 @@ uv run bench-gate case --task ./tasks/<id>/task.yaml \
   --result <run-dir> --result MISSING --result <run-dir> \
   --json-out case-<id>.json          # exit 0 with a verdict, 2 if it could not grade
 uv run bench-gate suite --case-result case-<id>.json --markdown-out verdict.md
-                                     # exit 0 green, 1 red
+                                     # exit 0 green, 1 red, 2 not evaluated
 uv run bench-gate record --case-result case-<id>.json   # main only; appends evidence
 ```
 
-The gate is rate-based, not all-must-pass: at a few hundred cases and realistic per-case reliability, "every case green" is a state the suite reaches on a vanishing fraction of runs, and a gate that reds most pull requests gets switched off. So a case is graded on a ladder — a forbidden action, a declared check that never ran, or a record whose liveness signals are inconsistent reds the job outright (a record showing no run at all — empty trajectory, zero billed tokens — is excluded as infrastructure instead, #1184); a case that merely _fails_ reds it only by failing **every** repetition, and only once the baseline store holds screening evidence that the case is reliable enough to mean something.
+The gate is rate-based, not all-must-pass: at a few hundred cases and realistic per-case reliability, "every case green" is a state the suite reaches on a vanishing fraction of runs, and a gate that reds most pull requests gets switched off. So a case is graded on a ladder — a forbidden action, a declared check that never ran, or a record whose liveness signals are inconsistent reds the job outright (a record showing no run at all — empty trajectory, zero billed tokens — is excluded as infrastructure instead, #1184); a case that merely _fails_ reds it only by failing **every** repetition, and only once the baseline store holds screening evidence that the case is reliable enough to mean something. Green has a coverage floor of its own: an admitted case that lost every repetition to infrastructure was not evaluated, and the run then reports **not evaluated** rather than green — `suite` exits 2, the JSON carries `outcome: not_evaluated` with the case ids, and the verdict says rerun when the environment is healthy rather than debug the change. A blocking case still outranks that: the run is red.
 
 That evidence is what `baselines/` holds, and admission is computed from it rather than declared in `task.yaml` — a case cannot admit itself in the same diff that makes it pass. A case with no record at the current version key is reported unadmitted, and one whose record was measured on different software is reported _stale_ rather than silently compared against.
 
@@ -64,7 +91,7 @@ That evidence is what `baselines/` holds, and admission is computed from it rath
 
 Two speeds, deliberately: the deterministic `Verification*` scores decide whether a repetition passed, and no judged score can fail a repetition on its own. The captured fixtures are the argument — three byte-identical failing runs scored `OutcomeValidity` 0.9, 1.0 and 0.2 while `VerificationCorrectness` held at 0.5 on all three. The judge is given exactly one job (rung 6): catching a **collapse** in judged quality against main's mean at the same version key, at a margin of two standard errors of that measured spread. At three repetitions it cannot see drift, and widening it is a matter of more repetitions or a less variable metric, not a smaller number.
 
-Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_AGGREGATE_MIN_SCORED`, `EVAL_AGGREGATE_ARMED` (unset by default: the suite aggregate is computed and reported against main's rate but cannot red the job until this is set to `1`, `true` or `yes`), `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, `EVAL_ADMISSION_MODE` (`roster` by default: the list decides and the record is reported; `record`: the record decides once it holds a full window) and `BOOTSTRAP_ADMITTED` (the blocking roster, read from `hack/eval/blocking-roster.txt`; [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md) has the decision and what the record must show before the mode changes).
+Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_AGGREGATE_MIN_SCORED`, `EVAL_AGGREGATE_ARMED` (unset by default: the suite aggregate is computed and reported against main's rate but cannot red the job until this is set to `1`, `true` or `yes`), `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, `EVAL_BASELINE_CAT_WORKERS` (default 16: how many per-case `gcloud storage cat` calls a GCS read runs at once), `EVAL_ADMISSION_MODE` (`roster` by default: the list decides and the record is reported; `record`: the record decides once it holds a full window) and `BOOTSTRAP_ADMITTED` (the blocking roster, read from `hack/eval/blocking-roster.txt`; [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md) has the decision and what the record must show before the mode changes).
 
 ## Portal CUJ evaluations
 

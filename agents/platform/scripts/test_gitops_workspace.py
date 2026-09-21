@@ -532,6 +532,17 @@ class TestResolveBaseBranch(WorkspaceTestCase):
         with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release"}):
             self.assertEqual(self.resolve(), "release")
 
+    def test_credential_proxy_base_branch_override_beats_gitops_base_and_remote(self):
+        self.origin_head = "origin/main"
+        with patch.dict(
+            os.environ,
+            {
+                "CREDENTIAL_PROXY_BASE_BRANCH": "custom-cred-base",
+                "GITOPS_BASE_BRANCH": "gitops-base",
+            },
+        ):
+            self.assertEqual(self.resolve(), "custom-cred-base")
+
     def test_no_clone_yet_falls_back_without_running_git(self):
         self.assertEqual(
             gitops_workspace.resolve_base_branch(None, self.runner), "main"
@@ -1029,6 +1040,245 @@ class TestContextRepos(WorkspaceTestCase):
         self.assertIn("context_repos", joined)
         self.assertIn("no provider for type 'gitlab'", joined)
         self.assertNotIn("managed_repos repository", joined)
+
+    def test_a_ref_on_a_context_entry_is_kept_and_handed_over_beside_the_slug(self):
+        context = (
+            '[{"type": "github", "url": "https://github.com/acme/terraform-live", '
+            '"ref": "release-2026"}, '
+            '{"type": "github", "url": "https://github.com/acme/notes"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [
+                    {"repo": "acme/terraform-live", "ref": "release-2026"},
+                    {"repo": "acme/notes", "ref": None},
+                ],
+            )
+            # The slug list every other caller reads is unchanged by the pin.
+            self.assertEqual(
+                gitops_workspace.get_context_github_repos(),
+                ["acme/terraform-live", "acme/notes"],
+            )
+
+    def test_a_ref_with_an_at_sign_after_the_first_character_is_kept(self):
+        # `release@2026` is a branch name git accepts: only the sequence `@{`
+        # and the lone name `@` are refused, and both stay refused below.
+        for good in ("release@2026", "deploy@eu", "team/x@y"):
+            with self.subTest(ref=good):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": good}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    self.assertTrue(gitops_workspace.is_valid_ref(good))
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repo_entries(),
+                        [{"repo": "acme/terraform-live", "ref": good}],
+                    )
+
+    def test_a_ref_that_is_not_a_branch_name_is_refused_and_marks_the_entry(self):
+        # A leading dash is an option to `git`; the rest are shapes a ref
+        # cannot take — `foo.lock/bar` among them, a `.lock` component git
+        # refuses in the middle of a name as it does at the end, and `+`,
+        # which git accepts and the shape check does not. The entry keeps
+        # its slug and carries the refused value under `refused_ref` in place
+        # of a `ref`, so the declared-intent search skips the repository
+        # rather than reading its default branch in the pin's place.
+        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "foo.lock/bar", "a/.b", "with space", "a@{1}", "@", "@release", "release/2026+hotfix"):
+            with self.subTest(ref=bad):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": bad}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": bad}],
+                        )
+                    # The raw entry carries the refused value, never as `ref`.
+                    self.assertEqual(
+                        gitops_workspace.get_context_repo_entries(),
+                        [{"type": "github", "url": "https://github.com/acme/terraform-live", "refused_ref": bad}],
+                    )
+                    # The slug list every other caller reads still names the
+                    # repository: it is owed, and the ledger names it as not
+                    # searched.
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(bad), joined)
+                self.assertIn("skips this repository", joined)
+                self.assertNotIn("reading HEAD", joined)
+
+    def test_an_empty_ref_is_refused_rather_than_read_as_no_pin(self):
+        # `"ref": ""` is what a template with an unset variable emits, and
+        # the pin it lost is exactly the one the default branch must not
+        # stand in for. It is refused like any value that is not a branch
+        # name: the entry carries it under `refused_ref`, the repository is
+        # skipped and owed, and the ledger names it until the key is removed
+        # or filled. Only an absent key reads the default branch.
+        for empty in ("", "   "):
+            with self.subTest(ref=repr(empty)):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": empty}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": empty}],
+                        )
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(empty), joined)
+        # An absent key is the one spelling of "no pin".
+        context = json.dumps([{"type": "github", "url": "https://github.com/acme/terraform-live"}])
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "acme/terraform-live", "ref": None}],
+            )
+
+    def test_a_null_ref_is_refused_rather_than_read_as_no_pin(self):
+        # `"ref": null` is what a JSON-emitting template writes for an unset
+        # variable, at least as often as `""`, and the value it stands in
+        # for is the same lost pin. The key is present, so it is not the
+        # absent key that means "no pin": the entry carries the JSON
+        # spelling under `refused_ref`, the repository is skipped and owed,
+        # and the ledger names it until the key is removed or filled.
+        context = '[{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": null}]'
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(
+                    gitops_workspace.get_context_github_repo_entries(),
+                    [{"repo": "acme/terraform-live", "ref": None, "refused_ref": "null"}],
+                )
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["acme/terraform-live"])
+        joined = "\n".join(logs.output)
+        self.assertIn("Refusing ref", joined)
+        self.assertIn("'null'", joined)
+        self.assertIn("skips this repository", joined)
+
+    def test_a_ref_that_is_not_a_string_is_refused_rather_than_spelt_as_a_branch(self):
+        # `"ref": 123` or `"ref": false` is a template that emitted the wrong
+        # type, not a branch named `123` or `False`; `str()` on the value
+        # would have passed both through the shape check as pins. Only a
+        # string is a candidate, and the refused value keeps its JSON
+        # spelling in the warning and on the entry, as `null` does.
+        for raw, spelling in ((123, "123"), (False, "false"), (["main"], '["main"]')):
+            with self.subTest(ref=spelling):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": raw}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": spelling}],
+                        )
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(spelling), joined)
+
+    def test_a_non_github_entry_is_skipped_from_the_entries_too(self):
+        context = (
+            '[{"type": "gitlab", "url": "https://gitlab.com/acme/live", "ref": "main"}, '
+            '{"type": "github", "url": "https://github.com/acme/notes", "ref": "docs"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(
+                    gitops_workspace.get_context_github_repo_entries(),
+                    [{"repo": "acme/notes", "ref": "docs"}],
+                )
+        self.assertIn("no provider for type 'gitlab'", "\n".join(logs.output))
+
+    def test_a_ref_on_a_managed_entry_is_not_a_thing(self):
+        # Only the context list carries a branch pin: the managed list is what
+        # the push gate and the resolver read, and a pin there would claim
+        # something nothing downstream honours.
+        managed = '[{"type": "github", "url": "https://github.com/acme/fleet", "ref": "release"}]'
+        state_file = self.mount(managed_repos=managed, context_repos=self.CONTEXT)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_managed_repo_entries(),
+                [{"type": "github", "url": "https://github.com/acme/fleet"}],
+            )
+
+    def test_the_first_entry_for_a_slug_wins_ref_included(self):
+        context = (
+            '[{"type": "github", "url": "https://github.com/acme/live", "ref": "a"}, '
+            '{"type": "github", "url": "https://github.com/acme/live", "ref": "b"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "acme/live", "ref": "a"}],
+            )
+
+    def test_a_case_variant_duplicate_is_the_same_slug_and_keeps_the_first_ref(self):
+        # The readers key on the lowercased slug, so a second entry that
+        # differed only in case would overwrite the first's ref with its own:
+        # a pinned entry followed by an unpinned spelling read the repository
+        # at its default branch, and a refused pin followed by one was read
+        # rather than skipped.
+        context = (
+            '[{"type": "github", "url": "https://github.com/Acme/Live", "ref": "release-2026"}, '
+            '{"type": "github", "url": "https://github.com/acme/live"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "Acme/Live", "ref": "release-2026"}],
+            )
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["Acme/Live"])
+
+    def test_the_managed_list_keeps_two_spellings_of_one_slug_as_its_readers_compare_them(self):
+        # The fold above is the context list's: its readers key on the
+        # lowercased slug. The managed list's readers compare the spelling
+        # exactly (the `--repo` allowlists in `audit_report.py`,
+        # `submit_suggestion.py` and `pr_conversation.py`, the token scope
+        # in `github_token_refresh.py`), so folding that list would refuse
+        # a `--repo` spelt the way its second entry is. It dedups exactly,
+        # as it did before the context list existed.
+        managed = (
+            '[{"type": "github", "url": "https://github.com/Acme/Fleet"}, '
+            '{"type": "github", "url": "https://github.com/acme/fleet"}, '
+            '{"type": "github", "url": "https://github.com/acme/fleet"}]'
+        )
+        state_file = self.mount(managed_repos=managed)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(), ["Acme/Fleet", "acme/fleet"]
+            )
 
     def test_validate_repo_org_matching_primary_org(self):
         with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):

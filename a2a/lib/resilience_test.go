@@ -59,6 +59,14 @@ func (l *logCapture) contains(substr string) bool {
 	return false
 }
 
+// String is every line recorded so far, for a failure that wants to show what
+// the client actually logged rather than only that a substring was absent.
+func (l *logCapture) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
 // Assertion 19: the client survives a NATS server restart and resumes
 // delivery without a process restart. The reconnect here is nats.go's
 // transient path (NR-1): the same client object rides it out, nothing is

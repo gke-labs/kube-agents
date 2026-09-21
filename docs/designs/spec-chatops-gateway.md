@@ -89,8 +89,37 @@ One user turn is one A2A task. On each inbound chat message the gateway:
    `authority` block.
 3. Publishes `kind: message` to `a2a.tasks.{session}.{taskId}.in` - the session is the
    addressee - with the conversation's `contextId` and the authority block below.
-4. Subscribes to the task's events subject and relays status and artifact updates back
-   into the conversation.
+4. Subscribes to the task's `…events` and `…supervisor` subjects (one durable, both
+   filters) and relays status and artifact updates back into the conversation. Its own
+   supervisor terminals arrive through the same relay and retire the task exactly as an
+   executor's terminal does.
+
+   What that costs in grant terms, named because nothing else records it - and stated
+   backwards in an earlier draft of this section. A single filter subject rides the
+   CONSUMER.CREATE request SUBJECT (`…CREATE.<stream>.<name>.<filter>`, nats.go's
+   `apiConsumerCreateWithFilterSubjectT`); a filter LIST travels in the request BODY,
+   where no subject permission can see it. So the per-stream enumeration
+   `spec-nats-deployment.md` uses to take `web` off `$JS.API.>` -
+   `$JS.API.CONSUMER.CREATE.TASKS.>` - would PERMIT this relay, because the bare subject
+   matches. What such a grant cannot do is CONSTRAIN which subjects the durable ends up
+   reading. Narrowing the gateway the same way is therefore available and costs the relay
+   nothing; what it does not buy is any bound on the filters, and that is the honest
+   reason the gateway's consumer reach is still wide.
+
+   The form that does refuse a multi-filter consumer is the one that pins the filter into
+   the grant, and the session pod is ALREADY on it. `sessionGrants` issues three consumers
+   by exact name with the filter riding the CREATE subject, pinned to the pod's own `…in`
+   and `…events`; there is no supervisor filter among them and no unscoped
+   `CONSUMER.CREATE`, and the pod's only subscribe grant is its inbox. Pinning and
+   multi-filter are mutually exclusive by construction: the pin lives in the subject and
+   the list does not. So a session pod can create neither a supervisor-filtered consumer nor a
+   two-filter one, and cannot core-subscribe the subject either. `message/stream`'s "both
+   subjects" is unmeetable for it today, and the narrower consequence is already shipping:
+   the worker adapter's respawn check reads `…events` alone, so it cannot see a terminal
+   its own predecessor's supervisor declared. The consequence is the split's, not the
+   adapter's - on an install whose stream still holds pre-split supervisor terminals the
+   check does see them, and stops when that retention window passes. Closing this means one
+   more enumerated filter, not a wildcard.
 
 The backend-native message id is recorded against the `correlationId` in the gateway's
 ingress log, so the audit chain runs chat message -> correlationId -> every hop -> change.
@@ -238,10 +267,12 @@ no terminal to wait for, and the record carries an independent bound for each ra
 than a justification that assumes a terminal that may not come. The `ask` copy is
 cleared by the reap scan once it is older than `A2A_ASK_TTL` (24 hours by default,
 under the stream's retention, which is what the content posture below needs). A task
-with nothing on its events subject at all - no pod, or a pod that never ran - is
-released from the serialization at the conversation's next turn once it is older than
-the first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line
-in the conversation saying so. That release publishes no terminal: age alone is not
+with nothing on either of its event subjects - no pod, or a pod that never ran - is
+released from the serialization at the conversation's next turn once it is older than the
+first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
+conversation saying so. Both subjects, not just `…events`: the fold reads them together,
+and assertion 9 exists because a task whose only event is its supervisor's terminal is not
+empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. Otherwise the terminal event this chain
@@ -253,7 +284,9 @@ the supervisor rule below is what keeps that from being a silent stop.
 **One rule for every pod the gateway deletes itself** (stated once here because four
 paths reach it - reap, Sweep, Delegate, and any future one): if the pod is running a
 DETACHED task, the gateway publishes that task's terminal event before deleting, as
-the supervisor of the sessions it spawns. The state is `canceled`, not `failed`:
+the supervisor of the sessions it spawns - on the task's `…supervisor` subject, which
+only the gateway's grant reaches (the 9/9 split), never on its `…events`. The state is
+`canceled`, not `failed`:
 every task this rule reaches is detached, and detached means a `stop` already
 published a cancel, so the gateway is finishing the cancel the requester asked for
 rather than reporting an error. That keeps assertion 13's enumeration intact
@@ -268,8 +301,9 @@ the idle TTL from the last user message, so which fires first is a property of t
 independently tunable numbers, not a guarantee.
 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
-gateway replays the context's tasks from JetStream, folds them into a transcript primer,
-and hands it to the new pod as its first input. If the harness's own session file
+gateway replays the context's tasks from JetStream - `tasks/get`, which folds each
+task's `…events` and `…supervisor` together - into a transcript primer, and hands it to
+the new pod as its first input. If the harness's own session file
 happens to survive (it usually won't), `--resume` is a shortcut - correctness never
 depends on it; session files are cache, the stream is the record. Task-stream retention bounds how far
 back rehydration reaches (72h placeholder in the payload spec). I think that's a
@@ -278,7 +312,8 @@ that suddenly remembers June. If review disagrees, the fix is a compacted transc
 topic, not longer task retention.
 
 **Sweep**, as in the demo: a pod in a terminal phase whose task never emitted a final
-event gets a terminal event published by the gateway, then deleted. This is the
+event gets a terminal event published by the gateway on the task's `…supervisor`
+subject, then deleted. This is the
 gateway's half of the payload spec's orphaned-task answer - it is the supervisor for
 sessions it spawned; the dispatcher's janitor is the other half (settled 8/24). The
 state follows the same rule as every other supervisor publish below: `failed` for a
@@ -292,11 +327,16 @@ stopped, which is the distinction the rule exists to keep.
 
 The payload spec reserves two envelope fields and this doc names what goes in them.
 
-**`identity` stays empty.** It is the link-level field - the verified identity of the
-_publisher_, bound to the authenticated NATS connection. A server-stamped header was
-ruled out empirically (8/24); the remaining choice - signed claim vs subject-derived
-identity - belongs with the deployment spec's account design and the authority work.
-The gateway has no business writing it.
+**`identity` stays empty - permanently, as of 9/9.** It is the link-level field: the
+verified identity of the _publisher_, bound to the authenticated NATS connection. A
+server-stamped header was ruled out empirically (8/24), and the choice that was left
+open here - signed claim vs subject-derived identity - is now settled as
+subject-derived. The publisher is the principal the subject implies, because the
+subject's writer set is pinned by connect-time grants. There is nothing for a
+publisher to write into `identity` that a consumer would be right to read, so the
+field is not "unarmed pending a mechanism"; it is empty because the mechanism that
+replaced it puts the answer somewhere a publisher cannot reach. The gateway has no
+business writing it, and neither does anyone else.
 
 **`authority` is the request-level field, and the gateway populates it.** Who asked,
 verified how, in front of whom:
@@ -402,11 +442,19 @@ How `principal` gets established depends on the backend, and the three are not e
   full stop.
 
 **What advisory means, stated plainly:** the gateway verifies the requester at ingress,
-but until connection-bound publisher identity lands, nothing stops another bus client
-from publishing an envelope with an invented `authority` block. So consumers MUST NOT
-authorize on it yet. It is carried now for the audit trail and for parity testing, and
-it becomes decision-grade only when `identity` arms and the deployment spec's accounts
-pin who may publish to the task subjects.
+but nothing stops another bus client from publishing an envelope with an invented
+`authority` block. So consumers MUST NOT authorize on it yet. It is carried now for the
+audit trail and for parity testing.
+
+**Corrected 9/9: it does not become decision-grade "when `identity` arms."** `identity`
+never arms; see above. And subject-derived publisher identity, which did land for the
+task plane on 9/9, is not enough on its own either - it says which principal wrote the
+bytes, while `authority` claims which human asked. An executor writing its own
+`…events` subject is the legitimate writer of that subject and can still put any
+`authority` block it likes in the envelope. What `authority` needs is a rule binding
+the block to the one publisher entitled to originate it, on subjects only that
+publisher writes; that is the authority half of the consumer rule, and it is still
+owed.
 
 The payload spec has carried this rule since 0.3: `authority` is populate-by-gateway-only,
 consumers forbidden from deciding on it, libraries pass it through untouched.
@@ -473,10 +521,13 @@ The first real adapter, and the production ingress. What makes it that is the id
 property above: the sender email Google Chat asserts is the same string as the cloud
 principal and the RBAC subject, so there is no mapping table and no impersonation
 surface in one. Same string, not same enforcement yet: the email rides the authority block,
-which is advisory until publisher identity arms (the signed-claim-vs-subject-derived
-decision "Requester identity" above leaves with the deployment spec and the authority
-work) — nothing authorizes on it today, and when the requester does become
-enforceable, this adapter is already carrying the string that decision needs. What the adapter costs is inheriting the existing Chat
+and `authority.requester` is advisory — permanently so, as far as the envelope is
+concerned. The signed-claim-vs-subject-derived question this paragraph used to leave open
+was answered on 9/9, and the answer is subject-derived identity (Verified identity, in
+`spec-a2a-payloads.md`): a property of the subject a message arrived on, which says
+nothing about a chat sender. Making the requester enforceable is the capability
+envelope's job rather than `identity`'s. Nothing authorizes on the email today, and when
+that lands this adapter is already carrying the string it needs. What the adapter costs is inheriting the existing Chat
 integration's operational surface, and this section records how it sits on it.
 
 **Ingress topology: the existing app registration and topic, a dedicated A2A

@@ -72,6 +72,59 @@ jobs:
           cache: true
           cache-dependency-path: "k8s-operator/go.sum"
 
+      # `make test` fetches the envtest binaries from GitHub's release-asset
+      # CDN on every run of every operator pull request, and a 504 there failed
+      # this job on a change that contained no Go (#1603). Caching removes the
+      # fetch from the common path rather than making it more reliable; the
+      # retry in k8s-operator/Makefile's envtest-use macro covers the miss.
+      #
+      # The key carries the pinned Kubernetes version read from the Makefile
+      # that declares it, not a copy of the literal. The key decides hit or
+      # miss and nothing else -- `setup-envtest use` selects by exact version
+      # out of <bin-dir>/k8s/<version>-<os>-<arch>, so a wrong key cannot serve
+      # the wrong binaries, it just never hits and the cache quietly stops
+      # earning its keep.
+      - name: Resolve the pinned envtest Kubernetes version
+        if: steps.filter.outputs.operator == 'true'
+        id: envtest
+        # Assigned first, then written. `echo "k=$(cmd)"` keeps echo's exit
+        # status even under `bash -e`, so a failing make would write an empty
+        # value and collapse the key to `envtest-Linux-`; an assignment
+        # propagates the failure instead. The emptiness check covers a make that
+        # succeeds and prints nothing. It does not cover a make that prints too
+        # much, which is what --no-print-directory is for: -s does not suppress
+        # an explicit -w arriving through MAKEFLAGS, and the directory banner
+        # would make this a multi-line $GITHUB_OUTPUT value -- malformed, not
+        # merely wrong. Actions sets no MAKEFLAGS today; this is the same guard
+        # k8s-operator/Makefile's own recursive call carries.
+        run: |
+          version="$(make -C k8s-operator -s --no-print-directory envtest-k8s-version)"
+          if [ -z "$version" ]; then
+            echo "::error::envtest-k8s-version printed nothing; the cache key would carry no version."
+            exit 1
+          fi
+          echo "k8s-version=$version" >> "$GITHUB_OUTPUT"
+
+      # Restore everywhere, save only on main. A cache written on a pull-request
+      # ref is invisible to every other ref but still counts against one
+      # repository budget -- already over the 10 GB limit and evicting when this
+      # was written, which is why docker-build.yml restricts its own export the
+      # same way. So writes happen on merges only, and only on the merges the
+      # push paths filter admits. Not one writer per merge, though: a merge
+      # touching k8s-operator/Makefile runs this job and a2a-test.yml's
+      # together, and on the run that first populates a key both miss and both
+      # save it. The loser logs `Unable to reserve cache` and carries on. What
+      # is left is one ~166 MB entry that pull requests restore from their
+      # base. A miss is not a failure: it falls back to the retrying download
+      # this change also adds.
+      - name: Restore cached envtest binaries
+        if: steps.filter.outputs.operator == 'true'
+        id: envtest-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: k8s-operator/bin/k8s
+          key: envtest-${{ runner.os }}-${{ steps.envtest.outputs.k8s-version }}
+
       # `make -C k8s-operator test` depends on test-python, which discovers the
       # tests under agents/platform/scripts as well as the operator's own. Those
       # modules import fastapi, mcp and the rest at module scope, so without this
@@ -127,3 +180,18 @@ jobs:
       - name: Run Tests
         if: steps.filter.outputs.operator == 'true'
         run: make -C k8s-operator test
+
+      # The one writer, per the restore step's note. Gated on the restore having
+      # missed as well as on main, because actions/cache/save is unconditional
+      # where actions/cache skips a save it already has -- without the first
+      # clause every main push re-uploads 166 MB it already holds.
+      - name: Save envtest binaries to the cache
+        if: >-
+          steps.filter.outputs.operator == 'true'
+          && github.event_name == 'push'
+          && github.ref == 'refs/heads/main'
+          && steps.envtest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: k8s-operator/bin/k8s
+          key: envtest-${{ runner.os }}-${{ steps.envtest.outputs.k8s-version }}

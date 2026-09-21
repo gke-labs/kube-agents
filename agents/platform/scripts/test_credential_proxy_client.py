@@ -11,7 +11,9 @@ Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 import base64
 import io
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -786,6 +788,110 @@ class TestConnectTimeout(unittest.TestCase):
             if isinstance(handler, credential_proxy_client._BrokerHTTPHandler)
         ]
         self.assertEqual(1, len(handlers))
+
+
+class ApiSessionTest(unittest.TestCase):
+    """The requests-shaped session that sends a Google API read through the broker."""
+
+    ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    URL = "https://monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries"
+
+    class FakeHttp:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, *, params=None, headers=None, timeout=None):
+            self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
+            return "upstream-response"
+
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        token_file = directory / "token"
+        token_file.write_text("caller-token\n", encoding="utf-8")
+        environ = {
+            "CREDENTIAL_PROXY_URL": self.ENDPOINT + "/",
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(token_file),
+        }
+        patcher = patch.dict(os.environ, environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.http = self.FakeHttp()
+
+    def test_get_rewrites_the_url_and_keeps_params_timeout_and_the_caller_token(self):
+        session = credential_proxy_client.ApiSession(http=self.http)
+        params = {"filter": 'metric.type="kubernetes.io/container/cpu/core_usage_time"', "pageSize": 1000}
+        self.assertEqual("upstream-response", session.get(self.URL, params=params, timeout=120))
+        self.assertEqual(
+            [{
+                "url": f"{self.ENDPOINT}/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries",
+                "params": params,
+                "headers": {"Authorization": "Bearer caller-token"},
+                "timeout": 120,
+            }],
+            self.http.calls,
+        )
+        self.assertEqual(credential_proxy_client.authorization_headers(), self.http.calls[0]["headers"])
+
+    def test_the_relay_prefix_is_the_shared_constant(self):
+        session = credential_proxy_client.ApiSession(http=self.http)
+        self.assertEqual(
+            f"{self.ENDPOINT}{credential_proxy_client.API_RELAY_PREFIX}monitoring.googleapis.com/v3/x",
+            session.relay_url("https://monitoring.googleapis.com/v3/x"),
+        )
+
+    def test_a_query_written_into_the_url_is_kept(self):
+        session = credential_proxy_client.ApiSession(http=self.http)
+        session.get(self.URL + "?pageToken=abc%3D%3D&pageSize=10")
+        self.assertTrue(self.http.calls[0]["url"].endswith("/timeSeries?pageToken=abc%3D%3D&pageSize=10"))
+        self.assertIsNone(self.http.calls[0]["params"])
+        self.assertIsNone(self.http.calls[0]["timeout"])
+
+    def test_an_explicit_endpoint_wins_and_loses_its_trailing_slash(self):
+        session = credential_proxy_client.ApiSession("http://127.0.0.1:8765///", http=self.http)
+        self.assertEqual(
+            "http://127.0.0.1:8765/v1/gcp/monitoring.googleapis.com/v3/x",
+            session.relay_url("https://monitoring.googleapis.com/v3/x"),
+        )
+
+    def test_no_broker_url_is_a_clear_error(self):
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
+            with self.assertRaises(RuntimeError) as raised:
+                credential_proxy_client.ApiSession(http=self.http)
+        self.assertIn("CREDENTIAL_PROXY_URL", str(raised.exception))
+
+    def test_a_missing_caller_token_fails_the_call_not_the_construction(self):
+        session = credential_proxy_client.ApiSession(http=self.http)
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_TOKEN_FILE": "/nonexistent/token"}):
+            with self.assertRaises(credential_proxy_client.TokenUnavailable):
+                session.get(self.URL)
+        self.assertEqual([], self.http.calls)
+
+    def test_the_default_transport_is_a_requests_session(self):
+        try:
+            import requests
+        except ImportError:  # pragma: no cover - environment without requests
+            self.skipTest("requests is not installed here; the sandbox image has it")
+        session = credential_proxy_client.ApiSession()
+        self.assertIsInstance(session._http, requests.Session)
+
+    def test_the_module_imports_where_requests_is_absent(self):
+        # `requests` is imported inside ApiSession, not at module scope: the
+        # broker and every other importer of this module must not need it.
+        script = (
+            "import sys; sys.modules['requests'] = None; "
+            "import credential_proxy_client as c; "
+            "s = c.ApiSession('http://b', http=object()); print(s.relay_url('https://h/p'))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(Path(__file__).parent),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("http://b/v1/gcp/h/p", completed.stdout.strip())
 
 
 if __name__ == "__main__":

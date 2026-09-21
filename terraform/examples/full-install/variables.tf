@@ -20,9 +20,15 @@ variable "cluster_mode" {
 }
 
 variable "create_cluster" {
-  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled and enforce NetworkPolicy (Dataplane V2 or the legacy Calico addon); the module refuses the plan otherwise."
+  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled and enforce NetworkPolicy (Dataplane V2 or the legacy Calico addon); the module refuses the plan otherwise, the NetworkPolicy half unless accept_no_network_policy is set."
   type        = bool
   default     = true
+}
+
+variable "accept_no_network_policy" {
+  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's — is accepted by the API server and enforced by nothing. The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
+  type        = bool
+  default     = false
 }
 
 variable "location" {
@@ -268,6 +274,17 @@ variable "model_default_name" {
   description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts)."
   type        = string
   default     = ""
+}
+
+variable "model_max_tokens" {
+  description = "Output tokens the LiteLLM gateway asks the provider for on a request that names none, rendered as max_tokens under every model_list alias; 0 leaves the key out. For a self-hosted backend whose prompt and output share one window. What it does and does not cap: the site's inference-gateway page, \"Setting the output-token budget\"."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.model_max_tokens >= 0 && floor(var.model_max_tokens) == var.model_max_tokens
+    error_message = "model_max_tokens must be a whole number of tokens, 0 or more."
+  }
 }
 
 variable "api_server_key" {

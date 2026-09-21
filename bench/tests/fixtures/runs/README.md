@@ -46,9 +46,11 @@ console links. It is replaced by a short placeholder. Nothing else in any of
 the five is altered.
 
 The redaction is safe because `output` is one of the 21 keys on the record that
-no scorer code reads: the ladder reads `scores`, `status`, `trajectory`,
-`tokens`, `latency`, `verification_report` and `verification_parse_errors`, and
-nothing else. The placeholder is deliberately **non-empty** and deliberately
+no rung reads: the ladder reads `scores`, `status`, `trajectory`, `tokens`,
+`latency`, `verification_report` and `verification_parse_errors`, and nothing
+else (`bench-gate case` quotes `output`'s first 300 characters into the build
+log for a failing repetition, which the placeholder serves as well as the
+original did). The placeholder is deliberately **non-empty** and deliberately
 does **not** contain the phrase `devops-bench smoke probe`, so it stays
 consistent with that record's `report-states-the-probe-title: fail`, and so
 `test_rung_3_ignores_an_empty_output` — which blanks `output` and asserts the

@@ -259,6 +259,7 @@ What to report in each case:
 - `silent_ok: true` — `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the ledger issue closed as completed and every open remediation PR for this stream closed with it; on `UPDATED` the ledger was rewritten but nothing moved. Dispatched on demand, say which in one line and give the issue URL.
 - `status: "CLEAN"` with `resolved: > 0` — every capacity gap this ledger tracked has been closed. Report the issue URL and the count.
 - `status: "CLEAN"` with `partial: true` — nothing reproduced, but the ledger and its PRs stayed open because the coverage was incomplete. One line, the clean result plus the `coverage_gaps`, then stop.
+- `status: "HELD"` — zero findings, but the ledger stayed open because the run did not account for findings it was carrying (`start` listed them under `carried`; `unaccounted` names the ones held): one line reporting the clean result, the held ids and the issue URL, then stop. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
 - Any other outcome — reply with **one line**: counts by severity, new vs. resolved, skipped-cluster count if any, remediation PRs opened or closed, and the `issue_url`.
 
 ## Red Lines

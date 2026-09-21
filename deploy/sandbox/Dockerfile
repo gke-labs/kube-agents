@@ -72,9 +72,9 @@ RUN apt-get update && \
 # command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
 # it could not run even if a skill asked for it. Nothing in agents/ does.
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -sSLf -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
+    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
-    curl -sSLf -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
     rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
@@ -91,7 +91,9 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Not the google-cloud or kubernetes clients, which are the bulk of what is left
 # there. Both authenticate before they are useful and the sandbox holds no
 # credential for either to find, so they would import and then fail; a skill
-# needing one goes through the wrapped CLIs, which is the whole arrangement.
+# needing one goes through the wrapped CLIs, or through the broker's read-only
+# Cloud API relay (`credential_proxy_client.ApiSession`, over `requests`)
+# for the REST reads no CLI exposes, which is the whole arrangement.
 RUN pip install --no-cache-dir pyyaml requests
 
 # A real git with no credential and no way to reach a host.

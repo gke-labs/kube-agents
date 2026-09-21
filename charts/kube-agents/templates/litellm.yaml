@@ -106,7 +106,7 @@
   "model-default", but a caller that names the harness ("hermes-agent") or the
   concrete model gets routed rather than a 404 from the gateway.
 */}}
-{{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks) }}
+{{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the rule file and the
   two modules are subPath mounts too, so an edit to any of them has to roll
@@ -185,6 +185,9 @@ spec:
         # the subPath mount below means nothing else will deliver it.
         checksum/config: {{ $checksumInput | sha256sum }}
     spec:
+      {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.litellm.topologySpread | default dict).enabled "replicas" .Values.litellm.replicaCount "selectorLabels" "app: litellm")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}
       {{- end }}

@@ -24,6 +24,10 @@ hard enum — add new types by PR):
 | `escalation`        | A cross-tier request not yet a change |
 | `observation`       | A durable finding worth sharing       |
 
+An entry of any type may also carry `declares:`, a list of `{check, namespace, object}` items (plus
+`cluster` for a one-cluster choice) naming a posture the `obtainability-audit` stream lists under
+_Declared intent_ instead of reporting (`../README.md`, "Declared intent").
+
 ## Entries
 
 - [Standard GKE cluster blueprint](cluster-blueprint/standard-gke.md) — `cluster-blueprint`
