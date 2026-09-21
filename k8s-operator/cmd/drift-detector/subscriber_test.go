@@ -160,7 +160,8 @@ func TestProcessBatchNacksUndecodableMessage(t *testing.T) {
 // On SIGTERM the loop's context is already cancelled by the time the batch it
 // was working on has to be settled. Settling on that context would abort every
 // ack, and the whole batch -- already handled -- would be redelivered to the
-// next instance. At T4 that is a duplicate inject on every restart.
+// next instance. With --daemon-url set that is a duplicate inject on every
+// non-graceful restart, which the in-memory insertId set cannot suppress.
 func TestProcessBatchSettlesAfterContextCancelled(t *testing.T) {
 	source := &fakeSource{recordCtxErr: true}
 	sub := newSubscriber(source, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
@@ -191,7 +192,7 @@ func TestProcessBatchSettlesAfterContextCancelled(t *testing.T) {
 // since T3 the handler does a network lookup per record. Without a bound on the
 // batch, a slow control plane holds a hundred messages past the deadline and
 // Pub/Sub redelivers the batch this process is still working on -- duplicate
-// drift lines now, a duplicate inject per cycle at T4. The guard is the deadline
+// drift lines, and a duplicate inject per cycle. The guard is the deadline
 // on the context the handler is given, so that is what this asserts: not that
 // the lookups are fast, but that they cannot run unbounded.
 func TestProcessBatchBoundsHandlingWithABudget(t *testing.T) {

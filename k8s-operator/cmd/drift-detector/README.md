@@ -15,7 +15,8 @@ why this is a Pub/Sub consumer and not an informer like its sibling
 
 Ingestion, classification, the `managedFields` join, and the inject: pull, parse, assign a tier,
 forward the records that represent a real human change, enrich each with what the live object says
-owns the fields, and post the result to the core-agent daemon as a `gitops-drift` inject. Nothing
+owns the fields, and post the result to the core-agent daemon — `session_kv_server.py`, the Session
+KV server, which the sibling event watcher posts to under the same name — as a `gitops-drift` inject. Nothing
 builds this binary into an image and nothing launches it, so reaching that pipeline is something an
 operator does by hand today and no installation detects drift on its own.
 
@@ -31,9 +32,12 @@ to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `ins
 remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
 after the handler returns, redelivery is ordinary rather than exceptional: the detector remembers
 the last few thousand `insertId`s it has injected and suppresses a repeat before opening a second
-session, so one redelivered batch does not page a human twice for one change. A climbing
-`duplicate=` count in the shutdown tally is a sign the ack deadline is too tight, not that the
-cluster is busy.
+session, so one redelivered batch does not page a human twice for one change. That set is in memory
+and per-process, which leaves one case uncovered: a non-graceful exit leaves its batch unacked, and
+the next instance starts with an empty set and injects those records again. A climbing `duplicate=`
+count in the shutdown tally is a sign the ack deadline is too tight, not that the cluster is busy.
+Climbing alongside `failed=` means something else — a record is marked seen before its send, so a
+failed inject is not retried on redelivery either.
 
 What the daemon does with the payload is
 [`session_kv_server.py`](../../../agents/platform/scripts/session_kv_server.py)'s half: it routes on
@@ -60,6 +64,30 @@ clusters.
 ```bash
 go run ./k8s-operator/cmd/drift-detector --project "$PROJECT_ID"
 ```
+
+With escalation on, which is off unless you ask for it:
+
+```bash
+# The token is passed by the *name* of the variable holding it, never by value:
+# a flag is visible in the process table and in this binary's own startup line.
+export SESSION_KV_API_KEY=$(kubectl get secret platform-agent-secrets \
+  -n kubeagents-system -o jsonpath='{.data.SESSION_KV_API_KEY}' | base64 --decode)
+
+go run ./k8s-operator/cmd/drift-detector \
+  --project "$PROJECT_ID" \
+  --in-cluster \
+  --daemon-url http://127.0.0.1:8699 \
+  --token-env SESSION_KV_API_KEY \
+  --owner drift-detector
+```
+
+**The daemon is loopback-only**, and that decides where this binary can run. `docker-entrypoint.sh`
+starts it with `--host 127.0.0.1 --port 8699`, so `--daemon-url` has nothing to point at from
+outside the agent Pod's network namespace. For a local run against a real install, forward the port
+first — `kubectl port-forward -n kubeagents-system <agent-pod> 8699:8699`, which only works where the
+install does not sandbox the pod. For a deployed one, the detector has to be a container in that Pod;
+nothing builds or launches it there yet, which is why the flag defaults to empty and the inject is
+off.
 
 Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
 agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
@@ -107,7 +135,7 @@ addressed and one that was and refused.
 | `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                             |
 | `--daemon-url`            | empty                            | Core-agent daemon to post the `gitops-drift` inject to, without a trailing slash. Empty disables the inject: records are still classified, joined and logged, and nothing is escalated.                                                                               |
 | `--token-env`             | empty                            | **Name** of the environment variable holding the daemon's bearer token, not the token. Required with `--daemon-url`, and an error without it — a flag value is visible in the process table.                                                                          |
-| `--owner`                 | empty                            | `X-Asserted-Caller` for the session the inject opens. Must be one of the daemon's `proxy_identities` or it rejects the call.                                                                                                                                          |
+| `--owner`                 | empty                            | `X-Asserted-Caller` for the session the inject opens. Sent and logged, not authorised: `POST /sessions` is guarded by the bearer token alone and stamps its own metadata. Set it anyway, so the value is on the wire before anything starts checking it.              |
 
 ## Classification
 
@@ -456,6 +484,20 @@ other lookup error: the records that would have reached a `GET` come out `failed
 acked, while a delete or a foreign-cluster record is unaffected, since both are settled before the
 context is consulted. Adding retries, a second `GET`, or a per-record backoff means re-checking
 that arithmetic.
+
+**The inject spends that same budget, and it is the slowest thing in it.** With `--daemon-url` set,
+a surviving record makes two more calls after the join — `POST /sessions` then
+`POST /sessions/<id>/inject` — each with its own ten-second client timeout and one retry behind a
+250ms delay. Worst case for a single record is therefore around forty seconds against a
+thirty-second default, so the batch deadline, not the client timeout, is what actually stops it:
+both calls are built with `http.NewRequestWithContext` on the handler's context, so a hung daemon
+cannot overrun the budget, it can only consume all of it on record one. What the operator sees when
+that happens is a batch of `failed` **lookups** — every later record's `GET` returning a deadline
+error — which reads identically to a slow control plane and is not. Check the inject tally on the
+shutdown line before blaming the API server, and turn the inject off with an empty `--daemon-url`
+to tell the two apart. Sizing the budget for an install with the inject on means budgeting for the
+daemon's latency as well as the control plane's; issue #1768 tracks giving each record its own
+budget so one slow dependency cannot starve the rest of the batch.
 
 For the budget to be the bound, it has to be the only one, and client-go supplies a second by
 default: a `rest.Config` that leaves `QPS` unset gets 5 requests a second with a burst of 10, and

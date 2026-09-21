@@ -100,7 +100,7 @@ const (
 	// settles only after every record in it has been handled: at the 100-message
 	// default a batch of slow lookups would run for far longer than any ack
 	// deadline, and Pub/Sub would redeliver the whole batch while this process
-	// was still working on it -- producing duplicate drift lines, and at T4 a
+	// was still working on it -- producing duplicate drift lines, and a
 	// duplicate inject per cycle, for as long as the control plane stayed slow.
 	//
 	// Thirty seconds is half the drift-pubsub module's 60-second deadline,
@@ -141,8 +141,9 @@ const (
 	// settleGracePeriod bounds the ack and nack calls issued while shutting
 	// down. The pull loop's context is already cancelled by then, so settling
 	// on it would abort: up to maxMessages records would be handled and then
-	// redelivered to the next instance, which at T4 is a duplicate inject per
-	// restart.
+	// redelivered to the next instance. The insertId set that suppresses a
+	// duplicate inject is in memory and per-process, so this is the one case it
+	// does not cover: a duplicate inject per non-graceful restart.
 	settleGracePeriod = 10 * time.Second
 )
 
@@ -226,8 +227,8 @@ type messageSource interface {
 //
 // Moving to StreamingPull would replace that cap with deadline extension, and
 // becomes worth the dependency if handling ever grows past what one budget can
-// hold -- a per-record inject at T4, or a fan-in doing several clusters' lookups
-// per record.
+// hold -- the per-record inject now behind --daemon-url, or a fan-in doing
+// several clusters' lookups per record.
 type pubsubSource struct {
 	service      *pubsub.Service
 	subscription string
@@ -330,9 +331,9 @@ func (p *pubsubSource) Nack(ctx context.Context, ackIDs []string) error {
 	return nil
 }
 
-// recordHandler consumes one parsed audit record. T4 injects behind this
-// signature; what ships behind it today is driftFilter.Handle, which classifies
-// and then forwards what survives to the T3 join.
+// recordHandler consumes one parsed audit record. What ships behind it is
+// driftFilter.Handle, which classifies and then forwards what survives to the
+// join, whose own terminal handler logs and -- with --daemon-url set -- injects.
 //
 // The context is derived from the pull loop's, so a handler doing network I/O
 // -- which the join does, one lookup per forwarded record -- is interrupted by

@@ -374,9 +374,14 @@ INJECT_KIND_DRIFT = "gitops-drift"
 # budget whatever produced them.
 #
 # The cost is worth naming: a node storm that spends the Warning budget also
-# silences drift for the rest of the day. `GET /v1/alert-quota` is where that
-# shows up, and every silenced record is still written to the ledger below, so
-# the daily recap can report it.
+# silences drift for the rest of the day, and the detector has already marked
+# that record's insertId seen, so it will not be re-offered. `GET
+# /v1/alert-quota` is where the count shows up. The silenced record itself is
+# written to the ledger below and goes no further: the event watcher's daily
+# recap excludes drift rows, and it never names a withheld alert in any case.
+# Recovering what was lost means querying `intercepted_events` directly. That is
+# thin, and it is the argument for giving drift its own recap rather than for
+# reaching into the watcher's.
 DRIFT_SEVERITY_LABEL = "Warning"
 
 # Distinct from the 🟡 `get_severity_details` returns for a Warning event, so
@@ -401,6 +406,22 @@ DRIFT_JOIN_ENRICHED = "enriched"
 # alternative renders as `prod//` and reads like a bug in the alert rather than
 # a gap in the record.
 DRIFT_UNKNOWN_FIELD = "unknown"
+
+# How many of one manager's field paths the card names before summarising the
+# rest as a count. The payload carries them all on purpose — an agent deciding
+# which fields to revert wants the whole claim — but this rendering goes
+# somewhere else: into a prompt the front door is told to copy verbatim, and
+# from there into a kanban card body a human reads. A GitOps controller
+# routinely owns more than two hundred paths on one Deployment, and three or
+# four such managers would put tens of kilobytes of `spec.template...` into both,
+# read by nobody.
+#
+# Twelve matches the cap the detector already applies to its own log line
+# (`maxReportedPaths` in `ownership.go`), so the card and the DRIFT line
+# summarise to the same width. The count that follows is what tells the reader
+# the list was cut rather than that the manager owns only twelve; the full set
+# is in the inject payload for anything that needs it.
+DRIFT_MAX_RENDERED_PATHS = 12
 
 
 def init_db() -> None:
@@ -1465,7 +1486,13 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
         paths = [path for path in (owner.get("paths") or []) if isinstance(path, str)]
 
         qualifiers = ", ".join(part for part in (operation, updated_at) if part)
-        owns = ", ".join(f"`{path}`" for path in paths) if paths else "no recorded paths"
+        if paths:
+            shown = paths[:DRIFT_MAX_RENDERED_PATHS]
+            owns = ", ".join(f"`{path}`" for path in shown)
+            if len(paths) > len(shown):
+                owns += f", and {len(paths) - len(shown)} more"
+        else:
+            owns = "no recorded paths"
         lines.append(f"  - `{manager}`{f' ({qualifiers})' if qualifiers else ''} owns {owns}")
 
     return "\n".join(lines)
@@ -2547,8 +2574,12 @@ def _inject_drift(
     cannot, because an audit entry is delivered once and its `insertId` is
     already marked as seen by the time this replies. So a drift record refused
     by the ceiling is gone from chat for good. The ledger row below is written
-    for exactly that case — it is the only place the record survives, and the
-    daily recap is where someone sees it.
+    for exactly that case, and is the only place the record survives — but
+    nothing reports it today: the event watcher's daily recap excludes drift
+    rows deliberately, since every number it prints is labelled as the watcher's.
+    Recovering a suppressed drift record means querying `intercepted_events`.
+    Worth fixing with a drift recap of its own; worth not papering over by
+    folding the rows into a report that would mislabel them.
     """
     resource = _drift_resource(payload)
     summary = _drift_summary(payload)

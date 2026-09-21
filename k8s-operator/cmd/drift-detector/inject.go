@@ -23,6 +23,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -30,9 +31,14 @@ import (
 const (
 	// injectKindDrift is stamped on every payload this binary sends, and is the
 	// string a playbook skill matches to tell a drift inject from the event
-	// watcher's. Fixed by docs/designs/drift-detection.md and by the AutoOps
-	// architecture's domain table, both of which name it in prose -- changing it
-	// here alone would leave the pipeline receiving a kind nothing routes.
+	// watcher's. This declaration and INJECT_KIND_DRIFT in
+	// agents/platform/scripts/session_kv_server.py are one decision in two
+	// languages: the daemon dispatches on this exact string, so changing it here
+	// alone leaves the detector sending a kind nothing routes, and the records
+	// are acked. A test on the Python side reads this line and asserts the two
+	// agree, which is what makes the pair a check rather than a convention.
+	// docs/designs/drift-detection.md and the AutoOps architecture's domain table
+	// name it in prose and follow these two, not the other way round.
 	injectKindDrift = "gitops-drift"
 
 	// sessionsPath and injectPathSuffix compose the two daemon endpoints. The
@@ -92,14 +98,37 @@ const (
 	// window measured in thousands of records is far wider than it needs to be.
 	seenInsertIDsCap = 4096
 
+	// schemeHTTP and schemeHTTPS are the only two --daemon-url may carry. Named
+	// because they are compared against rather than printed.
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+
 	// httpStatusServerErrorFloor is the first 5xx. At or above it the daemon is
 	// reporting its own failure rather than rejecting the request, which is the
 	// only class of status worth sending again.
 	httpStatusServerErrorFloor = 500
 
-	// ownerPathSeparator joins the field paths of one ownership claim in the
-	// payload's rendered path list.
-	ownerPathSeparator = ","
+	// summaryListSeparator joins the field managers named in the one-line
+	// summary. Not the payload's field paths, which travel as a JSON array and
+	// are never flattened into a string on this side.
+	summaryListSeparator = ","
+
+	// perRecordInjectBudget caps what one record's escalation may spend. The
+	// handler's context is the batch's shared join budget -- thirty seconds by
+	// default, for up to a hundred records -- and without a sub-budget a single
+	// unresponsive daemon spends all of it on the first survivor: both calls
+	// time out at defaultInjectTimeout, the retry adds two more, and the
+	// arithmetic exceeds the whole batch's allowance before record two is
+	// reached. Every record behind it then fails its lookup on an expired
+	// context and is acked anyway, so one slow dependency costs the batch its
+	// escalations and its joins together.
+	//
+	// Five seconds is a ceiling, not a target: a healthy daemon answers both
+	// calls in milliseconds, and the value only decides how many consecutive
+	// slow records it takes to exhaust the batch. It does not remove the
+	// coupling -- per-record budgets for the whole handler are the real fix,
+	// tracked separately -- it bounds the blast radius from one record to six.
+	perRecordInjectBudget = 5 * time.Second
 )
 
 // DriftInjectPayload is the JSON this binary posts as the inject message. Field
@@ -238,6 +267,23 @@ func newDriftInjector(cfg driftInjectorConfig) (*driftInjector, error) {
 	}
 	if strings.HasSuffix(cfg.daemonURL, "/") {
 		return nil, fmt.Errorf("inject: daemonURL must not end with '/' (got %q)", cfg.daemonURL)
+	}
+	// Whether the URL is a URL is as much a startup-time fact as whether the
+	// token variable is set, and it fails in the same shape if it is not
+	// checked here: --daemon-url=localhost:8699 parses, starts, logs that
+	// injects are enabled, and then fails every call on an unsupported scheme
+	// for as long as the process runs. url.Parse alone is too permissive to
+	// catch it -- that string parses, with "localhost" read as the scheme -- so
+	// the scheme and host are checked by name.
+	parsed, err := url.Parse(cfg.daemonURL)
+	if err != nil {
+		return nil, fmt.Errorf("inject: daemonURL is not a URL (got %q): %w", cfg.daemonURL, err)
+	}
+	if parsed.Scheme != schemeHTTP && parsed.Scheme != schemeHTTPS {
+		return nil, fmt.Errorf("inject: daemonURL must start with %s:// or %s:// (got %q)", schemeHTTP, schemeHTTPS, cfg.daemonURL)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("inject: daemonURL has no host (got %q)", cfg.daemonURL)
 	}
 	if cfg.bearerToken == "" {
 		return nil, errors.New("inject: bearerToken is required")
@@ -483,6 +529,16 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 		return
 	}
 
+	// Marked seen before the send, not after, so a record whose inject failed
+	// is not retried on redelivery either. The alternative loses more than it
+	// saves: the case it would rescue (a failed send whose batch is then
+	// redelivered, reachable because Ack is best-effort and a non-graceful exit
+	// leaves the batch unacked) is rarer than the case it would break, where
+	// the daemon acted and only the response was lost, and a human is paged
+	// twice for one change. A record lost this way is still on stdout as a
+	// DRIFT line, which is what makes the trade survivable; a run whose
+	// duplicate count and failure count climb together is the shape to look
+	// for.
 	record := event.Record
 	if !h.seen.Add(record.InsertID) {
 		// Logged rather than silent: a run whose duplicate count is climbing is
@@ -493,7 +549,13 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 		return
 	}
 
-	status, err := h.send(ctx, payloadForEvent(event))
+	// Derived from the handler's context rather than replacing it, so a SIGTERM
+	// or an exhausted batch budget still cuts the escalation short: this caps
+	// what one record may take out of the batch, it does not buy it more.
+	injectCtx, cancelInject := context.WithTimeout(ctx, perRecordInjectBudget)
+	defer cancelInject()
+
+	status, err := h.send(injectCtx, payloadForEvent(event))
 	if err != nil {
 		h.counts.Failed++
 		// insert_id is named because it is what the operator searches Cloud
@@ -519,6 +581,15 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 // failure this retries on can be either call: a session created against a
 // daemon that then fell over is not a session the second attempt can inject
 // into.
+//
+// The cost is that the retry is not idempotent when it is Inject rather than
+// CreateSession that failed. The first session is abandoned on the daemon, and
+// the second attempt re-enters the drift route from the top -- so a 5xx raised
+// after the daemon had already claimed its alert quota and written its ledger
+// row spends a second unit of the day's budget and writes a second row for one
+// insert_id. Accepted because the daemon does little between those steps and
+// its response, and because the alternative -- reusing a session whose daemon
+// may have restarted underneath it -- fails more often and less visibly.
 func (h *driftInjectHandler) send(ctx context.Context, payload DriftInjectPayload) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt <= injectRetries; attempt++ {
@@ -638,5 +709,5 @@ func ownerManagers(owners []fieldOwner) string {
 	for _, owner := range owners {
 		names = append(names, owner.Manager)
 	}
-	return strings.Join(names, ownerPathSeparator+" ")
+	return strings.Join(names, summaryListSeparator+" ")
 }

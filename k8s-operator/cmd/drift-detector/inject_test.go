@@ -212,9 +212,10 @@ func TestInjectSendsAGitopsDriftPayload(t *testing.T) {
 	}
 }
 
-// Both calls have to be authorised and attributed, and the asserted caller has
-// to be a header rather than a payload field: the daemon checks it against
-// proxy_identities before it reads a body.
+// Both calls have to be authorised and attributed. The bearer token is what the
+// daemon actually enforces; the asserted caller is a header rather than a
+// payload field so that it is readable before a body is parsed, which is what
+// would let the daemon start checking it without either side changing shape.
 func TestInjectAuthorisesBothCalls(t *testing.T) {
 	daemon, url := newFakeDaemon(t)
 	handler := handlerAgainst(t, url)
@@ -572,6 +573,15 @@ func TestNewDriftInjectorRejectsABadEndpoint(t *testing.T) {
 		{"no URL", driftInjectorConfig{bearerToken: "t"}},
 		{"a trailing slash", driftInjectorConfig{daemonURL: "http://daemon:8699/", bearerToken: "t"}},
 		{"no token", driftInjectorConfig{daemonURL: "http://daemon:8699"}},
+		// The scheme cases are the ones that would otherwise start cleanly and
+		// fail every call for the life of the process. url.Parse accepts
+		// "daemon:8699" with "daemon" as the scheme, so parsing alone does not
+		// catch it.
+		{"no scheme", driftInjectorConfig{daemonURL: "daemon:8699", bearerToken: "t"}},
+		{"a host and port with no scheme at all", driftInjectorConfig{daemonURL: "127.0.0.1:8699", bearerToken: "t"}},
+		{"a scheme this client cannot speak", driftInjectorConfig{daemonURL: "ftp://daemon:8699", bearerToken: "t"}},
+		{"a scheme but no host", driftInjectorConfig{daemonURL: "http://", bearerToken: "t"}},
+		{"not a URL", driftInjectorConfig{daemonURL: "http://[", bearerToken: "t"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := newDriftInjector(tc.cfg); err == nil {
@@ -700,5 +710,56 @@ func TestRealMainRejectsAnEmptyTokenVariable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "DRIFT_DAEMON_TOKEN") {
 		t.Errorf("error = %q, want it to name the variable that is unset", err)
+	}
+}
+
+// One unresponsive daemon must not cost the whole batch. Every record in a
+// batch shares one join budget, and before the per-record sub-budget a single
+// hung inject could spend all of it: two calls at defaultInjectTimeout each,
+// twice over for the retry, against a thirty-second default. The records behind
+// it would then fail their lookups on an expired context and be acked anyway.
+//
+// The assertion is on the shared context surviving, not on the wall clock: what
+// broke was that the batch had nothing left, and what fixes it is that the
+// handler returns with budget to spare.
+func TestOneHungInjectDoesNotSpendTheWholeBatchBudget(t *testing.T) {
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-blocked:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	inject, err := newDriftInjector(driftInjectorConfig{daemonURL: srv.URL, bearerToken: "t"})
+	if err != nil {
+		t.Fatalf("newDriftInjector returned error: %v", err)
+	}
+	handler := newDriftInjectHandler(inject)
+
+	// The batch's budget, as processBatch builds it.
+	batchBudget := 30 * time.Second
+	batchCtx, cancel := context.WithTimeout(context.Background(), batchBudget)
+	defer cancel()
+
+	start := time.Now()
+	handler.Handle(batchCtx, DriftEvent{Record: AuditRecord{InsertID: "hung-1"}})
+	spent := time.Since(start)
+
+	if batchCtx.Err() != nil {
+		t.Fatalf("one hung inject exhausted the batch's shared budget after %s; "+
+			"every later record in the batch would fail its lookup and be acked", spent)
+	}
+	// The cap covers the retry too, so the whole escalation fits in one budget
+	// rather than one per attempt.
+	if spent >= batchBudget {
+		t.Fatalf("one record spent %s of a %s batch budget", spent, batchBudget)
+	}
+	if handler.Counts().Failed != 1 {
+		t.Errorf("failed count = %d, want 1: a timed-out inject is a failure, not a silent drop",
+			handler.Counts().Failed)
 	}
 }

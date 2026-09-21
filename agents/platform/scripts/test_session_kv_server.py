@@ -1,3 +1,4 @@
+import copy
 import importlib
 import json
 import os
@@ -3978,6 +3979,41 @@ class TestDriftInject(unittest.TestCase):
         card = session_kv_server._drift_task_body(self._payload())
         self.assertIn("kubectl/v1.31.0", card)
         self.assertIn("self-declared", card)
+
+    def test_a_controllers_whole_field_list_does_not_land_in_the_card(self):
+        """A GitOps controller owns hundreds of paths; the card names a few.
+
+        The payload carries them all deliberately — an agent deciding what to
+        revert wants the whole claim — but this rendering goes into a prompt
+        the front door is told to copy verbatim and from there into a card body
+        a person reads. Unbounded, one Deployment edit is tens of kilobytes of
+        `spec.template...` in both.
+        """
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        paths = [f"spec.template.spec.containers.field{n}" for n in range(200)]
+        payload["owners"] = [
+            {"manager": "flux", "operation": "Apply", "paths": paths}
+        ]
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        cap = session_kv_server.DRIFT_MAX_RENDERED_PATHS
+        self.assertIn(paths[cap - 1], block, "the cap dropped a path it should have kept")
+        self.assertNotIn(paths[cap], block, "the path list was not capped")
+        # The count is what stops the reader concluding flux owns twelve fields.
+        self.assertIn(f"and {len(paths) - cap} more", block)
+
+    def test_a_short_field_list_is_shown_whole_with_no_count(self):
+        """The cap must not announce itself on a claim it did not cut."""
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        payload["owners"] = [
+            {"manager": "kubectl-edit", "operation": "Update", "paths": ["spec.replicas"]}
+        ]
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        self.assertIn("`spec.replicas`", block)
+        self.assertNotIn("more", block)
 
     def test_the_kind_constant_matches_the_detector(self):
         """One decision in two languages; the Go side is the other half."""

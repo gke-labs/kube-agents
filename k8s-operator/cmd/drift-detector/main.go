@@ -26,9 +26,9 @@
 // the live object -- on the cluster this process holds credentials for, and on
 // every cluster in the project that has a Cluster Agent profile under
 // --profiles-dir. A record naming a cluster in neither is still forwarded, and
-// counted unreachable. T4 posts what survives to the core-agent daemon as a
-// gitops-drift inject, which is where the pipeline the design describes takes
-// over: session, agent, chat, human approval, GitOps PR.
+// counted unreachable. With --daemon-url set, what survives is posted to the
+// core-agent daemon as a gitops-drift inject, which is where the pipeline the
+// design describes takes over: session, agent, chat, human approval, GitOps PR.
 //
 // The inject is off unless --daemon-url is set, and off is the default. No
 // image builds or launches this binary yet, so reaching that pipeline is
@@ -116,8 +116,12 @@ type flags struct {
 	// startup line prints its configuration. Required once daemonURL is set.
 	tokenEnv string
 
-	// owner is the X-Asserted-Caller the session is attributed to. It has to be
-	// in the daemon's proxy_identities for the call to be accepted.
+	// owner is the X-Asserted-Caller the session is attributed to. The daemon
+	// does not read that header today: POST /sessions is guarded by the bearer
+	// token alone and stamps its own metadata. It is sent so the value is on
+	// the wire and in the daemon's request log from the first release, which is
+	// what makes turning it into an authorisation check later a daemon-side
+	// change rather than a flag day across both binaries.
 	owner string
 
 	// kubeconfig and inCluster select how the join reaches the live object.
@@ -182,7 +186,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.tokenEnv, "token-env", "",
 		"Name of the environment variable holding the daemon's bearer token. Required with --daemon-url. The variable's name rather than its value, because a flag is visible in the process table.")
 	fs.StringVar(&f.owner, "owner", "",
-		"X-Asserted-Caller for the session the inject opens. Must be one of the daemon's proxy_identities or it rejects the call.")
+		"X-Asserted-Caller for the session the inject opens. Sent and logged, but not authorised against anything today: the daemon guards POST /sessions with the bearer token alone.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "",
 		"Path to a kubeconfig for the cluster whose live objects the join reads. An operator-supplied path for local runs, not a discovery mechanism. Mutually exclusive with --in-cluster; with no --profiles-dir either, the join is disabled.")
 	fs.BoolVar(&f.inCluster, "in-cluster", false,

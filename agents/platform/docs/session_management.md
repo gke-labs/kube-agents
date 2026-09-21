@@ -18,7 +18,7 @@ It binds loopback rather than `0.0.0.0` because it has exactly four callers and 
 2. **Dynamic Thread Resolution:** Captures the Chat API message ID returned from the first alert, saving it as the persistent thread key.
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
-5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. Informational events are held back from chat and reported as a count by the daily recap.
+5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector writes to the same table under its own `reason`; see [the second producer](#the-second-producer-gitops-drift). Informational events are held back from chat and reported as a count by the daily recap.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
 7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports` and gives the Chat Agent one turn to present it, so a scheduled finding lands in a thread the Chat Agent can answer follow-up questions about. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
@@ -27,7 +27,7 @@ It binds loopback rather than `0.0.0.0` because it has exactly four callers and 
 
 The session lands on the front door and cannot land anywhere else. Hermes selects a profile by URL prefix (`POST /p/<profile>/api/sessions`), only when `gateway.multiplex_profiles` is enabled — it is off by default and this install does not set it — and only against that profile's own `API_SERVER_KEY`. A `profile` key in the request body is accepted with a `201` and dropped, so it looks like routing and is not. Routing is therefore a prompt, not a parameter.
 
-`_build_agent_query` writes that prompt for the front door, and it is addressed to a router rather than to a diagnostician: make exactly one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report.
+`_build_agent_query` writes that prompt for the front door — for an event; a `gitops-drift` inject is routed to its own builder at the top of the same function — and it is addressed to a router rather than to a diagnostician: make exactly one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report.
 
 Delivery is the card itself. Hermes subscribes every card to the session it was filed from, and posts a subscribed card's `result` to chat when it turns terminal — so the Cluster Agent finishes with `kanban_complete` and nothing else, and the report reaches the thread the alert was raised in. The body's whole job on that point is to insist the entire report goes in `result`, since `result` is verbatim what the reader sees.
 
@@ -42,6 +42,8 @@ The session id is therefore the thread key, and `session_metadata` records the `
 Deduplication bounds how often _one_ failure is reported. It does nothing about many _distinct_ failures at once — a node draining or a namespace collapsing produces a hundred unrelated pods, each a legitimately new incident. The ceiling is the backstop for that case.
 
 `inject_message` classifies severity (`get_severity_details`), applies the [severity gate](#severity-gate), and then spends one of that severity's daily allowance before anything is posted or any agent turn is started. This is the only place both actions pass through, and severity is not known any earlier — `POST /sessions` carries no payload.
+
+A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It draws on the same `Warning` bucket, deliberately — the ceiling bounds the messages one person reads in a day, and that reader has one budget whatever produced them. The consequence is that a node storm spending the `Warning` budget silences drift for the rest of the day.
 
 | Severity   | Env var                      | Default |
 | ---------- | ---------------------------- | ------- |
@@ -68,10 +70,40 @@ Behaviour worth knowing before relying on it:
 - **Suppression is silent.** Nothing is posted to say the ceiling was reached — announcing it would spend a message to say no more messages are coming. The consequence is that once the cap bites, a quiet channel no longer distinguishes "nothing is wrong" from "the budget is spent", so the accounting lives outside chat: every suppressed alert is counted in `alert_quota`, logged at `WARNING` with the workload it dropped, and readable from `GET /v1/alert-quota`.
 - **The counter is fleet-wide,** not per cluster. One collapsing cluster can therefore exhaust the day's budget for every other cluster.
 - **It fails open.** If the quota table cannot be read or written, the alert goes through. A ceiling is a comfort feature and must never be the reason an incident is withheld.
-- **The suppressed alert is still acknowledged** to the watcher with `200 {"status": "suppressed"}`, rather than an error code. A 4xx or 5xx would land in `k8s_event_watcher_inject_errors_total`, which exists to say the daemon is broken; refusing an alert over a configured ceiling is it working. The watcher reads the body, drops its dedup entry and re-offers the workload on its next sighting — deliberately, because the entry's window is 24h and this ceiling resets at 00:00 UTC, so keeping it would mute the workload long after the reason for it expired. The price is a session row per re-offer until the day rolls over.
+- **The suppressed alert is still acknowledged** to the producer with `200 {"status": "suppressed"}`, rather than an error code. A 4xx or 5xx would land in `k8s_event_watcher_inject_errors_total`, which exists to say the daemon is broken; refusing an alert over a configured ceiling is it working. The watcher reads the body, drops its dedup entry and re-offers the workload on its next sighting — deliberately, because the entry's window is 24h and this ceiling resets at 00:00 UTC, so keeping it would mute the workload long after the reason for it expired. The price is a session row per re-offer until the day rolls over. **The drift detector cannot do any of that**, and the asymmetry matters: an audit entry is delivered once, and its `insertId` is marked seen before the reply is read, so a refused drift record is not re-offered on any later sighting. It is lost from chat for the day. The ledger row is the only place it survives, and nothing reports it — the recap below is the event watcher's and excludes drift rows. A `suppressed` reply therefore means "try again later" to one producer and "this change was never escalated" to the other.
 - **The budget survives restarts,** because it is on the `system-metadata` PVC rather than in memory. A crash-looping session server would otherwise hand out a fresh day's quota on every restart, which is precisely the condition the cap exists for.
 - **The day boundary is UTC midnight,** not the operator's local midnight.
 - **The severity gate runs first, and only alerts that survive it are billed.** A budget is a count of alerts sent, so an event that was never going to be posted must not spend one. Claiming first would bill the `Info` bucket for every suppressed image-pull `BackOff` and leave `GET /v1/alert-quota` reporting a day's worth of alerts nobody received. It cannot starve a real alert of its budget — anything graded `Warning` or `Critical` draws on a different bucket from the `Info` churn — so this ordering is bookkeeping, not a safety property.
+
+### The second producer: `gitops-drift`
+
+Everything above describes the k8s-event-watcher, which was the only thing posting to
+`/sessions/{id}/inject` until the drift detector
+([`k8s-operator/cmd/drift-detector/`](../../../k8s-operator/cmd/drift-detector/README.md)) started
+sending a second kind. The route dispatches on the payload's `kind`: `gitops-drift` takes its own
+branch, and everything else is an event and behaves exactly as described above. Nothing about the
+event path changed.
+
+What the drift branch does differently:
+
+- **It skips the severity classifier and the gate.** There is no `Event.Type` to grade and no
+  informational tier to hold back — the detector's own classifier already dropped everything it
+  judged to be automation rather than a person, upstream of this route. Every record that arrives
+  here is graded `Warning`.
+- **Its `suppressed` is terminal,** for the reason the bullet above gives.
+- **It writes its own chat line and its own kanban card,** through a second query builder
+  (`_drift_agent_query`) and a second body (`_drift_task_body`). The question is different: an event
+  says Kubernetes is unhappy and asks for a root cause; a drift record says someone changed a live
+  object outside git and asks whether the declared or the live state should win. The card is
+  addressed to the agent for the cluster _the change was made on_, which after the detector's
+  multi-cluster fan-in is not necessarily the cluster the detector runs in.
+- **Its ledger rows carry `reason = 'OutOfBandChange'`,** which is what keeps them out of the event
+  watcher's daily recap.
+
+The detector reaches this server the same way the watcher does — over loopback, with the
+`SESSION_KV_API_KEY` bearer token — which means it has to run inside this Pod's network namespace.
+No image builds or launches it today, so the inject has no in-cluster producer yet; the flag exists
+and the route accepts it.
 
 ---
 
@@ -183,7 +215,7 @@ CREATE TABLE incidents(
 
 #### `intercepted_events`
 
-One row per event the watcher forwards, whether or not it was announced in chat. `notified` is what
+One row per event the watcher forwards, whether or not it was announced in chat, plus one per drift record the detector sends. Drift rows are told apart by `reason = 'OutOfBandChange'`, and the daily recap excludes them: every number it prints is labelled as the watcher's. Everything below describes the watcher's rows. `notified` is what
 lets the `eod-event-watcher-daily-report` cron job report suppressed informational events as a
 number instead of losing them; the watcher's own dedup snapshot cannot substitute, because it is a
 rolling window of _active_ incidents keyed by `(uid, reason)`, carries no namespace or workload
@@ -236,7 +268,9 @@ so every pod of one Deployment shares a `workload`, a `namespace` and a `reason`
 the alerts the daily ceiling withheld, and those two cases are indistinguishable without it — one
 pod re-offered all afternoon writes many rows for one lost alert, while forty replicas failing at
 once write rows that look the same and are forty. It is the watcher's own dedup key
-(`involvedObject.uid`), which the payload has always carried; the daemon simply did not store it.
+(`involvedObject.uid`), which the payload has always carried; the daemon simply did not store it. A
+drift row puts the audit entry's Cloud Logging `insertId` here, which plays the same role for the
+detector — the one field that separates two rows describing the same object.
 A payload without one records `''`, since this pod cannot guess another pod's UID. Rows expire on the same 14-day TTL as the rest of the
 database, and on a row cap besides — see "Two bounds, not one":
 
@@ -246,7 +280,7 @@ CREATE TABLE intercepted_events(
   cluster     TEXT NOT NULL DEFAULT '',
   namespace   TEXT NOT NULL DEFAULT '',
   workload    TEXT NOT NULL DEFAULT '',
-  object_uid  TEXT NOT NULL DEFAULT '',  -- the involved object's UID; `workload` has its replica suffix stripped
+  object_uid  TEXT NOT NULL DEFAULT '',  -- the involved object's UID, or an audit `insertId` for a drift row
   object_kind TEXT NOT NULL DEFAULT '',
   reason      TEXT NOT NULL DEFAULT '',
   message     TEXT NOT NULL DEFAULT '',
