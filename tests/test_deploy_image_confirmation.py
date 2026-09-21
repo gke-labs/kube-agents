@@ -11,6 +11,7 @@ script fails loudly when its own inputs are wrong, rather than exiting 0
 having read nothing.
 """
 
+import hashlib
 import os
 import pathlib
 import re
@@ -325,17 +326,44 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
 
+    @staticmethod
+    def _operator_name(prefix, plugin, limit):
+        """buildPluginStagingContainerName / buildPluginVolumeName, mirrored."""
+        name = prefix + plugin
+        if len(name) > limit:
+            digest = hashlib.sha256(plugin.encode()).hexdigest()[:8]
+            name = name[: limit - 9] + "-" + digest
+        return name
+
     def test_a_truncated_staging_container_name_still_finds_its_plugin(self):
-        long_name = "a-plugin-with-a-very-long-name-that-the-operator-truncates-to-63"
+        """Past 35 characters the operator cuts stage-<name> and appends a hash."""
+        plugin = "a-plugin-with-a-very-long-name-that-gets-hashed"
+        entry = self._operator_name("stage-", plugin, 35)
+        self.assertNotEqual(entry, "stage-" + plugin)
         result = self._run(
             f"""
             platform-agent={_GHCR}/platform-agent:{_TAG}
-            stage-{long_name[:50]}={_GHCR}/pubsub-platform:{_OLD}
+            {entry}={_GHCR}/pubsub-platform:{_OLD}
             """,
-            plugin_releases=f"{long_name}=standalone",
+            plugin_releases=f"{plugin}=standalone",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Not judged", result.stdout)
+
+    def test_a_truncated_volume_name_still_finds_its_plugin(self):
+        """Past 63 characters the operator cuts plugin-<name> the same way."""
+        plugin = "a-plugin-whose-name-is-long-enough-that-its-volume-name-passes-sixty-three"
+        entry = self._operator_name("plugin-", plugin, 63)
+        self.assertNotEqual(entry, "plugin-" + plugin)
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            {entry}={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            plugin_releases=f"{plugin}=kube-agents",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"{entry}: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
 
     def test_a_volume_without_an_image_reference_is_not_counted(self):
         result = self._run(

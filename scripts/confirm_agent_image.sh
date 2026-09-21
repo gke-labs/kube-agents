@@ -143,6 +143,13 @@ readonly JSONPATH='{range .spec.template.spec.initContainers[*]}{.name}={.image}
 # all, as before.
 readonly PLUGIN_INIT_PREFIX="stage-"
 readonly PLUGIN_VOLUME_PREFIX="plugin-"
+# The operator's own naming, mirrored from buildPluginStagingContainerName
+# and buildPluginVolumeName in the controller: a name past the limit is cut
+# and given "-" plus the first eight hex characters of sha256(plugin name).
+# The staging limit is the Autopilot container-name limit (35).
+readonly PLUGIN_INIT_MAX_LEN=35
+readonly PLUGIN_VOLUME_MAX_LEN=63
+readonly PLUGIN_NAME_HASH_LEN=8
 readonly AGENT_RELEASE_JSONPATH='{range .items[*]}{.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
 readonly PLUGIN_RELEASE_JSONPATH='{range .items[*]}{.metadata.name}={.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
 
@@ -179,32 +186,47 @@ is_release_image() {
   grep -qxF "$segment" <<<"$release_names"
 }
 
-# The Helm release of the AgentPlugin a plugin entry comes from, by the entry's
-# name (stage-<plugin> or plugin-<plugin>; the init container name may be cut
-# to 63 characters, hence the prefix match as the fallback). Empty when the
-# plugin, or its annotation, is not found.
+# The first eight hex characters of sha256 of a plugin name, as the operator
+# computes them. sha256sum on Linux, shasum on macOS.
+plugin_name_hash() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$1" | sha256sum)"
+  else
+    digest="$(printf '%s' "$1" | shasum -a 256)"
+  fi
+  printf '%s' "${digest:0:${PLUGIN_NAME_HASH_LEN}}"
+}
+
+# The entry name the operator gives a plugin, for one prefix and its limit:
+# "<prefix><plugin>" whole when it fits, else its first (limit - 9)
+# characters, "-", and the hash.
+plugin_entry_name() {
+  local prefix="$1" plugin="$2" max_len="$3" name cut_len
+  name="${prefix}${plugin}"
+  if [ "${#name}" -gt "$max_len" ]; then
+    cut_len=$((max_len - PLUGIN_NAME_HASH_LEN - 1))
+    name="${name:0:${cut_len}}-$(plugin_name_hash "$plugin")"
+  fi
+  printf '%s' "$name"
+}
+
+# The Helm release of the AgentPlugin a plugin entry comes from, found by
+# building each AgentPlugin's staging container and volume names the way the
+# operator does and comparing. Empty when no AgentPlugin produces the entry.
 plugin_release_of() {
-  local entry="$1" plugin pname prelease
+  local entry="$1" pname prelease
   case "$entry" in
-    "$PLUGIN_INIT_PREFIX"*) plugin="${entry#"$PLUGIN_INIT_PREFIX"}" ;;
-    "$PLUGIN_VOLUME_PREFIX"*) plugin="${entry#"$PLUGIN_VOLUME_PREFIX"}" ;;
+    "$PLUGIN_INIT_PREFIX"* | "$PLUGIN_VOLUME_PREFIX"*) ;;
     *) return 0 ;;
   esac
   while IFS='=' read -r pname prelease; do
     [ -n "$pname" ] || continue
-    if [ "$pname" = "$plugin" ]; then
+    if [ "$entry" = "$(plugin_entry_name "$PLUGIN_INIT_PREFIX" "$pname" "$PLUGIN_INIT_MAX_LEN")" ] ||
+      [ "$entry" = "$(plugin_entry_name "$PLUGIN_VOLUME_PREFIX" "$pname" "$PLUGIN_VOLUME_MAX_LEN")" ]; then
       echo "$prelease"
       return 0
     fi
-  done <<<"$plugin_releases"
-  while IFS='=' read -r pname prelease; do
-    [ -n "$pname" ] || continue
-    case "$pname" in
-      "$plugin"*)
-        echo "$prelease"
-        return 0
-        ;;
-    esac
   done <<<"$plugin_releases"
 }
 
