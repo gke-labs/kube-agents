@@ -46,6 +46,50 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `stall-watch` reads the fleet and reports only what changed
+
+`stall-watch` is a `no_agent` script that delivers a report, like
+`kanban-board-health`, and not a poller: it files no card and wakes no model.
+Every thirty minutes it lists the project's clusters and, for every namespace of
+every running or reconciling cluster that is not a system namespace, runs the
+Cluster Agent's `stall_report.py` over a bounded list of controller kinds. It
+keeps a ledger of the rows it has already announced and prints one bullet per
+object when the object first appears and when its last row clears, plus a
+cluster or namespace it could not read and one it can read again. A stall that
+lasts a week is announced once, and a clean tick prints nothing. A namespace or
+cluster the tick could not read keeps its rows; one that is gone from the
+listing clears them at once; a `repeating-warnings` row, which exists only while
+its event recurred inside the script's window, clears only after two consecutive
+scans without it, so a warning that comes back every hour does not flap in and
+out of chat. A cluster listing gcloud itself calls incomplete clears no row for a cluster absent from it,
+and a sweep stops at a wall-clock budget short of the schedule and reports what
+it did not reach, because Hermes kills a script that runs an hour and a ledger
+never written is a tick that never happened.
+
+Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
+through `sandbox_exec`, because the agent container carries no kubectl (with the
+sandbox switched off the calls run locally and fail with `No such file or
+directory: 'gcloud'`, the same failure every `sandbox_exec` caller sees in that
+state). The script itself
+travels on the command's stdin, read from the agent image's copy in
+`/opt/defaults/scripts` and run with `python3 -I -`: what the `hermes` login
+executes is never a file under the sandbox's agent-owned `/opt/data`, and
+isolated mode keeps that directory, which is the command's working directory,
+off the module path, so a `json.py` the model dropped there is not the code that
+runs. The per-cluster kubeconfigs stay in `/home/hermes/.kubeconfigs`, where
+`platform_mcp_server.py` keeps its own, under a prefix of their own. The kind
+list is `DEFAULT_KINDS` in the script and is not operator-configurable on this
+release: `STALL_WATCH_KINDS` replaces it for a run started by hand in the pod
+(`all` hands `stall_report.py` its every-kind default), but the operator's env
+allowlist does not carry it, so a value on the CR's `spec.deployment.env` never
+reaches the script. The k8s-event-watcher and this job split the work by signal:
+a Warning whose reason is on the watcher's list is the watcher's within seconds;
+a condition, a reference or an event the list never names is this job's within
+the half hour. It declares `risk: high` because what it relays into chat is event
+text and object names from every namespace of every cluster in the project, the
+management cluster included, which is the untrusted-input case the tier contract
+below names.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
