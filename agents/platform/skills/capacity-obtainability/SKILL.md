@@ -181,8 +181,10 @@ Facts the probe rests on, verified against the live API — do not guess past
 them:
 
 - **The API counts chips, not nodes.** A v5e host carries 4 chips, so 64
-  nodes is `--chip-count=256`. State the conversion you applied and record
-  both numbers in the evidence, so a reader can check the arithmetic.
+  nodes is `--chip-count=256`. State the conversion arithmetic in the
+  report body itself — "64 nodes × 4 chips per host = 256 chips" — and
+  record both numbers in the evidence, so a reader can check the
+  arithmetic without opening the probe.
 - **The minimum reservable window is one day.** A `--duration-range` under
   `min=1d` returns `CONDITIONS_NOT_MET` ("The time window is too short") in
   every zone. Reserve the day and run the job inside it: the job's own
