@@ -706,6 +706,8 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("5 polling rounds", self.content)
         self.assertIn("ready", self.content)
         self.assertIn("timed out", self.content)
+        # Must acknowledge configurable concurrency (spec.harness.tuning.maxInProgress) rather than assuming a static cap
+        self.assertIn("spec.harness.tuning.maxInProgress", self.content)
         # Must define that blocked or failed probes do not count as a match
         self.assertRegex(
             self.content,
