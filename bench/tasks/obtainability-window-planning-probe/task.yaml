@@ -59,7 +59,10 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - "gcloud beta compute advice calendar-mode .*--tpu-version[ =]V5E"
+        # gcloud enum flags accept lowercase values, and a live run was
+        # observed passing --tpu-version v5e -- the check pins the probe and
+        # its arithmetic, not the letter case of an enum.
+        - "gcloud beta compute advice calendar-mode .*--tpu-version[ =][Vv]5[Ee]"
         - "advice calendar-mode .*--chip-count[ =]64"
   - name: report-states-the-chip-conversion
     role: objective
