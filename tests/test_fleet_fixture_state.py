@@ -149,6 +149,12 @@ def _future(days: int = 30) -> str:
 def _cluster_b(*, master: str = "1.33.4-gke.1134000", channel: str | None = "REGULAR", end=None, scope="NO_MINOR_UPGRADES") -> dict:
     doc = {
         "currentMasterVersion": master,
+        # The no-surge pool as `clusters describe` reports it; the
+        # readiness-surge-blocked role asserts on maxUnavailable here.
+        "nodePools": [
+            {"name": "default-pool", "upgradeSettings": {"maxSurge": 1}},
+            {"name": "no-surge-pool", "upgradeSettings": {"maxUnavailable": 1}},
+        ],
         "maintenancePolicy": {
             "window": {
                 "maintenanceExclusions": {
@@ -189,10 +195,13 @@ def _healthy_world() -> dict:
             # upgrade settings alone.
             "node?cloud.google.com/gke-nodepool=no-surge-pool": {"items": [_node(taint=None)]},
             "namespace/seeded-upgrade": {"metadata": {"name": "seeded-upgrade"}},
-            "deployment/pinned-batch-runner": {"status": {"readyReplicas": 2, "replicas": 2}},
-            "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None)),
+            "deployment/pinned-batch-runner": {
+                "spec": {"template": {"spec": {"nodeSelector": {"seeded-role": "no-surge"}}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
             "validatingwebhookconfiguration/seeded-fail-closed-gate": {
-                "webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail"}]
+                "webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30}]
             },
         },
         "describe": {
@@ -533,13 +542,17 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["describe"]["seeded-b"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "1 not checked" in done.stderr
+        assert "2 not checked" in done.stderr
+        # Two, not one: readiness-surge-blocked reads the same cluster
+        # document for its pool's upgrade settings, so an unreadable cluster
+        # takes it out of the run rather than drifting it.
         assert "version-laggard" not in self.drift_files()
+        assert "readiness-surge-blocked" not in self.drift_files()
 
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "8 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
+        assert "7 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):

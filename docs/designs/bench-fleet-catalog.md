@@ -104,11 +104,11 @@ the fleet could already show was a workload that resists eviction — `obtainabi
 PodDisruptionBudget checks, on slot `a`. What it could not show is the two cases where the drain
 never begins:
 
-| Role                           | What it plants                                                                                                                   |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `readiness-surge-blocked`      | A node pool with `max_surge: 0`, so an upgrade removes its only node rather than adding a replacement first                      |
-| `readiness-pinned-workload`    | A Deployment whose `nodeSelector` names that pool alone, so its pods have nowhere to go when it drains                           |
-| `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` with `failurePolicy: Fail` and no `timeoutSeconds`, pointing at a Service that does not exist |
+| Role                           | What it plants                                                                                                                                            |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `readiness-surge-blocked`      | A node pool with `max_surge: 0`, so an upgrade removes its only node rather than adding a replacement first                                               |
+| `readiness-pinned-workload`    | A Deployment whose `nodeSelector` names that pool alone, so its pods have nowhere to go when it drains                                                    |
+| `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` with `failurePolicy: Fail` and the API's maximum 30-second `timeoutSeconds`, pointing at a Service that does not exist |
 
 The first two are a pair, and that is the point: the surge setting alone is a configuration, and
 joining it to what actually runs there is an outage. A case can ask whether the agent made that

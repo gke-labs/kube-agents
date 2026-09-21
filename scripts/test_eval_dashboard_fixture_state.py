@@ -198,6 +198,9 @@ def _cluster_b():
     return {
         "currentMasterVersion": "1.33.4-gke.1134000",
         "releaseChannel": {"channel": "REGULAR"},
+        # The no-surge pool as `clusters describe` reports it; the
+        # readiness-surge-blocked role asserts on maxUnavailable here.
+        "nodePools": [{"name": "default-pool", "upgradeSettings": {"maxSurge": 1}}, {"name": "no-surge-pool", "upgradeSettings": {"maxUnavailable": 1}}],
         "maintenancePolicy": {"window": {"maintenanceExclusions": {"hold-the-minor-lag": {"startTime": "2026-09-01T00:00:00Z", "endTime": _future(), "maintenanceExclusionOptions": {"scope": "NO_MINOR_UPGRADES"}}}}},
     }
 
@@ -227,9 +230,12 @@ def healthy_world(*projects):
             # while they are healthy.
             "namespace/seeded-upgrade": {"metadata": {"name": "seeded-upgrade"}},
             "node?cloud.google.com/gke-nodepool=no-surge-pool": {"items": [{"spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
-            "deployment/pinned-batch-runner": {"status": {"readyReplicas": 2, "replicas": 2}},
+            "deployment/pinned-batch-runner": {
+                "spec": {"template": {"spec": {"nodeSelector": {"seeded-role": "no-surge"}}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
             "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
-            "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail"}]},
+            "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30}]},
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},

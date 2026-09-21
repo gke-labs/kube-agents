@@ -193,6 +193,13 @@
           "op": "any_eq",
           "value": "True",
           "why": "The pool's upgrade settings are readable from the GKE API whether or not its node is up, but the pinned workload below can only be Running if the node is, and the finding these two fixtures exist for is the pair. A NotReady node makes the workload Pending for a reason that is not the fixture"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='no-surge-pool')].upgradeSettings.maxUnavailable",
+          "op": "any_eq",
+          "value": 1,
+          "why": "the defect itself, as far as clusters describe exposes it: the pool upgrades by taking its only node away. Raising maxSurge back to 1 heals the fixture while every probe still passes, which is what this assertion exists to catch. maxSurge = 0 is the other half and is deliberately not asserted yet -- whether the API emits the zero or omits it is unconfirmed against a live apply, and an assertion guessed wrong leaves the role permanently drifted"
         }
       ]
     },
@@ -202,7 +209,7 @@
       "probes": [
         "deployment/pinned-batch-runner"
       ],
-      "fixture": "pinned-batch-runner Deployment, nodeSelector seeded-role=no-surge, so its pods run only on the pool that cannot surge and have nowhere to go when it drains",
+      "fixture": "pinned-batch-runner Deployment (one replica), nodeSelector seeded-role=no-surge, so its pod runs only on the pool that cannot surge and has nowhere to go when it drains",
       "state": [
         {
           "subject": "pod?app=pinned-batch-runner",
@@ -210,6 +217,13 @@
           "op": "any_eq",
           "value": "Running",
           "why": "The defect is that these pods have nowhere else to go, which is only true while they are somewhere. Pods already Pending carry no information about what a drain would do to them"
+        },
+        {
+          "subject": "deployment/pinned-batch-runner",
+          "path": "spec.template.spec.nodeSelector.seeded-role",
+          "op": "eq",
+          "value": "no-surge",
+          "why": "the pin is the defect. Drop the selector and the pod schedules onto the default pool, where a drain of the no-surge pool costs it nothing -- the fixture is healed and every probe still passes"
         }
       ]
     },
@@ -219,7 +233,7 @@
       "probes": [
         "validatingwebhookconfiguration/seeded-fail-closed-gate"
       ],
-      "fixture": "seeded-fail-closed-gate ValidatingWebhookConfiguration, failurePolicy Fail with no timeoutSeconds, pointing at a Service that does not exist; confined by namespaceSelector to seeded-upgrade so it cannot reject writes for unrelated scenarios",
+      "fixture": "seeded-fail-closed-gate ValidatingWebhookConfiguration: failurePolicy Fail with the API's maximum 30-second timeout, pointing at a Service that does not exist, confined by namespaceSelector to seeded-upgrade",
       "state": [
         {
           "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
@@ -227,6 +241,13 @@
           "op": "any_eq",
           "value": "Fail",
           "why": "Fail-closed is the whole defect: the same webhook with failurePolicy Ignore stalls no drain, so a run that read it as Ignore would be asserting against an object that is no longer the fixture"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
+          "path": "webhooks[*].timeoutSeconds",
+          "op": "any_eq",
+          "value": 30,
+          "why": "the second half of the defect. An omitted timeout is defaulted to 10 by the API server, so the long wait is only present while it is set explicitly, and a check that grades how long a drain can stall has nothing to read if someone drops it"
         }
       ]
     }
