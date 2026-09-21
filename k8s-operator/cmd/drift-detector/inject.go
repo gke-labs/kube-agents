@@ -56,9 +56,13 @@ const (
 	contentTypeHeader    = "Content-Type"
 	contentTypeJSON      = "application/json"
 
-	// defaultInjectTimeout bounds one HTTP call to the daemon. Matches the event
-	// watcher's, and is per-call rather than per-event: a drift inject is two
-	// calls, so the worst case an event contributes is twice this.
+	// defaultInjectTimeout bounds one HTTP call to the daemon, and matches the
+	// event watcher's. It is no longer what bounds a record's escalation:
+	// perRecordInjectBudget below is smaller and is derived from the handler's
+	// context, so in the shapes that matter -- an unresponsive daemon, a hung
+	// connection -- the budget expires first and this ceiling is never reached.
+	// It still bounds a call the budget does not cover, which is any call made
+	// outside Handle.
 	defaultInjectTimeout = 10 * time.Second
 
 	// errorBodyLimit caps how much of a failed response is quoted into the log.
@@ -170,7 +174,14 @@ type DriftInjectPayload struct {
 
 	// Timestamp is when the change was made, not when it was injected. The two
 	// differ by the sink's export lag plus however long this batch waited.
-	Timestamp time.Time `json:"timestamp"`
+	//
+	// A string rather than a time.Time so that "not recorded" can be sent as
+	// empty. A zero time.Time marshals to 0001-01-01T00:00:00Z, and the card
+	// renders whatever arrives here as the change's "When", so an audit entry
+	// with no usable timestamp would tell the reader the change was made in
+	// year one -- a fact, confidently stated, that is not one. Empty takes the
+	// renderer's unknown-field path instead.
+	Timestamp string `json:"timestamp"`
 
 	// InsertID is Cloud Logging's id for the audit entry: the key this binary
 	// deduplicates on, and the string to search the log with to find the entry
@@ -621,6 +632,15 @@ func (h *driftInjectHandler) Counts() injectCounts {
 	return h.counts
 }
 
+// formatAuditTimestamp renders a change's time for the payload, sending a zero
+// time as empty rather than as year one. See DriftInjectPayload.Timestamp.
+func formatAuditTimestamp(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 // payloadForEvent flattens a DriftEvent into the wire payload.
 func payloadForEvent(event DriftEvent) DriftInjectPayload {
 	record := event.Record
@@ -635,7 +655,7 @@ func payloadForEvent(event DriftEvent) DriftInjectPayload {
 		UserAgent:  record.UserAgent,
 		Verb:       record.Verb,
 		MethodName: record.MethodName,
-		Timestamp:  record.Timestamp,
+		Timestamp:  formatAuditTimestamp(record.Timestamp),
 		InsertID:   record.InsertID,
 		Resource: DriftInjectResource{
 			Group:       record.Resource.Group,

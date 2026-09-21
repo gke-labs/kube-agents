@@ -487,7 +487,27 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 	handleCtx, cancelHandle := context.WithTimeout(ctx, s.joinBudget)
 	defer cancelHandle()
 
-	for _, msg := range messages {
+	for i, msg := range messages {
+		// A cancelled *parent* context is SIGTERM: the process is going away.
+		// That is not the same as handleCtx expiring, which is the join budget
+		// running out and is handled below by forwarding the record anyway --
+		// there, the work still happens and the DRIFT line is still written.
+		// Here nothing can happen: the join fails instantly on a dead context,
+		// the inject fails with it, and the record is acked regardless, so
+		// every surviving human change left in the batch loses its escalation
+		// with no redelivery. Nacking returns them to the subscription for the
+		// next instance, which is what a rolling restart needs. settleCtx
+		// deliberately outlives the cancellation, so this nack is delivered.
+		if ctx.Err() != nil {
+			for _, unhandled := range messages[i:] {
+				nackIDs = append(nackIDs, unhandled.AckID)
+			}
+			log.Printf("drift-detector: shutting down mid-batch; returned %d of %d message(s) "+
+				"to the subscription unhandled rather than acking them undelivered",
+				len(messages)-i, len(messages))
+			break
+		}
+
 		record, err := parseAuditEntry(msg.Data)
 		switch {
 		case err == nil:

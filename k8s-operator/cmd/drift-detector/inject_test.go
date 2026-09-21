@@ -740,8 +740,16 @@ func TestOneHungInjectDoesNotSpendTheWholeBatchBudget(t *testing.T) {
 	}
 	handler := newDriftInjectHandler(inject)
 
-	// The batch's budget, as processBatch builds it.
-	batchBudget := 30 * time.Second
+	// Deliberately shorter than the 30s default, and the choice is what makes
+	// this test a guard rather than a description. Without the sub-context the
+	// escalation costs two client timeouts plus the retry delay -- 10s + 250ms
+	// + 10s -- so against a 30s budget it finishes at ~20.25s, every assertion
+	// below passes, and the test is green with the fix reverted. It was, when
+	// this was first written. At 12s the pre-fix path instead runs the batch
+	// context out during its second attempt and trips the first assertion,
+	// while the fixed path returns at perRecordInjectBudget and passes with
+	// room to spare.
+	batchBudget := 12 * time.Second
 	batchCtx, cancel := context.WithTimeout(context.Background(), batchBudget)
 	defer cancel()
 
@@ -753,10 +761,13 @@ func TestOneHungInjectDoesNotSpendTheWholeBatchBudget(t *testing.T) {
 		t.Fatalf("one hung inject exhausted the batch's shared budget after %s; "+
 			"every later record in the batch would fail its lookup and be acked", spent)
 	}
-	// The cap covers the retry too, so the whole escalation fits in one budget
-	// rather than one per attempt.
-	if spent >= batchBudget {
-		t.Fatalf("one record spent %s of a %s batch budget", spent, batchBudget)
+	// The positive form of the same property, and the one that names the cap:
+	// the whole escalation including its retry fits inside one per-record
+	// budget, rather than one budget per attempt. Doubled to absorb scheduling
+	// on a loaded CI machine without admitting a second full attempt.
+	if spent >= 2*perRecordInjectBudget {
+		t.Fatalf("one record spent %s on its escalation; perRecordInjectBudget is %s, so the "+
+			"per-record cap is not bounding the retry", spent, perRecordInjectBudget)
 	}
 	if handler.Counts().Failed != 1 {
 		t.Errorf("failed count = %d, want 1: a timed-out inject is a failure, not a silent drop",

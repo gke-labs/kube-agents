@@ -76,10 +76,17 @@ export SESSION_KV_API_KEY=$(kubectl get secret platform-agent-secrets \
 go run ./k8s-operator/cmd/drift-detector \
   --project "$PROJECT_ID" \
   --in-cluster \
+  --cluster-name "$CLUSTER_NAME" \
+  --cluster-location "$CLUSTER_LOCATION" \
   --daemon-url http://127.0.0.1:8699 \
   --token-env SESSION_KV_API_KEY \
   --owner drift-detector
 ```
+
+`--cluster-name` and `--cluster-location` are not optional here: `--in-cluster` and `--kubeconfig`
+each give the join one cluster's credentials, and with `--project` these two are what name the
+cluster those credentials reach. Omit either and startup refuses the flags rather than joining
+against the wrong cluster.
 
 **The daemon is loopback-only**, and that decides where this binary can run. `docker-entrypoint.sh`
 starts it with `--host 127.0.0.1 --port 8699`, so `--daemon-url` has nothing to point at from
@@ -488,16 +495,21 @@ that arithmetic.
 **The inject spends that same budget, and it is the slowest thing in it.** With `--daemon-url` set,
 a surviving record makes two more calls after the join — `POST /sessions` then
 `POST /sessions/<id>/inject` — each with its own ten-second client timeout and one retry behind a
-250ms delay. Worst case for a single record is therefore around forty seconds against a
-thirty-second default, so the batch deadline, not the client timeout, is what actually stops it:
-both calls are built with `http.NewRequestWithContext` on the handler's context, so a hung daemon
-cannot overrun the budget, it can only consume all of it on record one. What the operator sees when
-that happens is a batch of `failed` **lookups** — every later record's `GET` returning a deadline
-error — which reads identically to a slow control plane and is not. Check the inject tally on the
-shutdown line before blaming the API server, and turn the inject off with an empty `--daemon-url`
-to tell the two apart. Sizing the budget for an install with the inject on means budgeting for the
-daemon's latency as well as the control plane's; issue #1768 tracks giving each record its own
-budget so one slow dependency cannot starve the rest of the batch.
+250ms delay. Left at those numbers one hung daemon would spend around forty seconds of a
+thirty-second batch, which is the whole batch on record one: every record behind it then fails its
+lookup on an expired context and is acked anyway. So the escalation gets a sub-budget of its own,
+`perRecordInjectBudget`, five seconds derived from the handler's context — small enough that a
+batch survives several slow records, and derived rather than independent so a SIGTERM or an
+exhausted batch still cuts it short.
+
+That bounds the blast radius rather than removing it. Six consecutive unresponsive records still
+exhaust a thirty-second budget between them, and what the operator sees when they do is a batch of
+`failed` **lookups** — every later record's `GET` returning a deadline error — which reads
+identically to a slow control plane and is not. Check the inject tally on the shutdown line before
+blaming the API server, and turn the inject off with an empty `--daemon-url` to tell the two apart.
+Sizing the budget for an install with the inject on still means budgeting for the daemon's latency
+as well as the control plane's; a per-record budget covering the whole handler, rather than the
+escalation alone, is the fix that would remove the coupling and is tracked separately.
 
 For the budget to be the bound, it has to be the only one, and client-go supplies a second by
 default: a `rest.Config` that leaves `QPS` unset gets 5 requests a second with a burst of 10, and
