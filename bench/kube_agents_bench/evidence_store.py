@@ -214,7 +214,10 @@ class LocalBackend:
         # would read as "this case has never been screened", which silently
         # de-admits the case instead of saying the format changed. Checked
         # across the whole directory whatever `only` says: it is a statement
-        # about the store's format, not about the cases this read wants.
+        # about the store's format, not about the cases this read wants. The
+        # per-line parse check is not held to that rule -- a name is free to
+        # look at and bytes are the cost `only` exists to avoid, so a corrupt
+        # record out of scope waits until something grades that case.
         for stray in sorted(self.root.glob("*.json")):
             if stray.name != "VERSIONS.json":
                 raise ValueError(
@@ -308,8 +311,11 @@ class GcsBackend:
         A single-case scope is pushed down into the `ls` so the server walks
         one case's prefix instead of the whole store. A wider scope is filtered
         by the caller: one listing of everything is one process, and a listing
-        per case would cost more than it saved.
+        per case would cost more than it saved. An empty scope skips the
+        listing outright, since every object it returned would be dropped.
         """
+        if scope is not None and not scope:
+            return []
         prefix = self.location
         if scope is not None and len(scope) == 1:
             prefix = f"{self.location}/{_sanitize(next(iter(scope)))}"

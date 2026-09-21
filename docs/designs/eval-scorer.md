@@ -613,26 +613,26 @@ Money is not the constraint at any of these scales. Standard storage bills actua
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
 run. Wall clock is, which is why the fetches are concurrent and the read is scoped.
 
+The key partition also retires a caveat this section used to carry. Under a flat layout and a
+per-case window, a version key that went A → B → A could push the revert's own evidence at key A
+out of the window, so a genuinely screened case would read as "no evidence" and be de-admitted.
+With one directory per key and a per-key cap, key B's volume cannot displace key A's records at
+all: the revert lands back in A's directory and finds its own history intact.
+
 ### The read is scoped to the cases being graded
 
-`bench-gate case` runs once per task and `bench-gate suite` once at the end, so a matrix of
-eighteen tasks reads the store nineteen times. Each read asks about the cases it is grading —
-one for `case`, the graded set for `suite` — and never about the rest, so reading all of them was
-the same work repeated nineteen times. `BaselineStore.load(only=…)` takes the cases the caller
-will ask about; a single-case read lists that case's prefix rather than the whole store and
-fetches one object group.
+`bench-gate case` runs once per task and `bench-gate suite` once at the end, so the store is read
+once per active case plus one. Each read asks about the cases it is grading — one for `case`, the
+graded set for `suite` — and never about the rest, so reading all of them was the same work
+repeated every time. `BaselineStore.load(only=…)` takes the cases the caller will ask about; a
+single-case read lists that case's own prefix rather than the whole store, and fetches that case's
+objects in one `cat`.
 
 The narrowing has a failure mode that speed cannot detect, because a read that fetches nothing is
 the fastest of all: a store missing a case answers "never screened", which de-admits a case that
 is in fact passing and reds nothing. So the scope is remembered on the store, and a lookup outside
 it raises `CaseOutOfScope` — deliberately neither the `ValueError` the gate treats as a corrupt
 store nor the `StoreUnreachable` it degrades on, both of which get absorbed into a verdict.
-
-The key partition also retires a caveat this section used to carry. Under a flat layout and a
-per-case window, a version key that went A → B → A could push the revert's own evidence at key A
-out of the window, so a genuinely screened case would read as "no evidence" and be de-admitted.
-With one directory per key and a per-key cap, key B's volume cannot displace key A's records at
-all: the revert lands back in A's directory and finds its own history intact.
 
 ### When the store is unreachable
 
@@ -1369,10 +1369,10 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   Trend page can draw the spread across repetitions rather than the range of nightly means
   ([What a score is](#what-a-score-is)). Additive and optional; `bench-gate record` writes it,
   `_pool_judged()` ignores it.
-- The GCS listing is scoped by case, not by key. A single-case read lists that case's own prefix,
-  but `bench-gate suite` still lists the whole store and filters afterwards, because its cases can
-  sit at different keys and `BaselineStore.load` does not know which key it is about to be asked
-  for. Threading the key through both buys nothing at today's volumes; see
+- The GCS listing is scoped by case, not by key, and only when the scope is a single case.
+  `bench-gate suite` names several, so it lists the whole store and filters afterwards: one
+  listing is one `gcloud` process, and a listing per case would cost more than it saved. Both
+  limits are worth revisiting only if the store outgrows a listing; see
   [Reading is capped, and says so](#reading-is-capped-and-says-so).
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.

@@ -678,6 +678,19 @@ def test_several_cases_are_filtered_from_one_listing(gcloud):
     assert len([c for c in gcloud.calls if c[2] == "cat"]) == 2
 
 
+def test_an_empty_scope_reads_nothing_at_all(gcloud):
+    """Not even the listing. `bench-gate suite` with no case results lands here.
+
+    An empty scope is not `None`: it asks about no cases, so every object a
+    listing returned would be filtered straight back out again.
+    """
+    url, text = nested("case-a", KEY_DIR, 1)
+    gcloud.objects[url] = text
+
+    assert GcsBackend("gs://b/e").sources(set()) == []
+    assert gcloud.calls == []
+
+
 def test_a_scoped_read_returns_the_same_bytes_as_a_whole_one(gcloud):
     """Scoping changes what is read, never what a case's read says.
 
