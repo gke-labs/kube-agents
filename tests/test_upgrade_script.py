@@ -7,6 +7,7 @@ piped stdin execution, and source ref alignment in upgrade.sh.
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -452,29 +453,48 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
 
 
 
-class RecordedPluginImageTagKeysTest(unittest.TestCase):
-    """recorded_plugin_image_tag_keys against a stub helm, under the system bash."""
+class _StubHelm:
+    """Sources upgrade.sh with a stub `helm` on PATH and runs a snippet after it.
 
-    def _run(self, values_json, helm_exit=0):
+    The stub prints `stdout_json` on stdout, `stderr_text` on stderr, and
+    exits `helm_exit`. The script's own ERR trap is stood in for by one that
+    writes a banner, so a failure inside the functions shows where the real
+    run would abort.
+    """
+
+    def _run_with_helm(self, snippet, stdout_json, helm_exit=0, stderr_text=""):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         bin_dir = pathlib.Path(tmp.name) / "bin"
         bin_dir.mkdir()
         helm = bin_dir / "helm"
-        helm.write_text(f"#!/usr/bin/env bash\ncat <<'JSON'\n{values_json}\nJSON\nexit {helm_exit}\n")
+        helm.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' {shlex.quote(stderr_text)} >&2\n"
+            f"cat <<'JSON'\n{stdout_json}\nJSON\n"
+            f"exit {helm_exit}\n"
+        )
         helm.chmod(0o755)
-        # The ERR trap upgrade.sh installs, so a failure inside the function's
-        # substitutions would print the abort banner the way a real run does.
         setup = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
 trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
-recorded_plugin_image_tag_keys kube-agents kubeagents-system
-printf '%s\\n' "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
-echo "rc=$?"
+{snippet}
 """
-        env = get_isolated_test_env()
-        env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        return subprocess.run(["bash", "-c", setup], capture_output=True, text=True, env=env)
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(bin_dir=str(bin_dir)),
+        )
+
+
+class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
+    """recorded_plugin_image_tag_keys against a stub helm, under the system bash."""
+
+    _SNIPPET = 'recorded_plugin_image_tag_keys kube-agents kubeagents-system\nprintf "%s\\n" "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"\necho "rc=$?"'
+
+    def _run(self, values_json, helm_exit=0, stderr_text=""):
+        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit, stderr_text=stderr_text)
 
     def test_every_plugin_tag_the_release_records_is_printed(self):
         proc = self._run(
@@ -503,46 +523,41 @@ echo "rc=$?"
         self.assertEqual(proc.stdout.split(), ["rc=0"])
         self.assertNotIn("ABORT BANNER", proc.stderr)
 
+    def test_a_helm_warning_on_stderr_does_not_break_the_read(self):
+        """Helm warns on stderr on successful commands (a group-readable kubeconfig)."""
+        proc = self._run(
+            '{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}}}}',
+            stderr_text="WARNING: Kubernetes configuration file is group-readable. This is insecure.",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split()[:-1], ["plugins.pubsubPlatform.image.tag"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
     def test_a_malformed_plugins_value_is_an_error_not_an_empty_list(self):
         """upgrade.sh runs under set -e, so the failed call ends the sourced run."""
         proc = self._run('{"plugins":"oops"}')
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("rc=", proc.stdout)
         self.assertIn("Could not read the plugin image tags", proc.stdout)
+        self.assertIn("plugins is not an object", proc.stdout)
 
-    def test_a_failing_helm_read_is_an_error_not_an_empty_list(self):
-        """An empty list would run the pre-fix re-tag and leave the plugins behind.
-
-        The failure is reported once, by the function; on bash 3.2 the
-        inherited ERR trap would otherwise also fire inside the substitution.
-        """
-        proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}}}}', helm_exit=1)
+    def test_a_failing_helm_read_is_an_error_that_names_the_cause(self):
+        """An empty list would run the pre-fix re-tag and leave the plugins behind."""
+        proc = self._run("", helm_exit=1, stderr_text="Error: release: not found")
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("rc=", proc.stdout)
         self.assertIn("Could not read the values of Helm release", proc.stdout)
+        self.assertIn("Error: release: not found", proc.stdout)
         self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
 
 
-class HarnessRetagKeysTest(unittest.TestCase):
+class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
     """harness_retag_keys against a stub helm: the list helm_retag receives."""
 
+    _SNIPPET = 'harness_retag_keys kube-agents kubeagents-system\nprintf "%s\\n" "${HARNESS_RETAG_KEYS[@]}"'
+
     def _run(self, values_json, helm_exit=0):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        bin_dir = pathlib.Path(tmp.name) / "bin"
-        bin_dir.mkdir()
-        helm = bin_dir / "helm"
-        helm.write_text(f"#!/usr/bin/env bash\ncat <<'JSON'\n{values_json}\nJSON\nexit {helm_exit}\n")
-        helm.chmod(0o755)
-        setup = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
-trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
-harness_retag_keys kube-agents kubeagents-system
-printf '%s\\n' "${{HARNESS_RETAG_KEYS[@]}}"
-"""
-        env = get_isolated_test_env()
-        env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        return subprocess.run(["bash", "-c", setup], capture_output=True, text=True, env=env)
+        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit)
 
     def test_the_plugin_keys_follow_the_agent_and_sandbox_keys(self):
         proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"image":{"tag":"abc"}}}}')
@@ -564,7 +579,7 @@ printf '%s\\n' "${{HARNESS_RETAG_KEYS[@]}}"
         self.assertNotIn("ABORT BANNER", proc.stderr)
 
     def test_a_failed_read_stops_before_any_list_is_handed_on(self):
-        proc = self._run('{}', helm_exit=1)
+        proc = self._run("{}", helm_exit=1)
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("platformAgent.deployment.image.tag", proc.stdout)
         self.assertIn("Could not read the values of Helm release", proc.stdout)

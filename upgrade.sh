@@ -355,16 +355,23 @@ matches_release_bundle_ref() {
 # release, namespace.
 RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
 recorded_plugin_image_tag_keys() {
-  local release="$1" namespace="$2" values keys
+  local release="$1" namespace="$2" values keys stderr_file
   RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
-  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>&1)"; then
-    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to find the plugin image tags: ${values}"
+  # stderr kept apart from the JSON: Helm writes warnings there on successful
+  # commands too (a group-readable kubeconfig, for one), and merged into the
+  # capture they would break the jq parse of values that are fine.
+  stderr_file="$(mktemp)"
+  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>"$stderr_file")"; then
+    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to find the plugin image tags: $(cat "$stderr_file")"
+    rm -f "$stderr_file"
     return 1
   fi
-  if ! keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else error("plugins is not an object") end' <<<"$values" 2>&1)"; then
-    print_error "Could not read the plugin image tags from the values of Helm release '${release}': ${keys}"
+  if ! keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else error("plugins is not an object") end' <<<"$values" 2>"$stderr_file")"; then
+    print_error "Could not read the plugin image tags from the values of Helm release '${release}': $(cat "$stderr_file")"
+    rm -f "$stderr_file"
     return 1
   fi
+  rm -f "$stderr_file"
   RECORDED_PLUGIN_IMAGE_TAG_KEYS="$keys"
 }
 
