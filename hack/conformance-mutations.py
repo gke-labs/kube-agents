@@ -684,6 +684,14 @@ Mutation(
         "drop the digest and keep the tag, which reads as equivalent",
     ),
     Mutation(
+        "C4-hermes-plugin-ref",
+        "deploy/docker/Dockerfile",
+        (" --ref b7ece46a5c883a619686b6c698b0316d9fd50962", ""),
+        "test_C4_every_hermes_plugin_install_is_pinned_to_a_commit",
+        "drop the ref and install the plugin from whatever the upstream "
+        "default branch holds, which is how the build broke in the first place",
+    ),
+    Mutation(
         "C5-minted-write-verb",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      - get\n      - list\n", "      - get\n      - list\n      - patch\n"),
