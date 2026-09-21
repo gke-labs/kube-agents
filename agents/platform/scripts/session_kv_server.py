@@ -353,6 +353,55 @@ ALERT_DAILY_LIMITS = {
     "Info": _alert_daily_limit("ALERT_DAILY_LIMIT_INFO", 5),
 }
 
+# The `kind` a drift record carries, set by the drift detector
+# (`injectKindDrift` in k8s-operator/cmd/drift-detector/inject.go). It is the
+# only field `inject_message` routes on, and the two constants are one decision
+# in two languages: change this string alone and a drift payload falls through
+# to the event path, where `payload.get("kind_of_object") or "Pod"` renders it
+# as a Pod alert that names an object nobody touched.
+#
+# Every other caller of that route is the event watcher, which sends no `kind`
+# at all, so the equality test is safe in both directions.
+INJECT_KIND_DRIFT = "gitops-drift"
+
+# Drift is graded `Warning` rather than given a severity of its own, and the
+# reason is the ceiling rather than the wording. `ALERT_DAILY_LIMITS` is keyed
+# by severity and a `.get(severity, 0)` miss is allowed through *uncapped*, so
+# a severity invented here would have to be added to that dict — and a fourth
+# key is a second full ceiling beside the event watcher's, letting a quiet day
+# of events plus a drift storm post twice what either budget allows. The
+# ceiling bounds the messages one human reads in a day, and that reader is one
+# budget whatever produced them.
+#
+# The cost is worth naming: a node storm that spends the Warning budget also
+# silences drift for the rest of the day. `GET /v1/alert-quota` is where that
+# shows up, and every silenced record is still written to the ledger below, so
+# the daily recap can report it.
+DRIFT_SEVERITY_LABEL = "Warning"
+
+# Distinct from the 🟡 `get_severity_details` returns for a Warning event, so
+# drift is recognisable at a glance in a channel that already carries event
+# alerts.
+DRIFT_ALERT_EMOJI = "🔀"
+
+# The ledger's `reason` column holds a Kubernetes event reason for every other
+# writer. Drift has no event behind it, so this names what happened in the same
+# shape rather than leaving the column blank and the recap with nothing to
+# group on.
+DRIFT_LEDGER_REASON = "OutOfBandChange"
+
+# The `join` value the detector sends when it actually read the live object's
+# `managedFields` (`joinEnriched` in k8s-operator/cmd/drift-detector/join.go).
+# Any other value means ownership is absent because the lookup did not happen,
+# which is a different fact from an object that has no other owners — and the
+# card has to say which.
+DRIFT_JOIN_ENRICHED = "enriched"
+
+# What a card or chat line says where the detector sent a field empty. The
+# alternative renders as `prod//` and reads like a bug in the alert rather than
+# a gap in the record.
+DRIFT_UNKNOWN_FIELD = "unknown"
+
 
 def init_db() -> None:
     db_dir = os.path.dirname(SESSION_KV_DB_PATH)
@@ -1288,7 +1337,14 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
     block with `result = NULL`. The rule is stated here, where the router reads
     its instructions, rather than in the persona, because the persona is what
     the router had when it improvised.
+
+    Drift records take `_drift_agent_query` instead. They arrive on the same
+    route from a different producer and describe a change a person made, not a
+    failure Kubernetes reported, so none of the fields read below exist on one.
     """
+    if payload.get("kind") == INJECT_KIND_DRIFT:
+        return _drift_agent_query(payload)
+
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
@@ -1320,6 +1376,261 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
         f"parks the report unread for good (#656).\n\n"
         f"--- BEGIN TASK BODY (copy verbatim) ---\n"
         f"{_triage_task_body(payload)}\n"
+        f"--- END TASK BODY ---"
+    )
+
+
+def _drift_resource(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The `resource` object of a drift payload, or an empty one.
+
+    Typed rather than trusted. This route is authenticated, but the payload
+    behind the envelope is a free-form JSON string, and a `resource` that
+    arrives as a string would otherwise turn a malformed inject into a 500 from
+    the first `.get` — an error that says the daemon is broken when the caller
+    is.
+    """
+    resource = payload.get("resource")
+    return resource if isinstance(resource, dict) else {}
+
+
+def _drift_resource_path(payload: Dict[str, Any]) -> str:
+    """`namespace/resource/name`, dropping the parts the object does not have.
+
+    A cluster-scoped object has no namespace, and rendering one as `/nodes/n1`
+    invites the reader to look in a namespace called nothing.
+    """
+    resource = _drift_resource(payload)
+    kind = resource.get("resource") or DRIFT_UNKNOWN_FIELD
+    name = resource.get("name") or DRIFT_UNKNOWN_FIELD
+    namespace = resource.get("namespace") or ""
+    subresource = resource.get("subresource") or ""
+
+    path = f"{namespace}/{kind}/{name}" if namespace else f"{kind}/{name}"
+    return f"{path}/{subresource}" if subresource else path
+
+
+def _drift_summary(payload: Dict[str, Any]) -> str:
+    """The one-line rendering, preferring the detector's own.
+
+    `summary` exists on the payload for exactly this, so the sentence a human
+    reads is composed once, by the process that held the whole record. The
+    fallback is for a producer that sent the fields without it; it is
+    deliberately the same shape rather than a better one, because two renderings
+    of the same record that read differently is how a reader starts doubting
+    which is true.
+    """
+    summary = (payload.get("summary") or "").strip()
+    if summary:
+        return summary
+
+    principal = payload.get("principal") or DRIFT_UNKNOWN_FIELD
+    verb = payload.get("verb") or DRIFT_UNKNOWN_FIELD
+    cluster = payload.get("cluster") or DRIFT_UNKNOWN_FIELD
+    return f"{principal} ran {verb} on {_drift_resource_path(payload)} in {cluster}"
+
+
+def _drift_ownership_block(payload: Dict[str, Any]) -> str:
+    """What the live object's `managedFields` said, or why they were not read.
+
+    Three outcomes, and the card has to distinguish them, because two of them
+    look identical if ownership is reported as an empty list: the join did not
+    happen (no credentials for that cluster, the object is gone, the lookup
+    failed), the join happened and the object records no other owners, or the
+    join happened and these managers own these fields. Only the second is a
+    fact about the object. Presenting the first as the second is how an agent
+    concludes nothing else manages a field that a GitOps controller owns.
+    """
+    join = payload.get("join") or DRIFT_UNKNOWN_FIELD
+    if join != DRIFT_JOIN_ENRICHED:
+        lookup_error = payload.get("lookup_error") or ""
+        detail = f" The lookup reported: {lookup_error}" if lookup_error else ""
+        return (
+            f"- **Field ownership: not read** (`{join}`).{detail} "
+            f"Reason about this change without it, and say in your report that ownership was "
+            f"unavailable — do not treat the absence as evidence that no other manager owns these fields."
+        )
+
+    owners = [owner for owner in (payload.get("owners") or []) if isinstance(owner, dict)]
+    if not owners:
+        return (
+            "- **Field ownership:** read, and the live object records no `managedFields` entries at all. "
+            "Nothing is managing it declaratively."
+        )
+
+    lines = ["- **Field ownership** (read from the live object's `managedFields`):"]
+    for owner in owners:
+        manager = owner.get("manager") or DRIFT_UNKNOWN_FIELD
+        operation = owner.get("operation") or ""
+        updated_at = owner.get("updated_at") or ""
+        paths = [path for path in (owner.get("paths") or []) if isinstance(path, str)]
+
+        qualifiers = ", ".join(part for part in (operation, updated_at) if part)
+        owns = ", ".join(f"`{path}`" for path in paths) if paths else "no recorded paths"
+        lines.append(f"  - `{manager}`{f' ({qualifiers})' if qualifiers else ''} owns {owns}")
+
+    return "\n".join(lines)
+
+
+def _drift_task_body(payload: Dict[str, Any]) -> str:
+    """The kanban card body for an out-of-band change to a live object.
+
+    The event path's equivalent is `_triage_task_body`, and its docstring is the
+    canonical explanation of the parts these two share: the `kanban_complete`
+    delivery, the three `##` sections SOUL.md §7 permits, the **Done when**
+    line, and the `To authorize:` bullet that `kanban_notifier.actionable_report`
+    keys on to decide which completions earn an `incidents` row — which is what
+    makes the offer to reply `apply` honourable. Those literals are load-bearing
+    in both bodies for the same reasons; read that docstring before rewording
+    either.
+
+    What is not shared is the question. An event says Kubernetes is unhappy and
+    asks for a root cause. This says a person or a tool changed a live object
+    outside git, and asks whether the declared state or the live state is the
+    one that should win. That is a decision the reader makes, not a defect the
+    agent diagnoses, so the report's job is to establish what changed, whether
+    it still stands, and what each answer would cost.
+    """
+    resource_path = _drift_resource_path(payload)
+    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+    principal = payload.get("principal") or DRIFT_UNKNOWN_FIELD
+    user_agent = payload.get("user_agent") or ""
+    verb = payload.get("verb") or DRIFT_UNKNOWN_FIELD
+    method_name = payload.get("method_name") or DRIFT_UNKNOWN_FIELD
+    timestamp = payload.get("timestamp") or DRIFT_UNKNOWN_FIELD
+    insert_id = payload.get("insert_id") or DRIFT_UNKNOWN_FIELD
+    project = payload.get("project") or DRIFT_UNKNOWN_FIELD
+
+    reconciled_by = payload.get("reconciled_by") or ""
+    if payload.get("reconciled"):
+        reconcile_line = (
+            f"- **Possibly already reverted:** `{reconciled_by or DRIFT_UNKNOWN_FIELD}` wrote to this object "
+            f"after the change above, so a GitOps controller may have reconciled it already. Check the live "
+            f"object before proposing anything — there may be nothing left to do."
+        )
+    else:
+        reconcile_line = (
+            "- **Not shown to be reconciled:** no configured GitOps manager was recorded writing to this "
+            "object after the change. That is the absence of evidence, not evidence the change still stands; "
+            "read the live object to find out which."
+        )
+
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
+        f"through git, and the audit log is how we know about it.\n\n"
+        f"**What the audit log recorded:**\n"
+        f"- **Object:** {resource_path}\n"
+        f"- **Cluster / project:** {cluster_name} / {project}\n"
+        f"- **Who:** {principal}"
+        + (f" (self-declared user agent `{user_agent}`, which names a tool and never a person)" if user_agent else "")
+        + f"\n"
+        f"- **What:** `{verb}` via `{method_name}`\n"
+        f"- **When:** {timestamp}\n"
+        f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
+        f"{_drift_ownership_block(payload)}\n"
+        f"{reconcile_line}\n\n"
+        f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
+        f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
+        f"use it.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
+        f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
+        f"delivers one line to the person waiting for it.\n\n"
+        f"**Done when:** the report says what the live object looks like now compared with what the change did; "
+        f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
+        f"either reverting it to the declared state or codifying it in git, with the consequence of each. "
+        f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
+        f"a judge that grades this card reads `summary` before `result`.\n\n"
+        f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
+        f"you are the agent scoped to the cluster that changed, and the report has to be this card's own result "
+        f"to be delivered.\n\n"
+        f"**Do not judge the change by who made it.** An automation principal on this list was not filtered out "
+        f"upstream, and a human principal is not by itself a problem: the question is whether the live state or "
+        f"the declared state is the one that should win.\n\n"
+        f"Propose as many options as the situation genuinely warrants. Usually there are two — revert to what git "
+        f"declares, or change git to declare what is now live — and both are worth stating even when one is "
+        f"obviously right, because the reader is deciding which state wins.\n\n"
+        f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
+        f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
+        f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
+        f"**With exactly one option:** do not letter it and do not use the word 'Option' — a lettered label asks "
+        f"the reader to pick from a list of one. The 'What to do' section is then these two bullets and nothing "
+        f"else, replacing the ones in the template below:\n"
+        f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
+        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
+        f"No Recommended line, and nothing after **'apply'** in the call to action.\n\n"
+        f"**If the change was already reconciled away and nothing is left to do,** say that in 'What to do' as "
+        f"the single 'Proposed fix' bullet — 'no change needed, the object already matches the declared state' — "
+        f"and keep the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
+        f"Every <...> above and in the template below is a placeholder: fill each one in. The posted report must "
+        f"never contain a literal '<letter>'.\n\n"
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
+        f"these three `##` sections are the only ones, and there is no fourth:\n\n"
+        f"## What's wrong\n\n"
+        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"## Why\n\n"
+        f"- <What the live object shows now, and how it differs from what git declares, with the evidence>\n"
+        f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
+        f"## What to do\n\n"
+        f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
+        f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n"
+        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n"
+        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name "
+        f"one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
+        f"---"
+        f"\n\n**Who acts on this:**\n"
+        f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not "
+        f"you, and not from this card. Name the manifest change each option needs precisely enough that someone "
+        f"can open the Pull Request from your report alone. Two things are true whoever acts on it — the fix "
+        f"ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster "
+        f"directly (no `kubectl scale`, `patch`, or `apply`). That holds even for reverting this change: "
+        f"undoing an out-of-band write with another out-of-band write leaves the cluster no closer to git."
+    )
+
+
+def _drift_agent_query(payload: Dict[str, Any]) -> str:
+    """The front-door turn for a drift record.
+
+    `_build_agent_query`'s docstring explains why this is addressed to a router
+    rather than to a diagnostician, and why the brief travels between markers as
+    an opaque payload: the reader is the `default` profile, whose one tool is
+    `kanban_create`, and the failure the numbered rules replace was a helpful
+    front door improvising.
+
+    One thing differs and it is the whole reason this exists separately. The
+    cluster to route to is the cluster the change was *made on*, which the
+    multi-cluster fan-in means is not necessarily the one the detector runs in.
+    It comes from the payload's own `cluster` field and from nowhere else.
+    """
+    resource_path = _drift_resource_path(payload)
+    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+    principal = payload.get("principal") or DRIFT_UNKNOWN_FIELD
+
+    return (
+        f"An out-of-band change to a live object needs triage on GKE cluster '{cluster_name}'. "
+        f"The alert is already posted in the user's chat thread; your job is to route the diagnosis and nothing else.\n\n"
+        f"Make exactly one `kanban_create` call:\n\n"
+        f"- `assignee`: the `cluster-*` agent scoped to **{cluster_name}** — take its exact name from your "
+        f"`[SPECIALIST AGENTS AVAILABLE NOW]` block, and call `list_agents` once to refresh if none is listed for "
+        f"that cluster. This is the cluster the change was made on, which is not necessarily the cluster you are "
+        f"running in.\n"
+        f"- `title`: `Triage out-of-band change to {resource_path} by {principal} on {cluster_name}`\n"
+        f"- `body`: everything between the two markers below, **copied verbatim**.\n"
+        f"- `goal_mode`: leave it unset (it defaults to false). Rule 4 says why.\n\n"
+        f"Four rules, and they are why this text spells the call out:\n\n"
+        f"1. **Copy the body exactly.** Do not summarise it, shorten it, reformat it, or restate it in your own "
+        f"words. It carries the report format and the delivery instruction the diagnosis depends on.\n"
+        f"2. **One card, to the Cluster Agent.** Not `platform` — answering this needs the live object read from "
+        f"one named cluster, which is exactly what a Cluster Agent is for. Assign to `platform` only if that "
+        f"cluster genuinely has no agent after a `list_agents` refresh.\n"
+        f"3. **Do nothing else.** Do not investigate the change, do not post anything to chat, and do not file a "
+        f"second card to have someone else deliver the answer. Completing the card is the delivery: this one is "
+        f"subscribed to the thread the alert was posted in, and the report reaches the user from there.\n"
+        f"4. **Leave `goal_mode` off.** A goal-mode card is graded by an auxiliary judge against its title and "
+        f"body before `kanban_complete` is allowed through, and this body is a presentation template, not a "
+        f"checklist a judge can tick: a worker whose finished report the judge rejects cannot complete the card "
+        f"and has only `kanban_block` left, which parks the report unread for good.\n\n"
+        f"--- BEGIN TASK BODY (copy verbatim) ---\n"
+        f"{_drift_task_body(payload)}\n"
         f"--- END TASK BODY ---"
     )
 
@@ -2210,6 +2521,92 @@ def _watcher_features(header_value: str) -> set:
     return {token.strip().lower() for token in (header_value or "").split(",") if token.strip()}
 
 
+def _inject_drift(
+    session_id: str,
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+) -> Dict[str, str]:
+    """The `gitops-drift` half of `inject_message`.
+
+    Same three steps as the event path below — claim the ceiling, write the
+    ledger row, hand the alert to a background task — and deliberately so: they
+    are what make an alert countable, bounded and recoverable, and a second
+    producer that skipped them would be a second set of rules for the same
+    channel.
+
+    Two of the event path's steps are absent. There is no severity grading,
+    because every drift record is the same kind of finding; `DRIFT_SEVERITY_LABEL`
+    explains why it is graded as a Warning anyway. And there is no Info gate,
+    because there is no Info to gate — the detector's classifier already dropped
+    everything it judged to be automation rather than a person, upstream of this
+    route, which is the filtering this path's noise budget rests on.
+
+    A `suppressed` answer means something different here than it does to the
+    event watcher, and the difference is a real loss. The watcher rolls back its
+    dedup entry and re-offers the workload on its next sighting; the detector
+    cannot, because an audit entry is delivered once and its `insertId` is
+    already marked as seen by the time this replies. So a drift record refused
+    by the ceiling is gone from chat for good. The ledger row below is written
+    for exactly that case — it is the only place the record survives, and the
+    daily recap is where someone sees it.
+    """
+    resource = _drift_resource(payload)
+    summary = _drift_summary(payload)
+    resource_path = _drift_resource_path(payload)
+    # The cluster the change was made on. Falls back to this pod's own the way
+    # the event path does, so a payload from a producer that omitted it lands
+    # under a name rather than under ''.
+    cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+
+    allowed, suppressed_today = _claim_alert_quota(DRIFT_SEVERITY_LABEL)
+
+    event_row_id = record_intercepted_event(
+        cluster=cluster,
+        # Empty for a cluster-scoped object, which is the honest value: the
+        # event path's "default" would be a claim, and a wrong one.
+        namespace=resource.get("namespace") or "",
+        workload=resource.get("name") or DRIFT_UNKNOWN_FIELD,
+        # The audit entry's id plays the part `object_uid` plays for an event:
+        # the one field that separates two rows describing the same object. It
+        # is also what the detector deduplicates on, so a row here and a log
+        # line there can be matched up.
+        object_uid=payload.get("insert_id") or "",
+        object_kind=resource.get("resource") or DRIFT_UNKNOWN_FIELD,
+        reason=DRIFT_LEDGER_REASON,
+        message=summary,
+        severity=DRIFT_SEVERITY_LABEL,
+        # One audit entry, one change. Unlike an event, a drift record carries
+        # no repeat count: a principal who edits the same object twice produces
+        # two entries with two insert ids.
+        occurrences=1,
+        notified=allowed,
+    )
+
+    if not allowed:
+        logger.warning(
+            f"Suppressed drift alert for {resource_path} on {cluster or DRIFT_UNKNOWN_FIELD}: "
+            f"daily limit of {ALERT_DAILY_LIMITS[DRIFT_SEVERITY_LABEL]} {DRIFT_SEVERITY_LABEL} alerts reached, "
+            f"{suppressed_today} suppressed today. The detector will not re-offer this record; "
+            f"it survives only in the daily recap."
+        )
+        return {
+            "status": "suppressed",
+            "severity": DRIFT_SEVERITY_LABEL,
+            "suppressed_today": str(suppressed_today),
+        }
+
+    # Standard markdown, not Slack mrkdwn, for the reason the event path's
+    # alert gives: SlackAdapter.format_message reads a single `*...*` as italic.
+    alert_msg = (
+        f"{DRIFT_ALERT_EMOJI} **Drift:** {summary}\n"
+        f"🌱 _Checking what the cluster looks like now..._"
+    )
+
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload, event_row_id)
+
+    return {"status": "injected"}
+
+
 @app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])
 def inject_message(
     session_id: str,
@@ -2217,16 +2614,31 @@ def inject_message(
     background_tasks: BackgroundTasks,
     x_watcher_features: str = Header(default=""),
 ) -> Dict[str, str]:
-    """Receive the event payload and notify the Platform Agent via Google Chat."""
+    """Receive the event payload and notify the Platform Agent via Google Chat.
+
+    Two producers reach this route and they send different records. The event
+    watcher sends a Kubernetes event and sends no `kind`; the drift detector
+    sends `kind: gitops-drift` and an audit-log record of a change someone made.
+    Everything below the dispatch is the event path, unchanged, and the fields
+    it reads exist on nothing else — `payload.get("kind_of_object") or "Pod"`
+    would render a drifted ConfigMap as a Pod alert that names an object nobody
+    touched.
+    """
     raw_message = request_data.get("message", "")
     if not raw_message:
         raise HTTPException(status_code=400, detail="message field is required")
-        
+
     try:
         payload = json.loads(raw_message)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse inner payload JSON: {exc}")
-        
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="inner payload must be a JSON object")
+
+    if payload.get("kind") == INJECT_KIND_DRIFT:
+        return _inject_drift(session_id, payload, background_tasks)
+
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"

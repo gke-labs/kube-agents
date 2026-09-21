@@ -3696,6 +3696,298 @@ class TestFindingsQueueApi(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/findings/publication/backlog").status_code, 200)
 
 
+class TestDriftInject(unittest.TestCase):
+    """The `gitops-drift` half of /sessions/{id}/inject.
+
+    Two producers share that route and only one of them sends Kubernetes
+    events. Everything here is about keeping them apart: a drift record has no
+    `reason`, no `kind_of_object` and no `type`, so the event path's
+    `or "Pod"` defaults would render it as a confident alert about an object
+    nobody touched.
+    """
+
+    # The shape k8s-operator/cmd/drift-detector/inject.go posts. Kept whole
+    # rather than minimal: a test that sends three fields cannot catch a
+    # renderer that silently drops the other twelve.
+    DRIFT_PAYLOAD = {
+        "kind": "gitops-drift",
+        "summary": "alice@example.com patched prod/deployments/checkout (replicas owned by argocd)",
+        "cluster": "prod-us-east1",
+        "project": "example-project",
+        "location": "us-east1",
+        "principal": "alice@example.com",
+        "user_agent": "kubectl/v1.31.0",
+        "verb": "patch",
+        "method_name": "io.k8s.apps.v1.deployments.patch",
+        "timestamp": "2026-09-20T11:04:07Z",
+        "insert_id": "1a2b3c4d5e",
+        "resource": {
+            "group": "apps",
+            "version": "v1",
+            "namespace": "prod",
+            "resource": "deployments",
+            "name": "checkout",
+        },
+        "join": "enriched",
+        "owners": [
+            {
+                "manager": "argocd-controller",
+                "operation": "Apply",
+                "updated_at": "2026-09-19T08:00:00Z",
+                "paths": ["spec.replicas", "spec.template.spec.containers"],
+            },
+            {"manager": "kubectl-patch", "operation": "Update"},
+        ],
+        "reconciled": False,
+    }
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        # The ceiling is fleet-wide and the database is shared by the whole
+        # file, so today's spend has to be cleared or these order-depend on
+        # whatever ran before them.
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+                # Only this class's rows. Several tests here inject the same
+                # object, and the ledger is append-only — but wiping the table
+                # outright would take rows another class wrote and still
+                # asserts on.
+                conn.execute(
+                    "DELETE FROM intercepted_events WHERE reason = ?",
+                    (session_kv_server.DRIFT_LEDGER_REASON,),
+                )
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _payload(self, **overrides):
+        payload = json.loads(json.dumps(self.DRIFT_PAYLOAD))
+        payload.update(overrides)
+        return payload
+
+    def _inject(self, session_id="drift-sess", **overrides):
+        return self.client.post(
+            f"/sessions/{session_id}/inject",
+            json={"message": json.dumps(self._payload(**overrides))},
+        )
+
+    def _rows(self, workload):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
+                "occurrences, notified FROM intercepted_events WHERE workload = ?",
+                (workload,),
+            ).fetchall()
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_drift_record_is_not_rendered_as_a_pod_event(self, trigger):
+        """The regression the dispatch exists for.
+
+        Before the `kind` branch, this payload reached the event path and came
+        out as `🔵 Info: Unknown default/Pod/ —` : an alert naming an object
+        that does not exist, about an event that did not happen.
+        """
+        self.assertEqual(self._inject().json()["status"], "injected")
+
+        alert_msg = trigger.call_args.args[1]
+        self.assertIn(self.DRIFT_PAYLOAD["summary"], alert_msg)
+        self.assertNotIn("Pod", alert_msg)
+        self.assertNotIn("Unknown", alert_msg)
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_an_event_payload_still_takes_the_event_path(self, trigger):
+        """The other half of the same dispatch: the watcher is unaffected."""
+        event = {
+            "reason": "OOMKilled",
+            "namespace": "prod-api",
+            "kind_of_object": "Pod",
+            "name": "payment-api-64d8988cb7-r76jr",
+            "message": "Memory cgroup out of memory",
+            "type": "Warning",
+        }
+        resp = self.client.post(
+            "/sessions/evt-sess/inject",
+            json={"message": json.dumps(event)},
+            headers={"X-Watcher-Features": "policy-filtered"},
+        )
+        self.assertEqual(resp.json()["status"], "injected")
+
+        alert_msg = trigger.call_args.args[1]
+        self.assertIn("payment-api", alert_msg)
+        self.assertNotIn("Drift", alert_msg)
+        self.assertIn("Kubernetes Warning event", session_kv_server._build_agent_query(event))
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_the_ledger_row_records_the_change(self, trigger):
+        self._inject()
+        rows = self._rows("checkout")
+        self.assertEqual(len(rows), 1)
+        cluster, namespace, workload, object_uid, object_kind, reason, message, severity, occurrences, notified = rows[0]
+        self.assertEqual(cluster, "prod-us-east1")
+        self.assertEqual(namespace, "prod")
+        self.assertEqual(workload, "checkout")
+        # The audit entry's id, which is what makes two rows about the same
+        # object distinguishable and what the detector deduplicates on.
+        self.assertEqual(object_uid, "1a2b3c4d5e")
+        self.assertEqual(object_kind, "deployments")
+        self.assertEqual(reason, "OutOfBandChange")
+        self.assertEqual(message, self.DRIFT_PAYLOAD["summary"])
+        self.assertEqual(severity, "Warning")
+        self.assertEqual(occurrences, 1)
+        self.assertEqual(notified, 1)
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_cluster_scoped_object_gets_no_invented_namespace(self, trigger):
+        """`default` is the event path's guess and it would be a false claim here."""
+        self._inject(resource={"resource": "clusterroles", "name": "cluster-admin"})
+        rows = self._rows("cluster-admin")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "")
+
+        card = session_kv_server._drift_task_body(
+            self._payload(resource={"resource": "clusterroles", "name": "cluster-admin"})
+        )
+        self.assertIn("clusterroles/cluster-admin", card)
+        self.assertNotIn("/clusterroles/cluster-admin", card)
+
+    def test_the_card_is_addressed_to_the_cluster_the_change_was_made_on(self):
+        """Not the cluster this pod runs in: the fan-in means they differ."""
+        with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "the-local-cluster"}):
+            query = session_kv_server._build_agent_query(self._payload())
+        self.assertIn("prod-us-east1", query)
+        self.assertNotIn("the-local-cluster", query)
+        self.assertIn("cluster-*", query)
+        self.assertIn("out-of-band change", query)
+
+    def test_ownership_that_was_read_names_every_manager_and_path(self):
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("argocd-controller", card)
+        self.assertIn("spec.replicas", card)
+        self.assertIn("spec.template.spec.containers", card)
+        self.assertIn("kubectl-patch", card)
+        # A manager with no recorded paths says so rather than being dropped.
+        self.assertIn("no recorded paths", card)
+
+    def test_ownership_that_was_not_read_is_reported_as_unread(self):
+        """An unread join and an unowned object must not read alike.
+
+        Reporting the first as the second is how an agent concludes nothing
+        else manages a field that a GitOps controller owns.
+        """
+        for outcome in ("unreachable", "no_object", "gone", "failed"):
+            with self.subTest(join=outcome):
+                card = session_kv_server._drift_task_body(
+                    self._payload(join=outcome, owners=[], lookup_error="clusters/x: connection refused")
+                )
+                self.assertIn("not read", card)
+                self.assertIn(outcome, card)
+                self.assertIn("connection refused", card)
+                self.assertNotIn("records no `managedFields` entries", card)
+
+    def test_a_read_join_with_no_owners_says_the_object_has_none(self):
+        card = session_kv_server._drift_task_body(self._payload(owners=[]))
+        self.assertIn("records no `managedFields` entries", card)
+        self.assertNotIn("not read", card)
+
+    def test_a_reconcile_claim_is_carried_into_the_card(self):
+        card = session_kv_server._drift_task_body(
+            self._payload(reconciled=True, reconciled_by="argocd-controller")
+        )
+        self.assertIn("Possibly already reverted", card)
+        self.assertIn("argocd-controller", card)
+
+        unreconciled = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("Not shown to be reconciled", unreconciled)
+        # The negative is stated as absence of evidence, not as evidence.
+        self.assertIn("absence of evidence", unreconciled)
+
+    def test_the_card_keeps_the_literals_the_delivery_gate_keys_on(self):
+        """`kanban_notifier.actionable_report` reads these, as does SOUL.md §7.
+
+        The drift body is written separately from `_triage_task_body` but has
+        to be recognisable to the same readers, or the report earns no
+        `incidents` row and the offer to reply `apply` cannot be honoured.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("kanban_complete", card)
+        self.assertIn("**To authorize:**", card)
+        self.assertEqual(
+            [line for line in card.splitlines() if line.startswith("## ")],
+            ["## What's wrong", "## Why", "## What to do"],
+        )
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_drift_draws_on_the_warning_ceiling(self, trigger):
+        """One budget, not a second one beside the event watcher's."""
+        with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 1}):
+            self.assertEqual(self._inject().json()["status"], "injected")
+
+            resp = self._inject(insert_id="second-entry")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["status"], "suppressed")
+            self.assertEqual(resp.json()["severity"], "Warning")
+            self.assertEqual(trigger.call_count, 1)
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_suppressed_drift_record_is_still_recorded(self, trigger):
+        """The ledger is the only place it survives.
+
+        Unlike the watcher, the detector cannot re-offer a suppressed record:
+        the audit entry is delivered once and its insert id is already marked
+        as seen. So the recap is the whole of what a reader gets.
+        """
+        with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 1}):
+            self._inject(resource={"resource": "deployments", "name": "first", "namespace": "prod"})
+            self._inject(resource={"resource": "deployments", "name": "dropped", "namespace": "prod"})
+
+        rows = self._rows("dropped")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][9], 0)  # notified
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_payload_that_is_not_an_object_is_rejected(self, trigger):
+        resp = self.client.post(
+            "/sessions/drift-sess/inject",
+            json={"message": json.dumps(["not", "an", "object"])},
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_malformed_resource_does_not_crash_the_route(self, trigger):
+        """A 500 here would say the daemon is broken when the caller is."""
+        resp = self._inject(resource="deployments/checkout")
+        self.assertEqual(resp.status_code, 200)
+        rows = self._rows("unknown")
+        self.assertEqual(len(rows), 1)
+
+    def test_the_summary_falls_back_to_the_fields_when_absent(self):
+        summary = session_kv_server._drift_summary(self._payload(summary=""))
+        self.assertIn("alice@example.com", summary)
+        self.assertIn("patch", summary)
+        self.assertIn("prod/deployments/checkout", summary)
+        self.assertIn("prod-us-east1", summary)
+
+    def test_the_user_agent_is_labelled_as_self_declared(self):
+        """It names a tool and never a person, and the card has to say so."""
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("kubectl/v1.31.0", card)
+        self.assertIn("self-declared", card)
+
+    def test_the_kind_constant_matches_the_detector(self):
+        """One decision in two languages; the Go side is the other half."""
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "k8s-operator" / "cmd" / "drift-detector" / "inject.go"
+        ).read_text()
+        self.assertIn(f'injectKindDrift = "{session_kv_server.INJECT_KIND_DRIFT}"', source)
+
+
 if __name__ == "__main__":
     # Clean up temp database file on exit
     try:

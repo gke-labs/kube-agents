@@ -2,7 +2,7 @@
 
 Pulls GKE audit records from the Pub/Sub subscription
 [`terraform/modules/drift-pubsub`](../../../terraform/modules/drift-pubsub/) provisions, parses
-them, and — eventually — turns out-of-band cluster changes into `gitops-drift` injects.
+them, and turns out-of-band cluster changes into `gitops-drift` injects.
 [`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md) is the design; this
 file is how to work on the code.
 
@@ -13,10 +13,38 @@ why this is a Pub/Sub consumer and not an informer like its sibling
 
 ## What ships today
 
-Ingestion, classification, and the `managedFields` join: pull, parse, assign a tier, forward the
-records that represent a real human change, and enrich each with what the live object says owns the
-fields. Nothing builds this binary into an image and nothing launches it, so no installation runs it
-yet. The inject is still to come — `logDriftEvent` in `join.go` is the terminal handler it replaces.
+Ingestion, classification, the `managedFields` join, and the inject: pull, parse, assign a tier,
+forward the records that represent a real human change, enrich each with what the live object says
+owns the fields, and post the result to the core-agent daemon as a `gitops-drift` inject. Nothing
+builds this binary into an image and nothing launches it, so reaching that pipeline is something an
+operator does by hand today and no installation detects drift on its own.
+
+The inject is off unless `--daemon-url` is set, and off is the default. With it off the detector
+does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
+local run against a real subscription wants. With it on, each surviving record opens a session and
+posts one payload into it; `logDriftEvent` still runs first either way, so the `DRIFT` line is
+emitted whether or not a daemon is configured and whether or not the inject lands.
+
+Two things about that are worth knowing before relying on it. A record whose inject fails is
+**acked anyway and never redelivered** — the handler signature returns nothing, so there is no way
+to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` is the only
+remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
+after the handler returns, redelivery is ordinary rather than exceptional: the detector remembers
+the last few thousand `insertId`s it has injected and suppresses a repeat before opening a second
+session, so one redelivered batch does not page a human twice for one change. A climbing
+`duplicate=` count in the shutdown tally is a sign the ack deadline is too tight, not that the
+cluster is busy.
+
+What the daemon does with the payload is
+[`session_kv_server.py`](../../../agents/platform/scripts/session_kv_server.py)'s half: it routes on
+`kind`, so a `gitops-drift` payload gets its own chat alert and its own triage card — addressed to
+the agent for the cluster the change was made on, which the fan-in means is not necessarily the one
+the detector runs in — instead of being rendered through the event watcher's path, where the field
+defaults would describe it as a Pod. Drift draws on the same daily `Warning` ceiling as event
+alerts, and a record the ceiling refuses is lost rather than deferred: the daemon answers
+`suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
+ledger row the daemon writes is the only place that change survives. `GET /v1/alert-quota` is where
+a spent budget shows up.
 
 The join has two credential sources and they are additive. `--in-cluster` or `--kubeconfig` gives it
 the one directly reachable cluster; `--profiles-dir` gives it every cluster in `--project` that has
@@ -77,6 +105,9 @@ addressed and one that was and refused.
 | `--profiles-dir`          | empty                            | Hermes profiles directory, normally `/opt/data/profiles`. Every Cluster Agent profile whose cluster is in `--project` becomes a joinable cluster. Combines with the two above; a profile naming the cluster they already reach is dropped in favour of them.          |
 | `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource, in a second later than the audited change. Empty means no reconciliation claim is made.                 |
 | `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                             |
+| `--daemon-url`            | empty                            | Core-agent daemon to post the `gitops-drift` inject to, without a trailing slash. Empty disables the inject: records are still classified, joined and logged, and nothing is escalated.                                                                               |
+| `--token-env`             | empty                            | **Name** of the environment variable holding the daemon's bearer token, not the token. Required with `--daemon-url`, and an error without it — a flag value is visible in the process table.                                                                          |
+| `--owner`                 | empty                            | `X-Asserted-Caller` for the session the inject opens. Must be one of the daemon's `proxy_identities` or it rejects the call.                                                                                                                                          |
 
 ## Classification
 
