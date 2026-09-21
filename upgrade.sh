@@ -342,15 +342,23 @@ matches_release_bundle_ref() {
 # plugin names so that a plugin added to the chart and the composition is
 # covered without a change here. The chart the keys are applied to is pinned to
 # this script's commit by the source check, so its `plugins` block matches.
-# `trap - ERR` inside the substitutions: on bash 3.2 the inherited ERR trap
-# fires inside `$(...)` even when the assignment is guarded, and would print
-# the abort banner mid-run for a failure that is handled here. Arguments:
-# release, namespace.
+#
+# A read that fails is an error, not an empty list: an empty list would run
+# the pre-fix re-tag and leave the plugin images behind, with the omission
+# surfacing only from the image check after the Helm move. `trap - ERR` inside
+# the substitutions: on bash 3.2 the inherited ERR trap fires inside `$(...)`
+# even when the assignment is guarded, and the caller's failed assignment is
+# where the abort belongs. Arguments: release, namespace.
 recorded_plugin_image_tag_keys() {
   local release="$1" namespace="$2" values keys
-  values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>/dev/null)" || return 0
-  [ -n "$values" ] || return 0
-  keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else empty end' <<<"$values" 2>/dev/null)" || return 0
+  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>&1)"; then
+    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to find the plugin image tags: ${values}"
+    return 1
+  fi
+  if ! keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else error("plugins is not an object") end' <<<"$values" 2>&1)"; then
+    print_error "Could not read the plugin image tags from the values of Helm release '${release}': ${keys}"
+    return 1
+  fi
   [ -z "$keys" ] || printf '%s\n' "$keys"
 }
 
@@ -912,13 +920,15 @@ main() {
       # release records them: the operator renders them into the gateway as
       # stage-<plugin> init containers or plugin-<name> image volumes, and
       # the image check below reads both.
-      # A read loop rather than the bash 4 array builtin, and the `+`
-      # expansion for the empty case: operators run this from macOS, whose
-      # bash is 3.2.
-      local plugin_tag_keys=() plugin_tag_key
+      # The read is an assignment, so a failed read stops the run here rather
+      # than in a process substitution whose status nothing checks. A read
+      # loop rather than the bash 4 array builtin, and the `+` expansion for
+      # the empty case: operators run this from macOS, whose bash is 3.2.
+      local plugin_tag_list plugin_tag_keys=() plugin_tag_key
+      plugin_tag_list="$(recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"
       while IFS= read -r plugin_tag_key; do
         [ -n "$plugin_tag_key" ] && plugin_tag_keys+=("$plugin_tag_key")
-      done < <(recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")
+      done <<<"$plugin_tag_list"
       helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag" \
         ${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}
       print_success "Platform Agent deployment upgraded successfully!"

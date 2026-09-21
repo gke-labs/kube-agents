@@ -33,8 +33,10 @@ kubectl get deployment platform-agent-gateway -n kubeagents-system \
 helm history kube-agents -n kubeagents-system
 ```
 
-The third command lists the plugin images, as `stage-<plugin>` init containers or `plugin-<name>`
-image volumes depending on the cluster; it prints nothing when no plugin is enabled.
+The third command lists the gateway's init container and image volume images; the plugin ones are
+the lines naming `pubsub-platform` or `gke-stockout-investigator` (a `stage-<plugin>` init
+container or a `plugin-<name>` image volume, depending on the cluster). None means no plugin is
+enabled.
 
 Get `N-1`'s sources. Either a clean checkout of the tag or the release bundle passes the
 source check:
@@ -224,9 +226,9 @@ kubectl get pods -n kubeagents-system
 helm history kube-agents -n kubeagents-system
 ```
 
-Both images end in `:<N-1>`, so does every plugin image the third command lists (a `stage-<plugin>`
-init container or a `plugin-<name>` image volume, depending on the cluster; nothing listed means no
-plugin is enabled), the `Ready` condition reads `True`, the gateway pod is `Running`,
+Both images end in `:<N-1>`, so does every plugin image the fourth command lists (the lines naming
+`pubsub-platform` or `gke-stockout-investigator`), the `Ready` condition reads `True`, the gateway
+pod is `Running`,
 and the newest Helm revision is `deployed` at chart version `N-1`, with the operator step's
 revision `superseded` just before it. `kubeagents-system` is the default namespace; an install
 that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the chart's default

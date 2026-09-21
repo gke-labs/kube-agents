@@ -432,7 +432,11 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         """
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         harness = text[text.index("    harness)") : text.index("    full)")]
-        self.assertIn("recorded_plugin_image_tag_keys", harness)
+        self.assertIn(
+            'plugin_tag_list="$(recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"',
+            harness,
+            "the read has to be an assignment, so a failed read stops the run",
+        )
         self.assertIn('helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"', harness)
         self.assertIn('${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}', harness)
         self.assertNotIn("mapfile", harness, "macOS ships bash 3.2, which has no mapfile")
@@ -493,18 +497,24 @@ echo "rc=$?"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.split(), ["rc=0"])
 
-    def test_a_malformed_plugins_value_yields_nothing_and_no_banner(self):
+    def test_a_malformed_plugins_value_is_an_error_not_an_empty_list(self):
+        """upgrade.sh runs under set -e, so the failed call ends the sourced run."""
         proc = self._run('{"plugins":"oops"}')
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.split(), ["rc=0"])
-        self.assertNotIn("ABORT BANNER", proc.stderr)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("rc=", proc.stdout)
+        self.assertIn("Could not read the plugin image tags", proc.stdout)
 
-    def test_a_failing_helm_read_yields_nothing_and_no_banner(self):
-        """On bash 3.2 the inherited ERR trap fires inside $(...) unless dropped there."""
+    def test_a_failing_helm_read_is_an_error_not_an_empty_list(self):
+        """An empty list would run the pre-fix re-tag and leave the plugins behind.
+
+        The failure is reported once, by the function; on bash 3.2 the
+        inherited ERR trap would otherwise also fire inside the substitution.
+        """
         proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}}}}', helm_exit=1)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.split(), ["rc=0"])
-        self.assertNotIn("ABORT BANNER", proc.stderr)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("rc=", proc.stdout)
+        self.assertIn("Could not read the values of Helm release", proc.stdout)
+        self.assertLessEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
 
 
 if __name__ == "__main__":
