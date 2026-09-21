@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 from pathlib import Path
@@ -28,6 +29,16 @@ from typing import Callable, Sequence
 
 from kube_agents_bench import priors as priors_mod
 from kube_agents_bench import stats
+from kube_agents_bench.plan import (
+    DEFAULT_EFFECT,
+    DEFAULT_MAX_REPS,
+    DIRECTION_DOWN,
+    DIRECTION_UP,
+    adaptive_continue,
+    plan_rows,
+    render_plan,
+    undecidable,
+)
 from kube_agents_bench.execution import (
     DEFAULT_PARALLEL,
     LAUNCH_STAGGER_S,
@@ -42,6 +53,7 @@ from kube_agents_bench.execution import (
 from kube_agents_bench.report import (
     SummaryError,
     load_summary,
+    render_compare,
     render_summary,
     summarise,
     write_summary,
@@ -104,6 +116,13 @@ def add_selectors(parser: argparse.ArgumentParser) -> None:
 def add_run_arguments(run: argparse.ArgumentParser) -> None:
     add_selectors(run)
     run.add_argument("--reps", type=int, default=DEFAULT_REPS, help="repetitions per case")
+    run.add_argument(
+        "--until-decided",
+        action="store_true",
+        help="after --reps, keep running a case until it is significantly better or worse than the "
+        "baseline, no completion could be, or --max-reps is reached; refuses to start without a baseline",
+    )
+    run.add_argument("--max-reps", type=int, default=DEFAULT_MAX_REPS, help="ceiling under --until-decided")
     run.add_argument("--out", type=Path, default=None, help=f"run-set directory (default bench/{DEFAULT_OUT_ROOT}/<stamp>)")
     run.add_argument("--stagger", type=float, default=LAUNCH_STAGGER_S, help="seconds between unit launches")
     run.add_argument("--dry-run", action="store_true", help="print what would run and exit")
@@ -112,9 +131,27 @@ def add_run_arguments(run: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bench-run", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
+
+    plan = sub.add_parser("plan", help="rank the selection by repetitions needed; no cluster")
+    add_selectors(plan)
+    plan.add_argument("--effect", type=float, default=DEFAULT_EFFECT, help="pass-rate change to size for")
+    plan.add_argument("--power", type=float, default=stats.DEFAULT_POWER, help="power target")
+    plan.add_argument(
+        "--direction", choices=[DIRECTION_UP, DIRECTION_DOWN], default=DIRECTION_UP,
+        help="sort by reps to show a rise or a drop",
+    )
+    plan.add_argument("--reps", type=int, default=DEFAULT_REPS, help="repetitions the wall-clock estimate assumes")
+    plan.add_argument("--json", action="store_true", help="print the rows as JSON")
+
     add_run_arguments(sub.add_parser("run", help="run the selection against your install and summarise"))
+
     summarize = sub.add_parser("summarize", help="re-print a run set's summary")
     summarize.add_argument("run_set", type=Path)
+
+    compare = sub.add_parser("compare", help="one run set against another (candidate first)")
+    compare.add_argument("candidate", type=Path)
+    compare.add_argument("baseline_run_set", type=Path)
+    compare.add_argument("--alpha", type=float, default=stats.DEFAULT_ALPHA)
     return parser
 
 
@@ -214,11 +251,62 @@ def summarize_command(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def compare_command(args: argparse.Namespace) -> int:
+    try:
+        print(render_compare(load_summary(args.candidate), load_summary(args.baseline_run_set), args.alpha))
+    except SummaryError as exc:
+        print(f"bench-run: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    return EXIT_OK
+
+
+def plan_command(args: argparse.Namespace, *, env: dict[str, str]) -> int:
+    root = repo_root()
+    try:
+        cases = select_cases(args.selectors, roster=args.roster, domains=args.domain, root=root)
+    except SelectionError as exc:
+        print(f"bench-run: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    priors, _baseline = load_priors(args)
+    rows = plan_rows(
+        cases, priors, effect=args.effect, alpha=args.alpha, power=args.power,
+        parallel=args.parallel, env=env, include_infra=args.include_infra, overlap_reps=args.overlap_reps,
+    )
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        print(render_plan(rows, direction=args.direction, effect=args.effect, reps=args.reps, parallel=args.parallel))
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    env = dict(os.environ)
     if args.command == "summarize":
         return summarize_command(args)
-    return run_command(args, env=dict(os.environ))
+    if args.command == "compare":
+        return compare_command(args)
+    if args.command == "plan":
+        return plan_command(args, env=env)
+    if not args.until_decided:
+        return run_command(args, env=env)
+
+    def needs_baseline(cases: list[SelectedCase], priors: dict[str, priors_mod.Prior]) -> str | None:
+        missing = undecidable(cases, priors, env, args.include_infra)
+        if not missing:
+            return None
+        return (
+            "--until-decided needs a baseline to decide against, and none covers: "
+            + ", ".join(missing)
+            + " (pass --baseline, or drop the flag for a fixed --reps run)"
+        )
+
+    max_reps = max(args.max_reps, args.reps)
+    return run_command(
+        args, env=env,
+        continue_case=lambda priors: adaptive_continue(priors, max_reps=max_reps, alpha=args.alpha),
+        extra_problems=[needs_baseline],
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -30,12 +30,20 @@ __all__ = [
     "DECISION_UNDECIDED",
     "DECISION_WORSE",
     "Decision",
+    "SRC_FILE",
+    "SRC_MAIN",
+    "SRC_NONE",
+    "SRC_PRS",
     "SUMMARY_JSON",
     "SUMMARY_MD",
     "SummaryError",
     "decide",
+    "fmt_p",
+    "fmt_rate",
     "load_summary",
+    "render_compare",
     "render_summary",
+    "source_label",
     "summarise",
     "write_summary",
 ]
@@ -79,17 +87,17 @@ def decide(passes: int, fails: int, prior: priors_mod.Prior | None, alpha: float
     return Decision(p_value, verdict, interval)
 
 
-def _fmt_rate(value: float | None) -> str:
+def fmt_rate(value: float | None) -> str:
     return "  --" if value is None else f"{value:4.2f}"
 
 
-def _fmt_p(value: float | None) -> str:
+def fmt_p(value: float | None) -> str:
     if value is None:
         return "   --"
     return "<.001" if value < P_VALUE_DISPLAY_FLOOR else f"{value:5.3f}"
 
 
-def _source_label(source: str | None) -> str:
+def source_label(source: str | None) -> str:
     if not source:
         return SRC_NONE
     if source.endswith(priors_mod.TIER_NIGHTLY):
@@ -198,9 +206,9 @@ def render_summary(summary: dict[str, Any]) -> str:
             extras.append("expected_fail")
         decision = c["decision"] or "--"
         lines.append(
-            f"{c['case_id']:46} {c['passes']:>2}/{n:<2} {_fmt_rate(c['rate']):>5} {ci:>11} "
-            f"{_fmt_rate(base.get('rate')):>5} {base.get('n', 0):>5} {_source_label(base.get('source')):>4} "
-            f"{_fmt_p(c['p_value']):>6}  {decision}"
+            f"{c['case_id']:46} {c['passes']:>2}/{n:<2} {fmt_rate(c['rate']):>5} {ci:>11} "
+            f"{fmt_rate(base.get('rate')):>5} {base.get('n', 0):>5} {source_label(base.get('source')):>4} "
+            f"{fmt_p(c['p_value']):>6}  {decision}"
             + (f" ({', '.join(extras)})" if extras else "")
         )
         for name, count in sorted(c["failed_checks"].items(), key=lambda kv: -kv[1]):
@@ -211,6 +219,28 @@ def render_summary(summary: dict[str, Any]) -> str:
         for rep in c["reps"]:
             if rep["run_dir"]:
                 lines.append(f"  {c['case_id']} rep {rep['rep']}: {rep['outcome']}  {rep['run_dir']}")
+    return "\n".join(lines)
+
+
+def render_compare(candidate: dict[str, Any], baseline: dict[str, Any], alpha: float) -> str:
+    base_by_id = {c["case_id"]: c for c in baseline["cases"]}
+    lines = [
+        f"compare: {candidate['out_dir']} (at {candidate.get('commit') or '?'}) against "
+        f"{baseline['out_dir']} (at {baseline.get('commit') or '?'}); alpha {alpha}",
+        "",
+        f"{'case':46} {'cand':>7} {'base':>7} {'p':>6}  decision",
+    ]
+    for c in candidate["cases"]:
+        b = base_by_id.get(c["case_id"])
+        if c["skipped"] or b is None or b["skipped"]:
+            lines.append(f"{c['case_id']:46} {'--':>7} {'--':>7} {'--':>6}  not in both run sets")
+            continue
+        prior = priors_mod.Prior(c["case_id"], b["passes"], b["passes"] + b["fails"], None, baseline["out_dir"])
+        decision = decide(c["passes"], c["fails"], prior, alpha)
+        lines.append(
+            f"{c['case_id']:46} {c['passes']:>3}/{c['passes'] + c['fails']:<3} "
+            f"{b['passes']:>3}/{b['passes'] + b['fails']:<3} {fmt_p(decision.p_value):>6}  {decision.verdict}"
+        )
     return "\n".join(lines)
 
 

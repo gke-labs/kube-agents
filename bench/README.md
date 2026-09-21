@@ -12,7 +12,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
 - `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
-- `kube_agents_bench/runner.py`, `execution.py`, `report.py` — `bench-run`, the local runner described under [Running evals](#running-evals): the CLI, the repetition loop with the presubmit's locks and ceilings, and the verdict per case.
+- `kube_agents_bench/runner.py`, `execution.py`, `report.py`, `plan.py` — `bench-run`, the local runner described under [Running evals](#running-evals): the CLI, the repetition loop with the presubmit's locks and ceilings, the verdict per case, and the plan and adaptive stop.
 - `kube_agents_bench/selection.py`, `stats.py`, `priors.py` — its pieces: which cases a selector names and what each needs to run (a tofu stack, the seeded fleet, a GitHub token); exact small-sample statistics for pass rates (Wilson interval, Fisher exact test, repetitions needed to show a change); and where a case's pass rate on record comes from (the eval dashboard's `data.json`, preferring the nightly's record of `main` once it holds the admission window, or an earlier run's summary).
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. The rest are the Phase 2 domain scenarios; [`tasks/DRAFTS.md`](tasks/DRAFTS.md) is their status page.
 - `baselines/` — screening evidence and `VERSIONS.json`, one append-only JSONL file per case, one batch of runs per line, each keyed on the five software versions a score depends on. Written by runs on `main`, read by every pull request. See [baselines/README.md](baselines/README.md).
@@ -71,9 +71,10 @@ uv sync
 export AGENT_CLUSTER_CONTEXT=<kubectl context>      # the token is read from the install's secret
 export JUDGE_PROVIDER=google JUDGE_MODEL=gemini-3.1-pro-preview GCP_PROJECT_ID=<gcp project>
 
+uv run bench-run plan --roster presubmit             # no cluster: which cases can show a change, and in how many runs
 uv run bench-run run cost-idle-pool-probe            # three repetitions, the presubmit's number
-uv run bench-run run --roster blocking --parallel 4  # what can red a pull request, as the presubmit runs it
-uv run bench-run summarize results/bench-run/<stamp>
+uv run bench-run run cost-idle-pool-probe --until-decided --max-reps 12
+uv run bench-run compare results/bench-run/<branch-run> results/bench-run/<main-run>
 ```
 
 Selectors combine: case ids, globs on ids (`cost-*`), `task.yaml` paths, `--roster
@@ -82,22 +83,27 @@ and `--domain <slug>`. Nothing is selected by default. A case that reads the see
 with a reason until `BENCH_FLEET_KUBECONFIG_DIR` is set (`hack/fleet-kubeconfigs.sh`), and a case that
 provisions a tofu stack until `--include-infra` is passed with `PROJECT_ID` and `CLUSTER_NAME`.
 
-`run` prints, per case, `k/n` with a Wilson 95% interval, the two-sided Fisher exact p-value against
-the case's record, `better`/`worse`/`undecided`, and which checks failed how often. The record comes
-from the eval dashboard's `data.json` (`--baseline`; `none` works offline, and a previous run set's
-`summary.json` makes it an A/B against `main` built and run on the same install). The dashboard
-carries two records per case: the nightly's, which runs `main`, and the pooled record of every
-pull-request presubmit. The runner takes the nightly once it holds twenty runs and the presubmit
-record until then, and the `src` column says which (`main` or `prs`). Three passes on a case at
-0.87 on record are what the record produces most days, and the p-value says so. Every run set is a
-directory (`results/bench-run/<stamp>/` by default) holding, per case, one log and one devops-bench
-run directory per repetition (`<case>/rep1.log`, and `<case>/rep1/run_<stamp>_<case>-rep1/` as
-devops-bench names it), plus `summary.json` and `summary.md` at the root; the summary lists the run
-directories a pull request's Live validation section quotes. Ctrl-C (or any SIGINT to the runner)
-drops the queue, sends each in-flight unit one SIGINT, waits for it, and writes the summary of what
-completed; each unit runs in its own session, so nothing else signals it, and a unit that was
-provisioning a tofu stack gets fifteen minutes to finish its own teardown, which a second Ctrl-C
-does not cut short.
+`plan` reads each case's pass rate and run count from the eval dashboard's `data.json`
+(`--baseline`; `none` works offline, and a previous run set's `summary.json` makes it an A/B) and
+reports the repetitions needed before a rise or a drop of `--effect` (0.3 by default) would be
+significant at `--alpha` with `--power`, by two-sided Fisher exact test. The dashboard carries two
+records per case: the nightly's, which runs `main`, and the pooled record of every pull-request
+presubmit. The runner takes the nightly once it holds twenty runs and the presubmit record until
+then, and the `src` column says which (`main` or `prs`). That number is the honest answer to "how
+many times should I run this": a case at 0.87 on record needs more than twenty runs to show it
+reached 1.0, and three passes on it are what the record produces most days. `run` prints `k/n`
+with a Wilson 95% interval, the p-value against the baseline, `better`/`worse`/`undecided`, and which
+checks failed how often; `--until-decided` continues past `--reps` until the verdict is decided, no
+completion within `--max-reps` could decide it, or the ceiling is reached, and refuses to start for
+a case with no baseline. Every run set is a directory (`results/bench-run/<stamp>/` by default)
+holding, per case, one log and one devops-bench run directory per repetition
+(`<case>/rep1.log`, and `<case>/rep1/run_<stamp>_<case>-rep1/` as devops-bench names it), plus `summary.json` and `summary.md` at the
+root; the summary lists the run directories a pull request's Live validation section quotes. Ctrl-C
+(or any SIGINT to the runner) drops the queue, sends each in-flight unit one SIGINT, waits for it,
+and writes the summary of what completed; each unit runs in its own session, so nothing else
+signals it, and a unit that was provisioning a tofu stack gets fifteen minutes to finish its own
+teardown, which a second Ctrl-C does not cut short.
+[`docs/designs/bench-local-runner.md`](../docs/designs/bench-local-runner.md) has the rationale.
 
 Repetitions of one case run in series, as the presubmit runs them; different cases overlap up to
 `--parallel`. `--overlap-reps` lets a case's repetitions overlap for speed, which the presubmit never
