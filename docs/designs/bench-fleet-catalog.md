@@ -90,11 +90,40 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
-only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
-outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
+Eleven fixtures: ten across the three cluster slots and one project-scoped. Most in-cluster
+fixtures are on slot `a`, across the four seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security` and `seeded-capacity`, plus both defect node pools.
+Slot `c` carries a GKE-level defect only and no workloads at all: it is the configuration
+outlier. Slot `b` is the held-back control plane, and now also the upgrade-readiness drain
+defects — they belong with the cluster whose subject is upgrading.
+
+### Slot `b`: the drain that never starts
+
+Upgrading a node means draining it, and most upgrade failures are really drain failures. What
+the fleet could already show was a workload that resists eviction — `obtainability-audit`'s
+PodDisruptionBudget checks, on slot `a`. What it could not show is the two cases where the drain
+never begins:
+
+| Role                           | What it plants                                                                                                                   |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `readiness-surge-blocked`      | A node pool with `max_surge: 0`, so an upgrade removes its only node rather than adding a replacement first                      |
+| `readiness-pinned-workload`    | A Deployment whose `nodeSelector` names that pool alone, so its pods have nowhere to go when it drains                           |
+| `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` with `failurePolicy: Fail` and no `timeoutSeconds`, pointing at a Service that does not exist |
+
+The first two are a pair, and that is the point: the surge setting alone is a configuration, and
+joining it to what actually runs there is an outage. A case can ask whether the agent made that
+join.
+
+The webhook plants two of its finding's three properties. The dangerous variant matches
+cluster-wide, and a fail-closed cluster-wide webhook on a standing shared cluster would reject
+writes for every scenario that touches slot `b`, not only for this fixture. A `namespaceSelector`
+confines it to `seeded-upgrade`; the scope dimension belongs in a unit test with a recorded
+manifest, where nothing can be broken by it.
+
+A second pool rather than a setting on the default one, because the default pool's version
+pinning is what makes `version-laggard` exact, and a scenario that reds because this fixture
+disturbed that pin would point at the wrong place. Both new pool settings — `version` and
+`auto_upgrade` — follow the default pool for the same reason it carries them. Every cluster is labelled `environment=seeded`, which is what confines the drift
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
 from voting on the baseline.
 
