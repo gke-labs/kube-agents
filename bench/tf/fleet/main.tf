@@ -666,17 +666,31 @@ resource "google_container_cluster" "seeded_d" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  # local.fleet_labels, NOT local.cluster_labels. The `environment = seeded`
-  # label in cluster_labels is what confines the drift cohort to exactly
-  # {a, b, c}, and main.tf's locals block says outright that labelling a
-  # fourth cluster with it "would add a fourth voter and change the
-  # arithmetic". The drift scenario's severity ladder is computed on r = 2/3
-  # over three clusters; a fourth voter moves it and reds
-  # consistency-drift-outlier, a scenario this cluster has nothing to do
-  # with. Unlabelled, seeded-d lands in the unknown-environment cohort, is
-  # alone there, and the SOP's three-cluster floor keeps it from ever
-  # producing a drift finding of its own.
-  resource_labels     = local.fleet_labels
+  # local.cluster_labels, the same as the trio. The runner has no other way to
+  # find this cluster: hack/fleet-kubeconfigs.sh discovers slots with
+  # `resourceLabels.environment=seeded AND resourceLabels.managed-by=...`, so a
+  # cluster without the environment label is never listed, never resolves to a
+  # slot, and its roles are never published -- which fails the fleet-presence
+  # check on every pool project, with no warning naming a cause, because
+  # nothing about the cluster was ever seen.
+  #
+  # That makes seeded-d a fourth voter in the drift cohort, which the locals
+  # block at the top of this file warns about, so the arithmetic is worked here
+  # rather than hoped for. The cohort is keyed on environment (drift SOP 2.3)
+  # and the ladder walks one step at r < 0.90 and another at r < 0.80 (SOP
+  # 3.5). The planted facet is authorized-networks, base critical: at three
+  # clusters it is 2/3 = 0.67, two steps, surviving as minor. At four, with
+  # seeded-d configured like seeded-a and seeded-b, it is 3/4 = 0.75 -- still
+  # two steps, still minor, and consistency-drift-outlier grades the same.
+  # What is NOT safe is leaving the block off: 2/4 = 0.5 is below SOP 3.3's
+  # 2/3 threshold, so there is no baseline, no finding, and that scenario reds.
+  # The master_authorized_networks_config below is therefore load-bearing.
+  #
+  # The other base-critical facets stay uniform at 4/4: neither private nodes
+  # nor database encryption is configured on any cluster in this stack. Every
+  # lower-severity facet is dropped by the ladder at 0.75 exactly as it was at
+  # 0.67, so no facet gains a finding because a fourth cluster arrived.
+  resource_labels     = local.cluster_labels
   deletion_protection = false
 
   logging_config {

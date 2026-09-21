@@ -176,7 +176,7 @@
       "cluster_slot": "d",
       "namespace": "seeded-topology",
       "probes": ["deployment/zone-pinned-api"],
-      "fixture": "zone-pinned-api Deployment, four replicas, topology spread constraint with whenUnsatisfiable ScheduleAnyway plus a node affinity only the first zone satisfies, so every pod lands in one zone",
+      "fixture": "zone-pinned-api Deployment, two replicas, topology spread constraint with whenUnsatisfiable ScheduleAnyway plus a node affinity only the first zone satisfies, so both pods land in one zone",
       "state": [
         {
           "subject": "pod?app=zone-pinned-api",
@@ -235,6 +235,13 @@
           "op": "any_eq",
           "value": "Pending",
           "why": "Capacity is the cause this fixture plants, and a Pending pod is the only evidence of it. If every replica scheduled -- a larger node, or a quieter system set -- the cluster is merely unevenly loaded and an agent naming capacity would be guessing"
+        },
+        {
+          "subject": "deployment/capacity-starved-worker",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "the other half of the fixture, and what separates skew from a cluster where nothing schedules. A Pending pod alone is satisfied by all three being Pending, which the fixture's own comment calls broken rather than skewed. hpa-saturated pairs its Pending assertion with a readyReplicas floor for the same reason"
         }
       ]
     }

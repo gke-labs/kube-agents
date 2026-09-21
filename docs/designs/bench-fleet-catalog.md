@@ -97,13 +97,20 @@ Slots `b` and `c` carry GKE-level defects only and no workloads at all: `b` is t
 control plane, `c` is the configuration outlier. Slot `d` is the exception to "the defect is
 something planted in a cluster" — there, the cluster's own shape is the fixture.
 
-`a`, `b` and `c` are labelled `environment=seeded`, which is what confines the drift cohort to
-those three and keeps `platform-agent-host` and transient `eval-pr*` clusters from voting on the
-baseline. **Slot `d` deliberately carries no such label.** The drift SOP's severity ladder is
-computed over the cohort, and a fourth voter changes that arithmetic; unlabelled, `d` sits alone
-in the unknown-environment cohort, where the three-cluster floor keeps it from producing drift
-findings at all. Anything added to the fleet later inherits that rule: join the cohort only if
-the drift scenarios are meant to see you.
+Every cluster in the stack is labelled `environment=seeded`, which confines the drift cohort to
+the fleet and keeps `platform-agent-host` and transient `eval-pr*` clusters from voting on the
+baseline. **Slot `d` carries it too, and has to**: `hack/fleet-kubeconfigs.sh` discovers slots by
+filtering on that label together with `managed-by`, so a cluster without it is never listed and
+its roles are never published.
+
+That makes `d` a fourth voter, so the arithmetic is worked rather than avoided. The planted facet
+is `authorized-networks`, base `critical`, and the ladder walks one step below an agreement ratio
+of 0.90 and another below 0.80. At three clusters the ratio is 2/3 and the finding survives two
+steps down as `minor`; at four, with `d` carrying the same open block `a` and `b` carry, it is 3/4
+— still two steps, still `minor`. Leaving the block off `d` would make it 2/4, below the baseline
+threshold, so there would be no finding and `consistency-drift-outlier` would red. Anything added
+to the fleet later inherits that: a new cluster joins the cohort, and it has to be configured so
+the facets the drift scenarios assert on keep their majority.
 
 ### Slot `d`: the shape is the fixture
 
