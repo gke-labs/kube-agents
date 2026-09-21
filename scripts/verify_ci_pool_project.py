@@ -112,8 +112,8 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 # is what makes it a usable identity probe rather than just a reachability test.
 GITHUB_APP_URL = "https://api.github.com/app"
 
-# The read-only App the EVAL RUNNER grades ledger issues with, which is not the
-# minter App above. hack/ci-eval-pr.sh mints an installation token from it into
+# The App the EVAL RUNNER grades ledger issues with, which is not the minter App
+# above. hack/ci-eval-pr.sh mints an installation token from it into
 # BENCH_GITHUB_TOKEN before each devops-bench invocation; a test pins these two
 # to that script, so changing the App there cannot leave this check attesting a
 # credential CI no longer uses.
@@ -122,6 +122,13 @@ LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
+
+# The one permission the App holds that grading does not use. hack/ci-teardown.sh
+# closes the agent's leftover pull requests with it; without it that step fails on
+# every lease, and the next lease of the project inherits a pull request the run
+# before it opened. The grading mint asks for a read-only subset, so the two
+# callers do not share this.
+LEDGER_SWEEP_PERMISSION = ("pull_requests", "write")
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -1906,6 +1913,11 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     status is one of {"ok", "failed", "unverified"}, and the token is only ever
     returned, never logged: it is a live credential for every repository in the
     installation.
+
+    On "ok" the message is empty, or carries a non-fatal note about the
+    installation itself -- the mint response is the only place its scope and
+    permissions are visible, and a second call to see them would cost another
+    JWT for an answer already in hand.
     """
 
     def _b64(raw: bytes) -> bytes:
@@ -1999,6 +2011,21 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     token = body.get("token")
     if not token:
         return None, "unverified", "GitHub's mint response carried no token"
+
+    # Not fatal, and not about this project: grading works without it, and the
+    # teardown's sweep is the only caller that asks for it. But a missing write
+    # is invisible until a lease, and then only as one failed teardown step, so
+    # it is worth saying here. Absent permissions are GitHub changing its
+    # response rather than a revoked grant, same as the scope guard above.
+    scope, level = LEDGER_SWEEP_PERMISSION
+    granted = body.get("permissions")
+    if isinstance(granted, dict) and granted.get(scope) != level:
+        return token, "ok", (
+            f"App {LEDGER_APP_ID}'s installation does not hold `{scope}: {level}`, so the "
+            "pull-request sweep in hack/ci-teardown.sh fails on every lease and each run leaves "
+            "its remediation pull request open for the next one to inherit. An organisation "
+            "owner accepts it on the App's installation; it is pool-wide, not per-project"
+        )
     return token, "ok", ""
 
 
@@ -2101,7 +2128,13 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
         ])
 
-    return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
+    # A message on an "ok" mint is a note about the installation, not the read.
+    return CheckResult(
+        name,
+        True,
+        f"App {LEDGER_APP_ID} can read {repo_slug}'s issues",
+        warnings=[message] if message else [],
+    )
 
 
 def _probe_github_app_identity(

@@ -1919,6 +1919,37 @@ class LedgerTokenMintTest(unittest.TestCase):
         _, _, message = self._mint(sign_rc=1)
         self.assertNotIn("not-a-key", message)
 
+    def _mint_with_permissions(self, permissions):
+        body = {"token": "ghs_minted"}
+        if permissions is not None:
+            body["permissions"] = permissions
+        return self._mint(urlopen=lambda *a, **kw: _Response(dict(body)))
+
+    def test_a_missing_sweep_permission_is_noted_without_failing(self):
+        # Grading does not use it, so the token is still good and the project is
+        # still registrable. What breaks is the teardown's pull-request sweep,
+        # and it breaks silently: one failed step inside a teardown that is not
+        # allowed to red the job.
+        scope, level = checker.LEDGER_SWEEP_PERMISSION
+        token, status, message = self._mint_with_permissions({"issues": "read", scope: "read"})
+        self.assertEqual("ghs_minted", token)
+        self.assertEqual("ok", status)
+        self.assertIn(f"{scope}: {level}", message)
+        self.assertIn("hack/ci-teardown.sh", message)
+
+    def test_the_sweep_permission_present_says_nothing(self):
+        scope, level = checker.LEDGER_SWEEP_PERMISSION
+        _, status, message = self._mint_with_permissions({"issues": "read", scope: level})
+        self.assertEqual("ok", status)
+        self.assertEqual("", message)
+
+    def test_a_response_without_permissions_says_nothing(self):
+        # Same reasoning as the scope guard: an absent key is GitHub changing
+        # its response, not an owner taking the permission away.
+        _, status, message = self._mint_with_permissions(None)
+        self.assertEqual("ok", status)
+        self.assertEqual("", message)
+
 
 class LedgerReadCredentialTest(unittest.TestCase):
     """The grading credential, which is not the minter App and not the operator's own login."""
@@ -2025,6 +2056,21 @@ class LedgerReadCredentialTest(unittest.TestCase):
         with mock.patch.dict(checker.os.environ, env, clear=True):
             result = self._check(fail_if_called, pem=None)
         self.assertTrue(result.warnings)
+
+    def test_an_installation_note_rides_along_as_a_warning(self):
+        # The sweep permission is the only note the mint makes on an "ok". The
+        # read itself succeeded, so the check passes and says why anyway.
+        result = self._check(
+            lambda *a, **kw: _Response({}),
+            mint=("ghs_fake", "ok", "does not hold `pull_requests: write`"),
+        )
+        self.assertTrue(result.passed)
+        self.assertIn("pull_requests: write", " ".join(result.warnings))
+
+    def test_a_clean_mint_warns_about_nothing(self):
+        result = self._check(lambda *a, **kw: _Response({}))
+        self.assertTrue(result.passed)
+        self.assertEqual([], result.warnings)
 
     def test_the_token_never_reaches_a_message(self):
         result = self._check(self._http_error(403, "Forbidden"), mint=("ghs_secret_value", "ok", ""))

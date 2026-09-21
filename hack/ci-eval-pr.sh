@@ -908,9 +908,12 @@ export BENCH_TF_ROOT="./tf"
 # passed every onboarding check, was registered, and 404'd on the first pull
 # request that leased it (gke-labs/kube-agents#994).
 #
-# EVAL_LEDGER_APP_KEY_FILE set: mint a read-only installation token from App
-# 4739812 instead, once per fan-out unit, because a token lasts an hour and
-# units launch across the whole run. Unset: the mounted PAT stands. A mint that
+# EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
+# instead, once per fan-out unit, because a token lasts an hour and units launch
+# across the whole run. It is read-only because the mint asks for
+# GRADING_PERMISSIONS, not because the App is -- the App stopped being read-only
+# when hack/ci-teardown.sh needed pull_requests: write to close the agent's
+# leftovers (#1755). Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
 # repetition inside the fan-out; it never falls back to the PAT, which would
 # let a smoke test pass while proving nothing about the credential it was added
@@ -961,6 +964,13 @@ key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
 app_id = os.environ["EVAL_LEDGER_APP_ID"]
 installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
 
+# Asked for rather than inherited. The App also holds pull_requests: write, so
+# hack/ci-teardown.sh can close the agent's leftover pull requests (#1755) --
+# and the token the verifiers grade with must not carry it. A token can request
+# any subset of what the installation has, so the read-only property the
+# grading path relies on is restored here instead of at the App.
+GRADING_PERMISSIONS = {"issues": "read", "pull_requests": "read"}
+
 
 def b64(raw):
     return base64.urlsafe_b64encode(raw).rstrip(b"=")
@@ -992,9 +1002,11 @@ jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
 request = urllib.request.Request(
     "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
     method="POST",
+    data=json.dumps({"permissions": GRADING_PERMISSIONS}).encode(),
     headers={
         "Authorization": "Bearer " + jwt,
         "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
         "User-Agent": "kube-agents-ci-eval-pr",
     },
 )
@@ -1007,7 +1019,9 @@ except urllib.error.HTTPError as exc:
     # and a caller holding two locks should hear about them on the first.
     # 403 stays terminal with them: on this endpoint it is a suspended
     # installation as often as a secondary rate limit, and the two read alike
-    # from here.
+    # from here. 422 is terminal too, and means the installation no longer
+    # holds one of GRADING_PERMISSIONS -- an organisation-settings change, not
+    # something a retry reaches.
     message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
         exc.code,
         exc.reason,

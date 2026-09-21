@@ -1,4 +1,4 @@
-"""Tests for the ledger-token mint's retry in hack/ci-eval-pr.sh.
+"""Tests for the ledger-token mint in hack/ci-eval-pr.sh: its retry, and its scope.
 
 `run_one_unit` mints its own installation token after it has taken both locks,
 and a unit that cannot mint releases them and returns. That return costs the
@@ -20,8 +20,14 @@ visible from a run where GitHub answers. What has to hold:
 
 The functions are extracted from the script and executed with the network half
 stubbed out, so these assertions are against the code that ships.
+
+The scope half is newer and has nothing to do with the retry. The App stopped
+being read-only when the teardown's pull-request sweep needed it (#1755), so
+the read-only property the verifiers rely on now comes from what this mint asks
+for. LedgerMintScopeTest is what keeps it.
 """
 
+import ast
 import pathlib
 import re
 import subprocess
@@ -233,6 +239,44 @@ class LedgerMintContractTest(unittest.TestCase):
         self.assertIn("delay=2", body)
         self.assertIn("delay=$((delay * 4))", body)
         self.assertGreaterEqual(_attempts(), 2)
+
+
+class LedgerMintScopeTest(unittest.TestCase):
+    """The App is no longer read-only; the token it mints here still is.
+
+    App 4739812 gained `pull_requests: write` so hack/ci-teardown.sh can close
+    the agent's leftover pull requests (#1755). The verifiers grade with the
+    same App's key, and nothing about grading needs write. A mint may ask for
+    any subset of what the installation holds, so the separation lives at the
+    mint now instead of at the App: drop the body and the token inherits the
+    installation whole, and the credential that judges a run can change what it
+    judges.
+    """
+
+    def test_the_grading_token_asks_for_read_and_nothing_more(self):
+        body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
+        literal = re.search(r"^GRADING_PERMISSIONS = (\{[^}]*\})$", body, re.M)
+        self.assertIsNotNone(literal, "no GRADING_PERMISSIONS in _ledger_token_mint")
+        asked = ast.literal_eval(literal.group(1))
+        self.assertEqual(sorted(asked), ["issues", "pull_requests"])
+        for scope, level in asked.items():
+            with self.subTest(scope=scope):
+                self.assertEqual(level, "read")
+
+    def test_the_permissions_reach_github(self):
+        # A constant the request never carries narrows nothing.
+        body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
+        self.assertIn('data=json.dumps({"permissions": GRADING_PERMISSIONS}).encode()', body)
+
+    def test_the_sweep_is_the_only_writer(self):
+        # The other caller of this App. Its own narrowing is pinned in
+        # tests/test_ci_sweep_agent_pulls.py; what matters here is that the two
+        # asks are different, so a copy-paste that hands the grader write shows
+        # up as a failure rather than as a passing suite.
+        sweeper = (_REPO_ROOT / "hack" / "ci_sweep_agent_pulls.py").read_text(encoding="utf-8")
+        self.assertIn('TOKEN_PERMISSIONS = {"pull_requests": "write"}', sweeper)
+        grading = _extract(r"^GRADING_PERMISSIONS = \{[^}]*\}$", "GRADING_PERMISSIONS")
+        self.assertNotIn("write", grading)
 
 
 if __name__ == "__main__":
