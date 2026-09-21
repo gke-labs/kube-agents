@@ -1127,8 +1127,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # the two and the ledger App cannot read it. A rep that resubmits
             # byte-identical content writes nothing at all -- the skill raises
             # before the push -- so a correct rep lands here too, which is why
-            # the reason names both readings. Sweeping the GitOps repository
-            # between reps (#1755 item 2) is what removes leftovers.
+            # the reason names both readings. hack/ci-teardown.sh (#1755 item 2)
+            # closes these, but per job rather than between reps -- so a leftover
+            # an earlier rep of this same job opened is still here to be written
+            # to, and only #1755 item 3 settles that.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()
