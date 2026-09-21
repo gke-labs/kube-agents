@@ -1919,36 +1919,26 @@ class LedgerTokenMintTest(unittest.TestCase):
         _, _, message = self._mint(sign_rc=1)
         self.assertNotIn("not-a-key", message)
 
-    def _mint_with_permissions(self, permissions):
-        body = {"token": "ghs_minted"}
-        if permissions is not None:
-            body["permissions"] = permissions
-        return self._mint(urlopen=lambda *a, **kw: _Response(dict(body)))
+    def test_the_token_asks_for_issues_read_and_nothing_more(self):
+        # The App can also write pull requests, for the teardown's sweep. This
+        # check reads one repository's issues; a mint that named no permissions
+        # would hand a pool-wide write to a read-only probe.
+        seen = {}
 
-    def test_a_missing_sweep_permission_is_noted_without_failing(self):
-        # Grading does not use it, so the token is still good and the project is
-        # still registrable. What breaks is the teardown's pull-request sweep,
-        # and it breaks silently: one failed step inside a teardown that is not
-        # allowed to red the job.
-        scope, level = checker.LEDGER_SWEEP_PERMISSION
-        token, status, message = self._mint_with_permissions({"issues": "read", scope: "read"})
-        self.assertEqual("ghs_minted", token)
-        self.assertEqual("ok", status)
-        self.assertIn(f"{scope}: {level}", message)
-        self.assertIn("hack/ci-teardown.sh", message)
+        def urlopen(request, *a, **kw):
+            seen["body"] = json.loads(request.data) if request.data else None
+            return _Response({"token": "ghs_minted"})
 
-    def test_the_sweep_permission_present_says_nothing(self):
-        scope, level = checker.LEDGER_SWEEP_PERMISSION
-        _, status, message = self._mint_with_permissions({"issues": "read", scope: level})
-        self.assertEqual("ok", status)
-        self.assertEqual("", message)
+        self._mint(urlopen=urlopen)
+        self.assertEqual(seen["body"], {"permissions": {"issues": "read"}})
 
-    def test_a_response_without_permissions_says_nothing(self):
-        # Same reasoning as the scope guard: an absent key is GitHub changing
-        # its response, not an owner taking the permission away.
-        _, status, message = self._mint_with_permissions(None)
-        self.assertEqual("ok", status)
-        self.assertEqual("", message)
+    def test_a_permission_the_installation_lacks_fails(self):
+        # 422 is what GitHub answers when the mint asks for something the
+        # installation does not hold. Grading cannot read a ledger without it,
+        # so it is a failure rather than something a re-run reaches.
+        _, status, message = self._mint(urlopen=self._http_error(422, "Unprocessable Entity"))
+        self.assertEqual("failed", status)
+        self.assertIn("issues", message)
 
 
 class LedgerReadCredentialTest(unittest.TestCase):
@@ -2057,17 +2047,10 @@ class LedgerReadCredentialTest(unittest.TestCase):
             result = self._check(fail_if_called, pem=None)
         self.assertTrue(result.warnings)
 
-    def test_an_installation_note_rides_along_as_a_warning(self):
-        # The sweep permission is the only note the mint makes on an "ok". The
-        # read itself succeeded, so the check passes and says why anyway.
-        result = self._check(
-            lambda *a, **kw: _Response({}),
-            mint=("ghs_fake", "ok", "does not hold `pull_requests: write`"),
-        )
-        self.assertTrue(result.passed)
-        self.assertIn("pull_requests: write", " ".join(result.warnings))
-
-    def test_a_clean_mint_warns_about_nothing(self):
+    def test_a_passing_read_warns_about_nothing(self):
+        # A warning is counted as "could not be checked" and exits 2. Nothing
+        # about the App's other permissions belongs in that bucket: they are a
+        # pool-wide setting, not something this project's onboarding waits on.
         result = self._check(lambda *a, **kw: _Response({}))
         self.assertTrue(result.passed)
         self.assertEqual([], result.warnings)

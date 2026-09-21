@@ -3,20 +3,27 @@
 
 A remediation scenario opens a pull request there, and nothing closed it. The
 next lease of that project meets its predecessor's: `create_pull_request` in
-agents/platform/scripts/submit_suggestion.py treats "a pull request already
-exists" as success and returns the old one's URL, so a repetition that opened
-nothing could be graded as if it had (#1755).
+agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py treats "a
+pull request already exists" as success and returns the old one's URL, so a
+repetition that opened nothing can be graded as if it had (#1755). Repetitions
+inside a single lease share the repository too, and teardown runs per job rather
+than between them, so this closes the across-lease case only.
 
 Called from hack/ci-teardown.sh, which the Prow wrapper also runs at job start —
 so a lease begins clean even when the run before it was hard-killed.
 
 Three conditions, all required, matching is_agent_pull_request in
-agents/platform/scripts/forge.py: authored by this App's own bot login, head
-branch carrying the agent's prefix, and that branch in the repository itself
-rather than a fork. Branches are left alone: deleting a ref needs
-`contents: write`, which this credential deliberately does not have, and the
-agent pushes with --force-with-lease from a fresh clone, so a stale branch
-costs nothing.
+agents/platform/scripts/forge.py: authored by the agent's bot, head branch
+carrying the agent's prefix, and that branch in the repository itself rather
+than a fork.
+
+The branch is left, because deleting a ref needs `contents: write` and this
+credential deliberately has none. It is not free: both submit paths start from
+a leftover branch rather than overwrite it (`prepare` in submit_suggestion.py,
+and content_workspace.py's commit), so a repetition that reproduces the earlier
+fix exactly is refused "nothing to commit" — which already happens today, with
+or without this sweep. Closing the pull request fixes the other case, where the
+second fix differs and would otherwise be reported on the first one's URL.
 """
 
 import argparse
@@ -44,8 +51,14 @@ JWT_BACKDATE_SECONDS = 60
 OPENSSL_ERROR_CHARS = 300
 
 # An App acts through a bot account named for its slug, and that login authors
-# the pull requests an installation token opens.
+# the pull requests an installation token opens. The agent submits with the
+# token-minter App, not with the one this sweep signs as, so the author to look
+# for is that App's bot and not our own. hack/ci-deploy.sh names the same App;
+# a test pins the two. There is no public endpoint from an App id to its slug,
+# and teardown holds no key for that App, so the login is written out here.
 BOT_LOGIN_SUFFIX = "[bot]"
+AGENT_APP_SLUG = "kube-agents-evals-token-minter"
+AGENT_BOT_LOGIN = AGENT_APP_SLUG + BOT_LOGIN_SUFFIX
 
 # The only permission this asks for, and the only one it needs. The App can do
 # more -- it also reads issues, for the ledger checks -- so the token is
@@ -59,7 +72,9 @@ MAX_PAGES = 20
 
 # What GitHub answers when the installation has not accepted a permission the
 # mint asked for. Its message is about the token, which reads as a code fault;
-# the cause is a pending click in the organisation's settings.
+# the usual cause is a pending click in the organisation's settings. Not the
+# only one -- 403 also covers a suspended installation and a secondary rate
+# limit -- so the error names all three rather than asserting the first.
 PERMISSION_NOT_GRANTED_CODES = (403, 422)
 
 
@@ -156,7 +171,7 @@ def is_agent_pull_request(pull, repo, bot_login):
 
 
 def scoped_token(app_id, key_file, repo):
-    """A token for this repository alone, and the App's bot login.
+    """A token for this repository alone.
 
     The installation is resolved from the repository rather than passed in: one
     App serves thirty of them, and a hardcoded id is a silent 404 on the other
@@ -165,8 +180,15 @@ def scoped_token(app_id, key_file, repo):
     """
     bearer = "Bearer " + app_jwt(app_id, key_file)
     try:
-        slug = api("GET", "/app", bearer)["slug"]
         installation = api("GET", "/repos/%s/installation" % repo, bearer)["id"]
+    except urllib.error.HTTPError as exc:
+        # 401: the key is not App app_id's. 404: the App is not installed on
+        # this repository, which is an onboarding gap rather than a fault here.
+        raise SweepError(
+            "GitHub answered HTTP %d (%s) locating App %s's installation on %s"
+            % (exc.code, exc.reason, app_id, repo)
+        )
+    try:
         minted = api(
             "POST",
             "/app/installations/%s/access_tokens" % installation,
@@ -176,43 +198,57 @@ def scoped_token(app_id, key_file, repo):
     except urllib.error.HTTPError as exc:
         if exc.code in PERMISSION_NOT_GRANTED_CODES:
             raise SweepError(
-                "App %s cannot mint %s on %s (HTTP %d). An organisation owner has to accept "
-                "the permission on the App's installation before this sweep can run."
+                "App %s cannot mint %s on %s (HTTP %d). Usually the installation has not been "
+                "given the permission, and an organisation owner accepts it in settings; the "
+                "same code also answers a suspended installation and a secondary rate limit."
                 % (app_id, sorted(TOKEN_PERMISSIONS), repo, exc.code)
             )
-        # 401: the key is not App app_id's. 404: the App is not installed on
-        # this repository, which is an onboarding gap rather than a fault here.
         raise SweepError(
             "GitHub answered HTTP %d (%s) minting for App %s on %s"
             % (exc.code, exc.reason, app_id, repo)
         )
-    return minted["token"], slug + BOT_LOGIN_SUFFIX
+    return minted["token"]
 
 
 def sweep(repo, app_id, key_file, dry_run=False):
     """Close every pull request in the repository this agent owns."""
-    token, bot_login = scoped_token(app_id, key_file, repo)
-    authorization = "token " + token
+    authorization = "token " + scoped_token(app_id, key_file, repo)
 
     closed = 0
+    unclosed = []
     for pull in open_pulls(repo, authorization):
-        if not is_agent_pull_request(pull, repo, bot_login):
+        if not is_agent_pull_request(pull, repo, AGENT_BOT_LOGIN):
             continue
         number = pull["number"]
         print("  #%s (%s)" % (number, pull["head"]["ref"]))
-        if not dry_run:
+        if dry_run:
+            closed += 1
+            continue
+        # Each close stands alone. One that fails is reported and the sweep
+        # carries on: giving up here would leave every later pull request open
+        # for the next lease, which is the thing being fixed.
+        try:
             api(
                 "PATCH",
                 "/repos/%s/pulls/%s" % (repo, number),
                 authorization,
                 {"state": "closed"},
             )
+        except (urllib.error.HTTPError, OSError) as exc:
+            print("  #%s did not close (%s)" % (number, exc), file=sys.stderr)
+            unclosed.append(number)
+            continue
         closed += 1
 
     print(
         "%s %d pull request(s) by %s in %s"
-        % ("would close" if dry_run else "closed", closed, bot_login, repo)
+        % ("would close" if dry_run else "closed", closed, AGENT_BOT_LOGIN, repo)
     )
+    if unclosed:
+        raise SweepError(
+            "left %d pull request(s) open in %s: %s"
+            % (len(unclosed), repo, ", ".join("#%s" % n for n in unclosed))
+        )
     return closed
 
 

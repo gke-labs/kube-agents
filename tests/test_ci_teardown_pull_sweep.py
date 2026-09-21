@@ -1,4 +1,4 @@
-"""Teardown's Step 5 closes the agent's leftovers, and can never red the job.
+"""Teardown's Step 5 closes the agent's leftovers, and does not red a Prow job.
 
 `hack/ci-teardown.sh` grew a step that talks to GitHub rather than to the
 cluster: it closes the pull requests the platform agent left in the leased
@@ -16,8 +16,9 @@ Four properties, none of them visible from a successful run:
 * it passes the leased project's own repository, resolved through
   `gitops_repo_for_project()` in hack/ci-deploy.sh — the mapping's one home,
   lifted by its own text rather than copied here;
-* a failed sweep is counted and named in the summary, and still does not change
-  the teardown's exit code. The Prow wrapper has a Boskos release to reach;
+* a failed sweep is counted and named in the summary, and leaves the exit code
+  alone. The Prow wrapper has a Boskos release to reach. `CI_TEARDOWN_STRICT`
+  is the exception, and it is not what Prow sets;
 * it is reachable when every step before it has failed, which is the aborted
   run this whole file exists for.
 
@@ -66,7 +67,8 @@ def _teardown_steps():
 class CiTeardownPullSweepTest(unittest.TestCase):
     maxDiff = None
 
-    def _run_steps(self, project=_MAPPED_PROJECT, key_file="", python_exit=0, strict=None):
+    def _run_steps(self, project=_MAPPED_PROJECT, key_file="", python_exit=0, strict=None,
+                   gitops_repo=None):
         """Run the lifted steps with stubbed kubectl, helm and python3.
 
         Returns (returncode, stdout, python3 argv lines). The python3 stub
@@ -100,6 +102,8 @@ class CiTeardownPullSweepTest(unittest.TestCase):
             }
             if strict is not None:
                 overrides["CI_TEARDOWN_STRICT"] = strict
+            if gitops_repo is not None:
+                overrides["EVAL_GITOPS_REPO"] = gitops_repo
             proc = subprocess.run(
                 ["bash", "-c", "set -uo pipefail\n" + _teardown_steps()],
                 capture_output=True,
@@ -111,6 +115,21 @@ class CiTeardownPullSweepTest(unittest.TestCase):
         return proc.returncode, proc.stdout, calls
 
     # --- skipping ---------------------------------------------------------
+
+    def test_an_override_repo_is_swept_instead_of_the_mapped_one(self):
+        # ci-deploy.sh resolves EVAL_GITOPS_REPO first and Prow refuses it, so
+        # this is the laptop case: the deploy wrote to the override, and
+        # resolving by PROJECT_ID here would aim a sweep at a real pool repo.
+        _, out, calls = self._run_steps(
+            key_file="/etc/k/key.pem", gitops_repo="someone/throwaway"
+        )
+        self.assertIn("--repo someone/throwaway", " ".join(calls))
+        self.assertNotIn(_MAPPED_REPO, " ".join(calls), out)
+
+    def test_the_override_none_sweeps_nothing(self):
+        _, out, calls = self._run_steps(key_file="/etc/k/key.pem", gitops_repo="none")
+        self.assertIn("skipped", out)
+        self.assertEqual(calls, [])
 
     def test_no_mounted_key_skips_without_calling_anything(self):
         rc, out, calls = self._run_steps(key_file="")

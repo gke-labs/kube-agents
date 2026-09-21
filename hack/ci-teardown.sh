@@ -2,8 +2,10 @@
 # ==============================================================================
 # Prow CI Teardown Pipeline Script
 # ==============================================================================
-# Cleans up PR-scoped Kubernetes resources from target GKE cluster.
-# Preserves static cluster & GCP IAM setup for fast re-use across PR runs.
+# Cleans up what a PR run leaves in the leased project: its Kubernetes objects
+# on the target GKE cluster, and the agent's pull requests in the project's
+# GitOps repository. Preserves static cluster & GCP IAM setup for fast re-use
+# across PR runs.
 #
 # One `helm uninstall` (the release owns every Kubernetes object ci-deploy.sh
 # created) plus a CRD delete, since the chart leaves CRDs behind by Helm's own
@@ -13,9 +15,11 @@
 # for `helm uninstall` to act on, and Helm then refuses to adopt them on the
 # project's next lease (#1006). Step 4 names the kinds the label cannot reach.
 #
-# The CRD delete is the one conditional step: a release record that outlives
-# Step 1 needs its CRDs, or the next lease can neither uninstall nor upgrade
-# over it (#1172).
+# Two steps are conditional. The CRD delete runs when a release record outlives
+# Step 1, which needs its CRDs or the next lease can neither uninstall nor
+# upgrade over it (#1172). The pull-request sweep runs when an App key is
+# mounted and the project maps to a GitOps repository; without it the next
+# lease inherits a pull request this one opened (#1755).
 # ==============================================================================
 
 set -uo pipefail
@@ -376,11 +380,20 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Closing the agent's leftove
 # Skips, loudly and successfully, when the key is not mounted or the project
 # maps to no repository -- a laptop run of this script must not need a GitHub
 # credential. Branches are left: deleting a ref needs contents: write, which
-# this credential deliberately lacks, and the agent pushes with
-# --force-with-lease from a fresh clone, so a stale branch costs nothing.
+# this credential deliberately lacks. Both submit paths continue a leftover
+# branch rather than overwrite it, so one still costs a repetition that
+# reproduces the same fix -- see the module docstring in
+# hack/ci_sweep_agent_pulls.py for what that case does and does not break.
+#
+# EVAL_GITOPS_REPO first, the same order ci-deploy.sh resolves in. Prow refuses
+# the override outright, so there it is always the mapping -- but on a laptop
+# the deploy wrote to the override, and resolving by PROJECT_ID here would
+# point a sweep at the pool repository that project maps to instead.
 SWEEP_PULLS_STATUS=0
-GITOPS_REPO=""
-if [ -r "${CI_DEPLOY_SCRIPT}" ]; then
+GITOPS_REPO="${EVAL_GITOPS_REPO:-}"
+if [ "${GITOPS_REPO}" = "none" ]; then
+  GITOPS_REPO=""
+elif [ -z "${GITOPS_REPO}" ] && [ -r "${CI_DEPLOY_SCRIPT}" ]; then
   eval "$(awk '/^gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY_SCRIPT}")"
   GITOPS_REPO="$(gitops_repo_for_project "${PROJECT_ID:-}")" || GITOPS_REPO=""
 fi

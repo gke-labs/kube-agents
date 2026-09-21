@@ -123,12 +123,11 @@ GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
 
-# The one permission the App holds that grading does not use. hack/ci-teardown.sh
-# closes the agent's leftover pull requests with it; without it that step fails on
-# every lease, and the next lease of the project inherits a pull request the run
-# before it opened. The grading mint asks for a read-only subset, so the two
-# callers do not share this.
-LEDGER_SWEEP_PERMISSION = ("pull_requests", "write")
+# All this check does with the token is read one repository's issues, so that is
+# all it asks for. The App can write pull requests -- hack/ci-teardown.sh closes
+# the agent's leftovers with it -- and a token that inherited the installation
+# whole would carry that reach into a read-only probe.
+LEDGER_GRADING_PERMISSIONS = {"issues": "read"}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -1914,10 +1913,8 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     returned, never logged: it is a live credential for every repository in the
     installation.
 
-    On "ok" the message is empty, or carries a non-fatal note about the
-    installation itself -- the mint response is the only place its scope and
-    permissions are visible, and a second call to see them would cost another
-    JWT for an answer already in hand.
+    The token is narrowed to LEDGER_GRADING_PERMISSIONS: this check reads one
+    repository's issues, and has no business holding the write the App also has.
     """
 
     def _b64(raw: bytes) -> bytes:
@@ -1966,8 +1963,10 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
         headers={
             "Authorization": f"Bearer {jwt}",
             "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
             "User-Agent": "kube-agents-verify-ci-pool-project",
         },
+        data=json.dumps({"permissions": LEDGER_GRADING_PERMISSIONS}).encode(),
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1982,6 +1981,12 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             return None, "failed", (
                 f"App {LEDGER_APP_ID} has no installation {LEDGER_INSTALLATION_ID} (404). It was "
                 "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
+            )
+        if exc.code == 422:
+            return None, "failed", (
+                f"App {LEDGER_APP_ID}'s installation cannot grant "
+                f"{sorted(LEDGER_GRADING_PERMISSIONS)} (422), which is what grading reads a "
+                "ledger with. An organisation owner accepts it on the App's installation"
             )
         return None, "unverified", (
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of minting a token"
@@ -2012,20 +2017,6 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     if not token:
         return None, "unverified", "GitHub's mint response carried no token"
 
-    # Not fatal, and not about this project: grading works without it, and the
-    # teardown's sweep is the only caller that asks for it. But a missing write
-    # is invisible until a lease, and then only as one failed teardown step, so
-    # it is worth saying here. Absent permissions are GitHub changing its
-    # response rather than a revoked grant, same as the scope guard above.
-    scope, level = LEDGER_SWEEP_PERMISSION
-    granted = body.get("permissions")
-    if isinstance(granted, dict) and granted.get(scope) != level:
-        return token, "ok", (
-            f"App {LEDGER_APP_ID}'s installation does not hold `{scope}: {level}`, so the "
-            "pull-request sweep in hack/ci-teardown.sh fails on every lease and each run leaves "
-            "its remediation pull request open for the next one to inherit. An organisation "
-            "owner accepts it on the App's installation; it is pool-wide, not per-project"
-        )
     return token, "ok", ""
 
 
@@ -2128,13 +2119,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
         ])
 
-    # A message on an "ok" mint is a note about the installation, not the read.
-    return CheckResult(
-        name,
-        True,
-        f"App {LEDGER_APP_ID} can read {repo_slug}'s issues",
-        warnings=[message] if message else [],
-    )
+    return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
 
 
 def _probe_github_app_identity(

@@ -492,8 +492,8 @@ repository, and the URL comes back in the final answer: `submit_suggestion.py` r
 `execute_code`, so no distinct tool name reaches the trajectory to assert on.
 
 `report_contains` over `["github.com/", "/pull/"]` was the first way to grade that, and it cannot
-work. It reads the reply as text and fetches nothing, so an invented URL passes — and nothing
-sweeps the GitOps repositories between repetitions, so the pull request rep 1 opened is still
+work. It reads the reply as text and fetches nothing, so an invented URL passes — and the
+repetitions of a case share one GitOps repository, so the pull request rep 1 opened is still
 there for rep 2 and rep 3 to link. The repeats of a case were grading each other's leftovers.
 
 `pull_request_opened` resolves the URL instead and compares GitHub's stamps against
@@ -503,9 +503,11 @@ skill derives the branch from the change, so a later repetition pushes onto the 
 one used and edits the pull request already open on it. That stamp moves on any write by anyone,
 so what it proves is that the pull request was written to during the run — a repetition that only
 comments on a leftover passes as well. Telling those apart needs the head commit, which the ledger
-App cannot read; sweeping the GitOps repository between repetitions is what removes leftovers.
-A pull request closed without being merged is rejected: closing moves `updated_at` too, and what
-the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
+App cannot read; removing the leftovers is what closes the gap. `hack/ci-teardown.sh` does that
+once per lease, at the start of a run and again at the end, so nothing survives from the lease
+before — but repetitions inside one lease still share the repository, and nothing sweeps between
+them. A pull request closed without being merged is rejected: closing moves `updated_at` too, and
+what the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
 match across every pool project that breaks loudly if the organisation ever moves.
 
 It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`

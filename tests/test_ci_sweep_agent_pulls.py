@@ -7,7 +7,7 @@ success and returns the old one's URL, and a repetition that opened nothing
 could be graded as if it had (#1755). `hack/ci_sweep_agent_pulls.py` is what
 removes the leftover; these tests pin what it is allowed to touch.
 
-Three properties, and the first is the one that matters. The script runs with a
+Four properties, and the first is the one that matters. The script runs with a
 credential that can write pull requests across the pool's repositories, so
 "which pull requests are the agent's" is a security question, not a tidiness
 one. It is the same question `is_agent_pull_request` in
@@ -15,15 +15,20 @@ agents/platform/scripts/forge.py answers, and it needs all three of its
 conditions: a branch prefix alone is not ownership, because anyone who can fork
 can name a branch with it.
 
-Second, the token is narrowed at mint time -- to one repository, and to
+Second, the author it looks for is the agent's, not its own. forge.py asks that
+question from inside the agent, where the two are the same account; the sweep
+signs as a different App, and one that matched its own bot would close nothing
+and report success.
+
+Third, the token is narrowed at mint time -- to one repository, and to
 `pull_requests: write` -- so a teardown never holds the reach the App has. The
 App also holds `issues: read` for the grading path, and a token that inherited
 the installation whole would carry it.
 
-Third, a permission the organisation has not accepted yet has to read as what
+Fourth, a permission the organisation has not accepted yet has to read as what
 it is. GitHub answers that with a 403 or a 422 whose text is about tokens; the
-cause is a pending click in the organisation's settings, and a reader who is
-told the former goes looking in the wrong place.
+usual cause is a pending click in the organisation's settings, and a reader who
+is told the former goes looking in the wrong place.
 """
 
 import importlib.util
@@ -37,13 +42,17 @@ from unittest import mock
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE_PATH = _REPO_ROOT / "hack" / "ci_sweep_agent_pulls.py"
 _FORGE = _REPO_ROOT / "agents" / "platform" / "scripts" / "forge.py"
+_CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 
 _spec = importlib.util.spec_from_file_location("ci_sweep_agent_pulls", _MODULE_PATH)
 sweeper = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sweeper)
 
 REPO = "gke-agentic/kube-agents-evals-7-infra"
-BOT = "kube-agents-evals-ledger-reader[bot]"
+# The agent's author login, not the sweep's. The sweep signs as the ledger App,
+# and SWEEPER_BOT is what it would be matching if it asked GitHub who it is.
+BOT = "kube-agents-evals-token-minter[bot]"
+SWEEPER_BOT = "kube-agents-evals-ledger-reader[bot]"
 
 
 def agent_pull(number=1, branch="platform-agent/fix-the-thing", author=BOT, head_repo=REPO):
@@ -70,18 +79,20 @@ class _GitHub:
     rather than an index into a list that shifts whenever a call is added.
     """
 
-    def __init__(self, pulls=None, mint_error=None):
+    def __init__(self, pulls=None, mint_error=None, close_errors=None):
         self.calls = []
         self.pulls = pulls if pulls is not None else []
         self.mint_error = mint_error
+        # Keyed by pull-request number, so one close can fail while the rest
+        # succeed. There is no arm for "GET /app": asking GitHub who the sweep
+        # is would be the bug, so the stub answers it with an AssertionError.
+        self.close_errors = close_errors or {}
 
     def __call__(self, request, timeout=None):
         key = "%s %s" % (request.method, request.full_url.replace(sweeper.API_ROOT, ""))
         body = json.loads(request.data) if request.data else None
         self.calls.append((key, body))
 
-        if key == "GET /app":
-            return _Response(json.dumps({"slug": "kube-agents-evals-ledger-reader"}).encode())
         if key.startswith("GET /repos/") and key.endswith("/installation"):
             return _Response(json.dumps({"id": 157029058}).encode())
         if key.startswith("POST /app/installations/"):
@@ -92,6 +103,9 @@ class _GitHub:
             page = int(key.rsplit("page=", 1)[1])
             return _Response(json.dumps(self.pulls if page == 1 else []).encode())
         if key.startswith("PATCH /repos/"):
+            failure = self.close_errors.get(int(key.rsplit("/", 1)[1]))
+            if failure is not None:
+                raise failure
             return _Response(b"{}")
         raise AssertionError("unexpected call %s" % key)
 
@@ -148,6 +162,33 @@ class OwnershipTest(unittest.TestCase):
             'AGENT_BRANCH_PREFIX = "%s"' % sweeper.AGENT_BRANCH_PREFIX,
             forge,
         )
+
+
+class AgentAuthorTest(unittest.TestCase):
+    """The author looked for is the agent's, not the sweep's own.
+
+    forge.py asks "is this mine?" from inside the agent, where the credential
+    and the author are one account. The sweep is a third party: it signs with
+    the ledger App and the pull requests are the token-minter App's. Matching
+    its own login would close nothing, and report a clean sweep for doing it.
+    """
+
+    def test_the_agents_pull_request_is_closed(self):
+        github = _GitHub(pulls=[agent_pull(author=BOT)])
+        self.assertEqual(run_sweep(github), 1)
+
+    def test_a_pull_request_by_the_sweeps_own_bot_is_left(self):
+        github = _GitHub(pulls=[agent_pull(author=SWEEPER_BOT)])
+        self.assertEqual(run_sweep(github), 0)
+        self.assertEqual(github.keys("PATCH "), [])
+
+    def test_the_login_is_the_app_the_agent_submits_with(self):
+        # Two constants in files that do not read each other, and no endpoint
+        # from an App id to its slug -- so the name is pinned to the script
+        # that hands the App to the agent.
+        deploy = _CI_DEPLOY.read_text(encoding="utf-8")
+        self.assertIn(sweeper.AGENT_APP_SLUG, deploy)
+        self.assertEqual(sweeper.AGENT_BOT_LOGIN, sweeper.AGENT_APP_SLUG + "[bot]")
 
 
 class TokenScopeTest(unittest.TestCase):
@@ -207,6 +248,37 @@ class ClosingTest(unittest.TestCase):
         github = _GitHub(pulls=[agent_pull()])
         self.assertEqual(run_sweep(github, dry_run=True), 1)
         self.assertEqual(github.keys("PATCH "), [])
+
+
+class CloseFailureTest(unittest.TestCase):
+    """One close that fails must not abandon the ones behind it."""
+
+    def test_the_rest_are_still_closed(self):
+        github = _GitHub(
+            pulls=[agent_pull(number=1), agent_pull(number=2), agent_pull(number=3)],
+            close_errors={2: _http_error(409)},
+        )
+        with self.assertRaises(sweeper.SweepError):
+            run_sweep(github)
+        self.assertEqual(
+            github.keys("PATCH "),
+            ["PATCH /repos/%s/pulls/%d" % (REPO, n) for n in (1, 2, 3)],
+        )
+
+    def test_the_failure_names_what_was_left_open(self):
+        github = _GitHub(pulls=[agent_pull(number=7)], close_errors={7: _http_error(403)})
+        with self.assertRaises(sweeper.SweepError) as caught:
+            run_sweep(github)
+        self.assertIn("#7", str(caught.exception))
+
+    def test_an_unreachable_github_mid_sweep_is_survived(self):
+        github = _GitHub(
+            pulls=[agent_pull(number=1), agent_pull(number=2)],
+            close_errors={1: OSError("connection reset")},
+        )
+        with self.assertRaises(sweeper.SweepError):
+            run_sweep(github)
+        self.assertIn("PATCH /repos/%s/pulls/2" % REPO, github.keys("PATCH "))
 
 
 class MintFailureTest(unittest.TestCase):

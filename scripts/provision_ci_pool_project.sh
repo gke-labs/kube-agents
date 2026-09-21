@@ -382,7 +382,8 @@ fi
 # bench grader scores. Missing it is the evals-6 red that #994 opened for -- and
 # step 5's Ledger Read Credential check fails the project until it is done.
 echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
-echo "  That edit widens which repositories a minted token can read issues from:"
+echo "  That edit widens which repositories the App reads issues in and, since"
+echo "  hack/ci-teardown.sh sweeps with it, closes pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
