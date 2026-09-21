@@ -20,54 +20,63 @@ actually upgrades.
 
 ## Upgrades that went wrong in public
 
-Every check below exists because the thing it looks for has already taken a real company down.
-These are published postmortems and provider incident reports, not hypotheticals. Each one names
-the check that would have caught it.
+Every check below exists because the thing it looks for has already taken a real organization down.
+These are published postmortems, provider incident reports, and — where no company wrote one up —
+issue threads where operators reported production breakage. Each entry says which check would have
+caught it. Two categories have no incident behind them and are marked as such at the end; nothing
+here is a hypothetical dressed as history.
 
 **Reddit, 14 March 2023 — 314 minutes down.** Reddit upgraded a large cluster from Kubernetes 1.23
 to 1.24. The network died about two minutes later. Their CNI, Calico, picked its route reflectors —
 the nodes every other node peers with — by matching the label `node-role.kubernetes.io/master`.
 Kubernetes 1.24 removed that label from running clusters. The selector matched nothing, every node
 dropped every route, and the cluster went dark. There is no supported Kubernetes downgrade, so
-recovery meant a restore procedure that had never been run against production. The selector lived
-only in Calico's own datastore, hand-edited and committed nowhere, so scanning the GitOps
-repository would not have found it either.
+recovery meant a restore procedure they had never run against production. The postmortem is
+explicit about why no scan would have found it: the route-reflector configuration lived in
+Calico-specific data "expected to only be managed by their CLI interface (not the standard
+Kubernetes API), hand-edited, and uploaded back", and was "thus committed nowhere".
 [Postmortem](https://web.archive.org/web/20260826130053/https://www.reddit.com/r/RedditEng/comments/11xx5o0/you_broke_reddit_the_piday_outage/)
 (the Wayback copy; Reddit blocks automated fetches of the original).
 _Caught by:_ diffing the target release's removed **identifiers** — labels as well as API versions —
-against the selectors actually in use in the live cluster, including add-on configuration.
+against the selectors in use in the live cluster, including add-on configuration that lives outside
+the Kubernetes API.
 
 **Jetstack, September 2019 — a fail-closed webhook deadlocked a GKE control plane.** A regional GKE
-master upgrade hung past its 20-minute timeout. When the second master came up, kube-apiserver's
-startup hook tried to write a ConfigMap in `kube-system`. A ValidatingWebhookConfiguration backed by
-Open Policy Agent, scoped cluster-wide and set to `failurePolicy: Fail`, intercepted that write. OPA
-did not answer, the write timed out, the master failed its health check and crash-looped. The
-resulting API downtime stopped kubelets reporting node health, so GKE node auto-repair began
-destroying and recreating every node in a loop, taking out every tenant.
+master upgrade ran past the 20-minute timeout they had set on their Terraform apply. When the second
+master came up, kube-apiserver's startup hook tried to write a ConfigMap in `kube-system`. A
+ValidatingWebhookConfiguration backed by Open Policy Agent, scoped far more broadly than it needed
+to be, intercepted that write. OPA did not answer, the write timed out, the master failed its health
+check and crash-looped. The resulting API downtime stopped kubelets reporting node health, so GKE
+node auto-repair began destroying and recreating nodes in a loop, taking out every tenant. Their
+permanent fix was to scope the webhook to specific namespaces and resources and to give OPA a
+liveness probe.
 [Postmortem](https://web.archive.org/web/20230607064526/https://www.jetstack.io/blog/gke-webhook-outage/).
-_Caught by:_ listing every webhook with `failurePolicy: Fail`, and flagging any whose rules or
-namespace selector can match `kube-system` or cluster-scoped objects, or whose backend has one
-replica and no liveness probe.
+_Caught by:_ listing every webhook that fails closed and flagging any whose rules or namespace
+selector can match `kube-system` or cluster-scoped objects, or whose backend runs one replica with
+no liveness probe.
 
-**loveholidays, March 2019 — a 2-hour GKE upgrade window ran 7 hours.** Going from 1.10 to 1.12,
-individual node drains took 15 minutes or more: pods used `emptyDir`, which blocks eviction unless
-annotated `safe-to-evict`, and some workloads had a `terminationGracePeriodSeconds` of several
-minutes. One node pool upgrade hung with no drains happening at all and could not be cancelled from
-the console. Separately, GKE had withdrawn the exact patch version they were upgrading to five days
-earlier, and nobody re-read the release notes on the day.
+**loveholidays, March 2019 — a GKE upgrade budgeted at two to two and a half hours did not hold.**
+Going from 1.10 to 1.12, a 14-node pool "took over an hour" at about five minutes a node, because
+pods used `emptyDir` — which blocks eviction unless annotated `safe-to-evict` — and some workloads
+had a `terminationGracePeriodSeconds` of five to ten minutes. The author's own extrapolation is the
+point: at 100 nodes, with some taking over fifteen minutes to drain, the window is not recoverable.
+One node pool upgrade then hung with no drains happening at all and could not be cancelled from the
+console. Separately, GKE had withdrawn the exact patch version they upgraded to five days earlier,
+and it was still selectable.
 [Write-up](https://deploy.live/blog/the-shipwreck-of-gke-cluster-upgrade/).
 _Caught by:_ estimating drain time before the window — count pods with `emptyDir` and no
-`safe-to-evict` annotation, and grace-period outliers, then multiply by node count — and re-checking
-the target patch version against the release notes at run time rather than at planning time.
+`safe-to-evict` annotation, and grace-period outliers, then multiply by node count — and re-reading
+the target patch version's release notes at run time rather than at planning time.
 
-**Google Cloud, September 2022 — Calico wedged every drain on GKE 1.22 and later.** A race condition
+**Google Cloud, September 2022 — Calico wedged pod teardown on GKE 1.22 and later.** A race condition
 in Calico made the CNI fail pod teardown with an authorization error, leaving pods stuck in
-Terminating or Pending across 35+ regions. Every 1.22 and 1.23 release was affected, and 1.24 up to
-`1.24.4-gke.800`. Clusters running the autoscaler were hit hardest, because more node churn meant
-more teardowns. [Incident report](https://status.cloud.google.com/incidents/urNR4xD4gBNsyaZj3W1i).
-_Caught by:_ checking installed add-on versions against the provider's known-issues list for the
-**specific target patch version**, not just the minor. A check comparing minors would have waved
-this cluster straight into the bug.
+Terminating or Pending across 34 locations. Every 1.22 and 1.23 release was affected, and 1.24
+before `1.24.4-gke.800`. Google noted that using the cluster autoscaler can increase the chance of
+hitting it, since more node churn means more teardowns.
+[Incident report](https://status.cloud.google.com/incidents/urNR4xD4gBNsyaZj3W1i).
+_Caught by:_ checking installed add-on versions against the provider's known-issues list, at patch
+granularity where the fix landed in a patch — here a minor-level check flags 1.22 and 1.23 outright,
+but only the patch version distinguishes a safe 1.24 from an unsafe one.
 
 **Google Cloud, July–September 2021 — 59 days of auto-upgrades restarting containers.** Clusters on
 the REGULAR channel were automatically moved from 1.19 to 1.20. On any node pool still using Docker
@@ -78,44 +87,52 @@ _Caught by:_ inventorying the container runtime per node pool and treating "stil
 blocking. The same check is what catches the 1.24 dockershim removal.
 
 **Datadog, March 2023 (~50 hours, five regions) and Heroku, June 2025 (~24 hours) — the same
-failure, twice.** In both cases an unattended OS package upgrade ran on production Kubernetes nodes
-and restarted the node's networking service. Datadog's systemd version defaulted to deleting routing
-rules it had not created, which included the ones Cilium installed for pod networking; Heroku's
-networking config was applied by a script that only ran at first boot. Nodes fell off the network en
-masse — Datadog lost roughly 60% of its compute. Neither showed up in staging, because on a cold
-boot the ordering is fine; the bug only exists when the package is upgraded under a running node.
+failure, twice.** In both cases an automatic operating-system update ran on production hosts that
+should not have been taking one, and restarted the host's networking service. On Datadog's Ubuntu
+22.04 fleet, systemd v249's `systemd-networkd` "forcibly deleted the routes managed by the Container
+Network Interface (CNI) plugin (Cilium)", taking tens of thousands of nodes off the network between
+06:00 and 07:00. Heroku's networking service "relied on a legacy script that only applied correct
+routing rules on initial boot", so a restart severed outbound connectivity for every dyno on the
+host. Neither showed up in staging: on a cold boot the ordering is fine, and the bug exists only
+when the package is upgraded under a running machine. Heroku's corrective action was to disable
+unattended vendor OS upgrades outright.
 [Datadog](https://www.datadoghq.com/blog/2023-03-08-multiregion-infrastructure-connectivity-issue/),
 [Heroku](https://www.heroku.com/blog/summary-of-june-10-outage/).
-_Caught by:_ asserting that unattended OS upgrades are disabled on nodes, and testing node images by
-upgrading a running node rather than booting a fresh one.
+_Caught by:_ asserting that unattended OS package upgrades are disabled on nodes, and testing a node
+image by upgrading a running node rather than by booting a fresh one.
 
 **Spinnaker on GKE, September 2023 — a controller polling a removed API froze the upgrade.**
-Spinnaker's clouddriver called `policy/v1beta1/podsecuritypolicies` more than once a minute. GKE's
-deprecation insights saw the traffic and **paused the cluster's automatic upgrade to 1.25**. The
-cluster was not behind by accident; GKE was refusing to move it.
-[Issue thread](https://github.com/spinnaker/spinnaker/issues/6880).
+Spinnaker's clouddriver called `policy/v1beta1/podsecuritypolicies` more than once a minute and the
+cluster would not move to 1.25; `omitKinds` did not stop the polling
+([issue thread](https://github.com/spinnaker/spinnaker/issues/6880)). The mechanism is GKE's, not
+the thread's inference: when a deprecation insight is active, GKE states that "automatic upgrade to
+the upcoming minor version is paused"
+([GKE documentation](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations)).
+A cluster sitting on an old version is often not a scheduling accident.
 _Caught by:_ reading the deprecation insights and reporting a paused auto-upgrade as the reason a
 cluster is lagging — the check in the GKE deprecation insights section below.
 
 **Helm releases, from Kubernetes 1.25 — deploys blocked by a manifest nobody was running.** After
 1.25 removed PodSecurityPolicy, `helm upgrade` fails on any release whose **stored** manifest
-contains one. Nothing crashes; the workloads keep running. You simply cannot deploy anything until
-you rewrite the stored release with `helm mapkubeapis`. Removing the PSP from your chart does not
-help, because the failure is in reading the old release Secret.
-[Issue thread](https://github.com/helm/helm/issues/11287).
+contains one. Nothing crashes; the workloads keep running. You cannot deploy that release again,
+and removing the PSP from your chart does not help, because the failure is in reading the old
+release Secret. Operators in the thread report that `helm mapkubeapis` does not fully resolve it
+either — it rewrites `apiVersion`/`kind` pairs rather than removing a kind the new version does not
+serve ([issue thread](https://github.com/helm/helm/issues/11287)).
 _Caught by:_ scanning stored Helm release state and GitOps manifests for removed kinds, not only
 live objects. GKE's deprecation insights cannot see this: they are generated from live API-server
-traffic over a 30-day window, so an unused manifest that gets applied after the upgrade is invisible
-to them
-([GKE documentation](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations)).
+traffic over a 30-day observation window, so a manifest that is applied only after the upgrade is
+invisible to them.
 
-Two gaps worth stating. **Surge and quota** has no public postmortem behind it — the mechanism is
-documented by the providers rather than by victims, so the citation for it is
-[GKE's own upgrade quota page](https://cloud.google.com/kubernetes-engine/docs/how-to/node-upgrades-quota)
-rather than an incident. **Zonal volumes** is similar: the strongest artefact is Google stating that
-a cluster upgrade deletes the underlying instances and therefore all data on Local SSD, and
-recommending that node pools holding persistent data not be auto-upgraded at all
-([GKE documentation](https://cloud.google.com/kubernetes-engine/docs/concepts/local-ssd)).
+Two gaps, stated rather than papered over. **Surge and quota** has no public postmortem behind it;
+the mechanism is documented by the provider rather than by a victim, so the citation is
+[GKE's upgrade quota page](https://cloud.google.com/kubernetes-engine/docs/how-to/node-upgrades-quota).
+**Stateful workloads pinned to a zone** has none either. The nearest first-party statement is about
+ephemeral node storage rather than a zonal volume — GKE says data on a Local SSD "does not persist
+when the Pod or node is deleted, repaired, upgraded, or experiences an unrecoverable error"
+([GKE documentation](https://cloud.google.com/kubernetes-engine/docs/concepts/local-ssd)) — which
+makes the point that an upgrade is a data event for some workloads, but is not evidence for the
+zonal-volume case.
 
 ## Scope
 
@@ -156,6 +173,9 @@ than every check here; and it runs only when asked, not on the schedule.
 
 Already served (see Scope). One addition:
 
+- Re-read the target patch version's release notes and known issues **at run time**, not at
+  planning time. A provider can withdraw a patch version between the plan and the window, and a
+  withdrawn version stays selectable.
 - Each family gets a target version and a date, taken from the GKE release calendar by the
   operator, and every run reports the days remaining. The point is to catch a family falling
   behind **its own plan**, which happens long before it falls behind what GKE still supports.
@@ -178,6 +198,9 @@ is GKE refusing to move it, and nobody noticed.
 The checks:
 
 - Read the insights for every cluster and report them grouped by family.
+- Diff the target release's removed **identifiers** against what the live cluster uses — not just
+  `apiVersion`s, but node labels a selector can name. The label a release drops is the same class of
+  break as the API it drops, and it is the one a manifest scan misses.
 - Say **who has to fix it**. An insight names the API being called; the caller's identity comes
   from the insight detail and the `k8s.io/deprecated` audit-log annotations, and the owning team
   from the namespace. A finding nobody owns does not get fixed.
@@ -193,17 +216,32 @@ Four ways a workload breaks on a new version:
 
 - **Add-ons.** Service mesh, cert-manager, monitoring agents, GitOps controllers, CSI and CNI
   drivers, custom admission webhooks — each supports a range of Kubernetes versions. Inventory what
-  each family runs and check it against the target version's support matrix.
-- **Admission webhooks that block drains.** A webhook with `failurePolicy: Fail`, no
-  `timeoutSeconds`, or cluster-wide scope will stall the upgrade when its own backend restarts
-  mid-drain — the webhook rejects everything while it is down, including the pods the upgrade is
-  trying to move.
-- **Manifests in Git, not just live clusters.** A removed field or API version sitting in the
+  each family runs and check it against the target version's support matrix **and against the
+  provider's known-issues list for the specific target patch version**. A check that compares minor
+  versions alone passes a cluster into a bug the provider has already published and fixed in a
+  patch.
+- **Admission webhooks that fail closed.** A webhook with `failurePolicy: Fail` rejects everything
+  it matches while its own backend is down, which is exactly what happens when the node that backend
+  runs on is drained. Report the scope as well as the policy: a webhook whose rules or namespace
+  selector can match `kube-system` or a cluster-scoped object can block the control plane's own
+  writes during an upgrade, not just the pods being moved. Report the backend too — one replica with
+  no liveness probe is what turns a slow webhook into a stuck one.
+- **Manifests in Git, and release state, not just live clusters.** Stored Helm release manifests
+  carry removed kinds even when nothing in the cluster runs them, and the next `helm upgrade` of that
+  release fails on reading its own stored state. Nothing breaks until someone deploys, which is why
+  a live-traffic check never sees it.
+- **Manifests in Git.** A removed field or API version sitting in the
   GitOps repository breaks on the next sync even if nothing in the cluster uses it today: in-tree
   volume plugins, `PodSecurityPolicy`, seccomp annotations, legacy `Ingress` classes,
   `batch/v1beta1 CronJob`. `api_deprecation_scan.py` already covers the `apiVersion`/`kind` part on
   request (see Scope); what is new is the rest and running it on the schedule.
-- **Images with old assumptions.** Anything expecting cgroup v1 or a dockershim-era socket mount.
+- **Node runtime and image assumptions.** Inventory the container runtime per node pool — a pool
+  still on Docker rather than containerd is blocking, and the same check catches the dockershim
+  removal. Anything expecting cgroup v1 or a dockershim-era socket mount belongs here too.
+- **Unattended OS upgrades on nodes.** A node whose operating system updates itself can lose its
+  CNI's routing rules when the package manager restarts networking, and the failure appears on a
+  running node rather than a freshly booted one — so a node image that passes a boot test can still
+  break in place. Check that automatic OS package upgrades are disabled.
 
 ## Drain safety
 
@@ -211,6 +249,10 @@ Upgrading nodes means draining them: evict the pods, delete the node, bring up a
 upgrade failures are really drain failures. The PodDisruptionBudget, single-replica,
 rigid-scheduling and spreading checks already run (see Scope). The additions:
 
+- **How long the drain will actually take.** Count the pods that resist eviction before the window
+  is booked, not during it: `emptyDir` volumes without a `safe-to-evict` annotation, and
+  `terminationGracePeriodSeconds` outliers. Multiplied by node count, that is the window, and it is
+  routinely several times the estimate.
 - **No room to add a node.** A pool with `max-surge` of 0, or blue/green needed but not configured,
   or regional quota too tight to fit even one surge node. The upgrade cannot start.
 - **Workloads pinned to a pool being retired.** A `nodeSelector` or affinity naming a pool that is
