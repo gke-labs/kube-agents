@@ -2,13 +2,16 @@
 name: capacity-obtainability
 description: >-
   Check GKE quota and live hardware obtainability before recommending
-  capacity. Use when a cluster design, capacity plan, or scale-up decision
-  needs live evidence: regional quota verification (gcloud compute regions
-  describe), reservations, and capacity obtainability advice (gcloud beta
-  compute advice capacity / capacity-history) across zones and provisioning
-  models. For handling an inbound cluster-autoscaler stockout alert end to
-  end — triage, GitOps remediation, Pull Request — use the
-  gke-stockout-investigator plugin skill instead.
+  capacity, and plan future capacity windows for deadline-bound batch jobs.
+  Use when a cluster design, capacity plan, scale-up decision, GPU/TPU batch
+  schedule, or a free-standing availability question needs live evidence:
+  regional quota verification (gcloud compute regions describe),
+  reservations, capacity obtainability advice (gcloud beta compute advice
+  capacity / capacity-history) across zones and provisioning models, and
+  future window advice (gcloud beta compute advice calendar-mode) for "when
+  will this shape be obtainable". For handling an inbound cluster-autoscaler
+  stockout alert end to end — triage, GitOps remediation, Pull Request — use
+  the gke-stockout-investigator plugin skill instead.
 metadata:
   category: Containers
 ---
@@ -166,6 +169,117 @@ spec:
     locationPolicy: ANY
 ```
 
+## Future windows (batch jobs with a deadline)
+
+Run this section when the request is a job, not a cluster: a given shape and
+count that must run for a given duration inside a horizon ("64 TPU v5e nodes,
+12 hours, within 48 hours"). It answers _when_ and _where_ the shape is
+predicted obtainable, with Diagnostics E below; the quota check (Diagnostics
+A) still runs first, because a window you lack quota for is not a plan.
+
+Facts the probe rests on, verified against the live API — do not guess past
+them:
+
+- **The API counts chips, not nodes.** A v5e host carries 4 chips, so 64
+  nodes is `--chip-count=256`. State the conversion you applied and record
+  both numbers in the evidence, so a reader can check the arithmetic.
+- **The minimum reservable window is one day.** A `--duration-range` under
+  `min=1d` returns `CONDITIONS_NOT_MET` ("The time window is too short") in
+  every zone. Reserve the day and run the job inside it: the job's own
+  duration goes in the report and the ProvisioningRequest
+  (`maxRunDurationSeconds`), never in the probe's duration range.
+- **One call per candidate region, one recommended window per call.** A
+  success carries `startTime`, `endTime`, and `location` for the best window
+  in that region, plus a per-zone status map (`otherLocations`) for the
+  rest: `NO_CAPACITY`, `NOT_SUPPORTED`, or `CONDITIONS_NOT_MET` with
+  details. A zone that does not support the shape is a finding to report,
+  not a retry.
+- **The deadline bounds the start.** A job of duration D with horizon H
+  cannot start later than H − D after now; pass exactly that as
+  `--start-time-range` (compute the range immediately before the call, not
+  at the start of the conversation). A 12-hour job with a 48-hour horizon
+  cannot start later than hour 36.
+
+**Ranking.** Collect every region's recommended window, then rank: earliest
+start first; ties break toward the zone with the larger quota headroom from
+Diagnostics A. Ranks are unique and consecutive from one. The recommendation
+names the rank-one window's zone and exact UTC start time, and lists the
+runner-up windows and every zone that returned no window, with its status.
+If no allowed zone returns a window, say so and report each zone's status —
+an honest "no window inside the horizon" is the answer, not a failure to
+hide.
+
+**Record the evidence.** One `type:
+advice_service_workload_obtainability_planning` record per region call, with
+`api_method: compute.beta.AdviceService.CalendarMode`, the region, the node
+count and chips-per-node conversion, and the exact request body the command
+sent (the `futureResourcesSpecs` shape from `--log-http`, or reconstructed
+from the flags). Then exactly one `type:
+workload_obtainability_planning_analysis` record whose `analysis.windows`
+lists every window with `region`, `zone`, `startTime`, `endTime`,
+`durationHours` (the job's, not the reservation's), `capacitySignal` (the
+zone's status or `RECOMMENDED`), and its `rank`.
+
+**Attach the paired manifests.** A Dynamic Workload Scheduler request and
+its Kueue queue, both under one `pair_id`, both carrying a `target` of the
+rank-one window's `region`, `zone`, and `startTime`, and both in the same
+namespace. The shapes are pinned; adjust values only:
+
+```yaml
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: <job>-window
+  namespace: <namespace>
+  annotations:
+    obtainability.kube-agents/zone: <rank-one zone>
+    obtainability.kube-agents/start: "<rank-one startTime, UTC>"
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "43200" # the job's run, not the reservation day
+  podSets:
+    - count: 64 # nodes, not chips
+      podTemplateRef:
+        name: <job>-pod-template
+```
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: <job>-queue
+  namespace: <namespace>
+  annotations:
+    obtainability.kube-agents/zone: <rank-one zone>
+spec:
+  clusterQueue: <cluster-queue>
+```
+
+Attach each with `attach_artifact` (`type: provisioning_request`,
+`type: local_queue`) as parsed objects with `machineSpec` (for a TPU job,
+`acceleratorType: tpu-v5e` and the chip arithmetic), `pair_id`, and
+`target`. Planning only: hand both manifests to the user, apply nothing,
+submit nothing.
+
+**Report.** Carry this section, filled in:
+
+```markdown
+## Future windows
+
+- **Recommended**: <zone> starting <UTC time> — <one line on why it ranked
+  first>
+- **Runners-up**: <zone and start per window, or "none">
+- **No window**: <zone: status and detail, one line each, or "none">
+- The job must start by <UTC time> to finish inside the horizon.
+```
+
+**Unattended runs.** A session with no person in it — a scheduled re-check,
+an event-triggered run — asks no clarifying questions: take the missing
+values from the original request being re-checked or from the capability's
+recorded defaults, list every assumption in the report, and propose rather
+than apply any change to how the check runs.
+
 ## Diagnostics
 
 #### A. Quota Verification
@@ -243,11 +357,34 @@ gcloud beta compute advice capacity-history \
     --format="json"
 ```
 
+#### E. Future Reservation Calendar Advice
+
+For a deadline-bound batch job (the **Future windows** section above), probe
+each candidate region for its best predicted window. TPU shapes take a
+version, chip count, and workload type; VM shapes take a machine type and VM
+count (plus `--local-ssd` where the shape has one):
+
+```bash
+gcloud beta compute advice calendar-mode \
+    --region=us-central1 \
+    --tpu-version=V5E --chip-count=256 --workload-type=BATCH \
+    --duration-range=min=1d,max=1d \
+    --start-time-range=from=2026-09-22T00:00:00Z,to=2026-09-23T10:00:00Z \
+    --location-policy=us-central1-a=ALLOW \
+    --format=json
+```
+
+The `from` is now; the `to` is now plus the horizon minus the job duration;
+`--location-policy` narrows to the zones the user allowed, and is omitted to
+consider every zone in the region.
+
 _MANDATE_: You MUST actually execute the quota check (`gcloud compute regions
 describe`), the capacity advice (`gcloud beta compute advice capacity`), and,
 where preemption history matters, `gcloud beta compute advice capacity-history`
-— then record each as typed evidence and list the exact commands you ran in
-your report. An analysis you did not execute is not evidence.
+— for a deadline-bound batch job, `gcloud beta compute advice calendar-mode`
+per candidate region — then record each as typed evidence and list the exact
+commands you ran in your report. An analysis you did not execute is not
+evidence.
 
 ## ComputeClass resilience rules
 

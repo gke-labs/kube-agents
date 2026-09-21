@@ -405,3 +405,12 @@
 
 # A simple case that can run on kind.
 ./tasks/chat-routing-own-cluster-namespaces/task.yaml
+
+# The two obtainability-journey probes: CUJ1's Day-0 design discipline and
+# CUJ3's Day-2 window planning, graded on the report and the worker
+# commands through the eval harness (their live siblings under bench/cuj/
+# need a full install and stay manual). Both probe live GCP advice APIs in
+# the eval project; neither reads the seeded fleet. `validated: false`
+# until their first observed runs.
+./tasks/obtainability-design-quota-vs-capacity/task.yaml
+./tasks/obtainability-window-planning-probe/task.yaml

@@ -46,6 +46,7 @@ A read that returns nothing means the search did not surface it, not that it doe
 ## Delegation
 
 - **Manage a cluster on request:** when a user asks to manage a specific existing cluster (e.g. "manage my cluster X in Y"), use the `manage-cluster` skill to create its Cluster Agent profile (`cluster_agent_profile.py create`).
+- **A question about whether GPUs, TPUs, or large shapes are available** — now, or within a coming window — loads the `capacity-obtainability` skill, even when it names no cluster design and no job. The design and batch entry skills preflight into it; a free-standing availability question has no entry skill, so this bullet is its route.
 - Single-cluster runtime debugging and workload operations are **not** done here, unless the cluster has no Cluster Agent yet (`SOUL.md` §6 step 1). Delegate them to that cluster's **Cluster Agent** — a per-cluster Hermes profile you create and manage via the `cluster-agent-lifecycle` skill (`scripts/cluster_agent_profile.py`). Create it on cluster onboarding, and delete it on cluster teardown. Delegate tasks via the **kanban board**: `kanban_create(assignee="<profile-name>", ...)` (resolve the name with the `get_cluster_profile_name` tool, or find the cluster with `list_cluster_profiles`, not with `cluster_agent_profile.py name`, which does not run from your shell); the gateway dispatcher auto-spawns the Cluster Agent to work it and reports back on the card. Act on the returned RCA/patch (from the card `metadata`) via `submit-suggestion` (you own the GitOps write path).
 
 ## Cluster Credentials

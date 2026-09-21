@@ -1377,6 +1377,38 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_the_future_windows_spellings_reach_the_calendar_mode_entry(self):
+        # capacity-obtainability's Future windows section shows these exactly:
+        # the TPU probe (version + chips + workload type) and the VM-shape
+        # variant, one call per candidate region. The verb path was allowed
+        # before any of its flags had arity entries, so every one of these
+        # spellings was refused as gcp.unreadable-command -- the entry existed
+        # and nothing could reach it.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--tpu-version=V5E", "--chip-count=256",
+              "--workload-type=BATCH", "--duration-range=min=1d,max=1d",
+              "--start-time-range=from=2026-09-22T00:00:00Z,to=2026-09-23T10:00:00Z",
+              "--location-policy=us-central1-a=ALLOW", "--format=json"],
+             "calendar mode, TPU shape"),
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--machine-type=a3-megagpu-8g",
+              "--vm-count=8", "--duration-range=min=1d,max=7d",
+              "--start-time-range=from=2026-09-22,to=2026-09-28",
+              "--end-time-range=from=2026-09-23,to=2026-09-29",
+              "--format=json"],
+             "calendar mode, VM shape with an end-time range"),
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--machine-type=c3-standard-88-lssd",
+              "--vm-count=4", "--local-ssd=interface=NVME,size=375",
+              "--duration-range=min=1d,max=1d",
+              "--start-time-range=from=2026-09-22,to=2026-09-28",
+              "--format=json"],
+             "calendar mode, VM shape with local SSD"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
     def test_apply_stays_refused_even_as_an_explicit_dry_run(self):
         # A carve-out for `apply --dry-run=server|client` was tried and
         # withdrawn: server-side dry run needs the same RBAC as the write, so

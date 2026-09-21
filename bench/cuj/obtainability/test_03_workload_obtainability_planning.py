@@ -18,17 +18,38 @@ from cuj.utils.interaction import (
 from cuj.utils.milestones import Milestone, MilestoneSuite
 from cuj.utils.scenario import Scenario
 
-ALLOWED_ZONES = {"us-central1-a", "us-east4-a"}
+# us-east4 has no v5e zone at all (`calendar-mode` returns NOT_SUPPORTED for
+# every zone there, verified live 2026-09-21); europe-west4-b is a v5e zone
+# the API returns windows for. A contract naming a zone the API can never
+# recommend is unsatisfiable by any honest run.
+ALLOWED_ZONES = {"us-central1-a", "europe-west4-b"}
 ALLOWED_REGIONS = {zone.rsplit("-", 1)[0] for zone in ALLOWED_ZONES}
 JOB_DURATION = timedelta(hours=12)
+# The API's minimum reservable window is one day ("The time window is too
+# short. It should be at least 1 days.", verified live): the probe reserves
+# the day, the 12-hour job runs inside it.
+RESERVATION_FLOOR = timedelta(days=1)
 PLANNING_HORIZON = timedelta(hours=48)
 CALL_DELAY_TOLERANCE = timedelta(minutes=30)
+# The method the live endpoint names for this call
+# (X-Google-Esf-Cloud-Client-Params on a real `gcloud beta compute advice
+# calendar-mode` call); there is no alpha spelling.
 OBTAINABILITY_PLANNING_METHODS = {
-    "compute.alpha.AdviceService.CalendarMode",
+    "compute.beta.AdviceService.CalendarMode",
     "compute.advice.calendarMode",
 }
 TPU_V5E_VM_FAMILY = "VM_FAMILY_CLOUD_TPU_LITE_POD_SLICE_CT5LP"
-REQUIRED_SKILLS = {"gke-batch-hpc", "gke-workload-scaling"}
+# The API counts chips (a real request for 64 v5e nodes carries
+# acceleratorCount 256); the user and this test count nodes, and the
+# evidence must carry both so the arithmetic is checkable.
+TPU_V5E_CHIPS_PER_NODE = 4
+NODE_COUNT = 64
+CHIP_COUNT = NODE_COUNT * TPU_V5E_CHIPS_PER_NODE
+REQUIRED_SKILLS = {
+    "capacity-obtainability",
+    "gke-batch-hpc",
+    "gke-workload-scaling",
+}
 FORBIDDEN_OPERATIONS = {
     "apply_manifest",
     "create_cluster",
@@ -39,8 +60,8 @@ FORBIDDEN_OPERATIONS = {
 
 PROMPT = """Act as my batch scheduling partner. Plan a 64-node TPU v5e \
 training job that must run for 12 hours and finish within the next 48 hours. \
-Evaluate us-central1-a and us-east4-a using live \
-compute.alpha.AdviceService.CalendarMode evidence. Rank the predicted capacity \
+Evaluate us-central1-a and europe-west4-b using live \
+compute.beta.AdviceService.CalendarMode evidence. Rank the predicted capacity \
 windows across regions and recommend an exact UTC start time and zone. Generate \
 a Dynamic Workload Scheduler ProvisioningRequest and a paired Kueue LocalQueue \
 targeting that recommended region, zone, and window. This is planning-only: do \
@@ -120,8 +141,10 @@ MILESTONES = (
     ),
     Milestone(
         "m3-batch-skills-loaded",
-        "The Platform Agent loads the batch and scaling skills used by this backend.",
-        "the platform task loads gke-batch-hpc and gke-workload-scaling",
+        "The Platform Agent loads the obtainability, batch, and scaling "
+        "skills used by this backend.",
+        "the platform task loads capacity-obtainability, gke-batch-hpc, and "
+        "gke-workload-scaling",
         ("m2-platform-task-created",),
     ),
     Milestone(
@@ -219,6 +242,7 @@ def _valid_obtainability_planning_call(
     aggregate = _mapping(
         _mapping(spec.get("targetResources")).get("aggregateResources")
     )
+    reservation_seconds = int(RESERVATION_FLOOR.total_seconds())
     return (
         details.get("apiMethod") in OBTAINABILITY_PLANNING_METHODS
         and region in ALLOWED_REGIONS
@@ -234,11 +258,12 @@ def _valid_obtainability_planning_call(
         + PLANNING_HORIZON
         - JOB_DURATION
         + CALL_DELAY_TOLERANCE
-        and _duration_seconds(time_range.get("minDuration")) == 43200
-        and _duration_seconds(time_range.get("maxDuration")) == 43200
+        and _duration_seconds(time_range.get("minDuration")) == reservation_seconds
+        and _duration_seconds(time_range.get("maxDuration")) == reservation_seconds
         and aggregate.get("vmFamily") == TPU_V5E_VM_FAMILY
         and aggregate.get("workloadType") == "BATCH"
-        and _integer(aggregate.get("acceleratorCount")) == 64
+        and _integer(aggregate.get("acceleratorCount")) == CHIP_COUNT
+        and _integer(details.get("nodeCount")) == NODE_COUNT
     )
 
 

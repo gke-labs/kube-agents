@@ -316,6 +316,30 @@ the linked GitOps repositories' manifests for apiVersions the target removes and
 its replacement and the commit it read; run it with `--target-version` and the version report's
 `--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
 """,
+    "gke-batch-hpc": f"""{FOOTER_MARKER}
+
+## Before scheduling a GPU/TPU batch job with a deadline
+
+Before recommending a start time, zone, or capacity path for a GPU/TPU or large-shape batch job —
+especially one that must finish inside a horizon — load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its **Future windows**
+section: verify the regional quota for the exact accelerator metric, probe
+`gcloud beta compute advice calendar-mode` once per candidate region for the job's shape, count,
+duration, and horizon, and rank the returned windows. That skill owns the probe's flags, the
+chips-per-node arithmetic, the ranking rule, and the paired ProvisioningRequest + LocalQueue
+shapes; follow it rather than restating them here.
+""",
+    "gke-workload-scaling": f"""{FOOTER_MARKER}
+
+## Before recommending GPU/TPU or large-shape capacity for a scale-up
+
+Before recommending capacity for a GPU/TPU or large-shape scale-up, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics: the
+regional quota for the exact accelerator metric, then live obtainability advice for the requested
+shape across zones and provisioning models — and, for a deadline-bound batch scale-up, its
+**Future windows** section (`gcloud beta compute advice calendar-mode`). That skill owns what to
+probe and how to report it; follow it rather than restating it here.
+""",
 }
 
 

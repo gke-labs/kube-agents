@@ -514,6 +514,15 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # capacity-obtainability's Flex-Start capacity probe adds a run duration.
         # Without the arity entry the allowlisted command is unreachable.
         "--max-run-duration",
+        # capacity-obtainability's Future-windows probe: the flags `advice
+        # calendar-mode` takes, from its gcloud synopsis (verified against
+        # SDK help and a live call). The verb path was allowlisted with the
+        # other advice entries, but with none of its flags listed here every
+        # spelling the skill emits was refused -- the --max-run-duration trap
+        # again. --machine-type and --region were already present above.
+        "--tpu-version", "--chip-count", "--workload-type", "--vm-count",
+        "--local-ssd", "--duration-range", "--start-time-range",
+        "--end-time-range", "--location-policy",
         # `compute routers list` scopes by --regions (plural), the router
         # analogue of the --zones trap above.
         "--regions",

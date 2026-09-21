@@ -1,0 +1,86 @@
+# Registered in hack/eval/nightly-cases.txt.
+#
+# Domain: capacity (capacity-obtainability skill, Future windows section).
+# Journey: CUJ3's Day-2 batch window planning through the kanban path — a
+# deadline-bound TPU job must be planned from live
+# `gcloud beta compute advice calendar-mode` evidence: the probe executed per
+# candidate region with the chips-per-node conversion stated, a ranked
+# window recommendation (or an honest per-zone "no window"), and the paired
+# ProvisioningRequest + LocalQueue. The live sibling is
+# bench/cuj/obtainability/test_03_workload_obtainability_planning.py, which
+# needs a full install and grades the portal projection; this case grades
+# the same behavior's report through the eval harness so a regression reds
+# CI.
+#
+# The window verdict is live capacity weather: the report may honestly find
+# no window in a zone (v5e is a thin pool), so no check here demands one.
+# What is deterministic is the probe running, the chip arithmetic being
+# stated, the manifests being generated, and no guarantee being claimed.
+#
+# Planted defect required: none — the case probes the live advice API in the
+# eval project and grades the report's discipline, not a fixture.
+# Isolation class: read-only (planning only; nothing created or applied).
+# Tier: nightly (new case; presubmit admission is earned on record).
+id: obtainability-window-planning-probe
+name: Batch window plan probes calendar mode and pairs its manifests
+prompt: >-
+  Plan a 16-node TPU v5e training job that must run for 12 hours and finish
+  within the next 48 hours. Evaluate us-central1-a and europe-west4-b using
+  live compute.beta.AdviceService.CalendarMode evidence, rank the predicted
+  capacity windows, and recommend an exact UTC start time and zone — or
+  state honestly, per zone, that no window exists inside the horizon.
+  Generate a Dynamic Workload Scheduler ProvisioningRequest and a paired
+  Kueue LocalQueue targeting the recommendation. This is planning-only: do
+  not apply manifests, submit a provisioning request, create
+  infrastructure, or mutate Kubernetes or cloud state.
+expected_output: >-
+  The agent loads capacity-obtainability's Future windows section and runs
+  `gcloud beta compute advice calendar-mode` once per candidate region with
+  the day-floor duration range and a start-time range that ends the job
+  inside the horizon, converting 16 v5e nodes to 64 chips and saying so. The
+  report ranks the returned windows (or names each zone's status when none
+  returns), recommends an exact UTC start or an honest no-window verdict,
+  claims no guarantee, and carries a queued-provisioning.gke.io
+  ProvisioningRequest and a Kueue LocalQueue paired to the recommendation.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: capacity
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+verification_spec:
+  - name: the-calendar-mode-probe-actually-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_patterns:
+        - "gcloud beta compute advice calendar-mode .*--tpu-version[ =]V5E"
+        - "advice calendar-mode .*--chip-count[ =]64"
+  - name: report-states-the-chip-conversion
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["64"]
+      any_of_phrases: ["chips", "chip count", "chip-count"]
+  - name: report-delivers-a-window-verdict
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["UTC", "no window", "NO_CAPACITY", "NOT_SUPPORTED"]
+      forbidden_phrases: ["guaranteed capacity", "capacity is guaranteed"]
+  - name: report-carries-the-paired-manifests
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        - "ProvisioningRequest"
+        - "queued-provisioning.gke.io"
+        - "LocalQueue"
