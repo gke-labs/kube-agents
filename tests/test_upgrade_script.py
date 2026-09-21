@@ -423,25 +423,27 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         rollout_idx = text.index('rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=900s')
         self.assertLess(confirm_idx, rollout_idx)
 
-    def test_the_harness_retag_carries_the_plugin_image_keys(self):
-        """The plugin init containers are the image check's business too.
+    def test_the_harness_retag_uses_the_assembled_key_list(self):
+        """The branch re-tags exactly what harness_retag_keys assembled.
 
-        Re-tagging the agent and sandbox alone left pubsub-platform and
-        gke-stockout-investigator on the previous tag, and the post-upgrade
-        image check refused (#1808).
+        The assembly itself runs under test in HarnessRetagKeysTest; what the
+        branch owes is to call it and to hand the whole list to helm_retag,
+        which turns each key into `--set key=<tag>` (#1808).
         """
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         harness = text[text.index("    harness)") : text.index("    full)")]
         self.assertIn(
-            '\n      recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"\n',
+            '\n      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"\n'
+            '      helm_retag "${HARNESS_RETAG_KEYS[@]}"\n',
             harness,
-            "a plain call: a substitution would swallow print_error's stdout and fire the ERR trap twice",
         )
-        self.assertIn('<<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"', harness)
-        self.assertNotIn("$(recorded_plugin_image_tag_keys", harness)
-        self.assertIn('helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"', harness)
-        self.assertIn('${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}', harness)
         self.assertNotIn("mapfile", harness, "macOS ships bash 3.2, which has no mapfile")
+        retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
+        self.assertIn('set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")', retag)
+
+    def test_jq_is_required_for_the_modes_that_read_with_it(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then\n    required_tools+=(jq)', text)
 
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
@@ -519,6 +521,53 @@ echo "rc=$?"
         self.assertNotIn("rc=", proc.stdout)
         self.assertIn("Could not read the values of Helm release", proc.stdout)
         self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+
+class HarnessRetagKeysTest(unittest.TestCase):
+    """harness_retag_keys against a stub helm: the list helm_retag receives."""
+
+    def _run(self, values_json, helm_exit=0):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bin_dir = pathlib.Path(tmp.name) / "bin"
+        bin_dir.mkdir()
+        helm = bin_dir / "helm"
+        helm.write_text(f"#!/usr/bin/env bash\ncat <<'JSON'\n{values_json}\nJSON\nexit {helm_exit}\n")
+        helm.chmod(0o755)
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
+harness_retag_keys kube-agents kubeagents-system
+printf '%s\\n' "${{HARNESS_RETAG_KEYS[@]}}"
+"""
+        env = get_isolated_test_env()
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        return subprocess.run(["bash", "-c", setup], capture_output=True, text=True, env=env)
+
+    def test_the_plugin_keys_follow_the_agent_and_sandbox_keys(self):
+        proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"image":{"tag":"abc"}}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.split(),
+            [
+                "platformAgent.deployment.image.tag",
+                "agentSandbox.image.tag",
+                "plugins.pubsubPlatform.image.tag",
+                "plugins.stockoutInvestigator.image.tag",
+            ],
+        )
+
+    def test_without_recorded_plugins_the_list_is_the_agent_and_sandbox_alone(self):
+        proc = self._run('{"operator":{"image":{"tag":"abc"}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["platformAgent.deployment.image.tag", "agentSandbox.image.tag"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
+    def test_a_failed_read_stops_before_any_list_is_handed_on(self):
+        proc = self._run('{}', helm_exit=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("platformAgent.deployment.image.tag", proc.stdout)
+        self.assertIn("Could not read the values of Helm release", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -368,6 +368,27 @@ recorded_plugin_image_tag_keys() {
   RECORDED_PLUGIN_IMAGE_TAG_KEYS="$keys"
 }
 
+# Sets HARNESS_RETAG_KEYS, the Helm keys the harness step re-tags: the agent
+# and sandbox tags, then every plugin tag the release records. A function of
+# its own so the assembly runs under test with a stub helm, rather than being
+# pinned by the text of the case branch. A read loop rather than the bash 4
+# array builtin: operators run this from macOS, whose bash is 3.2. Arguments:
+# release, namespace.
+HARNESS_RETAG_KEYS=()
+harness_retag_keys() {
+  local release="$1" namespace="$2" key
+  HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag" "agentSandbox.image.tag")
+  recorded_plugin_image_tag_keys "$release" "$namespace"
+  # An if, not `[ -n ] &&`: with nothing recorded the here-string is one empty
+  # line, the test fails, the loop's status is that failure, and under
+  # `set -e` the harness step would stop on an install with no plugins.
+  while IFS= read -r key; do
+    if [ -n "$key" ]; then
+      HARNESS_RETAG_KEYS+=("$key")
+    fi
+  done <<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
+}
+
 # The two refusals that do not need a ref to make sense: an unversioned source
 # directory, and a dirty one. Split out of verify_local_source_ref because a
 # tagless run still applies this checkout's Terraform and charts to a live
@@ -925,18 +946,10 @@ main() {
       # The plugin images move with them for the same reason, when the
       # release records them: the operator renders them into the gateway as
       # stage-<plugin> init containers or plugin-<name> image volumes, and
-      # the image check below reads both.
-      # A plain call, not a substitution: a failed read stops the run here,
-      # once, with the function's own message shown. A read loop rather than
-      # the bash 4 array builtin, and the `+` expansion for the empty case:
-      # operators run this from macOS, whose bash is 3.2.
-      local plugin_tag_keys=() plugin_tag_key
-      recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
-      while IFS= read -r plugin_tag_key; do
-        [ -n "$plugin_tag_key" ] && plugin_tag_keys+=("$plugin_tag_key")
-      done <<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
-      helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag" \
-        ${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}
+      # the image check below reads both. A plain call, not a substitution: a
+      # failed read stops the run here, once, with its own message shown.
+      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
+      helm_retag "${HARNESS_RETAG_KEYS[@]}"
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 
