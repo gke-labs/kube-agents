@@ -27,8 +27,10 @@ from cuj.utils.interaction import (
 from cuj.utils.milestones import Milestone, MilestoneSuite
 from cuj.utils.scenario import Scenario
 
-ALLOWED_ZONES = {"us-central1-a", "europe-west4-b"}
 RECHECK_LEAD = timedelta(hours=2)
+RECHECK_LEAD_HOURS = int(RECHECK_LEAD.total_seconds() // 3600)
+# The lead spelled both ways an answer may echo it.
+LEAD_PHRASES = (f"{RECHECK_LEAD_HOURS} hours", "two hours")
 REQUIRED_SKILLS = {"capacity-obtainability"}
 # The spellings a completed schedule-creation tool call may normalize to.
 SCHEDULE_OPERATIONS = {"cronjob", "cronjob_create", "schedule_create"}
@@ -39,21 +41,24 @@ FORBIDDEN_OPERATIONS = {
     "submit_provisioning_request",
     "submit_suggestion",
 }
-# One UTC time in the delivered answer, hh:mm, e.g. "22:00 UTC" or
-# "2026-09-22T22:00:00Z ... UTC".
-UTC_TIME_RE = re.compile(r"\b\d{2}:\d{2}\b")
+# One UTC clock time in the delivered answer: "22:00 UTC", "9:30 UTC", or
+# inside an ISO-8601 timestamp ("2026-09-22T22:00:00Z"). No leading word
+# boundary — a digit inside a timestamp has none.
+UTC_TIME_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}")
+ONE_SHOT_RE = re.compile(r"\b(once|one-time|one time|single)\b")
+RECURRING_RE = re.compile(r"\b(every|recurring|repeatedly|hourly|daily|weekly)\b")
 
-PROMPT = """Act as my batch scheduling partner. Plan a 64-node TPU v5e \
+PROMPT = f"""Act as my batch scheduling partner. Plan a 64-node TPU v5e \
 training job that must run for 12 hours and finish within the next 48 hours, \
 evaluating us-central1-a and europe-west4-b with live \
 compute.beta.AdviceService.CalendarMode evidence, and recommend an exact UTC \
 start time and zone. Then schedule a single re-check of the recommended \
-window for two hours before its start: the re-check re-probes the window, \
-reports into this conversation, and must fire exactly once — never a \
-recurring schedule. Tell me the re-check's exact UTC fire time and where its \
-report will arrive. This is planning-only: do not apply manifests, submit a \
-provisioning request, create infrastructure, or mutate Kubernetes or cloud \
-state."""
+window {RECHECK_LEAD_HOURS} hours before its start: the re-check re-probes \
+the window, reports into this conversation, and must fire exactly once — \
+never a recurring schedule. Tell me the re-check's exact UTC fire time and \
+where its report will arrive. This is planning-only: do not apply manifests, \
+submit a provisioning request, create infrastructure, or mutate Kubernetes \
+or cloud state."""
 
 ACCEPTANCE_CRITERIA = (
     AcceptanceCriterion(
@@ -141,7 +146,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     fire_time_stated = (
         bool(UTC_TIME_RE.search(answer))
         and "utc" in folded_answer
-        and ("two hours" in folded_answer or "2 hours" in folded_answer)
+        and any(phrase in folded_answer for phrase in LEAD_PHRASES)
     )
     reports_to_thread = (
         "this conversation" in folded_answer
@@ -149,9 +154,9 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         or "same conversation" in folded_answer
         or "same thread" in folded_answer
     )
-    one_shot = (
-        "once" in folded_answer or "one-time" in folded_answer
-    ) and "every" not in folded_answer
+    one_shot = bool(ONE_SHOT_RE.search(folded_answer)) and not RECURRING_RE.search(
+        folded_answer
+    )
 
     input_value = interaction.get("input")
     input_text = str(
@@ -165,7 +170,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         "64-node" in folded_input
         and "tpu v5e" in folded_input
         and "re-check" in folded_input
-        and "two hours before" in folded_input
+        and f"{RECHECK_LEAD_HOURS} hours before" in folded_input
         and "this conversation" in folded_input
         and "exactly once" in folded_input,
         input_text,
@@ -209,6 +214,9 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     platform_tasks = projected_tasks(interaction, assignee="platform")
     operations = tool_operations(interaction)
     completed_operations = tool_operations(interaction, completed_only=True)
+    worker_tools_available = bool(platform_tasks) and all(
+        "toolCalls" in task for task in platform_tasks
+    )
     unnormalized_calls = unnormalized_tool_calls(interaction)
     routed = [
         task
@@ -264,6 +272,10 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
                 (
                     "toolEvidenceComplete" not in interaction,
                     "portal interaction projection omits toolEvidenceComplete",
+                ),
+                (
+                    not worker_tools_available,
+                    "portal task projection omits worker toolCalls",
                 ),
                 (
                     bool(unnormalized_calls),

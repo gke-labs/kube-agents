@@ -61,9 +61,14 @@ verification_spec:
       required_patterns:
         # gcloud enum flags accept lowercase values, and a live run was
         # observed passing --tpu-version v5e -- the check pins the probe and
-        # its arithmetic, not the letter case of an enum.
+        # its arithmetic, not the letter case of an enum. The two region
+        # patterns pin "once per candidate region": without them, one call
+        # against a single region satisfies the shape patterns and the
+        # dropped-second-region regression ships green.
         - "gcloud beta compute advice calendar-mode .*--tpu-version[ =][Vv]5[Ee]"
         - "advice calendar-mode .*--chip-count[ =]64"
+        - "advice calendar-mode .*--region[ =]us-central1"
+        - "advice calendar-mode .*--region[ =]europe-west4"
   - name: report-states-the-chip-conversion
     role: objective
     mode: assert

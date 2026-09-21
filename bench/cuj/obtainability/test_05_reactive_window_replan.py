@@ -221,6 +221,9 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     platform_tasks = projected_tasks(interaction, assignee="platform")
     operations = tool_operations(interaction)
     completed_operations = tool_operations(interaction, completed_only=True)
+    worker_tools_available = bool(platform_tasks) and all(
+        "toolCalls" in task for task in platform_tasks
+    )
     unnormalized_calls = unnormalized_tool_calls(interaction)
     routed = [
         task
@@ -302,6 +305,10 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
                 (
                     "toolEvidenceComplete" not in interaction,
                     "portal interaction projection omits toolEvidenceComplete",
+                ),
+                (
+                    not worker_tools_available,
+                    "portal task projection omits worker toolCalls",
                 ),
                 (
                     bool(unnormalized_calls),

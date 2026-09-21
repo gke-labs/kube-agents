@@ -213,14 +213,16 @@ hide.
 
 **Record the evidence.** One `type:
 advice_service_workload_obtainability_planning` record per region call, with
-`api_method: compute.beta.AdviceService.CalendarMode`, the region, the node
-count and chips-per-node conversion, and the exact request body the command
-sent (the `futureResourcesSpecs` shape from `--log-http`, or reconstructed
-from the flags). Then exactly one `type:
+`api_method: compute.beta.AdviceService.CalendarMode`, the `region`,
+`nodeCount`, `chipsPerNode`, and under `request` the canonical body the
+flags produce — the `futureResourcesSpecs` shape. Reconstruct it from the
+flags you passed; the shell gate refuses `--log-http`, so capturing the
+wire body is not a path you have. Then exactly one `type:
 workload_obtainability_planning_analysis` record whose `analysis.windows`
-lists every window with `region`, `zone`, `startTime`, `endTime`,
-`durationHours` (the job's, not the reservation's), `capacitySignal` (the
-zone's status or `RECOMMENDED`), and its `rank`.
+lists every window **in rank order, rank one first**, each with `region`,
+`zone`, `startTime`, `endTime`, `durationHours` (the job's, not the
+reservation's), `capacitySignal` (the zone's status or `RECOMMENDED`), and
+its `rank`.
 
 **Attach the paired manifests.** A Dynamic Workload Scheduler request and
 its Kueue queue, both under one `pair_id`, both carrying a `target` of the
@@ -371,7 +373,7 @@ gcloud beta compute advice calendar-mode \
     --region=us-central1 \
     --tpu-version=V5E --chip-count=256 --workload-type=BATCH \
     --duration-range=min=1d,max=1d \
-    --start-time-range=from=2026-09-22T00:00:00Z,to=2026-09-23T10:00:00Z \
+    --start-time-range=from=2026-09-22T00:00:00Z,to=2026-09-23T12:00:00Z \
     --location-policy=us-central1-a=ALLOW \
     --format=json
 ```
