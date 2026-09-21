@@ -430,6 +430,12 @@ optional enrichment, never a prerequisite. It has a full design doc and a comple
 separates a human out-of-band change from CI and from controller churn (~99% noise reduction with two
 static filters).
 
+The adapter is now built end to end — ingestion, classification, the `managedFields` join across
+every cluster the Platform Agent has onboarded, and the inject itself — and the daemon routes the
+kind to its own chat alert and its own triage card. It stays a candidate rather than going live for
+one reason: no image builds or launches the detector, so an operator runs it by hand and no
+installation detects drift on its own. What the domain is waiting on is deployment, not design.
+
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously
 bounded cross-domain troubleshooting.
