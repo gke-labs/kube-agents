@@ -1,15 +1,28 @@
 # Upgrade readiness checks for a large GKE fleet
 
-**Status:** requirements. Nothing in this document is built beyond what the Scope table credits to
-an existing audit or skill.
+**Status:** requirements. Nothing here is built beyond what the Scope table credits to an existing
+audit or skill.
+
+## The problem, in one paragraph
+
+Kubernetes ships a new minor version every few months, and GKE clusters have to follow. Before a
+team upgrades, somebody has to answer one question: **will anything break?** Answering it today
+means opening several tools and checking by hand — is anything still calling an API this version
+deletes, are the add-ons compatible, will the pods survive nodes being drained one at a time — and
+then repeating all of it for the next group of clusters. A team running hundreds of clusters does
+this over and over. This document lists the checks an agent should run on a schedule instead, so
+the answer is waiting for them.
+
+Two things to know about the checks. They are **read-only**: they look and report, and never
+upgrade anything — that stays a human's decision. And they are **grouped by cluster family**, a
+family being a set of clusters built from the same template, because that is the unit a team
+actually upgrades.
 
 ## Scope
 
-Scheduled audits and one skill already cover part of this ground. The table maps each area below to
-what runs it today; the SOP or skill named is canonical for exactly what it checks and at what
-threshold, and this document does not restate those checks; each job's cadence is in the
-[cron jobs reference](../site/src/content/docs/reference/cron-jobs.md). What a builder picks up from
-here is the third column.
+Some of this already runs. The table says what, so nobody builds it twice. The SOP or skill named
+is the real definition of what that check does and at what threshold; this document does not
+repeat it. **The third column is the work.**
 
 | Area                                   | Already on `main`                                                                                                                                                                                                                                                                                                                                                                                                                                                | New in this document                                                                                                                                                                                                   |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -19,108 +32,111 @@ here is the third column.
 | Drain safety and disruption            | `obtainability-audit` (`agents/platform/governance/obtainability_audit_sop.md`): multi-replica workloads with no PodDisruptionBudget, drain-blocking budgets, single-replica Service-backed Deployments, rigid scheduling, missing spread. On request, `fleet-upgrade-verification --readiness` grades drain-blocking PDBs, upgrade-covering maintenance exclusions and node-pool skew per member against a chosen target, emitting `blocked`/`unknown`/`ready`. | Surge and blue/green capacity per pool, workloads pinned to a pool being retired, whether anything consumes the cluster's upgrade notifications.                                                                       |
 | Rollout orchestration and verification | The `fleet-upgrade-verification` skill reports, run over run, which clusters started, completed or stalled against one target version.                                                                                                                                                                                                                                                                                                                           | Canary sequencing per family with each family's blocking findings, and the post-upgrade diff.                                                                                                                          |
 
-## Purpose
+## What a run produces: a verdict, not a list
 
-A platform team running GKE at scale — millions of cores, dozens of cluster families (fleets of
-clusters built to one template), and multi-tenant clusters holding thousands of namespaces each —
-assesses readiness for every Kubernetes minor-version bump by hand. Several tools are stitched
-together to find deprecated API callers, check add-on compatibility, and confirm workloads will
-survive a node drain, and the exercise is repeated per cluster family.
+A list of findings still leaves someone deciding what it means. So each run ends with a verdict for
+every cluster family — **`Go`**, **`No-Go`**, or **`Action required`** — in a form a release
+pipeline can read and gate on.
 
-This document lists the checks such an operator would realistically ask the Platform Agent to run on
-a schedule ahead of an upgrade, as candidate criteria for a scheduled audit. Each check is
-read-only: it inspects the fleet and reports a finding, with an owner and a run-over-run delta,
-and never upgrades a cluster.
+Every check below carries a tier, and the tiers are what produce the verdict:
 
-## How it is delivered
+| Tier         | Meaning                                                         | Examples                                                                                                                                                                           |
+| ------------ | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Blocker**  | The upgrade will fail or cause an outage. Fix before upgrading. | GKE has paused auto-upgrade on the cluster; a PodDisruptionBudget that can never be satisfied, so the node drain hangs forever; no spare quota for the extra node an upgrade needs |
+| **Risk**     | The upgrade can proceed, but watch this.                        | An add-on whose version is not supported on the target Kubernetes version                                                                                                          |
+| **Advisory** | Worth knowing, not worth blocking.                              | A stale annotation                                                                                                                                                                 |
 
-These checks are delivered as one audit capability on the
-[capability delivery vehicle](capability-delivery-vehicle.md), which gives them five properties,
-none of them built here: it ships **pre-defined** with the agent; it runs **scheduled** as a weekly
-job; it is **triggerable** from chat at any time, for the whole fleet or for one family ahead of
-its upgrade window; they are **customizable**, in that the criteria below are held apart from the procedure so an
-operator can revise them by describing the change to the agent and agreeing the edit; and they are
-**self-learning**, in that the agent refines those criteria from what it learns in those
-conversations, within limits the operator sets. This document lists only the checks; the delivery
-requirements are a separate design.
+The findings are the evidence behind the verdict; the verdict is the deliverable.
 
-## The verdict
-
-The output is a decision, not an inventory: an operator's job here is deciding whether an upgrade
-can proceed, and a list of unranked findings leaves that triage manual. Every check declares a
-tier — **Blocker** (the upgrade cannot proceed: an active auto-upgrade pause, an unsatisfiable
-PodDisruptionBudget, a surge the quota cannot fit), **Risk** (proceed with attention: an add-on
-lagging the target version's support), or **Advisory** — and each run emits a machine-readable
-verdict per cluster family: `Go`, `No-Go`, or `Action required`, naming the blocking findings. A
-platform lead can wire that verdict into a release pipeline as a gate; the finding list is the
-evidence behind it, not the deliverable.
-
-`fleet-upgrade-verification --readiness` is the nearest thing on `main`: per member, against a
-chosen target, it already emits `blocked`/`unknown`/`ready` from drain-blocking PDBs, maintenance
-exclusions and skew. What this document adds is the aggregation a release gate needs — a verdict
-per **cluster family** rather than per member, every check here tiered into it rather than that
-script's three inputs, and the verdict produced by the scheduled audit rather than only on
-request.
+Closest thing on `main`: `fleet-upgrade-verification --readiness` already emits
+`blocked`/`unknown`/`ready` per cluster from drain-blocking PDBs, maintenance exclusions and skew.
+Three things are missing — the verdict is per cluster, not per family; it reads three inputs rather
+than every check here; and it runs only when asked, not on the schedule.
 
 ## Version posture
 
-Served today by `security-patch-orchestrator` and, on request, `fleet-upgrade-verification` (see
-Scope). The addition:
+Already served (see Scope). One addition:
 
-- A target version and date per cluster family, supplied by the operator from the GKE release
-  calendar, and the days remaining per cluster against its family's date — so a family falling
-  behind its own plan is reported before it falls behind the channel.
+- Each family gets a target version and a date, taken from the GKE release calendar by the
+  operator, and every run reports the days remaining. The point is to catch a family falling
+  behind **its own plan**, which happens long before it falls behind what GKE still supports.
 
 ## GKE deprecation insights
 
-GKE publishes per-cluster
-[deprecation insights](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations)
-through the Recommender API (`google.container.DiagnosisInsight`): calls to APIs removed in the
-next minor, deprecated authentication methods, old node images, and similar. GKE pauses
-auto-upgrade on a cluster with an unresolved insight, so a cluster silently pinned to an old
-version is a finding in its own right.
+Kubernetes removes APIs on a schedule. If a workload is still calling one that the next version
+deletes, that workload breaks the moment the control plane upgrades.
 
-- Read insights for every cluster in scope and report them per cluster family.
-- Join each insight to who has to fix it: the calling user agent and service account (from the
-  insight detail and `k8s.io/deprecated` audit-log annotations) and the owning team of the
-  namespace.
-- Confirm the `apiserver_requested_deprecated_apis` metric is quiet for the APIs the _target_
-  version removes, not only the current one.
-- Track resolution across runs so a team sees "12 callers last week, 3 now".
-- Report "auto-upgrade paused by an unresolved insight" as the cause when a cluster is behind its
-  channel for that reason, rather than as an unexplained lag.
+GKE already detects this and will tell you: it publishes
+[deprecation insights](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations)
+per cluster through the Recommender API (`google.container.DiagnosisInsight`), covering removed API
+calls, deprecated authentication methods, old node images and more. Nothing in this repository
+reads them today.
+
+There is a second reason to care. **When GKE sees one of these, it stops auto-upgrading that
+cluster.** So a cluster quietly sitting on an old version is often not a scheduling accident — it
+is GKE refusing to move it, and nobody noticed.
+
+The checks:
+
+- Read the insights for every cluster and report them grouped by family.
+- Say **who has to fix it**. An insight names the API being called; the caller's identity comes
+  from the insight detail and the `k8s.io/deprecated` audit-log annotations, and the owning team
+  from the namespace. A finding nobody owns does not get fixed.
+- Cross-check the API server's own counter (`apiserver_requested_deprecated_apis`) for the APIs the
+  **target** version removes — not just the current one, which is what a team usually checks.
+- Track the count across runs, so a team sees progress: "12 callers last week, 3 now."
+- When a cluster is behind its channel because an insight paused its auto-upgrade, say that is the
+  reason rather than reporting an unexplained lag.
 
 ## Workload compatibility
 
-- Inventory third-party add-ons per family (service mesh, cert-manager, monitoring agents, GitOps
-  controllers, CSI and CNI drivers, custom admission webhooks) and their versions against the
-  target Kubernetes minor's support matrix.
-- Admission webhooks with `failurePolicy: Fail`, no `timeoutSeconds`, or cluster-wide scope: these
-  stall an upgrade when the webhook backend restarts mid-drain.
-- Manifests in the operator's GitOps repositories, not only live clusters, that use removed
-  fields or defaults: in-tree volume plugins, `PodSecurityPolicy`, seccomp annotations, legacy
-  `Ingress` classes, `batch/v1beta1 CronJob`. `api_deprecation_scan.py` already does the
-  `apiVersion`/`kind` half of this on request (see Scope); what is new is the rest of the surface
-  and running it on the audit's schedule rather than only when asked.
-- Images that assume cgroup v1 or a dockershim-era socket mount.
+Four ways a workload breaks on a new version:
 
-## Drain safety and disruption
+- **Add-ons.** Service mesh, cert-manager, monitoring agents, GitOps controllers, CSI and CNI
+  drivers, custom admission webhooks — each supports a range of Kubernetes versions. Inventory what
+  each family runs and check it against the target version's support matrix.
+- **Admission webhooks that block drains.** A webhook with `failurePolicy: Fail`, no
+  `timeoutSeconds`, or cluster-wide scope will stall the upgrade when its own backend restarts
+  mid-drain — the webhook rejects everything while it is down, including the pods the upgrade is
+  trying to move.
+- **Manifests in Git, not just live clusters.** A removed field or API version sitting in the
+  GitOps repository breaks on the next sync even if nothing in the cluster uses it today: in-tree
+  volume plugins, `PodSecurityPolicy`, seccomp annotations, legacy `Ingress` classes,
+  `batch/v1beta1 CronJob`. `api_deprecation_scan.py` already covers the `apiVersion`/`kind` part on
+  request (see Scope); what is new is the rest and running it on the schedule.
+- **Images with old assumptions.** Anything expecting cgroup v1 or a dockershim-era socket mount.
 
-The PodDisruptionBudget, single-replica, rigid-scheduling and spreading checks are served today by
-`obtainability-audit` (see Scope). The additions:
+## Drain safety
 
-- Node pools with `max-surge` 0, blue/green needed but not configured, or regional quota that
-  cannot fit a surge node.
-- Workloads pinned by `nodeSelector` or affinity to a pool being retired.
-- Whether anything consumes the cluster's `UpgradeEvent` and `SecurityBulletinEvent` Pub/Sub
-  notifications, beyond their being configured.
+Upgrading nodes means draining them: evict the pods, delete the node, bring up a new one. Most
+upgrade failures are really drain failures. The PodDisruptionBudget, single-replica,
+rigid-scheduling and spreading checks already run (see Scope). The additions:
 
-## Rollout orchestration and verification
+- **No room to add a node.** A pool with `max-surge` of 0, or blue/green needed but not configured,
+  or regional quota too tight to fit even one surge node. The upgrade cannot start.
+- **Workloads pinned to a pool being retired.** A `nodeSelector` or affinity naming a pool that is
+  going away leaves those pods nowhere to land.
+- **Nobody listening to the upgrade notifications.** GKE publishes `UpgradeEvent` and
+  `SecurityBulletinEvent` to Pub/Sub. Checking the topic is configured is not enough — check
+  something actually consumes it, or the notifications go nowhere.
 
-Run-over-run rollout tracking against one target version is served today by
-`fleet-upgrade-verification` (see Scope). The additions:
+## Rollout and verification
 
-- A proposed sequence: canary one cluster per family, soak, then the rest — with each family's
-  blocking findings named.
-- A post-upgrade diff per cluster: new `CrashLoopBackOff` or `ImagePullBackOff`, webhook latency,
-  pending pods, new deprecation warnings that were not there before.
+Rollout tracking against one target version already runs (see Scope). The additions:
+
+- **A sequence, not a switch.** Upgrade one cluster per family first, let it soak, then the rest —
+  and name each family's blocking findings so the order is justified rather than arbitrary.
+- **A diff after the upgrade.** Compare each cluster against itself before and after: new
+  `CrashLoopBackOff` or `ImagePullBackOff`, webhook latency, pods stuck pending, deprecation
+  warnings that were not there before. Without the diff, "the upgrade worked" means "nothing
+  obvious caught fire".
+
+## How it is delivered
+
+These checks are one audit capability on the
+[capability delivery vehicle](capability-delivery-vehicle.md), which gives them five properties
+that are not built here: it **ships with the agent**; it **runs on a weekly schedule**; it can be
+**asked for in chat** at any time, for the whole fleet or one family; its criteria are
+**customizable**, held apart from the procedure so an operator can change a threshold by agreeing
+the edit with the agent; and it is **self-learning**, refining those criteria from what the
+operator says, within limits the operator sets.

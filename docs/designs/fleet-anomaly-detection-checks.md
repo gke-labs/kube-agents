@@ -22,40 +22,39 @@ here is the third column.
 | Usage                                   | Nothing scheduled beyond what capacity and cost already report (single-zone pools, out-of-resources events, gross over-request). Several usage checks need a metrics source the audits currently forbid, and the obtainability SOP records HPA-at-maximum, VPA gaps and OOMKill history as dropped for that reason.                                                                                          | Zonal skew with its cause, per-family utilization baselines, autoscaler and scaling health, workload health trends, control-plane load, accelerator utilization — and the metrics source they need.         |
 | Costs                                   | `fleet-wide-cost-analysis` (`agents/platform/governance/fleet_wide_cost_analysis_sop.md`): over-request, orphaned volumes and disks, unconsumed claims, idle addresses, orphaned load balancers, under-allocated pools, scale-down blockers, terminal pods, idle namespaces. `gce-compute-fleet-audit` reports orphaned snapshots; `gcp-networking-fabric-audit` reports Cloud NAT saturation.               | Committed-use coverage, Spot-share drift and machine-generation cost; cost anomaly attribution; cross-zone and cross-region traffic; observability spend; storage tiering against measured use; chargeback. |
 
-## Purpose
+## The problem, in one paragraph
 
-A platform team running GKE at scale — millions of cores, dozens of cluster families (fleets of
-clusters built to one template), and multi-tenant clusters holding thousands of namespaces each —
-finds that local problems hide in fleet-wide dashboards. With that many clusters nobody watches any
-one family or region, so a problem confined to one of them (their example: zonal skew in a single
-region) is discovered only when it becomes an outage.
+A dashboard averaged over hundreds of clusters hides the one cluster that is in trouble. Nobody
+watches any single cluster family or region closely, so a problem confined to one of them is found
+when it becomes an outage rather than before. That is not hypothetical: the team this came from
+lost a region to **zonal skew** — pods quietly piling into one zone of a region instead of
+spreading across three — which nobody saw until the zone had a bad day. This document lists the
+checks an agent should run on a schedule so that kind of problem is reported while it is still
+boring.
 
-This document lists the checks such an operator would realistically ask the Platform Agent to run on
-a schedule, as candidate criteria for scheduled audits. The operator's own framing is "guardrails,
-usage, and costs", and the three sections follow it. Each check is read-only: it inspects the
-fleet and reports a finding and never changes a cluster.
+The checks are **read-only**: they look and report, never change a cluster.
 
-## How it is delivered
+## How the findings are shaped
 
-These checks are delivered as one audit capability on the
-[capability delivery vehicle](capability-delivery-vehicle.md), which gives them five properties,
-none of them built here: it ships **pre-defined** with the agent; it runs **scheduled** as cron
-jobs, one per section at its own cadence; it is **triggerable** from chat at any time, for the
-whole fleet or for one family or region; they are **customizable**, in that the criteria below are held apart from the procedure so an
-operator can revise them by describing the change to the agent and agreeing the edit; and they are
-**self-learning**, in that the agent refines those criteria from what it learns in those
-conversations, within limits the operator sets. This document lists only the checks; the delivery
-requirements are a separate design.
+Three rules apply to every check below, and they are what make the output usable rather than
+another dashboard:
 
-Every check reports per cluster family and region — at dozens of multi-tenant clusters a single
-fleet-wide report is unreadable — and every finding carries an owner (team label) and a
-week-over-week delta. The families themselves are the natural baseline: a cluster is anomalous when
-it diverges from its siblings, not from a fleet-wide average.
+- **Report per cluster family and region, never fleet-wide.** One combined report across dozens of
+  multi-tenant clusters is unreadable, and averaging is exactly what hid the problem.
+- **Compare a cluster to its siblings, not to an average.** A family is a set of clusters built
+  from the same template, so they should look alike. A cluster is interesting when it differs from
+  the others in its own family — that is a much sharper signal than "above the fleet mean".
+- **Every finding names an owner and a trend.** Who owns it (from the team label) and whether it
+  got better or worse since last week. A finding with neither is noise.
+
+The three sections that follow are the operator's own words for what they want watched:
+**guardrails** (rules that must hold), **usage** (how the fleet is actually behaving), and
+**costs**.
 
 ## Guardrails
 
-Configuration that must hold everywhere, and the places it has quietly stopped holding. Where the
-Scope table names a job, that job's checks are not repeated here.
+Rules that are supposed to hold everywhere, and the places they have quietly stopped holding. Where
+the Scope table names a job, that job's checks are not repeated here.
 
 - **Tenant isolation.** Namespaces with no ResourceQuota or LimitRange; node-pressure evictions
   concentrated on a few tenants.
@@ -129,3 +128,13 @@ orphaned-snapshot and NAT-saturation checks are served today (see Scope).
   retention; regional disks where zonal would do.
 - **Chargeback.** Namespace-level cost allocation drift inside multi-tenant clusters, and tenants
   whose allocated share no longer matches their quota or label.
+
+## How it is delivered
+
+These checks are one audit capability on the
+[capability delivery vehicle](capability-delivery-vehicle.md), which gives them five properties
+that are not built here: it **ships with the agent**; it **runs on a schedule**, one job per
+section at its own cadence; it can be **asked for in chat** at any time, for the whole fleet or
+one family or region; its criteria are **customizable**, held apart from the procedure so an
+operator can change a threshold by agreeing the edit with the agent; and it is **self-learning**,
+refining those criteria from what the operator says, within limits the operator sets.
