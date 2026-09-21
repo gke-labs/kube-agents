@@ -43,6 +43,17 @@ red is not the author's diff:
     ### ⚪ Smoke gate: run killed at the deadline
     > Prow killed this run at its 360-minute deadline at 10:19 AM ET; ...
 
+A run the suite itself could not evaluate (`runs[].eval_outcome`,
+SCHEMA.md: an admitted case, or every case, lost every repetition to
+infrastructure, so the job exited 2) is not a red either, whatever Prow's
+FAILURE and the final line's `Failed` word say: `is_red` is false for it,
+and it gets the same one-line shape naming the cases the suite listed in
+`runs[].not_evaluated`, that nothing was graded for them, that nothing
+about the change is implied, and to retest once the environment is healthy:
+
+    ### ⚪ Smoke gate: run not evaluated
+    > `security-overgrant-probe` lost every repetition to infrastructure ...
+
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
 `shared` (the gate's), `only-this-pr` (yours), `storm`, `delegation-ceiling`
@@ -190,6 +201,28 @@ BOX_DEADLINE_QUIET = (
 )
 FOOTER_DEADLINE = "Ran {minutes} min to the deadline · [build log]({url})"
 CONDITION_LOST_PODS = health.LOST_PODS
+# The not-evaluated comment (module docstring). The suite's own words for
+# the state, in the shape of the lost-pod comment: the cases, that nothing
+# was graded for them, that nothing about the change is implied, and when
+# to retest -- in words, as the gate's own banner puts it ("rerun when
+# the environment is healthy"); the lost-pod line above already shows the
+# command itself.
+HEADING_NOT_EVALUATED = "### ⚪ Smoke gate: run not evaluated"
+BOX_NOT_EVALUATED = (
+    "{cases} lost every repetition to infrastructure before the agent could be graded{storm}."
+    " The suite could certify nothing, so Prow reports the run red; nothing was graded for {them}"
+    " and nothing about your change is implied. Retest once the environment is healthy."
+)
+BOX_NOT_EVALUATED_EVERY = (
+    "Every case lost every repetition to infrastructure before the agent could be graded{storm}."
+    " The suite evaluated nothing, so Prow reports the run red; nothing about your change is implied."
+    " Retest once the environment is healthy."
+)
+# While health.json's condition is storm: the same line post_health.py
+# draws, so the comment and the brief agree on what the weather is.
+BOX_NOT_EVALUATED_STORM = " — a quota storm is declared on the gate right now"
+FOOTER_NOT_EVALUATED = "Ran {minutes} min on {project} · [build log]({url})"
+CONDITION_STORM = health.STORM
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
 TABLE_ROW = "| `{case}`{note} | {result} | {also} |"
 HELD_OUT_CELL = " (held out)"
@@ -252,17 +285,24 @@ class Red:
 
 def is_red(run: health.Run) -> bool:
     """FAILURE, with tasks, and at least one graded repetition: not aborted,
-    not a setup death, not a suite the storm emptied."""
-    return run.result == health.RUN_FAILURE and run.full and any(task.graded for task in run.tasks)
+    not a setup death, not a suite the storm emptied, and not a run the
+    suite itself said it could not evaluate (module docstring)."""
+    return run.result == health.RUN_FAILURE and run.full and any(task.graded for task in run.tasks) and not run.not_evaluated
+
+
+def is_commented_on(run: health.Run) -> bool:
+    """A red, a lost pod, a deadline kill, or a not-evaluated run: the four
+    shapes that get a comment."""
+    return is_red(run) or run.lost_pod or run.deadline_kill or run.not_evaluated
 
 
 def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
-    """The newest red, lost or deadline-killed run per pull request among
+    """The newest red, lost, deadline-killed or not-evaluated run per pull request among
     those finishing in (since, now]."""
     newest: dict = {}
     for raw in data.get("runs") or []:
         run = health.Run(raw)
-        if run.pr is None or not run.finished or not (since < run.finished <= now) or not (is_red(run) or run.lost_pod or run.deadline_kill):
+        if run.pr is None or not run.finished or not (since < run.finished <= now) or not is_commented_on(run):
             continue
         current = newest.get(run.pr)
         if current is None or run.finished > health.Run(current).finished:
@@ -483,6 +523,37 @@ def render_lost_comment(run: health.Run, health_doc: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dict, project: str | None = None) -> str:
+    """The not-evaluated comment: the cases the suite could not grade, that
+    nothing about the change is implied, and when to retest -- with the
+    storm named while health.json's condition is `storm`. `project` is the
+    raw record's (health.Run does not carry it)."""
+    in_storm = health_doc.get("condition") == CONDITION_STORM and health_doc.get("state") != health.GREEN
+    storm = BOX_NOT_EVALUATED_STORM if in_storm else ""
+    lost = list(verdict.get("not_evaluated") or run.not_evaluated_cases)
+    recorded = {c.get("case") for c in verdict.get("cases") or []}
+    if lost and recorded and recorded <= set(lost):
+        box = BOX_NOT_EVALUATED_EVERY.format(storm=storm)
+    else:
+        named = join_names([{"case": c} for c in lost]) or "An admitted case"
+        box = BOX_NOT_EVALUATED.format(cases=named, storm=storm, them=plural(len(lost) or 1, "it", "them"))
+    links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
+    if in_storm:
+        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+    wall = run.wall_clock
+    minutes = int(wall.total_seconds() // 60) if wall else "?"
+    project = (project or UNKNOWN_PROJECT).removeprefix(PROJECT_PREFIX)
+    lines = [
+        MARKER,
+        HEADING_NOT_EVALUATED,
+        "",
+        f"> {box} {' · '.join(links)}",
+        "",
+        FOOTER_NOT_EVALUATED.format(minutes=minutes, project=project, url=BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)),
+    ]
+    return "\n".join(lines) + "\n"
+
+
 # --------------------------------------------------------------------------- #
 # Posting
 # --------------------------------------------------------------------------- #
@@ -550,6 +621,10 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
             body = render_lost_comment(run, health_doc)
         elif run.deadline_kill:
             body = render_deadline_comment(run, health_doc)
+        elif run.not_evaluated:
+            admitted = roster.at(run.started or run.finished)
+            verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
+            body = render_not_evaluated_comment(run, verdict, health_doc, project=raw.get("project"))
         else:
             admitted = roster.at(run.started or run.finished)
             verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
