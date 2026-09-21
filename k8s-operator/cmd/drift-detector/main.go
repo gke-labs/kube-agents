@@ -186,7 +186,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.tokenEnv, "token-env", "",
 		"Name of the environment variable holding the daemon's bearer token. Required with --daemon-url. The variable's name rather than its value, because a flag is visible in the process table.")
 	fs.StringVar(&f.owner, "owner", "",
-		"X-Asserted-Caller for the session the inject opens. Sent and logged, but not authorised against anything today: the daemon guards POST /sessions with the bearer token alone.")
+		"X-Asserted-Caller for the session the inject opens. Sent, but nothing reads it today: the daemon guards POST /sessions with the bearer token alone.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "",
 		"Path to a kubeconfig for the cluster whose live objects the join reads. An operator-supplied path for local runs, not a discovery mechanism. Mutually exclusive with --in-cluster; with no --profiles-dir either, the join is disabled.")
 	fs.BoolVar(&f.inCluster, "in-cluster", false,
@@ -469,6 +469,21 @@ func realMain(argv []string) error {
 			assertedCaller: f.owner,
 		})
 		if err != nil {
+			return err
+		}
+
+		// Fatal, and for the same reason verifyClusterIdentity above is: the
+		// failure it prevents produces confident wrong output rather than a
+		// count. A daemon predating the drift dispatch answers 200 to every
+		// record while turning it into a Warning Pod alert billed to the event
+		// watcher's ceiling, so the run reports full delivery and degrades the
+		// signal an on-call human already depends on. See VerifyKindSupported.
+		//
+		// Refusing to start, rather than falling back to log-only, because the
+		// two are indistinguishable in every later line and an operator who set
+		// --daemon-url asked for escalation. The error names dropping the flag
+		// as the way to get the degraded mode deliberately.
+		if err := inject.VerifyKindSupported(ctx, injectKindDrift); err != nil {
 			return err
 		}
 	}

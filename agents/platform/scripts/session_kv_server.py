@@ -342,8 +342,8 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 # budget for the others; `GET /v1/alert-quota` is where that shows up.
 
 # The bucket drift alerts are billed to, which is deliberately not the bucket
-# they are labelled with (see DRIFT_SEVERITY_LABEL, which is what they display
-# as). `_claim_alert_quota` keys the `alert_quota` table on the string it is
+# they are labelled with (see DRIFT_SEVERITY_LABEL, which is what the ledger
+# records them as). `_claim_alert_quota` keys the `alert_quota` table on the string it is
 # handed, so billing drift as "Warning" would spend the event watcher's budget
 # -- and the two traffic shapes are not comparable. One `kubectl apply -f
 # ./manifests/` touching six objects is six audit entries, six survivors of the
@@ -396,17 +396,52 @@ ALERT_DAILY_LIMITS = {
 # to dispatch.
 INJECT_KIND_DRIFT = "gitops-drift"
 
+# What `GET /healthz` advertises, so a producer can find out whether this daemon
+# understands its kind before it sends one.
+#
+# The dispatch above is an equality test, and a daemon that predates it has no
+# way to say so: the drift payload falls into the event path, where the defaults
+# turn it into a `Warning` Pod alert named `default/` for reason `Unknown`. That
+# bills the watcher's bucket -- the one DRIFT_QUOTA_KEY exists to stop drift
+# spending -- writes a ledger row the daily recap counts as a watcher event, and
+# still answers 200, so the producer records it delivered and never retries.
+# Silent at both ends, and one `kubectl apply` over six objects is six of them.
+#
+# The skew is not hypothetical: this script is copied to the shared PVC from the
+# agent image and the Go producers ship in their own images, so the two roll
+# independently. The event watcher hit the same class of problem and solved it
+# by negotiating (`X-Watcher-Features`); this is the same trade in the other
+# direction, because here it is the *producer* that has to know what the daemon
+# can do rather than the reverse.
+#
+# Advertised on the unauthenticated `/healthz` rather than behind the bearer
+# token so the probe is a precondition of starting, not a thing a producer
+# discovers only once it holds credentials. The absence of the key is the
+# signal: an old daemon returns `{"status": "ok"}` and nothing else, so a
+# producer that requires its kind here fails closed against one.
+#
+# Add a kind to this list only when the dispatch actually handles it. The
+# watcher's two are here because the event path is what "not drift" means, and
+# that is a real answer for them rather than a fallback.
+INJECT_KINDS_SUPPORTED = ["k8s-event", "k8s-event-followup", INJECT_KIND_DRIFT]
+
 # Drift is graded `Warning` rather than given a severity of its own, and this
 # is now a statement about wording alone. Display and billing were the same
 # string until DRIFT_QUOTA_KEY split them, because `_claim_alert_quota` keys the
 # `alert_quota` table on whatever it is handed; they are two decisions and this
 # constant is only the first of them.
 #
-# Drift is *displayed* as a Warning, so it sorts with the event watcher's
-# warnings in a channel that already carries them, and DRIFT_ALERT_EMOJI keeps
-# it distinguishable inside that sort. It is not *budgeted* as one: see
-# DRIFT_QUOTA_KEY for the bucket it bills, and for why sharing the watcher's
-# was worse than letting the two ceilings add up.
+# Drift is *recorded* as a Warning -- the `severity` column of its
+# `intercepted_events` row, and the `severity` field of the suppressed response
+# -- which puts it on the same scale as the event watcher's rows for anyone
+# querying the ledger across both. It reaches no reader directly: the chat
+# message is `{DRIFT_ALERT_EMOJI} **Drift:** ...` and never names a severity at
+# all, so changing this constant changes stored data and an API field, not
+# anything a human sees.
+#
+# It is not *budgeted* as a Warning either: see DRIFT_QUOTA_KEY for the bucket
+# it bills, and for why sharing the watcher's was worse than letting the two
+# ceilings add up.
 #
 # The cost of the ceiling is worth naming whichever bucket it comes from: a
 # spent budget silences drift for the rest of the day, and the detector has
@@ -731,9 +766,16 @@ def mark_delivery_failed(event_row_id: Optional[int], detail: str) -> None:
 
 
 @app.get("/healthz")
-def healthz() -> Dict[str, str]:
-    """Unauthenticated on purpose: it returns no data and gates the others."""
-    return {"status": "ok"}
+def healthz() -> Dict[str, Any]:
+    """Unauthenticated on purpose: it returns no data and gates the others.
+
+    `inject_kinds` is the exception to "returns no data", and it is here rather
+    than behind the token because a producer has to be able to check it before
+    it starts. See INJECT_KINDS_SUPPORTED for what a caller is expected to do
+    with it and why the key's absence is the interesting case. It names what
+    this route's dispatch understands, not what the daemon can do generally.
+    """
+    return {"status": "ok", "inject_kinds": INJECT_KINDS_SUPPORTED}
 
 
 @app.post("/sessions", status_code=201, dependencies=[Depends(verify_api_key)])

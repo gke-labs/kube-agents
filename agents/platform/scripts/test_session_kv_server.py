@@ -929,7 +929,37 @@ class TestSessionKvServerAuth(unittest.TestCase):
         os.environ.pop("SESSION_KV_API_KEY", None)
         response = self.client.get("/healthz")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok"})
+        self.assertEqual(response.json()["status"], "ok")
+
+    def test_healthz_advertises_the_inject_kinds_unauthenticated(self):
+        """The version-skew handshake, and it has to work without the key.
+
+        A producer checks this before it starts, which is before it has any
+        reason to believe its credentials are right; putting the advertisement
+        behind the bearer token would make the check something a caller can only
+        do once it is already configured to talk.
+        """
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        response = self.client.get("/healthz")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            session_kv_server.INJECT_KIND_DRIFT, response.json().get("inject_kinds", [])
+        )
+
+    def test_healthz_advertises_only_kinds_the_inject_route_handles(self):
+        """The advertisement is a promise, so nothing may be on it by accident.
+
+        A producer that finds its kind here starts and sends. If the dispatch
+        has no branch for that kind the payload falls into the event path, is
+        graded as a Warning Pod alert against the event watcher's ceiling, and
+        is still answered 200 -- the exact failure the handshake exists to stop,
+        arriving through the check that was supposed to prevent it. The event
+        watcher's two kinds are on the list because the event path is a real
+        answer for them rather than a fallback.
+        """
+        watcher_kinds = {"k8s-event", "k8s-event-followup"}
+        handled = watcher_kinds | {session_kv_server.INJECT_KIND_DRIFT}
+        self.assertEqual(set(session_kv_server.INJECT_KINDS_SUPPORTED), handled)
 
     def test_protected_routes_reject_a_missing_key(self):
         for method, path, body in self.PROTECTED_ROUTES:

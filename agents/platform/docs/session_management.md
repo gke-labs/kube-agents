@@ -43,7 +43,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 `inject_message` classifies severity (`get_severity_details`), applies the [severity gate](#severity-gate), and then spends one of that severity's daily allowance before anything is posted or any agent turn is started. This is the only place both actions pass through, and severity is not known any earlier — `POST /sessions` carries no payload.
 
-A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one it displays as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
+A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -94,8 +94,10 @@ What the drift branch does differently:
   informational tier to hold back — the detector's own classifier already dropped everything it
   judged to be automation rather than a person, upstream of this route. Every record that arrives
   here is graded `Warning`.
-- **It bills a bucket of its own,** `GitOpsDrift`, rather than the `Warning` one it displays as.
-  [The ceiling section](#daily-alert-ceiling) has the reasoning and what the split costs.
+- **It bills a bucket of its own,** `GitOpsDrift`, rather than the `Warning` one it is recorded as.
+  [The ceiling section](#daily-alert-ceiling) has the reasoning and what the split costs. The
+  `Warning` label reaches no reader: it is the `severity` column of the ledger row and a field of
+  the suppressed response, and the chat line names no severity at all.
 - **Its `suppressed` is terminal,** for the reason the bullet above gives.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of
   the fields describing it are chosen by that person: `fieldManager` is a free query parameter and
@@ -120,6 +122,29 @@ The detector reaches this server the same way the watcher does — over loopback
 `SESSION_KV_API_KEY` bearer token — which means it has to run inside this Pod's network namespace.
 No image builds or launches it today, so the inject has no in-cluster producer yet; the flag exists
 and the route accepts it.
+
+#### Asking whether the dispatch is there
+
+`GET /healthz` answers `inject_kinds`, the list of kinds the dispatch above understands, and the
+detector probes it at startup and refuses to run if `gitops-drift` is not on it.
+
+The dispatch is an equality test on `kind`, and a daemon predating it cannot say so: the drift
+payload falls into the event path, where the defaults render it as a `Warning` Pod alert named
+`default/` for reason `Unknown`. That bills the watcher's bucket rather than `GitOpsDrift`, writes a
+ledger row the daily recap counts as a watcher event, and still answers `200`, so the producer
+records it delivered and never retries. Silent at both ends, and one `kubectl apply` over six
+objects is six of them.
+
+The skew is an ordinary deployment window rather than a hypothetical: this script is copied to the
+shared PVC from the agent image while the Go producers ship in their own, so the two roll
+independently. The event watcher negotiates the same class of problem in the other direction with
+`X-Watcher-Features`.
+
+It is on the unauthenticated `/healthz` so the probe is a precondition of starting rather than
+something a producer discovers only once it holds credentials, and the key's _absence_ is the
+signal: an old daemon answers `{"status": "ok"}` and nothing else, so a producer that requires its
+kind fails closed against one. A kind goes on the list only when the dispatch actually handles it —
+the watcher's two are there because the event path is a real answer for them rather than a fallback.
 
 ---
 

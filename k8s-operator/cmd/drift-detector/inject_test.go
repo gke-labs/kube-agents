@@ -40,6 +40,16 @@ type fakeDaemon struct {
 	// injectBody is the JSON body answered to a successful inject.
 	injectBody string
 
+	// healthzStatus and healthzBody are what GET /healthz answers. Zero and
+	// empty mean 200 with a current daemon's advertisement, so a test that does
+	// not care about the handshake gets one that passes.
+	healthzStatus int
+	healthzBody   string
+
+	// healthzCalls counts the probes, which is what distinguishes a check that
+	// ran and passed from one that never ran at all.
+	healthzCalls int
+
 	// sessionCalls and injectCalls count the two endpoints. The session count is
 	// what proves a duplicate was suppressed before any work was done, rather
 	// than after a session had already been opened.
@@ -62,6 +72,26 @@ func newFakeDaemon(t *testing.T) (*fakeDaemon, string) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		d.headers = append(d.headers, r.Header.Clone())
+
+		// Before the suffix test, and by exact path: the fall-through at the
+		// bottom of this handler treats everything that is not an inject as a
+		// session create, so without a branch of its own a probe would be
+		// counted as one and answered with a session id.
+		if r.URL.Path == healthzPath {
+			d.healthzCalls++
+			if d.healthzStatus != 0 && d.healthzStatus != http.StatusOK {
+				w.WriteHeader(d.healthzStatus)
+				_, _ = w.Write([]byte("not well"))
+				return
+			}
+			body := d.healthzBody
+			if body == "" {
+				body = fmt.Sprintf(`{"status":"ok","inject_kinds":["k8s-event",%q]}`, injectKindDrift)
+			}
+			w.Header().Set(contentTypeHeader, contentTypeJSON)
+			_, _ = w.Write([]byte(body))
+			return
+		}
 
 		if strings.HasSuffix(r.URL.Path, injectPathSuffix) {
 			d.injectCalls++
@@ -582,12 +612,129 @@ func TestNewDriftInjectorRejectsABadEndpoint(t *testing.T) {
 		{"a scheme this client cannot speak", driftInjectorConfig{daemonURL: "ftp://daemon:8699", bearerToken: "t"}},
 		{"a scheme but no host", driftInjectorConfig{daemonURL: "http://", bearerToken: "t"}},
 		{"not a URL", driftInjectorConfig{daemonURL: "http://[", bearerToken: "t"}},
+		// Same failure shape as the scheme cases, by a different route: the
+		// endpoints are appended to this string rather than resolved against
+		// it, so a query or a fragment ends up in front of the path and every
+		// call reaches no route at all.
+		{"a query string", driftInjectorConfig{daemonURL: "http://daemon:8699?debug=1", bearerToken: "t"}},
+		{"a bare question mark", driftInjectorConfig{daemonURL: "http://daemon:8699?", bearerToken: "t"}},
+		{"a fragment", driftInjectorConfig{daemonURL: "http://daemon:8699#frag", bearerToken: "t"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := newDriftInjector(tc.cfg); err == nil {
 				t.Error("newDriftInjector accepted a configuration that cannot work")
 			}
 		})
+	}
+}
+
+// The handshake's happy path. Worth its own test mostly for the call count: a
+// VerifyKindSupported that returned nil without probing would pass every
+// negative case below too, because those all assert on an error that a
+// no-op would simply never produce.
+func TestVerifyKindSupportedAcceptsADaemonThatAdvertisesTheKind(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	inject, err := newDriftInjector(driftInjectorConfig{daemonURL: url, bearerToken: "t"})
+	if err != nil {
+		t.Fatalf("newDriftInjector returned error: %v", err)
+	}
+
+	if err := inject.VerifyKindSupported(context.Background(), injectKindDrift); err != nil {
+		t.Fatalf("VerifyKindSupported rejected a daemon advertising %q: %v", injectKindDrift, err)
+	}
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if daemon.healthzCalls != 1 {
+		t.Errorf("healthz calls = %d, want 1 -- the check has to actually ask", daemon.healthzCalls)
+	}
+	if daemon.sessionCalls != 0 || daemon.injectCalls != 0 {
+		t.Errorf("sessions=%d injects=%d, want 0 and 0 -- the probe must not open a session",
+			daemon.sessionCalls, daemon.injectCalls)
+	}
+}
+
+// Every way the probe can come back short has to be a refusal, and the first
+// case is the one that matters: a daemon predating the drift dispatch answers
+// 200 with no inject_kinds at all, and reading that silence as permission would
+// leave this binary sending drift down the daemon's event path -- graded a
+// Warning Pod alert against the event watcher's ceiling, and answered 200, so
+// nothing here or there would report it. Fail closed on all of them.
+func TestVerifyKindSupportedRefusesADaemonThatCannotConfirmTheKind(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"a daemon predating the advertisement", 0, `{"status":"ok"}`},
+		{"an empty kind list", 0, `{"status":"ok","inject_kinds":[]}`},
+		{"a null kind list", 0, `{"status":"ok","inject_kinds":null}`},
+		{"a daemon that handles only events", 0, `{"status":"ok","inject_kinds":["k8s-event"]}`},
+		{"a body that is not JSON", 0, `not json`},
+		{"a kind list of the wrong type", 0, `{"status":"ok","inject_kinds":"gitops-drift"}`},
+		{"an unhealthy daemon", http.StatusServiceUnavailable, ""},
+		{"a route the daemon does not have", http.StatusNotFound, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			daemon, url := newFakeDaemon(t)
+			daemon.healthzStatus = tc.status
+			daemon.healthzBody = tc.body
+
+			inject, err := newDriftInjector(driftInjectorConfig{daemonURL: url, bearerToken: "t"})
+			if err != nil {
+				t.Fatalf("newDriftInjector returned error: %v", err)
+			}
+			if err := inject.VerifyKindSupported(context.Background(), injectKindDrift); err == nil {
+				t.Error("VerifyKindSupported accepted a daemon that never confirmed the kind")
+			}
+		})
+	}
+}
+
+// The check is worth nothing unless startup runs it, and the two tests above
+// would pass just as happily with the call deleted from realMain. This is the
+// wiring: a daemon that answers /healthz the way a pre-dispatch one does has to
+// stop the process before it reaches the subscription, because past that point
+// every record it sends is reported delivered and silently mis-graded.
+func TestRealMainRefusesToStartAgainstADaemonThatCannotTakeDrift(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	daemon.healthzBody = `{"status":"ok"}`
+	t.Setenv("DRIFT_DAEMON_TOKEN", "token-value")
+
+	err := realMain([]string{
+		"--project", "example-project",
+		"--daemon-url", url,
+		"--token-env", "DRIFT_DAEMON_TOKEN",
+	})
+	if err == nil {
+		t.Fatal("realMain started against a daemon that does not understand the drift kind")
+	}
+	// Naming the kind is the whole diagnostic: the operator has to be able to
+	// tell this apart from the daemon being down, which is the other way a
+	// startup probe fails and has an entirely different fix.
+	if !strings.Contains(err.Error(), injectKindDrift) {
+		t.Errorf("error = %q, want it to name %q", err, injectKindDrift)
+	}
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if daemon.healthzCalls != 1 {
+		t.Errorf("healthz calls = %d, want 1 -- startup has to probe, not assume", daemon.healthzCalls)
+	}
+}
+
+// An unreachable daemon is the same refusal as an old one. Separate from the
+// table above because there is no server to configure: the failure is in the
+// round trip rather than in the reply.
+func TestVerifyKindSupportedRefusesAnUnreachableDaemon(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	inject, err := newDriftInjector(driftInjectorConfig{daemonURL: url, bearerToken: "t"})
+	if err != nil {
+		t.Fatalf("newDriftInjector returned error: %v", err)
+	}
+	if err := inject.VerifyKindSupported(context.Background(), injectKindDrift); err == nil {
+		t.Error("VerifyKindSupported accepted a daemon it could not reach")
 	}
 }
 

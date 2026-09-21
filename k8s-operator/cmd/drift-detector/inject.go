@@ -24,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -46,6 +47,12 @@ const (
 	// suffix carries its own leading slash and the id does not.
 	sessionsPath     = "/sessions"
 	injectPathSuffix = "/inject"
+
+	// healthzPath is the daemon's unauthenticated liveness endpoint, and also
+	// where it advertises the inject kinds its dispatch understands. See
+	// VerifyKindSupported for why this binary refuses to start when the kind it
+	// sends is not on that list.
+	healthzPath = "/healthz"
 
 	// The headers the daemon reads. Authorization carries the same bearer token
 	// the event watcher uses; X-Asserted-Caller is how the daemon attributes the
@@ -120,11 +127,19 @@ const (
 	// perRecordInjectBudget caps what one record's escalation may spend. The
 	// handler's context is the batch's shared join budget -- thirty seconds by
 	// default, for up to a hundred records -- and without a sub-budget a single
-	// unresponsive daemon spends all of it on the first survivor: both calls
-	// time out at defaultInjectTimeout, the retry adds two more, and the
-	// arithmetic exceeds the whole batch's allowance before record two is
-	// reached. Every record behind it then fails its lookup on an expired
-	// context and is acked anyway, so one slow dependency costs the batch its
+	// unresponsive daemon spends most or all of it on the first survivor.
+	//
+	// How much depends on where it stalls, and the two are further apart than
+	// they look. A daemon that answers neither call costs one defaultInjectTimeout
+	// per attempt and never reaches Inject, so two attempts and injectRetryDelay
+	// is 20.25s: two thirds of the batch, not all of it. The worst case is a
+	// daemon that answers CreateSession just inside its timeout and then hangs
+	// Inject, which pays both ceilings on both attempts and approaches 40s. Only
+	// that shape exceeds the batch's whole allowance; the ordinary hang merely
+	// leaves too little of it for the ninety-nine records behind.
+	//
+	// Either way those records then fail their lookups on a context at or near
+	// expiry and are acked anyway, so one slow dependency costs the batch its
 	// escalations and its joins together.
 	//
 	// Five seconds is a ceiling, not a target: a healthy daemon answers both
@@ -296,6 +311,16 @@ func newDriftInjector(cfg driftInjectorConfig) (*driftInjector, error) {
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("inject: daemonURL has no host (got %q)", cfg.daemonURL)
 	}
+	// The endpoints are composed by concatenation, not by url.ResolveReference,
+	// so anything after the path is appended to rather than replaced: a base of
+	// "http://host:8699?x=1" yields "http://host:8699?x=1/sessions", whose path
+	// is empty and whose query is nonsense. That reaches no route on the daemon
+	// and every call fails for the life of the process, which is the same
+	// failure shape the scheme check above exists to catch at startup.
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return nil, fmt.Errorf("inject: daemonURL must carry no query or fragment (got %q); "+
+			"the endpoint paths are appended to it", cfg.daemonURL)
+	}
 	if cfg.bearerToken == "" {
 		return nil, errors.New("inject: bearerToken is required")
 	}
@@ -322,6 +347,78 @@ type injectMessageRequest struct {
 // injectResponse is the daemon's reply to an accepted inject.
 type injectResponse struct {
 	Status string `json:"status"`
+}
+
+// healthzResponse is the daemon's reply to GET /healthz. InjectKinds is what a
+// current daemon advertises its inject dispatch as understanding; a daemon
+// predating that advertisement omits the field, which is the case
+// VerifyKindSupported exists to catch, so the nil and the empty slice mean the
+// same thing here and neither is distinguished from the other.
+type healthzResponse struct {
+	InjectKinds []string `json:"inject_kinds"`
+}
+
+// VerifyKindSupported refuses to run against a daemon that does not understand
+// the kind this binary sends.
+//
+// The dispatch on the daemon's side is an equality test on the payload's `kind`
+// and there is nothing in a reply that reveals whether it ran. Against a daemon
+// predating it, a drift payload takes the event path instead, where the
+// defaults grade it `Warning` and render it as a Pod alert for `default/`
+// naming reason `Unknown`: it bills the event watcher's ceiling, which is the
+// bucket DRIFT_QUOTA_KEY exists to keep drift out of, writes a ledger row the
+// daily recap counts as a watcher event, and answers 200. Inject then reports
+// success, the record is counted injected and its insertId marked seen, and
+// nothing anywhere names the skew. One multi-object apply is six such alerts,
+// which is the watcher's whole default budget for the day.
+//
+// The two halves roll independently -- the daemon script is copied to the
+// shared PVC from the agent image, this binary ships in its own -- so the skew
+// is an ordinary deployment window rather than a misconfiguration. The event
+// watcher negotiates the mirror-image problem with X-Watcher-Features; this is
+// the same trade with the roles reversed, and it is a startup check rather than
+// a per-record one because the answer cannot change under a running process
+// without the daemon restarting anyway.
+//
+// Fails closed: an unreachable daemon, an unparseable body, and a reply with no
+// inject_kinds at all are all refusals. The last is the one that matters, and
+// treating a missing field as permission would defeat the check, because a
+// daemon old enough to mishandle the payload is exactly the one that omits it.
+func (i *driftInjector) VerifyKindSupported(ctx context.Context, kind string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, i.cfg.daemonURL+healthzPath, nil)
+	if err != nil {
+		return fmt.Errorf("inject: build GET %s: %w", healthzPath, err)
+	}
+
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("inject: GET %s: %w", healthzPath, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
+		return &injectHTTPError{status: resp.StatusCode, body: string(body), call: "GET " + healthzPath}
+	}
+
+	var parsed healthzResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return fmt.Errorf("inject: decode GET %s response: %w", healthzPath, err)
+	}
+
+	if slices.Contains(parsed.InjectKinds, kind) {
+		return nil
+	}
+
+	if len(parsed.InjectKinds) == 0 {
+		return fmt.Errorf("inject: the daemon at %s advertises no inject kinds, so it predates the %q dispatch: "+
+			"every record sent to it would be graded as a Warning Pod event against the event watcher's ceiling "+
+			"and reported back as delivered. Upgrade the agent image, or drop --daemon-url to log drift without "+
+			"escalating it", i.cfg.daemonURL, kind)
+	}
+	return fmt.Errorf("inject: the daemon at %s does not handle %q (it advertises %v), so every record sent to it "+
+		"would take its event path and be reported back as delivered. Upgrade the agent image, or drop "+
+		"--daemon-url to log drift without escalating it", i.cfg.daemonURL, kind, parsed.InjectKinds)
 }
 
 // CreateSession opens a session for one drift event and returns its id.

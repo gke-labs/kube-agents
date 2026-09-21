@@ -339,9 +339,13 @@ func (p *pubsubSource) Nack(ctx context.Context, ackIDs []string) error {
 // -- which the join does, one lookup per forwarded record -- is interrupted by
 // SIGTERM rather than holding shutdown open for its timeout. It is deliberately
 // not the settle context: an in-flight lookup abandoned at shutdown leaves its
-// message acked and its drift unreported, which matches what realMain already
-// documents about an interrupted batch, and is preferable to delaying the ack of
-// every other message in the batch behind it.
+// message acked and its drift unreported, which is preferable to delaying the
+// ack of every other message in the batch behind it.
+//
+// That loss is confined to the one record the handler was inside. Every record
+// the loop had not reached is nacked instead and redelivered to the next
+// instance -- the ctx.Err() branch in processBatch below, and the shutdown
+// comment on realMain's signal context, which describe that half.
 //
 // Derived rather than passed through, because processBatch also puts the batch's
 // join budget on it. A handler is therefore cut short by whichever comes first,
