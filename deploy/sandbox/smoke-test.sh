@@ -469,7 +469,102 @@ check "and so does the profiles directory itself" "home=[/opt/data] kc=[]" \
 # GitOps skills make outside the credential proxy's workspace root.
 check "PLATFORM_AGENT_HOME is not narrowed with it" "data=[/opt/data]" \
   "$(hermes_ssh "$CP" 'echo "data=[$PLATFORM_AGENT_HOME]"' 2>&1)"
-"${SSH[@]}" "rm -rf $CP /opt/data/scratch/smoke-$$" >/dev/null 2>&1
+
+# The shape the dispatcher actually produces, which none of the cases above
+# reach: a card's scratch workspace on the default board is
+# `<root>/kanban/workspaces/<id>`, under no profile home, so the cwd says
+# nothing about which profile is speaking. A Cluster Agent card kept the root,
+# its preflight read the default profile's USER.md, and it blocked on every
+# dispatch. The agent image's ssh client now names the profile on every
+# connection (deploy/docker/ssh_config.d/10-sandbox-profile-home.conf). This
+# half drives the sandbox's side of that from the runner's own client, with the
+# value spelled out through -o SetEnv. It cannot use the drop-in itself: the
+# runner's OpenSSH (9.6 on ubuntu-24.04) leaves ${HERMES_HOME} unexpanded in a
+# SetEnv, where the agent image's 10.0 expands it, so the drop-in is driven from
+# the agent image in 4f below.
+hermes_ssh_named() { # hermes_ssh_named <HERMES_PROFILE_HOME> <cwd-word> <command>
+  local script quoted
+  script=$(printf 'builtin cd -- %s || exit 126\neval %s\n__hermes_ec=$?\nexit $__hermes_ec' \
+    "$2" "'$3'")
+  quoted=${script//\'/\'\"\'\"\'}
+  ssh "${SSH_OPTS[@]}" -o "SetEnv=HERMES_PROFILE_HOME=$1" agent@127.0.0.1 "bash -c '$quoted'"
+}
+SWS="/opt/data/kanban/workspaces/t_5eeded04"
+check "a shared-root workspace alone leaves the root, which is the gap" "home=[/opt/data]" \
+  "$(hermes_ssh "$SWS" 'echo "home=[$HERMES_HOME]"' 2>&1)"
+check "the profile the client names narrows it, kubeconfig and kanban variables with it" \
+  "home=[$CP] kc=[$CP/kubeconfig.yaml] ws=[$SWS]" \
+  "$(hermes_ssh_named "$CP" "$SWS" 'echo "home=[$HERMES_HOME] kc=[$KUBECONFIG] ws=[$HERMES_KANBAN_WORKSPACE]"' 2>&1)"
+# The two pods' data roots are different volumes that happen to share a path,
+# so the value is read as a name and rebased onto this one.
+check "a home under another root is rebased by name" "home=[$CP]" \
+  "$(hermes_ssh_named /mnt/agent-data/profiles/cluster-smoke "$SWS" 'echo "home=[$HERMES_HOME]"' 2>&1)"
+check "the client's name beats a cwd under another profile" "home=[$CP]" \
+  "$(hermes_ssh_named "$CP" "$PP/kanban/workspaces/t_5eeded05" 'echo "home=[$HERMES_HOME]"' 2>&1)"
+# A worker on the default profile sends the root. Not a profile and not an
+# error: the root is what that worker wants.
+root_named=$(hermes_ssh_named /opt/data "$SWS" 'echo "home=[$HERMES_HOME]"' 2>&1)
+check "the root itself names no profile" "home=[/opt/data]" "$root_named"
+check_absent "and is not remarked on" "sandbox-session-command:" "$root_named"
+# A profile the agent pod has and this volume does not yet. The mirror runs on
+# the agent pod's start and when a profile is scaffolded, and a card dispatched
+# inside that window has to say why its preflight is about to read the wrong tree.
+unmirrored=$(hermes_ssh_named /opt/data/profiles/cluster-absent "$SWS" 'echo "home=[$HERMES_HOME]"' 2>&1)
+check "a profile not mirrored yet falls back to the working directory" "home=[/opt/data]" "$unmirrored"
+check "and says so" "profile cluster-absent is not mirrored into the sandbox yet" "$unmirrored"
+# The client picks among the homes this volume has, and nothing else.
+check "a traversal in the name is refused" "home=[/opt/data]" \
+  "$(hermes_ssh_named /opt/data/profiles/.. "$SWS" 'echo "home=[$HERMES_HOME]"' 2>&1)"
+check "and so is a name with a slash in it" "home=[/opt/data]" \
+  "$(hermes_ssh_named /opt/data/profiles/../../etc "$SWS" 'echo "home=[$HERMES_HOME]"' 2>&1)"
+# An AcceptEnv inside a Match block replaces the global list rather than adding
+# to it, so the agent's block restates the locale or loses it.
+check "the agent account still accepts the locale" "lang=[C.smoke]" \
+  "$(ssh "${SSH_OPTS[@]}" -o SetEnv=LANG=C.smoke agent@127.0.0.1 'echo "lang=[$LANG]"' 2>&1)"
+check "the hermes account is not offered the profile home" "named=[]" \
+  "$(ssh "${SSH_OPTS[@]}" -o "SetEnv=HERMES_PROFILE_HOME=$CP" hermes@127.0.0.1 'echo "named=[$HERMES_PROFILE_HOME]"' 2>&1)"
+
+echo
+echo "== 4f. the agent image's own client names the profile =="
+# The other half: the drop-in as the agent image carries it, through the ssh
+# client the agent image carries, against this sandbox. docker-build.yml builds
+# the platform image with load: true before it reaches this script, so the
+# image is in the daemon there; elsewhere the section says it skipped rather
+# than failing a run that has nothing to do with the agent image. --add-host
+# gives the sandbox the name the operator would give it, because the drop-in
+# matches on that name and a Hostname rewrite in a client config would defeat
+# it: `Match host` sees the name after Hostname substitution. --network host
+# reaches the published port the way the runner's own client does, and the key
+# travels on stdin rather than a bind mount, so nothing on the host has to be
+# readable by the image's uid.
+AGENT_IMAGE="${AGENT_IMAGE:-platform-agent:latest}"
+SANDBOX_ALIAS=smoke-shell-0.smoke-shell.smoke.svc.cluster.local
+if docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1; then
+  agent_ssh() { # agent_ssh <HERMES_HOME for the client, empty for unset> <host> <command>
+    docker run --rm -i --network host --add-host "$SANDBOX_ALIAS:127.0.0.1" \
+      -e "SMOKE_HERMES_HOME=$1" --entrypoint sh "$AGENT_IMAGE" -c '
+        umask 077 && mkdir -p /tmp/smoke && cat >/tmp/smoke/id || exit 1
+        if [ -n "$SMOKE_HERMES_HOME" ]; then export HERMES_HOME=$SMOKE_HERMES_HOME; else unset HERMES_HOME; fi
+        exec ssh -n -i /tmp/smoke/id -p "$0" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=DEBUG1 \
+          "agent@$1" "$2"' "$PORT" "$2" "$3" <"$WORK/id"
+  }
+  # The client's debug log is the only place it says what it sent, and it prints
+  # the value it expanded: an older client that sent the literal ${HERMES_HOME}
+  # fails this line rather than passing it by accident.
+  named=$(agent_ssh "$CP" "$SANDBOX_ALIAS" 'echo "home=[$HERMES_HOME] named=[$HERMES_PROFILE_HOME]"' 2>&1)
+  check "the drop-in sends the worker's HERMES_HOME" "setting env HERMES_PROFILE_HOME = \"$CP\"" "$named"
+  check "and the session narrows to it" "home=[$CP] named=[$CP]" "$named"
+  unset_out=$(agent_ssh "" "$SANDBOX_ALIAS" 'echo "home=[$HERMES_HOME] named=[$HERMES_PROFILE_HOME]"' 2>&1)
+  check_absent "an unset HERMES_HOME sends nothing" "setting env HERMES_PROFILE_HOME" "$unset_out"
+  check "and still connects" "home=[/opt/data] named=[]" "$unset_out"
+  elsewhere=$(agent_ssh "$CP" 127.0.0.1 'echo "named=[$HERMES_PROFILE_HOME]"' 2>&1)
+  check_absent "a host that is not a sandbox is sent nothing" "setting env HERMES_PROFILE_HOME" "$elsewhere"
+  check "and still connects" "named=[]" "$elsewhere"
+else
+  echo "SKIP  $AGENT_IMAGE is not loaded; docker-build.yml loads it before this script and runs these there"
+fi
+"${SSH[@]}" "rm -rf $CP $SWS $PP/kanban /opt/data/scratch/smoke-$$" >/dev/null 2>&1
 
 echo
 echo "== 5. credential-proxy wrappers =="
