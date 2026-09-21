@@ -620,7 +620,9 @@ class DeleteProfileTest(unittest.TestCase):
     @mock.patch("subprocess.run")
     @mock.patch("sandbox_exec.sandbox_enabled", return_value=True)
     @mock.patch("sandbox_exec.run")
-    def test_delete_profile_removes_home_and_cleans_sandbox(self, mock_sbox_run, mock_sbox_enabled, mock_sub_run):
+    def test_delete_profile_removes_agent_home_and_leaves_sandbox_intact(
+        self, mock_sbox_run, mock_sbox_enabled, mock_sub_run
+    ):
         home = self.tmp / "cluster-target"
         home.mkdir()
         (home / "USER.md").write_text("identity")
@@ -629,12 +631,10 @@ class DeleteProfileTest(unittest.TestCase):
 
         self.assertFalse(home.exists())
         mock_sub_run.assert_called_once()
-        mock_sbox_run.assert_called_once_with(
-            ["rm", "-rf", "/opt/data/profiles/cluster-target"],
-            check=True,
-            timeout=15,
-            principal=sandbox_exec.TERMINAL_PRINCIPAL,
-        )
+        # Pruning the profile from the agent pod must NOT delete the profile directory
+        # on the sandbox volume, which would remove kubeconfig.yaml out from under an
+        # in-flight Cluster Agent worker and cause kubectl to fall back to the management cluster.
+        mock_sbox_run.assert_not_called()
 
 
 class SandboxStubTest(unittest.TestCase):

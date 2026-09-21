@@ -37,8 +37,6 @@ ENV_PLATFORM_AGENT_HOME = "PLATFORM_AGENT_HOME"
 ENV_HERMES_HOME = "HERMES_HOME"
 DEFAULT_DATA_ROOT = Path("/opt/data")
 PROFILES_DIR_NAME = "profiles"
-SANDBOX_PROFILES_BASE = Path(sandbox_exec.DEFAULT_SANDBOX_CWD) / PROFILES_DIR_NAME
-SANDBOX_CLEANUP_TIMEOUT_SECONDS = 15
 
 
 def _resolve_data_root() -> Path:
@@ -503,16 +501,6 @@ def delete_profile(name: str) -> None:
         log(f"'hermes profile delete {name}' failed (continuing to clean up home): {e}")
     if home.exists():
         shutil.rmtree(home, ignore_errors=True)
-    if sandbox_exec.sandbox_enabled():
-        try:
-            sandbox_exec.run(
-                ["rm", "-rf", str(SANDBOX_PROFILES_BASE / name)],
-                check=True,
-                timeout=SANDBOX_CLEANUP_TIMEOUT_SECONDS,
-                principal=sandbox_exec.TERMINAL_PRINCIPAL,
-            )
-        except Exception as e:  # noqa: BLE001
-            log(f"sandbox cleanup of profile {name} skipped: {e}")
 
 
 def list_profiles(include_incomplete: bool = False) -> list[str]:
