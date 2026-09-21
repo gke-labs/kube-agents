@@ -423,11 +423,88 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         rollout_idx = text.index('rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=900s')
         self.assertLess(confirm_idx, rollout_idx)
 
+    def test_the_harness_retag_carries_the_plugin_image_keys(self):
+        """The plugin init containers are the image check's business too.
+
+        Re-tagging the agent and sandbox alone left pubsub-platform and
+        gke-stockout-investigator on the previous tag, and the post-upgrade
+        image check refused (#1808).
+        """
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        harness = text[text.index("    harness)") : text.index("    full)")]
+        self.assertIn("recorded_plugin_image_tag_keys", harness)
+        self.assertIn('helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"', harness)
+        self.assertIn('${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}', harness)
+        self.assertNotIn("mapfile", harness, "macOS ships bash 3.2, which has no mapfile")
+
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         self.assertIn('[ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]', text)
         self.assertIn('kubectl get deployment "$PLATFORM_AGENT_DEPLOYMENT" -n "$target_namespace"', text)
 
+
+
+class RecordedPluginImageTagKeysTest(unittest.TestCase):
+    """recorded_plugin_image_tag_keys against a stub helm, under the system bash."""
+
+    def _run(self, values_json, helm_exit=0):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bin_dir = pathlib.Path(tmp.name) / "bin"
+        bin_dir.mkdir()
+        helm = bin_dir / "helm"
+        helm.write_text(f"#!/usr/bin/env bash\ncat <<'JSON'\n{values_json}\nJSON\nexit {helm_exit}\n")
+        helm.chmod(0o755)
+        # The ERR trap upgrade.sh installs, so a failure inside the function's
+        # substitutions would print the abort banner the way a real run does.
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
+recorded_plugin_image_tag_keys kube-agents kubeagents-system
+echo "rc=$?"
+"""
+        env = get_isolated_test_env()
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        return subprocess.run(["bash", "-c", setup], capture_output=True, text=True, env=env)
+
+    def test_every_plugin_tag_the_release_records_is_printed(self):
+        proc = self._run(
+            '{"plugins":{"pubsubPlatform":{"enabled":false,"image":{"tag":"abc"}},'
+            '"stockoutInvestigator":{"image":{"tag":"abc"}},'
+            '"aThirdPlugin":{"image":{"tag":"abc"}}}}'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.split()[:-1],
+            [
+                "plugins.pubsubPlatform.image.tag",
+                "plugins.stockoutInvestigator.image.tag",
+                "plugins.aThirdPlugin.image.tag",
+            ],
+        )
+
+    def test_a_plugin_without_a_recorded_tag_is_left_out(self):
+        proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"enabled":false}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split()[:-1], ["plugins.pubsubPlatform.image.tag"])
+
+    def test_nothing_without_recorded_plugins(self):
+        proc = self._run('{"operator":{"image":{"tag":"abc"}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["rc=0"])
+
+    def test_a_malformed_plugins_value_yields_nothing_and_no_banner(self):
+        proc = self._run('{"plugins":"oops"}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["rc=0"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
+    def test_a_failing_helm_read_yields_nothing_and_no_banner(self):
+        """On bash 3.2 the inherited ERR trap fires inside $(...) unless dropped there."""
+        proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}}}}', helm_exit=1)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["rc=0"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
 
 
 if __name__ == "__main__":

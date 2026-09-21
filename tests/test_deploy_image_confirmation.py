@@ -156,8 +156,15 @@ class _StubKubectl:
                 """
             )
         else:
+            # Refuse a template read that does not ask for image volumes, so the
+            # tests below go red if the range is dropped rather than passing on
+            # a listing the stub would print whatever it was asked.
             template_branch = textwrap.dedent(
                 f"""\
+                if [[ "$*" != *'volumes[*]}}{{.name}}={{.image.reference}}'* ]]; then
+                  echo 'stub kubectl: the template read does not cover image volumes' >&2
+                  exit 1
+                fi
                 count_file="{stub_dir}/calls"
                 count=$(cat "$count_file" 2>/dev/null || echo 0)
                 echo $((count + 1)) >"$count_file"
@@ -243,6 +250,42 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("3 release image", result.stdout)
+
+    def test_it_fails_when_a_plugin_image_volume_is_on_an_older_tag(self):
+        """On a cluster with ImageVolumeSource the plugin image is a volume.
+
+        The reference lives under .volumes[].image, not in a container, and a
+        re-tag that left it behind is the same defect as a stale init
+        container (#1808).
+        """
+        result = self._run(
+            f"""
+            sandbox-credential-cleanup={_GHCR}/platform-agent:{_TAG}
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
+            platform-agent-data-vol=
+            plugin-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            """,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
+        self.assertIn("Only plugin images are off the tag", result.stdout)
+        self.assertIn("--set plugins.<name>.image.tag", result.stdout)
+
+    def test_a_volume_without_an_image_reference_is_not_counted(self):
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            platform-agent-data-vol=
+            tmp-scratch=
+            """,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 release image(s)", result.stdout)
+
+    def test_the_template_read_covers_image_volumes(self):
+        text = _SCRIPT.read_text()
+        self.assertIn("{range .spec.template.spec.volumes[*]}{.name}={.image.reference}", text)
 
     def test_it_fails_when_the_agent_is_pinned_to_an_older_tag(self):
         # spec.deployment.image pinned to a full reference, so the tag the

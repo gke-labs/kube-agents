@@ -334,6 +334,26 @@ matches_release_bundle_ref() {
   return 1
 }
 
+# Prints, one per line, the Helm keys of the plugin image tags the release's
+# user-supplied values record (`plugins.<name>.image.tag`), for the harness
+# step to re-tag with the agent and sandbox tags. Read from the recorded values
+# rather than from the enabled flags because the composition records the tag
+# for a disabled plugin too; derived from the values rather than from a list of
+# plugin names so that a plugin added to the chart and the composition is
+# covered without a change here. The chart the keys are applied to is pinned to
+# this script's commit by the source check, so its `plugins` block matches.
+# `trap - ERR` inside the substitutions: on bash 3.2 the inherited ERR trap
+# fires inside `$(...)` even when the assignment is guarded, and would print
+# the abort banner mid-run for a failure that is handled here. Arguments:
+# release, namespace.
+recorded_plugin_image_tag_keys() {
+  local release="$1" namespace="$2" values keys
+  values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>/dev/null)" || return 0
+  [ -n "$values" ] || return 0
+  keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else empty end' <<<"$values" 2>/dev/null)" || return 0
+  [ -z "$keys" ] || printf '%s\n' "$keys"
+}
+
 # The two refusals that do not need a ref to make sense: an unversioned source
 # directory, and a dirty one. Split out of verify_local_source_ref because a
 # tagless run still applies this checkout's Terraform and charts to a live
@@ -580,6 +600,12 @@ main() {
   print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
 
   local required_tools=(gcloud kubectl helm)
+  # jq: the harness step's plugin re-tag reads the release's values with it,
+  # and the post-upgrade image check that harness and full modes run has
+  # needed it all along. The operator step does neither.
+  if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then
+    required_tools+=(jq)
+  fi
   if [ "$PARAM_UPGRADE_MODE" = "full" ]; then
     required_tools+=(terraform)
   fi
@@ -882,7 +908,19 @@ main() {
       # at the same commit, and the shell the agent reaches over ssh is the
       # half that runs the new tools. Retagging the agent alone leaves the
       # StatefulSet on the previous image.
-      helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"
+      # The plugin images move with them for the same reason, when the
+      # release records them: the operator renders them into the gateway as
+      # stage-<plugin> init containers or plugin-<name> image volumes, and
+      # the image check below reads both.
+      # A read loop rather than the bash 4 array builtin, and the `+`
+      # expansion for the empty case: operators run this from macOS, whose
+      # bash is 3.2.
+      local plugin_tag_keys=() plugin_tag_key
+      while IFS= read -r plugin_tag_key; do
+        [ -n "$plugin_tag_key" ] && plugin_tag_keys+=("$plugin_tag_key")
+      done < <(recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")
+      helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag" \
+        ${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 

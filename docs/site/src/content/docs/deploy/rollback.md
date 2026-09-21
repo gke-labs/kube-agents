@@ -28,8 +28,13 @@ kubectl get deployment platform-agent-gateway -n kubeagents-system \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="platform-agent")].image}{"\n"}'
 kubectl get deployment kube-agents-controller-manager -n kubeagents-system \
   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+kubectl get deployment platform-agent-gateway -n kubeagents-system \
+  -o jsonpath='{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.template.spec.volumes[*]}{.image.reference}{"\n"}{end}'
 helm history kube-agents -n kubeagents-system
 ```
+
+The third command lists the plugin images, as `stage-<plugin>` init containers or `plugin-<name>`
+image volumes depending on the cluster; it prints nothing when no plugin is enabled.
 
 Get `N-1`'s sources. Either a clean checkout of the tag or the release bundle passes the
 source check:
@@ -75,7 +80,8 @@ operator then reconciles the `PlatformAgent` from `N-1`'s schema, and its first 
 the agent Deployment with `N-1`'s spec, rolling the pod wherever that spec differs, still on `N`'s
 image, because the agent tag in the release's values has not moved yet. The harness step is a
 second `helm upgrade` with the same chart re-tagging the agent image (on releases that ship the
-shell sandbox, the sandbox image with it), followed by a wait for the rollout. Operator first
+shell sandbox, the sandbox image with it, and from the first release after `0.6.0` the plugin
+images the release records), followed by a wait for the rollout. Operator first
 because the CRD schema and the controller have to agree before the agent the controller renders
 is replaced. Between the two commands `N`'s agent image runs under `N-1`'s Deployment spec,
 without whatever `N`'s operator had added to it, which is why the pair is run back to back rather
@@ -84,7 +90,9 @@ than a step at a time.
 Each step's `helm upgrade` waits up to ten minutes for the objects the chart renders, the
 controller Deployment among them. A timeout there leaves the release `failed`, which the next run
 does not un-stick on its own: the current script un-sticks a `pending-*` release alone, and
-`0.4.0`'s un-sticks nothing. After Helm returns, the script waits with `kubectl rollout status`
+`0.4.0`'s un-sticks nothing. After Helm returns, the script first reads the gateway Deployment's
+release images back against the tag and fails the step on any still on `N` (from `0.5.0`; the
+current script reads plugin image volumes too), then waits with `kubectl rollout status`
 for the rollouts the chart does not cover, the agent Deployment first, and those waits are
 `N-1`'s: the current script gives the agent fifteen minutes in the namespace `install.env` names,
 while `0.4.0`'s gives it two minutes in `kubeagents-system` whatever `NAMESPACE` says. So on a
@@ -101,7 +109,22 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
 ## What the two steps change
 
 - The Helm release: `N-1`'s chart version, two new revisions in `helm history`.
-- The operator and agent images, at tag `N-1`; the sandbox image too when `N-1`'s chart has it.
+- The operator and agent images, at tag `N-1`; the sandbox image too when `N-1`'s chart has it,
+  and the plugin images when `N-1`'s script is from after `0.6.0`. `0.4.0`, `0.5.0` and `0.6.0`
+  all leave the plugin images on `N`'s tag. With a plugin enabled, `0.5.0`'s and `0.6.0`'s image
+  check then refuses where the plugin is staged by an init container (GKE Autopilot, and Standard
+  below 1.35), with both Helm moves already made; where it is mounted as an image volume the check
+  does not read it and passes, and `0.4.0` has no check. In every case, finish that rollback from
+  the `N-1` checkout by re-tagging the two plugin keys by hand (`--reuse-values` for `0.4.0`, to
+  match its script):
+
+  ```bash
+  helm upgrade kube-agents charts/kube-agents -n kubeagents-system --reset-then-reuse-values \
+    --set plugins.pubsubPlatform.image.tag=<N-1> \
+    --set plugins.stockoutInvestigator.image.tag=<N-1>
+  kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system
+  ```
+
 - The CRD schema, now `N-1`'s.
 - Every object the chart renders, including the `PlatformAgent` resource, re-rendered from
   `N-1`'s templates. Objects `N`'s chart rendered and `N-1`'s does not are deleted by the upgrade;
@@ -195,11 +218,15 @@ kubectl get deployment kube-agents-controller-manager -n kubeagents-system \
   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
 kubectl get platformagent platform-agent -n kubeagents-system \
   -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+kubectl get deployment platform-agent-gateway -n kubeagents-system \
+  -o jsonpath='{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.template.spec.volumes[*]}{.image.reference}{"\n"}{end}'
 kubectl get pods -n kubeagents-system
 helm history kube-agents -n kubeagents-system
 ```
 
-Both images end in `:<N-1>`, the `Ready` condition reads `True`, the gateway pod is `Running`,
+Both images end in `:<N-1>`, so does every plugin image the third command lists (a `stage-<plugin>`
+init container or a `plugin-<name>` image volume, depending on the cluster; nothing listed means no
+plugin is enabled), the `Ready` condition reads `True`, the gateway pod is `Running`,
 and the newest Helm revision is `deployed` at chart version `N-1`, with the operator step's
 revision `superseded` just before it. `kubeagents-system` is the default namespace; an install
 that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the chart's default
@@ -228,8 +255,8 @@ so the release itself keeps its last revision.
   flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
   full mode does, because its Helm release renders from the composition's values rather than the
   recorded ones (the section above), at the price of a GCP-level apply and the plan read that
-  goes before it. The one pair published today, `0.5.0` to `0.4.0`, is not affected: `0.4.0`'s
-  chart has no schema.
+  goes before it. Neither pair published today is affected: neither `0.4.0`'s nor `0.5.0`'s
+  chart has a schema.
 - **`N`'s operator owns an object that `N-1`'s chart renders.** Helm refuses to adopt an object
   that carries another manager's ownership labels (`exists and cannot be imported into the
 current release: invalid ownership metadata`). The `litellm-policy` NetworkPolicy is the case

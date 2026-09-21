@@ -37,7 +37,9 @@
 # Every release image in the template is checked, not just the agent
 # container's. The operator renders the agent container, the
 # sandbox-credential-cleanup init container, the platform-agent-dashboard
-# container (on by default), and the agent-api-auth sidecar. The credential
+# container (on by default), the agent-api-auth sidecar and, for each enabled
+# AgentPlugin, either a stage-<plugin> init container or a plugin-<name> image
+# volume, depending on whether the cluster supports ImageVolumeSource. The credential
 # proxy is a Deployment of its own, which this script is not pointed at and so
 # does not cover, and neither is the shell sandbox StatefulSet. The proxy's
 # image reference is derived from resolveAgentImage's output, so it normally
@@ -125,7 +127,11 @@ release_names="$(jq -r '.images[] | select(.origin == "first-party" and .tagPoli
 }
 
 # name=image, one per line, init containers first.
-readonly JSONPATH='{range .spec.template.spec.initContainers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{"\n"}{end}'
+# Image volumes too: on a cluster with ImageVolumeSource the operator mounts a
+# plugin image as a volume instead of staging it with an init container, and
+# the reference lives under .volumes[].image. A volume of any other kind has
+# no reference and reads as "name=", which the loop below skips.
+readonly JSONPATH='{range .spec.template.spec.initContainers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.volumes[*]}{.name}={.image.reference}{"\n"}{end}'
 
 stderr_file="$(mktemp)"
 # Carry the real status through the cleanup. A bare `rm` in an EXIT trap
@@ -256,6 +262,10 @@ while true; do
       echo "An image above is unset. The operator then serves its own default image and never reads spec.deployment.tag, so this deploy's tag was ignored before any pin could matter. Set the repository with:"
       echo "  kubectl patch platformagent <name> -n ${namespace} --type=merge \\"
       echo "    -p '{\"spec\":{\"deployment\":{\"image\":\"<repository, no tag>\"}}}'"
+    elif ! grep -qvE '^  (plugin-|stage-)' <<<"${mismatched%$'\n'}"; then
+      echo "Only plugin images are off the tag. The operator renders them from the AgentPlugin objects the chart renders from plugins.<name>.image.tag, which a re-tag that set the agent tag alone leaves behind. Move them with:"
+      echo "  helm upgrade kube-agents <chart> -n ${namespace} --reset-then-reuse-values \\"
+      echo "    --set plugins.<name>.image.tag=${tag}"
     else
       echo "No CR above pins or omits spec.deployment.image, so the CR is not the cause here. Read the status: an operator that is absent, crash-looping, or returning early leaves the pod template as it was."
     fi
