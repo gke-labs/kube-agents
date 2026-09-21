@@ -226,9 +226,9 @@ def healthy_world(*projects):
             # capacity case -- the three signals that say the skew's cause is
             # actually present rather than merely that the objects exist.
             "namespace/seeded-topology": {"metadata": {"name": "seeded-topology"}},
-            "deployment/zone-pinned-api": {"status": {"readyReplicas": 4, "replicas": 4}},
+            "deployment/zone-pinned-api": {"spec": {"template": {"spec": {"topologySpreadConstraints": [{"whenUnsatisfiable": "ScheduleAnyway"}], "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "topology.kubernetes.io/zone"}]}]}}}}}}, "status": {"readyReplicas": 2, "replicas": 2}},
             "pod?app=zone-pinned-api": _pods(_pod(restarts=0, last_reason=None)),
-            "statefulset/zone-bound-store": {"status": {"readyReplicas": 1}},
+            "statefulset/zone-bound-store": {"spec": {"volumeClaimTemplates": [{"spec": {"storageClassName": "standard-rwo"}}]}, "status": {"readyReplicas": 1}},
             "persistentvolumeclaim?app=zone-bound-store": {"items": [{"status": {"phase": "Bound"}}]},
             "deployment/capacity-starved-worker": {"status": {"readyReplicas": 1, "replicas": 3}},
             "pod?app=capacity-starved-worker": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")),

@@ -13,9 +13,11 @@
 # limitations under the License.
 
 # The zonal-skew defects, all on seeded-d because the skew needs the
-# multi-zonal shape main.tf gives it. Each block names the scenario that
-# asserts on it; change a name here and that scenario's exact check goes red,
-# which is the intended failure mode.
+# multi-zonal shape main.tf gives it. Each block names the CATALOGUE ROLE
+# that addresses it -- not a scenario, unlike defects-a.tf: no case reads
+# these yet. Renaming a workload here breaks that role's probe and `state`
+# assertions in fixtures.json, which surfaces as fixture drift on the hourly
+# scan rather than as a red case.
 #
 # Three separate workloads on purpose. Noticing that pods are not spread is
 # the easy half; the anomaly checks have to say WHY, and a single skewed
@@ -41,15 +43,61 @@ resource "kubernetes_namespace_v1" "seeded_topology" {
   depends_on = [google_container_node_pool.seeded_d_default]
 }
 
-# Defect (skew cause 1: the scheduler was allowed to give up). Four replicas
+# Compliance SOP 2.6 flags a non-system namespace that has workloads and no
+# NetworkPolicy. These pods use no network at all, so a default-deny closes
+# the finding at zero fixture risk, as defects-a.tf does on slot a.
+resource "kubernetes_network_policy_v1" "seeded_topology_default_deny" {
+  provider = kubernetes.seeded_d
+
+  metadata {
+    name      = "default-deny"
+    namespace = kubernetes_namespace_v1.seeded_topology.metadata[0].name
+  }
+
+  spec {
+    pod_selector {}
+    policy_types = ["Ingress", "Egress"]
+  }
+}
+
+# The two small fixtures schedule ahead of the capacity one. Without this the
+# three compete for the same two e2-smalls in whatever order a node rebuild
+# happens to produce: a 400m capacity-starved-worker pod landing first leaves
+# too little for zone-pinned-api, whose node affinity gives it nowhere else to
+# go, and the scheduling and volume fixtures then read as drifted for a reason
+# that is not their own. Slot a solves the same problem with a taint on
+# pinned-inference-pool; here the workloads must share a pool, because the
+# capacity fixture has to be starved by a real node, so priority is the lever
+# rather than isolation.
+#
+# Far below the system-critical floor on purpose: these must never preempt
+# anything GKE runs.
+resource "kubernetes_priority_class_v1" "seeded_topology_fixture" {
+  provider = kubernetes.seeded_d
+
+  metadata {
+    name = "seeded-topology-fixture"
+  }
+
+  value       = 100
+  description = "Seeded-fleet zonal-skew fixtures that must schedule before the capacity fixture."
+}
+
+# Defect (skew cause 1: the scheduler was allowed to give up). Two replicas
 # with a topology spread constraint whose `whenUnsatisfiable` is
 # ScheduleAnyway, plus a node affinity that only the first zone satisfies. The
 # constraint reads as if it spreads; ScheduleAnyway means the scheduler treats
-# it as a preference and places every pod in one zone anyway, which is exactly
+# it as a preference and places both pods in one zone anyway, which is exactly
 # the misconfiguration operators mistake for protection. A check that reports
 # "skew" here without naming ScheduleAnyway has not done the job.
 #
-# Asserted by anomaly-zonal-skew-scheduling.
+# Two replicas rather than four, and that is a constraint. At three or more a
+# Deployment with no HorizontalPodAutoscaler trips obtainability SOP 3.5, and
+# an HPA would move the replica count out from under a fixture whose whole
+# subject is where the replicas sit. Two is the smallest count on which "all
+# of them are in one zone" is a statement about a distribution.
+#
+# Addressed by the zonal-skew-scheduling role.
 resource "kubernetes_deployment_v1" "zone_pinned_api" {
   provider = kubernetes.seeded_d
 
@@ -60,7 +108,7 @@ resource "kubernetes_deployment_v1" "zone_pinned_api" {
   }
 
   spec {
-    replicas = 4
+    replicas = 2
 
     selector {
       match_labels = { app = "zone-pinned-api" }
@@ -72,6 +120,21 @@ resource "kubernetes_deployment_v1" "zone_pinned_api" {
       }
 
       spec {
+        priority_class_name = kubernetes_priority_class_v1.seeded_topology_fixture.metadata[0].name
+
+        # Compliance SOP 2.7 and 2.11, obtainability SOP 3.2: the closures
+        # every planted workload in defects-a.tf carries, so these fixtures
+        # add no finding beyond the ones README.md declares.
+        automount_service_account_token = false
+
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+
         # The constraint that looks like protection and is not.
         topology_spread_constraint {
           max_skew           = 1
@@ -108,13 +171,44 @@ resource "kubernetes_deployment_v1" "zone_pinned_api" {
               cpu    = "10m"
               memory = "16Mi"
             }
+            limits = {
+              memory = "32Mi"
+            }
           }
         }
       }
     }
   }
 
+  # These pods are meant to sit two-in-one-zone, which is a satisfied rollout,
+  # but the priority class below can leave them briefly Pending behind a
+  # rebuild. Not waiting keeps an apply from turning a scheduling delay into a
+  # provisioning failure, the way defects-a.tf does for its own fixtures.
+  wait_for_rollout = false
+
   depends_on = [google_container_node_pool.seeded_d_default]
+}
+
+# Reliability SOP 3.3 background closure: zone-pinned-api runs two replicas
+# with no PodDisruptionBudget, which is the planted checkout-gateway defect on
+# slot a -- and obtainability-fleet-exposure-sweep requires that workload to be
+# the fleet's only right answer. maxUnavailable 1 is the SOP's structurally
+# safe shape and blocks no drain. defects-a.tf gives inference-server the same
+# budget for the same reason.
+resource "kubernetes_pod_disruption_budget_v1" "zone_pinned_api" {
+  provider = kubernetes.seeded_d
+
+  metadata {
+    name      = "zone-pinned-api"
+    namespace = kubernetes_namespace_v1.seeded_topology.metadata[0].name
+  }
+
+  spec {
+    max_unavailable = "1"
+    selector {
+      match_labels = { app = "zone-pinned-api" }
+    }
+  }
 }
 
 # Defect (skew cause 2: a volume pinned it). A StatefulSet whose PVC binds a
@@ -126,7 +220,7 @@ resource "kubernetes_deployment_v1" "zone_pinned_api" {
 # One replica, deliberately: the fixture is the immovability, not the count,
 # and a second replica would double the disk.
 #
-# Asserted by anomaly-zonal-skew-volume.
+# Addressed by the zonal-skew-volume role.
 resource "kubernetes_stateful_set_v1" "zone_bound_store" {
   provider = kubernetes.seeded_d
 
@@ -150,6 +244,21 @@ resource "kubernetes_stateful_set_v1" "zone_bound_store" {
       }
 
       spec {
+        # Compliance SOP 2.7 and 2.11, obtainability SOP 3.2: the closures
+        # every planted workload in defects-a.tf carries, so these fixtures
+        # add no finding beyond the ones README.md declares.
+        automount_service_account_token = false
+
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+
+        priority_class_name = kubernetes_priority_class_v1.seeded_topology_fixture.metadata[0].name
+
         container {
           name    = "pause"
           image   = "registry.k8s.io/pause:3.10"
@@ -159,6 +268,9 @@ resource "kubernetes_stateful_set_v1" "zone_bound_store" {
             requests = {
               cpu    = "10m"
               memory = "16Mi"
+            }
+            limits = {
+              memory = "32Mi"
             }
           }
 
@@ -190,6 +302,8 @@ resource "kubernetes_stateful_set_v1" "zone_bound_store" {
     }
   }
 
+  wait_for_rollout = false
+
   depends_on = [google_container_node_pool.seeded_d_default]
 }
 
@@ -204,7 +318,7 @@ resource "kubernetes_stateful_set_v1" "zone_bound_store" {
 # say the cause is capacity. A check that reports a misconfiguration here is
 # wrong in a way that sends someone to edit a manifest that is correct.
 #
-# Asserted by anomaly-zonal-skew-capacity.
+# Addressed by the zonal-skew-capacity role.
 resource "kubernetes_deployment_v1" "capacity_starved_worker" {
   provider = kubernetes.seeded_d
 
@@ -227,6 +341,29 @@ resource "kubernetes_deployment_v1" "capacity_starved_worker" {
       }
 
       spec {
+        # Compliance SOP 2.7 and 2.11, obtainability SOP 3.2 closures.
+        automount_service_account_token = false
+
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+
+        # Obtainability SOP 3.8: a soft spread, which cannot block scheduling
+        # and so cannot interfere with the capacity the fixture is about.
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "topology.kubernetes.io/zone"
+          when_unsatisfiable = "ScheduleAnyway"
+
+          label_selector {
+            match_labels = { app = "capacity-starved-worker" }
+          }
+        }
+
         container {
           name    = "pause"
           image   = "registry.k8s.io/pause:3.10"
@@ -242,11 +379,41 @@ resource "kubernetes_deployment_v1" "capacity_starved_worker" {
               cpu    = "400m"
               memory = "64Mi"
             }
+            limits = {
+              memory = "128Mi"
+            }
           }
         }
       }
     }
   }
 
+  # The third replica never schedules -- that IS the defect. Without this the
+  # apply blocks on a rollout that cannot finish and the scheduled reconcile
+  # reads as a provisioning failure, exactly as defects-a.tf records for
+  # inference-server.
+  wait_for_rollout = false
+
   depends_on = [google_container_node_pool.seeded_d_default]
+}
+
+# Reliability SOP 3.3 background closure, as for zone-pinned-api above.
+# capacity-starved-worker keeps three replicas because the fixture is that
+# they do not all fit, which also means obtainability SOP 3.5 no-hpa applies
+# to it -- an HPA would move the replica count the fixture depends on, so
+# that row is declared in README.md rather than closed here.
+resource "kubernetes_pod_disruption_budget_v1" "capacity_starved_worker" {
+  provider = kubernetes.seeded_d
+
+  metadata {
+    name      = "capacity-starved-worker"
+    namespace = kubernetes_namespace_v1.seeded_topology.metadata[0].name
+  }
+
+  spec {
+    max_unavailable = "1"
+    selector {
+      match_labels = { app = "capacity-starved-worker" }
+    }
+  }
 }

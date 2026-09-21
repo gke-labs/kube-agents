@@ -699,10 +699,24 @@ resource "google_container_cluster" "seeded_d" {
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
+
+  # Matches seeded-a and seeded-b so the authorized-networks drift facet keeps
+  # a majority -- see the resource_labels comment above for the arithmetic.
+  # Like theirs, this is also a declared compliance 2.10 background finding;
+  # README.md's accepted-background table carries the row.
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "0.0.0.0/0"
+      display_name = "open-for-eval"
+    }
+  }
 }
 
 # One node per zone. node_count on a multi-zonal pool is PER ZONE, so 1 here
-# is two nodes in total -- the whole standing cost of this cluster.
+# is two nodes in total. Not the whole standing cost of the cluster: GKE
+# charges a management fee per Standard cluster whatever its topology, and
+# README.md's accounting puts three of those fees at most of the fleet's
+# monthly total. A fourth cluster costs that fee plus these two nodes.
 resource "google_container_node_pool" "seeded_d_default" {
   name       = "default-pool"
   location   = var.zone

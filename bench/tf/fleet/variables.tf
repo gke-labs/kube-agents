@@ -19,7 +19,7 @@ variable "project_id" {
 }
 
 variable "zone" {
-  description = "Zone for all three clusters. Zonal on purpose: the fleet exists to be looked at, not to be available, and a regional control plane triples nothing but the bill."
+  description = "Zone for the fleet's clusters. Zonal on purpose: the fleet exists to be looked at, not to be available, and a regional control plane triples nothing but the bill."
   type        = string
   default     = "us-central1-a"
 }

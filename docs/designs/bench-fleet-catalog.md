@@ -127,16 +127,19 @@ The last two rows are why there are three fixtures rather than one. A check that
 on all three has done the easy half; a check that calls the capacity case a misconfiguration
 sends someone to edit a manifest that is correct.
 
-| Role                 | Slot    | Day | What is planted                                                                       |
-| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+| Role                    | Slot    | Day | What is planted                                                                                                                         |
+| ----------------------- | ------- | --- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`        | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                   |
+| `no-pdb-workload`       | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                             |
+| `crashloop-workload`    | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                   |
+| `hpa-saturated`         | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                   |
+| `idle-nodepool`         | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                     |
+| `orphan-disks`          | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                        |
+| `version-laggard`       | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                              |
+| `drift-outlier`         | c       | 1   | Master authorized networks absent, where a and b carry an open block                                                                    |
+| `zonal-skew-scheduling` | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity |
+| `zonal-skew-volume`     | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, one replica on a zonal `standard-rwo` claim                                        |
+| `zonal-skew-capacity`   | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, three replicas at 400m against two e2-smalls, so one stays Pending           |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -157,7 +160,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the eight roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two of the eleven roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the

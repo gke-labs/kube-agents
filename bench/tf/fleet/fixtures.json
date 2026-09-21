@@ -194,6 +194,20 @@
           "op": "any_eq",
           "value": "Running",
           "why": "The skew is only observable once pods are placed. A cluster whose pods are all still Pending has no distribution to read, and a check asserting skew there would be asserting against an environment that is not ready rather than against the defect"
+        },
+        {
+          "subject": "deployment/zone-pinned-api",
+          "path": "spec.template.spec.topologySpreadConstraints[*].whenUnsatisfiable",
+          "op": "any_eq",
+          "value": "ScheduleAnyway",
+          "why": "the defect itself, and the half a check has to name. Flipping this to DoNotSchedule makes the constraint real, so the pods spread and the fixture is healed while every probe still passes and both pods are still Running"
+        },
+        {
+          "subject": "deployment/zone-pinned-api",
+          "path": "spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[*].matchExpressions[*].key",
+          "op": "any_eq",
+          "value": "topology.kubernetes.io/zone",
+          "why": "the other half: the required zone affinity is what makes ScheduleAnyway bite. Drop it and the pods spread on their own, leaving a constraint that looks misconfigured but produces no skew to attribute"
         }
       ]
     },
@@ -211,6 +225,13 @@
           "op": "any_eq",
           "value": "Bound",
           "why": "The zone binding exists only once the claim is bound: an unbound claim has no disk and therefore no zone, so the cause this fixture exists to test is not yet true of the cluster"
+        },
+        {
+          "subject": "statefulset/zone-bound-store",
+          "path": "spec.volumeClaimTemplates[*].spec.storageClassName",
+          "op": "any_eq",
+          "value": "standard-rwo",
+          "why": "standard-rwo is the zonal class, and zonality is the whole fixture. Swap it for a regional class and the pod can move zones, so the skew has no storage cause to attribute -- while the claim is still Bound and the probe still passes"
         }
       ]
     },
