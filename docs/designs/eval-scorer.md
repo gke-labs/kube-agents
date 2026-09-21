@@ -580,7 +580,7 @@ measured data. Config belongs where it gets reviewed.
 
 ### Reading is capped, and says so
 
-The reader lists the whole prefix once, groups the object names by case and then by key directory,
+The reader lists the prefix once, groups the object names by case and then by key directory,
 takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200) **per case per key**, and concatenates
 what survives in one `cat` per case. Those per-case `cat`s run concurrently, at most
 `EVAL_BASELINE_CAT_WORKERS` (default 16) at a time: the cost of a read is one `gcloud` process
@@ -602,19 +602,31 @@ directory, so all of one key's records land in one directory and sort by stamp w
 directories.
 
 **The cap bounds the fetch, not the listing.** Listing is O(every object ever written under the
-prefix), because the reader cannot know which names are newest without seeing them. The key
-partition largely settles this on its own: a prefix stops growing when the key changes, and a
-long-lived key at one recorded batch a night is on the order of a few hundred objects a year. What
-remains unbounded is the _total_ across all historical keys, which grows only as fast as the
-software versions do. At today's scale — a handful of active cases, one batch per case per night —
-that is invisible. If it ever stops being invisible, the fix is to scope the listing to
-the key being read rather than the whole prefix, which the layout now makes a one-line change; see
-[Open items](#open-items).
+prefix being listed), because the reader cannot know which names are newest without seeing them.
+The key partition largely settles this on its own: a prefix stops growing when the key changes, and
+a long-lived key at one recorded batch a night is on the order of a few hundred objects a year.
+What remains unbounded is the _total_ across all historical keys, which grows only as fast as the
+software versions do. Scoping the read to one case, below, bounds it further: the prefix a
+single-case read lists is that case's own.
 
 Money is not the constraint at any of these scales. Standard storage bills actual bytes with no
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
-run. Wall clock was: the gate reads the whole store once per graded case, which is why the fetches
-are concurrent.
+run. Wall clock is, which is why the fetches are concurrent and the read is scoped.
+
+### The read is scoped to the cases being graded
+
+`bench-gate case` runs once per task and `bench-gate suite` once at the end, so a matrix of
+eighteen tasks reads the store nineteen times. Each read asks about the cases it is grading —
+one for `case`, the graded set for `suite` — and never about the rest, so reading all of them was
+the same work repeated nineteen times. `BaselineStore.load(only=…)` takes the cases the caller
+will ask about; a single-case read lists that case's prefix rather than the whole store and
+fetches one object group.
+
+The narrowing has a failure mode that speed cannot detect, because a read that fetches nothing is
+the fastest of all: a store missing a case answers "never screened", which de-admits a case that
+is in fact passing and reds nothing. So the scope is remembered on the store, and a lookup outside
+it raises `CaseOutOfScope` — deliberately neither the `ValueError` the gate treats as a corrupt
+store nor the `StoreUnreachable` it degrades on, both of which get absorbed into a verdict.
 
 The key partition also retires a caveat this section used to carry. Under a flat layout and a
 per-case window, a version key that went A → B → A could push the revert's own evidence at key A
@@ -1357,11 +1369,10 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   Trend page can draw the spread across repetitions rather than the range of nightly means
   ([What a score is](#what-a-score-is)). Additive and optional; `bench-gate record` writes it,
   `_pool_judged()` ignores it.
-- The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
-  filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
-  for and `bench-gate suite` reads many cases at potentially different keys. Scoping the listing to
-  the key means threading it through both, which the layout now makes worth doing but which buys
-  nothing at today's volumes; see
+- The GCS listing is scoped by case, not by key. A single-case read lists that case's own prefix,
+  but `bench-gate suite` still lists the whole store and filters afterwards, because its cases can
+  sit at different keys and `BaselineStore.load` does not know which key it is about to be asked
+  for. Threading the key through both buys nothing at today's volumes; see
   [Reading is capped, and says so](#reading-is-capped-and-says-so).
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.

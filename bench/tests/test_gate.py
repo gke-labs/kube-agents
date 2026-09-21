@@ -43,7 +43,8 @@ from pathlib import Path
 
 import pytest
 
-from kube_agents_bench import evidence_store
+from kube_agents_bench import evidence_store, gate
+from kube_agents_bench.baselines import CaseOutOfScope
 from kube_agents_bench.gate import REPORT_EXCERPT_MAX_CHARS, _report_excerpt, main
 from kube_agents_bench.scoring import MISSING
 
@@ -1184,3 +1185,89 @@ def test_a_capped_read_says_so_in_the_verdict(tmp_path, monkeypatch, gcloud):
     text = md.read_text(encoding="utf-8")
     assert "NOTE — truncated read" in text
     assert "`a`: the 3 oldest" in text
+
+
+# --------------------------------------------------------------------------
+# gcs: reading only the cases being graded
+# --------------------------------------------------------------------------
+
+
+def test_grading_one_case_reads_one_case(kanban_task, tmp_path, monkeypatch, gcloud):
+    """The gate runs `case` once per task and each one read the whole store.
+
+    Eighteen tasks against thirty-eight case prefixes is thirty-seven wasted
+    reads per task, and the verdict never depended on one of them.
+    """
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    seed_gcs(
+        gcloud,
+        *[
+            baseline_line(
+                "agent-kanban-smoke", runs=3, passes=3,
+                judged={"OutcomeValidity": {"mean": 1.0, "n": 3}},
+                at=f"2026-08-0{i + 1}T00:00:00Z",
+            )
+            for i in range(7)
+        ],
+        *[baseline_line(f"other-{i}", runs=3, passes=3) for i in range(5)],
+    )
+
+    out = tmp_path / "case.json"
+    doc = graded_case(
+        kanban_task, [FIXTURE_RUNS / n for n in RED_RUNS], out, store_with(tmp_path)
+    )
+    # Unchanged by the narrowing: same 21/21 window, same admission, same rung.
+    assert doc["admitted"] is True and doc["rung"] == 4
+
+    (listed,) = [c for c in gcloud.calls if c[2] == "ls"]
+    assert listed[3] == "gs://b/evidence/agent-kanban-smoke/**"
+    read = [u for c in gcloud.calls if c[2] == "cat" for u in c[3:]]
+    assert read and not [u for u in read if "/other-" in u]
+
+
+def test_the_suite_reads_the_cases_it_graded_and_no_others(tmp_path, monkeypatch, gcloud):
+    """`suite` pools a baseline rate over the cases in its own inputs, so a
+    case absent from this run can never enter the number."""
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    seed_gcs(
+        gcloud,
+        baseline_line("a", runs=20, passes=20),
+        *[baseline_line(f"other-{i}", runs=20, passes=0) for i in range(5)],
+    )
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=1, scored=4)
+
+    # Reds on main's 100% against this run's 25% -- the ungraded cases' 0/20
+    # would have dragged the comparator down had they been pooled in.
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store_with(tmp_path)),
+        "--min-scored", "1",
+    ]) == 1
+    read = [u for c in gcloud.calls if c[2] == "cat" for u in c[3:]]
+    assert read and not [u for u in read if "/other-" in u]
+
+
+def test_a_case_outside_the_scope_raises_instead_of_reading_as_unscreened(tmp_path):
+    """The guard that makes the narrowing safe, reached through the gate.
+
+    A scoped store asked about a case it never read would otherwise answer
+    "no evidence", which de-admits a passing case and reds nothing.
+    """
+    store, fatal, degraded = gate._load_store(str(store_with(tmp_path)), only={"a"})
+    assert (fatal, degraded) == (None, None)
+    with pytest.raises(CaseOutOfScope):
+        store.history_for("b")
+
+
+def test_an_unreachable_store_keeps_its_scope(tmp_path, monkeypatch, gcloud):
+    """The degraded path returns an empty store, and it is scoped like the
+    successful one -- otherwise an outage would be the one way a caller bug
+    slipped through."""
+    gcloud.fail = "ERROR: (gcloud.storage.ls) 503 Backend Error"
+    store, fatal, degraded = gate._load_store("gs://b/evidence", only={"a"})
+    assert fatal is None and degraded is not None
+    assert store.history_for("a") == []
+    with pytest.raises(CaseOutOfScope):
+        store.history_for("b")
