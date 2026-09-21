@@ -2774,9 +2774,14 @@ def inject_message(
     """Receive the event payload and notify the Platform Agent via Google Chat.
 
     Two producers reach this route and they send different records. The event
-    watcher sends a Kubernetes event and sends no `kind`; the drift detector
-    sends `kind: gitops-drift` and an audit-log record of a change someone made.
-    Everything below the dispatch is the event path, unchanged, and the fields
+    watcher sends a Kubernetes event, stamped `k8s-event` or
+    `k8s-event-followup`; the drift detector sends `kind: gitops-drift` and an
+    audit-log record of a change someone made. The dispatch is an equality test
+    against `INJECT_KIND_DRIFT`, not a match against the watcher's kinds, so
+    everything that is not drift — those two, a kind a future producer invents,
+    or no kind at all — takes the event path.
+
+    Everything below the dispatch is that event path, unchanged, and the fields
     it reads exist on nothing else — `payload.get("kind_of_object") or "Pod"`
     would render a drifted ConfigMap as a Pod alert that names an object nobody
     touched.
