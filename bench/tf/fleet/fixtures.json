@@ -13,9 +13,7 @@
     "crashloop-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-debug",
-      "probes": [
-        "deployment/payments-api"
-      ],
+      "probes": ["deployment/payments-api"],
       "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit",
       "state": [
         {
@@ -37,9 +35,7 @@
     "no-pdb-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-reliability",
-      "probes": [
-        "deployment/checkout-gateway"
-      ],
+      "probes": ["deployment/checkout-gateway"],
       "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace",
       "state": [
         {
@@ -85,9 +81,7 @@
     "rbac-overgrant": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": [
-        "clusterrolebinding/debug-binding"
-      ],
+      "probes": ["clusterrolebinding/debug-binding"],
       "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount",
       "state": [
         {
@@ -109,9 +103,7 @@
     "idle-nodepool": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": [
-        "node?cloud.google.com/gke-nodepool=idle-batch-pool"
-      ],
+      "probes": ["node?cloud.google.com/gke-nodepool=idle-batch-pool"],
       "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint",
       "state": [
         {
@@ -183,9 +175,7 @@
     "zonal-skew-scheduling": {
       "cluster_slot": "d",
       "namespace": "seeded-topology",
-      "probes": [
-        "deployment/zone-pinned-api"
-      ],
+      "probes": ["deployment/zone-pinned-api"],
       "fixture": "zone-pinned-api Deployment, four replicas, topology spread constraint with whenUnsatisfiable ScheduleAnyway plus a node affinity only the first zone satisfies, so every pod lands in one zone",
       "state": [
         {
@@ -214,9 +204,7 @@
     "zonal-skew-volume": {
       "cluster_slot": "d",
       "namespace": "seeded-topology",
-      "probes": [
-        "statefulset/zone-bound-store"
-      ],
+      "probes": ["statefulset/zone-bound-store"],
       "fixture": "zone-bound-store StatefulSet with a standard-rwo PersistentVolumeClaim, so the pod is bound to whichever zone its disk landed in and cannot move",
       "state": [
         {
@@ -238,9 +226,7 @@
     "zonal-skew-capacity": {
       "cluster_slot": "d",
       "namespace": "seeded-topology",
-      "probes": [
-        "deployment/capacity-starved-worker"
-      ],
+      "probes": ["deployment/capacity-starved-worker"],
       "fixture": "capacity-starved-worker Deployment, three replicas at 400m CPU each against two e2-small nodes, so some pods run and the rest stay Pending with an insufficient-cpu event",
       "state": [
         {
