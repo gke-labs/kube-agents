@@ -433,10 +433,12 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         harness = text[text.index("    harness)") : text.index("    full)")]
         self.assertIn(
-            'plugin_tag_list="$(recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"',
+            '\n      recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"\n',
             harness,
-            "the read has to be an assignment, so a failed read stops the run",
+            "a plain call: a substitution would swallow print_error's stdout and fire the ERR trap twice",
         )
+        self.assertIn('<<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"', harness)
+        self.assertNotIn("$(recorded_plugin_image_tag_keys", harness)
         self.assertIn('helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"', harness)
         self.assertIn('${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}', harness)
         self.assertNotIn("mapfile", harness, "macOS ships bash 3.2, which has no mapfile")
@@ -465,6 +467,7 @@ class RecordedPluginImageTagKeysTest(unittest.TestCase):
 KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
 trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
 recorded_plugin_image_tag_keys kube-agents kubeagents-system
+printf '%s\\n' "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
 echo "rc=$?"
 """
         env = get_isolated_test_env()
@@ -496,6 +499,7 @@ echo "rc=$?"
         proc = self._run('{"operator":{"image":{"tag":"abc"}}}')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.split(), ["rc=0"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
 
     def test_a_malformed_plugins_value_is_an_error_not_an_empty_list(self):
         """upgrade.sh runs under set -e, so the failed call ends the sourced run."""
@@ -514,7 +518,7 @@ echo "rc=$?"
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("rc=", proc.stdout)
         self.assertIn("Could not read the values of Helm release", proc.stdout)
-        self.assertLessEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
 
 
 if __name__ == "__main__":

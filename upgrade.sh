@@ -334,23 +334,29 @@ matches_release_bundle_ref() {
   return 1
 }
 
-# Prints, one per line, the Helm keys of the plugin image tags the release's
-# user-supplied values record (`plugins.<name>.image.tag`), for the harness
-# step to re-tag with the agent and sandbox tags. Read from the recorded values
-# rather than from the enabled flags because the composition records the tag
-# for a disabled plugin too; derived from the values rather than from a list of
-# plugin names so that a plugin added to the chart and the composition is
-# covered without a change here. The chart the keys are applied to is pinned to
-# this script's commit by the source check, so its `plugins` block matches.
+# Sets RECORDED_PLUGIN_IMAGE_TAG_KEYS to the Helm keys, one per line, of the
+# plugin image tags the release's user-supplied values record
+# (`plugins.<name>.image.tag`), for the harness step to re-tag with the agent
+# and sandbox tags. Read from the recorded values rather than from the enabled
+# flags because the composition records the tag for a disabled plugin too;
+# derived from the values rather than from a list of plugin names so that a
+# plugin added to the chart and the composition is covered without a change
+# here. The chart the keys are applied to is pinned to this script's commit by
+# the source check, so its `plugins` block matches.
 #
 # A read that fails is an error, not an empty list: an empty list would run
 # the pre-fix re-tag and leave the plugin images behind, with the omission
-# surfacing only from the image check after the Helm move. `trap - ERR` inside
-# the substitutions: on bash 3.2 the inherited ERR trap fires inside `$(...)`
-# even when the assignment is guarded, and the caller's failed assignment is
-# where the abort belongs. Arguments: release, namespace.
+# surfacing only from the image check after the Helm move. It assigns rather
+# than prints, as gke_dns_endpoint_flag does, so that the caller runs it as a
+# plain command: print_error writes to stdout, which a command substitution
+# would swallow, and under `set -E` the ERR trap would fire in the
+# substitution's subshell and again in the parent. `trap - ERR` inside its own
+# substitutions for the same reason, on bash 3.2 in particular. Arguments:
+# release, namespace.
+RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
 recorded_plugin_image_tag_keys() {
   local release="$1" namespace="$2" values keys
+  RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
   if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>&1)"; then
     print_error "Could not read the values of Helm release '${release}' in '${namespace}' to find the plugin image tags: ${values}"
     return 1
@@ -359,7 +365,7 @@ recorded_plugin_image_tag_keys() {
     print_error "Could not read the plugin image tags from the values of Helm release '${release}': ${keys}"
     return 1
   fi
-  [ -z "$keys" ] || printf '%s\n' "$keys"
+  RECORDED_PLUGIN_IMAGE_TAG_KEYS="$keys"
 }
 
 # The two refusals that do not need a ref to make sense: an unversioned source
@@ -920,15 +926,15 @@ main() {
       # release records them: the operator renders them into the gateway as
       # stage-<plugin> init containers or plugin-<name> image volumes, and
       # the image check below reads both.
-      # The read is an assignment, so a failed read stops the run here rather
-      # than in a process substitution whose status nothing checks. A read
-      # loop rather than the bash 4 array builtin, and the `+` expansion for
-      # the empty case: operators run this from macOS, whose bash is 3.2.
-      local plugin_tag_list plugin_tag_keys=() plugin_tag_key
-      plugin_tag_list="$(recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"
+      # A plain call, not a substitution: a failed read stops the run here,
+      # once, with the function's own message shown. A read loop rather than
+      # the bash 4 array builtin, and the `+` expansion for the empty case:
+      # operators run this from macOS, whose bash is 3.2.
+      local plugin_tag_keys=() plugin_tag_key
+      recorded_plugin_image_tag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
       while IFS= read -r plugin_tag_key; do
         [ -n "$plugin_tag_key" ] && plugin_tag_keys+=("$plugin_tag_key")
-      done <<<"$plugin_tag_list"
+      done <<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
       helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag" \
         ${plugin_tag_keys[@]+"${plugin_tag_keys[@]}"}
       print_success "Platform Agent deployment upgraded successfully!"
