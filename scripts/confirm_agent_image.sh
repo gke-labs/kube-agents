@@ -133,6 +133,19 @@ release_names="$(jq -r '.images[] | select(.origin == "first-party" and .tagPoli
 # no reference and reads as "name=", which the loop below skips.
 readonly JSONPATH='{range .spec.template.spec.initContainers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.volumes[*]}{.name}={.image.reference}{"\n"}{end}'
 
+# A plugin image is the release's business only when its AgentPlugin is: the
+# operator stages every AgentPlugin in the namespace that names the agent,
+# including one installed on its own (agentplugins/*/install.sh, its own Helm
+# release and its own image tag), which no re-tag of this release moves. The
+# release that owns the PlatformAgent, and the one that owns each AgentPlugin,
+# are read from Helm's release annotation; a plugin under another release is
+# skipped, and an agent with no annotation (a kustomize install) counts them
+# all, as before.
+readonly PLUGIN_INIT_PREFIX="stage-"
+readonly PLUGIN_VOLUME_PREFIX="plugin-"
+readonly AGENT_RELEASE_JSONPATH='{range .items[*]}{.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
+readonly PLUGIN_RELEASE_JSONPATH='{range .items[*]}{.metadata.name}={.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
+
 stderr_file="$(mktemp)"
 # Carry the real status through the cleanup. A bare `rm` in an EXIT trap
 # succeeds and becomes the shell's exit status, turning a fatal error into a
@@ -166,15 +179,63 @@ is_release_image() {
   grep -qxF "$segment" <<<"$release_names"
 }
 
-# Sets matched and mismatched from a name=image listing.
+# The Helm release of the AgentPlugin a plugin entry comes from, by the entry's
+# name (stage-<plugin> or plugin-<plugin>; the init container name may be cut
+# to 63 characters, hence the prefix match as the fallback). Empty when the
+# plugin, or its annotation, is not found.
+plugin_release_of() {
+  local entry="$1" plugin pname prelease
+  case "$entry" in
+    "$PLUGIN_INIT_PREFIX"*) plugin="${entry#"$PLUGIN_INIT_PREFIX"}" ;;
+    "$PLUGIN_VOLUME_PREFIX"*) plugin="${entry#"$PLUGIN_VOLUME_PREFIX"}" ;;
+    *) return 0 ;;
+  esac
+  while IFS='=' read -r pname prelease; do
+    [ -n "$pname" ] || continue
+    if [ "$pname" = "$plugin" ]; then
+      echo "$prelease"
+      return 0
+    fi
+  done <<<"$plugin_releases"
+  while IFS='=' read -r pname prelease; do
+    [ -n "$pname" ] || continue
+    case "$pname" in
+      "$plugin"*)
+        echo "$prelease"
+        return 0
+        ;;
+    esac
+  done <<<"$plugin_releases"
+}
+
+# True for a plugin entry whose AgentPlugin belongs to another Helm release
+# than the agent, which this release's re-tag cannot move and must not judge.
+is_foreign_plugin() {
+  local entry="$1" prelease
+  case "$entry" in
+    "$PLUGIN_INIT_PREFIX"* | "$PLUGIN_VOLUME_PREFIX"*) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$agent_releases" ] || return 1
+  prelease="$(plugin_release_of "$entry")"
+  [ -n "$prelease" ] || return 1
+  ! grep -qxF "$prelease" <<<"$agent_releases"
+}
+
+# Sets matched, mismatched and skipped from a name=image listing.
 inspect_template() {
   matched=0
   mismatched=""
+  skipped=""
 
   local name image
   while IFS='=' read -r name image; do
     [ -n "$image" ] || continue
     is_release_image "$image" || continue
+    if is_foreign_plugin "$name"; then
+      skipped="${skipped}  ${name}: ${image} (AgentPlugin of another Helm release)"$'\n'
+      continue
+    fi
     matched=$((matched + 1))
     case "$image" in
       *:"$tag") ;;
@@ -190,10 +251,15 @@ while true; do
   # kubectl's own error is kept rather than discarded, because an expired
   # credential and a slow operator look identical from here until the deadline.
   listing="$(kubectl get "deployment/${deployment}" -n "$namespace" -o jsonpath="$JSONPATH" 2>"$stderr_file" || true)"
+  # Errors here are not kept: a cluster without the AgentPlugin CRD, or an
+  # agent no Helm release owns, reads as empty and every plugin entry counts.
+  agent_releases="$(kubectl get platformagent -n "$namespace" -o jsonpath="$AGENT_RELEASE_JSONPATH" 2>/dev/null | grep -v '^$' | sort -u || true)"
+  plugin_releases="$(kubectl get agentplugin -n "$namespace" -o jsonpath="$PLUGIN_RELEASE_JSONPATH" 2>/dev/null || true)"
   inspect_template "$listing"
 
   if [ "$matched" -gt 0 ] && [ -z "$mismatched" ]; then
     echo "Operator applied tag ${tag} to all ${matched} release image(s) in ${deployment}."
+    [ -z "$skipped" ] || printf 'Not judged, installed outside the release:\n%s' "$skipped"
     exit 0
   fi
 

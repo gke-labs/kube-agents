@@ -126,6 +126,8 @@ class _StubKubectl:
         cr_reason="Reconciled",
         deployment_missing=False,
         images_json=None,
+        agent_release="kube-agents",
+        plugin_releases="",
     ):
         """Run the script against one or more stubbed reads of the template.
 
@@ -179,6 +181,14 @@ class _StubKubectl:
             textwrap.dedent(
                 f"""\
                 #!/usr/bin/env bash
+                if [[ "$*" == *release-name* && "$*" == *platformagent* ]]; then
+                  printf '%s\\n' '{agent_release}'
+                  exit 0
+                fi
+                if [[ "$*" == *agentplugin* ]]; then
+                  printf '%s\\n' '{plugin_releases}'
+                  exit 0
+                fi
                 if [[ "$*" == *status.phase* ]]; then
                   echo '  platform-agent: {cr_phase}'
                   echo '    Ready=False {cr_reason}'
@@ -271,6 +281,61 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
         self.assertIn("Only plugin images are off the tag", result.stdout)
         self.assertIn("--set plugins.<name>.image.tag", result.stdout)
+
+    def test_a_plugin_installed_outside_the_release_is_not_judged(self):
+        """agentplugins/*/install.sh releases a plugin on its own, at its own tag.
+
+        The operator stages it like any other, but no re-tag of this release
+        moves it, so it is reported and left out of the verdict.
+        """
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            stage-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            plugin-gkestockoutinvestigator={_GHCR}/gke-stockout-investigator:{_OLD}
+            """,
+            plugin_releases="pubsubplatform=pubsubplatform\ngkestockoutinvestigator=gkestockoutinvestigator",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 release image(s)", result.stdout)
+        self.assertIn("Not judged, installed outside the release", result.stdout)
+        self.assertIn("stage-pubsubplatform", result.stdout)
+
+    def test_a_plugin_of_the_release_on_an_older_tag_still_fails(self):
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            plugin-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            plugin_releases="pubsubplatform=kube-agents",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
+
+    def test_without_a_release_on_the_agent_every_plugin_counts(self):
+        """A kustomize install has no Helm annotation; nothing is skipped."""
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            plugin-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            agent_release="",
+            plugin_releases="pubsubplatform=pubsubplatform",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
+
+    def test_a_truncated_staging_container_name_still_finds_its_plugin(self):
+        long_name = "a-plugin-with-a-very-long-name-that-the-operator-truncates-to-63"
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            stage-{long_name[:50]}={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            plugin_releases=f"{long_name}=standalone",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Not judged", result.stdout)
 
     def test_a_volume_without_an_image_reference_is_not_counted(self):
         result = self._run(

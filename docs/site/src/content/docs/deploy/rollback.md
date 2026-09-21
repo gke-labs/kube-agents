@@ -227,8 +227,9 @@ helm history kube-agents -n kubeagents-system
 ```
 
 Both images end in `:<N-1>`, so does every plugin image the fourth command lists (the lines naming
-`pubsub-platform` or `gke-stockout-investigator`), the `Ready` condition reads `True`, the gateway
-pod is `Running`,
+`pubsub-platform` or `gke-stockout-investigator`; a plugin installed on its own, outside the
+release, keeps its own tag and is not the rollback's to move), the `Ready` condition reads `True`,
+the gateway pod is `Running`,
 and the newest Helm revision is `deployed` at chart version `N-1`, with the operator step's
 revision `superseded` just before it. `kubeagents-system` is the default namespace; an install
 that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the chart's default
