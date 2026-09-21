@@ -1560,6 +1560,25 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
         self.assertRegex(h.text("tags_env"), r"HERMES_AGENT_TAG=\S+@sha256:[0-9a-f]{64}")
         self.assertIn("${HERMES_AGENT_TAG}", h.text("dockerfile"))
 
+    def test_C4_every_hermes_plugin_install_is_pinned_to_a_commit(self) -> None:
+        """A plugin installed from a third-party default branch is unpinned
+        upstream content executed inside the agent process.
+
+        `hermes plugins install <spec>` with no `--ref` resolves against
+        whatever that repository's default branch holds at build time, so the
+        image changes without a commit here and the build can break on a
+        morning nobody touched it. Asserted so that dropping the ref back to a
+        floating branch is a red test rather than a diff nobody reads.
+        """
+        installs = re.findall(r"hermes plugins install\s+(\S+)((?:\s+--\S+(?:\s+\S+)?)*)", h.text("dockerfile"))
+        self.assertTrue(installs, "no `hermes plugins install` found; this test is vacuous")
+        for spec, flags in installs:
+            self.assertRegex(
+                flags,
+                r"--ref\s+[0-9a-f]{40}\b",
+                f"`hermes plugins install {spec}` is not pinned to a full commit SHA",
+            )
+
     def test_C4_precondition_the_chart_still_names_images(self) -> None:
         self.assertIn("repository:", h.text("chart_values"))
         # The operator-default half of the violation below reads a second
