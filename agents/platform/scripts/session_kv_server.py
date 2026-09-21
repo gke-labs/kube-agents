@@ -396,18 +396,17 @@ ALERT_DAILY_LIMITS = {
 # to dispatch.
 INJECT_KIND_DRIFT = "gitops-drift"
 
-# Drift is graded `Warning` rather than given a severity of its own, and the
-# reason is the ceiling rather than the wording. `ALERT_DAILY_LIMITS` is keyed
-# by severity and a `.get(severity, 0)` miss is allowed through *uncapped*, so
-# a severity invented here would have to be added to that dict — and a fourth
-# key is a second full ceiling beside the event watcher's, letting a quiet day
-# of events plus a drift storm post twice what either budget allows. The
-# ceiling bounds the messages one human reads in a day, and that reader is one
-# budget whatever produced them.
+# Drift is graded `Warning` rather than given a severity of its own, and this
+# is now a statement about wording alone. Display and billing were the same
+# string until DRIFT_QUOTA_KEY split them, because `_claim_alert_quota` keys the
+# `alert_quota` table on whatever it is handed; they are two decisions and this
+# constant is only the first of them.
 #
 # Drift is *displayed* as a Warning, so it sorts with the event watcher's
-# warnings in a channel that already carries them. It is not *budgeted* as one:
-# see DRIFT_QUOTA_KEY.
+# warnings in a channel that already carries them, and DRIFT_ALERT_EMOJI keeps
+# it distinguishable inside that sort. It is not *budgeted* as one: see
+# DRIFT_QUOTA_KEY for the bucket it bills, and for why sharing the watcher's
+# was worse than letting the two ceilings add up.
 #
 # The cost of the ceiling is worth naming whichever bucket it comes from: a
 # spent budget silences drift for the rest of the day, and the detector has

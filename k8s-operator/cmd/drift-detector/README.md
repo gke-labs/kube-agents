@@ -44,8 +44,12 @@ What the daemon does with the payload is
 `kind`, so a `gitops-drift` payload gets its own chat alert and its own triage card — addressed to
 the agent for the cluster the change was made on, which the fan-in means is not necessarily the one
 the detector runs in — instead of being rendered through the event watcher's path, where the field
-defaults would describe it as a Pod. Drift draws on the same daily `Warning` ceiling as event
-alerts, and a record the ceiling refuses is lost rather than deferred: the daemon answers
+defaults would describe it as a Pod. Drift is displayed as a `Warning` but billed to a daily ceiling
+of its own rather than to the event watcher's, because one `kubectl apply` over a directory is one
+human action and several audit entries: sharing the bucket let routine use of this signal cap-drop
+the watcher's for the rest of the day. The two ceilings therefore add up, which is the cost of the
+split; what it does not fix is the fan-out itself, since the detector coalesces nothing. A record
+the ceiling refuses is lost rather than deferred: the daemon answers
 `suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
 ledger row the daemon writes is the only place that change survives. `GET /v1/alert-quota` is where
 a spent budget shows up.

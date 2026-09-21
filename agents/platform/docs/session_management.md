@@ -43,7 +43,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 `inject_message` classifies severity (`get_severity_details`), applies the [severity gate](#severity-gate), and then spends one of that severity's daily allowance before anything is posted or any agent turn is started. This is the only place both actions pass through, and severity is not known any earlier — `POST /sessions` carries no payload.
 
-A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It draws on the same `Warning` bucket, deliberately — the ceiling bounds the messages one person reads in a day, and that reader has one budget whatever produced them. The consequence is that a node storm spending the `Warning` budget silences drift for the rest of the day.
+A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one it displays as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
 | Severity   | Env var                      | Default |
 | ---------- | ---------------------------- | ------- |
@@ -90,7 +90,19 @@ What the drift branch does differently:
   informational tier to hold back — the detector's own classifier already dropped everything it
   judged to be automation rather than a person, upstream of this route. Every record that arrives
   here is graded `Warning`.
+- **It bills a bucket of its own,** `GitOpsDrift`, rather than the `Warning` one it displays as.
+  [The ceiling section](#daily-alert-ceiling) has the reasoning and what the split costs.
 - **Its `suppressed` is terminal,** for the reason the bullet above gives.
+- **It defangs the fields it renders.** The record describes a change someone made, and several of
+  the fields describing it are chosen by that person: `fieldManager` is a free query parameter and
+  `callerSuppliedUserAgent` is whatever the client declared. Both are rendered inside a block the
+  front door is told to copy verbatim, so a backtick in either would close the span it sits in and
+  the rest of the value would read as instruction text. The drift renderers substitute the
+  characters that end a span or start a line of their own, replace the chat-template control tokens
+  `_defang_report` already handles, and truncate, so a field stuffed with instructions cannot
+  outweigh the prompt around it. Replacement is with U+FFFD rather than deletion, because the card
+  is evidence and a reader should see that the value was altered. The event path does not do this
+  and is unchanged; its fields come from the kubelet rather than from the caller being reported on.
 - **It writes its own chat line and its own kanban card,** through a second query builder
   (`_drift_agent_query`) and a second body (`_drift_task_body`). The question is different: an event
   says Kubernetes is unhappy and asks for a root cause; a drift record says someone changed a live
@@ -350,17 +362,21 @@ reads on a day the recap said everything was fine.
 
 #### `alert_quota`
 
-Tracks how much of each severity's daily allowance has been spent, and how many alerts the ceiling dropped:
+Tracks how much of each bucket's daily allowance has been spent, and how many alerts the ceiling dropped:
 
 ```sql
 CREATE TABLE alert_quota(
   day TEXT NOT NULL,              -- UTC YYYY-MM-DD
-  severity TEXT NOT NULL,         -- Critical | Warning | Info
+  severity TEXT NOT NULL,         -- Critical | Warning | Info | GitOpsDrift
   sent INTEGER NOT NULL DEFAULT 0,
   suppressed INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, severity)
 );
 ```
+
+The column is named `severity` and three of its four values are one, but the key is whatever
+`_claim_alert_quota` was handed: `GitOpsDrift` is a billing bucket for records that display as
+`Warning`. `GET /v1/alert-quota` reports the row as it finds it, so a reader sees four buckets.
 
 Rows age out after `SESSION_KV_CLEANUP_TTL_DAYS`, along with `session_metadata` and `incidents`, so roughly two weeks of history is available to answer "what did we drop last week".
 
