@@ -55,10 +55,11 @@ PROFILES_ROOT="$SANDBOX_DATA_ROOT/$PROFILES_DIR_NAME"
 # volume. Name matched with sandbox_mirror.CREDENTIALS and cluster_preflight.sh.
 PINNED_KUBECONFIG_NAME=kubeconfig.yaml
 # The profile home the agent pod's ssh client says it is speaking for: the
-# worker's own HERMES_HOME, sent as HERMES_PROFILE_HOME by the drop-in the agent
-# image carries (deploy/docker/ssh_config.d/10-sandbox-profile-home.conf) and
+# worker's own HERMES_HOME, sent as HERMES_PROFILE_HOME by the agent image's
+# client (deploy/docker/ssh-wrapper.sh puts it in the client's environment,
+# deploy/docker/ssh_config.d/10-sandbox-profile-home.conf sends it) and
 # accepted for this account by sshd_config. Empty when the client sent nothing:
-# an agent image without the drop-in, a HERMES_HOME the client had unset, or a
+# an agent image without the pair, a HERMES_HOME the client had unset, or a
 # caller that is not Hermes' backend.
 FORWARDED_PROFILE_HOME=${HERMES_PROFILE_HOME-}
 
@@ -110,19 +111,22 @@ narrow_to_profile() {
 # HERMES_HOME anywhere else — the same rule the cwd path applies. Every use of
 # the value is a quoted expansion; nothing here evaluates it.
 #
-# Three ways to get nothing, and only two of them say so. A value with no
-# `/profiles/` in it is the root, which is what a worker on the default profile
-# sends and what it wants, so it is silent. A name that is not one component
-# (empty, `.`, `..`, a slash) is not a profile and is refused aloud. A
-# well-formed name with no home here is a profile the sandbox has not received
-# yet: sandbox_mirror.py creates every profile's home on the agent pod's start
-# and pushes a Cluster Agent's identity when the profile is scaffolded, so a
-# card dispatched inside that window falls back to the cwd derivation, and the
-# message says why its preflight is about to read the wrong tree.
+# Three ways to get nothing, and only two of them say so. The root itself, or a
+# value with no `/profiles/` in it, is what a worker on the default profile
+# sends and what it wants, so it is silent — the root is matched first, by
+# value, because a data root can itself have a `profiles` component in its
+# path and would otherwise read as a profile named for its last component. A
+# name that is not one component (empty, `.`, `..`, a slash) is not a profile
+# and is refused aloud. A well-formed name with no home here is a profile the
+# sandbox has not received yet: sandbox_mirror.py creates every profile's home
+# on the agent pod's start and pushes a Cluster Agent's identity when the
+# profile is scaffolded, so a card dispatched inside that window falls back to
+# the cwd derivation, and the message says why its preflight is about to read
+# the wrong tree.
 export_forwarded_profile_home() { # export_forwarded_profile_home <HERMES_PROFILE_HOME>
   local value=$1 name
   case $value in
-  "") return 1 ;;
+  "" | "$SANDBOX_DATA_ROOT") return 1 ;;
   */"$PROFILES_DIR_NAME"/*) name=${value##*/"$PROFILES_DIR_NAME"/} ;;
   *) return 1 ;;
   esac

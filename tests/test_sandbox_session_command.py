@@ -119,6 +119,34 @@ class SessionCommandProfileHomeTest(unittest.TestCase):
         self.assertIn(f"home=[{self.root}] kc=[]", proc.stdout)
         self.assertEqual(proc.stderr, "")
 
+    def test_a_root_with_a_profiles_component_is_still_the_root(self) -> None:
+        """The root is matched by value before the name is read out, so a data
+        root such as /mnt/profiles/data is not taken for a profile called
+        `data` and a default-profile worker on such an install is not told,
+        on every command, that `data` is not mirrored."""
+        base = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        root = base / "profiles" / "data"
+        (root / "profiles" / "cluster-a").mkdir(parents=True)
+        workspace = root / "kanban" / "workspaces" / _TASK_ID
+        env = {
+            "PATH": os.environ["PATH"],
+            "HERMES_HOME": str(root),
+            "HERMES_PROFILE_HOME": str(root),
+            "SSH_ORIGINAL_COMMAND": _wire(str(workspace), _PROBE),
+        }
+        proc = subprocess.run(["bash", str(_SCRIPT)], cwd=root, env=env,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"home=[{root}] kc=[]", proc.stdout)
+        self.assertEqual(proc.stderr, "")
+        # And a profile under that root still narrows: the by-name derivation
+        # is what comes after the root check, not what it replaced.
+        env["HERMES_PROFILE_HOME"] = f"{root}/profiles/cluster-a"
+        proc = subprocess.run(["bash", str(_SCRIPT)], cwd=root, env=env,
+                              capture_output=True, text=True, timeout=60)
+        self.assertIn(f"home=[{root / 'profiles' / 'cluster-a'}]", proc.stdout)
+
     def test_the_cwd_still_narrows_when_the_name_is_the_root(self) -> None:
         """The name only takes precedence when it names a profile; a command
         run from inside a profile home with the root forwarded is that

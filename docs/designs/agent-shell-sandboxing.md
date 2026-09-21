@@ -240,9 +240,11 @@ through the sandbox rather than by reading:
   "`terminal.cwd` carries no filesystem namespace", which counts five independent cwd
   resolvers — and [#62169](https://github.com/NousResearch/hermes-agent/issues/62169),
   with no fix in `main`.
-- **The dispatcher's environment does not cross.** `terminal.env_passthrough` exists
+- **The worker's environment does not cross.** `terminal.env_passthrough` exists
   for exactly this and is read by `code_execution_tool.py` and the local and Docker
-  backends only, so every `HERMES_KANBAN_*` variable arrives empty on this backend.
+  backends only, so every `HERMES_KANBAN_*` variable arrives empty on this backend, and
+  so does the worker's `HERMES_HOME`, which on a card dispatched to a Cluster Agent is
+  the difference between its own profile and the default one's.
 - **`kanban_complete(artifacts=[...])` stats a guest path on the host.**
   `kanban_db.py` resolves each declared artifact with `pathlib` and calls `is_file()`
   in the gateway process, so a file that exists in the sandbox is reported as
@@ -258,8 +260,10 @@ environment](#one-connection-under-every-environment) below.
 
 Three workarounds carry the design past them. The sandbox image's
 [`ForceCommand`](#the-working-directory-has-to-exist-on-the-far-side-and-hermes-does-not-create-it)
-creates the working directory and recovers the two `HERMES_KANBAN_*` variables that a
-path can yield; the [skills tree is baked](#what-the-sandbox-needs-and-where-it-comes-from)
+creates the working directory, recovers the two `HERMES_KANBAN_*` variables that a
+path can yield, and narrows `HERMES_HOME` to the profile the agent image's `ssh` client
+names on every connection ([the profile home](#the-same-crossing-drops-the-profile-home));
+the [skills tree is baked](#what-the-sandbox-needs-and-where-it-comes-from)
 into the image rather than left to the backend's profile-unaware sync; and workers use
 `kanban_attach` in place of an artifact declared under the card's own workspace, which
 is the part of that defect nothing on this side can reach. None of them are in Hermes source — see
@@ -1466,25 +1470,42 @@ board is `<root>/kanban/workspaces/<id>`, under no profile home, so a Cluster Ag
 arrived with nothing but the root to go on, blocked on check 1 within seconds of every
 dispatch, and after two blocks tripped the loop breaker.
 
-So the client says which profile is speaking. The agent image carries
-`deploy/docker/ssh_config.d/10-sandbox-profile-home.conf`, a drop-in the base image's
+So the client says which profile is speaking. The agent image carries two files for it.
+`deploy/docker/ssh_config.d/10-sandbox-profile-home.conf` is a drop-in the base image's
 `/etc/ssh/ssh_config` includes:
 
 ```
-Match host *-shell-0.*-shell.* exec "test ${HERMES_HOME:+1}"
-    SetEnv HERMES_PROFILE_HOME=${HERMES_HOME}
+Match host *-shell-0.*-shell.*
+    SendEnv HERMES_PROFILE_HOME
 ```
 
-`ssh` expands `${HERMES_HOME}` from its own environment when it connects, so what arrives
-is the worker's value on every call — Hermes spawns one `ssh` per command, with no `-F`,
-so the system config is read. The `Match` scopes the rule to the sandbox's name as the
-operator builds it and skips the block when `HERMES_HOME` is unset or empty; without the
-guard an unset variable fails the connection rather than sending nothing. It travels under
-its own name rather than as `HERMES_HOME` because `sshd` applies `SetEnv` over anything
-accepted from the client, so the entrypoint's `SetEnv` would discard a forwarded
-`HERMES_HOME` on arrival. `sshd_config` accepts `HERMES_PROFILE_HOME` inside
-`Match User agent` — restating `LANG LC_*` there, since an `AcceptEnv` in a `Match` block
-replaces the global list rather than extending it — and `hermes` is never offered it.
+and `deploy/docker/ssh-wrapper.sh`, installed as `/usr/local/bin/ssh` ahead of the real
+client on `PATH`, copies `HERMES_HOME` to `HERMES_PROFILE_HOME` in the client's environment
+at the moment the client is spawned and execs `/usr/bin/ssh`. Hermes' backend
+(`tools/environments/ssh.py` in the base image, at the tag `tags.env` pins) spawns `ssh` by
+name with no `-F`, so it finds the wrapper and reads the system config. The `Match` scopes
+the rule to the sandbox's name as the operator builds it; `SendEnv` sends nothing for a
+variable that is not set, so an unset `HERMES_HOME` sends nothing. It travels under its own
+name rather than as `HERMES_HOME` because `sshd` applies `SetEnv` over anything accepted
+from the client, so the entrypoint's `SetEnv` would discard a forwarded `HERMES_HOME` on
+arrival. `sshd_config` accepts `HERMES_PROFILE_HOME` inside `Match User agent` — restating
+`LANG LC_*` there, since an `AcceptEnv` in a `Match` block replaces the global list rather
+than extending it — and `hermes` is never offered it.
+
+`SendEnv` from the environment, and not `SetEnv HERMES_PROFILE_HOME=${HERMES_HOME}`, which
+the client would expand itself and which needs no wrapper. That form does not survive
+[the connection sharing](#one-connection-under-every-environment) this document already
+records: every `ssh` Hermes spawns carries `ControlMaster=auto` with one `ControlPath` per
+`user@host:port`, so the gateway, the Platform Agent worker and every Cluster Agent card
+ride one master. A multiplexed client hands its session request to the master, and the
+master forwards the client's variables only where its own `SendEnv` list permits the name,
+then adds its own `SetEnv` values after them — so under `SetEnv` the sandbox sees the
+profile of whichever process opened the master, for as long as that master persists,
+which is the original failure with a different profile substituted. Reproduced against
+the sandbox image with the agent image's own client: a master opened as the platform
+profile, a second session asking as a cluster profile, and the platform profile arriving
+under `SetEnv`, the cluster profile under `SendEnv`. Section 4f of the smoke test keeps
+that pair of sessions as a case.
 
 The wrapper reads the value as a profile _name_, not a path. The two pods' data roots are
 different volumes that happen to share a path, so the component after the last
@@ -1492,24 +1513,27 @@ different volumes that happen to share a path, so the component after the last
 to exist already: the client picks among the homes the sandbox has and nothing else, the
 rule the cwd derivation already applied. The name wins over the working directory when
 both say something, because a worker's `HERMES_HOME` is who it is and its cwd is only
-where it is working. A value with no `/profiles/` in it is the root — what a worker on the
-default profile sends — and is silent; a name that is not one component is refused with a
-line on stderr; a well-formed name with no home here is a profile the mirror has not
+where it is working. The root itself, or a value with no `/profiles/` in it, is what a
+worker on the default profile sends and is silent — the root is matched by value first, so
+a data root with a `profiles` component in its own path is not read as a profile; a name
+that is not one component is refused with a line on stderr; a well-formed name with no
+home here is a profile the mirror has not
 delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` runs
 on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
 that window would otherwise fail the same way with nothing beside the failure to say why.
 Nothing evaluates the value; every use is a quoted expansion.
 
-The Dockerfile checks at build time, with `ssh -G`, that the include still reaches the
-drop-in and that the image's `ssh` expands it — an older client leaves `${HERMES_HOME}`
-literal, and would send it, which is also why the smoke test drives the drop-in from the
-agent image's own client rather than the runner's. Section 4e of the smoke test covers the
-sandbox's side over a real `sshd`: the shared-root workspace narrowing, the rebase, the
-name beating the cwd, the root, the unmirrored profile, the two refusals, the locale
-surviving the `Match` block, `hermes` getting nothing. Section 4f covers the client's: the
-expanded value in its debug log, an unset `HERMES_HOME` sending nothing, another host
-sending nothing. `tests/test_sandbox_session_command.py` runs the wrapper's decisions
-without Docker.
+The Dockerfile checks at build time that `ssh` resolves to the wrapper and the client it
+execs is there, and, with `ssh -G`, that the include still reaches the drop-in, that it
+parses on the image's client, and that the host pattern matches the operator's naming and
+nothing else. Section 4e of the smoke test covers the sandbox's side over a real `sshd`:
+the shared-root workspace narrowing, the rebase, the name beating the cwd, the root, the
+unmirrored profile, the two refusals, the locale surviving the `Match` block, `hermes`
+getting nothing. Section 4f covers the client's, from the agent image so that the wrapper
+and the drop-in are the image's own: the value in the client's debug log, an unset
+`HERMES_HOME` sending nothing, another host sending nothing, and the caller's profile
+arriving through a shared master. `tests/test_sandbox_session_command.py` runs the
+ForceCommand's decisions without Docker.
 
 #### `kanban_complete(artifacts=[...])` checks the file on the wrong pod
 

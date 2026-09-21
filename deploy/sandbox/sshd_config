@@ -106,8 +106,8 @@ Match User agent
     ForceCommand /usr/local/bin/sandbox-session-command
     # HERMES_PROFILE_HOME is the one variable taken from the client, and only
     # for this account. The agent image's ssh client sends the worker's own
-    # HERMES_HOME under that name on every connection
-    # (deploy/docker/ssh_config.d/10-sandbox-profile-home.conf), because a
+    # HERMES_HOME under that name on every connection (deploy/docker/
+    # ssh-wrapper.sh and ssh_config.d/10-sandbox-profile-home.conf), because a
     # card's working directory does not say which profile is speaking and the
     # ForceCommand above has nothing else to go on. Not HERMES_HOME itself: the
     # entrypoint's SetEnv names the root, and sshd applies SetEnv over anything
