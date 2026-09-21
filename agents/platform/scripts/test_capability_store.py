@@ -270,13 +270,29 @@ class ShippedTemplatesTest(unittest.TestCase):
                 defined = set(cs.load(SHIPPED, name).properties())
                 self.assertEqual(cited, defined)
 
-    def test_shipped_defaults_equal_the_schema_defaults(self):
-        # The template is the day-one value and the schema's `default` is what a
-        # reset returns to; the two saying different things is a trap for both.
+    def test_every_shipped_criteria_file_is_empty(self):
+        # The day-one value is the schema's `default`, read at use time, and the
+        # volume holds only what an operator tuned. Ship a populated
+        # criteria.json and the first scaffold copies every key onto the volume,
+        # where merge_volume_wins then pins it forever: no later release can
+        # correct a default, because the merge cannot tell a value the operator
+        # chose from one the image handed over on day one.
+        for name in cs.list_capabilities(SHIPPED):
+            with self.subTest(name):
+                self.assertEqual(cs.load(SHIPPED, name).criteria, {})
+
+    def test_every_shipped_schema_is_closed(self):
+        # additionalProperties: false is the ONLY thing that refuses an unknown
+        # key. A schema that omits it accepts anything the model invents, and
+        # every other guard in validate() still passes.
         for name in cs.list_capabilities(SHIPPED):
             with self.subTest(name):
                 cap = cs.load(SHIPPED, name)
-                self.assertEqual(cap.criteria, cap.defaults())
+                self.assertIs(cap.schema.get("additionalProperties"), False)
+                self.assertTrue(
+                    all("default" in spec for spec in cap.schema["properties"].values()),
+                    f"{name}: every property needs a default, since the template ships none",
+                )
 
     def test_every_shipped_capability_is_a_cron_job_on_the_platform_roster(self):
         roster = json.loads((REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json").read_text())

@@ -380,9 +380,18 @@ def merge_volume_wins(image: object, live: object) -> object:
 
     The volume wins every key it holds; the image contributes only the keys the
     volume is silent about. A threshold the operator tuned through the agent
-    therefore survives an upgrade, and a key a new release adds arrives with
-    its shipped default. A key the image stops shipping stays on the volume —
-    the image-owned schema beside it is what says the key is no longer defined.
+    therefore survives an upgrade.
+
+    This only behaves as intended because the template ships `criteria.json`
+    EMPTY. Day-one values come from the image-owned schema's `default`, read at
+    use time, so a key nobody has tuned is absent from the volume and a release
+    that changes its default reaches every install. Ship a populated
+    `criteria.json` instead and the first scaffold copies every key onto the
+    volume, after which the merge cannot tell a value the operator chose from
+    one the image handed over on day one — and no later release can correct a
+    default again, including a `never` key. A key the image stops shipping
+    stays on the volume; the schema beside it is what says it is no longer
+    defined.
     """
     if not isinstance(image, dict):
         return live if isinstance(live, dict) else image
@@ -429,9 +438,11 @@ def _restore_volume_wins(
         try:
             write_json_atomic(destination, merged, sort_keys=True)
         except OSError as exc:
-            # The image's defaults are in place, so the capability still runs;
-            # what is lost is the operator's tuning, which is worth a line.
-            log(f"WARN: could not merge {relative}; image defaults stand ({exc})")
+            # The copytree skipped this path, so the volume's file is still on
+            # disk untouched: any tuning is intact, and a key the image added
+            # is covered by the schema default that effective_criteria falls
+            # back to. What is lost is only the merge itself.
+            log(f"WARN: could not merge {relative}; the volume's copy stands ({exc})")
 
 
 def overlay_template(

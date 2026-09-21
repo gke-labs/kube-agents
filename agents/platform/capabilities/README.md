@@ -31,3 +31,23 @@ ship everything as `propose` until a capability has earned otherwise.
 This tree is not under `skills/` on purpose: the entrypoint replaces `skills/` wholesale on every
 start and the shell sandbox carries its own image copy, so nothing editable at runtime can live
 there.
+
+## Reading the store from a shell
+
+`capability_store.py` doubles as a read-only CLI for an operator on the gateway,
+which is how you read the audit trail after the fact:
+
+```bash
+python3 /opt/defaults/scripts/capability_store.py list
+python3 /opt/defaults/scripts/capability_store.py get <capability>
+python3 /opt/defaults/scripts/capability_store.py history <capability>
+```
+
+`history` prints the changelog entries newest last: the name given as
+`confirmed_by`, the reason, and the before and after value of every key the call
+changed. The name is recorded, not verified — it is what the operator told the
+agent, so the changelog answers "what changed and what was claimed", not "who
+authenticated".
+
+Writes do not go through the CLI. The only write path is the `capability_criteria`
+tool, which is where the learning policy is enforced.

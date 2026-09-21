@@ -77,8 +77,9 @@ MODE_CONFIRMED = "confirmed"
 MODE_AUTONOMOUS = POLICY_AUTONOMOUS
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
-# Bounds on what one call may carry, so a runaway model cannot fill the volume
-# through this path.
+# Bounds on what ONE call may carry. These cap an entry, not the file:
+# changelog.jsonl is append-only with no rotation, so a persistent caller can
+# still grow it without limit. Bounding the file is not solved here.
 MAX_CHANGES_PER_CALL = 32
 MAX_REASON_CHARS = 2000
 # A name or handle, not a transcript pasted as evidence of who agreed.
