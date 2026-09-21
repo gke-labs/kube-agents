@@ -540,6 +540,9 @@ class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
         self.assertNotIn("rc=", proc.stdout)
         self.assertIn("Could not read the plugin image tags", proc.stdout)
         self.assertIn("plugins is not an object", proc.stdout)
+        # One banner, from the caller: a second one would mean the trap fired
+        # inside the jq substitution as well, which `trap - ERR` there prevents.
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
 
     def test_a_failing_helm_read_is_an_error_that_names_the_cause(self):
         """An empty list would run the pre-fix re-tag and leave the plugins behind."""
