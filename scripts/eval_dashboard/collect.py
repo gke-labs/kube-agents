@@ -18,8 +18,9 @@ resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which job
 produced the run: the presubmit gate, or the nightly periodic below),
 `runs[].has_build_log` plus the `runs[].pod_*` trio (how the build ended,
 from Prow's podinfo.json -- read only for a build that looks like a lost
-pod, below), `runs[].merge_conflict` (below) and `releases[]`
-(release-candidate eval runs, below).
+pod, below), `runs[].merge_conflict` (below), `runs[].eval_outcome` with
+`runs[].not_evaluated` (the suite's own not-evaluated verdict, below) and
+`releases[]` (release-candidate eval runs, below).
 
 Two tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
 gate matrix on every pull request; the nightly periodic
@@ -43,6 +44,19 @@ A pull request that will not merge into main leaves the same zero-task
 FAILURE (2026-09-15: #1569, #1572, #1575, reported as an infrastructure
 degradation; #1608). clone-records.json is read for those builds too, and
 `merge_conflict` says which of the two it was.
+
+A run the suite could not evaluate -- an admitted case, or every case, lost
+every repetition to infrastructure -- ends with the same `PR Smoke Test
+Evaluation Failed` anchors on its final line, with `NOT EVALUATED` between
+them, and `outcome: not_evaluated` in the `eval-verdict.json` that
+`bench-gate suite` wrote into the job's artifacts (hack/ci-eval-pr.sh,
+announce_suite_verdict). The line alone is not trusted: for a build whose
+final line carries the marker, that one artifact is read as well, and only
+when its `outcome` agrees does the run carry `eval_outcome: "not_evaluated"`
+and the `not_evaluated` case ids -- the same double check the script makes
+before it prints the marker. `eval_verdict` stays `RED` either way, so a
+reader of that field alone keeps working; the consumers that tell the two
+apart (classify.py, gate_comment.py) read `eval_outcome`.
 
 Release candidates are collected separately and land in `releases[]`, never
 in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
@@ -250,6 +264,16 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # the health adjudicator needs to tell a lost pod from a clone failure.
 PODINFO_FILE = "podinfo.json"
 BUILD_LOG_FILE = "build-log.txt"
+# The suite's own verdict, written by `bench-gate suite --json-out` into
+# the job's artifacts and uploaded by Prow beside the log (module
+# docstring). Read only for a build whose final line carries the marker
+# between its anchors -- one extra object for those builds, none for any
+# other -- and honoured only when its `outcome` is the word below, which is
+# scoring.py's SUITE_OUTCOME_NOT_EVALUATED and hack/ci-eval-pr.sh's
+# EVAL_VERDICT_OUTCOME_NOT_EVALUATED.
+EVAL_VERDICT_FILE = "artifacts/eval-verdict.json"
+NOT_EVALUATED_MARKER = "NOT EVALUATED"
+EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
 # Prow's clone-records.json: `[{refs, commands[], failed}]`. Read for the
 # zero-task FAILURE builds, to separate a pull request that would not merge
 # into its base from a setup crash.
@@ -477,6 +501,7 @@ def parse_build_log(text: str) -> dict:
     current = None  # the task the next rep grading line belongs to
     eval_verdict = None
     eval_duration_s = None
+    not_evaluated_line = False
     for line in text.splitlines():
         # The agent's own words first, and consumed whole: every other
         # pattern below that is an unanchored `search` (the lease, the final
@@ -519,13 +544,39 @@ def parse_build_log(text: str) -> dict:
         if m:
             eval_verdict = m.group("verdict")
             eval_duration_s = int(m.group("duration"))
+            # The classification words sit between the anchors (module
+            # docstring); the line only says which builds to read the
+            # verdict file for.
+            not_evaluated_line = NOT_EVALUATED_MARKER in line
             current = None  # nothing after the verdict is grading detail
     return {
         "project": project,
         "tasks": tasks,
         "eval_verdict": eval_verdict,
         "eval_duration_s": eval_duration_s,
+        "not_evaluated_line": not_evaluated_line,
     }
+
+
+def parse_eval_verdict(text: str | None) -> list[str] | None:
+    """The case ids a not-evaluated `eval-verdict.json` names, or None.
+
+    None for a missing or malformed file and for any other `outcome`: the
+    caller then records the run as the plain RED its final line's `Failed`
+    word already says, never a not-evaluated one on the line's word alone.
+    A `not_evaluated` list that is absent or malformed reads as empty; the
+    outcome is the fact and the list is detail.
+    """
+    if text is None:
+        return None
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or doc.get("outcome") != EVAL_OUTCOME_NOT_EVALUATED:
+        return None
+    named = doc.get("not_evaluated")
+    return [case for case in named if isinstance(case, str) and case] if isinstance(named, list) else []
 
 
 def _iso(ts) -> str | None:
@@ -660,6 +711,24 @@ def build_run(
     parsed = parse_build_log(log_text or "")
     result = finished.get("result")
 
+    # The suite's own verdict (module docstring): one read of the artifact,
+    # only for a build whose final line says NOT EVALUATED, and only
+    # recorded when the artifact agrees. A line without an agreeing file
+    # is the plain RED the line's `Failed` word already says, with a
+    # warning so a renamed artifact cannot silently turn every such run
+    # back into a hard failure.
+    suite: dict = {}
+    if parsed["not_evaluated_line"]:
+        lost = parse_eval_verdict(read(EVAL_VERDICT_FILE))
+        if lost is None:
+            print(
+                f"warning: build {build_id}: the final line says {NOT_EVALUATED_MARKER} but"
+                f" {EVAL_VERDICT_FILE} is missing or does not agree; recorded as a plain RED",
+                file=sys.stderr,
+            )
+        else:
+            suite = {"eval_outcome": EVAL_OUTCOME_NOT_EVALUATED, "not_evaluated": lost}
+
     # How the build ended (module docstring). A build that ran has a log and
     # costs no extra read; the two shapes a lost pod leaves -- no log at all,
     # or a zero-task FAILURE -- pay one read of podinfo.json. `has_build_log`
@@ -740,6 +809,7 @@ def build_run(
         "eval_verdict": _EVAL_VERDICT_BY_WORD.get(parsed["eval_verdict"]),
         "duration_s": duration_s,
         "tasks": parsed["tasks"],
+        **suite,
         **ended,
     }
 

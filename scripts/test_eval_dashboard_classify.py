@@ -591,6 +591,7 @@ class RealWeekTest(unittest.TestCase):
     def test_the_fixture_is_real_and_trimmed(self):
         self.assertGreater(len(self.runs), 100)
         self.assertIn("trimmed", self.data)
+        self.assertIn("2097362141184626688", self.data["trimmed"]["derived"], "the one derived run is declared")
         prs = {r["pr"] for r in self.runs}
         for pr in (1275, 1246, 1238, 1150, 1226, 1267, 913, 608):
             self.assertIn(pr, prs)
@@ -659,16 +660,102 @@ class RealWeekTest(unittest.TestCase):
         self.assertEqual(verdict["cls"], "setup")
         self.assertTrue(verdict["matches_incident"])
 
+    def test_the_derived_not_evaluated_run_inside_the_outage(self):
+        # SCHEMA.md, Fixtures: the testdata_notevaluated/ build re-dated into
+        # the window. The outage's shared rule must not claim it: its one
+        # lost case graded nothing, and the suite's word comes first.
+        verdict = self.verdict("2097362141184626688")
+        self.assertEqual(verdict["pr"], 1782)
+        self.assertEqual(verdict["verdict"], "not_evaluated")
+        self.assertEqual(verdict["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(verdict["headline"], "Not evaluated: 1 gate case lost every repetition to infrastructure.")
+        self.assertFalse(verdict["matches_incident"])
+        self.assertEqual(case(verdict, "security-overgrant-probe")["outcome"], "infra")
+
     def test_the_contract_keys_are_present_on_every_run(self):
         for r in self.runs:
             verdict = classify.classify_run(r, self.runs, health_at=OUTAGE, admitted=ADMITTED)
             self.assertEqual(set(verdict) >= {"build", "pr", "headline", "verdict", "cases", "matches_incident"}, True)
-            self.assertIn(verdict["verdict"], ("red", "green", "infra"))
+            self.assertIn(verdict["verdict"], ("red", "green", "infra", "not_evaluated"))
             for c in verdict["cases"]:
                 self.assertEqual(set(c) >= {"case", "outcome", "cls", "also_failing_prs", "pass_rate_30d", "reason", "excerpt", "do"}, True)
                 self.assertIsNone(c["nightly_failed_recent"], "no nightly in the fixture week")
                 self.assertIn(c["outcome"], ("failed", "partial", "passed", "infra"))
                 self.assertIn(c["cls"], ("shared", "only-this-pr", "storm", "setup", None))
+
+
+
+def not_evaluated_run(build=1, pr=1782, lost=("security-overgrant-probe",), every=False, finished=T0):
+    """What the collector records for a run the suite could not evaluate
+    (SCHEMA.md, `eval_outcome`): the lost cases graded nothing, the rest
+    passed, Prow says FAILURE, and the suite's list names the lost ones."""
+    names = sorted(ADMITTED)
+    tasks = [task(n, "iii" if (every or n in lost) else "ppp") for n in names] + [task(HOLD_OUT, "iii" if every else "ppp")]
+    target = run(build, pr, finished, result="FAILURE", tasks=tasks)
+    target["eval_outcome"] = "not_evaluated"
+    target["not_evaluated"] = names + [HOLD_OUT] if every else list(lost)
+    return target
+
+
+class NotEvaluatedTest(unittest.TestCase):
+    """The suite's own verdict (hack/ci-eval-pr.sh exit 2) is the fourth
+    headline state: never the "absolute rule tripped" red the same run read
+    as before the collector recorded it, and never folded into infra."""
+
+    def test_the_suites_verdict_is_its_own_headline_never_the_absolute_rule_text(self):
+        target = not_evaluated_run()
+        verdict = classify_run(target, [target])
+        self.assertEqual(verdict["verdict"], "not_evaluated")
+        self.assertEqual(verdict["headline"], "Not evaluated: 1 gate case lost every repetition to infrastructure.")
+        self.assertIn("Nothing was graded for security-overgrant-probe, so the gate could certify nothing and found nothing against the change.", verdict["lede"])
+        self.assertIn("no absolute check tripped", verdict["lede"])
+        self.assertNotIn("absolute rule", verdict["headline"] + verdict["lede"])
+        self.assertEqual(verdict["do"], classify.DO_NOT_EVALUATED)
+        self.assertEqual(verdict["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(case(verdict, "security-overgrant-probe")["outcome"], "infra")
+        self.assertEqual(case(verdict, "reliability-pdb-probe")["outcome"], "passed")
+        self.assertFalse(verdict["matches_incident"])
+        self.assertFalse(verdict["setup_death"])
+
+    def test_every_case_lost_has_its_own_headline_and_matches_a_declared_storm(self):
+        target = not_evaluated_run(every=True)
+        verdict = classify_run(target, [target], health_at=STORM)
+        self.assertEqual(verdict["headline"], "Not evaluated: every case lost every repetition to infrastructure.")
+        self.assertEqual(verdict["verdict"], "not_evaluated")
+        self.assertTrue(verdict["matches_incident"])
+        self.assertIn("A quota storm is declared right now.", verdict["lede"])
+        self.assertEqual(verdict["not_evaluated"], sorted(ADMITTED) + [HOLD_OUT])
+
+    def test_without_the_suites_list_the_lost_cases_are_the_admitted_ones_that_graded_nothing(self):
+        target = not_evaluated_run()
+        target["not_evaluated"] = []
+        verdict = classify_run(target, [target])
+        self.assertEqual(verdict["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(verdict["verdict"], "not_evaluated")
+
+    def test_the_same_run_without_the_field_still_reads_as_the_hard_red_it_always_was(self):
+        target = not_evaluated_run()
+        del target["eval_outcome"]
+        del target["not_evaluated"]
+        verdict = classify_run(target, [target])
+        self.assertEqual(verdict["verdict"], "red")
+        self.assertTrue(verdict["headline"].startswith("The run is red, but no gate case failed outright."))
+        self.assertNotIn("not_evaluated", verdict)
+
+    def test_a_record_with_the_field_and_no_tasks_is_still_not_evaluated(self):
+        target = run(1, 1782, T0, result="FAILURE", tasks=[])
+        target.update({"eval_outcome": "not_evaluated", "not_evaluated": ["agent-kanban-smoke"]})
+        verdict = classify_run(target, [target])
+        self.assertEqual((verdict["verdict"], verdict["not_evaluated"]), ("not_evaluated", ["agent-kanban-smoke"]))
+        self.assertEqual(verdict["headline"], "Not evaluated: 1 gate case lost every repetition to infrastructure.")
+
+    def test_the_emptied_run_of_a_storm_without_the_field_is_still_the_storms_shape(self):
+        # The suite decides which one it is; a record without its word reads
+        # as it did before the field existed.
+        target = run(1, 1, T0, tasks=[task(n, "iii") for n in sorted(ADMITTED)], result="FAILURE")
+        verdict = classify_run(target, [target], health_at=STORM)
+        self.assertEqual(verdict["verdict"], "infra")
+        self.assertTrue(verdict["headline"].startswith("Nothing was graded"))
 
 
 if __name__ == "__main__":

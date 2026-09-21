@@ -58,6 +58,12 @@ LOSTPOD_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / 
 BUILD_1118_LOST = "2098383791838990336"  # PR 1118, NodeNotReady 2h08m in, no build-log.txt
 BUILD_1446_CLONE_FAILED = "2098418565454499840"  # PR 1446, clone failed (merge conflict) in 0s
 
+# The one DERIVED build (SCHEMA.md, Fixtures): the suite's not-evaluated
+# verdict -- NOT EVALUATED on the final line, artifacts/eval-verdict.json
+# agreeing -- which no real build carried when the fixture was written.
+NOTEVAL_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_notevaluated"
+BUILD_1782_NOT_EVALUATED = "2101862036789329920"  # one admitted case lost every repetition
+
 # The three real builds, oldest first (started.json timestamps).
 BUILD_956_TRUNCATED = "2092688354838581248"  # PR 956, deadline hit before verdict
 BUILD_998_INFRA = "2093030474753511424"  # PR 998, compliance canary infra-failed
@@ -2010,6 +2016,89 @@ class TestPrMerged(unittest.TestCase):
         self.assertIs(runs[5]["pr_merged"], False)  # recent first resolution
         asked = {line.split()[2] for line in log.read_text().splitlines()}
         self.assertEqual(asked, {"30", "60"})
+
+
+
+class TestNotEvaluatedRun(unittest.TestCase):
+    """runs[].eval_outcome and runs[].not_evaluated (SCHEMA.md), from the
+    DERIVED build under testdata_notevaluated/ -- no real run had ended with
+    the verdict when it was written; SCHEMA.md's fixtures table says so. Its
+    final line carries NOT EVALUATED between the anchors and its
+    artifacts/eval-verdict.json says `outcome: not_evaluated`, the two facts
+    the collector requires together."""
+
+    def fixture(self):
+        return collect.runs_from_dir(NOTEVAL_TESTDATA)[0]
+
+    def test_the_suites_verdict_rides_beside_a_red_eval_verdict(self):
+        run = self.fixture()
+        self.assertEqual(run["build_id"], BUILD_1782_NOT_EVALUATED)
+        self.assertEqual((run["result"], run["eval_verdict"]), ("FAILURE", "RED"), "the line's Failed word still reads RED")
+        self.assertEqual(run["eval_outcome"], "not_evaluated")
+        self.assertEqual(run["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(run["duration_s"], 1631, "the anchors survive the words between them")
+        by_name = {t["name"]: t for t in run["tasks"]}
+        self.assertEqual(by_name["security-overgrant-probe"]["result"], "infra")
+        self.assertEqual([r["result"] for r in by_name["security-overgrant-probe"]["reps"]], ["infra", "infra", "infra"])
+        self.assertEqual(by_name["reliability-pdb-probe"]["result"], "pass")
+        self.assertEqual(
+            list(run),
+            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "eval_outcome", "not_evaluated", "has_build_log"],
+        )
+
+    def test_the_verdict_file_is_read_once_and_only_when_the_line_says_so(self):
+        asked = []
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+
+        def reader(name):
+            asked.append(name)
+            return inner(name)
+
+        run = collect.build_run(BUILD_1782_NOT_EVALUATED, reader)
+        self.assertEqual(asked.count("artifacts/eval-verdict.json"), 1)
+        self.assertEqual(run["eval_outcome"], "not_evaluated")
+        asked.clear()
+        plain = collect._dir_reader(TESTDATA / BUILD_998_FULL)
+
+        def plain_reader(name):
+            asked.append(name)
+            return plain(name)
+
+        run = collect.build_run(BUILD_998_FULL, plain_reader)
+        self.assertNotIn("artifacts/eval-verdict.json", asked, "a plain Failed line costs no extra read")
+        self.assertFalse({"eval_outcome", "not_evaluated"} & set(run))
+
+    def test_a_line_without_an_agreeing_file_is_a_plain_red_with_a_warning(self):
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        for label, verdict_text in (
+            ("missing", None),
+            ("malformed", "{"),
+            ("a red outcome", json.dumps({"green": False, "outcome": "red", "not_evaluated": []})),
+            ("not an object", json.dumps(["not_evaluated"])),
+        ):
+            with self.subTest(label):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: verdict_text if name == "artifacts/eval-verdict.json" else inner(name))
+                self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
+                self.assertEqual(run["eval_verdict"], "RED")
+                self.assertIn("the final line says NOT EVALUATED but artifacts/eval-verdict.json is missing or does not agree", err.getvalue())
+
+    def test_parse_eval_verdict(self):
+        self.assertIsNone(collect.parse_eval_verdict(None))
+        self.assertIsNone(collect.parse_eval_verdict("{"))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "green"})))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps([])))
+        self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated"})), [], "the outcome is the fact; the list is detail")
+        self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": "a"})), [])
+        self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": ["a", 3, "", None, "b"]})), ["a", "b"])
+
+    def test_the_fields_reach_data_json_and_the_lost_case_counts_against_nothing(self):
+        data = collect.collect(from_dir=NOTEVAL_TESTDATA)
+        run = json.loads(json.dumps(data))["runs"][0]
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+        lost = _cases_by_name(data)["security-overgrant-probe"]
+        self.assertEqual((lost["runs_on_record"], lost["pass_rate"], lost["last3"]), (1, None, ["infra"]))
 
 
 if __name__ == "__main__":

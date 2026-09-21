@@ -48,6 +48,9 @@ OUTAGE_SINCE = "2026-09-08T09:00:00+00:00"
 # 1274, finished 09-08 10:39:30Z = Tue 6:39 AM ET.
 SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
 SETUP_DEATH_BUILD = "2097273589702070272"
+# The one derived run in the fixture (SCHEMA.md, Fixtures): the suite's
+# not-evaluated verdict, re-dated into the outage window.
+NOT_EVALUATED_BUILD = "2097362141184626688"
 SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
 
@@ -1179,6 +1182,21 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("Read the build log", app)
         self.assertNotIn("died during setup", app)
 
+    def test_pr_view_not_evaluated_run(self):
+        # The suite's own verdict: neither the hard-failure page ("Read the
+        # build log") nor the PR's ("Fix the PR."), and the lost case sits
+        # under Not graded.
+        app = dom_text(self.run_page, query=f"build={NOT_EVALUATED_BUILD}")
+        self.assertIn("Not evaluated: 1 gate case lost every repetition to infrastructure.", app)
+        self.assertIn("Not graded · 1", app)
+        self.assertIn("<b>Retest once the environment is healthy.</b>", app)
+        self.assertIn("no absolute-check failure", app)
+        for absent in ("Read the build log", "Fix the PR.", "absolute rule", "Nothing right now."):
+            self.assertNotIn(absent, app)
+        index = dom_text(self.index)
+        self.assertIn('class="runrow v-not_evaluated"', index)
+        self.assertIn("not evaluated · 1 case lost", index)
+
     def test_pr_view_unknown_build(self):
         app = dom_text(self.run_page, query="build=1")
         self.assertIn(f"No run with that id in the last {render.RUN_VIEW_DAYS} days.", app)
@@ -1455,6 +1473,30 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn("no eval banner · job SUCCESS", app)
         self.assertNotIn("javascript:", app)
         self.assertNotIn('href="hostile', app)
+
+
+
+class NotEvaluatedVerdictTest(unittest.TestCase):
+    """The fourth verdict (classify.py: the suite itself could not evaluate
+    the run) travels through brief.json and the pages know its token."""
+
+    def test_the_brief_carries_the_verdict_and_the_lost_cases(self):
+        data = load_fixture()
+        data["generated_at"] = NOW
+        data["cases"] = [{"name": n, "active": True} for n in CRASHLOOP_TRIO]
+        brief = render.brief_document(data, render.normalize_health(health_doc()), None, None)
+        run = next(r for r in brief["runs"] if r["build"] == NOT_EVALUATED_BUILD)
+        self.assertEqual(run["verdict"], "not_evaluated")
+        self.assertEqual(run["not_evaluated"], ["security-overgrant-probe"])
+        self.assertTrue(run["headline"].startswith("Not evaluated: 1 gate case lost every repetition"))
+        self.assertTrue(run["do"].startswith("Retest once the environment is healthy."))
+        other = next(r for r in brief["runs"] if r["build"] == "2097282860221206528")
+        self.assertEqual(other["not_evaluated"], [], "every other verdict carries the empty list")
+
+    def test_pages_js_and_the_template_know_the_token(self):
+        script = PAGES_JS.read_text()
+        self.assertIn('run.verdict === "not_evaluated"', script)
+        self.assertIn(".runrow.v-not_evaluated", (PAGES_JS.parent / "page.html.tmpl").read_text())
 
 
 if __name__ == "__main__":

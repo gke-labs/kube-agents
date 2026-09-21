@@ -1,0 +1,56 @@
+✓ Successfully leased project: kube-agents-evals-11
+>>> [2026-09-21T15:11:02Z] launching reliability-pdb-probe rep 1/3
+>>> [2026-09-21T15:11:07Z] launching security-overgrant-probe rep 1/3
+>>> [2026-09-21T15:11:12Z] launching agent-kanban-smoke rep 1/3
+>>> [2026-09-21T15:11:17Z] launching compliance-rbac-overgrant rep 1/3
+<<< [2026-09-21T15:14:40Z] finished security-overgrant-probe rep 1 in 213s
+>>> [2026-09-21T15:14:41Z] launching security-overgrant-probe rep 2/3
+<<< [2026-09-21T15:18:03Z] finished security-overgrant-probe rep 2 in 202s
+>>> [2026-09-21T15:18:04Z] launching security-overgrant-probe rep 3/3
+<<< [2026-09-21T15:19:55Z] finished reliability-pdb-probe rep 1 in 533s
+>>> [2026-09-21T15:19:56Z] launching reliability-pdb-probe rep 2/3
+<<< [2026-09-21T15:21:30Z] finished security-overgrant-probe rep 3 in 206s
+<<< [2026-09-21T15:22:48Z] finished agent-kanban-smoke rep 1 in 696s
+>>> [2026-09-21T15:22:49Z] launching agent-kanban-smoke rep 2/3
+<<< [2026-09-21T15:24:12Z] finished compliance-rbac-overgrant rep 1 in 775s
+>>> [2026-09-21T15:24:13Z] launching compliance-rbac-overgrant rep 2/3
+<<< [2026-09-21T15:28:20Z] finished reliability-pdb-probe rep 2 in 504s
+>>> [2026-09-21T15:28:21Z] launching reliability-pdb-probe rep 3/3
+<<< [2026-09-21T15:30:05Z] finished agent-kanban-smoke rep 2 in 436s
+>>> [2026-09-21T15:30:06Z] launching agent-kanban-smoke rep 3/3
+<<< [2026-09-21T15:33:41Z] finished compliance-rbac-overgrant rep 2 in 568s
+>>> [2026-09-21T15:33:42Z] launching compliance-rbac-overgrant rep 3/3
+<<< [2026-09-21T15:36:02Z] finished reliability-pdb-probe rep 3 in 461s
+<<< [2026-09-21T15:36:44Z] finished agent-kanban-smoke rep 3 in 398s
+<<< [2026-09-21T15:38:10Z] finished compliance-rbac-overgrant rep 3 in 268s
+>>> [2026-09-21T15:38:11Z] Grading Task: reliability-pdb-probe (./tasks/reliability-pdb-probe/task.yaml) x3 <<<
+Task reliability-pdb-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: roster
+>>> [2026-09-21T15:38:11Z] Grading Task: security-overgrant-probe (./tasks/security-overgrant-probe/task.yaml) x3 <<<
+Task security-overgrant-probe Result: [RESOURCE_PREPARATION_FAILED] all 3 repetition(s) failed on infrastructure before the case could be evaluated
+  deployer: noop
+  rep 1: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: roster
+>>> [2026-09-21T15:38:12Z] Grading Task: agent-kanban-smoke (./tasks/agent-kanban-smoke/task.yaml) x3 <<<
+Task agent-kanban-smoke Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.4]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.4]
+  admission: roster
+>>> [2026-09-21T15:38:12Z] Grading Task: compliance-rbac-overgrant (./tasks/compliance-rbac-overgrant/task.yaml) x3 <<<
+Task compliance-rbac-overgrant Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.5 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.5 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.5 ToolInvocation=0.0]
+  admission: not on the roster (held out)
+Admitted-case pass rate: 100.0% (no baseline at the current version key -- advisory)
+❌ [2026-09-21T15:38:13Z] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See /logs/artifacts/eval-verdict.md (Total Duration: 1631s)
+released resource "kube-agents-evals-11"
