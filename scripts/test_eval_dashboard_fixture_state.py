@@ -204,7 +204,7 @@ def _cluster_b():
 
 def healthy_world(*projects):
     """Every role planted and in its designed state on each project."""
-    trio = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"]]
+    trio = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
     return {
         "clusters": {project: trio for project in projects},
         "kubectl": {
@@ -220,6 +220,18 @@ def healthy_world(*projects):
             "poddisruptionbudget?": {"items": []},
             "clusterrolebinding/debug-binding": {"roleRef": {"name": "cluster-admin"}, "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}]},
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [{"spec": {"taints": [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            # seeded-d's zonal-skew trio. Each is in the state its role's
+            # `state` block asserts: a scheduled pod for the scheduling case,
+            # a Bound claim for the volume case, and a Pending pod for the
+            # capacity case -- the three signals that say the skew's cause is
+            # actually present rather than merely that the objects exist.
+            "namespace/seeded-topology": {"metadata": {"name": "seeded-topology"}},
+            "deployment/zone-pinned-api": {"status": {"readyReplicas": 4, "replicas": 4}},
+            "pod?app=zone-pinned-api": _pods(_pod(restarts=0, last_reason=None)),
+            "statefulset/zone-bound-store": {"status": {"readyReplicas": 1}},
+            "persistentvolumeclaim?app=zone-bound-store": {"items": [{"status": {"phase": "Bound"}}]},
+            "deployment/capacity-starved-worker": {"status": {"readyReplicas": 1, "replicas": 3}},
+            "pod?app=capacity-starved-worker": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")),
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
@@ -299,10 +311,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 7, "drifted": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 10, "drifted": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 7, "drifted": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 10, "drifted": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -356,7 +368,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 13, "drifted": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 19, "drifted": 1, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

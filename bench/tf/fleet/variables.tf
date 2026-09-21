@@ -24,8 +24,14 @@ variable "zone" {
   default     = "us-central1-a"
 }
 
+variable "second_zone" {
+  description = "The second zone seeded-d's nodes span. Must be in the same region as var.zone: a node pool's zones are region-scoped, and the skew fixtures below are about distribution within one region, which is the shape the anomaly checks have to reason about."
+  type        = string
+  default     = "us-central1-b"
+}
+
 variable "cluster_prefix" {
-  description = "Name prefix for the three clusters (seeded-a, seeded-b, seeded-c)."
+  description = "Name prefix for the clusters (seeded-a, seeded-b, seeded-c, seeded-d)."
   type        = string
   default     = "seeded"
 }

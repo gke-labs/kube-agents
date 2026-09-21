@@ -90,13 +90,42 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
-only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
-outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
-cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
-from voting on the baseline.
+Eleven fixtures: ten across the four cluster slots and one project-scoped. The namespace-level
+fixtures are on slot `a`, across the four seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security` and `seeded-capacity`, plus both defect node pools.
+Slots `b` and `c` carry GKE-level defects only and no workloads at all: `b` is the held-back
+control plane, `c` is the configuration outlier. Slot `d` is the exception to "the defect is
+something planted in a cluster" — there, the cluster's own shape is the fixture.
+
+`a`, `b` and `c` are labelled `environment=seeded`, which is what confines the drift cohort to
+those three and keeps `platform-agent-host` and transient `eval-pr*` clusters from voting on the
+baseline. **Slot `d` deliberately carries no such label.** The drift SOP's severity ladder is
+computed over the cohort, and a fourth voter changes that arithmetic; unlabelled, `d` sits alone
+in the unknown-environment cohort, where the three-cluster floor keeps it from producing drift
+findings at all. Anything added to the fleet later inherits that rule: join the cohort only if
+the drift scenarios are meant to see you.
+
+### Slot `d`: the shape is the fixture
+
+Zonal skew is the one anomaly that cannot be planted as an object. A cluster whose nodes are all
+in one zone has no zonal distribution, so `a`, `b` and `c` — each single-zone — cannot carry it.
+Slot `d` is multi-zonal: a zonal control plane with `node_locations` spanning two zones, one
+`e2-small` in each. That is the cheapest shape on which "the pods are all in one zone" is a true
+statement about a real cluster, and it is two nodes' worth of standing cost rather than a
+regional control plane's.
+
+Its three roles exist to separate _noticing_ skew from _explaining_ it, which is the part an
+agent gets wrong:
+
+| Role                    | Cause it plants                                                                                     | What distinguishes it                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `zonal-skew-scheduling` | A `topologySpreadConstraint` set to `ScheduleAnyway` beside a node affinity only one zone satisfies | The constraint reads as protection and is a preference; the fix is a manifest edit                   |
+| `zonal-skew-volume`     | A StatefulSet whose zonal PersistentVolumeClaim binds it to one zone                                | The pod cannot move without its data; the fix is a migration, not an edit                            |
+| `zonal-skew-capacity`   | Replicas that do not fit the second zone's node, leaving Pending pods                               | Distribution looks identical to the scheduling case, and only the Pending pods' events say otherwise |
+
+The last two rows are why there are three fixtures rather than one. A check that reports "skew"
+on all three has done the easy half; a check that calls the capacity case a misconfiguration
+sends someone to edit a manifest that is correct.
 
 | Role                 | Slot    | Day | What is planted                                                                       |
 | -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
