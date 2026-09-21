@@ -2084,6 +2084,22 @@ class TestNotEvaluatedRun(unittest.TestCase):
                 self.assertEqual(run["eval_verdict"], "RED")
                 self.assertIn("the final line says NOT EVALUATED but artifacts/eval-verdict.json is missing or does not agree", err.getvalue())
 
+    def test_a_transient_miss_on_the_artifact_gets_a_second_read(self):
+        # A recorded build is never re-read, so one failed object read must
+        # not record a not-evaluated run as the hard red for good.
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        misses = []
+
+        def reader(name):
+            if name == "artifacts/eval-verdict.json" and not misses:
+                misses.append(name)
+                return None
+            return inner(name)
+
+        run = collect.build_run(BUILD_1782_NOT_EVALUATED, reader)
+        self.assertEqual(misses, ["artifacts/eval-verdict.json"])
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+
     def test_parse_eval_verdict(self):
         self.assertIsNone(collect.parse_eval_verdict(None))
         self.assertIsNone(collect.parse_eval_verdict("{"))

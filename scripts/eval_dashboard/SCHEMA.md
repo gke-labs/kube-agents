@@ -444,7 +444,7 @@ what the renderer does with them.
   `gate_comment.py` does not read it; no comment is left either way.
   Absent reads as a setup crash.
 - `runs[].eval_outcome`, `runs[].not_evaluated` — an `eval_outcome` of
-  `not_evaluated` is the fourth run verdict, read before every other
+  `not_evaluated` is a run verdict of its own, read before every other
   rule and never folded into `red` or `infra`: `classify.py` verdicts the
   run `not_evaluated` with a headline naming the lost cases (the suite's
   list, else the admitted cases that graded nothing) and a retest-when-
@@ -452,8 +452,12 @@ what the renderer does with them.
   answers `is_red` false for it and leaves the one-line ⚪ "run not
   evaluated" comment naming those cases; `render.py` passes the verdict
   and the list through to `brief.json`, where the run page and the Brief's
-  run rows label the run and the numbers count it apart from the gate's
-  reds. `health.py` carries both on `Run` and no rule reads them. Absent
+  run rows label the run and the Reds tile says how many of the gate's reds
+  were not evaluated (the count stays inside `infra_reds`, so the tile and
+  the daily digest agree). A gate case that failed every graded repetition
+  on the same run is named in the lede and the comment (the suite's roster
+  is the branch's; the dashboard's can be newer). `health.py` carries both
+  on `Run`, keeps them through `--trim`, and no rule reads them. Absent
   reads as a run the suite graded.
 
 ### `coverage` — from `docs/designs/domains.yaml`
@@ -1068,5 +1072,5 @@ the crashloop outage of 09-07/08 with PR #608's 15-case red inside it),
 trimmed to the fields `classify.py` reads, for `test_eval_dashboard_classify.py`
 and the page tests — plus one **derived** run, build 2097362141184626688,
 the `testdata_notevaluated/` build re-dated into the outage window so the
-fourth verdict is classified and rendered beside the real week; its
+not-evaluated verdict is classified and rendered beside the real week; its
 `trimmed.derived` note says so.

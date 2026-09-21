@@ -749,6 +749,18 @@ class NotEvaluatedTest(unittest.TestCase):
         self.assertEqual((verdict["verdict"], verdict["not_evaluated"]), ("not_evaluated", ["agent-kanban-smoke"]))
         self.assertEqual(verdict["headline"], "Not evaluated: 1 gate case lost every repetition to infrastructure.")
 
+    def test_a_gate_case_that_collapsed_on_the_same_run_is_named_in_the_lede(self):
+        # The suite's roster is the branch's; the dashboard's can be newer.
+        # The verdict stays the suite's, the case keeps its own class and do,
+        # and the lede says what to read before retesting.
+        target = not_evaluated_run()
+        target["tasks"] = [task(n, "iii" if n == "security-overgrant-probe" else "fff" if n == "agent-kanban-smoke" else "ppp") for n in sorted(ADMITTED)]
+        verdict = classify_run(target, [target])
+        self.assertEqual(verdict["verdict"], "not_evaluated")
+        self.assertTrue(verdict["lede"].endswith("agent-kanban-smoke also failed every graded repetition here; read its transcript before retesting."), verdict["lede"])
+        self.assertEqual(case(verdict, "agent-kanban-smoke")["outcome"], "failed")
+        self.assertEqual(case(verdict, "agent-kanban-smoke")["do"], classify.DO_UNCLEAR)
+
     def test_the_emptied_run_of_a_storm_without_the_field_is_still_the_storms_shape(self):
         # The suite decides which one it is; a record without its word reads
         # as it did before the field existed.

@@ -525,6 +525,9 @@ TRIM_REASON_CHARS = 96
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
 ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict", "eval_verdict")
+# The suite's own verdict (SCHEMA.md, `eval_outcome`): kept by --trim so a
+# fixture cut from a data.json holding a not-evaluated run replays as one.
+SUITE_FIELDS = ("eval_outcome", "not_evaluated")
 
 UTC = timezone.utc
 
@@ -2163,7 +2166,7 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
             # Kept as written so a fixture cut from a two-tier data.json
             # replays the same filter the live tick applies.
             entry[tiers.TIER_KEY] = run[tiers.TIER_KEY]
-        for key in ENDED_FIELDS:
+        for key in ENDED_FIELDS + SUITE_FIELDS:
             if key in run:
                 entry[key] = run[key]
         runs.append(entry)

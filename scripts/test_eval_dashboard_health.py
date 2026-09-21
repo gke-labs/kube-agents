@@ -793,6 +793,14 @@ class LostPods(unittest.TestCase):
         self.assertEqual({k: v for k, v in trimmed[0].items() if k in health.ENDED_FIELDS}, {"has_build_log": False, "pod_phase": "Failed", "pod_node": "node-a", "pod_last_event": "NodeNotReady"})
         self.assertFalse(set(health.ENDED_FIELDS) & set(trimmed[1]))
 
+    def test_trim_carries_the_suites_verdict_so_a_fixture_replays_it(self):
+        # A field trim drops is a field the replay cannot see: without these
+        # two a not-evaluated run returns as the hard red in the fixture.
+        doc = data(dict(run(1, 1, T0, tasks=[task("x", "ppp")], result="FAILURE"), eval_outcome="not_evaluated", not_evaluated=["y"]), run(2, 2, T0, tasks=[task("x", "ppp")]))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")["runs"]
+        self.assertEqual({k: trimmed[0][k] for k in health.SUITE_FIELDS}, {"eval_outcome": "not_evaluated", "not_evaluated": ["y"]})
+        self.assertFalse(set(health.SUITE_FIELDS) & set(trimmed[1]))
+
     def test_trim_carries_merge_conflict_so_a_fixture_replays_the_same_verdict(self):
         # #1608: a field trim drops is a field the replay cannot see, and the
         # conflicted merge silently returns as a setup death in the fixture.
