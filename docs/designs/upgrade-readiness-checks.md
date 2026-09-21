@@ -18,6 +18,105 @@ upgrade anything — that stays a human's decision. And they are **grouped by cl
 family being a set of clusters built from the same template, because that is the unit a team
 actually upgrades.
 
+## Upgrades that went wrong in public
+
+Every check below exists because the thing it looks for has already taken a real company down.
+These are published postmortems and provider incident reports, not hypotheticals. Each one names
+the check that would have caught it.
+
+**Reddit, 14 March 2023 — 314 minutes down.** Reddit upgraded a large cluster from Kubernetes 1.23
+to 1.24. The network died about two minutes later. Their CNI, Calico, picked its route reflectors —
+the nodes every other node peers with — by matching the label `node-role.kubernetes.io/master`.
+Kubernetes 1.24 removed that label from running clusters. The selector matched nothing, every node
+dropped every route, and the cluster went dark. There is no supported Kubernetes downgrade, so
+recovery meant a restore procedure that had never been run against production. The selector lived
+only in Calico's own datastore, hand-edited and committed nowhere, so scanning the GitOps
+repository would not have found it either.
+[Postmortem](https://web.archive.org/web/20260826130053/https://www.reddit.com/r/RedditEng/comments/11xx5o0/you_broke_reddit_the_piday_outage/)
+(the Wayback copy; Reddit blocks automated fetches of the original).
+_Caught by:_ diffing the target release's removed **identifiers** — labels as well as API versions —
+against the selectors actually in use in the live cluster, including add-on configuration.
+
+**Jetstack, September 2019 — a fail-closed webhook deadlocked a GKE control plane.** A regional GKE
+master upgrade hung past its 20-minute timeout. When the second master came up, kube-apiserver's
+startup hook tried to write a ConfigMap in `kube-system`. A ValidatingWebhookConfiguration backed by
+Open Policy Agent, scoped cluster-wide and set to `failurePolicy: Fail`, intercepted that write. OPA
+did not answer, the write timed out, the master failed its health check and crash-looped. The
+resulting API downtime stopped kubelets reporting node health, so GKE node auto-repair began
+destroying and recreating every node in a loop, taking out every tenant.
+[Postmortem](https://web.archive.org/web/20230607064526/https://www.jetstack.io/blog/gke-webhook-outage/).
+_Caught by:_ listing every webhook with `failurePolicy: Fail`, and flagging any whose rules or
+namespace selector can match `kube-system` or cluster-scoped objects, or whose backend has one
+replica and no liveness probe.
+
+**loveholidays, March 2019 — a 2-hour GKE upgrade window ran 7 hours.** Going from 1.10 to 1.12,
+individual node drains took 15 minutes or more: pods used `emptyDir`, which blocks eviction unless
+annotated `safe-to-evict`, and some workloads had a `terminationGracePeriodSeconds` of several
+minutes. One node pool upgrade hung with no drains happening at all and could not be cancelled from
+the console. Separately, GKE had withdrawn the exact patch version they were upgrading to five days
+earlier, and nobody re-read the release notes on the day.
+[Write-up](https://deploy.live/blog/the-shipwreck-of-gke-cluster-upgrade/).
+_Caught by:_ estimating drain time before the window — count pods with `emptyDir` and no
+`safe-to-evict` annotation, and grace-period outliers, then multiply by node count — and re-checking
+the target patch version against the release notes at run time rather than at planning time.
+
+**Google Cloud, September 2022 — Calico wedged every drain on GKE 1.22 and later.** A race condition
+in Calico made the CNI fail pod teardown with an authorization error, leaving pods stuck in
+Terminating or Pending across 35+ regions. Every 1.22 and 1.23 release was affected, and 1.24 up to
+`1.24.4-gke.800`. Clusters running the autoscaler were hit hardest, because more node churn meant
+more teardowns. [Incident report](https://status.cloud.google.com/incidents/urNR4xD4gBNsyaZj3W1i).
+_Caught by:_ checking installed add-on versions against the provider's known-issues list for the
+**specific target patch version**, not just the minor. A check comparing minors would have waved
+this cluster straight into the bug.
+
+**Google Cloud, July–September 2021 — 59 days of auto-upgrades restarting containers.** Clusters on
+the REGULAR channel were automatically moved from 1.19 to 1.20. On any node pool still using Docker
+rather than containerd, every container on a node restarted whenever the Docker daemon did. Google
+eventually paused automatic upgrades to stop it spreading.
+[Incident report](https://status.cloud.google.com/incidents/vFhgfrfzzrx6zQo69SdQ).
+_Caught by:_ inventorying the container runtime per node pool and treating "still on Docker" as
+blocking. The same check is what catches the 1.24 dockershim removal.
+
+**Datadog, March 2023 (~50 hours, five regions) and Heroku, June 2025 (~24 hours) — the same
+failure, twice.** In both cases an unattended OS package upgrade ran on production Kubernetes nodes
+and restarted the node's networking service. Datadog's systemd version defaulted to deleting routing
+rules it had not created, which included the ones Cilium installed for pod networking; Heroku's
+networking config was applied by a script that only ran at first boot. Nodes fell off the network en
+masse — Datadog lost roughly 60% of its compute. Neither showed up in staging, because on a cold
+boot the ordering is fine; the bug only exists when the package is upgraded under a running node.
+[Datadog](https://www.datadoghq.com/blog/2023-03-08-multiregion-infrastructure-connectivity-issue/),
+[Heroku](https://www.heroku.com/blog/summary-of-june-10-outage/).
+_Caught by:_ asserting that unattended OS upgrades are disabled on nodes, and testing node images by
+upgrading a running node rather than booting a fresh one.
+
+**Spinnaker on GKE, September 2023 — a controller polling a removed API froze the upgrade.**
+Spinnaker's clouddriver called `policy/v1beta1/podsecuritypolicies` more than once a minute. GKE's
+deprecation insights saw the traffic and **paused the cluster's automatic upgrade to 1.25**. The
+cluster was not behind by accident; GKE was refusing to move it.
+[Issue thread](https://github.com/spinnaker/spinnaker/issues/6880).
+_Caught by:_ reading the deprecation insights and reporting a paused auto-upgrade as the reason a
+cluster is lagging — the check in the GKE deprecation insights section below.
+
+**Helm releases, from Kubernetes 1.25 — deploys blocked by a manifest nobody was running.** After
+1.25 removed PodSecurityPolicy, `helm upgrade` fails on any release whose **stored** manifest
+contains one. Nothing crashes; the workloads keep running. You simply cannot deploy anything until
+you rewrite the stored release with `helm mapkubeapis`. Removing the PSP from your chart does not
+help, because the failure is in reading the old release Secret.
+[Issue thread](https://github.com/helm/helm/issues/11287).
+_Caught by:_ scanning stored Helm release state and GitOps manifests for removed kinds, not only
+live objects. GKE's deprecation insights cannot see this: they are generated from live API-server
+traffic over a 30-day window, so an unused manifest that gets applied after the upgrade is invisible
+to them
+([GKE documentation](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations)).
+
+Two gaps worth stating. **Surge and quota** has no public postmortem behind it — the mechanism is
+documented by the providers rather than by victims, so the citation for it is
+[GKE's own upgrade quota page](https://cloud.google.com/kubernetes-engine/docs/how-to/node-upgrades-quota)
+rather than an incident. **Zonal volumes** is similar: the strongest artefact is Google stating that
+a cluster upgrade deletes the underlying instances and therefore all data on Local SSD, and
+recommending that node pools holding persistent data not be auto-upgraded at all
+([GKE documentation](https://cloud.google.com/kubernetes-engine/docs/concepts/local-ssd)).
+
 ## Scope
 
 Some of this already runs. The table says what, so nobody builds it twice. The SOP or skill named
