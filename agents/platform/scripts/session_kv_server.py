@@ -340,6 +340,27 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 # Counts are fleet-wide rather than per-cluster, matching the ceiling as
 # specified. The trade-off is that one collapsing cluster can exhaust the day's
 # budget for the others; `GET /v1/alert-quota` is where that shows up.
+
+# The bucket drift alerts are billed to, which is deliberately not the bucket
+# they are labelled with (see DRIFT_SEVERITY_LABEL, which is what they display
+# as). `_claim_alert_quota` keys the `alert_quota` table on the string it is
+# handed, so billing drift as "Warning" would spend the event watcher's budget
+# -- and the two traffic shapes are not comparable. One `kubectl apply -f
+# ./manifests/` touching six objects is six audit entries, six survivors of the
+# classifier and six injects, because the detector coalesces nothing; the
+# watcher's warnings arrive one incident at a time. Sharing the bucket
+# therefore let routine use of the new signal silently cap-drop the deployed
+# one for the rest of the UTC day, which is the more expensive of the two
+# directions.
+#
+# The honest cost of splitting them is that the ceilings now add up: a quiet day
+# of events plus a drift storm posts more total alerts than the single shared
+# budget allowed. That is a bounded rise in chat volume, and it buys back a
+# signal an on-call human already depends on. What this does not fix is the
+# fan-out itself -- six cards for one `apply` is still six cards -- which needs
+# coalescing in the detector and is a design change rather than a constant.
+DRIFT_QUOTA_KEY = "GitOpsDrift"
+
 ALERT_DAILY_LIMITS = {
     "Critical": _alert_daily_limit("ALERT_DAILY_LIMIT_CRITICAL", 10),
     "Warning": _alert_daily_limit("ALERT_DAILY_LIMIT_WARNING", 5),
@@ -351,6 +372,11 @@ ALERT_DAILY_LIMITS = {
     # Info stream into chat — the flood the ceiling exists to bound — rather
     # than a ceiling anyone chose. test_a_missing_severity_is_uncapped pins it.
     "Info": _alert_daily_limit("ALERT_DAILY_LIMIT_INFO", 5),
+    # Drift's own bucket, keyed by DRIFT_QUOTA_KEY rather than by the severity
+    # it displays as. Declared here rather than left to a `.get` miss because a
+    # miss is allowed through *uncapped* (see the Info note above), and an
+    # uncapped drift stream is exactly the flood this bucket exists to bound.
+    DRIFT_QUOTA_KEY: _alert_daily_limit("ALERT_DAILY_LIMIT_DRIFT", 5),
 }
 
 # The `kind` a drift record carries, set by the drift detector
@@ -360,8 +386,14 @@ ALERT_DAILY_LIMITS = {
 # to the event path, where `payload.get("kind_of_object") or "Pod"` renders it
 # as a Pod alert that names an object nobody touched.
 #
-# Every other caller of that route is the event watcher, which sends no `kind`
-# at all, so the equality test is safe in both directions.
+# Every other caller of that route is the event watcher, which stamps its own
+# `kind` (`injectKindEvent`/`injectKindFollowup` in
+# k8s-operator/cmd/k8s-event-watcher/types.go, "k8s-event" and
+# "k8s-event-followup"). The dispatch is an equality test against this string
+# rather than a match against those, so anything that is not drift -- their
+# kinds, a kind a future producer invents, or no kind at all -- takes the event
+# path, which is the behaviour the event watcher had before this route learned
+# to dispatch.
 INJECT_KIND_DRIFT = "gitops-drift"
 
 # Drift is graded `Warning` rather than given a severity of its own, and the
@@ -373,11 +405,15 @@ INJECT_KIND_DRIFT = "gitops-drift"
 # ceiling bounds the messages one human reads in a day, and that reader is one
 # budget whatever produced them.
 #
-# The cost is worth naming: a node storm that spends the Warning budget also
-# silences drift for the rest of the day, and the detector has already marked
-# that record's insertId seen, so it will not be re-offered. `GET
-# /v1/alert-quota` is where the count shows up. The silenced record itself is
-# written to the ledger below and goes no further: the event watcher's daily
+# Drift is *displayed* as a Warning, so it sorts with the event watcher's
+# warnings in a channel that already carries them. It is not *budgeted* as one:
+# see DRIFT_QUOTA_KEY.
+#
+# The cost of the ceiling is worth naming whichever bucket it comes from: a
+# spent budget silences drift for the rest of the day, and the detector has
+# already marked that record's insertId seen, so it will not be re-offered.
+# `GET /v1/alert-quota` is where the count shows up. The silenced record itself
+# is written to the ledger below and goes no further: the event watcher's daily
 # recap excludes drift rows, and it never names a withheld alert in any case.
 # Recovering what was lost means querying `intercepted_events` directly. That is
 # thin, and it is the argument for giving drift its own recap rather than for
@@ -406,6 +442,41 @@ DRIFT_JOIN_ENRICHED = "enriched"
 # alternative renders as `prod//` and reads like a bug in the alert rather than
 # a gap in the record.
 DRIFT_UNKNOWN_FIELD = "unknown"
+
+# The cluster name a drift card falls back to when the payload names none and
+# GKE_CLUSTER_NAME is unset -- the cluster the agent itself runs on. The event
+# path spells the same fallback inline in two places; this is named because the
+# drift renderers are new code and the rule binds the lines being written.
+DRIFT_FALLBACK_CLUSTER_NAME = "platform-agent-host"
+
+# How much of one audit-supplied field survives into the card. Long enough for a
+# real field manager, User-Agent or resource name; short enough that a field
+# stuffed with instructions cannot outweigh the prompt around it.
+DRIFT_MAX_FIELD_CHARS = 200
+
+# What a defanged field's removed characters are replaced with: U+FFFD, the
+# replacement character. A visible marker rather than silent deletion, because a
+# reader seeing it knows the value was altered, which matters when the value is
+# evidence in an incident. Written as an escape rather than as the character
+# itself so the substitution survives a tool that mangles non-ASCII source.
+DRIFT_DEFANG_PLACEHOLDER = "\ufffd"
+
+# Characters removed from every audit-supplied field before it is interpolated
+# into the card. Backtick because the renderers place these values inside
+# backticks inside a block the front door is told to copy verbatim: one
+# backtick closes the span and the rest of the value reads as instruction text.
+# CR and LF because a newline lets a value open what looks like a new directive
+# line of its own.
+#
+# Deliberately not `*` or `_`. Both are markdown emphasis, but neither is
+# active inside a code span, and removing the backticks is what keeps the span
+# closed -- so stripping them buys nothing and costs a great deal: `_` appears
+# in `no_object`, in `insert_id`, in field paths and in ordinary manager names,
+# and replacing it leaves `no_object` reading as `no`, the placeholder, then
+# `object` -- readable evidence turned into noise. Everything else is
+# left alone for the same reason: this text is what a human reads to decide
+# whether a change should stand.
+_DRIFT_UNSAFE_CHARS_RE = re.compile(r"[`\r\n]")
 
 # How many of one manager's field paths the card names before summarising the
 # rest as a count. The payload carries them all on purpose — an agent deciding
@@ -1421,10 +1492,10 @@ def _drift_resource_path(payload: Dict[str, Any]) -> str:
     invites the reader to look in a namespace called nothing.
     """
     resource = _drift_resource(payload)
-    kind = resource.get("resource") or DRIFT_UNKNOWN_FIELD
-    name = resource.get("name") or DRIFT_UNKNOWN_FIELD
-    namespace = resource.get("namespace") or ""
-    subresource = resource.get("subresource") or ""
+    kind = _defang_drift_field(resource.get("resource")) or DRIFT_UNKNOWN_FIELD
+    name = _defang_drift_field(resource.get("name")) or DRIFT_UNKNOWN_FIELD
+    namespace = _defang_drift_field(resource.get("namespace"))
+    subresource = _defang_drift_field(resource.get("subresource"))
 
     path = f"{namespace}/{kind}/{name}" if namespace else f"{kind}/{name}"
     return f"{path}/{subresource}" if subresource else path
@@ -1440,14 +1511,67 @@ def _drift_summary(payload: Dict[str, Any]) -> str:
     of the same record that read differently is how a reader starts doubting
     which is true.
     """
-    summary = (payload.get("summary") or "").strip()
+    # `_defang_drift_field` coerces before it strips, so a producer that sent
+    # `summary` as a number or a list yields a defanged string rather than the
+    # AttributeError a bare `.strip()` raised -- which surfaced as a 500 on a
+    # route whose other malformed-input paths all answer 400.
+    summary = _defang_drift_field(payload.get("summary")).strip()
     if summary:
         return summary
 
-    principal = payload.get("principal") or DRIFT_UNKNOWN_FIELD
-    verb = payload.get("verb") or DRIFT_UNKNOWN_FIELD
-    cluster = payload.get("cluster") or DRIFT_UNKNOWN_FIELD
+    principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
+    verb = _defang_drift_field(payload.get("verb")) or DRIFT_UNKNOWN_FIELD
+    cluster = _defang_drift_field(payload.get("cluster")) or DRIFT_UNKNOWN_FIELD
     return f"{principal} ran {verb} on {_drift_resource_path(payload)} in {cluster}"
+
+
+def _drift_fallback_cluster() -> str:
+    """The cluster a drift card names when the payload does not.
+
+    Read at call time rather than folded into a module constant, so a test (and
+    a redeployed pod) sees the current GKE_CLUSTER_NAME rather than whatever it
+    was at import.
+    """
+    return os.environ.get("GKE_CLUSTER_NAME", DRIFT_FALLBACK_CLUSTER_NAME)
+
+
+def _defang_drift_field(value: Any) -> str:
+    """Make one audit-supplied value safe to interpolate into the card.
+
+    Everything the detector forwards about a change is chosen by the person
+    being reported on. `fieldManager` is a free query parameter, `user_agent`
+    comes from `callerSuppliedUserAgent`, and the Go side documents both as
+    self-declared and unverified; the principal and resource names are no
+    better. Those values land inside backticks, inside the `BEGIN TASK BODY
+    (copy verbatim)` block, in a prompt that instructs the front door to copy
+    the body into a kanban card and hand it to a Cluster Agent. A single
+    backtick closes the span and the remainder reads as instruction text to
+    both models.
+
+    So this strips the characters that let a value escape its span or open a
+    line of its own, removes the chat-template control tokens `_defang_report`
+    handles, and truncates. It is deliberately narrower than quoting or
+    escaping the whole body: the card is read by a human as evidence about an
+    incident, and a mangled field manager name is a worse report.
+
+    This is the drift path's own defence and touches nothing the event path
+    executes -- `inject_message` dispatches on `kind` before either renderer
+    runs. The event path has the same exposure with a different threat model
+    and is not changed here.
+
+    The blast radius if it is bypassed is bounded by what the two agents can
+    do: the front door's only tool is `kanban_create` and the Cluster Agent is
+    read-only, so the realistic outcome is a misdirected or fabricated report
+    rather than a mutation. Bounded is not zero, which is why this exists.
+    """
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    text = _CONTROL_TOKEN_RE.sub("[token]", text)
+    text = _DRIFT_UNSAFE_CHARS_RE.sub(DRIFT_DEFANG_PLACEHOLDER, text)
+    if len(text) > DRIFT_MAX_FIELD_CHARS:
+        text = text[:DRIFT_MAX_FIELD_CHARS] + "…"
+    return text
 
 
 def _drift_ownership_block(payload: Dict[str, Any]) -> str:
@@ -1461,9 +1585,9 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     fact about the object. Presenting the first as the second is how an agent
     concludes nothing else manages a field that a GitOps controller owns.
     """
-    join = payload.get("join") or DRIFT_UNKNOWN_FIELD
+    join = _defang_drift_field(payload.get("join")) or DRIFT_UNKNOWN_FIELD
     if join != DRIFT_JOIN_ENRICHED:
-        lookup_error = payload.get("lookup_error") or ""
+        lookup_error = _defang_drift_field(payload.get("lookup_error"))
         detail = f" The lookup reported: {lookup_error}" if lookup_error else ""
         return (
             f"- **Field ownership: not read** (`{join}`).{detail} "
@@ -1480,14 +1604,14 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
 
     lines = ["- **Field ownership** (read from the live object's `managedFields`):"]
     for owner in owners:
-        manager = owner.get("manager") or DRIFT_UNKNOWN_FIELD
-        operation = owner.get("operation") or ""
-        updated_at = owner.get("updated_at") or ""
+        manager = _defang_drift_field(owner.get("manager")) or DRIFT_UNKNOWN_FIELD
+        operation = _defang_drift_field(owner.get("operation"))
+        updated_at = _defang_drift_field(owner.get("updated_at"))
         paths = [path for path in (owner.get("paths") or []) if isinstance(path, str)]
 
         qualifiers = ", ".join(part for part in (operation, updated_at) if part)
         if paths:
-            shown = paths[:DRIFT_MAX_RENDERED_PATHS]
+            shown = [_defang_drift_field(path) for path in paths[:DRIFT_MAX_RENDERED_PATHS]]
             owns = ", ".join(f"`{path}`" for path in shown)
             if len(paths) > len(shown):
                 owns += f", and {len(paths) - len(shown)} more"
@@ -1518,16 +1642,16 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     it still stands, and what each answer would cost.
     """
     resource_path = _drift_resource_path(payload)
-    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
-    principal = payload.get("principal") or DRIFT_UNKNOWN_FIELD
-    user_agent = payload.get("user_agent") or ""
-    verb = payload.get("verb") or DRIFT_UNKNOWN_FIELD
-    method_name = payload.get("method_name") or DRIFT_UNKNOWN_FIELD
-    timestamp = payload.get("timestamp") or DRIFT_UNKNOWN_FIELD
-    insert_id = payload.get("insert_id") or DRIFT_UNKNOWN_FIELD
-    project = payload.get("project") or DRIFT_UNKNOWN_FIELD
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
+    user_agent = _defang_drift_field(payload.get("user_agent"))
+    verb = _defang_drift_field(payload.get("verb")) or DRIFT_UNKNOWN_FIELD
+    method_name = _defang_drift_field(payload.get("method_name")) or DRIFT_UNKNOWN_FIELD
+    timestamp = _defang_drift_field(payload.get("timestamp")) or DRIFT_UNKNOWN_FIELD
+    insert_id = _defang_drift_field(payload.get("insert_id")) or DRIFT_UNKNOWN_FIELD
+    project = _defang_drift_field(payload.get("project")) or DRIFT_UNKNOWN_FIELD
 
-    reconciled_by = payload.get("reconciled_by") or ""
+    reconciled_by = _defang_drift_field(payload.get("reconciled_by"))
     if payload.get("reconciled"):
         reconcile_line = (
             f"- **Possibly already reverted:** `{reconciled_by or DRIFT_UNKNOWN_FIELD}` wrote to this object "
@@ -1629,8 +1753,8 @@ def _drift_agent_query(payload: Dict[str, Any]) -> str:
     It comes from the payload's own `cluster` field and from nowhere else.
     """
     resource_path = _drift_resource_path(payload)
-    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
-    principal = payload.get("principal") or DRIFT_UNKNOWN_FIELD
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
 
     return (
         f"An out-of-band change to a live object needs triage on GKE cluster '{cluster_name}'. "
@@ -2589,7 +2713,7 @@ def _inject_drift(
     # under a name rather than under ''.
     cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
 
-    allowed, suppressed_today = _claim_alert_quota(DRIFT_SEVERITY_LABEL)
+    allowed, suppressed_today = _claim_alert_quota(DRIFT_QUOTA_KEY)
 
     event_row_id = record_intercepted_event(
         cluster=cluster,
@@ -2616,9 +2740,11 @@ def _inject_drift(
     if not allowed:
         logger.warning(
             f"Suppressed drift alert for {resource_path} on {cluster or DRIFT_UNKNOWN_FIELD}: "
-            f"daily limit of {ALERT_DAILY_LIMITS[DRIFT_SEVERITY_LABEL]} {DRIFT_SEVERITY_LABEL} alerts reached, "
-            f"{suppressed_today} suppressed today. The detector will not re-offer this record; "
-            f"it survives only in the daily recap."
+            f"daily limit of {ALERT_DAILY_LIMITS[DRIFT_QUOTA_KEY]} drift alerts reached, "
+            f"{suppressed_today} suppressed today. The detector will not re-offer this record. "
+            f"Nothing reports it: the event watcher's daily recap excludes drift rows by design, so "
+            f"this line and its `intercepted_events` row (reason={DRIFT_LEDGER_REASON}, "
+            f"object_uid={payload.get('insert_id') or DRIFT_UNKNOWN_FIELD}) are the only traces."
         )
         return {
             "status": "suppressed",
