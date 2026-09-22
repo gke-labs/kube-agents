@@ -746,8 +746,7 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
             if sweep.out_of_budget(started, cid, namespace):
                 break
             try:
-                findings, skipped = scan_namespace(kubeconfig, namespace, source, kinds)
-                skipped = skipped | dropped
+                findings, unread = scan_namespace(kubeconfig, namespace, source, kinds)
             except sandbox_exec.SandboxUnavailable:
                 raise
             except subprocess.TimeoutExpired as exc:
@@ -759,9 +758,12 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
                 sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
                 continue
             sweep.read_scopes.add(scope_key(cid, namespace))
-            if skipped:
-                sweep.partial_scopes[scope_key(cid, namespace)] = skipped
-                sweep.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(skipped))} not read"
+            # A kind the cluster does not serve holds its rows without making
+            # the namespace unreadable: most clusters lack some optional CRD.
+            if unread | dropped:
+                sweep.partial_scopes[scope_key(cid, namespace)] = unread | dropped
+            if unread:
+                sweep.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(unread))} not read"
             for f in findings:
                 sweep.rows[ledger_key(cid, f)] = {
                     "cluster": cid,
@@ -1179,7 +1181,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         body = card_body(sweep.project, name, location, namespace, rows, scope_first_seen(state, scope) or now)
         task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
         skipped = 0
-        while task_id and (card_status(task_id) or "") in TERMINAL_CARD_STATUSES:
+        status = card_status(task_id) if task_id else None
+        while task_id and status in TERMINAL_CARD_STATUSES:
             # The board handed back a finished card for a key it had seen, as
             # it does for every generation a lost ledger once used; move the
             # generation on and file again.
@@ -1191,9 +1194,15 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 task_id = None
                 break
             task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
+            status = card_status(task_id) if task_id else None
         if not task_id:
             # No card, so nothing to comment on; the rows stay and the next
             # tick tries the board again.
+            continue
+        if status is None:
+            # The key may have handed back a finished card; adopt nothing the
+            # board cannot describe, and let the next tick ask again.
+            sys.stderr.write(f"stall_watch: could not read the status of card {task_id} for {scope}; the next tick asks again\n")
             continue
         opened += 1
         episodes[scope] = {

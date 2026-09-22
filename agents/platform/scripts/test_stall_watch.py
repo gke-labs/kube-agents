@@ -650,6 +650,21 @@ class Cards(Base):
         self.assertEqual(len(self.board.cards), 2)
         self.assertEqual(next(reversed(self.board.cards.values()))["status"], "ready")
 
+    def test_a_card_the_board_cannot_describe_is_not_adopted(self):
+        # A repeated key can hand back a finished card; with `show` failing
+        # there is no telling, so nothing is adopted until the board answers.
+        old = "t_old0001"
+        self.board.by_key[stall_watch.card_key(f"c@{LOCATION}", "checkout", 0)] = old
+        self.board.cards[old] = {"status": "done", "assignee": "", "title": "", "body": "", "key": "", "comments": []}
+        self.board.fail_show = True
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(self.noticed(lines), [])
+        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.board.fail_show = False
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertNotEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["card"], old)
+        self.assertEqual(len(self.noticed(lines)), 1)
+
     def test_a_finished_card_handed_back_for_a_repeated_key_is_not_adopted(self):
         # Defence in depth: even if the key repeats, a terminal card is never
         # recorded as the episode's card.
@@ -1073,6 +1088,7 @@ class Scope(Base):
         kinds = scan[scan.index("--kind") + 1].split(",")
         self.assertNotIn("certificates.cert-manager.io", kinds)
         self.assertIn("deployments", kinds, "a bare plural matches its grouped api-resources name")
+        self.assertEqual(self.ledger()["unreadable"], {}, "a CRD the cluster never installed does not make its namespaces unreadable")
         _, fake = self.run_tick({"c": {"payments": []}}, served=[])
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
         self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS), "an empty api-resources leaves the list unfiltered")
