@@ -37,6 +37,9 @@ ENV_PLATFORM_AGENT_HOME = "PLATFORM_AGENT_HOME"
 ENV_HERMES_HOME = "HERMES_HOME"
 DEFAULT_DATA_ROOT = Path("/opt/data")
 PROFILES_DIR_NAME = "profiles"
+CLUSTER_PROFILE_PREFIX = "cluster-"
+IDENTITY_FILE = "USER.md"
+RESERVED_PROFILES = frozenset({"default", "platform"})
 
 
 def _resolve_data_root() -> Path:
@@ -50,7 +53,11 @@ def _resolve_data_root() -> Path:
     if os.environ.get(ENV_PLATFORM_AGENT_HOME):
         return Path(os.environ[ENV_PLATFORM_AGENT_HOME])
     raw_home = Path(os.environ.get(ENV_HERMES_HOME, str(DEFAULT_DATA_ROOT)))
-    if raw_home.parent.name == PROFILES_DIR_NAME:
+    if (
+        raw_home.parent.name == PROFILES_DIR_NAME
+        and (raw_home.name in RESERVED_PROFILES or raw_home.name.startswith(CLUSTER_PROFILE_PREFIX))
+        and not (raw_home / PROFILES_DIR_NAME).is_dir()
+    ):
         return raw_home.parent.parent
     return raw_home
 
@@ -84,13 +91,6 @@ PROFILES_BASE = _resolve_profiles_base()
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
-CLUSTER_PROFILE_PREFIX = "cluster-"
-IDENTITY_FILE = "USER.md"
-
-# Non-cluster profiles that live under $HERMES_HOME/profiles but are never
-# managed as Cluster Agents: the front-door router (`default`) and the Platform
-# Agent itself (`platform`). Reconciliation must never touch these.
-RESERVED_PROFILES = frozenset({"default", "platform"})
 
 # How the scaffold checks that gcloud's kubeconfig exists on the side that will
 # read it. An absolute path because a builtin `test` would be the sandbox
@@ -539,8 +539,9 @@ def cmd_delete(args: argparse.Namespace) -> None:
     print(name)
 
 
-def cmd_list(_args: argparse.Namespace) -> None:
-    for name in list_profiles():
+def cmd_list(args: argparse.Namespace) -> None:
+    profiles = list_profiles() if getattr(args, "all", False) else list_ready_profiles()
+    for name in profiles:
         print(name)
 
 
@@ -570,7 +571,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--cluster", required=True)
         sp.add_argument("--location", required=True)
 
-    sub.add_parser("list", help="List existing cluster profiles")
+    list_parser = sub.add_parser("list", help="List active, fully scaffolded cluster profiles")
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
+    )
     return parser
 
 

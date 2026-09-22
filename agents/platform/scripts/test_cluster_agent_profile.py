@@ -543,6 +543,11 @@ class ResolveProfilesBaseTest(unittest.TestCase):
             self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
             self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
 
+    def test_resolves_when_data_root_parent_is_named_profiles(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/srv/profiles/data"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/srv/profiles/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/profiles/data/profiles"))
+
 
 class ListProfilesTest(unittest.TestCase):
     def setUp(self):
@@ -567,14 +572,37 @@ class ListProfilesTest(unittest.TestCase):
 
         self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
 
-    def test_cmd_list_prints_sorted(self):
-        (self.tmp / "cluster-zeta").mkdir()
-        (self.tmp / "cluster-beta").mkdir()
+    def test_cmd_list_prints_ready_sorted_by_default(self):
+        for name in ("cluster-zeta", "cluster-beta"):
+            p = self.tmp / name
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+            (p / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                encoding="utf-8",
+            )
+        (self.tmp / "cluster-incomplete").mkdir()
+        (self.tmp / "cluster-incomplete" / "config.yaml").write_text(
+            "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+            encoding="utf-8",
+        )
 
         out = io.StringIO()
         with mock.patch("sys.stdout", out):
-            cap.cmd_list(mock.MagicMock())
+            cap.cmd_list(mock.MagicMock(all=False))
         self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
+
+        out_all = io.StringIO()
+        with mock.patch("sys.stdout", out_all):
+            cap.cmd_list(mock.MagicMock(all=True))
+        self.assertEqual(out_all.getvalue(), "cluster-beta\ncluster-incomplete\ncluster-zeta\n")
+
+    def test_build_parser_list_all(self):
+        parser = cap.build_parser()
+        args = parser.parse_args(["list"])
+        self.assertFalse(args.all)
+        args_all = parser.parse_args(["list", "--all"])
+        self.assertTrue(args_all.all)
 
 
 class ListReadyProfilesTest(unittest.TestCase):
