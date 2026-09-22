@@ -302,6 +302,14 @@ Attach each with `attach_artifact` (`type: provisioning_request`,
 `target`. Planning only: hand both manifests to the user, apply nothing,
 submit nothing.
 
+**"Planning-only" and "text output only" never waive the records.** Those
+constraints forbid mutations — applying, submitting, creating. The typed
+records are not mutations; they are how planning work is delivered, and a
+task that asks for the plan "as text" still gets its `record_evidence`
+calls per probe and its `attach_artifact` calls per manifest, alongside
+the prose. Skipping them because the task said "text output" delivers a
+claim, not evidence.
+
 **Report.** Carry this section, filled in:
 
 ```markdown
