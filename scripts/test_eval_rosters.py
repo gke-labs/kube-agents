@@ -110,6 +110,14 @@ MOVED_TO_NIGHTLY = [
 ADMITTED_AFTER_THE_SPLIT = [
     # 2026-09-22 (#1023): 529/570 graded presubmit repetitions since #1626, no collapse.
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
+    # 2026-09-22 (#1023): 12/12 on the four graded nights 09-16 to 09-20.
+    ("pdb-remediation-pr", "obtainability-remediation-proposal"),
+]
+# Moved from the nightly file into the presubmit one after the split, as
+# (case, the presubmit line it follows); the same case leaves NIGHTLY_AT_SPLIT
+# below, since the nightly runs both files and lists no case twice.
+PROMOTED_AFTER_THE_SPLIT = [
+    ("pdb-remediation-pr", "rca-remediation-pr"),  # 2026-09-22 (#1023)
 ]
 
 
@@ -168,14 +176,23 @@ class ParserTest(unittest.TestCase):
 
 
 class SplitLostNothingTest(unittest.TestCase):
-    def test_the_presubmit_file_is_the_tasks_array_at_the_split(self):
-        self.assertEqual(eval_rosters.presubmit_cases(), PRESUBMIT_AT_SPLIT)
+    def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted(self):
+        self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT))
 
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
         self.assertEqual(eval_rosters.blocking_roster(), with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT))
 
-    def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases(self):
-        self.assertEqual(eval_rosters.nightly_cases(), NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY)
+    def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted(self):
+        promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
+        expected = [c for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY if c not in promoted]
+        self.assertEqual(eval_rosters.nightly_cases(), expected)
+
+    def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
+        for case, _ in PROMOTED_AFTER_THE_SPLIT:
+            with self.subTest(case=case):
+                self.assertIn(case, eval_rosters.presubmit_cases())
+                self.assertIn(case, eval_rosters.blocking_roster())
+                self.assertNotIn(case, eval_rosters.nightly_cases())
 
     def test_the_script_no_longer_carries_the_arrays(self):
         # A literal array creeping back in would be a second source of truth

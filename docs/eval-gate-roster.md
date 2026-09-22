@@ -64,7 +64,7 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Eleven of the eighteen presubmit cases are admitted (recount the entries of
+Twelve of the nineteen presubmit cases are admitted (recount the entries of
 `hack/eval/presubmit-cases.txt` and `blocking-roster.txt` rather than trusting this
 sentence — an earlier copy of it miscounted twice): the ones whose recent record shows
 failures only on their own regressions or on infra classes the harness already excludes
@@ -154,6 +154,18 @@ Admitted on the record since the split:
   planted-pool name and the ceiling, 10 only the ceiling, 1 only the pool. The residual is
   mostly the platform's shape, not the case's own regression; the roster's operative metric
   is the collapse, and there were none in 196 runs.
+- **pdb-remediation-pr**, 2026-09-22
+  ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), the remediation domain's
+  second case ([#1079](https://github.com/gke-labs/kube-agents/pull/1079)), moved from
+  `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
+  the record the nightly built: 12/12 on the four graded nights 2026-09-16 to 09-20
+  (420–1153 s a repetition), after 11/15 across its five presubmit runs on #1079 (3/3, 2/3,
+  1/3, 3/3, 2/3; the misses #1079 traced to
+  [#1097](https://github.com/gke-labs/kube-agents/issues/1097) and
+  [#1590](https://github.com/gke-labs/kube-agents/issues/1590)). It is the first case to
+  take a presubmit seat straight from the nightly under the 2026-09-15 rule, and its
+  presubmit record starts with this edit; a collapse on an unrelated pull request in its
+  first days is the thing to watch, and the demotion lever below is the answer.
 
 ## How far the roster's promise reaches
 

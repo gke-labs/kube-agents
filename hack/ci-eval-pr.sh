@@ -1421,6 +1421,23 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # The expensive term is instead compliance-rbac-overgrant at 2042s for three
 # repetitions (681s each), which is 24% of the whole task budget on its own.
 #
+# 2026-09-22: pdb-remediation-pr moved in from the nightly (#1023), the
+# nineteenth case, measured rather than projected. Under the fan-out at
+# parallelism 4 the serial arithmetic above no longer prices the job: the 14
+# green presubmits of 09-19 to 09-21 ran the fan-out in 6073-10940s (median
+# 8147s) against the 360m deadline, with ~15min of build and deploy outside
+# it. This case costs 980-1929s a repetition in presubmit (420-1153s on the
+# four graded nights), so three repetitions add ~3750-5800s of lane time,
+# ~16-24min of wall clock at four lanes when the lanes are full. Only a
+# repetition that ran to the 2700s delegation ceiling plus grading could
+# make it the last unit; on the record it does not: its 1250s hint is the
+# presubmit's largest, so it launches first in each repetition round, and
+# the round-3 tail (first rep-3 launch to the fan-out's end) ran
+# 2118-5849s in those 14 runs, longer at its shortest than 1929s,
+# its longest measured repetition. The last unit stays one of the
+# obtainability probes launched at the tail of round 3. No Prow deadline
+# change rides with this activation.
+#
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
 # pull request. It is not a legitimate default: at 1 the collapse rung
@@ -1618,8 +1635,11 @@ unit_cost_hint() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
-    # Nightly-only. Measured 980-1929s across build 2099539376672346112's
-    # three repetitions (267-559s in August); median of the September run.
+    # Presubmit since 2026-09-22 (#1023), nightly-only before that. Measured
+    # 980-1929s across build 2099539376672346112's three repetitions (267-559s
+    # in August); median of the September run, kept although the four graded
+    # nights of 09-16 to 09-20 ran 420-1153s: the presubmit shares the model
+    # quota with the daytime herd, which is where the September run was.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
