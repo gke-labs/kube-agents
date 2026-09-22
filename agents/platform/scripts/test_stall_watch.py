@@ -54,6 +54,8 @@ DEPLOYMENT_ROW = finding(
     "dangling-reference",
     "template.spec.containers[0].envFrom[0].configMapRef -> ConfigMap/checkout-feature-flags not found",
 )
+#: A row that clears on the first scan without it, for tests about other things.
+DEADLINE_ROW = finding("checkout", "Deployment/checkout-api", "stale-condition", "Progressing=False ProgressDeadlineExceeded")
 TIMEOUT = subprocess.TimeoutExpired("gcloud", stall_watch.GET_CREDENTIALS_TIMEOUT_SECONDS)
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
 SERVED_DEFAULT = ["deployments.apps", "statefulsets.apps", "daemonsets.apps", "jobs.batch", "gateways.gateway.networking.k8s.io", "httproutes.gateway.networking.k8s.io", "certificates.cert-manager.io", "pods", "configmaps"]
@@ -207,6 +209,7 @@ class Transitions(Base):
 
     def test_cleared_stall_is_announced_once(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.run_tick({"c": {"checkout": []}})
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertIn(stall_watch.CLEARED_HEADING, lines)
         self.assertIn("0 new, 1 cleared", lines[0])
@@ -244,6 +247,20 @@ class Transitions(Base):
         self.assertIn(stall_watch.CLEARED_HEADING, lines)
         self.assertEqual(self.ledger()["stalls"], {})
 
+    def test_a_dangling_reference_survives_one_failed_referent_listing(self):
+        # The referent `-o name` listing failing while the object listing
+        # succeeded drops the row from a scan marked complete; one miss is not
+        # a clear.
+        forbidden = "warning: cannot list configmaps in checkout; references to configmaps are not checked: timeout\n"
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        lines, _ = self.run_tick({"c": {"checkout": ([], forbidden)}})
+        self.assertEqual(lines, [])
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(lines, [], "never cleared, so not new")
+        self.run_tick({"c": {"checkout": []}})
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertIn(stall_watch.CLEARED_HEADING, lines)
+
     def test_a_condition_row_clears_on_the_first_scan_without_it(self):
         self.run_tick({"c": {"storefront": [GATEWAY_CONDITION_ROW]}})
         lines, _ = self.run_tick({"c": {"storefront": []}})
@@ -255,6 +272,7 @@ class Transitions(Base):
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, deadline]}})
         self.assertEqual(lines, [])
         self.assertEqual(len(self.ledger()["stalls"]), 2)
+        self.run_tick({"c": {"checkout": [deadline]}})
         lines, _ = self.run_tick({"c": {"checkout": [deadline]}})
         self.assertEqual(lines, [], "one row clearing while the object stays stalled is not a recovery")
         lines, _ = self.run_tick({"c": {"checkout": []}})
@@ -275,17 +293,6 @@ class Transitions(Base):
         self.assertIn(GATEWAY_SECRET, bullets[0].split(stall_watch.DETAIL_JOINER)[0])
         self.assertIn("and 3 more", bullets[0])
 
-    def test_a_message_field_when_the_report_carries_one_is_printed_after_the_detail(self):
-        # stall_report.py on main emits no `message`; a build that does gets it
-        # shown, and the row key does not move when the message does.
-        row = dict(GATEWAY_CONDITION_ROW, message="Error GWCER102: " + GATEWAY_SECRET)
-        lines, _ = self.run_tick({"c": {"storefront": [row]}})
-        self.assertIn(f"InvalidCertificateRef: Error GWCER102: {GATEWAY_SECRET}", "\n".join(lines))
-        moved = dict(row, message="Error GWCER102: still not found.", stalled_for="50m", stalled_seconds=3000)
-        lines, _ = self.run_tick({"c": {"storefront": [moved]}})
-        self.assertEqual(lines, [])
-        self.assertEqual(list(self.ledger()["stalls"].values())[0]["stalled_for"], "50m")
-
     def test_two_clusters_two_kinds_of_stall(self):
         lines, _ = self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"checkout": [DEPLOYMENT_ROW]}})
         text = "\n".join(lines)
@@ -305,6 +312,48 @@ class Transitions(Base):
 
 
 class Gone(Base):
+    def test_a_long_event_message_is_cut_in_the_bullet_but_kept_in_the_ledger(self):
+        long_row = finding("ns", "Gateway/g", "repeating-warnings", "SYNC x9: " + "x" * 5000)
+        lines, _ = self.run_tick({"c": {"ns": [long_row]}})
+        bullet = next(l for l in lines if l.startswith("- " + label("c")))
+        self.assertLess(len(bullet), stall_watch.ROW_DETAIL_MAX_CHARS + 120)
+        self.assertTrue(bullet.endswith(stall_watch.TRUNCATION_MARKER))
+        self.assertEqual(len(list(self.ledger()["stalls"].values())[0]["detail"]), len(long_row["detail"]))
+
+    def test_new_objects_past_the_cap_wait_for_the_next_tick(self):
+        rows = [finding("ns", f"Deployment/app-{i:02d}", "generation-lag", "generation 2 observed 1") for i in range(stall_watch.MAX_LISTED_ROWS + 5)]
+        lines, _ = self.run_tick({"c": {"ns": rows}})
+        self.assertIn(f"- and 5{stall_watch.DEFERRED_SUFFIX}", lines)
+        self.assertIn(f"{stall_watch.MAX_LISTED_ROWS} new, 0 cleared", lines[0])
+        self.assertEqual(len(self.ledger()["stalls"]), stall_watch.MAX_LISTED_ROWS)
+        lines, _ = self.run_tick({"c": {"ns": rows}})
+        self.assertIn("5 new, 0 cleared", lines[0])
+        self.assertEqual(sum(1 for l in lines if l.startswith("- " + label("c"))), 5)
+        self.assertEqual(len(self.ledger()["stalls"]), stall_watch.MAX_LISTED_ROWS + 5)
+        self.assertEqual(self.run_tick({"c": {"ns": rows}})[0], [])
+
+    def test_the_report_stays_under_the_relay_cap_and_defers_the_rest(self):
+        rows = [finding("ns", f"Gateway/g-{i:02d}", "repeating-warnings", f"SYNC x{i}: " + "m" * 380) for i in range(28)]
+        lines, _ = self.run_tick({"c": {"ns": rows}})
+        self.assertLessEqual(sum(len(l) + 1 for l in lines), stall_watch.REPORT_MAX_CHARS)
+        deferred = next(l for l in lines if l.endswith(stall_watch.DEFERRED_SUFFIX))
+        n = int(deferred.split()[2])
+        self.assertGreater(n, 0)
+        self.assertEqual(len(self.ledger()["stalls"]), 28 - n)
+        lines, _ = self.run_tick({"c": {"ns": rows}})
+        self.assertIn(f"{n} new" if n <= stall_watch.MAX_LISTED_ROWS else "", lines[0])
+
+    def test_cleared_objects_past_the_cap_clear_on_the_next_tick(self):
+        rows = [finding("ns", f"Deployment/app-{i:02d}", "generation-lag", "generation 2 observed 1") for i in range(stall_watch.MAX_LISTED_ROWS + 5)]
+        self.run_tick({"c": {"ns": rows}})
+        self.run_tick({"c": {"ns": rows}})
+        lines, _ = self.run_tick({"c": {"ns": []}})
+        self.assertIn(f"0 new, {stall_watch.MAX_LISTED_ROWS} cleared", lines[0])
+        self.assertEqual(len(self.ledger()["stalls"]), 5)
+        lines, _ = self.run_tick({"c": {"ns": []}})
+        self.assertIn("0 new, 5 cleared", lines[0])
+        self.assertEqual(self.ledger()["stalls"], {})
+
     def test_a_deleted_namespace_clears_its_object_at_once(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS, "catalog": []}})
         lines, _ = self.run_tick({"c": {"catalog": []}})
@@ -398,6 +447,7 @@ class Unreadable(Base):
         self.assertEqual(len(self.ledger()["stalls"]), 1)
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(lines, [], "the object was never cleared, so it is not new either")
+        self.run_tick({"c": {"checkout": []}})
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertIn(stall_watch.CLEARED_HEADING, lines)
 
@@ -443,7 +493,7 @@ class Unreadable(Base):
         self.assertEqual(self.ledger()["unreadable"], {})
 
     def test_unreadable_namespace_keeps_its_rows(self):
-        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEPLOYMENT_ROW]}})
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
         lines, _ = self.run_tick({"c": {"storefront": stall_watch.REPORT_UNREADABLE_EXIT, "checkout": []}})
         text = "\n".join(lines)
         self.assertIn(f"- {label('c')} / `storefront`: no kind could be read", text)
@@ -463,7 +513,7 @@ class Unreadable(Base):
         self.assertEqual(len(self.ledger()["stalls"]), 1)
 
     def test_unparsable_output_marks_one_scope_not_the_sweep(self):
-        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEPLOYMENT_ROW]}})
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
         lines, _ = self.run_tick({"c": {"storefront": '{"namespace": "storefront", "find', "checkout": []}})
         text = "\n".join(lines)
         self.assertIn(f"- {label('c')} / `storefront`: stall_report.py returned unparsable output", text)
@@ -634,12 +684,6 @@ class Scope(Base):
 
 
 class Output(Base):
-    def test_long_sections_are_capped_with_a_count(self):
-        rows = [finding("ns", f"Deployment/app-{i}", "generation-lag", "generation 2 observed 1") for i in range(stall_watch.MAX_LISTED_ROWS + 5)]
-        lines, _ = self.run_tick({"c": {"ns": rows}})
-        self.assertIn("- and 5 more", lines)
-        self.assertEqual(sum(1 for l in lines if l.startswith("- " + label("c"))), stall_watch.MAX_LISTED_ROWS)
-
     def test_main_prints_lines_and_exits_zero(self):
         fake = FakeFleet({"c": {"storefront": GATEWAY_ROWS}})
         out = io.StringIO()

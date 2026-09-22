@@ -218,13 +218,25 @@ NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
 REPORT_UNREADABLE_EXIT = 2
 
 #: Consecutive scans a row must be absent from before it clears, per
-#: heuristic; one for everything not named here.
-CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2}
+#: heuristic; one for everything not named here. A repeating-warnings row
+#: exists only while its event recurred inside the report's window, and a
+#: dangling-reference row vanishes for a scan whose one referent listing
+#: failed while the object listing succeeded; both flap on one miss.
+CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2}
 DEFAULT_CLEAR_AFTER_MISSED_SCANS = 1
-#: Chat renders a bullet list; past this many objects per section the rest is a count.
+#: Chat renders a bullet list; past this many objects per section, or past
+#: the character budget, the rest waits for the next tick rather than being
+#: counted and never named. The relay cuts a report at 12,000 characters.
 MAX_LISTED_ROWS = 30
-#: One bullet per object, with at most this many of its rows spelled out.
+REPORT_MAX_CHARS = 11000
+HEADLINE_ALLOWANCE_CHARS = 200
+DEFERRED_SUFFIX = " more, next tick"
+#: One bullet per object, with at most this many of its rows spelled out, and
+#: an event message is the one field a tenant writes, so it is cut here at the
+#: length the report script's own table uses.
 MAX_DETAILS_PER_OBJECT = 3
+ROW_DETAIL_MAX_CHARS = 400
+TRUNCATION_MARKER = "..."
 DETAIL_JOINER = "; "
 LEDGER_KEY_SEPARATOR = "|"
 #: A cluster is `name@location`: two projects' clusters may share a name
@@ -671,7 +683,6 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
                     "object": f.get("object", ""),
                     "heuristic": f.get("heuristic", ""),
                     "detail": f.get("detail", ""),
-                    "message": f.get("message", ""),
                     "stalled_for": f.get("stalled_for", ""),
                     "stalled_seconds": int(f.get("stalled_seconds") or 0),
                 }
@@ -691,13 +702,13 @@ def group_by_object(rows: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
 
 def row_text(row: dict) -> str:
     detail = row["detail"]
-    if row.get("message"):
-        detail = f"{detail}: {row['message']}"
+    if len(detail) > ROW_DETAIL_MAX_CHARS:
+        detail = detail[: ROW_DETAIL_MAX_CHARS - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
     return f"{row['heuristic']} {detail}"
 
 
 def names_a_referent(row: dict) -> bool:
-    return bool(row.get("message")) or "not found" in row.get("detail", "")
+    return "not found" in row.get("detail", "")
 
 
 def describe_object(key: tuple[str, str, str], rows: list[dict]) -> str:
@@ -714,18 +725,33 @@ def describe_object(key: tuple[str, str, str], rows: list[dict]) -> str:
     return f"- {cluster_label(cid)} {SCOPE_SEPARATOR} `{namespace}` — {obj}{age}: {DETAIL_JOINER.join(shown)}"
 
 
-def section(heading: str, lines: list[str]) -> list[str]:
-    if not lines:
-        return []
-    shown = lines[:MAX_LISTED_ROWS]
-    more = len(lines) - len(shown)
-    if more:
-        shown.append(f"- and {more} more")
-    return [heading, *shown]
+def fit(heading: str, bullets: list[str], budget: int) -> tuple[list[str], int]:
+    """A section that fits: at most MAX_LISTED_ROWS bullets and within the
+    character budget. Returns the lines and how many bullets were left out,
+    which the caller defers to the next tick rather than dropping."""
+    if not bullets:
+        return [], 0
+    lines = [heading]
+    used = len(heading) + 1
+    shown = 0
+    for bullet in bullets:
+        if shown >= MAX_LISTED_ROWS or used + len(bullet) + 1 > budget:
+            break
+        lines.append(bullet)
+        used += len(bullet) + 1
+        shown += 1
+    deferred = len(bullets) - shown
+    if deferred:
+        lines.append(f"- and {deferred}{DEFERRED_SUFFIX}")
+    return lines, deferred
 
 
 def diff_and_update(state: dict, sweep: Sweep, now: str) -> list[str]:
-    """Fold the sweep into the ledger and return the lines worth posting."""
+    """Fold the sweep into the ledger and return the lines worth posting.
+
+    Only what is printed is ledgered: an object whose bullet did not fit this
+    tick keeps its previous state, so it is announced, or cleared, on a later
+    tick instead of being counted once and never named."""
     previous = state["stalls"]
     current = dict(previous)
     for key, row in sweep.rows.items():
@@ -744,36 +770,54 @@ def diff_and_update(state: dict, sweep: Sweep, now: str) -> list[str]:
             del current[key]
         else:
             current[key] = {**entry, "missed": missed}
-    state["stalls"] = current
     known_before = {object_key(e) for e in previous.values()}
     known_after = {object_key(e) for e in current.values()}
-    new_objects = {k: rows for k, rows in group_by_object(list(sweep.rows.values())).items() if k not in known_before}
-    cleared_objects = {k: rows for k, rows in group_by_object(list(previous.values())).items() if k not in known_after}
+    new_objects = sorted((k, rows) for k, rows in group_by_object(list(sweep.rows.values())).items() if k not in known_before)
+    cleared_objects = sorted((k, rows) for k, rows in group_by_object(list(previous.values())).items() if k not in known_after)
 
     prior_unreadable = state["unreadable"]
-    newly_unreadable = [f"- {scope_label(scope)}: {reason}" for scope, reason in sorted(sweep.unreadable.items()) if scope not in prior_unreadable]
-    readable_again = [
-        f"- {scope_label(scope)}"
-        for scope in sorted(prior_unreadable)
-        if scope not in sweep.unreadable and sweep.scope_read(scope)
-    ]
+    newly_unreadable = sorted((scope, reason) for scope, reason in sweep.unreadable.items() if scope not in prior_unreadable)
+    readable_again = sorted(scope for scope in prior_unreadable if scope not in sweep.unreadable and sweep.scope_read(scope))
+
+    # The sections that report a change already made come first in the budget;
+    # new stalls take what is left and the tail waits for the next tick.
+    budget = REPORT_MAX_CHARS - HEADLINE_ALLOWANCE_CHARS
+    cleared_lines, cleared_deferred = fit(CLEARED_HEADING, [describe_object(k, rows) for k, rows in cleared_objects], budget)
+    budget -= sum(len(l) + 1 for l in cleared_lines)
+    unreadable_lines, unreadable_deferred = fit(UNREADABLE_HEADING, [f"- {scope_label(scope)}: {reason}" for scope, reason in newly_unreadable], budget)
+    budget -= sum(len(l) + 1 for l in unreadable_lines)
+    readable_lines, readable_deferred = fit(READABLE_AGAIN_HEADING, [f"- {scope_label(scope)}" for scope in readable_again], budget)
+    budget -= sum(len(l) + 1 for l in readable_lines)
+    new_lines, new_deferred = fit(NEW_HEADING, [describe_object(k, rows) for k, rows in new_objects], budget)
+
+    # Defer what was not printed: a new object's rows leave the ledger so it is
+    # new again next tick; a cleared object's rows stay so it clears next tick;
+    # an unreadable scope stays out of the record so it is newly unreadable
+    # next tick; a recovered scope stays recorded so it recovers next tick.
+    for k, _ in new_objects[len(new_objects) - new_deferred:]:
+        for key in [key for key, e in current.items() if object_key(e) == k]:
+            del current[key]
+    for k, _ in cleared_objects[len(cleared_objects) - cleared_deferred:]:
+        for key, e in previous.items():
+            if object_key(e) == k:
+                current[key] = e
+    announced_unreadable = dict(newly_unreadable[: len(newly_unreadable) - unreadable_deferred])
+    recovered = set(readable_again[: len(readable_again) - readable_deferred])
+    state["stalls"] = current
     state["unreadable"] = {
         scope: reason
         for scope, reason in {**prior_unreadable, **sweep.unreadable}.items()
-        if scope in sweep.unreadable or not (sweep.scope_read(scope) or sweep.scope_gone(scope))
+        if (scope in sweep.unreadable and (scope in prior_unreadable or scope in announced_unreadable))
+        or (scope not in sweep.unreadable and scope in prior_unreadable and not (scope in recovered or sweep.scope_gone(scope)))
     }
     state["updated_at"] = now
 
-    lines: list[str] = []
-    lines += section(NEW_HEADING, [describe_object(k, rows) for k, rows in sorted(new_objects.items())])
-    lines += section(CLEARED_HEADING, [describe_object(k, rows) for k, rows in sorted(cleared_objects.items())])
-    lines += section(UNREADABLE_HEADING, newly_unreadable)
-    lines += section(READABLE_AGAIN_HEADING, readable_again)
+    lines = new_lines + cleared_lines + unreadable_lines + readable_lines
     if not lines:
         return []
     headline = (
-        f"{HEADLINE_PREFIX} — {len(new_objects)} new, {len(cleared_objects)} cleared "
-        f"(swept {sweep.clusters} clusters, {sweep.namespaces} namespaces; {len(known_after)} stalled objects open)"
+        f"{HEADLINE_PREFIX} — {len(new_objects) - new_deferred} new, {len(cleared_objects) - cleared_deferred} cleared "
+        f"(swept {sweep.clusters} clusters, {sweep.namespaces} namespaces; {len({object_key(e) for e in current.values()})} stalled objects open)"
     )
     return [headline, *lines]
 
