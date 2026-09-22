@@ -150,9 +150,10 @@ The six probes that carry the audit domains in presubmit after the 2026-08-26 re
 ## Second cases per domain (#1023)
 
 Issue #1023 asks for a second case in each single-case domain. The second cases register in
-`hack/eval/nightly-cases.txt`, not the presubmit file: the presubmit seats stay with the probes, the blocking
+`hack/eval/nightly-cases.txt`, not the presubmit file: a presubmit seat is earned on the record, the blocking
 roster is hand-edited (`BOOTSTRAP_ADMITTED`, #1568), and the record a case builds in the nightly
-periodic is what a later roster edit cites. Each case is measured in its authoring pull
+periodic is what a later roster edit cites (`pdb-remediation-pr` and `incident-triage-oom-event-probe`
+moved on theirs on 2026-09-22, #1023). Each case is measured in its authoring pull
 request's presubmit runs before it moves to the nightly tier; the build ids and per-repetition
 costs are recorded in the task header, in `hack/ci-eval-pr.sh`'s nightly block, and in the
 table below. Security's second case, `security-overgrant-remediation-proposal`, predates this
