@@ -66,7 +66,10 @@ and its open card completed with a comment saying so. At most three cards open
 per tick (`MAX_CARDS_PER_TICK`, the default of the pull-request poller's
 `PR_AGENT_MAX_PER_TICK`), since each is a Cluster Agent turn and the number of
 namespaces with a new stall is chosen by whoever can create namespaces; the rest
-wait for the next tick, and chat gets one line saying how many. A new object in
+keep their rows and wait, oldest first sighting first, so a tenant filling three
+fresh namespaces every tick cannot keep an older stall from its card, and chat
+gets one line saying how many wait. A card the board refused leaves its
+namespace waiting the same way. A new object in
 a namespace whose card is still open is a comment on that card; when every
 object in the namespace has cleared, the card gets a closing comment and is
 completed. A `repeating-warnings` or `dangling-reference` row clears only after

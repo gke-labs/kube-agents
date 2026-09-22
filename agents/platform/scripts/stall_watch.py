@@ -250,9 +250,13 @@ EPISODES_KEY = "episodes"
 NO_PROFILE_REASON = "no Cluster Agent profile; not read"
 #: Cards opened per tick. Each is a Cluster Agent turn, and the number of
 #: namespaces with a new stall is chosen by whoever can create namespaces, so
-#: the rest wait for the next tick the way the budget holds unread namespaces.
-#: The default of github_scan_gate's PR_AGENT_MAX_PER_TICK.
+#: the rest keep their rows and wait, oldest first sighting first: a tenant
+#: filling three fresh namespaces every tick cannot keep an older stall from
+#: its card. The default of github_scan_gate's PR_AGENT_MAX_PER_TICK.
 MAX_CARDS_PER_TICK = 3
+#: Finished cards the board may hand back for one scope in one tick, each
+#: moving the generation on, before the scope waits for the next tick.
+MAX_FINISHED_CARDS_SKIPPED = 5
 #: Object names a chat line or card comment spells out before counting the rest.
 MAX_OBJECTS_IN_LINE = 8
 CARD_IDEMPOTENCY_PREFIX = "stall-watch"
@@ -1068,11 +1072,13 @@ def subscribe_card(task_id: str, db_path: Path | None = None) -> int:
     return written
 
 
-def unledger_scope(state: dict, scope: str) -> None:
-    """Drop a scope's rows so the next tick sees its objects as new and tries
-    the board again."""
-    for key in [k for k, e in state["stalls"].items() if scope_key(e["cluster"], e["namespace"]) == scope]:
-        del state["stalls"][key]
+def scope_rows(state: dict, scope: str) -> list[dict]:
+    return [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
+
+
+def scope_first_seen(state: dict, scope: str) -> str:
+    """When the scope's oldest ledgered row was first seen: the queue order."""
+    return min((str(e.get("first_seen") or "") for e in scope_rows(state, scope)), default="")
 
 
 def end_episode(state: dict, scope: str) -> dict:
@@ -1119,67 +1125,77 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     no board and says what it would have done."""
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
+    # Every scope read this tick that has rows and no card is a candidate,
+    # whether its objects appeared now or it has waited: past the cap, after a
+    # refused card, or with no profile. Oldest first sighting first.
+    candidates = dict(new_by_scope)
+    for entry in state["stalls"].values():
+        scope = scope_key(entry["cluster"], entry["namespace"])
+        if scope not in candidates and scope not in episodes and scope in sweep.read_scopes:
+            candidates[scope] = []
     opened = held = 0
-    for scope, rows in sorted(new_by_scope.items()):
+    for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
+        new_rows = candidates[scope]
         cid, namespace = split_scope(scope)
         name, _, location = cid.partition(CLUSTER_ID_SEPARATOR)
         episode = episodes.get(scope)
+        # A card carries every object the scope holds, not only the ones that
+        # appeared this tick.
+        seen = {(r["object"], r["heuristic"], r["detail"]) for r in new_rows}
+        rows = new_rows + [e for e in scope_rows(state, scope) if (e["object"], e["heuristic"], e["detail"]) not in seen]
         if dry_run:
             if episode:
-                what = f"would comment on card `{episode['card']}` for"
+                what, shown = f"would comment on card `{episode['card']}` for", new_rows
             elif opened < MAX_CARDS_PER_TICK:
-                what = "would open a card for"
+                what, shown = "would open a card for", rows
                 opened += 1
             else:
                 held += 1
                 continue
-            lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {names_text(object_names(rows))}")
+            lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {names_text(object_names(shown))}")
             continue
         if episode:
             status = card_status(episode["card"])
             if status is None and not episode_gone(state, scope, episode["card"]):
                 # The rows stay ledgered; the comment waits for a board that answers.
-                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(rows)))
+                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
                 continue
             if status is not None and status not in TERMINAL_CARD_STATUSES:
                 episode["unknown"] = 0
-                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(rows)))
+                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
                 comment_pending(episode, namespace)
                 continue
             if status is not None:
                 end_episode(state, scope)
         if opened >= MAX_CARDS_PER_TICK:
-            # The rows leave the ledger, so the next tick sees the objects as
-            # new and files for them then.
-            unledger_scope(state, scope)
             held += 1
             continue
         assignee = cluster_agent_for(sweep.project, name, location)
         if assignee is None:
             # The profile went between the sweep and the card; the next sweep
-            # leaves the cluster out.
+            # leaves the cluster out and its rows clear.
             sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no card for {scope}\n")
-            unledger_scope(state, scope)
             continue
         generation = int(state.setdefault(GENERATIONS_KEY, {}).get(scope) or 0)
-        # A card replacing a gone or finished one carries every object the
-        # scope still holds, not only the ones that appeared this tick.
-        known = [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
-        seen = {(r["object"], r["heuristic"], r["detail"]) for r in rows}
-        rows = rows + [e for e in known if (e["object"], e["heuristic"], e["detail"]) not in seen]
         title = card_title(name, namespace, rows)
         body = card_body(sweep.project, name, location, namespace, rows, now)
         task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
-        if task_id and (card_status(task_id) or "") in TERMINAL_CARD_STATUSES:
-            # The board handed back a finished card for a key it had seen; move
-            # the generation on and file once more.
+        skipped = 0
+        while task_id and (card_status(task_id) or "") in TERMINAL_CARD_STATUSES:
+            # The board handed back a finished card for a key it had seen, as
+            # it does for every generation a lost ledger once used; move the
+            # generation on and file again.
             generation += 1
             state[GENERATIONS_KEY][scope] = generation
+            skipped += 1
+            if skipped > MAX_FINISHED_CARDS_SKIPPED:
+                sys.stderr.write(f"stall_watch: the board handed back {skipped} finished cards for {scope}; the next tick continues from generation {generation}\n")
+                task_id = None
+                break
             task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
         if not task_id:
-            # No card yet, so nothing to comment on: the rows leave the ledger
-            # and the next tick sees the objects as new and tries the board again.
-            unledger_scope(state, scope)
+            # No card, so nothing to comment on; the rows stay and the next
+            # tick tries the board again.
             continue
         opened += 1
         episodes[scope] = {

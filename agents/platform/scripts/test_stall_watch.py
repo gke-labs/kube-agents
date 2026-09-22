@@ -287,16 +287,17 @@ class Base(unittest.TestCase):
         for name in clusters:
             self.profile_dir(name, location).mkdir(parents=True, exist_ok=True)
 
-    def run_tick(self, fleet, unmanaged=(), **kw):
+    def run_tick(self, fleet, unmanaged=(), now=None, **kw):
         """Every cluster in the fleet has a Cluster Agent profile unless
-        `unmanaged` names it, the way the reconciler prunes one."""
+        `unmanaged` names it, the way the reconciler prunes one. `now` pins
+        the tick's clock, for tests about the order of first sightings."""
         fake = FakeFleet(fleet, **kw)
         for name, location in fake.fleet:
             if name in unmanaged:
                 shutil.rmtree(self.profile_dir(name, location), ignore_errors=True)
             else:
                 self.scaffold(name, location=location)
-        with patch.object(stall_watch, "run_sandbox", fake):
+        with patch.object(stall_watch, "run_sandbox", fake), patch.object(stall_watch, "now_iso", side_effect=lambda: now or stall_watch.datetime.now(stall_watch.timezone.utc).replace(microsecond=0).isoformat()):
             lines = stall_watch.tick(self.state, dry_run=False)
         return lines, fake
 
@@ -371,12 +372,40 @@ class Cards(Base):
         self.assertEqual(len(self.board.opened()), stall_watch.MAX_CARDS_PER_TICK)
         self.assertEqual(len(self.noticed(lines)), stall_watch.MAX_CARDS_PER_TICK + 1)
         self.assertEqual(lines[-1], f"{stall_watch.NOTICED_PREFIX} in 2 more namespaces; cards follow on later ticks, {stall_watch.MAX_CARDS_PER_TICK} a tick")
-        self.assertEqual(len(self.ledger()["stalls"]), stall_watch.MAX_CARDS_PER_TICK, "a held namespace's rows wait for the tick that files for them")
+        self.assertEqual(len(self.ledger()["stalls"]), 5, "a held namespace keeps its rows and its first sighting")
+        self.assertEqual(len(self.ledger()[stall_watch.EPISODES_KEY]), stall_watch.MAX_CARDS_PER_TICK)
         lines, _ = self.run_tick(fleet)
         self.assertEqual(len(self.board.opened()), 5)
         self.assertEqual(len(lines), 2)
         self.assertEqual(sorted(c["title"].split(" in ")[1].split(" on ")[0] for c in self.board.cards.values()), [f"tenant-{i}" for i in range(5)])
         self.assertEqual(self.run_tick(fleet)[0], [])
+
+    def test_a_held_namespace_is_filed_before_namespaces_first_seen_later(self):
+        # A tenant filling three fresh wedged namespaces every tick would
+        # otherwise take every card, tick after tick, from a stall whose name
+        # sorts after theirs.
+        def wedged(ns):
+            return [finding(ns, "Deployment/api", "stale-condition", "Progressing=False ProgressDeadlineExceeded")]
+
+        self.run_tick({"c": {f"aaa-{i}": wedged(f"aaa-{i}") for i in range(3)} | {"payments": wedged("payments")}}, now="2026-09-22T10:00:00+00:00")
+        self.assertEqual(len(self.board.opened()), 3)
+        self.assertFalse(any(" in payments on " in c["title"] for c in self.board.cards.values()))
+        lines, _ = self.run_tick({"c": {f"aaa-{i}": wedged(f"aaa-{i}") for i in range(3, 6)} | {"payments": wedged("payments")}}, now="2026-09-22T10:30:00+00:00")
+        filed = [c["title"].split(" in ")[1].split(" on ")[0] for c in self.board.cards.values()]
+        self.assertIn("payments", filed, filed)
+        self.assertEqual(filed[3], "payments", "the namespace held since the earlier tick is filed first")
+        self.assertEqual(len(self.board.opened()), 6)
+        self.assertEqual(len(self.cleared(lines)), 3, "the deleted tenant namespaces closed their cards")
+
+    def test_a_namespace_not_read_this_tick_is_not_filed_from_its_ledgered_rows(self):
+        fleet = {"c": {f"tenant-{i}": [DEADLINE_ROW | {"namespace": f"tenant-{i}"}] for i in range(4)}}
+        self.run_tick(fleet)
+        self.assertEqual(len(self.board.opened()), 3)
+        lines, _ = self.run_tick({"c": {"tenant-3": TIMEOUT, **{f"tenant-{i}": [DEADLINE_ROW | {"namespace": f"tenant-{i}"}] for i in range(3)}}})
+        self.assertEqual(len(self.board.opened()), 3, "tenant-3's rows are held, and unread this tick, so no card yet")
+        self.assertEqual(lines, [])
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(len(self.board.opened()), 4)
 
     def test_a_dry_run_holds_the_same_namespaces(self):
         fleet = {"c": {f"tenant-{i}": [DEADLINE_ROW | {"namespace": f"tenant-{i}"}] for i in range(4)}}
@@ -607,6 +636,28 @@ class Cards(Base):
         self.assertEqual(len(self.noticed(lines)), 1)
         self.assertNotIn(f"card `{first}`", lines[0])
         self.assertEqual(len(self.board.cards), 2)
+        # Twice over: two finished cards on the board and no ledger.
+        second = [t for t in self.board.cards if t != first][0]
+        self.board.cards[second]["status"] = "done"
+        self.state.write_text(json.dumps(state))
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(self.board.cards), 3)
+        self.assertNotIn(f"card `{first}`", lines[0])
+        self.assertNotIn(f"card `{second}`", lines[0])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["card"], [t for t in self.board.cards if t not in (first, second)][0])
+
+    def test_finished_cards_handed_back_past_the_bound_leave_the_scope_for_the_next_tick(self):
+        for g in range(stall_watch.MAX_FINISHED_CARDS_SKIPPED + 1):
+            tid = f"t_old{g:05d}"
+            self.board.by_key[stall_watch.card_key(f"c@{LOCATION}", "checkout", g)] = tid
+            self.board.cards[tid] = {"status": "done", "assignee": "", "title": "", "body": "", "key": "", "comments": []}
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
+        self.assertEqual(self.ledger()[stall_watch.GENERATIONS_KEY][f"c@{LOCATION}/checkout"], stall_watch.MAX_FINISHED_CARDS_SKIPPED + 1)
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(self.noticed(lines)), 1)
+        self.assertEqual(self.board.cards[self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["card"]]["status"], "ready")
 
     def test_the_idempotency_key_carries_no_clock_so_a_retry_reuses_it(self):
         # The stall's reported age and the scan clock both move between the
@@ -632,11 +683,12 @@ class Cards(Base):
         self.assertFalse(any(c.startswith("complete ") for c in self.board.calls))
         self.assertEqual(self.board.cards[tid]["comments"], [])
 
-    def test_a_board_that_refuses_the_card_leaves_the_objects_new_for_the_next_tick(self):
+    def test_a_board_that_refuses_the_card_leaves_the_scope_waiting_for_the_next_tick(self):
         self.board.fail_next_create = True
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(lines, [])
-        self.assertEqual(self.ledger()["stalls"], {})
+        self.assertEqual(len(self.ledger()["stalls"]), 1, "the row keeps its first sighting")
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(len(self.noticed(lines)), 1)
         self.assertEqual(len(self.board.cards), 1, "the refused attempt filed nothing; the retry filed once")
