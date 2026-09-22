@@ -33,10 +33,22 @@ provider "kubernetes" {
   cluster_ca_certificate = base64decode(google_container_cluster.seeded_b.master_auth[0].cluster_ca_certificate)
 }
 
-# Defect (upgrade readiness): a pool that cannot surge. `max_surge = 0` with
-# `max_unavailable = 1` means GKE upgrades this pool by taking a node away
-# rather than adding one first, so every pod on it is evicted with nowhere
-# prepared to land. On a one-node pool that is the whole pool at once.
+# Defect (upgrade readiness): a pool that upgrades in place. `max_surge = 0`
+# with `max_unavailable = 1` means GKE takes the node away and recreates it in
+# the same pool rather than adding a replacement first, so everything on it is
+# down for the length of that recreate. On a one-node pool that is the whole
+# pool at once.
+#
+# What this is NOT is a pool being retired, and the distinction matters for
+# whoever writes the check. The node comes back, so a single-replica workload
+# here suffers a guaranteed outage of minutes per upgrade, not a permanent
+# Pending. It is also not universally a misconfiguration: the shipped
+# gke-upgrades skill prescribes exactly `maxSurge=0, maxUnavailable=1` for
+# reservation-bound pools and as the remedy for a stockout. So the finding a
+# check should raise is the JOIN -- this surge setting under a workload that
+# cannot absorb the gap -- and its tier is a Risk, not a Blocker. The Blocker
+# on this cluster is the disruption budget further down, which stops the drain
+# from finishing at all.
 #
 # A second pool rather than a setting on the default one, deliberately: the
 # default pool's version pinning is what makes `version-laggard` exact (see
@@ -114,10 +126,14 @@ resource "kubernetes_namespace_v1" "seeded_upgrade" {
   depends_on = [google_container_node_pool.seeded_b_default]
 }
 
-# Defect (upgrade readiness): a workload pinned to the pool that cannot
-# surge. The nodeSelector names the one pool in the cluster carrying the
-# `seeded-role` label, so when that pool is drained this pod has nowhere to
-# go — it does not move to the default pool, it goes Pending and stays there.
+# Defect (upgrade readiness): a single-replica workload pinned to the pool
+# that upgrades in place. The nodeSelector names the one pool carrying the
+# `seeded-role` label, so the pod does not fall back to the default pool while
+# its node is being recreated — it is Pending for the whole recreate, and with
+# one replica that is a full outage of this workload every time the pool
+# upgrades. It is not Pending forever; the node returns. A check that reports
+# "nowhere to land" here has overstated it, and an agent that reports minutes
+# of downtime per node recreate is right.
 #
 # One replica, and that is a constraint rather than a preference. At two it
 # would be a multi-replica workload with no PodDisruptionBudget, which is
@@ -230,12 +246,16 @@ resource "kubernetes_network_policy_v1" "seeded_upgrade_default_deny" {
   }
 }
 
-# Defect (upgrade readiness): an admission webhook that fails closed and
-# waits the maximum time before giving up. `failurePolicy: Fail` means that
-# while the webhook's own backend is down — which is exactly what happens
-# when the node it runs on is drained — every write it matches is rejected
-# rather than allowed through. A drain that evicts the webhook's own pod then
-# stalls on its own admission rule.
+# Defect (upgrade readiness): an admission webhook that fails closed onto a
+# backend that does not exist. The planted property is the unresolvable
+# `clientConfig.service` below, NOT `failurePolicy: Fail` on its own — this
+# repository's own operator webhook sets Fail
+# (k8s-operator/config/webhook/manifests.yaml), as do cert-manager and GKE's
+# managed-prometheus, so a check that fires on the policy alone reports every
+# healthy cluster. Fail plus a backend that can never answer is the
+# combination that turns a drain into a deadlock: while the backend is down,
+# every write the rule matches is rejected rather than allowed through, and a
+# drain that evicts the backend's own pod stalls on its own admission rule.
 #
 # `timeout_seconds = 30` is set explicitly, and that is the fixture rather
 # than an incidental value. "failurePolicy Fail with no timeoutSeconds" is

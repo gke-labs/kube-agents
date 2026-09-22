@@ -175,7 +175,7 @@
       "cluster_slot": "b",
       "namespace": null,
       "probes": ["node?cloud.google.com/gke-nodepool=no-surge-pool"],
-      "fixture": "no-surge-pool node pool with max_surge 0 and max_unavailable 1, so an upgrade takes its only node away rather than adding a replacement first",
+      "fixture": "no-surge-pool node pool with max_surge 0 and max_unavailable 1, so an upgrade recreates its only node in place rather than adding a replacement first -- a guaranteed outage for anything pinned there, not a retirement",
       "state": [
         {
           "subject": "node?cloud.google.com/gke-nodepool=no-surge-pool",
@@ -197,7 +197,7 @@
       "cluster_slot": "b",
       "namespace": "seeded-upgrade",
       "probes": ["deployment/pinned-batch-runner"],
-      "fixture": "pinned-batch-runner Deployment (one replica), nodeSelector seeded-role=no-surge, so its pod runs only on the pool that cannot surge and has nowhere to go when it drains",
+      "fixture": "pinned-batch-runner Deployment (one replica), nodeSelector seeded-role=no-surge, so it runs only on the pool that upgrades in place and is down for the whole of each node recreate rather than falling back to the default pool",
       "state": [
         {
           "subject": "pod?app=pinned-batch-runner",
@@ -219,7 +219,7 @@
       "cluster_slot": "b",
       "namespace": null,
       "probes": ["validatingwebhookconfiguration/seeded-fail-closed-gate"],
-      "fixture": "seeded-fail-closed-gate ValidatingWebhookConfiguration: failurePolicy Fail with the API's maximum 30-second timeout, pointing at a Service that does not exist, confined by namespaceSelector to seeded-upgrade",
+      "fixture": "seeded-fail-closed-gate ValidatingWebhookConfiguration: failurePolicy Fail with the API's maximum 30-second timeout, pointing at a Service that does not exist -- the unresolvable backend is the defect, since Fail alone is set by healthy webhooks throughout the fleet -- confined by namespace and object selectors",
       "state": [
         {
           "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
@@ -234,6 +234,13 @@
           "op": "any_eq",
           "value": 30,
           "why": "the second half of the defect. An omitted timeout is defaulted to 10 by the API server, so the long wait is only present while it is set explicitly, and a check that grades how long a drain can stall has nothing to read if someone drops it"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
+          "path": "webhooks[*].clientConfig.service.name",
+          "op": "any_eq",
+          "value": "nonexistent-admission-gate",
+          "why": "the property that makes this dangerous rather than ordinary. failurePolicy Fail is set by cert-manager, managed-prometheus and this repository's own operator webhook; Fail onto a backend that cannot answer is what deadlocks a drain. Point the clientConfig at a Service that resolves and the fixture is healed while the policy and the timeout still read as planted"
         }
       ]
     },

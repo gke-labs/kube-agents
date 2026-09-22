@@ -236,7 +236,7 @@ def healthy_world(*projects):
                 "status": {"readyReplicas": 1, "replicas": 1},
             },
             "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
-            "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30}]},
+            "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30, "clientConfig": {"service": {"name": "nonexistent-admission-gate"}}}]},
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},

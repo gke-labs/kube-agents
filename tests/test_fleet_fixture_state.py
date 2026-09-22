@@ -205,7 +205,7 @@ def _healthy_world() -> dict:
             },
             "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
             "validatingwebhookconfiguration/seeded-fail-closed-gate": {
-                "webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30}]
+                "webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30, "clientConfig": {"service": {"name": "nonexistent-admission-gate"}}}]
             },
         },
         "describe": {
