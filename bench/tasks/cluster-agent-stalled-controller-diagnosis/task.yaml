@@ -12,7 +12,10 @@
 #
 # Both object names are in the prompt, so a report that restates the brief
 # names them without running anything. The objective also needs the skill's
-# contracted closing line, "stalled resources: 1", which only a scan prints.
+# contracted closing line, "stalled resources: <count>", which only a scan
+# prints. The count is left out: the ReplicaSet and Pods of inventory-api
+# carry rows too, and a narrowed scan prints a smaller number than a
+# namespace-wide one.
 # Two safeguards join when #1873 lands the role, since a fleet check may only
 # name a role fixtures.json defines: the ConfigMap inventory-flags stays absent
 # in seeded-stall, and inventory-api's envFrom still names it. They catch the
@@ -56,4 +59,4 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["inventory-flags", "stalled resources: 1"]
+      required_phrases: ["inventory-flags", "stalled resources:"]
