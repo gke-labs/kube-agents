@@ -123,6 +123,13 @@ const (
 	// as a steer; the id is what says it is the same message.
 	injectSeenCap = 4096
 
+	// injectSeqFloorCap bounds the memory of where evicted conversations'
+	// sequences stopped (InjectAdapter.seqFloors). A key re-minted after this
+	// many further evictions starts its numbering over, which is the cost of
+	// the bound; a poller that old is a poller whose conversation was evicted
+	// thousands of conversations ago.
+	injectSeqFloorCap = 4096
+
 	// The bearer credential, spelled once. The scheme is compared
 	// case-insensitively (RFC 7235 makes it a case-insensitive token) and
 	// the credential in constant time.
@@ -131,8 +138,8 @@ const (
 
 	// injectMaxBodyBytes bounds one request body. A prompt is a few
 	// kilobytes; this is generous enough for any case's opening turn and
-	// small enough that an unauthenticated door cannot be used to fill the
-	// gateway's heap.
+	// small enough that one request, from a caller the token admitted,
+	// cannot fill the gateway's heap.
 	injectMaxBodyBytes = 1 << 20
 
 	// injectMaxTextRunes bounds the text of one injected message, and
@@ -450,9 +457,11 @@ func (l *injectIDLog) at(prior int) (id string, evicted bool) {
 // injectConversation is one synthetic conversation's state.
 type injectConversation struct {
 	entries []InjectEntry
-	// nextSeq is monotonic across evictions: a reader polling with a
+	// nextSeq is monotonic across evictions -- of entries, and of the
+	// conversation itself (InjectAdapter.seqFloors): a reader polling with a
 	// sequence must never see one it has already consumed, even once the
-	// oldest entries have been dropped.
+	// oldest entries have been dropped or the conversation was evicted and
+	// minted again under it.
 	nextSeq int
 	// terminals records the terminal state of every task that has ended on
 	// this conversation, so a reader that arrives after the event still
@@ -524,6 +533,13 @@ type InjectAdapter struct {
 	// order is the conversation keys in first-seen order, for the eviction
 	// the map cannot do on its own.
 	order []string
+	// seqFloors is where an evicted conversation's sequence stopped, by key,
+	// so a re-mint of the same key continues it: a poller following `after`
+	// across an eviction under its running task would otherwise have the
+	// relay's later posts, renumbered from 1, filtered out as already read.
+	// seqFloorOrder bounds it at injectSeqFloorCap, oldest eviction first.
+	seqFloors     map[string]int
+	seqFloorOrder []string
 	// directOf maps an author to the conversation they last spoke on, which
 	// is what OpenDirect answers with. Bounded by the conversation cap: an
 	// entry is dropped when its conversation is evicted.
@@ -579,6 +595,7 @@ func NewInjectAdapter(listen, token string, firstEventGrace time.Duration, log *
 		log:             log,
 		conversations:   map[string]*injectConversation{},
 		directOf:        map[string]string{},
+		seqFloors:       map[string]int{},
 		submissions:     map[string]*injectSubmission{},
 		notify:          make(chan struct{}),
 	}, nil
@@ -939,13 +956,40 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 				delete(a.directOf, author)
 			}
 		}
+		if evicted := a.conversations[oldest]; evicted != nil {
+			a.rememberSeqFloorLocked(oldest, evicted.nextSeq)
+		}
 		delete(a.conversations, oldest)
 	}
 	a.mints++
-	conv := &injectConversation{nextSeq: 1, terminals: map[string]string{}, gen: a.mints}
+	conv := &injectConversation{nextSeq: a.seqFloorLocked(key), terminals: map[string]string{}, gen: a.mints}
 	a.conversations[key] = conv
 	a.order = append(a.order, key)
 	return conv
+}
+
+// rememberSeqFloorLocked records where an evicted conversation's sequence
+// stopped, bounded at injectSeqFloorCap by eviction order. Caller holds a.mu.
+func (a *InjectAdapter) rememberSeqFloorLocked(key string, next int) {
+	if _, ok := a.seqFloors[key]; !ok {
+		a.seqFloorOrder = append(a.seqFloorOrder, key)
+	}
+	a.seqFloors[key] = next
+	for len(a.seqFloorOrder) > injectSeqFloorCap {
+		delete(a.seqFloors, a.seqFloorOrder[0])
+		a.seqFloorOrder = a.seqFloorOrder[1:]
+	}
+}
+
+// seqFloorLocked is the sequence a conversation minted under key starts at:
+// where its evicted predecessor stopped, or 1. The floor is left in place
+// rather than consumed, so the bound above stays by eviction order; the next
+// eviction of the key overwrites it. Caller holds a.mu.
+func (a *InjectAdapter) seqFloorLocked(key string) int {
+	if next, ok := a.seqFloors[key]; ok {
+		return next
+	}
+	return 1
 }
 
 // appendLocked stamps and stores one entry, then wakes every waiting reader.

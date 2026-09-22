@@ -520,7 +520,7 @@ func TestInjectTerminalIsAnsweredAfterTheFact(t *testing.T) {
 	}
 }
 
-// TestInjectGradesAFailedTaskRatherThanHidingIt: a task an executor took and
+// TestInjectGradesAFailedTask: a task an executor took and
 // ended `failed` is an outcome, not an infrastructure fault, and both the
 // reason and the terminal state have to reach the caller.
 func TestInjectGradesAFailedTask(t *testing.T) {
@@ -2294,13 +2294,15 @@ func TestInjectNamedCancelOfTheActiveTaskDetachesTheRecord(t *testing.T) {
 	// The detach is persisted by the end-of-turn write, not by the post.
 	r.awaitTurnEnd(t, reply.Conversation)
 
-	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	page := r.probe(t, reply.Conversation, reply.TaskID)
+	probe := page.Probe
 	if !probe.Active || !probe.Detached || probe.TaskID != reply.TaskID {
 		t.Fatalf("after a named cancel of the active task: probe = %+v, want it active and detached", probe)
 	}
 	// And the named-cancel path's own refusal did not fire: the conversation
-	// holds this task, so the cancel is the ordinary one.
-	posts := strings.Join(entryTexts(reply.Entries, InjectEntryPost), "\n")
+	// holds this task, so the cancel is the ordinary one. Read off the page
+	// the probe just fetched, not the POST's reply, which predates the cancel.
+	posts := strings.Join(entryTexts(page.Entries, InjectEntryPost), "\n")
 	if strings.Contains(posts, "no longer holds") {
 		t.Fatalf("the active task took the released-task path: %q", posts)
 	}
@@ -2838,6 +2840,32 @@ func TestInjectEvictionDropsEveryAuthorsMappingToTheConversation(t *testing.T) {
 		if conversation, ok := f.door.directOf[author]; ok {
 			t.Errorf("%s still maps to %q after its conversation was evicted", author, conversation)
 		}
+	}
+}
+
+// TestInjectAReMintedConversationContinuesItsSequence: a conversation evicted
+// under a running task is minted again by the relay's next post, and that
+// post must not be numbered from 1. A poller holding `after` from before the
+// eviction filters on the number, so a restart would hide the deliverable
+// from it for good; InjectEntry.Seq promises otherwise.
+func TestInjectAReMintedConversationContinuesItsSequence(t *testing.T) {
+	f := startFakeDoor(t, func(InboundMessage) {})
+	const key = injectKeyPrefix + "long-runner"
+	for _, text := range []string{"⏳ submitted…", "⚙️ working"} {
+		if _, err := f.door.Post(key, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, last, _ := f.door.snapshot(key, 0, ""); last != 2 {
+		t.Fatalf("lastSeq before the eviction = %d, want 2", last)
+	}
+	f.evictEverything(t, "long-runner")
+	if _, err := f.door.Post(key, "the answer"); err != nil {
+		t.Fatal(err)
+	}
+	entries, last, _ := f.door.snapshot(key, 2, "")
+	if len(entries) != 1 || entries[0].Seq != 3 || last != 3 {
+		t.Fatalf("after the eviction a poller at after=2 sees entries=%+v lastSeq=%d; want the one new post at seq 3", entries, last)
 	}
 }
 

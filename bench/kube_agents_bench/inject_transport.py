@@ -76,6 +76,8 @@ __all__ = [
     "OUTCOME_TERMINAL",
     "OUTCOME_UNCLASSIFIED",
     "PERSONA_REASONS",
+    "PROBES_PER_POLL",
+    "PROBE_BOUND_SECONDS",
     "PROBE_PARAM",
     "REASON_CANCELED_BEFORE_START",
     "REASON_PREFIX",
@@ -368,7 +370,13 @@ SUBMIT_TIMEOUT_SECONDS = 120.0
 # out after `budget` seconds, so the fractional second decides -- and a lost
 # race reads as a dead tunnel, tearing down a healthy port-forward.
 POLL_TIMEOUT_MARGIN_SECONDS = 30.0
-POLL_TIMEOUT_SECONDS = POLL_WAIT_SECONDS + POLL_TIMEOUT_MARGIN_SECONDS
+# What the gateway allows one probe (its probeTimeout, a turn's bound), and how
+# many a probed GET may run: one before the wait and one more after a wait
+# that blocked. The client timeout covers both on top of the wait, or a bus
+# slow enough to make a probe take longer than the margin would read as a
+# dead tunnel and tear down a healthy port-forward.
+PROBE_BOUND_SECONDS = 60.0
+PROBES_PER_POLL = 2
 
 # How much of the conversation's last post a log line or an infrastructure
 # message quotes, so a stalled task's last words are on the record without
@@ -714,9 +722,10 @@ class Probe:
     detached: bool = False
     executor_state: str = ""
     final: bool = False
-    # The fold's terminal, when ``final``: whose word it is (the gateway's
-    # ``executor`` or ``gateway``), the result artifact's text and the
-    # terminal's status message, as the read route reports them.
+    # The fold's terminal, when ``final``: whose word it is (``executor`` or
+    # ``supervisor``, the two the session record carries), the result
+    # artifact's text and the terminal's status message, as the read route
+    # reports them.
     terminal_source: str = ""
     result: str = ""
     reason: str = ""
@@ -1097,9 +1106,12 @@ class InjectTask:
         on the record -- nothing ran either way, and grading it would put a
         record with no run on it in front of the scorer. ``working``,
         detached or not: a graded timeout.
-        Anything else -- the gateway could not look, or the record no longer
-        holds the task and this side never saw a terminal -- cannot be
-        classified.
+        Anything else -- the record no longer holds the task and this side
+        never saw a terminal, or the gateway could not look and no earlier
+        read saw an executor state either -- cannot be classified. A read
+        failure on this one request does not discard what the probed polls
+        before it saw: a task working at the last look is working at the
+        budget, one only ever queued is queued.
         """
         body = self._poll(task_id, after, 0)
         after, _ = self._absorb(fold, body, after)
@@ -1110,7 +1122,9 @@ class InjectTask:
         )
         if fold.final:
             return self._ended(fold, task_id, probe)
-        if not probe.could_look or not probe.concerns(task_id):
+        if not probe.could_look:
+            return self._classify_from_the_polls(fold, task_id, probe)
+        if not probe.concerns(task_id):
             return Exchange(fold, OUTCOME_UNCLASSIFIED, self.conversation, task_id, probe)
         if probe.final:
             return self._finish(fold, task_id, after, probe)
@@ -1121,6 +1135,33 @@ class InjectTask:
             # floor, which check_budget refuses, so this is a gateway whose
             # reported grace changed under the run. Not classifiable.
             return Exchange(fold, OUTCOME_UNCLASSIFIED, self.conversation, task_id, probe)
+        if fold.queued_only:
+            return Exchange(fold, OUTCOME_QUEUED, self.conversation, task_id, probe)
+        return Exchange(fold, OUTCOME_DEADLINE, self.conversation, task_id, probe)
+
+    def _classify_from_the_polls(self, fold: Fold, task_id: str, probe: Probe) -> Exchange:
+        """The deadline read could not look: classify from the reads before it.
+
+        Every poll was probed, so the fold holds the lifecycle up to the last
+        look, seconds before this one. A one-off KV or stream-read failure on
+        the gateway's side is not evidence about the task, and discarding
+        what the polls saw would cancel a working task and file the run as
+        infrastructure. Never-started needs the record's age, which only the
+        probe carries, so a task with no executor state seen stays
+        unclassifiable.
+        """
+        seen = [state for state in fold.executor_states if state]
+        if not seen:
+            return Exchange(fold, OUTCOME_UNCLASSIFIED, self.conversation, task_id, probe)
+        _log.warning(
+            "inject: the deadline read on %s could not look (%s); classifying %s from the "
+            "%d earlier reads, the last of which saw %s",
+            self.conversation,
+            probe.error,
+            task_id,
+            len(seen),
+            seen[-1],
+        )
         if fold.queued_only:
             return Exchange(fold, OUTCOME_QUEUED, self.conversation, task_id, probe)
         return Exchange(fold, OUTCOME_DEADLINE, self.conversation, task_id, probe)
@@ -1183,8 +1224,13 @@ class InjectTask:
         )
         # The margin is over what the SERVER was asked to wait, not over the
         # caller's remaining budget: a client timeout should mean the
-        # connection died, never that the gateway answered a moment late.
-        return _request(url, wait + POLL_TIMEOUT_MARGIN_SECONDS, self.token)
+        # connection died, never that the gateway answered a moment late --
+        # and a probed read may also spend the gateway's probe bound twice,
+        # before the wait and after one that blocked, on top of the wait.
+        timeout = wait + POLL_TIMEOUT_MARGIN_SECONDS
+        if probe:
+            timeout += PROBES_PER_POLL * PROBE_BOUND_SECONDS
+        return _request(url, timeout, self.token)
 
     def cancel(self, task_id: str = "", *, settle: float | None = None) -> Exchange | None:
         """Stop the conversation's task, and read what the stop found.

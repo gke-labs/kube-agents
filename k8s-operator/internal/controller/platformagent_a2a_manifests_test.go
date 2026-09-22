@@ -4275,8 +4275,9 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, svc); err != nil {
 		t.Fatalf("inject Service: %v", err)
 	}
-	// ClusterIP is the access control: a LoadBalancer or a NodePort would
-	// publish an unauthenticated task-submission endpoint off-cluster.
+	// ClusterIP keeps the door inside the cluster: a LoadBalancer or a
+	// NodePort would publish a task-submission endpoint off-cluster with the
+	// bearer token as its only guard.
 	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 		t.Errorf("inject Service type = %q, want ClusterIP", svc.Spec.Type)
 	}
@@ -4293,9 +4294,9 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	}
 }
 
-// TestA2AInjectFenceDeniesEveryPod: the fence is the whole of what withholds
-// an unauthenticated endpoint from the cluster, so it has to select the
-// gateway pod and admit nobody. An ingress rule appearing here later is a
+// TestA2AInjectFenceDeniesEveryPod: the fence is what keeps every other pod
+// off the door's port, so a leaked token alone reaches nothing; it has to
+// select the gateway pod and admit nobody. An ingress rule appearing here later is a
 // decision someone has to make deliberately.
 func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
@@ -4471,6 +4472,51 @@ func TestA2AInjectTokenIsMintedOnceAndKept(t *testing.T) {
 	}
 	if string(again.Data[a2aInjectTokenKey]) != minted {
 		t.Error("the token changed across reconciles; every caller holding it is now refused")
+	}
+}
+
+// TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret: a Secret under the
+// rendered name that this agent did not create is not the door's key. The
+// token is the door's only access control, so adopting one would arm the door
+// with a credential its planter holds; and the flag-off removal refuses to
+// delete an unowned object, so a render built on it would wedge every later
+// reconcile. The reconcile fails before the Service is rendered, and the
+// planted Secret is left exactly as it was.
+func TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	planted := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace},
+		Data:       map[string][]byte{a2aInjectTokenKey: []byte("planted-token")},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, planted).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	var err error
+	for i := 0; i < 2 && err == nil; i++ {
+		_, err = r.Reconcile(ctx, req)
+	}
+	if err == nil || !strings.Contains(err.Error(), "unowned") {
+		t.Fatalf("Reconcile with a planted token Secret: err = %v, want a refusal naming the unowned Secret", err)
+	}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	after := &corev1.Secret{}
+	if err := cl.Get(ctx, key, after); err != nil {
+		t.Fatal(err)
+	}
+	if string(after.Data[a2aInjectTokenKey]) != "planted-token" || metav1.IsControlledBy(after, agent) {
+		t.Errorf("the planted Secret was changed or adopted: %+v", after.ObjectMeta.OwnerReferences)
+	}
+	if err := cl.Get(ctx, key, &corev1.Service{}); !errors.IsNotFound(err) {
+		t.Errorf("the inject Service was rendered on top of the refused token (err=%v)", err)
 	}
 }
 

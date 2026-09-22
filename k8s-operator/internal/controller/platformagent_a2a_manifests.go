@@ -2138,6 +2138,15 @@ func (r *PlatformAgentReconciler) ensureA2AInjectTokenSecret(ctx context.Context
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
+		if !metav1.IsControlledBy(existing, agent) {
+			// Not ours, not adopted. The token is the door's only access
+			// control, so a Secret somebody else wrote under the rendered name
+			// would hand the door to whoever wrote it; and the flag-off
+			// removal refuses to delete an unowned object, so a render built
+			// on one would wedge later. Refused here, before the Service and
+			// the gateway's env reference the name.
+			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A inject door's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
+		}
 		if len(existing.Data[a2aInjectTokenKey]) > 0 {
 			return nil
 		}

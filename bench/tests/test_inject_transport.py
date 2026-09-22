@@ -1143,6 +1143,56 @@ def test_an_unclassifiable_deadline_is_infrastructure(
     assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
 
 
+def test_a_transient_at_the_deadline_read_classifies_from_the_polls(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every poll before the deadline was probed and saw the task working.
+    A read failure on the one deadline request is not evidence about the
+    task; the run is the graded timeout the polls describe, cancelled and
+    graded on what it produced, not an infrastructure failure."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    real_classify = inject.InjectTask._classify
+
+    def failing_at_the_deadline(self: inject.InjectTask, *args: Any, **kwargs: Any) -> Any:
+        stub_gateway.probe_error = "session lookup: context deadline exceeded"
+        return real_classify(self, *args, **kwargs)
+
+    monkeypatch.setattr(inject.InjectTask, "_classify", failing_at_the_deadline)
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert not infra(result)
+    assert result.output == "partial findings"
+    assert any("did not reach a terminal state" in e for e in result.errors)
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+
+
+def test_a_transient_at_the_deadline_read_keeps_a_queued_task_queued(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same transient over a task the polls only ever saw submitted is
+    the queued classification, still infrastructure and still cancelled."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
+    stub_gateway.executor_states = ["submitted"]
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    real_classify = inject.InjectTask._classify
+
+    def failing_at_the_deadline(self: inject.InjectTask, *args: Any, **kwargs: Any) -> Any:
+        stub_gateway.probe_error = "reading task: nats: timeout"
+        return real_classify(self, *args, **kwargs)
+
+    monkeypatch.setattr(inject.InjectTask, "_classify", failing_at_the_deadline)
+
+    result = KubeAgentsHarness().run("wait in line")
+
+    assert infra(result)
+    assert "sat queued" in result.errors[0]
+    assert stub_gateway.cancels
+
+
 def test_a_transient_settle_read_does_not_relabel_a_graded_deadline(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1303,6 +1353,38 @@ def test_an_adopted_fold_grades_the_result_text_over_the_placeholder(
     assert result.output == "the PodDisruptionBudget allows zero disruptions"
     assert PLACEHOLDER not in result.output
     assert result.metadata["final_message"] == result.output
+
+
+def test_a_probed_poll_gives_the_gateway_time_for_both_probes(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every poll this transport sends is probed, and the gateway runs the
+    probe before the wait and again after a wait that blocked, each under its
+    own bound. A client timeout of the wait plus a margin covers neither, so
+    a slow bus would read as a dead tunnel and tear down a healthy
+    port-forward; the timeout covers both probes on top of the wait."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)
+    real_request = inject._request
+    timeouts: list[tuple[str, float]] = []
+
+    def recording(url: str, timeout: float, *args: Any, **kwargs: Any) -> Any:
+        timeouts.append((url, timeout))
+        return real_request(url, timeout, *args, **kwargs)
+
+    monkeypatch.setattr(inject, "_request", recording)
+
+    KubeAgentsHarness().run("quick one")
+
+    probed = [t for url, t in timeouts if f"{inject.PROBE_PARAM}=1" in url]
+    assert probed, "no probed GET was sent"
+    floor = inject.POLL_TIMEOUT_MARGIN_SECONDS + inject.PROBES_PER_POLL * inject.PROBE_BOUND_SECONDS
+    assert all(t >= floor for t in probed), probed
+    # The preflight read asks the server to wait nothing and still gets both
+    # probes' worth of time.
+    assert probed[0] == floor
+    # A POST gets its own submit timeout, not the poll's.
+    posts = [t for url, t in timeouts if url.endswith(inject.INJECT_PATH)]
+    assert posts == [inject.SUBMIT_TIMEOUT_SECONDS]
 
 
 def test_a_supervisor_terminal_on_the_fold_is_infrastructure(

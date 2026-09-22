@@ -77,14 +77,17 @@ func (s *sideDoorAdapter) Run(ctx context.Context, handler func(InboundMessage))
 	errs := make(chan error, 2)
 	go func() {
 		err := s.primary.Run(ctx, handler)
-		if err != nil {
+		// A half that stopped because it was asked to -- the parent's
+		// cancel, or the cancel below after the other half failed -- is a
+		// clean shutdown, not an error to report.
+		if err != nil && ctx.Err() == nil {
 			s.log.Error("the chat backend stopped; the gateway is going with it", "err", err)
 		}
 		errs <- err
 	}()
 	go func() {
 		err := s.door.Run(ctx, handler)
-		if err != nil {
+		if err != nil && ctx.Err() == nil {
 			s.log.Error("the inject door stopped; the gateway is going with it", "err", err)
 		}
 		errs <- err
