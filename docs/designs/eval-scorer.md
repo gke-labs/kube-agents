@@ -547,6 +547,8 @@ The backend has been exercised end to end against a real bucket
 | An admitted case that fails every repetition reds the suite | rung 4 collapse, `suite` exits 1                                  |
 | A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
 | A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
+| A single-case scope lists that case's prefix alone          | the case's own objects, not the store's                           |
+| A case with no prefix yet is an empty read, not an outage   | `matched no objects`, the same text an empty root gives           |
 
 What no local run can reach is the nightly Prow job's own append. Its nights are the validation,
 read through the dashboard's Nightly report (`scripts/eval_dashboard/nightly.py`).
