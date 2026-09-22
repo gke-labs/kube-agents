@@ -45,14 +45,16 @@ endpoint from outside the cluster. It is also identical in both modes, because t
 renders the bus beside the agent and leaves the agent's HTTP server as it was.
 
 The reply it grades is the Responses payload. When the agent delegates by filing a kanban card,
-the harness re-prompts the same conversation every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30
-by default) with an instruction to call `kanban_show` on the outstanding ids, until every card
-reads done, blocked or archived or `AGENT_DELEGATION_TIMEOUT` elapses (1800 s by default, 2700 s
-in the presubmit, 3000 s for its six full-audit units). The delivered card results are appended
-to the answer, and the worker's report and terminal commands are read back with `kubectl exec` from
+the harness reads the outstanding cards' statuses off the agent's kanban store with `kubectl exec`
+every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30 by default), and re-prompts the same
+conversation with an instruction to call `kanban_show` only once a card reads done, blocked or
+archived (or when the store cannot be read), until every card has settled or
+`AGENT_DELEGATION_TIMEOUT` elapses (1800 s by default, 2700 s in the presubmit, 3000 s for its
+six full-audit units). The delivered card results are appended to the answer, and the worker's
+report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted. A customer sees the card result relayed to their thread; they never see the files, and
-the poll turns are model calls the customer never made.
+deleted. A customer sees the card result relayed to their thread; they never see the files, the
+store reads, or the collecting turn, which is a model call the customer never made.
 
 The consequence, measured: the presubmit matrix ran under `mode: next` with the A2A gateway in
 `ErrImagePull`, the auth callout in `ImagePullBackOff` and the provisioning Job in `Error`, and

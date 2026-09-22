@@ -46,7 +46,11 @@ Environment:
     AGENT_DELEGATION_TIMEOUT: Total seconds to wait for delegated work across
         all status turns (default ``1800``). ``0`` disables waiting, restoring
         the single-turn behaviour.
-    AGENT_DELEGATION_POLL_INTERVAL: Seconds between status turns (default ``30``).
+    AGENT_DELEGATION_POLL_INTERVAL: Seconds between board reads while delegated
+        work is awaited (default ``30``). Each read is a ``kubectl exec``
+        against the agent's kanban store; a status turn through the model is
+        made only when a read shows a card settled, or when the board cannot
+        be read at all.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 """
 
@@ -73,7 +77,7 @@ from typing import Any
 
 from devops_bench.agents import AgentHarness, AgentResult
 
-from kube_agents_bench import transcript, worker_trajectory
+from kube_agents_bench import board, transcript, worker_trajectory
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -1019,10 +1023,12 @@ class KubeAgentsHarness(AgentHarness):
         trajectory afterwards, in :meth:`_settle`, read from their session
         stores rather than from any turn.)
 
-        The harness cannot read the board itself (in-cluster SQLite, with only
-        ``/v1/responses`` and ``/api/sessions`` exposed), so it asks the agent
-        to, re-POSTing the same stateful ``conversation`` so the agent keeps its
-        context. Cards filed *during* a status turn join the wait.
+        Each poll first reads the cards' statuses off the board itself
+        (:mod:`kube_agents_bench.board`, one ``kubectl exec`` and no model
+        turn). Only when a card has stopped moving -- or the board cannot be
+        read -- does the harness ask the agent, re-POSTing the same stateful
+        ``conversation`` so the agent keeps its context and can carry the
+        card's result back. Cards filed *during* a status turn join the wait.
 
         A turn that fails in transport is retried up to
         :data:`_MAX_TRANSPORT_FAILURES` times running -- through a fresh
@@ -1067,6 +1073,12 @@ class KubeAgentsHarness(AgentHarness):
         silent = 0
         transport_failures = 0
         timed_out = True
+        # The freshest status seen for each card, from whichever source read
+        # it last -- the board or a status turn -- for the deadline report.
+        # ``statuses`` stays the agent's own readings, which are what settle a
+        # card: a board reading never retires a card from ``outstanding``,
+        # because only a status turn can carry the card's result back.
+        latest: dict[str, str] = dict(statuses)
         while outstanding:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1082,6 +1094,24 @@ class KubeAgentsHarness(AgentHarness):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+
+            # Ask the board before asking the agent. A status turn replays the
+            # whole conversation through the model, so a card that runs for
+            # 45 minutes used to cost ~90 turns and millions of input tokens
+            # against the quota the worker under test shares. The board read
+            # is one kubectl exec and no tokens; the turn is spent only once
+            # the board says a card has stopped moving, since that is the one
+            # turn that can bring its result into the conversation. A read
+            # that fails, or does not know every outstanding card, decides
+            # nothing: the turn is made exactly as before, so the silent-turn
+            # ceiling still ends a wait on a card the agent cannot see.
+            on_board = board.read_statuses(_agent_shell, outstanding, _EXEC_TIMEOUT)
+            if on_board is not None:
+                latest.update(on_board)
+                if all(t in on_board for t in outstanding) and not any(
+                    on_board[t] in _TERMINAL_STATUSES for t in outstanding
+                ):
+                    continue
 
             poll = _POLL_PROMPT.format(tool=STATUS_TOOL, ids=", ".join(outstanding))
             try:
@@ -1150,6 +1180,7 @@ class KubeAgentsHarness(AgentHarness):
             # reading the board pass as one still answering, and would mark
             # every turn after the first terminal card as settled.
             fresh_reported = reported_statuses(new_calls(turn, seen_calls))
+            latest.update(fresh_reported)
             _fold_status_turn(
                 result,
                 turn,
@@ -1188,7 +1219,7 @@ class KubeAgentsHarness(AgentHarness):
             result.errors.append(
                 "delegated tasks did not finish within "
                 f"{delegation_timeout:.0f}s: "
-                + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
+                + ", ".join(f"{t} ({latest.get(t, 'unknown')})" for t in outstanding)
             )
         self._settle(result, observed, awaited)
         return session_id
