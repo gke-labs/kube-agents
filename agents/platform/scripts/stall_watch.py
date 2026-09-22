@@ -311,9 +311,6 @@ PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
 #: failed while the object listing succeeded; both flap on one miss.
 CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2}
 DEFAULT_CLEAR_AFTER_MISSED_SCANS = 1
-#: An event message is the one field a tenant writes, so it is cut in a card
-#: or a chat line at the length the report script's own table uses.
-ROW_DETAIL_MAX_CHARS = 400
 TRUNCATION_MARKER = "..."
 LEDGER_KEY_SEPARATOR = "|"
 #: A cluster is `name@location`: two projects' clusters may share a name
@@ -780,13 +777,6 @@ def object_key(row: dict) -> tuple[str, str, str]:
     return (row.get("cluster", ""), row.get("namespace", ""), row.get("object", ""))
 
 
-def row_text(row: dict) -> str:
-    detail = row["detail"]
-    if len(detail) > ROW_DETAIL_MAX_CHARS:
-        detail = detail[: ROW_DETAIL_MAX_CHARS - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
-    return f"{row['heuristic']} {detail}"
-
-
 def diff_and_update(state: dict, sweep: Sweep, now: str) -> tuple[dict, dict]:
     """Fold the sweep into the ledger. Returns the objects that started stalling
     this tick and the objects whose last row cleared, each grouped by
@@ -921,7 +911,9 @@ def card_title(cluster: str, namespace: str, rows: list[dict]) -> str:
 
 
 def rows_block(rows: list[dict]) -> str:
-    lines = [f"- {r['object']}: {row_text(r)} ({r.get('stalled_for') or '?'})" for r in sorted(rows, key=lambda r: (r["object"], r["heuristic"]))]
+    # A row's detail carries condition reasons, spec paths, referent names and
+    # event messages a tenant writes; the skill's own run reads them again.
+    lines = [f"- {r['object']}: {r['heuristic']} ({r.get('stalled_for') or '?'})" for r in sorted(rows, key=lambda r: (r["object"], r["heuristic"]))]
     shown = lines[:MAX_ROWS_IN_CARD]
     if len(lines) > len(shown):
         shown.append(f"- and {len(lines) - len(shown)} more rows; the skill's own run lists them all")
