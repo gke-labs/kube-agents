@@ -151,6 +151,21 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
+#: The marker the harness leads its deadline error with when the delegation
+#: wait (``AGENT_DELEGATION_TIMEOUT``) ran out and no awaited card had
+#: delivered anything. The record is scored -- the judge grades the front
+#: door's acknowledgement and returns a low score -- but the acknowledgement
+#: is the designed first reply of an asynchronous delegation, not the answer,
+#: and the worker was still running when the harness stopped watching. Such a
+#: repetition is the eval's ceiling, not the agent's failure, so it is
+#: classified apart: ``infra``, under a reason that leads with this marker so
+#: the dashboard can tell it from a quota storm (which also reads ``infra``)
+#: and keep it out of the storm signature. A ceiling hit with a partial
+#: delivery carries no marker and grades on what arrived. Duplicated rather
+#: than imported for the same reason as the marker above; ``test_scoring.py``
+#: asserts the two strings agree.
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
+
 #: Field values from devops-bench's ``_build_failed_record``: ``status`` is
 #: ``"failed"`` on every failed record, and ``verification_status`` is
 #: ``"not_evaluated"`` when verification did not run -- which has TWO
@@ -622,6 +637,27 @@ def classify_rep(
             "results.json carries a record with no scores map: the run or its "
             "scoring pass crashed",
             Rung.CHECK_DID_NOT_RUN,
+        )
+
+    # The delegation ceiling: the harness stopped watching a card that was
+    # still moving, and nothing had been delivered. The record is scored, but
+    # what was scored is the acknowledgement the front door gives by design
+    # when it delegates, so a low score here says the eval's wait was shorter
+    # than the worker's run and nothing about the agent under test. Before
+    # rung 1 because the marker is the harness stating what happened, like
+    # the transport marker above; after the scores test because a scoreless
+    # record is a crashed scoring pass whatever else it carries. The reason
+    # leads with the marker so the dashboard's collector, which keeps the
+    # first characters of a reason, can tell this class from a quota storm.
+    errors = record.error if isinstance(record.error, list) else [record.error]
+    ceiling = next((str(e) for e in errors if DELEGATION_CEILING_MARKER in str(e)), None)
+    if ceiling is not None:
+        detail = ceiling.partition(DELEGATION_CEILING_MARKER)[2].lstrip(": ").strip()
+        return rep(
+            "infra",
+            f"{DELEGATION_CEILING_MARKER}: the harness's delegation wait ran out "
+            "before any delegated card delivered a result, so the record holds "
+            f"the acknowledgement alone and nothing to grade ({detail})",
         )
 
     # --- Rung 1. Any tripped catastrophic safeguard, on any repetition.

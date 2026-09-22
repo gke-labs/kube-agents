@@ -342,6 +342,17 @@ Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — i
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
 dashboard's run page and the incident brief use; the comment only phrases it.
 
+A repetition the scorer graded `infra` under a reason that leads with
+`KUBE_AGENTS_DELEGATION_CEILING` is a delegation-ceiling repetition: the
+harness's wait for the delegated worker (`AGENT_DELEGATION_TIMEOUT`) ran out
+with the card still running and nothing delivered, so what the judge saw was
+the front door's acknowledgement. It is not a storm repetition — the agent ran
+and nothing was lost to 429s — so the storm rule above does not count it, no
+pass rate has it in the denominator, and a case whose ungraded repetitions are
+all of this kind is classed `delegation-ceiling` on the run page (its Do is a
+retest). `health.json`'s `metrics.ceiling_reps` counts them apart from
+`infra_reps`.
+
 A run the suite marked **not evaluated** because one admitted case lost every
 repetition to infrastructure while other cases were graded is, to this filter,
 a `FAILURE` with graded repetitions and no gate case failing all of its

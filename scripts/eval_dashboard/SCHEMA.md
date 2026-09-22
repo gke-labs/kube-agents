@@ -140,7 +140,14 @@ the same layout and is collected from the moment it starts running.
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
-      tokens this collector has never seen) → `fail`.
+      tokens this collector has never seen) → `fail`. An `infra` rep whose
+      `reason` leads with `KUBE_AGENTS_DELEGATION_CEILING` is a
+      **delegation-ceiling** rep: the harness's wait for the delegated worker
+      ran out with the card still running and nothing delivered. The readers
+      (`classify.py`, `health.py`) count it apart from the storm reps — it is
+      not lost to 429s — and outside every pass-rate denominator; `classify.py`
+      classes a case whose ungraded reps are all of this kind
+      `delegation-ceiling`.
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
@@ -382,8 +389,11 @@ what the renderer does with them.
   `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
   `reason` is free-form log text (renderers must escape it). `infra` reps
   are excluded from every pass-fraction denominator, exactly like `infra`
-  task results. When `reps` is absent the task's single `result` stands in
-  for one rep.
+  task results; an `infra` rep whose `reason` leads with
+  `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
+  (`storm_reps`, `health.json`'s `infra_reps`) and reported under
+  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `result` stands in for one rep.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
   its verdict and is reported as truncated. Absent means unknown.

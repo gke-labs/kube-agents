@@ -45,6 +45,7 @@ import pytest
 from kube_agents_bench.cases import CaseSpec, load_case
 from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
+    DELEGATION_CEILING_MARKER,
     INFRA_FAILURE_MARKER,
     MISSING,
     SUITE_OUTCOME_GREEN,
@@ -902,6 +903,53 @@ def test_the_marker_literal_matches_the_harness():
     from kube_agents_bench.harness import INFRA_FAILURE_MARKER as harness_marker
 
     assert INFRA_FAILURE_MARKER == harness_marker
+
+
+def test_the_ceiling_marker_literal_matches_the_harness():
+    """Same contract as the transport marker: two files, one string."""
+    from kube_agents_bench.harness import DELEGATION_CEILING_MARKER as harness_marker
+
+    assert DELEGATION_CEILING_MARKER == harness_marker
+    assert DELEGATION_CEILING_MARKER != INFRA_FAILURE_MARKER
+
+
+def test_a_delegation_ceiling_with_nothing_delivered_is_its_own_infra_class(tofu_spec, make_run):
+    """#1874's case: the wait ran out with the worker still running.
+
+    The record is scored -- the judge grades the front door's acknowledgement
+    -- but the acknowledgement is the designed first reply of a delegation,
+    not the answer, so a low score here measures the eval's ceiling and not
+    the agent. The reason leads with the marker so the dashboard can tell the
+    class from a quota storm, which also reads `infra`.
+    """
+    def at_the_ceiling(rec):
+        rec["errors"] = [
+            (
+                f"{DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 2700s: "
+                "t_2282937f (running)"
+            )
+        ]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    run = make_run(mutate=at_the_ceiling)
+    verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    assert verdict.reps[0].reason.startswith(DELEGATION_CEILING_MARKER)
+    assert "t_2282937f (running)" in verdict.reps[0].reason
+    assert INFRA_FAILURE_MARKER not in verdict.reps[0].reason
+
+
+def test_a_ceiling_hit_after_a_partial_delivery_still_grades(tofu_spec, make_run):
+    """No marker, no carve-out: a fan-out that delivered some results is graded
+    on what arrived, exactly as before."""
+    def partial(rec):
+        rec["errors"] = ["delegated tasks did not finish within 2700s: t_0000002 (running)"]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=partial)], admitted=True)
+    assert verdict.reps[0].outcome != "infra"
 
 
 def test_infra_repetitions_are_excluded_from_the_rate(tofu_spec, make_run):

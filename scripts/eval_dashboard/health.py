@@ -104,6 +104,16 @@ REP_RESULT_INFRA = "infra"
 REP_PASS = "pass"
 REP_FAIL = "fail"
 REP_STORM = "storm"
+# The fourth kind: a repetition the harness stopped watching with its worker
+# still running -- the delegation wait (AGENT_DELEGATION_TIMEOUT) ran out
+# before anything was delivered. The scorer grades it `infra` under a reason
+# that leads with this marker (bench/kube_agents_bench/scoring.py, #1874).
+# Not a storm rep: the agent ran and nothing was lost to 429s, so it stays out
+# of rule 2's count and of every pass-rate denominator.
+# test_eval_dashboard_health.py reads the literal out of the scorer so the two
+# cannot drift.
+REP_CEILING = "ceiling"
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
 # How old data.json may be before health.json is flagged stale. The
 # collector writes `stale_after_s` when it knows its own cadence
@@ -456,6 +466,8 @@ def rep_kind(rep: dict) -> str:
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
+    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+        return REP_CEILING
     if result == REP_RESULT_INFRA:
         return REP_STORM
     if STORM_REASON_RE.search(rep.get("reason") or ""):
@@ -464,11 +476,11 @@ def rep_kind(rep: dict) -> str:
 
 
 class Task:
-    __slots__ = ("fails", "name", "passes", "storms")
+    __slots__ = ("ceilings", "fails", "name", "passes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
-        self.passes = self.fails = self.storms = 0
+        self.passes = self.fails = self.storms = self.ceilings = 0
         reps = task.get("reps")
         if reps is None:
             # No per-rep detail (SCHEMA.md: absence means unknown); the
@@ -480,6 +492,8 @@ class Task:
                 self.passes += 1
             elif kind == REP_STORM:
                 self.storms += 1
+            elif kind == REP_CEILING:
+                self.ceilings += 1
             else:
                 self.fails += 1
 
@@ -533,8 +547,12 @@ class Run:
         return sum(task.storms for task in self.tasks)
 
     @property
+    def ceiling_reps(self) -> int:
+        return sum(task.ceilings for task in self.tasks)
+
+    @property
     def total_reps(self) -> int:
-        return sum(task.passes + task.fails + task.storms for task in self.tasks)
+        return sum(task.passes + task.fails + task.storms + task.ceilings for task in self.tasks)
 
     @property
     def lost_pod(self) -> bool:
@@ -961,6 +979,9 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
         "lost_pods": lost,
         "infra_rep_rate": round(storm_reps / reps, 3) if reps else None,
         "infra_reps": storm_reps,
+        # Apart from the storm's count: repetitions the harness stopped
+        # watching at its delegation ceiling with the worker still running.
+        "ceiling_reps": sum(run.ceiling_reps for run in full),
     }
     for pct in WALL_CLOCK_PERCENTILES:
         value = percentile(walls, pct)

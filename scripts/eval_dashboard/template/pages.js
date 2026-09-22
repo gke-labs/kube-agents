@@ -942,6 +942,7 @@ function tagFor(c) {
   if (c.cls === "shared") return `<span class="tag shared">${c.also_failing_prs >= 1 ? `failing on ${plural(c.also_failing_prs, "other PR")}` : "in the current outage"}</span>`;
   if (c.cls === "only-this-pr") return '<span class="tag yours">only your PR</span>';
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
+  if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
@@ -1076,6 +1077,7 @@ function lastFailureHtml(c) {
   if (f.state === "partial") head = `${reps.fail} of ${reps.pass + reps.fail} reps failed (the gate counts that as a pass)`;
   else if (f.cls === "shared") head = f.also_failing_prs >= 1 ? `the gate's: failing on ${plural(f.also_failing_prs, "other PR")} at the time` : "the gate's: in the outage at the time";
   else if (f.cls === "storm") head = "a quota storm: repetitions lost before grading";
+  else if (f.cls === "delegation-ceiling") head = "the delegation ceiling: the harness stopped waiting with the worker still running";
   else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
   else if (f.event) head = "failed all reps in a run where almost everything failed";
   else head = "failed all reps";

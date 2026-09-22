@@ -75,6 +75,20 @@ EMPTY_RECORD = "the record is not evidence of a real agent run: the trajectory i
 NEVER_RAN = "the record shows no agent ever ran: the trajectory is empty and tokens.total is 0"
 RETRIES = "the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): "
 GRADED_FAIL = "VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent"
+# The scorer's delegation-ceiling marker, read out of its source: this test
+# does not import the bench package, and the literal must not drift.
+SCORER = pathlib.Path(__file__).resolve().parent.parent / "bench" / "kube_agents_bench" / "scoring.py"
+
+
+def _scorer_ceiling_marker() -> str:
+    for line in SCORER.read_text(encoding="utf-8").splitlines():
+        if line.startswith("DELEGATION_CEILING_MARKER = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"DELEGATION_CEILING_MARKER not found in {SCORER}")
+
+
+SCORER_CEILING_MARKER = _scorer_ceiling_marker()
+CEILING = f"{SCORER_CEILING_MARKER}: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +100,7 @@ REP_LETTER = {
     "f": {"result": "fail", "reason": GRADED_FAIL},
     "i": {"result": "infra", "reason": RETRIES},
     "e": {"result": "fail", "reason": EMPTY_RECORD},
+    "c": {"result": "infra", "reason": CEILING},
 }
 
 
@@ -171,6 +186,20 @@ class RepKinds(unittest.TestCase):
         self.assertTrue(health.Task({"name": "x", "result": "fail"}).collapsed)
         self.assertEqual(health.Task({"name": "x", "result": "infra"}).storms, 1)
         self.assertFalse(health.Task({"name": "x", "result": "pass"}).collapsed)
+
+    def test_the_ceiling_marker_is_the_scorers(self):
+        self.assertEqual(health.DELEGATION_CEILING_MARKER, SCORER_CEILING_MARKER)
+
+    def test_a_ceiling_rep_is_its_own_kind_whatever_the_verdict_token(self):
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": CEILING}), "ceiling")
+        self.assertEqual(health.rep_kind({"result": "fail", "reason": CEILING}), "ceiling")
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": RETRIES}), "storm")
+
+    def test_ceiling_reps_are_neither_graded_nor_storms(self):
+        t = health.Task(task("x", "ccc"))
+        self.assertEqual((t.passes, t.fails, t.storms, t.ceilings, t.graded), (0, 0, 0, 3, 0))
+        self.assertFalse(t.collapsed, "nothing graded, nothing collapsed")
+        self.assertTrue(health.Task(task("x", "ffc")).collapsed, "a ceiling rep never softens a collapse")
 
 
 # --------------------------------------------------------------------------- #
@@ -722,6 +751,21 @@ class Metrics(unittest.TestCase):
         tasks = [task("a", "ppp"), task("b", "pie"), task("c", "iii")]
         doc = data(run(1, 1, T0 - timedelta(hours=1), result="SUCCESS", tasks=tasks))
         self.assertEqual(adjudicate(doc, T0)["metrics"]["infra_rep_rate"], round(5 / 9, 3))
+
+    def test_ceiling_reps_are_counted_apart_from_the_storms(self):
+        """Fifteen ceiling reps across three PRs would be a storm if they were
+        storm reps (rule 2); they are not, so the gate stays GREEN and the
+        digest carries them under their own key."""
+        runs = [
+            run(k, 100 + k, T0 - timedelta(minutes=10 * k), result="SUCCESS",
+                tasks=green_tasks() + [task("slow", "ccc"), task("slower", "cc")])
+            for k in range(1, 4)
+        ]
+        result = adjudicate(data(*runs), T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["metrics"]["infra_reps"], 0)
+        self.assertEqual(result["metrics"]["ceiling_reps"], 15)
+        self.assertEqual(result["metrics"]["infra_rep_rate"], 0.0)
 
 
 # --------------------------------------------------------------------------- #

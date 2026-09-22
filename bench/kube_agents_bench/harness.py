@@ -104,6 +104,17 @@ SERVICE_API_PORT = 8642
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
+# Leads the deadline error when the delegation wait ran out and no awaited
+# card had delivered anything: the graded output is then the front door's
+# acknowledgement alone, which is no answer to grade for or against the agent
+# under test. ``scoring.py`` matches this string and classifies the repetition
+# as its own infrastructure class, apart from the transport marker above (the
+# agent was reached and its worker was still running). A ceiling hit after a
+# partial delivery -- a fan-out with some cards finished -- carries no marker
+# and grades as before. Duplicated in ``scoring.py`` for the same reason as
+# the marker above; ``test_scoring.py`` asserts the two strings agree.
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
+
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
 # task that asks for a written report -- and its log holds the worker's whole
@@ -1216,11 +1227,18 @@ class KubeAgentsHarness(AgentHarness):
         # the budget is untouched, and claiming it ran out would misreport why
         # the run stopped.
         if outstanding and timed_out:
-            result.errors.append(
+            report = (
                 "delegated tasks did not finish within "
                 f"{delegation_timeout:.0f}s: "
                 + ", ".join(f"{t} ({latest.get(t, 'unknown')})" for t in outstanding)
             )
+            # With nothing delivered the record holds the acknowledgement
+            # alone; the marker routes it to its own class in the scorer
+            # rather than a graded failure of the agent under test. A partial
+            # delivery keeps the plain report and grades on what arrived.
+            if not delivered_results(observed, awaited):
+                report = f"{DELEGATION_CEILING_MARKER}: {report}"
+            result.errors.append(report)
         self._settle(result, observed, awaited)
         return session_id
 

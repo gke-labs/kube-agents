@@ -48,6 +48,20 @@ ADMITTED = frozenset(
 HOLD_OUT = "compliance-rbac-overgrant"
 GRADED_FAIL = "VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent from the report: ['OOMKilled']"
 NEVER_RAN = "the record shows no agent ever ran: the trajectory is empty and tokens.total is 0"
+# The scorer's delegation-ceiling marker, read out of its source: this test
+# does not import the bench package, and the literal must not drift.
+SCORER = pathlib.Path(__file__).resolve().parent.parent / "bench" / "kube_agents_bench" / "scoring.py"
+
+
+def _scorer_ceiling_marker() -> str:
+    for line in SCORER.read_text(encoding="utf-8").splitlines():
+        if line.startswith("DELEGATION_CEILING_MARKER = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"DELEGATION_CEILING_MARKER not found in {SCORER}")
+
+
+SCORER_CEILING_MARKER = _scorer_ceiling_marker()
+CEILING = f"{SCORER_CEILING_MARKER}: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
 OUTAGE = {"state": "OUTAGE", "condition": "shared_break", "failing_cases": CRASHLOOP_TRIO}
 STORM = {"state": "DEGRADED", "condition": "storm", "failing_cases": []}
 SETUP = {"state": "DEGRADED", "condition": "setup_deaths", "failing_cases": []}
@@ -59,6 +73,7 @@ def rep(letter):
         "f": {"result": "fail", "reason": GRADED_FAIL},
         "i": {"result": "infra", "reason": NEVER_RAN},
         "e": {"result": "fail", "reason": NEVER_RAN},
+        "c": {"result": "infra", "reason": CEILING},
     }[letter]
 
 
@@ -107,6 +122,46 @@ class RepAndOutcomeTest(unittest.TestCase):
         self.assertEqual(classify.outcome_of(classify.rep_counts(task("a", "iii"))), "infra")
         self.assertEqual(classify.outcome_of(classify.rep_counts({"name": "a", "result": "fail"})), "failed", "no reps: the single result stands in")
         self.assertIsNone(classify.outcome_of(classify.rep_counts({"name": "a"})))
+
+    def test_the_ceiling_marker_is_the_scorers(self):
+        """The literal is the scorer's; read it out of the source so the two
+        cannot drift (the scorer is a package this test does not import)."""
+        self.assertEqual(classify.DELEGATION_CEILING_MARKER, SCORER_CEILING_MARKER)
+
+    def test_a_ceiling_rep_is_its_own_kind_not_a_storm(self):
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": CEILING}), "ceiling")
+        self.assertEqual(classify.rep_kind({"result": "fail", "reason": CEILING}), "ceiling", "the marker decides, whatever the verdict token")
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": NEVER_RAN}), "storm")
+
+    def test_ceiling_reps_are_ungraded_and_outside_the_storm_count(self):
+        counts = classify.rep_counts(task("a", "ccc"))
+        self.assertEqual((counts["pass"], counts["fail"], counts["infra"], counts["ceiling"]), (0, 0, 0, 3))
+        self.assertEqual(classify.outcome_of(counts), "infra")
+        self.assertEqual(classify.outcome_of(classify.rep_counts(task("a", "pcc"))), "passed", "a pass beside ceiling reps is a clean pass")
+        self.assertEqual(classify.outcome_of(classify.rep_counts(task("a", "fcc"))), "failed", "ceiling reps never soften a collapse")
+        target = run(1, 1, T0, tasks=[task("x", "ccc"), task("y", "ccc")] + gate_tasks())
+        self.assertEqual(classify.storm_reps(target), 0)
+        rates = classify.case_pass_rates([target, run(2, 2, T0, tasks=[task("x", "pcc")])], T0)
+        self.assertEqual(rates["x"], 1.0, "the denominator is graded reps only")
+        self.assertNotIn("y", {k for k, v in rates.items() if v is not None})
+
+    def test_a_case_lost_to_the_ceiling_is_classed_as_such_not_as_the_storms(self):
+        target = run(1, 1, T0, tasks=gate_tasks() + [task("x", "ccc")], result="SUCCESS")
+        verdict = classify_run(target, [target], health_at=STORM)
+        row = case(verdict, "x")
+        self.assertEqual((row["outcome"], row["cls"], row["do"]), ("infra", classify.CLS_CEILING, classify.DO_CEILING))
+        self.assertEqual(row["reps"]["ceiling"], 3)
+        self.assertEqual(verdict["storm_reps"], 0)
+        # Mixed with a real storm rep, the storm's rules decide as before.
+        mixed = run(2, 1, T0, tasks=gate_tasks() + [task("x", "cci")], result="SUCCESS")
+        self.assertEqual(case(classify_run(mixed, [mixed], health_at=STORM), "x")["cls"], "storm")
+
+    def test_nothing_graded_because_of_the_ceiling_says_so(self):
+        target = run(1, 1, T0, tasks=[task(n, "ccc") for n in sorted(ADMITTED)], result="FAILURE")
+        verdict = classify_run(target, [target])
+        self.assertIn("delegation ceiling", verdict["headline"])
+        self.assertEqual(verdict["verdict"], "infra")
+        self.assertFalse(verdict["matches_incident"])
 
     def test_the_reason_loses_its_score_prefix(self):
         self.assertEqual(classify.clean_reason(GRADED_FAIL), "rca-names-the-oom: required phrases absent from the report: ['OOMKilled']")

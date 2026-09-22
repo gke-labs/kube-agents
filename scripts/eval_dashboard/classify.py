@@ -42,6 +42,12 @@ Per failed admitted case, in priority order:
   runs of other pull requests inside ONLY_PR_WINDOW and failed here.
 * ``None`` -- nothing above fits; the page says it cannot tell.
 
+An ungraded case (outcome ``infra``) is ``storm`` under the same storm
+tests, or ``delegation-ceiling`` when every one of its ungraded repetitions
+carries the scorer's DELEGATION_CEILING_MARKER: the harness's delegation
+wait ran out with the worker still running (#1874). Ceiling repetitions
+are outside the storm count and every pass-rate denominator.
+
 ``setup`` is a run-level class: no tasks, a FAILURE verdict, under
 SETUP_DEATH_MAX_DURATION (#1172). A lost pod -- the same zero-task FAILURE
 at any duration, with a NodeNotReady pod event or no build log at all
@@ -117,6 +123,17 @@ STORM_REASON_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- Delegation ceiling (#1874) -----------------------------------------------
+# The marker bench/kube_agents_bench/scoring.py leads a repetition's reason
+# with when the harness's delegation wait ran out before the worker delivered
+# anything: the record holds the front door's acknowledgement alone. The
+# scorer grades it `infra`, but it is not a storm rep -- the agent ran and its
+# worker was still going when the eval stopped watching -- so it is counted
+# apart: out of the storm signature and out of every pass-rate denominator.
+# test_eval_dashboard_classify.py reads the literal out of the scorer so the
+# two cannot drift.
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
+
 # --- Setup death (#1172, #1176) -----------------------------------------------
 # Zero tasks, concluded FAILURE, and over inside this long: the run died at
 # clone or deploy before any case ran (the adjudicator's setup-death rule).
@@ -131,6 +148,12 @@ RUN_EVENT_FAIL_FRACTION = 0.8
 # Repetition results the collector writes (SCHEMA.md); anything else is
 # "not measured".
 REP_RESULTS = ("pass", "fail", "infra")
+# The four kinds `rep_kind` sorts repetitions into. `storm` is a repetition
+# the harness could not grade; `ceiling` is one it stopped watching (above).
+REP_PASS = "pass"
+REP_FAIL = "fail"
+REP_STORM = "storm"
+REP_CEILING = "ceiling"
 # Memo bounds for the per-run derivations and the 30-day pass rates.
 RUN_CACHE_MAX = 4096
 RATE_CACHE_MAX = 8
@@ -160,6 +183,7 @@ OUTCOME_INFRA = "infra"
 CLS_SHARED = "shared"
 CLS_ONLY_THIS_PR = "only-this-pr"
 CLS_STORM = "storm"
+CLS_CEILING = "delegation-ceiling"
 CLS_SETUP = "setup"
 VERDICT_RED = "red"
 VERDICT_GREEN = "green"
@@ -184,6 +208,7 @@ DO_STORM = "Retest after the storm clears; a run started inside it loses repetit
 DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the problem."
 DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
+DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
 DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
@@ -226,37 +251,42 @@ def task_reps(task: dict) -> list[dict]:
 
 
 def rep_kind(rep: dict) -> str:
-    """'pass' | 'fail' | 'storm' -- the adjudicator's three kinds. A storm rep is
-    one the harness could not grade: an infra verdict, or a fail whose
-    reason is a never-ran phrasing."""
+    """'pass' | 'fail' | 'storm' | 'ceiling' -- the adjudicator's kinds. A storm
+    rep is one the harness could not grade: an infra verdict, or a fail whose
+    reason is a never-ran phrasing. A ceiling rep is one the harness stopped
+    watching with the worker still running (its reason leads with
+    DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm."""
     result = str(rep.get("result") or "").lower()
     if result == "pass":
-        return "pass"
+        return REP_PASS
+    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+        return REP_CEILING
     if result == "infra":
-        return "storm"
+        return REP_STORM
     if STORM_REASON_RE.search(rep.get("reason") or ""):
-        return "storm"
-    return "fail"
+        return REP_STORM
+    return REP_FAIL
 
 
 def rep_counts(task: dict) -> dict:
-    counts = {"pass": 0, "fail": 0, "infra": 0}
+    counts = {"pass": 0, "fail": 0, "infra": 0, "ceiling": 0}
     for rep in task_reps(task):
         kind = rep_kind(rep)
-        counts["infra" if kind == "storm" else kind] += 1
+        counts["infra" if kind == REP_STORM else kind] += 1
     return counts
 
 
 def outcome_of(counts: dict) -> str | None:
     """passed (every graded rep passed), partial, failed (every graded rep
-    failed), infra (nothing graded), None (no reps at all)."""
+    failed), infra (nothing graded: storm or ceiling reps only), None (no
+    reps at all)."""
     if counts["pass"] and counts["fail"]:
         return OUTCOME_PARTIAL
     if counts["fail"]:
         return OUTCOME_FAILED
     if counts["pass"]:
         return OUTCOME_PASSED
-    if counts["infra"]:
+    if counts["infra"] or counts.get("ceiling"):
         return OUTCOME_INFRA
     return None
 
@@ -606,7 +636,12 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         if not is_admitted:
             do = DO_HELD_OUT
     elif outcome == OUTCOME_INFRA:
-        if run_storm or condition == CONDITION_STORM:
+        if counts["ceiling"] and not counts["infra"]:
+            # Every ungraded rep hit the delegation ceiling: the eval's wait,
+            # not the storm's 429s, and never the pull request's.
+            cls = CLS_CEILING
+            do = DO_CEILING
+        elif run_storm or condition == CONDITION_STORM:
             cls = CLS_STORM
             do = DO_STORM
     return {
@@ -643,7 +678,14 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
         else ""
     )
     if not gate:
-        if any(c["outcome"] == OUTCOME_INFRA for c in cases):
+        ungraded = [c for c in cases if c["outcome"] == OUTCOME_INFRA]
+        if ungraded and all(c["cls"] == CLS_CEILING for c in ungraded):
+            return (
+                "Nothing was graded: every repetition hit the delegation ceiling with its worker still running.",
+                "The harness stopped waiting before any worker delivered; that is the eval's wait, not a verdict on your change." + held_note,
+                VERDICT_INFRA,
+            )
+        if ungraded:
             return (
                 "Nothing was graded: every repetition was lost before the agent ran.",
                 "That is the quota storm's shape, not a verdict on your change." + held_note,

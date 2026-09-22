@@ -1725,20 +1725,73 @@ def test_delegation_budget_exhaustion_is_an_error_not_a_crash(
     devops-bench refuses to promote a run with a populated ``errors``, so an
     unfinished delegation cannot pass as a genuine low score.
     """
+    # Paced so the deadline, not the silent-turn ceiling, ends the wait: the
+    # stub repeats its last turn under the same call id, which reads as an
+    # agent that stopped reporting after three instant polls.
     monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
-    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.03")
     stub_agent.turns = [_create_turn(), _show_turn("running")]
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert result.has_errors()
+    assert "did not finish within" in result.errors[0]
     assert _TASK_ID in result.errors[0]
-    assert "running" in result.errors[0]
-    # A wait that timed out against a LIVE endpoint is agent slowness, not
-    # transport: it grades, and must never borrow the INFRA class.
+    assert "(running)" in result.errors[0]
+    # A wait that timed out against a LIVE endpoint is not transport, so it
+    # must never borrow that class; with nothing delivered it carries its own
+    # marker instead, which the scorer routes to the delegation-ceiling class
+    # rather than grading the acknowledgement as the answer.
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert result.errors[0].startswith(harness.DELEGATION_CEILING_MARKER)
     # Partial, not empty: whatever the agent did say is still recorded.
     assert result.trajectory
+
+
+def test_a_ceiling_hit_after_a_partial_delivery_carries_no_marker(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fan-out that delivered some results is graded on what arrived."""
+    # Paced as in the budget-exhaustion test: one status turn, then the
+    # deadline ends the wait with the second card still running.
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    first, second = "t_00000001", "t_00000002"
+    creates = [
+        item
+        for index, tid in enumerate((first, second))
+        for item in _call(
+            "kanban_create",
+            {"title": f"task {index}"},
+            {"ok": True, "task_id": tid, "status": "ready"},
+            f"call_create_{index}",
+        )
+    ]
+    shows = [
+        *_call(
+            "kanban_show",
+            {"task_id": first},
+            {"task": {"id": first, "status": "done", "result": _RCA_RESULT}, "runs": []},
+            "call_show_1",
+        ),
+        *_call(
+            "kanban_show",
+            {"task_id": second},
+            {"task": {"id": second, "status": "running", "result": None}, "runs": []},
+            "call_show_2",
+        ),
+    ]
+    stub_agent.turns = [
+        _turn(*creates, _text("Filed both.")),
+        _turn(*shows, _text(f"{first} is done; {second} is still running.")),
+    ]
+
+    result = KubeAgentsHarness().run("Fan out.")
+
+    assert _RCA_RESULT in result.output
+    ceiling = [e for e in result.errors if "did not finish within" in e]
+    assert ceiling and second in ceiling[0]
+    assert harness.DELEGATION_CEILING_MARKER not in ceiling[0]
 
 
 def test_delegation_wait_can_be_disabled(
@@ -1814,6 +1867,9 @@ def test_a_ceiling_hit_on_a_readable_board_costs_no_status_turn(
     assert result.has_errors()
     assert _TASK_ID in result.errors[0]
     assert "(running)" in result.errors[0]
+    # Nothing was delivered, so the record is the acknowledgement alone and
+    # the error carries the marker the scorer routes to its own class.
+    assert result.errors[0].startswith(harness.DELEGATION_CEILING_MARKER)
     assert len(stub_agent.requests) == 1
     assert reads
 
