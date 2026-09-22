@@ -1915,13 +1915,16 @@ record_case() { # <task-name>
 # Grade one finished case and, on a main run, record it. One case at a time:
 # `bench-gate case` reads the whole store (up to sixteen gcloud processes for a
 # GCS store), and six lanes finishing together would run six of those at once;
-# serialized, the load is the old loop's, just earlier. The lock is held across
-# the print too, which keeps each case's grading block contiguous in the job
-# log -- scripts/eval_dashboard/collect.py attaches `rep N:` lines to the
+# serialized, the load is the old loop's, just earlier. The lock keeps two
+# gradings apart; it is not what keeps one case's block contiguous in the job
+# log, since the launcher's `>>>` and the other lanes' `<<<` lines never take
+# it. That is the single `cat` below: a block under PIPE_BUF (4096 bytes; the
+# fixtures measure 448-1524) reaches the stdout pipe in one write. It matters
+# because scripts/eval_dashboard/collect.py attaches `rep N:` lines to the
 # `Task <name> Result:` line above them and closes the block at the next
-# `>>>`/`===`/`---` header, so another lane's launch marker landing inside a
-# block would orphan the rest of it. A lock whose holder died is a throttle
-# failure, not a reason to skip the grading. The sentinel is written only on a
+# `>>>`/`===`/`---` header, so a launch marker landing inside a block would
+# orphan the rest of it -- keep the block small. A lock whose holder died is a
+# throttle failure, not a reason to skip the grading. The sentinel is written only on a
 # grading that produced its JSON; anything else is left for the loop after the
 # fan-out, and says so.
 finish_case() { # <task-path> <task-name>
