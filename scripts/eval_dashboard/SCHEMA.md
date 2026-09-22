@@ -915,9 +915,9 @@ the lease, the fan-out start, the launch and `finished` markers, the
 entrypoint's timeout and grace-period lines, the profile table. The four
 grading blocks are **spliced in**: the real night printed none, because the
 grading ran after the fan-out's `wait` and the deadline arrived first. They
-are real `bench-gate case` output from the night before (build
-2101461441721667584) for four cases that also ran this night, placed at each
-case's repetition-3 `finished` line the way `hack/ci-eval-pr.sh` prints them
+are real `bench-gate case` output from the night before
+(build 2101461441721667584) for four cases that also ran this night, placed at
+each case's repetition-3 `finished` line the way `hack/ci-eval-pr.sh` prints them
 since it grades per case, three of them after the SIGTERM, inside the grace
 period; the `recorded` lines are restamped to this build. The
 `Eval ended before its verdict` line is the EXIT trap's cut-off report:
