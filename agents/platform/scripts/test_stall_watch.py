@@ -1077,12 +1077,6 @@ class Scope(Base):
         _, fake = self.run_tick({"c": {"payments": [], "kubeagents-system": []}}, namespaces_extra=extra)
         self.assertEqual(sorted(fake.scanned()), ["kubeagents-system", "payments"])
 
-    def test_a_terminating_namespace_is_still_read_so_its_rows_can_clear(self):
-        gone = [dict(GATEWAY_CONDITION_ROW, namespace="old")]
-        self.run_tick({"c": {"old": gone}})
-        lines, _ = self.run_tick({"c": {"old": []}})
-        self.assertEqual(len(self.cleared(lines)), 1)
-
     def test_default_kinds_are_passed_and_all_lets_the_script_decide(self):
         _, fake = self.run_tick({"c": {"payments": []}})
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)

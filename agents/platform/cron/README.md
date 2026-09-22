@@ -108,11 +108,13 @@ CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
 this job split the work by signal: a Warning whose reason is on the watcher's
 list is the watcher's within seconds; a condition, a reference or an event the
 list never names is this job's within the half hour. It declares `risk: high`
-because what it puts in a card body and relays into chat is event text and
-object names from every namespace of every cluster on the Cluster Agent roster,
-the management cluster included unless `RECONCILE_EXCLUDE` names it; the card
-body marks those rows as data rather than instructions, and the Cluster Agent's
-read-only skill and preflight bound what it does with them.
+because every card it files starts a Cluster Agent turn over every namespace of
+every cluster on the Cluster Agent roster, the management cluster included
+unless `RECONCILE_EXCLUDE` names it. The card body and chat lines carry object
+names, heuristics and durations only, never a row's detail, since condition
+reasons, spec paths and event messages are text a tenant writes; the Cluster
+Agent reads that text again when it runs the skill, and its read-only skill and
+preflight bound what it does with it.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
