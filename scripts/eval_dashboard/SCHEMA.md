@@ -922,8 +922,8 @@ since it grades per case, three of them after the SIGTERM, inside the grace
 period; the `recorded` lines are restamped to this build. The
 `Eval ended before its verdict` line is the EXIT trap's cut-off report:
 
-| build               | why it is here                                                                                                 |
-| ------------------- | -------------------------------------------------------------------------------------------------------------- |
+| build               | why it is here                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
 | 2102186223282950144 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
 
 `testdata_health/data.json.gz` is a **real** published `data.json` reduced by
