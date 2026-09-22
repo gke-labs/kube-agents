@@ -71,9 +71,10 @@ recurred inside the script's window, so a warning that comes back every hour
 would otherwise flap in and out; such a row clears only after two
 consecutive scans without it. A namespace or cluster this tick could not
 read keeps its rows rather than clearing them, because absence of evidence
-is not recovery, and so does a scan that skipped a kind the cluster serves
-(the kind list is filtered per cluster to what it serves, so such a skip is
-a failure and never a missing CRD); one that is gone from the listing clears
+is not recovery, and so does a row whose own kind a scan skipped, or a
+repeating-warnings row when the events were not read (the kind list is
+filtered per cluster to what it serves, so such a skip is a failure and never
+a missing CRD, and every other row in the namespace is judged as usual); one that is gone from the listing clears
 them at once, because deleting the namespace is how the motivating case
 usually ends. A listing gcloud itself calls incomplete clears no row for a
 cluster absent from it, and a sweep stops at a wall-clock budget short of
@@ -171,8 +172,14 @@ NAMESPACE_NAME_PREFIX = "namespace/"
 API_RESOURCES_ARGV = ("kubectl", "api-resources", "--namespaced=true", "--verbs=list", "-o", "name")
 API_RESOURCES_TIMEOUT_SECONDS = 60
 #: stall_report.py exits 0 after skipping a kind or the events it could not
-#: read and says so on stderr; such a scan updates rows and clears none.
-PARTIAL_SCAN_MARKERS = ("not scanned", "not read")
+#: read and says so on stderr, naming the resource; such a scan clears no
+#: row of that kind (or no repeating-warnings row, for the events) and every
+#: other row in the namespace is judged as usual.
+SKIPPED_KIND_PATTERN = re.compile(r"warning: (\S+) in \S+ not scanned")
+EVENTS_NOT_READ_PATTERN = re.compile(r"warning: events in \S+ not read")
+EVENTS_MARKER = "events"
+REPEATING_WARNINGS_HEURISTIC = "repeating-warnings"
+PLURAL_IES = "ies"
 #: gcloud exits 0 on a partial listing and says so on stderr ("The following
 #: zones did not respond ... List results may be incomplete."); a cluster
 #: absent from such a listing is unknown, not gone.
@@ -256,6 +263,9 @@ NOTICED_PREFIX = "🧭 stall noticed"
 CLEARED_PREFIX = "✅ stall cleared"
 DRY_RUN_PREFIX = "dry run:"
 TASK_ID_PATTERN = re.compile(r"\bt_[0-9a-f]{8}\b")
+#: A card the board no longer has, or cannot describe for this many ticks
+#: running, ends its episode so the namespace is not wedged behind it.
+MAX_UNKNOWN_CARD_TICKS = 3
 #: A card the Cluster Agent is working on is not completed under it when the
 #: stall clears; the watch comments and lets the worker finish, then closes
 #: the episode once the card reaches a terminal status.
@@ -467,18 +477,34 @@ def list_namespaces(kubeconfig: str) -> list[str]:
     return sorted(n for n in names if n and not is_system_namespace(n))
 
 
-def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None) -> tuple[list[dict], bool]:
-    """The findings stall_report.py reports for one namespace, and whether it
-    read everything it was asked to. Raises when the namespace could not be
-    read at all, so the caller keeps its ledger rows."""
+def skipped_in(stderr: str) -> set[str]:
+    """The resources a scan could not list, and EVENTS_MARKER when it could not
+    read the events, from the report script's stderr."""
+    skipped = set(SKIPPED_KIND_PATTERN.findall(stderr or ""))
+    if EVENTS_NOT_READ_PATTERN.search(stderr or ""):
+        skipped.add(EVENTS_MARKER)
+    return skipped
+
+
+def resource_names_kind(resource: str, kind: str) -> bool:
+    """Whether a kubectl resource name (`deployments`, `gateways.gateway...`)
+    is the plural of an object's Kind (`Deployment`, `Gateway`)."""
+    plural = resource.split(".", 1)[0].lower()
+    singular = plural[: -len(PLURAL_IES)] + "y" if plural.endswith(PLURAL_IES) else plural.rstrip("s")
+    return singular == kind.lower()
+
+
+def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None) -> tuple[list[dict], set[str]]:
+    """The findings stall_report.py reports for one namespace, and the
+    resources it could not read. Raises when the namespace could not be read
+    at all, so the caller keeps its ledger rows."""
     r = run_sandbox(report_argv(namespace, kinds), timeout=NAMESPACE_SCAN_TIMEOUT_SECONDS, kubeconfig=kubeconfig, stdin=source)
     if r.returncode == REPORT_UNREADABLE_EXIT:
         raise RuntimeError(f"no kind could be read: {stderr_excerpt(r.stderr)}")
     if r.returncode != 0:
         raise RuntimeError(f"stall_report.py exited {r.returncode}: {stderr_excerpt(r.stderr)}")
     report = parse_json(r.stdout, "stall_report.py") or {}
-    complete = not any(m in (r.stderr or "") for m in PARTIAL_SCAN_MARKERS)
-    return report.get("findings") or [], complete
+    return report.get("findings") or [], skipped_in(r.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -556,10 +582,10 @@ class Sweep:
     def __init__(self, project: str = "") -> None:
         self.project = project
         self.rows: dict[str, dict] = {}
-        #: `cluster/namespace` scopes whose scan ran this tick, and the subset
-        #: that skipped a kind or the events: those update rows and clear none.
+        #: `cluster/namespace` scopes whose scan ran this tick, and for the
+        #: ones that skipped a kind or the events, what they skipped.
         self.read_scopes: set[str] = set()
-        self.partial_scopes: set[str] = set()
+        self.partial_scopes: dict[str, set[str]] = {}
         #: Every cluster the project listed, whatever its status, and whether
         #: gcloud vouched for the listing being complete.
         self.listed_clusters: set[str] = set()
@@ -580,18 +606,25 @@ class Sweep:
     def namespaces(self) -> int:
         return len(self.read_scopes)
 
-    def verdict(self, cid: str, namespace: str) -> str:
-        """What this tick can say about a ledger row in that scope: its
-        namespace or cluster is GONE from the listing, the namespace was
-        scanned and the row was ABSENT, or the scope was not read and the row
+    def verdict(self, entry: dict) -> str:
+        """What this tick can say about a ledger row: its namespace or cluster
+        is GONE from the listing, the namespace was scanned and the row was
+        ABSENT, or the scope (or the row's own kind) was not read and the row
         is UNKNOWN."""
+        cid, namespace = entry.get("cluster", ""), entry.get("namespace", "")
         if cid not in self.listed_clusters:
             return GONE if self.listing_complete else UNKNOWN
         namespaces = self.listed_namespaces.get(cid)
         if namespaces is not None and namespace not in namespaces:
             return GONE
         scope = scope_key(cid, namespace)
-        if scope in self.partial_scopes or scope not in self.read_scopes:
+        if scope not in self.read_scopes:
+            return UNKNOWN
+        skipped = self.partial_scopes.get(scope, set())
+        if EVENTS_MARKER in skipped and entry.get("heuristic") == REPEATING_WARNINGS_HEURISTIC:
+            return UNKNOWN
+        kind = str(entry.get("object", "")).split("/", 1)[0]
+        if any(resource_names_kind(r, kind) for r in skipped if r != EVENTS_MARKER):
             return UNKNOWN
         return ABSENT
 
@@ -667,7 +700,7 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
             if sweep.out_of_budget(started, cid, namespace):
                 break
             try:
-                findings, complete = scan_namespace(kubeconfig, namespace, source, kinds)
+                findings, skipped = scan_namespace(kubeconfig, namespace, source, kinds)
             except sandbox_exec.SandboxUnavailable:
                 raise
             except subprocess.TimeoutExpired as exc:
@@ -679,8 +712,9 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
                 sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
                 continue
             sweep.read_scopes.add(scope_key(cid, namespace))
-            if not complete:
-                sweep.partial_scopes.add(scope_key(cid, namespace))
+            if skipped:
+                sweep.partial_scopes[scope_key(cid, namespace)] = skipped
+                sweep.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(skipped))} not read"
             for f in findings:
                 sweep.rows[ledger_key(cid, f)] = {
                     "cluster": cid,
@@ -719,7 +753,7 @@ def diff_and_update(state: dict, sweep: Sweep, now: str) -> tuple[dict, dict]:
     for key, entry in previous.items():
         if key in sweep.rows:
             continue
-        verdict = sweep.verdict(entry.get("cluster", ""), entry.get("namespace", ""))
+        verdict = sweep.verdict(entry)
         if verdict == UNKNOWN:
             continue
         missed = int(entry.get("missed") or 0) + 1
@@ -782,6 +816,20 @@ def card_status(task_id: str) -> str | None:
         return str(status) if status else None
     except Exception as exc:  # noqa: BLE001 - reported, and the caller retries next tick
         sys.stderr.write(f"stall_watch: could not read card {task_id}: {exc}\n")
+        return None
+
+
+def card_exists(task_id: str, db_path: Path | None = None) -> bool | None:
+    """Whether the board has the card at all, read straight from its tasks
+    table; None when the board could not be opened."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path or board_path()}?mode=ro", uri=True, timeout=BOARD_BUSY_TIMEOUT_SECONDS)
+        try:
+            return conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"stall_watch: could not open the board to look for {task_id}: {exc}\n")
         return None
 
 
@@ -891,7 +939,7 @@ def home_targets() -> list[tuple[str, str, str]]:
     for platform in CHAT_PLATFORMS:
         key = platform.upper() + HOME_CHANNEL_SUFFIX
         value = os.environ.get(key, "").strip()
-        if not value or key == RELAY_LABEL_ENV:
+        if not value:
             continue
         thread = os.environ.get(platform.upper() + HOME_CHANNEL_THREAD_SUFFIX, "").strip()
         targets.append((platform, value, thread))
@@ -957,12 +1005,30 @@ def episode_id(rows: list[dict], now_epoch: int) -> int:
     return (now_epoch - oldest) // EPISODE_ID_RESOLUTION_SECONDS
 
 
+def episode_gone(episodes: dict, scope: str, task_id: str) -> bool:
+    """A card the board no longer has, or one it could not describe for
+    MAX_UNKNOWN_CARD_TICKS ticks running, ends its episode; otherwise the
+    unknown is counted and the caller retries next tick."""
+    episode = episodes[scope]
+    exists = card_exists(task_id)
+    episode["unknown"] = 0 if exists else int(episode.get("unknown") or 0) + 1
+    if exists is False or episode["unknown"] >= MAX_UNKNOWN_CARD_TICKS:
+        sys.stderr.write(f"stall_watch: card {task_id} for {scope} is gone from the board; its episode ends\n")
+        episodes.pop(scope)
+        return True
+    return False
+
+
 def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scope: dict, now: str, *, dry_run: bool = False) -> list[str]:
     """Open, comment on and close cards for the tick's episodes; return the
     chat lines, one per card opened and one per card closed. A dry run touches
     no board and says what it would have done."""
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
+    # Judged before the loop below unledgers anything, so a scope whose rows
+    # were dropped to be retried is never mistaken for a cleared one.
+    open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
+    deferred: set[str] = set()
     for scope, rows in sorted(new_by_scope.items()):
         cid, namespace = split_scope(scope)
         name, _, location = cid.partition(CLUSTER_ID_SEPARATOR)
@@ -974,13 +1040,18 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if episode:
             status = card_status(episode["card"])
             if status is None:
-                unledger_scope(state, scope)
-                continue
-            if status not in TERMINAL_CARD_STATUSES:
+                if not episode_gone(episodes, scope, episode["card"]):
+                    unledger_scope(state, scope)
+                    deferred.add(scope)
+                    continue
+                episode = None
+            elif status not in TERMINAL_CARD_STATUSES:
                 if comment_card(episode["card"], f"The watch now also sees these objects stalled in `{namespace}`:\n\n{rows_block(rows)}"):
                     episode["objects"] = sorted(set(episode.get("objects", [])) | set(object_names(rows)))
+                    episode["unknown"] = 0
                 else:
                     unledger_scope(state, scope)
+                    deferred.add(scope)
                 continue
         assignee = assignee_for(sweep.project, name, location)
         task_id = open_card(
@@ -991,15 +1062,18 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         )
         if not task_id:
             unledger_scope(state, scope)
+            deferred.add(scope)
             continue
-        subscribe_card(task_id)
-        episodes[scope] = {"card": task_id, "assignee": assignee, "opened_at": now, "objects": object_names(rows)}
+        subscribed = subscribe_card(task_id) > 0 or not home_targets()
+        episodes[scope] = {"card": task_id, "assignee": assignee, "opened_at": now, "objects": object_names(rows), "subscribed": subscribed}
         lines.append(
             f"{NOTICED_PREFIX} in {cluster_label(cid)} / `{namespace}`: {', '.join(object_names(rows))}; "
             f"card `{task_id}` opened for `{assignee}`"
         )
-    open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
-    for scope in sorted(set(episodes) - open_scopes):
+    for scope, episode in episodes.items():
+        if not dry_run and not episode.get("subscribed", True) and home_targets():
+            episode["subscribed"] = subscribe_card(episode["card"]) > 0
+    for scope in sorted(set(episodes) - open_scopes - deferred):
         episode = episodes[scope]
         cleared = ", ".join(object_names(cleared_by_scope.get(scope, [])) or episode.get("objects", []))
         if dry_run:
@@ -1007,6 +1081,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         status = card_status(episode["card"])
         if status is None:
+            episode_gone(episodes, scope, episode["card"])
             continue
         if status not in TERMINAL_CARD_STATUSES:
             if not episode.get("cleared_at"):

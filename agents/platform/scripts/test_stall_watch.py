@@ -176,9 +176,19 @@ class FakeBoard:
         self.db_path = db_path
         self.calls = []
         self.cards = {}
+        self.filed = 0
         self.fail_next_create = False
         self.fail_show = False
         self.fail_complete = False
+        self.fail_comment_once = False
+
+    def forget(self, tid):
+        """The card leaves the board: an operator deleted it or the volume was restored."""
+        self.cards.pop(tid)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
+        conn.commit()
+        conn.close()
 
     def __call__(self, command):
         self.calls.append(command)
@@ -188,7 +198,8 @@ class FakeBoard:
                 self.fail_next_create = False
                 raise RuntimeError("board locked")
             opts = {argv[i]: argv[i + 1] for i in range(1, len(argv) - 1) if argv[i].startswith("--") and argv[i] != "--json"}
-            tid = f"t_{len(self.cards) + 1:08x}"
+            self.filed += 1
+            tid = f"t_{self.filed:08x}"
             self.cards[tid] = {"status": "ready", "assignee": opts.get("--assignee"), "title": argv[-1], "body": opts.get("--body", ""), "key": opts.get("--idempotency-key"), "comments": []}
             conn = sqlite3.connect(self.db_path)
             conn.execute("INSERT INTO tasks (id, title, body, assignee, status, created_at) VALUES (?, ?, ?, ?, 'ready', 1)", (tid, argv[-1], opts.get("--body", ""), opts.get("--assignee")))
@@ -202,6 +213,9 @@ class FakeBoard:
                 raise RuntimeError("board locked")
             return json.dumps({"task": {"id": tid, "status": self.cards[tid]["status"]}})
         if argv[0] == "comment":
+            if self.fail_comment_once:
+                self.fail_comment_once = False
+                raise RuntimeError("database is locked")
             self.cards[argv[1]]["comments"].append(argv[2])
             return "ok"
         if argv[0] == "complete":
@@ -396,6 +410,57 @@ class Cards(Base):
         self.assertEqual(lines, [])
         self.assertEqual(len(next(iter(self.board.cards.values()))["comments"]), 1)
 
+    def test_a_card_gone_from_the_board_ends_its_episode_and_a_new_stall_opens_a_new_card(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        first = next(iter(self.board.cards))
+        self.board.forget(first)
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(len(self.noticed(lines)), 1, "a new card, not a comment on a card that is not there")
+        self.assertEqual(len(self.board.cards), 1)
+        self.assertNotEqual(next(iter(self.board.cards)), first)
+
+    def test_a_card_gone_from_the_board_ends_its_episode_on_clear_without_a_line(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        self.board.forget(next(iter(self.board.cards)))
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(lines, [])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
+
+    def test_a_board_that_cannot_answer_for_three_ticks_ends_the_episode(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        with patch.object(stall_watch, "card_exists", return_value=None):
+            self.board.fail_show = True
+            for _ in range(stall_watch.MAX_UNKNOWN_CARD_TICKS - 1):
+                self.run_tick({"c": {"checkout": []}})
+                self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+            self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
+
+    def test_one_failed_comment_does_not_complete_the_card_as_cleared(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        tid = next(iter(self.board.cards))
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        self.board.fail_comment_once = True
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(self.board.cards[tid]["status"], "ready", "the stall is still present; nothing completed it")
+        self.assertEqual(self.board.cards[tid]["comments"], [])
+        self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(len(self.board.cards[tid]["comments"]), 1)
+
+    def test_a_failed_subscription_is_retried_on_a_later_tick(self):
+        with patch.object(stall_watch, "subscribe_card", return_value=0):
+            self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        tid = next(iter(self.board.cards))
+        self.assertFalse(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
+        self.assertEqual(self.subs(tid), [])
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
+        self.assertEqual(len(self.subs(tid)), 1)
+
     def test_the_idempotency_key_is_stable_across_a_retry(self):
         self.board.fail_next_create = True
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
@@ -515,14 +580,30 @@ class Ledger(Base):
         lines, _ = self.run_tick({"c": {"storefront": []}})
         self.assertEqual(len(self.cleared(lines)), 1)
 
-    def test_a_scan_that_skipped_a_kind_clears_nothing_in_that_namespace(self):
-        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+    def test_a_scan_that_skipped_a_kind_holds_only_that_kinds_rows(self):
+        gateway = dict(GATEWAY_CONDITION_ROW, namespace="checkout")
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW, gateway]}})
         lines, _ = self.run_tick({"c": {"checkout": ([], NOT_SCANNED)}})
-        self.assertEqual(lines, [], "the deployments read failed this tick; the row is unknown, not gone")
-        self.assertEqual(len(self.ledger()["stalls"]), 1)
+        self.assertEqual(lines, [], "the Deployment row is unknown; the Gateway row cleared but the object list is not empty yet")
+        kinds_left = sorted(e["object"].split("/")[0] for e in self.ledger()["stalls"].values())
+        self.assertEqual(kinds_left, ["Deployment"], "deployments were not scanned, gateways were")
+        self.assertIn("partial: deployments not read", self.ledger()["unreadable"][f"c@{LOCATION}/checkout"])
         self.assertEqual(self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})[0], [], "never cleared, so not new")
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertEqual(len(self.cleared(lines)), 1)
+
+    def test_events_not_read_holds_only_repeating_warning_rows(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        no_events = "warning: events in storefront not read; repeating-warnings is not evaluated: kubectl exited 1\n"
+        lines, _ = self.run_tick({"c": {"storefront": ([], no_events)}})
+        self.assertEqual(lines, [])
+        left = sorted(e["heuristic"] for e in self.ledger()["stalls"].values())
+        self.assertEqual(left, ["repeating-warnings"], "the condition row cleared; the warning row waits for a scan that read events")
+
+    def test_a_skipped_grouped_kind_matches_its_object_kind(self):
+        self.assertTrue(stall_watch.resource_names_kind("gateways.gateway.networking.k8s.io", "Gateway"))
+        self.assertTrue(stall_watch.resource_names_kind("networkpolicies.networking.k8s.io", "NetworkPolicy"))
+        self.assertFalse(stall_watch.resource_names_kind("deployments", "Gateway"))
 
     def test_a_partial_scan_still_adds_new_rows(self):
         lines, _ = self.run_tick({"c": {"checkout": ([DEPLOYMENT_ROW], NOT_SCANNED)}})

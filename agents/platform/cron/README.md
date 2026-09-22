@@ -75,8 +75,7 @@ gets. `deliver: chat` then carries two one-liners, "stall noticed in
 `<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened" and "stall cleared
 ...; card `<id>` closed", plus the sweep-failed and sweep-recovered lines every
 roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
-cluster that timed out, a namespace whose scan failed or skipped a kind the
-cluster serves, a listing gcloud called incomplete, a sweep that hit its
+cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a listing gcloud called incomplete, a sweep that hit its
 25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
 an exhausted sweep resumes where it stopped.
 
