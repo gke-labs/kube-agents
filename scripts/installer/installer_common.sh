@@ -31,6 +31,10 @@
 # path nobody knows in advance.
 _installer_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
 INSTALL_DEFAULTS_FILE="${KUBE_AGENTS_INSTALL_DEFAULTS:-${_installer_common_dir}/../../install.defaults.env}"
+if [ -r "${_installer_common_dir}/gke_dns_endpoint.sh" ]; then
+  # shellcheck source=scripts/installer/gke_dns_endpoint.sh
+  . "${_installer_common_dir}/gke_dns_endpoint.sh"
+fi
 unset _installer_common_dir
 if [ -r "$INSTALL_DEFAULTS_FILE" ]; then
   # shellcheck source=/dev/null
@@ -43,6 +47,9 @@ else
   echo "  ℹ It ships with the repository. Re-clone, or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy." >&2
   return 1 2>/dev/null || exit 1
 fi
+
+# Request timeout for kubectl probes against live clusters in the installer.
+readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
@@ -1533,8 +1540,13 @@ write_tfvars_from_state() {
   # live only in that cluster's Secret (a fresh clone has no install.env values),
   # and recovery is gated on the kubectl context actually being this cluster.
   if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
+    if type gke_dns_endpoint_flag >/dev/null 2>&1; then
+      GKE_DNS_ENDPOINT_FLAG=""
+      gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
+    fi
+    # shellcheck disable=SC2086
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
-      --project "${PROJECT_ID}" >/dev/null 2>&1 || true
+      --project "${PROJECT_ID}" ${GKE_DNS_ENDPOINT_FLAG:-} >/dev/null 2>&1 || true
   fi
 
   # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
@@ -1565,7 +1577,8 @@ write_tfvars_from_state() {
       # just destroyed black-holes TCP instead of refusing, and eight keys
       # times a hung connect stalls the install for minutes.
       secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --request-timeout=10s \
+        --context "$expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
         -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
       if [ -n "$secret_val" ]; then
         export "${secret_key}=${secret_val}"
@@ -1615,7 +1628,13 @@ write_tfvars_from_state() {
     print_info "SKIP_CERT_MANAGER=true: the composition will not install cert-manager. The operator webhooks need one serving before the apply."
   elif [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
     # Credentials were fetched above, on the same adoption branch.
-    if kubectl get deployment cert-manager -n cert-manager >/dev/null 2>&1; then
+    # Check that current-context actually points to this cluster; a stale context
+    # must not probe another cluster and wrongly disable cert-manager on this one.
+    local cert_expected_ctx
+    cert_expected_ctx="$(gke_context_name)"
+    if [ "$(kubectl config current-context 2>/dev/null || true)" = "$cert_expected_ctx" ] &&
+      kubectl get deployment cert-manager -n cert-manager --context "$cert_expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" >/dev/null 2>&1; then
       # The Deployment alone cannot say whose it is. On a retry after an
       # apply that died past the cert-manager release, and on every
       # upgrade.sh regeneration of an existing-cluster install, the

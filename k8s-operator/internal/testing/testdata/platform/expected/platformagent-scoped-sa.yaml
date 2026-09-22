@@ -605,6 +605,14 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: GKE_PROJECT_ID
+              value: example-project
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:

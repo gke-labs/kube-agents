@@ -55,6 +55,14 @@ LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
+# Context name environment variable pinning the host cluster (#1799).
+HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+
+# Default execution and request timeouts for kubectl (#1799).
+DEFAULT_KUBECTL_TIMEOUT_SECONDS = 60
+DEFAULT_KUBECTL_REQUEST_TIMEOUT = "30s"
+ENV_KUBECTL_TIMEOUT_SECONDS = "CREDENTIAL_PROXY_KUBECTL_TIMEOUT_SECONDS"
+
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
 # costs rather than whether it happens: the chunk size keeps the discard flat in
@@ -3125,8 +3133,10 @@ class CommandExecutor:
         max_output_bytes: int,
         state_dir: str,
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
+        kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
     ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.kubectl_timeout_seconds = kubectl_timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
@@ -3433,6 +3443,17 @@ class CommandExecutor:
         # the pool existed -- regenerated on the ambient identity, never
         # selected on.
         scoped = executable == "kubectl"
+        if executable == "kubectl":
+            has_request_timeout = any(
+                arg == "--request-timeout" or arg.startswith("--request-timeout=")
+                for arg in command
+            )
+            if not has_request_timeout:
+                command = [
+                    command[0],
+                    f"--request-timeout={DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+                    *command[1:],
+                ]
         command, flag_kubeconfig = self._reroute_kubeconfig_flags(command, scoped=scoped)
         if flag_kubeconfig is not None:
             # The flag beats the environment, because that is the precedence
@@ -3475,6 +3496,12 @@ class CommandExecutor:
             # taking roles/container.viewer off that identity is not a tidy-up
             # alongside this work but the half of it that covers this door.
             kubeconfig_path = self._default_kubeconfig()
+        elif executable == "kubectl" and HOST_CONTEXT_ENV in self.environment:
+            # When the caller names no cluster, resolve against the host cluster
+            # context pinned in the environment rather than whatever was last fetched (#1799).
+            kubeconfig_path = self._resolve_kubeconfig(
+                self.environment[HOST_CONTEXT_ENV], scoped=scoped
+            )
         else:
             kubeconfig_path = None
         return self._execute(
@@ -3942,11 +3969,16 @@ class CommandExecutor:
         reaches a cluster, and if the pool did not cover that path it would be
         the one door left open onto the ambient credential.
         """
+        host_context = self.environment.get(HOST_CONTEXT_ENV)
+        if host_context:
+            target = parse_gke_context(host_context.strip())
+            if target is not None:
+                return target
         try:
             text = Path(self.environment["KUBECONFIG"]).read_text(
                 encoding="utf-8", errors="replace"
             )
-        except OSError:
+        except (KeyError, OSError):
             return None
         context = read_current_context(text)
         return parse_gke_context(context) if context else None
@@ -4100,11 +4132,8 @@ class CommandExecutor:
         Returned rather than written: the destination is a path in the agent's
         pod, which this process cannot see and must not be handed a route into.
         """
-        if not wants_kubeconfig:
-            # No destination asked for, so gcloud updates the broker's own
-            # config as it always has. Nothing agent-authored is involved.
-            return self._execute(command, stdin=stdin, cwd=cwd)
-
+        # Always execute into an isolated scratch file so the broker's own
+        # base config (watcher.config) is never mutated (#1799).
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch)
@@ -4119,7 +4148,8 @@ class CommandExecutor:
                     # redundant fetch. Taking the lock here would serialise every
                     # scaffold behind every cold read for no benefit.
                     os.replace(scratch, self._managed_kubeconfig(target))
-                result = replace(result, kubeconfig=generated)
+                if wants_kubeconfig:
+                    result = replace(result, kubeconfig=generated)
             return result
         finally:
             scratch.unlink(missing_ok=True)
@@ -4193,10 +4223,15 @@ class CommandExecutor:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        effective_timeout = (
+            self.kubectl_timeout_seconds
+            if argv and Path(argv[0]).name == "kubectl"
+            else self.timeout_seconds
+        )
         try:
             stdout_bytes, stderr_bytes = process.communicate(
                 input=stdin.encode("utf-8") if stdin is not None else None,
-                timeout=self.timeout_seconds,
+                timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -4205,6 +4240,14 @@ class CommandExecutor:
             except OSError:
                 pass
             stdout_bytes, stderr_bytes = process.communicate()
+            if argv and Path(argv[0]).name == "kubectl":
+                target_str = (
+                    f"target kubeconfig {kubeconfig_path}"
+                    if kubeconfig_path
+                    else "ambient cluster target"
+                )
+                msg = f"\n[credential-proxy] kubectl command timed out after {effective_timeout}s ({target_str})\n"
+                stderr_bytes = (stderr_bytes or b"") + msg.encode("utf-8")
 
         stdout_bytes, stdout_truncated = self._truncate(stdout_bytes)
         stderr_bytes, stderr_truncated = self._truncate(stderr_bytes)
@@ -5763,6 +5806,9 @@ def serve(args: argparse.Namespace) -> None:
         timeout_seconds=args.timeout_seconds,
         max_output_bytes=args.max_output_bytes,
         state_dir=args.state_dir,
+        kubectl_timeout_seconds=getattr(
+            args, "kubectl_timeout_seconds", DEFAULT_KUBECTL_TIMEOUT_SECONDS
+        ),
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
@@ -5875,6 +5921,17 @@ def parse_args() -> argparse.Namespace:
         "--timeout-seconds",
         type=int,
         default=int(os.getenv("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "300")),
+    )
+    parser.add_argument(
+        "--kubectl-timeout-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                ENV_KUBECTL_TIMEOUT_SECONDS,
+                str(DEFAULT_KUBECTL_TIMEOUT_SECONDS),
+            )
+        ),
+        help="Timeout in seconds for kubectl execution",
     )
     parser.add_argument(
         "--max-request-bytes",

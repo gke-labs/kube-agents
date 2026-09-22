@@ -723,6 +723,16 @@ Consequences:
   `SIGSEGV` on a deeply nested document, where the Python loader raises a
   catchable error. The input is chosen by the sandbox, so this is a
   denial-of-service boundary rather than a performance choice.
+- A `kubectl` command that specifies neither `--context` nor a `--kubeconfig`/`KUBECONFIG`
+  runs against the host cluster context (`KUBE_CONTEXT_NAME`). It does not follow whichever
+  cluster was most recently selected by `get-credentials`.
+- `gcloud container clusters get-credentials` writes into an isolated scratch kubeconfig rather
+  than mutating the broker's primary configuration (`watcher.config`). This keeps commands without
+  an explicit target on the host cluster and prevents one task's credentials from redirecting
+  another.
+- Proxied `kubectl` executions inject `--request-timeout=30s` when no request timeout is
+  provided and enforce a 60-second command deadline. An unreachable cluster fails fast rather than
+  holding the broker worker for `kubectl`'s 300-second default client timeout.
 
 ### Cloud API reads
 

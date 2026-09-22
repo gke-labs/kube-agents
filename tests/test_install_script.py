@@ -1823,6 +1823,16 @@ run_menu_system "."
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC=1", proc.stdout)
 
+    def test_wait_for_deployment_object_passes_context(self):
+        """Context argument must be forwarded as --context to kubectl."""
+        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_deployment_object dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
     def test_print_generate_only_handoff_renders_required_commands(self):
         """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""
         cmd = f"""

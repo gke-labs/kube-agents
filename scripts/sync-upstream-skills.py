@@ -115,6 +115,23 @@ GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET = """          > {output_file_pa
         refuses it.
 """
 
+# gke-basics' cluster credentials example upstream runs `gcloud container clusters get-credentials`
+# without isolating KUBECONFIG, which overwrites the default kubeconfig context and breaks the Platform
+# Agent's ambient host cluster context. The replacement isolates credentials to a per-target KUBECONFIG
+# under $HERMES_HOME/.kubeconfigs/.
+GKE_BASICS_OLD_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials:
+     ```bash
+     gcloud container clusters get-credentials CLUSTER_NAME --region=REGION --quiet
+     ```"""
+
+GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials, and isolate credentials to a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` to preserve ambient cluster context:
+     ```bash
+     KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_CLUSTER_NAME.yaml" \\
+       gcloud container clusters get-credentials CLUSTER_NAME --region=REGION --quiet
+     ```"""
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
 # where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
 # skill only this repository has from a passage upstream cannot know about, or to drop a name this
@@ -139,6 +156,12 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET,
             GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET,
+        ),
+    ],
+    "gke-basics": [
+        (
+            GKE_BASICS_OLD_CREDENTIALS_SNIPPET,
+            GKE_BASICS_NEW_CREDENTIALS_SNIPPET,
         ),
     ],
 }

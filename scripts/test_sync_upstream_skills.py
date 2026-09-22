@@ -204,6 +204,25 @@ class ApplySubstitutionsTest(unittest.TestCase):
             self.assertNotIn(sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET, content)
             self.assertIn(sync.GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET, content)
 
+    def test_applies_basics_credentials_substitution(self):
+        d = self._skill_dir(body=sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET + "\n")
+        self.assertTrue(sync.apply_substitutions(str(d), "gke-basics"))
+        text = self._read(d)
+        self.assertNotIn(sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET, text)
+        self.assertIn(sync.GKE_BASICS_NEW_CREDENTIALS_SNIPPET, text)
+        self.assertIn("KUBECONFIG=", text)
+        # Second call must be a no-op (replacement already present).
+        self.assertFalse(sync.apply_substitutions(str(d), "gke-basics"))
+        self.assertEqual(text.count(sync.GKE_BASICS_NEW_CREDENTIALS_SNIPPET), 1)
+
+    def test_repo_basics_skill_carries_credentials_substitution(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-basics" / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-basics"]:
+            self.assertNotIn(target, content)
+            self.assertEqual(content.count(replacement), 1, replacement)
+
 
 if __name__ == "__main__":
     unittest.main()

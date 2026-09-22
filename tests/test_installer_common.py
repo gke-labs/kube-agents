@@ -68,10 +68,19 @@ CERT_MANAGER_RELEASE_STATE = _state_doc(
       "instances": [{"index_key": 0, "attributes": {"id": "cert-manager", "name": "cert-manager"}}]}]
 )
 
-# A kubectl that finds a cert-manager Deployment and nothing else; the
-# current-context read answers with a name that is not this install's, so the
-# generator's credential recovery stays out of the way.
+# A kubectl that finds a cert-manager Deployment on this install's cluster.
 _CERT_MANAGER_PRESENT_KUBECTL = (
+    "#!/usr/bin/env bash\n"
+    'case "$*" in\n'
+    '  *"get deployment cert-manager"*) exit 0 ;;\n'
+    '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+    "esac\n"
+    "exit 1\n"
+)
+
+# A kubectl whose current-context points at some other cluster; the cert-manager
+# probe and credential recovery must not touch it.
+_CERT_MANAGER_OTHER_CONTEXT_KUBECTL = (
     "#!/usr/bin/env bash\n"
     'case "$*" in\n'
     '  *"get deployment cert-manager"*) exit 0 ;;\n'
@@ -354,6 +363,21 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=_CERT_MANAGER_PRESENT_KUBECTL,
                 gcloud_exit=1,
                 gcloud_stderr="ERROR: (gcloud.storage.cat) HTTPError 503: Service Unavailable",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("enable_cert_manager        = true", dest.read_text())
+
+    def test_tfvars_keeps_cert_manager_when_kubectl_context_is_not_this_cluster(self):
+        # A stale or different kubectl context must not probe the wrong cluster
+        # and wrongly disable cert-manager on the target cluster.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub=_autopilot_describe_stub(),
+                kubectl_script=_CERT_MANAGER_OTHER_CONTEXT_KUBECTL,
+                gcloud_exit=1,
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("enable_cert_manager        = true", dest.read_text())
