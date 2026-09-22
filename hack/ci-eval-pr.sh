@@ -651,6 +651,9 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 # baseline store the gate compares against is built from PASSING runs on main,
 # and those are exactly the records the old failure-only trap threw away. It
 # cannot precede the `$?` capture, so it sits immediately after it.
+# collect_gateway_log follows it for the same reason: a green nightly whose
+# repetitions ran to the delegation ceiling used to leave no gateway log to
+# say whether the worker was starved by 429s or a stuck dispatcher.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -668,6 +671,7 @@ profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
   collect_bench_results
+  collect_gateway_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
