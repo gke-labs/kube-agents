@@ -605,6 +605,16 @@ class ListProfilesTest(unittest.TestCase):
             cap.cmd_list(mock.MagicMock(all=True))
         self.assertEqual(out_all.getvalue(), "cluster-beta\ncluster-halfbuilt\ncluster-zeta\n")
 
+    def test_list_parser_all_flag(self):
+        parser = cap.build_parser()
+        args_default = parser.parse_args(["list"])
+        self.assertEqual(args_default.command, "list")
+        self.assertFalse(args_default.all)
+
+        args_all = parser.parse_args(["list", "--all"])
+        self.assertEqual(args_all.command, "list")
+        self.assertTrue(args_all.all)
+
 
 
 class SandboxStubTest(unittest.TestCase):

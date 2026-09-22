@@ -556,7 +556,7 @@ def cmd_name(args: argparse.Namespace) -> None:
     print(profile_name(args.project, args.cluster, args.location))
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage per-cluster Cluster Agent Hermes profiles.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -577,7 +577,11 @@ def main() -> None:
         action="store_true",
         help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
     )
+    return parser
 
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}
     handlers[args.command](args)
