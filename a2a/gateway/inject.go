@@ -149,6 +149,18 @@ const (
 	injectMaxTextRunes = 64 * 1024
 	injectMaxKeyRunes  = 128
 
+	// injectMaxAuthorRunes bounds the author a request names. A real one is
+	// short (it is resolved through the principal map), and it rides into the
+	// drop notice, the ingress log and directOf, so it is bounded and checked
+	// for control characters the way the key is.
+	injectMaxAuthorRunes = 256
+
+	// injectMaxDirectAuthors bounds InjectAdapter.directOf. An eviction drops
+	// the authors mapped to the evicted conversation, but a token holder can
+	// name a fresh author on every request to one live conversation, which
+	// nothing on that side ever evicts; the cap does, oldest author first.
+	injectMaxDirectAuthors = 4096
+
 	// injectMaxEntryBytes bounds one stored transcript entry, in BYTES: it is
 	// handed to truncateRunes, which despite its name bounds a byte length at
 	// a rune boundary. A separate name from the rune bound above because one
@@ -541,9 +553,12 @@ type InjectAdapter struct {
 	seqFloors     map[string]int
 	seqFloorOrder []string
 	// directOf maps an author to the conversation they last spoke on, which
-	// is what OpenDirect answers with. Bounded by the conversation cap: an
-	// entry is dropped when its conversation is evicted.
-	directOf map[string]string
+	// is what OpenDirect answers with. Bounded twice: an entry is dropped
+	// when its conversation is evicted, and directOrder caps the map at
+	// injectMaxDirectAuthors by first-seen order, because a token holder can
+	// name a fresh author on every request to one conversation.
+	directOf    map[string]string
+	directOrder []string
 	// submissions dedupes accepted POSTs by backend message id, and
 	// submissionOrder is its eviction queue, bounded at injectSeenCap.
 	submissions     map[string]*injectSubmission
@@ -953,7 +968,7 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 		// mapping is the live one.
 		for author, conversation := range a.directOf {
 			if conversation == oldest {
-				delete(a.directOf, author)
+				a.forgetDirectLocked(author)
 			}
 		}
 		if evicted := a.conversations[oldest]; evicted != nil {
@@ -1116,7 +1131,9 @@ func (a *InjectAdapter) turnSince(key string, prior injectCounts) injectTurn {
 // conversation's counts as they stand, once no earlier turn this door handed
 // over is still running. The two happen under one lock, so two POSTs cannot
 // both find the conversation quiet. False when the earlier turn did not end
-// by the deadline or the caller went away.
+// in time -- by the deadline, or with less than a turn (turnTimeout) of it
+// left, so a turn that is handed over always has the time handleInbound runs
+// under -- or the caller went away.
 //
 // The deadline is the caller's, shared with the wait that follows, so a
 // request answers within one submit bound of its arrival however the bound
@@ -1131,6 +1148,17 @@ func (a *InjectAdapter) claimTurn(ctx context.Context, key string, deadline time
 		a.mu.Lock()
 		conv := a.conversationLocked(key)
 		if conv.handed <= conv.turns {
+			if time.Until(deadline) < turnTimeout {
+				// The earlier turn ended, but too late: handed over now, this
+				// turn would have less than the turnTimeout handleInbound runs
+				// under, and the wait's deadline would fall while the turn was
+				// still legitimately running -- a `no-answer` refusal, pinned
+				// for every retry of the message id, for a message the gateway
+				// goes on to act on. A refusal has to mean nothing started, so
+				// the message is not handed over at all.
+				a.mu.Unlock()
+				return injectCounts{}, false
+			}
 			conv.handed++
 			prior := countsOf(conv)
 			a.mu.Unlock()
@@ -1157,8 +1185,9 @@ func (a *InjectAdapter) claimTurn(ctx context.Context, key string, deadline time
 // earlierTurnNote is the refusal note for a message the door did not hand
 // over because the conversation's previous turn never ended.
 func earlierTurnNote() string {
-	return fmt.Sprintf("an earlier turn on this conversation did not finish within %s, so this "+
-		"message was not handed to the gateway", injectSubmitWait)
+	return fmt.Sprintf("an earlier turn on this conversation did not finish in time (a message is "+
+		"handed over only with a whole turn, %s, left of the %s bound), so this message was not "+
+		"handed to the gateway", turnTimeout, injectSubmitWait)
 }
 
 // remadeNote is the refusal note for a conversation evicted under a waiter.
@@ -1200,6 +1229,10 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(req.Author) == "" {
 		injectError(w, http.StatusBadRequest, "author is required; it is resolved through the principal map")
+		return
+	}
+	if err := injectAuthorWellFormed(req.Author); err != nil {
+		injectError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.Text == "" {
@@ -1316,7 +1349,32 @@ func (a *InjectAdapter) noteRequester(key, author string) {
 	defer a.mu.Unlock()
 	conv := a.conversationLocked(key)
 	conv.requester = author
+	a.noteDirectLocked(author, key)
+}
+
+// noteDirectLocked records the conversation an author last spoke on, bounded
+// at injectMaxDirectAuthors by first-seen order. Caller holds a.mu.
+func (a *InjectAdapter) noteDirectLocked(author, key string) {
+	if _, ok := a.directOf[author]; !ok {
+		a.directOrder = append(a.directOrder, author)
+	}
 	a.directOf[author] = key
+	for len(a.directOrder) > injectMaxDirectAuthors {
+		delete(a.directOf, a.directOrder[0])
+		a.directOrder = a.directOrder[1:]
+	}
+}
+
+// forgetDirectLocked drops an author's mapping and its place in the order, so
+// an author noted again later is counted once. Caller holds a.mu.
+func (a *InjectAdapter) forgetDirectLocked(author string) {
+	delete(a.directOf, author)
+	for i, candidate := range a.directOrder {
+		if candidate == author {
+			a.directOrder = append(a.directOrder[:i], a.directOrder[i+1:]...)
+			return
+		}
+	}
 }
 
 // handleCancel is POST /conversations/<key>/cancel: stop whatever is running
@@ -1345,6 +1403,10 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 	if strings.TrimSpace(req.Author) == "" {
 		injectError(w, http.StatusBadRequest,
 			"author is required: a cancel is verified like any other message on the conversation")
+		return
+	}
+	if err := injectAuthorWellFormed(req.Author); err != nil {
+		injectError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1736,9 +1798,6 @@ func injectConversationKey(raw string) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("conversation is required")
 	}
-	if len([]rune(key)) > injectMaxKeyRunes {
-		return "", fmt.Errorf("conversation is longer than %d runes", injectMaxKeyRunes)
-	}
 	for _, r := range key {
 		// A control character would ride into the ingress log and the KV
 		// key; neither has any business carrying a newline.
@@ -1746,15 +1805,39 @@ func injectConversationKey(raw string) (string, error) {
 			return "", fmt.Errorf("conversation contains a control character")
 		}
 	}
-	if strings.HasPrefix(key, injectKeyPrefix) {
-		return key, nil
+	if !strings.HasPrefix(key, injectKeyPrefix) {
+		if strings.Contains(key, ":") {
+			return "", fmt.Errorf("conversation must not contain a colon unless it starts with %q: "+
+				"the prefix is what keeps a synthetic conversation distinguishable from a real backend's",
+				injectKeyPrefix)
+		}
+		key = injectKeyPrefix + key
 	}
-	if strings.Contains(key, ":") {
-		return "", fmt.Errorf("conversation must not contain a colon unless it starts with %q: "+
-			"the prefix is what keeps a synthetic conversation distinguishable from a real backend's",
-			injectKeyPrefix)
+	// Bounded once the prefix is settled, so the key a POST answers with is a
+	// key the read and cancel routes accept: the prefix is part of what rides
+	// into the KV key and the log line either way, and measuring the raw value
+	// on the POST and the prefixed one on the GET would accept a key on the
+	// way in that it refuses on the way back.
+	if len([]rune(key)) > injectMaxKeyRunes {
+		return "", fmt.Errorf("conversation is longer than %d runes", injectMaxKeyRunes)
 	}
-	return injectKeyPrefix + key, nil
+	return key, nil
+}
+
+// injectAuthorWellFormed bounds the author a request names, for the reasons
+// injectConversationKey bounds the key: it rides into the drop notice, the
+// ingress log and directOf. Blankness is the caller's check, because the two
+// routes say different things about why an author is required.
+func injectAuthorWellFormed(author string) error {
+	if len([]rune(author)) > injectMaxAuthorRunes {
+		return fmt.Errorf("author is longer than %d runes", injectMaxAuthorRunes)
+	}
+	for _, r := range author {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("author contains a control character")
+		}
+	}
+	return nil
 }
 
 // intParam reads a non-negative integer query parameter, absent meaning zero.

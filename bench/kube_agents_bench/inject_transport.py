@@ -1263,10 +1263,14 @@ class InjectTask:
         reason.
 
         Returns:
-            The folded outcome when a terminal arrived inside ``settle``,
-            otherwise ``None``. Best effort throughout: a cancel that cannot
-            be delivered is logged, because the caller is already abandoning
-            the task.
+            What the read after the cancel found, when a task id was named
+            and ``settle`` is positive: the exchange as it stands at the end
+            of the settle, terminal when an executor confirmed inside it and
+            otherwise the fold as it was. ``None`` when the cancel itself
+            could not be delivered, when there was no task to read, or when
+            that read failed. Best effort throughout: a cancel that cannot be
+            delivered is logged, because the caller is already abandoning the
+            task.
         """
         task_id = task_id or self.task_id
         # Resolved here rather than in the signature, so the module constant

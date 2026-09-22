@@ -1060,8 +1060,11 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	// residue; replaying the in subject for the cancel envelope is the
 	// close if it ever bites.
 	rec.MarkCanceled(active.TaskID)
-	g.observeCancelPublished(rec.Key, active.TaskID)
+	// The post before the signal: a waiter woken by the signal snapshots the
+	// conversation's entries, and the line saying the cancel went belongs in
+	// what it reads.
 	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+	g.observeCancelPublished(rec.Key, active.TaskID)
 }
 
 // cancelNamedTask publishes kind:cancel for a task this conversation has
@@ -1109,11 +1112,12 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 		return
 	}
 	rec.MarkCanceled(taskID)
-	g.observeCancelPublished(rec.Key, taskID)
 	g.log.Info("cancel published for a task the conversation no longer holds",
 		"conversation", rec.Key, "taskId", taskID, "addressee", ref.Addressee)
+	// The post before the signal, as in cancelTask.
 	g.post(rec.Key, fmt.Sprintf("🛑 cancel sent for task `%s`, which this conversation no longer holds — "+
 		"it ends when an executor confirms, if one ever took it", taskID))
+	g.observeCancelPublished(rec.Key, taskID)
 }
 
 // answerStatusByReplay answers "what is it doing" from the stream, not from

@@ -703,6 +703,12 @@ func TestInjectConversationKey(t *testing.T) {
 		{"foreign backend", "gchat:spaces/AAA/threads/BBB", "", true},
 		{"newline", "case\n1", "", true},
 		{"too long", strings.Repeat("x", injectMaxKeyRunes+1), "", true},
+		// The bound is on the key with its prefix, the same on the way in and
+		// on the way back: a raw value that fits only without the prefix is
+		// refused at the POST rather than accepted there and refused on the GET.
+		{"longest raw that fits with the prefix", strings.Repeat("x", injectMaxKeyRunes-len([]rune(injectKeyPrefix))),
+			injectKeyPrefix + strings.Repeat("x", injectMaxKeyRunes-len([]rune(injectKeyPrefix))), false},
+		{"raw that fits only without the prefix", strings.Repeat("x", injectMaxKeyRunes-len([]rune(injectKeyPrefix))+1), "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := injectConversationKey(tc.in)
@@ -717,6 +723,11 @@ func TestInjectConversationKey(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("injectConversationKey(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			// The key a POST answers with is handed straight back on the read
+			// and cancel routes, which run it through this validator again.
+			if again, err := injectConversationKey(got); err != nil || again != got {
+				t.Fatalf("injectConversationKey(%q) handed back = (%q, %v), want it accepted unchanged", got, again, err)
 			}
 		})
 	}
@@ -738,6 +749,9 @@ func TestInjectRefusesMalformedRequests(t *testing.T) {
 		{"no conversation", `{"author":"1001","text":"hi"}`, http.StatusBadRequest},
 		{"no author", `{"conversation":"c","text":"hi"}`, http.StatusBadRequest},
 		{"no text", `{"conversation":"c","author":"1001"}`, http.StatusBadRequest},
+		{"author too long", fmt.Sprintf(`{"conversation":"c","author":%q,"text":"hi"}`,
+			strings.Repeat("a", injectMaxAuthorRunes+1)), http.StatusBadRequest},
+		{"author with a newline", `{"conversation":"c","author":"10\n01","text":"hi"}`, http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, err := r.do(t, http.MethodPost, r.base+injectPath, []byte(tc.body), injectTestToken)
@@ -2840,6 +2854,36 @@ func TestInjectEvictionDropsEveryAuthorsMappingToTheConversation(t *testing.T) {
 		if conversation, ok := f.door.directOf[author]; ok {
 			t.Errorf("%s still maps to %q after its conversation was evicted", author, conversation)
 		}
+		for _, queued := range f.door.directOrder {
+			if queued == author {
+				t.Errorf("%s still has a place in the cap's order after its conversation was evicted", author)
+			}
+		}
+	}
+}
+
+// TestInjectDirectOfIsCappedAcrossDistinctAuthors: an eviction drops the
+// authors mapped to the evicted conversation, but a token holder can name a
+// fresh author on every request to one live conversation, which no eviction
+// on that side ever reaches. The cap does, oldest author first.
+func TestInjectDirectOfIsCappedAcrossDistinctAuthors(t *testing.T) {
+	f := startFakeDoor(t, func(InboundMessage) {})
+	const key = injectKeyPrefix + "many-authors"
+	const over = 3
+	for i := range injectMaxDirectAuthors + over {
+		f.door.noteRequester(key, fmt.Sprintf("author-%d", i))
+	}
+	f.door.mu.Lock()
+	defer f.door.mu.Unlock()
+	if len(f.door.directOf) != injectMaxDirectAuthors || len(f.door.directOrder) != injectMaxDirectAuthors {
+		t.Fatalf("directOf holds %d authors (order %d), want the cap of %d",
+			len(f.door.directOf), len(f.door.directOrder), injectMaxDirectAuthors)
+	}
+	if _, ok := f.door.directOf["author-0"]; ok {
+		t.Error("the oldest author is still mapped past the cap")
+	}
+	if got := f.door.directOf[fmt.Sprintf("author-%d", injectMaxDirectAuthors+over-1)]; got != key {
+		t.Errorf("the newest author maps to %q, want %q", got, key)
 	}
 }
 
@@ -2869,6 +2913,59 @@ func TestInjectAReMintedConversationContinuesItsSequence(t *testing.T) {
 	}
 }
 
+// TestInjectAClaimWithLessThanATurnLeftIsRefusedNotHandedOver: a message
+// behind an earlier turn that ends late in this message's bound is refused at
+// the claim rather than handed over with less of the bound left than the
+// turn timeout handleInbound runs under. Handed over, the wait would fall due
+// while the turn legitimately ran, answer `no-answer`, pin that answer for
+// every retry of the message id, and the turn would go on to mint a task
+// nobody was told about -- the outcome a refusal exists to rule out.
+func TestInjectAClaimWithLessThanATurnLeftIsRefusedNotHandedOver(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+	door, err := NewInjectAdapter(ln.Addr().String(), injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = injectKeyPrefix + "late-handover"
+	ctx := context.Background()
+	if _, ok := door.claimTurn(ctx, key, time.Now().Add(injectSubmitWait)); !ok {
+		t.Fatal("the first claim on a quiet conversation must succeed")
+	}
+	type outcome struct {
+		ok      bool
+		elapsed time.Duration
+	}
+	late := make(chan outcome, 1)
+	started := time.Now()
+	go func() {
+		_, ok := door.claimTurn(ctx, key, time.Now().Add(turnTimeout-time.Second))
+		late <- outcome{ok, time.Since(started)}
+	}()
+	// Let the claim take its first look and start waiting, then end the
+	// earlier turn with less than a turn of the second message's bound left.
+	time.Sleep(2 * injectPollInterval)
+	door.TurnFinished(key)
+	select {
+	case got := <-late:
+		if got.ok {
+			t.Fatal("the message was handed over with less than a turn of its bound left")
+		}
+		if got.elapsed > injectSubmitWait/4 {
+			t.Fatalf("the refusal took %s; it should follow the earlier turn's end, not the deadline", got.elapsed)
+		}
+	case <-time.After(injectSubmitWait / 4):
+		t.Fatal("the claim did not return once the earlier turn ended")
+	}
+	// The same message with a whole bound left is handed over at once.
+	if _, ok := door.claimTurn(ctx, key, time.Now().Add(injectSubmitWait)); !ok {
+		t.Fatal("a claim with a whole bound left behind an ended turn must be handed over")
+	}
+}
+
 // TestInjectOneBoundCoversTheClaimAndTheWait: a duplicate POST waits one
 // submit bound from its own arrival for the first POST's answer. Were the
 // claim (waiting for an earlier turn to end) and the wait each given a whole
@@ -2890,7 +2987,7 @@ func TestInjectOneBoundCoversTheClaimAndTheWait(t *testing.T) {
 	const key = injectKeyPrefix + "one-bound"
 	ctx := context.Background()
 	// A turn handed over and never ended.
-	if _, ok := door.claimTurn(ctx, key, time.Now().Add(time.Second)); !ok {
+	if _, ok := door.claimTurn(ctx, key, time.Now().Add(injectSubmitWait)); !ok {
 		t.Fatal("the first claim on a quiet conversation must succeed")
 	}
 	deadline := time.Now().Add(4 * injectPollInterval)

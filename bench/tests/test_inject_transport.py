@@ -1364,6 +1364,10 @@ def test_a_probed_poll_gives_the_gateway_time_for_both_probes(
     a slow bus would read as a dead tunnel and tear down a healthy
     port-forward; the timeout covers both probes on top of the wait."""
     stub_gateway.entries = running_transcript(stub_gateway.task_id)
+    # The stub never ends the task, so the run ends at the budget; the
+    # assertions are about each request's timeout, not the budget, and the
+    # default one would hold the test for the whole of it.
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
     real_request = inject._request
     timeouts: list[tuple[str, float]] = []
 

@@ -4365,6 +4365,9 @@ func a2aGatewayEnv(t *testing.T, cl client.Client, agent *agentv1alpha1.Platform
 // closed one, not one behind a fence -- none, so there is nothing to
 // misconfigure and nothing to find.
 func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
+	// Pinned off rather than inherited, so a shell that exports the flag does
+	// not turn this test into its opposite.
+	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
 
 	// The render, first: nothing in the pod spec even mentions it.
@@ -4391,7 +4394,7 @@ func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
 	cl, agent, _, _ := a2aInjectAgentState(t)
 	ctx := context.Background()
 	name := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
-	for _, obj := range []client.Object{&corev1.Service{}, &corev1.ConfigMap{}, &networkingv1.NetworkPolicy{}} {
+	for _, obj := range a2aInjectRenderedKinds() {
 		if err := cl.Get(ctx, name, obj); !errors.IsNotFound(err) {
 			t.Errorf("%T %s exists without the flag (err=%v)", obj, name.Name, err)
 		}
@@ -4460,8 +4463,8 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	if !mounted {
 		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aInjectPrincipalMapDir)
 	}
-	// The other map stays mounted and unread: two ConfigMaps cannot share a
-	// path, and an install with this backend has no Discord one anyway.
+	// The other map stays mounted, at its own path: two ConfigMaps cannot
+	// share one, and the chat backends still read the default.
 	var stillHasDefault bool
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if v.Name == "principal-map" {
@@ -4498,9 +4501,11 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, secret); err != nil {
 		t.Fatalf("the door's bearer token Secret was not rendered: %v", err)
 	}
-	if len(secret.Data[a2aInjectTokenKey]) < a2aInjectTokenNumBytes {
-		t.Errorf("the token is %d bytes; it is the door's whole access control",
-			len(secret.Data[a2aInjectTokenKey]))
+	// Hex, two characters a byte: the length says the whole of the random
+	// material reached the Secret.
+	if len(secret.Data[a2aInjectTokenKey]) != 2*a2aInjectTokenNumBytes {
+		t.Errorf("the token is %d hex characters, want %d (%d random bytes); it is the door's whole access control",
+			len(secret.Data[a2aInjectTokenKey]), 2*a2aInjectTokenNumBytes, a2aInjectTokenNumBytes)
 	}
 
 	svc := &corev1.Service{}
@@ -4786,6 +4791,7 @@ func TestA2AInjectTokenIsRepairedIfEmptied(t *testing.T) {
 // applied to the credential. A Secret is the one object here whose presence
 // on an install that never asked for the door would be more than residue.
 func TestA2AInjectTokenIsNotRenderedWithoutTheFlag(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
 	cl, agent, _, _ := a2aInjectAgentState(t)
 	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
 	if err := cl.Get(context.Background(), key, &corev1.Secret{}); !errors.IsNotFound(err) {
