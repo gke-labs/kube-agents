@@ -273,7 +273,7 @@ warn_on_overreaching_custom_roles() {
 # (us-central1-a). Autopilot clusters are regional, so this is what decides
 # whether the default shape is creatable at a given location. One home for the
 # pattern: install.sh both demotes the default and validates an explicit
-# --cluster-mode against it, and the two must agree.
+# --gke-cluster-mode against it, and the two must agree.
 location_is_region() {
   [[ "${1:-}" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]
 }
@@ -1450,7 +1450,7 @@ write_tfvars_from_state() {
   # deletion-protection apply and upgrade's full apply both became cluster
   # replacements.
   #
-  # CLUSTER_MODE (install.sh --cluster-mode, recorded in install.env) therefore
+  # CLUSTER_MODE (install.sh --gke-cluster-mode, recorded in install.env) therefore
   # decides ONE case: the fresh create, where the probe found no cluster and
   # the interview is the only information there is. Every branch on which a
   # cluster exists assigns cluster_mode from the probe, so a stale or
@@ -1677,7 +1677,7 @@ write_tfvars_from_state() {
   # pool AND the RuntimeClass on the pod; Autopilot ships the gvisor
   # RuntimeClass natively and has no pool to manage, so asking the gke-cluster
   # module for one there fails the plan. Deriving both from the probed
-  # cluster_mode keeps --gvisor=true meaning the same thing on either shape.
+  # cluster_mode keeps --enable-gvisor=true meaning the same thing on either shape.
   #
   # The fallback stays false even though a fresh install now defaults to the
   # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
@@ -1704,7 +1704,7 @@ write_tfvars_from_state() {
       # release channel's current version, which has been past the floor since
       # 2023. There is nothing to describe yet, so checking would only produce
       # the "could not read the version" warning below on every fresh
-      # --cluster-mode=autopilot --gvisor=true install.
+      # --gke-cluster-mode=autopilot --enable-gvisor=true install.
       print_info "Creating Autopilot cluster '${CLUSTER_NAME}': using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
     else
       # Autopilot's gvisor RuntimeClass arrived in a specific GKE version, and
@@ -1732,7 +1732,7 @@ write_tfvars_from_state() {
         print_warning "Could not read the GKE version of Autopilot cluster '${CLUSTER_NAME}'; proceeding as though it supports GKE Sandbox. Below ${GVISOR_AUTOPILOT_MIN_VERSION} the agent Deployment is never created and this run fails at its final check."
       elif ! gke_version_at_least "$master_version" "$GVISOR_AUTOPILOT_MIN_VERSION"; then
         print_error "Autopilot cluster '${CLUSTER_NAME}' runs GKE ${master_version}, and its gvisor RuntimeClass needs ${GVISOR_AUTOPILOT_MIN_VERSION} or later."
-        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in install.env. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
+        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --enable-gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in install.env. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
         print_info "Tearing down instead? uninstall.sh forces ENABLE_GVISOR=false and is never blocked by this check; if you reach it from some other caller, export ENABLE_GVISOR=false first."
         return 1
       fi
@@ -1779,7 +1779,7 @@ write_tfvars_from_state() {
     echo ""
     echo "# The DNS endpoint is open and deletion protection is off. cluster_mode is"
     echo "# the live cluster's own shape whenever there is one to probe, and the"
-    echo "# --cluster-mode the install asked for only on a create."
+    echo "# --gke-cluster-mode the install asked for only on a create."
     echo "cluster_mode               = $(hcl_str "${cluster_mode}")"
     echo "create_cluster             = ${create_cluster}"
     echo "# An adoption that chose to install without NetworkPolicy enforcement."

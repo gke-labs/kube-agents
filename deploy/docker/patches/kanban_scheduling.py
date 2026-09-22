@@ -1,6 +1,7 @@
-"""Scheduling repairs for ``hermes_cli/kanban_db.py``.
+"""Scheduling repairs for ``hermes_cli/kanban_db.py`` and ``kanban_db_dispatch.py``.
 
-Four faults share this one upstream file, so they share one patch quartet.
+Four faults share what was one upstream file until Hermes v2026.9.14 split the
+dispatcher out of it, so they share one patch quartet.
 Splitting them across separate appliers meant several anchored rewrites of
 ``kanban_db.py`` racing to stay consistent with each other, multiple import
 trailers, and a build gate whose halves could disagree about what the engine now
@@ -160,10 +161,12 @@ Background — one identity, two lifetimes
     return f"{host}:{os.getpid()}"
 
 Under Kubernetes ``socket.gethostname()`` is the **pod name**, so the token is
-pod-scoped. ``detect_crashed_workers`` then decides whose worker PIDs it is
-entitled to adjudicate using only the host half::
+pod-scoped. ``detect_crashed_workers`` (since v2026.9.14 its reclaim half,
+``_reclaim_dead_workers`` in ``kanban_db_dispatch``) then decides whose worker
+PIDs it is entitled to adjudicate using only the host half, through upstream's
+``_host_prefix()`` helper::
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    host_prefix = _kb._host_prefix()   # f"{_claimer_id().split(':', 1)[0]}:"
     ...
     if not lock.startswith(host_prefix):
         continue
@@ -618,7 +621,7 @@ def claim_is_self(lock: Optional[str], claimer_id: str) -> bool:
 def claim_host(token: Optional[str]) -> str:
     """The host half of a ``host:pid`` claim token — the pod name in-cluster.
 
-    Split the same way ``detect_crashed_workers`` splits it (``split(':', 1)``),
+    Split the same way upstream's ``_host_prefix()`` splits it (``split(':', 1)``),
     so a hostname that somehow contains a colon is read identically here and
     upstream.
     """

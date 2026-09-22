@@ -33,6 +33,7 @@ def check(label: str, actual: object, expected: object) -> None:
 
 def main() -> int:
     import tools.approval as ap
+    import tools.approval_context as approval_context
     import tools.cron_risk_gate as crg
     from tools.cron_run_scope import cron_run_scope
 
@@ -49,12 +50,18 @@ def main() -> int:
 
     state = {"cron": True, "mode": "approve"}
 
-    # Pin session predicates
+    # Pin session predicates. They are from-imported by name into tools.approval,
+    # so a pin there is what the gates' own calls resolve.
     ap._is_interactive_cli = lambda: False
     ap._is_gateway_approval_context = lambda: False
+    ap._is_single_query_approval_context = lambda: False
+    ap._is_unattended_platform_approval_context = lambda: False
     ap._is_cron_approval_context = lambda: state["cron"]
-    ap._get_cron_approval_mode = lambda: state["mode"]
-    ap._get_approval_mode = lambda: "smart"
+    # The mode getters are not imported by name since v2026.9.14: the patched
+    # arm and upstream's _Unattended.mode() both resolve them on
+    # approval_context at call time, so they are pinned there.
+    approval_context._get_cron_approval_mode = lambda: state["mode"]
+    approval_context._get_approval_mode = lambda: "smart"
     ap._command_matches_permanent_allowlist = lambda cmd: False
     ap._match_user_deny_rule = lambda cmd: None
     ap._should_skip_container_guards = lambda *a, **kw: False

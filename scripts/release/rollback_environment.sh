@@ -317,7 +317,7 @@ check_images_exist() {
   names="$(release_image_names "${checkout}")"
   repos="$( {
     kubectl get deployment,statefulset -n "${NAMESPACE}" \
-      -o jsonpath='{range .items[*]}{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{end}' 2>/dev/null
+      -o jsonpath='{range .items[*]}{range .spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{range .spec.template.spec.volumes[*]}{.image.reference}{"\n"}{end}{end}' 2>/dev/null
   } | sed -e 's/@.*$//' -e 's/:[^/]*$//' | sort -u)"
   while IFS= read -r repo; do
     [ -n "${repo}" ] || continue

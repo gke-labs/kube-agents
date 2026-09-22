@@ -178,7 +178,6 @@ jobs:
           CLUSTER_MODE: ${{ vars.CLUSTER_MODE }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           THIRD_PARTY_REGISTRY_PREFIX: ${{ vars.THIRD_PARTY_REGISTRY_PREFIX }}
-          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
           NAMESPACE: ${{ vars.NAMESPACE }}
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}

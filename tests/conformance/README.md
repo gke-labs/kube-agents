@@ -87,12 +87,17 @@ One set of inputs is not registered: the group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
-is added. The non-empty-glob guard lives with C4's SHA-pin sweep; the group-B
-allowlists are guarded differently — a holder appearing or vanishing moves a
-set the test compares exactly. C4 is the invariant; its stricter form, which
-also requires the version comment beside each SHA and a digest on a `docker://`
-ref, and the fork-guard check on every auto-triggered credentialed workflow,
-run under `make test-python` in `tests/test_workflow_pins_and_fork_guards.py`.
+is added. Four of the five consumers of that glob answer for the empty set
+themselves: the group-B allowlists go red when an expected name goes missing,
+and B4's `workflow_run` gate and its `pull_request_target` checkout test each
+assert their own filtered subset non-empty. The fifth asserts an absence, and
+an absence is true of the empty set, so `_workflows()` in
+`test_B_write_path.py` raises on its behalf. C4's SHA-pin sweep keeps its own
+copy of the glob and guards it the same way. C4 is the invariant; its stricter
+form, which also requires the version comment beside each SHA and a digest on a
+`docker://` ref, and the fork-guard check on every auto-triggered credentialed
+workflow, run under `make test-python` in
+`tests/test_workflow_pins_and_fork_guards.py`.
 
 ## Invariant → test → bucket → historical attack
 
@@ -142,7 +147,7 @@ currently fails.
 | B1  | the denylist refuses merge and approve                                     | 1        | `test_B1_the_denylist_refuses_merge_and_approve`                                    | `gh pr merge` _used_ to work — the original recording of this violation — until `github.merge`/`github.assent` shipped; this pins the two rules that closed it, each with its own mutation                                                               |
 | B1  | the agent cannot force-push                                                | 1 **KV** | `test_B1_the_agent_cannot_merge_or_approve`                                         | `git push --force origin main` matches no denylist rule; the git verb and lease machinery constrain where git writes, not this flag — a watched branch is still rewritable                                                                               |
 | B2  | no workflow approves or merges a pull request                              | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                             | a model verdict causing a merge                                                                                                                                                                                                                          |
-| B2  | `pull-requests: write` has exactly one holder                              | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
+| B2  | `pull-requests: write` has exactly six holders                             | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
 | B2  | a certified predicate in a human-only path                                 | **3**    | —                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
 | B3  | substrate paths enumerated as code                                         | 1 **KV** | `test_B3_the_substrate_paths_are_enumerated_as_code`                                | `failurePolicy: Fail` → `Ignore`, commit message "unblock apply during upgrade window"                                                                                                                                                                   |
 | B3  | the agent cannot reach admission or RBAC through kubectl                   | 1        | `test_B3_the_agent_cannot_reach_the_admission_policy_through_kubectl`               | — (the API half; the artifact half is the KV above)                                                                                                                                                                                                      |
@@ -256,12 +261,12 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-102 mutations: 79 KILLED, 21 NOISY, two `must_survive` controls (one on the
+105 mutations: 80 KILLED, 23 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-17 against
+handling), zero genuine survivors, zero stale — measured 2026-09-21 against
 this branch merged with `main`; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 100 of the 102: a
+Note that the summary line the harness prints accounts for 103 of the 105: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is

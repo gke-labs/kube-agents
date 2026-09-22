@@ -72,9 +72,9 @@ Deliberately NOT checked:
   ``max_in_progress`` cap, the per-profile cap, an unassigned card, a
   non-spawnable assignee, and a respawn guard of up to 86400s. The dispatcher
   *does* log its failures (``kanban dispatcher: tick failed on board <slug>``,
-  with a traceback, from ``gateway/kanban_watchers.py``) and survives them, so a
-  log or OTel alert on that line is the right vehicle and belongs to
-  observability. Do not add a query for this.
+  with a traceback, from ``gateway/kanban_watchers_dispatcher.py``) and
+  survives them, so a log or OTel alert on that line is the right vehicle and
+  belongs to observability. Do not add a query for this.
 - *stale ``running`` cards.* ``detect_stale_running`` already reclaims them:
   ``kanban.dispatch_stale_timeout_seconds`` resolves to 14400 from
   ``hermes_cli/config_defaults.py`` (not from any file in this repo), and

@@ -132,10 +132,10 @@ mcp_servers:
 # inject_memory_provider_tools() bails unless it is listed, and that injection is
 # the only path by which the provider's tools reach the model. It is on both keys
 # because a kanban worker resolves its toolsets from `cli`
-# (_resolve_worker_cli_toolsets in hermes_cli/kanban_db.py) while the API server
-# path uses `api_server`; a specialist reached either way must see the same
-# memory. Which tools that actually yields is decided by the provider — under
-# `memory.read_only` below it is the two read tools and nothing else.
+# (_resolve_worker_cli_toolsets in hermes_cli/kanban_db_dispatch.py) while the
+# API server path uses `api_server`; a specialist reached either way must see
+# the same memory. Which tools that actually yields is decided by the provider
+# — under `memory.read_only` below it is the two read tools and nothing else.
 #
 # The toolset also surfaces Hermes' own built-in `memory` tool (MEMORY.md /
 # USER.md), whose check_fn is unconditional. It is inert here for the same reason

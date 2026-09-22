@@ -12,8 +12,10 @@ point after ``credential_redaction.py`` is installed at
    file that would raise at import.
 2. ``agent/display.py`` -- ``redact_tool_args_for_display`` gains a branch for
    ``terminal`` and ``execute_code`` after the ``browser_type`` one. A literal
-   anchor on that four-line branch, because the edit is a rewrite of the
-   function's tail and the branch is the only text in the file that pins it.
+   anchor on that branch (two lines at v2026.9.14: the test and a dict-merge
+   return) plus the ``return args`` it precedes, because the edit is a rewrite
+   of the function's tail and the branch is the only text in the file that
+   pins it.
 3. ``hermes_cli/main.py`` -- the transcript wrapper is installed as the first
    statement of ``main()``, the console entry point every ``hermes`` argv
    resolves to, ahead of the fast-launch returns and of the first print.
@@ -62,9 +64,7 @@ except Exception:  # noqa: BLE001 - a failed registration must not break import
 
 DISPLAY_ANCHOR = (
     '    if tool_name == "browser_type" and isinstance(args.get("text"), str):\n'
-    '        safe_args = dict(args)\n'
-    '        safe_args["text"] = redact_sensitive_text(args["text"], force=True)\n'
-    '        return safe_args\n'
+    '        return {**args, "text": redact_sensitive_text(args["text"], force=True)}\n'
     '    return args\n'
 )
 DISPLAY_MARKER = "_kube_agents_redact_tool_argument"

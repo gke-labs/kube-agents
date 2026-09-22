@@ -7,9 +7,10 @@ and wired into ``tools/kanban_tools.py`` (the ``kanban_create`` and
 
 Why
 ---
-Completing a card IS the delivery: ``gateway/kanban_notifier.py`` posts a
-terminal card's ``result`` into the subscribed chat thread as the answer to
-whoever asked. On 2026-08-27 (issue #1010, eval ``capacity-pinned-pool-probe``,
+Completing a card IS the delivery: ``gateway/kanban_notifier.py`` (this
+repository's companion module, wired into upstream's
+``gateway/kanban_watchers_notifier.py``) posts a terminal card's ``result``
+into the subscribed chat thread as the answer to whoever asked. On 2026-08-27 (issue #1010, eval ``capacity-pinned-pool-probe``,
 build ``2093054394793725952``) the platform worker on ``t_470a97c5`` fanned
 one investigation card out per cluster agent and then completed its own card
 with::
@@ -251,10 +252,13 @@ def record_worker_child(conn, child_task_id: str, creator_task_id: str) -> bool:
 def maybe_record_worker_child(conn, child_task_id: str) -> bool:
     """Record attribution when this process is a dispatcher-spawned worker.
 
-    The single call the patched ``kanban_create`` handler makes, immediately
-    after ``kanban_auto_subscribe``'s subscription inheritance and under the
-    same worker test. A process with no ``HERMES_KANBAN_TASK`` (chat session,
-    CLI, cron) writes nothing.
+    The single call the patched ``kanban_create`` handler makes, directly
+    after the created card is read back and before ``kanban_auto_subscribe``'s
+    subscription inheritance: both hook the same upstream line, so whichever
+    applier runs last sits first, and the Dockerfile runs this one last. The
+    two are order-independent -- each writes its own table and neither reads
+    the other's -- and share the same worker test. A process with no
+    ``HERMES_KANBAN_TASK`` (chat session, CLI, cron) writes nothing.
     """
     creator = (os.environ.get(WORKER_TASK_ENV) or "").strip()
     if not creator:
@@ -297,7 +301,7 @@ def _stash_submitted_result(conn, task_id: str, result) -> None:
 def require_children_settled(task_id, connect, result=None) -> str | None:
     """The completion gate. ``None`` when the completion may proceed.
 
-    ``connect`` is ``hermes_cli.kanban_db.connect`` (injected by the applier's
+    ``connect`` is ``hermes_cli.kanban_db_connect.connect`` (injected by the applier's
     import trailer; injected so this module imports cleanly outside the
     image). The connection it returns is closed here. ``result`` is the
     completion's submitted result, passed so a refusal can preserve it on the

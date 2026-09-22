@@ -12,10 +12,13 @@ the dependency only points one way: the gateway already imports
 The problem, measured
 ---------------------
 Both gateway watchers are pure polls. The dispatcher ticks every
-``kanban.dispatch_interval_seconds`` (5s on the live cluster; the sleep loop
-at the bottom of ``_kanban_dispatcher_watcher``) and the notifier every 5s
-(the ``interval`` default on ``_kanban_notifier_watcher``, spawned with no
-args from ``gateway/run.py``). So every hop of a task chain — card created →
+``kanban.dispatch_interval_seconds`` (upstream defaults to 60s at v2026.9.14;
+5s on the live cluster) and the notifier every 5s (the ``interval`` default on
+``_kanban_notifier_watcher``, spawned with no args from
+``gateway/run_startup.py``);
+both doze through the mixin's shared ``_sleep_between_ticks``, a plain
+1s-sliced sleep with no wake primitive behind it. So every hop of a task
+chain — card created →
 dispatcher claims it; card completed → notifier delivers and children promote
 — pays an average of half a tick and up to a whole one, for work that took
 microseconds to commit.
@@ -44,7 +47,7 @@ dispatcher itself writes during a tick — hooking those would let the
 dispatcher wake itself and turn the 0.25s reaction slice into a busy loop.
 
 Consumers construct one :class:`WakeMonitor` per watcher loop and replace
-their fixed sleep with :func:`wait_interval`, which dozes in ≤0.25s slices and
+their call to the shared fixed sleep with :func:`wait_interval`, which dozes in ≤0.25s slices and
 breaks early when the wake file's mtime moves. Reaction to a nudge is
 therefore ≤0.25s, while the full-interval scan remains the unconditional
 fallback — the wake file is an accelerator, never a correctness dependency.

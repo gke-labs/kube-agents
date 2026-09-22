@@ -264,19 +264,27 @@ func a2aTestCalloutKeys(t *testing.T) *a2aCalloutKeys {
 // INFO on the streams provisioning names. Worker came off it in #1393, the same
 // way, and A5 then split that list in two: a2aBridgeJetStreamGrants() on TASKS
 // and the runtime-state bucket, a2aAgentJetStreamGrants() on the two topic
-// streams and nothing else. Gateway is the last one, and it is the one that cannot narrow on
-// this branch's terms -- it has no client presenting a token yet.
+// streams and nothing else. Gateway was the last, and the narrowing #1666
+// asked for took it: a2aGatewayJetStreamGrants(), the same verbs on TASKS and
+// on the session registry it owns. The set is now EMPTY, which is the state
+// this test exists to keep.
 //
-// Failing here means one of two things and they want opposite responses. An
-// identity dropping off the list is the callout doing its job — narrow the
-// grant, then narrow this list and the comment with it. An identity appearing
-// on it is a new bare $JS.API.>, which is a principal that can create, delete
-// or purge any stream and any consumer on the account, including another
-// principal's. That is not a list to grow without an argument in the identity's
-// own comment for why it cannot be enumerated instead.
+// An empty expectation is a weaker test than a named one, so read what still
+// holds it up. The set being empty is asserted here and in
+// renderA2ANATSConf's doc comment; what each principal may hold instead is
+// TestEveryNATSUserGrantIsEnumeratedAndStreamScoped's table, which fails on a
+// verb or a stream no row records, and the three per-user shape tests beside
+// it. This one is the single sentence: nobody takes the whole API.
+//
+// Failing here means a principal has gained a bare $JS.API.> -- a principal
+// that can create, delete or purge any stream and any consumer on the
+// account, including another principal's. Three narrowings have now shown
+// that the grant is never the only way to get the client working, so the bar
+// for putting it back is an argument in that identity's own comment for why
+// its call set cannot be enumerated, not a green suite.
 func TestOnlyTheseIdentitiesHoldTheBareJetStreamAPIGrant(t *testing.T) {
 	const bare = "$JS.API.>"
-	expected := []string{"gateway"}
+	var expected []string
 
 	var got []string
 	for _, id := range a2aIdentities(identityTestAgent()) {

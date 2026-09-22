@@ -13,12 +13,15 @@ the app does not have. Its ``bot_scopes`` list asks for ``reactions:read`` and
 stops there.
 
 The adapter calls the *write* half of the API in four places
-(``plugins/platforms/slack/adapter.py``)::
+(``plugins/platforms/slack/adapter.py``; v2026.9.14 spelling, where one
+``_react(..., remove=)`` helper replaced the ``_add_reaction``/``_remove_reaction``
+pair that v2026.8.19's hooks called — the wrappers still exist but nothing in
+the adapter calls them)::
 
-    on_processing_start     -> _add_reaction(channel, ts, "eyes")
-    on_processing_complete  -> _remove_reaction(channel, ts, "eyes")
-                            -> _add_reaction(channel, ts, "white_check_mark")
-                            -> _add_reaction(channel, ts, "x")
+    on_processing_start     -> _react(channel, ts, "eyes", team_id, remove=False)
+    on_processing_complete  -> _react(channel, ts, "eyes", team_id, remove=True)
+                            -> _react(channel, ts, "white_check_mark", ..., remove=False)
+                            -> _react(channel, ts, "x", ..., remove=False)
 
 ``reactions.add`` and ``reactions.remove`` both require ``reactions:write``.
 Without it Slack rejects every one of them with ``missing_scope``, so the 👀
@@ -27,12 +30,15 @@ ended, never appear.
 
 Why this has gone unnoticed
 ---------------------------
-The failure is swallowed deliberately. ``_add_reaction`` ends::
+The failure is swallowed deliberately. ``_react`` ends::
 
     except Exception as e:
-        # Don't log as error — may fail if already reacted or missing scope
-        logger.debug("[Slack] reactions.add failed (%s): %s", emoji, e)
+        logger.debug(
+            "[Slack] reactions.%s failed (%s): %s", "remove" if remove else "add", emoji, e)
         return False
+
+and its docstring names the case: "Failures (already reacted, missing scope)
+are debug-logged only."
 
 which folds the one condition that makes the feature permanently dead in with
 the benign one, and logs it below the default level. Nothing above ``debug`` is
@@ -50,8 +56,12 @@ The fix
 -------
 Add ``reactions:write`` to ``bot_scopes``. ``bot_scopes.sort()`` runs further
 down the same function, so this element's position is cosmetic as far as the
-emitted manifest goes; it is inserted next to ``reactions:read`` to keep the
-source list alphabetical as well.
+emitted manifest goes; it is inserted directly after ``reactions:read`` to keep
+the source list alphabetical as well, reusing whatever separator upstream put
+after that element. Upstream has written the list both ways — one scope per
+line through v2026.8.19, several per line from v2026.9.14 — so the insert
+follows the separator (newline plus indent, or a single space) rather than
+assuming a line of its own.
 
 The list is located with ``find_assign`` rather than pinned by a literal anchor
 spelling out its contents. Upstream edits this list — ``reactions:read`` itself
@@ -87,10 +97,13 @@ RELATIVE = "hermes_cli/slack_cli.py"
 # element count alone cannot tell a fresh tree from an already-patched one.
 BUILD_MARKER = '"reactions:write"'
 
-#: The element the new scope is inserted after, at whatever indentation the list
-#: is written at. Anchored to the whole line so it cannot match inside a longer
-#: scope name, and so the captured indent can be reused verbatim.
-READ_SCOPE = re.compile(r'^([ \t]*)"reactions:read",[ \t]*$', re.MULTILINE)
+#: The element the new scope is inserted after, together with the separator
+#: that follows it: a newline and the next element's indent when the list is one
+#: scope per line (v2026.8.19), or the spaces before the next element when
+#: several share a line (v2026.9.14). The separator is captured so the insert
+#: can reuse it verbatim, and the quotes plus trailing comma are what keep this
+#: from matching inside a longer scope name or a bare last element.
+READ_SCOPE = re.compile(r'"reactions:read",(?P<sep>[ \t]*\n[ \t]*|[ \t]+)')
 
 WRITE_SCOPE = "reactions:write"
 
@@ -111,15 +124,15 @@ def apply(root: Path) -> None:
     if len(found) != 1:
         raise SystemExit(
             f"slack_reactions_scope patch: {RELATIVE}: expected 1 "
-            f'"reactions:read" element on a line of its own in bot_scopes, '
-            f"found {len(found)}. {patchlib.DRIFT_NOTE}"
+            f'"reactions:read" element followed by a comma and another element '
+            f"in bot_scopes, found {len(found)}. {patchlib.DRIFT_NOTE}"
         )
 
     patch.splice(
         scopes.value_start,
         scopes.value_end,
         READ_SCOPE.sub(
-            lambda m: f'{m.group(0)}\n{m.group(1)}"{WRITE_SCOPE}",', text, count=1
+            lambda m: f'{m.group(0)}"{WRITE_SCOPE}",{m.group("sep")}', text, count=1
         ),
     )
     patch.commit(f"{WRITE_SCOPE} added to bot_scopes")

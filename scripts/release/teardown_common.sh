@@ -57,6 +57,21 @@ teardown_is_strict() {
   esac
 }
 
+# Canonicalizes an affirmative or negative boolean string to literal "true" or
+# "false". Preserves unrecognised values untouched (including typos and whitespace)
+# so downstream or pre-flight validators can reject them instead of silently
+# defaulting or disabling a feature.
+canonical_bool() {
+  local val="${1:-}"
+  local stripped="${val//[[:space:]]/}"
+  case "$stripped" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) echo "true" ;;
+    [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo] | [Nn] | 0 | [Oo][Ff][Ff]) echo "false" ;;
+    *) echo "$val" ;;
+  esac
+}
+
+
 # Expands the three coordinates into TEARDOWN_TARGET so that a `set -u`
 # abort on a missing one happens at the top of a script, before it has created
 # a temp file or reached GCP.
@@ -83,10 +98,13 @@ teardown_run() {
   local log_file="$1"
   local args=(
     --non-interactive -y
-    --project-id="${GCP_PROJECT_ID}"
-    --region="${GCP_REGION}"
-    --cluster-name="${GKE_CLUSTER_NAME}"
+    --gcp-project-id="${GCP_PROJECT_ID}"
+    --gcp-region="${GCP_REGION}"
+    --gke-cluster-name="${GKE_CLUSTER_NAME}"
   )
+  if [ -n "${NAMESPACE:-}" ]; then
+    args+=(--agent-namespace="${NAMESPACE}")
+  fi
 
   local status
   # errexit is lifted around the pipeline rather than the shorter `|| true`:

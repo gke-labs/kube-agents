@@ -39,9 +39,9 @@ For automated environments, CI/CD pipelines, and AI Agents where no interactive 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
-  --project-id="my-gcp-project" \
-  --cluster-name="platform-agent-host" \
-  --region="us-central1" \
+  --gcp-project-id="my-gcp-project" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --model-provider="gemini" \
   --permission-set="read-only"
 ```
@@ -89,7 +89,7 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 - **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
 - **Credential isolation** — model-authored code runs in a shell sandbox pod that holds no API keys or tokens; an Envoy credential broker in a pod of its own injects them at the network boundary.
 - **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
-- **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox) by default; `--gvisor=false` opts out.
+- **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox) by default; `--enable-gvisor=false` opts out.
 - **GitOps-only mutations** — infrastructure changes are proposed as pull requests for human review.
 
 Exactly what is _enforced_ on which plane — Kubernetes RBAC, GCP IAM, and the GitOps path each answer differently — is set out in [Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do). Read that before granting the agent access to a production project.

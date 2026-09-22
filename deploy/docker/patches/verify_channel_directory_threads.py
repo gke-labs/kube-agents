@@ -13,8 +13,14 @@ Slack calls come out. Before the patch: 33, all failing. After: 1.
 
 The one substitution is ``_build_from_sessions``, which reads ``state.db`` -- a
 file that does not exist in the build. That replaces the *data source*, not the
-code under test; ``_build_slack``, the merge, the grouping and the resolution
-loop are all the real, patched ones.
+code under test; ``_build_slack``, the merge, and ``_slack_resolve_raw_names``
+(the grouping and the resolution loop, split out of ``_build_slack`` in
+v2026.9.14) are all the real, patched ones.
+
+Run against the *unpatched* v2026.9.14 base, the storm replay passes (upstream
+groups by base id itself now) and exactly the checks this patch still owns fail:
+the thread label is overwritten, and an unresolvable channel is re-probed on the
+next refresh.
 
 Usage::
 
@@ -110,19 +116,22 @@ check(
     "conversations.info is addressed to the channel",
     "conversations_info(channel=base_id)" in _src,
 )
-# The old negative here was `conversations_info(channel=entry["id"])`, the shape
-# that caused the storm. v2026.8.13 stopped writing it — upstream groups by base
-# id itself now — so the check could no longer fail and proved nothing. Its
-# replacement is narrower than it reads: the applier's OLD_RESOLVE anchor
-# carries this same work list and substitute() insists on exactly one
-# occurrence, so upstream simply reinstating it fails the applier long before
-# this runs. What is left here is a second, distinct occurrence elsewhere in the
-# file — the one shape substitute() cannot see, and the one that would reinstate
-# the perpetual re-probe with every other anchor intact.
+# The negative here follows upstream's spelling of the unfiltered work list.
+# It was `conversations_info(channel=entry["id"])` (the shape that caused the
+# storm) until v2026.8.13, then `unresolved = [ch for ch in channels` until
+# v2026.9.14 split the resolver out and wrote the grouping as a `setdefault`
+# on `unresolved_by_base`. Each time upstream stopped writing the old shape the
+# check could no longer fail and proved nothing. It is narrower than it reads:
+# the applier's OLD_GROUPING anchor carries this same text and substitute()
+# insists on exactly one occurrence, so upstream simply reinstating it fails
+# the applier long before this runs. What is left here is a second, distinct
+# occurrence elsewhere in the file — the one shape substitute() cannot see, and
+# the one that would reinstate the perpetual re-probe with every other anchor
+# intact.
 check(
     "the work list is the capped, miss-cached one",
-    "unresolved = [ch for ch in channels" not in _src,
-    "upstream's unfiltered list is back; unresolvable channels would be "
+    "unresolved_by_base.setdefault(" not in _src,
+    "upstream's unfiltered grouping is back; unresolvable channels would be "
     "re-probed on every refresh forever",
 )
 

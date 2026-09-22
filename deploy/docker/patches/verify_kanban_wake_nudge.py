@@ -36,6 +36,9 @@ def check(label: str, condition: object, detail: str = "") -> None:
 
 
 from hermes_cli import kanban_db as K  # noqa: E402
+# ``connect`` lives in kanban_db_connect at v2026.9.14; kanban_db only re-exports
+# it through a deprecation shim scheduled for removal.
+from hermes_cli.kanban_db_connect import connect as _connect  # noqa: E402
 from hermes_cli.kanban_wake_nudge import (  # noqa: E402
     WakeMonitor,
     record_wake,
@@ -48,7 +51,7 @@ TMP = Path(tempfile.mkdtemp())
 
 def fresh():
     db = TMP / f"kanban{len(list(TMP.iterdir()))}.db"
-    return db, K.connect(db)
+    return db, _connect(db)
 
 
 def status(conn, tid):
@@ -68,6 +71,19 @@ check(
 check(
     "kanban_db resolved the producer import",
     hasattr(K, "_kanban_record_wake"),
+)
+# v2026.9.14 gave both loops one shared ``_sleep_between_ticks``; the swap has
+# to reach both call sites or one loop silently keeps the full-interval poll.
+WATCHERS_SOURCE = open("gateway/kanban_watchers.py").read()
+check(
+    "neither watcher loop dozes through the shared fixed sleep any more",
+    "await self._sleep_between_ticks(interval)" not in WATCHERS_SOURCE,
+    "a loop still calling the upstream sleep never sees a nudge",
+)
+check(
+    "both loops wait through the wake-aware wait",
+    WATCHERS_SOURCE.count("await _kanban_wait_interval(") == 2,
+    f"found {WATCHERS_SOURCE.count('await _kanban_wait_interval(')} call sites, expected 2",
 )
 
 # --- 2. Producers nudge, dispatcher writes stay quiet ------------------------
@@ -124,7 +140,7 @@ async def race():
         # A worker is another process with its own connection; the nearest
         # in-process equivalent is another thread with its own connection
         # (kanban connections are thread-bound).
-        c = K.connect(db2)
+        c = _connect(db2)
         try:
             K.create_task(c, title="mid-wait card", assignee="platform")
         finally:

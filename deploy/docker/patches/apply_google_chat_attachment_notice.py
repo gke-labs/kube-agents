@@ -9,12 +9,12 @@ The bug
 ``_post_attachment_fallback`` is the notice a user gets when the bot produced a
 file and could not upload it. Upstream ships its four user-facing lines in
 Spanish, inside an otherwise English adapter with an English docstring above
-them::
+them (v2026.9.14 wraps the lines differently from v2026.8.19; the words are
+the same)::
 
     f"⚠️ No he podido adjuntar **{filename}**.",
-    "Google Chat sólo permite adjuntar archivos cuando el bot tiene "
-    "permiso explícito tuyo (OAuth de usuario). Es un consentimiento "
-    "único que se hace desde este chat.",
+    "Google Chat sólo permite adjuntar archivos cuando el bot tiene permiso explícito tuyo (OAuth de usuario). "
+    "Es un consentimiento único que se hace desde este chat.",
     "**Para activarlo:** envía `/setup-files` y sigue las instrucciones.",
     f"Mientras tanto el archivo está en el host: `{path}`",
 
@@ -122,30 +122,30 @@ BUILD_MARKER = "kube-agents patch: attachment-fallback notice"
 # against the relay patch's source; see the module docstring.
 RELAY_FLAG = "_credential_proxy_relay_patched"
 
-# The docstring's second paragraph through the end of the message block. One
-# contiguous anchor rather than several, because the replacement rewrites the
-# whole of what it describes: the docstring promises a ``/setup-files`` flow
-# that the patched body only sometimes offers.
+# The method's docstring through the end of the message block, as upstream
+# v2026.9.14 spells it (the two-line docstring and ``[caption] if caption``
+# arrived with the platforms refactor; v2026.8.19 had a five-line docstring and
+# a three-statement ``lines`` build). One contiguous anchor rather than several,
+# because the replacement rewrites the whole of what it describes: the docstring
+# promises a ``/setup-files`` flow that the patched body only sometimes offers.
+# The ``try: await self._create_message(chat_id, _thread_body(...))`` that
+# follows is upstream's and is left in place.
 ANCHOR = '''\
-        Tells the user that file delivery requires a one-time consent
-        flow (``/setup-files``) and reports the local-host path so the
-        file isn't lost. Returns ``success=False`` so callers know the
-        attachment did not land.
-        """
-        lines = []
-        if caption:
-            lines.append(caption)
+        """Post the ``/setup-files`` notice (plus host path) when native delivery is
+        unavailable. Always returns ``success=False``."""
+        lines = [caption] if caption else []
         lines.extend([
             f"⚠️ No he podido adjuntar **{filename}**.",
-            "Google Chat sólo permite adjuntar archivos cuando el bot tiene "
-            "permiso explícito tuyo (OAuth de usuario). Es un consentimiento "
-            "único que se hace desde este chat.",
+            "Google Chat sólo permite adjuntar archivos cuando el bot tiene permiso explícito tuyo (OAuth de usuario). "
+            "Es un consentimiento único que se hace desde este chat.",
             "**Para activarlo:** envía `/setup-files` y sigue las instrucciones.",
             f"Mientras tanto el archivo está en el host: `{path}`",
         ])
 '''
 
 PATCHED = '''\
+        """Post a text notice when native attachment delivery is unavailable.
+
         Names the file, says why it could not be attached, and reports the
         host path so the file is not lost. Returns ``success=False`` so
         callers know the attachment did not land.

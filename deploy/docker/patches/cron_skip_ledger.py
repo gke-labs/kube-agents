@@ -34,12 +34,13 @@ can also be projected to monitoring):
 
 ``already_running``
     An in-process dedup guard refused: ``job_id`` is still in the scheduler's
-    ``_running_job_ids`` from an earlier fire. The occurrence is genuinely
-    lost, because the schedule has *already* moved past it — in ``tick``,
-    ``advance_next_runs`` moved ``next_run_at`` for the whole due set before
-    dispatch begins; in ``_run_claimed_job``, ``claim_job_for_fire`` moved it
-    for this job before the guard ran. This is the common case above: a job
-    whose run outlives its own period.
+    ``_running_job_ids`` from an earlier fire. What was asked for is genuinely
+    lost — in ``tick``, ``advance_next_runs`` moved ``next_run_at`` for the
+    whole due set before dispatch begins, so the occurrence is gone; in
+    ``_run_claimed_job`` the manual ``claim_job_for_fire`` has stamped the fire
+    claim and re-anchored ``next_run_at`` from now but no occurrence identity,
+    so it is the requested run that is gone, not a scheduled slot. This is the
+    common case above: a job whose run outlives its own period.
 
 ``already_running_elsewhere``
     The cross-process mirror of the same thing — ``_job_locks.claim`` refused,
@@ -52,7 +53,8 @@ Each of those two is recorded at both of its sites — ``tick``'s dispatch loop
 and ``_run_claimed_job``, the run half a manual fire and a background dispatch
 share. The second pair is new at v2026.8.13: the split that gave ``run_one_job``
 four callers put both guards after the fire claim, so a refusal there now costs
-an occurrence where it used to cost nothing.
+the requested run (the fire claim is already stamped) where it used to cost
+nothing; the scheduled slot is untouched, see ``already_running`` above.
 
 ``interpreter_shutdown``
     The gateway began finalizing between ``advance_next_runs`` and
@@ -94,8 +96,8 @@ an occurrence where it used to cost nothing.
     missing its ``id``.
 
 ``fire_claim_lost``
-    ``_process_job`` (the worker ``_run_and_release`` runs) re-takes the fire
-    claim at execution time and ``claim_job_for_fire`` refused it. Upstream
+    ``_process_due_job`` (the worker ``_run_and_release`` runs, through
+    ``tick``'s ``_process_job`` closure) re-takes the fire claim at execution time and ``claim_job_for_fire`` refused it. Upstream
     (v2026.8.19) closes the claimed row as ``failed`` with ``Fire claim lost;
     execution was not started.``, which — when the refusal is another owner's
     fresh claim — is ``dispatch_claim_rejected``'s complaint again: an
@@ -104,12 +106,13 @@ an occurrence where it used to cost nothing.
     True`` that tells the tick the occurrence was handled is unchanged.
 
     The code is wider than its name. ``claim_job_for_fire`` returns ``False``
-    for four things this call site cannot tell apart: another owner holds a
-    fresh ``fire_claim``; the job is missing, disabled or paused; the per-job
-    fire fence timed out (upstream "fails closed" after
-    ``_JOBS_LOCK_TIMEOUT_SECONDS``); or the fence file could not be opened at
-    all. The first is the guarantee working and the second is benign; the last
-    two are the job being unable to run, and they land under this code too,
+    for five things this call site cannot tell apart: another owner holds a
+    fresh ``fire_claim``; the ledger already records this occurrence as
+    completed (v2026.9.14's ``completed_occurrence`` check); the job is
+    missing, disabled or paused; the per-job fire fence timed out (upstream
+    "fails closed" after ``_JOBS_LOCK_TIMEOUT_SECONDS``); or the fence file
+    could not be opened at all. The first two are the guarantee working and
+    the third is benign; the last two are the job being unable to run, and they land under this code too,
     with the cause only in upstream's fence log line. So a job whose
     occurrences keep arriving under ``fire_claim_lost`` has stopped running,
     whatever the name suggests, and the count of the code — projected as
@@ -252,7 +255,7 @@ SKIP_DISPATCH_CLAIM_REJECTED = "dispatch_claim_rejected"
 #: the schedule had already advanced.
 SKIP_CREATE_EXECUTION_FAILED = "create_execution_failed"
 #: The worker re-took the fire claim at execution time and was refused; the
-#: docstring lists the four refusals this covers.
+#: docstring lists the five refusals this covers.
 SKIP_FIRE_CLAIM_LOST = "fire_claim_lost"
 
 #: Every reason the ledger will accept. An unknown code is coerced rather than

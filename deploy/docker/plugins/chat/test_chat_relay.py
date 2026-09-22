@@ -3,7 +3,7 @@
 Covers ``adapter.py`` on its own. What it cannot cover is that Hermes resolves
 ``deliver: "chat"`` to this plugin at all — that is
 ``deploy/docker/plugins/verify_chat_relay.py``, which drives the real
-``cron/scheduler.py::_deliver_result`` against the installed tree at image build
+``cron/scheduler_delivery.py::_deliver_result`` against the installed tree at image build
 time.
 """
 
@@ -878,7 +878,7 @@ class TestSiblingDeliveryTargets(unittest.TestCase):
     def test_a_semicolon_is_not_a_separator_the_scheduler_honours(self):
         """Over-reporting is the one direction this must never err in.
 
-        ``cron/scheduler.py::_resolve_delivery_targets`` splits on ``,`` alone,
+        ``cron/scheduler_delivery.py::_resolve_delivery_targets`` splits on ``,`` alone,
         so ``slack;x`` is one part it cannot resolve and it delivers nowhere.
         Splitting on ``;`` here named ``slack`` as handled anyway, the relay
         subtracted it, and the report reached no channel at all while the run

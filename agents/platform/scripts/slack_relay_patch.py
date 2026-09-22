@@ -520,7 +520,15 @@ def install() -> None:
                 return cache_audio_from_bytes(content, ext)
             return cache_image_from_bytes(content, ext)
 
-        async def download_bytes(self: Any, url: str, team_id: str = "") -> bytes:
+        async def download_bytes(
+            self: Any, url: str, team_id: str = "", *, html_label: str = ""
+        ) -> bytes:
+            # ``html_label`` names the download in upstream's own rejection of
+            # an HTML sign-in page where bytes were expected. Behind the relay
+            # that check runs on the proxy's side, so the label is accepted
+            # for signature parity -- upstream's ``_download_slack_file``
+            # passes it by keyword -- and not used.
+            del html_label
             response = await asyncio.to_thread(
                 request,
                 "/v1/chat/slack/files/download",
@@ -808,7 +816,7 @@ def install() -> None:
             # through to ``_plugin_scope_from_callable`` on the entry's own
             # ``adapter_factory`` and then its ``check_fn``; both are
             # frame-independent and recover the same scope
-            # (``platform_registry.py:515-520`` in v2026.8.13). Only an entry
+            # (``platform_registry.py:271-278`` in v2026.9.14). Only an entry
             # whose callables the tool registry cannot place lands in the global
             # scope instead of a plugin one.
             return original_registry_register(self, entry, *args, **kwargs)

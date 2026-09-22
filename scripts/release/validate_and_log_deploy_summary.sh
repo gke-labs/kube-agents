@@ -55,7 +55,7 @@ echo "----------------------------------------------------------------------"
 echo "Model Provider:             ${MODEL_PROVIDER:-gemini}"
 echo "Model Default Name:         ${MODEL_DEFAULT_NAME:-<NOT SET>}"
 echo "Gemini API Key:             ${API_KEY_STATUS}"
-# Unset does not mean off here: provision_rc_environment.sh omits --gvisor when
+# Unset does not mean off here: provision_rc_environment.sh omits --enable-gvisor when
 # this is empty, and install.sh then applies its own default, which is the
 # sandbox. Say so rather than logging a bare <NOT SET> beside a run that
 # provisions a gvisor node pool.

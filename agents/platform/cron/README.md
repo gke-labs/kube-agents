@@ -174,7 +174,7 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler.py::_resolve_delivery_targets`
+values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the

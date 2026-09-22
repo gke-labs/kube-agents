@@ -29,8 +29,8 @@ The six checks:
    before the indexes it invalidates; the ledger write in the in-process guard
    is outside ``_running_lock``; the cross-process guard and the
    ``create_execution`` failure path both release the running slot (and the
-   latter the flock) before writing; ``_process_job`` no longer closes a lost
-   fire claim as failed. Each is an ordering the applier's text match cannot
+   latter the flock) before writing; ``_process_due_job`` no longer closes a
+   lost fire claim as failed. Each is an ordering the applier's text match cannot
    see and a behavioural check would only catch under contention.
 2. THE MIGRATION. Legacy DDL, rows in it, driven through ``list_executions``.
    Rows preserved, CHECK widened and still enforced, indexes back, scratch
@@ -105,6 +105,21 @@ CLAIM_LOST_JOB = "drift-audit"
 #: The message the injected create_execution raises with; the row must carry it.
 INJECTED_CAUSE = "injected: executions ledger unavailable"
 LEGACY_ROWS = 40
+#: The indexes _initialize_schema must have put back after the rebuild: the
+#: two the legacy ledger carried plus the partial occurrence index v2026.9.14
+#: creates after its add_column_if_missing calls.
+EXPECTED_INDEXES = {
+    "idx_executions_job_claimed",
+    "idx_executions_status_claimed",
+    "idx_executions_occurrence",
+}
+#: The missed-window fixture's schedule, and how far past it the fixture sits.
+#: A daily job's grace is 7200s; three hours is past it with room to spare, and
+#: still inside the same day's lattice arithmetic below.
+MISSED_JOB_EXPR = "20 6 * * *"
+MISSED_JOB_HOUR = 6
+MISSED_JOB_MINUTE = 20
+MISSED_MIN_AGE = timedelta(hours=3)
 
 FAILURES: list = []
 
@@ -230,8 +245,10 @@ def check_shape() -> None:
                 "the flock, suppressing it on the next tick as well",
             )
 
-    process = function_named(scheduler, "_process_job")
-    check("_process_job still re-takes the fire claim", process is not None)
+    # v2026.9.14 lifted the fire-claim re-take out of tick's ``_process_job``
+    # closure into this module-level helper; the closure now only delegates.
+    process = function_named(scheduler, "_process_due_job")
+    check("_process_due_job still re-takes the fire claim", process is not None)
     if process is not None:
         src = ast.unparse(process)
         check(
@@ -248,9 +265,11 @@ def check_shape() -> None:
         )
 
     # The same pair of guards, in the run half a manual fire and a background
-    # dispatch share. Both sit after claim_job_for_fire, so both drop a
-    # scheduled occurrence; an unrecorded one is invisible to `hermes cron runs`
-    # and to cron_health, which is the silence this whole module exists to end.
+    # dispatch share. Both sit after claim_job_for_fire, whose manual claim has
+    # stamped the fire claim and re-anchored next_run_at but no occurrence
+    # identity, so both drop the requested run rather than a scheduled slot;
+    # an unrecorded refusal is invisible to `hermes cron runs` and to
+    # cron_health, which is the silence this whole module exists to end.
     tools = HERMES / "tools" / "cronjob_tools.py"
     claimed = function_named(tools, "_run_claimed_job")
     check("_run_claimed_job still holds the dispatch guards", claimed is not None)
@@ -385,10 +404,12 @@ def check_migration(ex) -> None:
     check("the CHECK now admits skipped", "'skipped'" in sql, sql)
     check("the four upstream statuses are still constrained", "'unknown'" in sql, sql)
     check("the skip_reason column exists", "skip_reason" in sql, sql)
+    # A subset check, not equality: the two the legacy fixture carried must be
+    # back, and the occurrence index v2026.9.14 creates after them must exist
+    # too. Anything further upstream adds is its business.
     check(
-        "both indexes were recreated after the drop",
-        ledger_objects("index")
-        == {"idx_executions_job_claimed", "idx_executions_status_claimed"},
+        "the indexes were recreated after the drop",
+        EXPECTED_INDEXES <= ledger_objects("index"),
         f"found {sorted(ledger_objects('index'))} — the rebuild dropped them "
         "with the old table and nothing put them back",
     )
@@ -606,7 +627,7 @@ def check_tick_guards(sched, reasons) -> None:
     )
 
     # Through the real pool: tick creates the claimed row and submits
-    # _run_and_release, whose _process_job re-takes the fire claim and loses.
+    # _run_and_release, whose _process_due_job re-takes the fire claim and loses.
     # sync=True waits for the future, so the ledger is settled on return.
     from agent.monitoring.cron_health import project_execution_event
 
@@ -687,8 +708,8 @@ def check_dispatch_guards(sched, reasons) -> None:
     check(
         "an in-process dispatch overlap is recorded",
         bool(rows),
-        "claim_job_for_fire advanced next_run_at before this guard ran, so "
-        "the occurrence is gone and nothing records it",
+        "claim_job_for_fire stamped the fire claim before this guard ran, so "
+        "the requested run is gone and nothing records it",
     )
     check(
         # bool(rows) as well as all(): over an empty set all() is vacuously
@@ -732,7 +753,17 @@ def check_missed_window(reasons) -> None:
     import cron.jobs as cj
 
     now = hermes_now()
-    stale = (now - timedelta(hours=5)).isoformat()  # a daily job's grace is 7200s
+    # On the cron lattice, not merely in the past: v2026.9.14 classifies a
+    # next_run_at that its expression could never have produced as a hand
+    # edit of jobs.json and re-anchors it without firing, which would make
+    # this check report a catch-up regression that is really a bad fixture.
+    # So the stale instant is the most recent 06:20 at least three hours ago.
+    stale_dt = now.replace(
+        hour=MISSED_JOB_HOUR, minute=MISSED_JOB_MINUTE, second=0, microsecond=0
+    )
+    if now - stale_dt < MISSED_MIN_AGE:
+        stale_dt -= timedelta(days=1)
+    stale = stale_dt.isoformat()
     (HOME / "cron" / "jobs.json").write_text(
         json.dumps(
             {
@@ -740,7 +771,7 @@ def check_missed_window(reasons) -> None:
                     {
                         "id": QUIET_JOB,
                         "name": "Security & RBAC Posture Audit",
-                        "schedule": {"kind": "cron", "expr": "20 6 * * *"},
+                        "schedule": {"kind": "cron", "expr": MISSED_JOB_EXPR},
                         "prompt": "",
                         "enabled": True,
                         "deliver": "local",

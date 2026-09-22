@@ -89,6 +89,22 @@ user consumes with explicit ack (unscoped `$JS.ACK.>` is a cross-principal +TERM
 sets `--allow-direct` on every stream so nats.go picks that route, and only that route
 is granted.
 
+Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is granted
+for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
+`lib.TasksGet` on every task it dispatches, and a call that finds events creates an ordered
+consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
+`TasksGet` sets on it, which is why the replay costs a consumer slot for the calls of the last
+five seconds rather than for the last five minutes of them (gke-labs/kube-agents#1739) without
+the bridge needing a destructive verb on TASKS. The slot outlives the call it served: the
+threshold runs from the call returning, not from it starting. A call on a task the retention window no longer holds
+creates no consumer at all -- the horizon read returns `TaskNotFound` before the consumer is
+created. Either way the call emits no refused publish of its own. One does arrive if the
+ordered consumer resets mid-replay -- a bus reconnect is enough -- because nats.go deletes
+the consumer it replaces: that publish on `$JS.API.CONSUMER.DELETE.TASKS.<name>` is refused,
+which costs a log line and leaves the consumer it could not delete to the same threshold.
+It is the one violation this grant produces by design, so any other `Permissions Violation`
+in the bridge's log still means what it says.
+
 **Static is the answer here, not a residue.** `bridge` replaced the shared `worker` user
 rather than inheriting it, and it stays a password principal on purpose. The auth
 callout keys its map on the username TokenReview returns, which names a ServiceAccount;

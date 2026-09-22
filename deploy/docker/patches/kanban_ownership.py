@@ -11,10 +11,10 @@ Three contexts, one environment variable
 ``HERMES_KANBAN_TASK`` is the only ownership signal the environment carries, and
 three different things can be running while it is set:
 
-*A dispatcher-spawned worker.* ``hermes_cli/kanban_db.py``'s ``_default_spawn``
-sets the variable before spawning the process, so here it means what it says:
-this run holds that card and is expected to end it with ``kanban_complete`` or
-``kanban_block``.
+*A dispatcher-spawned worker.* ``hermes_cli/kanban_db_dispatch.py``'s
+``_default_spawn`` sets the variable before spawning the process, so here it
+means what it says: this run holds that card and is expected to end it with
+``kanban_complete`` or ``kanban_block``.
 
 *A ``delegate_task`` child.* The child runs ``run_conversation`` in the
 *parent's own process*, so the variable still holds whatever the parent's

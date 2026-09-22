@@ -507,7 +507,7 @@ Four knobs need context beyond the chart:
   value to `""` to run on the standard container runtime instead. Installs
   driven by the Terraform composition never see this default — it always renders
   `runtimeClassName` explicitly, from its own `agent_runtime_class` variable,
-  which `install.sh` writes from `--gvisor`. That variable still defaults to
+  which `install.sh` writes from `--enable-gvisor`. That variable still defaults to
   `""`, so a bare `terraform apply` against the composition leaves the agent
   unsandboxed where a bare `helm install` sandboxes it.
 - `harness.experimental.shellSandbox.runtimeClassName` is the same choice for the
