@@ -105,9 +105,10 @@ PodDisruptionBudget checks, on slot `a`. What it could not show is the two cases
 never begins:
 
 | Role                           | What it plants                                                                                                                                            |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `readiness-surge-blocked`      | A node pool with `max_surge: 0`, so an upgrade removes its only node rather than adding a replacement first                                               |
 | `readiness-pinned-workload`    | A Deployment whose `nodeSelector` names that pool alone, so its pods have nowhere to go when it drains                                                    |
+| `readiness-drain-blocked`      | b                                                                                                                                                         | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently |
 | `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` with `failurePolicy: Fail` and the API's maximum 30-second `timeoutSeconds`, pointing at a Service that does not exist |
 
 The first two are a pair, and that is the point: the surge setting alone is a configuration, and
@@ -160,7 +161,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the ten roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two of the eleven roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the

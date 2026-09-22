@@ -310,3 +310,52 @@ resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
     }
   }
 }
+
+# Defect (upgrade readiness): the budget that makes the drain impossible, not
+# merely slow. `maxUnavailable: 0` means no pod this budget matches may ever be
+# evicted voluntarily, so `disruptionsAllowed` is 0 forever -- not because the
+# workload is unhealthy, but because the spec forbids it. Obtainability SOP 3.4
+# calls this "the highest-value finding in the audit and the one most often
+# missed": it stops every node drain in the cluster, so node-pool upgrades,
+# auto-repair and autoscaler scale-down all stall until a human edits it.
+#
+# This is the fixture the readiness capability exists for. The other two on this
+# cluster are configurations that LOOK dangerous; this one, composed with them,
+# is an upgrade that cannot complete:
+#
+#   no-surge-pool has max_surge = 0, so the upgrade drains its only node
+#   rather than adding a replacement first;
+#   pinned-batch-runner runs only there, by nodeSelector;
+#   this budget refuses its eviction.
+#
+# A check that reports the surge setting alone, or the budget alone, has not
+# said the upgrade will fail. Reporting the chain is what the case grades.
+#
+# Bounded deliberately: the pool is tainted and only this workload tolerates
+# it, so the drain that cannot finish is a drain of one node nothing else uses.
+# The fleet already tolerates this shape -- defects-a.tf's inference-server
+# budget sits at disruptionsAllowed 0 permanently for a different reason, and
+# main.tf records that nothing in the eval path drains that node either.
+#
+# maxUnavailable 0 rather than minAvailable >= replicas, because SOP 3.4 flags
+# it on the spec alone. A minAvailable rule is read against the live replica
+# count, so it would stop being a finding the moment the workload scaled.
+#
+# Addressed by the readiness-drain-blocked role.
+resource "kubernetes_pod_disruption_budget_v1" "drain_blocked" {
+  provider = kubernetes.seeded_b
+
+  metadata {
+    name      = "pinned-batch-runner"
+    namespace = kubernetes_namespace_v1.seeded_upgrade.metadata[0].name
+    labels    = local.fleet_labels
+  }
+
+  spec {
+    max_unavailable = "0"
+
+    selector {
+      match_labels = { app = "pinned-batch-runner" }
+    }
+  }
+}

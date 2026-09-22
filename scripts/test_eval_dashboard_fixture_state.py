@@ -229,6 +229,7 @@ def healthy_world(*projects):
             # the finding is what a drain WOULD do, which is only meaningful
             # while they are healthy.
             "namespace/seeded-upgrade": {"metadata": {"name": "seeded-upgrade"}},
+            "poddisruptionbudget/pinned-batch-runner": {"spec": {"maxUnavailable": 0}, "status": {"disruptionsAllowed": 0, "currentHealthy": 1}},
             "node?cloud.google.com/gke-nodepool=no-surge-pool": {"items": [{"spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
             "deployment/pinned-batch-runner": {
                 "spec": {"template": {"spec": {"nodeSelector": {"seeded-role": "no-surge"}}}},
@@ -315,10 +316,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 10, "drifted": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 11, "drifted": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 10, "drifted": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 11, "drifted": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -372,7 +373,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 19, "drifted": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 21, "drifted": 1, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

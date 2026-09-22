@@ -236,6 +236,28 @@
           "why": "the second half of the defect. An omitted timeout is defaulted to 10 by the API server, so the long wait is only present while it is set explicitly, and a check that grades how long a drain can stall has nothing to read if someone drops it"
         }
       ]
+    },
+    "readiness-drain-blocked": {
+      "cluster_slot": "b",
+      "namespace": "seeded-upgrade",
+      "probes": ["poddisruptionbudget/pinned-batch-runner"],
+      "fixture": "pinned-batch-runner PodDisruptionBudget with maxUnavailable 0, so no pod it matches may ever be evicted voluntarily and every node drain that touches one blocks indefinitely",
+      "state": [
+        {
+          "subject": "poddisruptionbudget/pinned-batch-runner",
+          "path": "status.disruptionsAllowed",
+          "op": "eq",
+          "value": 0,
+          "why": "the defect as the API reports it. Widen maxUnavailable to 1 and this becomes 1 while the pod is healthy, so the assertion catches the one edit that heals the fixture -- which no probe would, since the budget still exists"
+        },
+        {
+          "subject": "poddisruptionbudget/pinned-batch-runner",
+          "path": "status.currentHealthy",
+          "op": "ge",
+          "value": 1,
+          "why": "the half that separates the defect from an unhealthy workload. disruptionsAllowed is also 0 when nothing is running, which is not this fixture; requiring a healthy pod alongside it means the zero is the spec's doing. hpa-saturated pairs its assertion the same way"
+        }
+      ]
     }
   }
 }
