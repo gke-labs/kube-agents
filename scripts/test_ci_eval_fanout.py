@@ -311,6 +311,25 @@ STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"
         self.assertLess(src.index('EVAL_IS_MAIN_RUN="true"'), src.index("run_one_unit() {"))
         self.assertLess(src.index("EVAL_RECORDED_MANIFEST="), src.index("run_one_unit() {"))
 
+    def test_the_run_marks_its_suite_step_reached_before_writing_its_own_verdict(self):
+        """The one line that keeps the EXIT trap's cut-off table from
+        overwriting a finished run's verdict is `EVAL_SUITE_REACHED=1`, set
+        in the main body after the fan-out's `wait` and before the run's own
+        `bench-gate suite`; report_partial_verdict returns on it. Dropped,
+        moved below the suite call, or moved into the `(cd ...)` subshell,
+        every run that reached its verdict would have the trap rewrite
+        eval-verdict.md / .json with the PARTIAL banner, and the suite would
+        stay green. test_ci_eval_trap.py proves the function honours the
+        variable; this pins that the script sets it, where it must.
+        """
+        src = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(src.count("\nwait\n"), 1, "one fan-out wait in the main body")
+        self.assertEqual(src.count("\nEVAL_SUITE_REACHED=1\n"), 1, "set once, at top level")
+        own_suite = '(cd "${BENCH_DIR}" && uv run bench-gate suite \\\n  "${CASE_RESULTS[@]}"'
+        self.assertLess(src.index("\nwait\n"), src.index("\nEVAL_SUITE_REACHED=1\n"))
+        self.assertLess(src.index("\nEVAL_SUITE_REACHED=1\n"), src.index(own_suite))
+        self.assertIn('[ -z "${EVAL_SUITE_REACHED:-}" ] || return 0', lifted("report_partial_verdict"))
+
 
 class RunDirRecoveryTest(unittest.TestCase):
     def test_the_results_line_regex_recovers_the_run_directory(self):
