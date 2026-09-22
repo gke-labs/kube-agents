@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription); the model router beside the gateway is designed in `spec-model-router.md` and not yet built
 
 ## Purpose
 
@@ -37,6 +37,11 @@ prompt, no tools, nothing to inject into. The judgment the demo gateway exercise
 into the session pods, which is where the model already lives. The safety classifier
 discussed for group chats slots in beside the gateway later as a veto - it can block or
 reroute a message, and it never widens anything.
+
+**Amended 2026-09-22.** The seam this paragraph reserves is filled by the model router,
+designed in [`spec-model-router.md`](spec-model-router.md). The property this section
+protects is unchanged: the gateway process hosts no context window of its own, and the
+router picks a destination and never holds an authority or publishes.
 
 ## What a session is
 
