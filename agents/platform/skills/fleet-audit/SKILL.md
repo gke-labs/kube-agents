@@ -80,10 +80,10 @@ names:
   that stream's SOP here, in this session, through the two-command lifecycle below —
   `audit_report.py start`, the sweep, `audit_report.py finish` — and report every check you did not
   run as a coverage gap: a cluster you could not read goes in `scope.skipped`, a check that could
-  have run on a cluster and did not goes in that cluster's `limitations`, so `finish` reports the run
-  `partial` and names each gap. Never skip a check silently: a document that omits the checks it
-  never ran reads exactly like a complete one, and the roster check exists to catch that. This is
-  the interim until the trigger has a path from here (#1876).
+  have run on a cluster and did not goes in that cluster's `limitations`, so `finish` reports the
+  run `partial` and names each gap. Never skip a check silently: a document that omits the checks
+  it never ran reads exactly like a complete one, and the roster check exists to catch that. This
+  is the interim until the trigger has a path from here (#1876).
 - **More than one stream:** say the on-demand trigger is unavailable and that each stream will run
   on its own schedule. Do not improvise several streams in one turn — see the next paragraph.
 
@@ -95,9 +95,9 @@ then issued zero `kubectl` commands, hand-typed five empty findings documents, a
 fleet-wide all-clear. One stream, run through `start` and `finish` with its gaps declared, is the
 whole of what this session may take on.
 
-The scheduler holds a per-job lock for the length of a run, so a stream already in flight is not
-started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
-is running and what each attempt did.
+The scheduler holds a per-job lock for the length of a triggered run, so the tick does not start a
+stream twice. A stream run here holds no such lock, which is why the bullet above checks
+`cronjob(action='runs')` first: it shows what is running and what each attempt did.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
 stream: for a stream you queued, that it is queued for the next tick; for the one stream you ran
@@ -1141,8 +1141,9 @@ be a day stale until a run can read it; report the gap as you would any other pa
   protection above back off: the run stops being `partial`, the ledger closes, and a fleet nobody
   looked at publishes as clean. The commands are published verbatim, so a padded entry is not a
   private shortcut — it is a false statement in a public issue, with your run's name on it.
-- **Never run the audit inline when asked to run the cron job.** Dispatch it; see
-  [Running a stream on demand](#running-a-stream-on-demand).
+- **Never run more than one stream inline when asked to run the cron jobs.** One named stream runs
+  here as [Running a stream on demand](#running-a-stream-on-demand) says; several are never
+  improvised.
 - **Never call `start`, `finish`, or `remediate` for a stream you dispatched.** The run owns its
   stream's lifecycle end to end and has already published by the time the call returns to you. A
   second `finish` reads a findings document the run's own `start` consumed, so it publishes whatever

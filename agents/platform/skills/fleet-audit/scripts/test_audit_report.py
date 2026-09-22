@@ -11736,10 +11736,12 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("hermes cron run", bullet)
         self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
         self.assertIn("cronjob(action='run')", bullet)
-        self.assertIn("exactly one job", bullet)
+        self.assertIn("exactly one audit stream", bullet)
+        self.assertIn("cronjob(action='runs')", bullet)
         self.assertIn("audit_report.py start", bullet)
         self.assertIn("coverage gap", bullet)
         self.assertIn("more than one job", bullet)
+        self.assertIn("not an audit stream", bullet)
 
     def test_the_skill_allows_one_stream_in_session_with_its_gaps_declared(self):
         """The skill's own copy of the interim (#1876), same substance.
@@ -11753,11 +11755,17 @@ class TestDispatchAndHandover(unittest.TestCase):
         text = self.read("skills/fleet-audit/SKILL.md")
         section = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Exactly one stream", section)
+        self.assertIn("cronjob(action='runs')", section)
         self.assertIn("audit_report.py finish", section)
         self.assertIn("coverage gap", section)
         self.assertIn("More than one stream", section)
         self.assertIn("2026-08-03", section)
         self.assertIn("cronjob(action='run')", section)
+        # The red line at the foot of the file is what a worker weighs
+        # first; it has to say the same thing as the section it points to.
+        red_lines = text.split("\n## Red lines", 1)[1]
+        self.assertIn("Never run more than one stream inline", red_lines)
+        self.assertNotIn("Never run the audit inline", red_lines)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
