@@ -64,20 +64,15 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Ten of the eighteen presubmit cases are admitted (recount the entries of
+Eleven of the eighteen presubmit cases are admitted (recount the entries of
 `hack/eval/presubmit-cases.txt` and `blocking-roster.txt` rather than trusting this
 sentence — an earlier copy of it miscounted twice): the ones whose recent record shows
 failures only on their own regressions or on infra classes the harness already excludes
 from the verdict.
 
 The rest still run and report on every pull request, and they cannot red one on a GRADED
-failure. Four are held out with a filed issue naming the exit condition:
+failure. Three are held out with a filed issue naming the exit condition:
 
-- **capacity-pinned-pool-probe** —
-  [#1010](https://github.com/gke-labs/kube-agents/issues/1010): worker completes its card
-  at fan-out ("Awaiting synthesis" as the final answer). The failure is correlated across
-  repetitions when the agent chooses to fan out, so the collapse rule does not absorb it.
-  Enters when the fix merges.
 - **cluster-agent-healthy-workload-no-finding** —
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010): the delegation receipt is
   graded as the answer (51 of 156 recorded repetitions).
@@ -137,6 +132,28 @@ obtainability activations from
 One re-admission on record: **agent-kanban-smoke** earned its seat back after the
 2026-08-27 redesign (a real SRE question graded on `kanban_create` plus cluster names);
 the reds that once argued for un-arming it belonged to the old vocabulary check.
+
+Admitted on the record since the split:
+
+- **capacity-pinned-pool-probe**, 2026-09-22
+  ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)). Held out on
+  [#1010](https://github.com/gke-labs/kube-agents/issues/1010) (the delegation receipt
+  graded as the answer; fixed by
+  [#1174](https://github.com/gke-labs/kube-agents/pull/1174), 2026-09-03), then kept out
+  while its ceiling check redded correct answers on wording
+  ([#1626](https://github.com/gke-labs/kube-agents/pull/1626), merged 2026-09-15 10:44 PM
+  ET). Presubmit record from that merge to 2026-09-22 (`data.json`, presubmit tier): 196
+  runs on 104 pull requests, 570 graded repetitions, 529 passed (92.8%), 41 failed, 18
+  infra-excluded, 147 runs at 3/3 and no run with every graded repetition failed. Per UTC
+  day: 09-16 105/111, 09-17 164/177, 09-18 95/104, 09-19 33/36, 09-20 8/9, 09-21 118/127,
+  09-22 6/6. Nightly: 3/3, 2/3, 2/3, 3/3 on the four graded nights 09-16 to 09-20. What the
+  41 misses are: 31 carry an excerpt and every one is the delegation acknowledgement or a
+  blocked delegation delivered as the answer
+  ([#1840](https://github.com/gke-labs/kube-agents/issues/1840),
+  [#1874](https://github.com/gke-labs/kube-agents/issues/1874)); 30 of the 41 miss both the
+  planted-pool name and the ceiling, 10 only the ceiling, 1 only the pool. The residual is
+  mostly the platform's shape, not the case's own regression; the roster's operative metric
+  is the collapse, and there were none in 196 runs.
 
 ## How far the roster's promise reaches
 

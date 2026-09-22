@@ -501,6 +501,25 @@ class RenderedFilesTest(unittest.TestCase):
         self.assertNotRegex(script, r"prLink\([^)]*\)\s*\.replace", "prLink's anchor is markup, never stripped back to text")
 
 
+# The blocking roster as the split left it (test_eval_rosters.ROSTER_AT_SPLIT).
+# BrowserTest renders the fixture week against THIS roster, not the live
+# hack/eval/blocking-roster.txt: the run page counts gate cases from the
+# roster, so every admission since (#1023 admitted the eleventh) would
+# otherwise move the "10 gate cases" the expectations below pin.
+ROSTER_AT_SPLIT = frozenset({
+    "reliability-pdb-probe",
+    "security-overgrant-probe",
+    "upgrades-lagging-master-probe",
+    "consistency-authorized-networks-probe",
+    "cost-idle-pool-probe",
+    "obtainability-remediation-proposal",
+    "cluster-agent-crashloop-debug",
+    "cluster-agent-crashloop-misleading-symptom",
+    "cluster-agent-crashloop-evidence-chain",
+    "agent-kanban-smoke",
+})
+
+
 @unittest.skipUnless(chrome(), "headless Chrome not found")
 class BrowserTest(unittest.TestCase):
     """The pages as a browser renders them. Data: the real fixture week with
@@ -510,6 +529,8 @@ class BrowserTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        cls.roster_patch = unittest.mock.patch.object(render.classify, "admitted_cases", return_value=ROSTER_AT_SPLIT)
+        cls.roster_patch.start()
         data = load_fixture()
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "active": True} for n in CRASHLOOP_TRIO]
@@ -529,6 +550,7 @@ class BrowserTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.roster_patch.stop()
         cls.tmp.cleanup()
 
     def render_state(self, health, sub="s"):

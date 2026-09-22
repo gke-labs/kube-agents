@@ -1,5 +1,11 @@
 # ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
-# `capacity` off the coverage allowlist in docs/designs/domains.yaml.
+# `capacity` off the coverage allowlist in docs/designs/domains.yaml. On the
+# blocking roster since 2026-09-22 (#1023), on its presubmit record after
+# #1626: 529 of 570 graded repetitions (92.8%) over 196 runs, no all-reps
+# collapse. The 41 misses are mostly the delegation acknowledgement or a
+# blocked delegation delivered as the answer (#1840, #1874; 31 of the 41),
+# the rest a missing ceiling value; docs/eval-gate-roster.md carries the
+# numbers.
 #
 # A PROBE, not the audit. The full stockout-prevention sweep exists and is
 # spec-ready (stockout-pinned-pool); on 2026-08-26 its run failed on transport

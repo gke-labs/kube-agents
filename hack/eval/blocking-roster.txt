@@ -30,6 +30,7 @@
 # what the record says about it.
 
 reliability-pdb-probe
+capacity-pinned-pool-probe
 security-overgrant-probe
 upgrades-lagging-master-probe
 consistency-authorized-networks-probe

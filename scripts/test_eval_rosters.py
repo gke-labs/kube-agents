@@ -103,6 +103,24 @@ MOVED_TO_NIGHTLY = [
     "cluster-agent-crashloop-fix-request",
 ]
 
+# Admitted after the split, each by a pull request that cited the record
+# (docs/eval-gate-roster.md, "Admitted on the record since the split"), as
+# (case, the roster line it follows): the file keeps the presubmit file's
+# reporting order.
+ADMITTED_AFTER_THE_SPLIT = [
+    # 2026-09-22 (#1023): 529/570 graded presubmit repetitions since #1626, no collapse.
+    ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
+]
+
+
+def with_insertions(base, insertions):
+    """``base`` with each (case, follows) pair inserted after its predecessor."""
+    out = list(base)
+    for case, follows in insertions:
+        out.insert(out.index(follows) + 1, case)
+    return out
+
+
 OLD_SCRIPT_LINE = 'export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe,b-probe,c-probe}"\n'
 
 
@@ -153,8 +171,8 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split(self):
         self.assertEqual(eval_rosters.presubmit_cases(), PRESUBMIT_AT_SPLIT)
 
-    def test_the_blocking_roster_is_bootstrap_admitted_at_the_split(self):
-        self.assertEqual(eval_rosters.blocking_roster(), ROSTER_AT_SPLIT)
+    def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
+        self.assertEqual(eval_rosters.blocking_roster(), with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT))
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases(self):
         self.assertEqual(eval_rosters.nightly_cases(), NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY)
