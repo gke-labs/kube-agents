@@ -599,17 +599,17 @@ class ListReadyProfilesTest(unittest.TestCase):
             )
         return p
 
-    def test_ready_profiles_filters_incomplete_scaffolds_and_missing_kubeconfig(self):
+    def test_ready_profiles_filters_incomplete_scaffolds(self):
         self._scaffold("cluster-ready")
         self._scaffold("cluster-no-user", user_md=False, identity=True)
         self._scaffold("cluster-no-identity", user_md=True, identity=False)
         self._scaffold("not-a-cluster-prefix", user_md=True, identity=True)
-        self._scaffold("cluster-missing-kubeconfig", user_md=True, identity=True)
 
-        def mock_kubeconfig_landed(path: Path) -> bool:
-            return "missing-kubeconfig" not in str(path)
+        self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
 
-        with mock.patch.object(cap, "kubeconfig_landed", side_effect=mock_kubeconfig_landed):
+    def test_ready_profiles_does_not_probe_sandbox_or_call_kubeconfig_landed(self):
+        self._scaffold("cluster-ready")
+        with mock.patch.object(cap, "kubeconfig_landed", side_effect=AssertionError("kubeconfig_landed should not be called")):
             self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
 
 

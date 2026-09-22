@@ -515,11 +515,10 @@ def list_profiles() -> list[str]:
 def list_ready_profiles() -> list[str]:
     """Return sorted names of active, fully scaffolded Cluster Agent profiles.
 
-    Filters profiles to ensure they:
+    Filters profiles on the agent pod PVC to ensure they:
     - Start with 'cluster-' prefix and are not in RESERVED_PROFILES
-    - Have a stamped 'USER.md' identity file
+    - Have a stamped 'USER.md' identity file (written at step 4 after credentials fetch)
     - Have a valid, readable cluster_identity in config.yaml
-    - Have a landed kubeconfig (checked via kubeconfig_landed)
     """
     valid = []
     for name in list_profiles():
@@ -529,8 +528,6 @@ def list_ready_profiles() -> list[str]:
         if not (home / IDENTITY_FILE).is_file():
             continue
         if read_cluster_identity(home) is None:
-            continue
-        if not kubeconfig_landed(home / "kubeconfig.yaml"):
             continue
         valid.append(name)
     return sorted(valid)
