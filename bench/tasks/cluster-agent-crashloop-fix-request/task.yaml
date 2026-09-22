@@ -172,7 +172,8 @@ verification_spec:
     mode: assert
     check:
       # Not report_contains: a substring passes on an invented URL, and on the
-      # PR an earlier rep opened, since nothing sweeps the GitOps repository.
+      # PR an earlier rep opened, which the teardown sweep does not reach: it
+      # runs per job, not between reps.
       type: pull_request_opened
       owner: gke-agentic
   - name: rca-names-the-oom

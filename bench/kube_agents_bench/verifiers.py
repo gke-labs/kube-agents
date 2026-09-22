@@ -942,9 +942,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
     WHY THIS EXISTS. The remediation cases used to grade on a
     ``report_contains`` over ``["github.com/", "/pull/"]``, which asks only
     that the reply hold a URL-shaped string. Nothing is fetched, so an invented
-    link passes; and nothing sweeps the eval GitOps repositories, so a pull
-    request an earlier rep opened is still there and still linkable. Repeats of
-    a case were being graded against a pile of their own earlier output (#1755).
+    link passes; and the teardown sweep runs per job rather than between reps,
+    so a pull request an earlier rep of the same job opened is still there and
+    still linkable. Repeats of a case were being graded against a pile of their
+    own earlier output (#1755).
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
@@ -1124,13 +1125,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # request and returns its URL. That work lands in `updated_at`
             # alone. The stamp moves on any write by anyone, so a rep that only
             # comments on a leftover passes too; the head commit would separate
-            # the two and the ledger App cannot read it. A rep that resubmits
-            # byte-identical content writes nothing at all -- the skill raises
-            # before the push -- so a correct rep lands here too, which is why
-            # the reason names both readings. hack/ci-teardown.sh (#1755 item 2)
-            # closes these, but per job rather than between reps -- so a leftover
-            # an earlier rep of this same job opened is still here to be written
-            # to, and only #1755 item 3 settles that.
+            # the two, and the grading token now carries pull_requests: read. A
+            # rep that resubmits byte-identical content writes nothing at all --
+            # the skill raises before the push -- so a correct rep lands here
+            # too, which is why the reason names both readings.
+            # hack/ci-teardown.sh (#1755 item 2) closes these, but per job
+            # rather than between reps -- so a leftover an earlier rep of this
+            # same job opened is still here to be written to, and only #1755
+            # item 3 settles that.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()

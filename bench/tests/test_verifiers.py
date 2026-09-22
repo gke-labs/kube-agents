@@ -1676,8 +1676,9 @@ def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
 
 
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
-    """The defect this check exists for (#1755). Nothing sweeps the GitOps
-    repository, so rep 1's pull request is still there for rep 2 to link. The
+    """The defect this check exists for (#1755). The teardown sweep runs per
+    job, not between reps, so rep 1's pull request is still there for rep 2 to
+    link within the same job. The
     URL, the repository and the number are all identical to a real pass; the
     stamps are what tell them apart, and a run that only quotes the URL moves
     neither of them."""

@@ -43,13 +43,12 @@
 # variations already read; one planted defect serving two domains is the
 # sharing crashloop-workload does for cluster debugging and remediation).
 #
-# Isolation class: read-only on the cluster; unbounded write to the eval
-# GitOps repo. Every run leaves a pull request behind, permanently —
-# submit-suggestion has no dedupe and nothing ever closes its PRs (the
-# accounting is in rca-remediation-pr's header; this case doubles that
-# accumulation, accepted on the same terms: the *-infra repos are throwaway
-# fixtures nobody reads). Eligible tier: nightly, under the merged
-# fan-out.
+# Isolation class: read-only on the cluster; write to the eval GitOps repo.
+# Every run leaves a pull request behind and submit-suggestion has no dedupe;
+# hack/ci-teardown.sh closes them at job start and end (the accounting is in
+# rca-remediation-pr's header). This case doubles the within-job accumulation,
+# accepted on the same terms: the *-infra repos are throwaway fixtures nobody
+# reads. Eligible tier: nightly, under the merged fan-out.
 #
 # Expected cost bracket: unmeasured. Bounded below by
 # obtainability-remediation-proposal (124-130s measured — same fixture,
@@ -103,7 +102,8 @@ verification_spec:
     mode: assert
     check:
       # Not report_contains: a substring passes on an invented URL, and on the
-      # PR an earlier rep opened, since nothing sweeps the GitOps repository.
+      # PR an earlier rep opened, which the teardown sweep does not reach: it
+      # runs per job, not between reps.
       type: pull_request_opened
       # gke-agentic/<project>-infra on every pool project, so the org half is a
       # fair exact match and breaks loudly if the org moves.
