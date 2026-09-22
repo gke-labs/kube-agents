@@ -75,15 +75,17 @@ where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod,
 does not license `cronjob(action='run')`. What you do instead depends on how many streams the request
 names:
 
-- **Exactly one stream:** run that stream's SOP here, in this session, through the two-command
-  lifecycle below — `audit_report.py start`, the sweep, `audit_report.py finish` — and report every
-  check you did not run as a coverage gap: a cluster you could not read goes in `scope.skipped`, a
-  check that could have run on a cluster and did not goes in that cluster's `limitations`, so `finish`
-  reports the run `partial` and names each gap. Never skip a check silently: a document that omits
-  the checks it never ran reads exactly like a complete one, and the roster check exists to catch
-  that. This is the interim until the trigger has a path from here (#1876).
+- **Exactly one stream:** check `cronjob(action='runs')` first; a run of that stream already in
+  flight holds the per-job lock this session does not, so say it is running and stop. Otherwise run
+  that stream's SOP here, in this session, through the two-command lifecycle below —
+  `audit_report.py start`, the sweep, `audit_report.py finish` — and report every check you did not
+  run as a coverage gap: a cluster you could not read goes in `scope.skipped`, a check that could
+  have run on a cluster and did not goes in that cluster's `limitations`, so `finish` reports the run
+  `partial` and names each gap. Never skip a check silently: a document that omits the checks it
+  never ran reads exactly like a complete one, and the roster check exists to catch that. This is
+  the interim until the trigger has a path from here (#1876).
 - **More than one stream:** say the on-demand trigger is unavailable and that each stream will run
-  on its 06:20 schedule. Do not improvise several streams in one turn — see the next paragraph.
+  on its own schedule. Do not improvise several streams in one turn — see the next paragraph.
 
 **Do not run more than one stream in the session that received the request.** A triggered run gets
 its own process and its own turn budget. A session that improvises several audits instead has one

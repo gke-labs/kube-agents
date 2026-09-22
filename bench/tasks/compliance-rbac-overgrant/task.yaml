@@ -49,7 +49,7 @@
 # and ai-security-planted-model-audit now carries it in presubmit over a
 # per-run planted defect (a floating model-image tag and a plaintext
 # registry credential).
-# Journey: a scheduled audit SOP runs end to end — delegates to a worker,
+# Journey: an audit SOP asked for on demand runs end to end — delegates to a worker,
 # sweeps the fleet, and files a ledger issue a human can act on.
 #
 # Planted defect required: a cluster-scoped ClusterRoleBinding named
