@@ -1000,8 +1000,9 @@ def board_path() -> Path:
 def subscribe_card(task_id: str, db_path: Path | None = None) -> int:
     """Write the card's chat subscription rows for the home channels, seeded at
     the card's current event head so its creation is not replayed. Returns the
-    rows written; fail-soft, since a card without a row still gets worked and
-    the next tick's comment is the only thing lost."""
+    number of the card's rows on the board once the write is committed, so a
+    row already there counts and a write the commit lost does not; fail-soft,
+    since a card without a row still gets worked and the next tick tries again."""
     targets = home_targets()
     if not targets:
         sys.stderr.write("stall_watch: no home channel in the environment; the card's progress will not reach chat\n")
@@ -1018,18 +1019,19 @@ def subscribe_card(task_id: str, db_path: Path | None = None) -> int:
             head = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
             created = int(time.time())
             for platform, chat_id, thread_id in targets:
-                cur = conn.execute(
+                conn.execute(
                     "INSERT OR IGNORE INTO kanban_notify_subs "
                     "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, delivery_mode, delivery_metadata, created_at, last_event_id) "
                     "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
                     (task_id, platform, chat_id, thread_id, NOTIFIER_PROFILE, DELIVERY_MODE, json.dumps({"thread_id": thread_id} if thread_id else {}), created, head),
                 )
-                written += cur.rowcount if cur.rowcount > 0 else 0
             conn.commit()
+            written = conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchone()[0]
         finally:
             conn.close()
     except sqlite3.Error as exc:
         sys.stderr.write(f"stall_watch: could not write the subscription for {task_id}: {exc}\n")
+        written = 0
     return written
 
 
@@ -1113,6 +1115,11 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 end_episode(state, scope)
         assignee = assignee_for(sweep.project, name, location)
         generation = int(state.setdefault(GENERATIONS_KEY, {}).get(scope) or 0)
+        # A card replacing a gone or finished one carries every object the
+        # scope still holds, not only the ones that appeared this tick.
+        known = [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
+        seen = {(r["object"], r["heuristic"], r["detail"]) for r in rows}
+        rows = rows + [e for e in known if (e["object"], e["heuristic"], e["detail"]) not in seen]
         task_id = open_card(
             card_title(name, namespace, rows),
             card_body(sweep.project, name, location, namespace, rows, now, assignee),

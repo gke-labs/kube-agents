@@ -522,7 +522,6 @@ class Cards(Base):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         first = next(iter(self.board.cards))
         self.board.cards[first]["status"] = "done"
-        self.board.by_key = {k: v for k, v in self.board.by_key.items()}
         # Pretend the generation counter was lost with the ledger.
         state = self.ledger(); state[stall_watch.EPISODES_KEY] = {}; state[stall_watch.GENERATIONS_KEY] = {}; state["stalls"] = {}
         self.state.write_text(json.dumps(state))
@@ -629,11 +628,45 @@ class Subscriptions(Base):
     def test_a_card_not_on_the_board_gets_no_row(self):
         self.assertEqual(stall_watch.subscribe_card("t_deadbeef", self.db), 0)
 
-    def test_subscribing_twice_writes_once(self):
+    def test_subscribing_twice_writes_once_and_still_counts_the_row(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
         tid = next(iter(self.board.cards))
-        self.assertEqual(stall_watch.subscribe_card(tid, self.db), 0)
+        self.assertEqual(stall_watch.subscribe_card(tid, self.db), 1, "a row already on the board is a subscribed card, not a failure")
         self.assertEqual(len(self.subs(tid)), 1)
+
+    def test_a_commit_that_fails_counts_as_no_row_written(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        tid = next(iter(self.board.cards))
+        conn = sqlite3.connect(self.db)
+        conn.execute("DELETE FROM kanban_notify_subs")
+        conn.commit()
+        conn.close()
+        real_connect = stall_watch.sqlite3.connect
+
+        class LosesTheCommit:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def commit(self):
+                raise sqlite3.OperationalError("disk I/O error")
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        with patch.object(stall_watch.sqlite3, "connect", lambda *a, **k: LosesTheCommit(real_connect(*a, **k))):
+            self.assertEqual(stall_watch.subscribe_card(tid, self.db), 0)
+        self.assertEqual(self.subs(tid), [], "the transaction was discarded with the connection")
+
+    def test_a_replacement_card_carries_every_object_the_scope_still_holds(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        first = next(iter(self.board.cards))
+        self.board.forget(first)
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        card = next(reversed(self.board.cards.values()))
+        self.assertIn("Deployment/checkout-api", card["body"])
+        self.assertIn("Deployment/cart-api", card["body"])
+        self.assertIn("Deployment/checkout-api", card["title"])
 
 
 class Ledger(Base):
