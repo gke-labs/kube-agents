@@ -212,17 +212,53 @@ an honest "no window inside the horizon" is the answer, not a failure to
 hide.
 
 **Record the evidence.** One `type:
-advice_service_workload_obtainability_planning` record per region call, with
-`api_method: compute.beta.AdviceService.CalendarMode`, the `region`,
-`nodeCount`, `chipsPerNode`, and under `request` the canonical body the
-flags produce — the `futureResourcesSpecs` shape. Reconstruct it from the
-flags you passed; the shell gate refuses `--log-http`, so capturing the
-wire body is not a path you have. Then exactly one `type:
-workload_obtainability_planning_analysis` record whose `analysis.windows`
-lists every window **in rank order, rank one first**, each with `region`,
-`zone`, `startTime`, `endTime`, `durationHours` (the job's, not the
-reservation's), `capacitySignal` (the zone's status or `RECOMMENDED`), and
-its `rank`.
+advice_service_workload_obtainability_planning` record per region call.
+Use **exactly** this `request` shape — do not rename keys and do not
+restate the gcloud flags as a flat dictionary; `futureResourcesSpecs` is
+the API's body, reconstructed from the flags you passed (the shell gate
+refuses `--log-http`, so capturing the wire body is not a path you have).
+A v5e host carries 4 chips and the reservation floor is one day, so for 64
+nodes the aggregate is 256 chips and the durations are `86400s`:
+
+```json
+{
+  "region": "europe-west4",
+  "nodeCount": 64,
+  "chipsPerNode": 4,
+  "futureResourcesSpecs": {
+    "spec": {
+      "deploymentType": "DENSE",
+      "locationPolicy": {
+        "locations": { "zones/europe-west4-b": { "preference": "ALLOW" } }
+      },
+      "targetResources": {
+        "aggregateResources": {
+          "acceleratorCount": 256,
+          "vmFamily": "VM_FAMILY_CLOUD_TPU_LITE_POD_SLICE_CT5LP",
+          "workloadType": "BATCH"
+        }
+      },
+      "timeRangeSpec": {
+        "minDuration": "86400s",
+        "maxDuration": "86400s",
+        "startTimeNotEarlierThan": "<now, RFC 3339 UTC>",
+        "startTimeNotLaterThan": "<now + horizon - job duration>"
+      }
+    }
+  }
+}
+```
+
+Set `api_method: compute.beta.AdviceService.CalendarMode` and put the
+structured findings from the real response in `analysis`. Then exactly one
+`type: workload_obtainability_planning_analysis` record whose `analysis`
+carries two keys: `windows`, every schedulable window **in rank order,
+rank one first**, each with `region`, `zone`, `startTime`, `endTime`,
+`durationHours` (the job's, not the reservation's), `capacitySignal` (the
+zone's status or `RECOMMENDED`), and its `rank`; and `zoneStatuses`, one
+entry per allowed zone that returned no window, mapping the zone to the
+status the API gave (`NO_CAPACITY`, `NOT_SUPPORTED`, ...), so the analysis
+covers every allowed zone whether or not it is obtainable.
 
 **Attach the paired manifests.** A Dynamic Workload Scheduler request and
 its Kueue queue, both under one `pair_id`, both carrying a `target` of the

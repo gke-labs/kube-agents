@@ -83,8 +83,12 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac03-multi-region-windows-evaluated",
-        "kube-agents evaluates predicted capacity windows across regions.",
-        "CalendarMode analysis contains valid windows in at least two regions",
+        "kube-agents evaluates predicted capacity windows across both "
+        "candidate regions; a region with no obtainable window is covered "
+        "by its per-zone status, since live capacity weather is not the "
+        "agent's to command.",
+        "every listed window is valid and windows plus zoneStatuses cover "
+        "both allowed regions",
     ),
     AcceptanceCriterion(
         "ac04-windows-ranked",
@@ -347,7 +351,16 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         item for item in _list(analysis.get("windows")) if isinstance(item, dict)
     ]
     valid_windows = [item for item in windows if _valid_window(item, created_at)]
-    regions = {str(item["region"]) for item in valid_windows}
+    # Coverage, not luck: a region the live API reports as stocked out
+    # cannot produce a valid window, so its honest per-zone status covers
+    # it. Verified live 2026-09-22: us-central1-a returned NO_CAPACITY
+    # while europe-west4-b returned a real window.
+    zone_statuses = _mapping(analysis.get("zoneStatuses"))
+    covered_regions = {str(item["region"]) for item in valid_windows} | {
+        str(zone).rsplit("-", 1)[0]
+        for zone, status in zone_statuses.items()
+        if str(zone) in ALLOWED_ZONES and str(status or "").strip()
+    }
     ranks = [item.get("rank") for item in windows]
     ranked = (
         bool(windows)
@@ -369,7 +382,12 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and top_start is not None
         and top_start.strftime("%Y-%m-%d") in final_output
         and top_start.strftime("%H:%M") in final_output
-        and "UTC" in final_output.upper()
+        # An RFC 3339 timestamp with a Z suffix IS a UTC statement; the
+        # word is only required when the answer paraphrases the time.
+        and (
+            "UTC" in final_output.upper()
+            or str(top.get("startTime") or "") in final_output
+        )
     )
 
     artifacts = projected_records(interaction, "artifacts")
@@ -424,8 +442,14 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     suite.record(
         "ac03-multi-region-windows-evaluated",
-        len(valid_windows) == len(windows) and len(regions) >= 2,
-        {"windows": windows, "regions": sorted(regions)},
+        bool(windows)
+        and len(valid_windows) == len(windows)
+        and covered_regions == ALLOWED_REGIONS,
+        {
+            "windows": windows,
+            "zoneStatuses": zone_statuses,
+            "coveredRegions": sorted(covered_regions),
+        },
         blocked_by=tuple(dict.fromkeys((*interaction_blocker, *evidence_blocker))),
     )
     suite.record(
