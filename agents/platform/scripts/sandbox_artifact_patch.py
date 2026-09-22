@@ -252,18 +252,25 @@ def _screen(paths: list[str]) -> list[str]:
     if not paths:
         return []
     try:
+        from gateway import media_policy
         from gateway.platforms import base
     except ImportError:
-        # The original method imports this module itself a few lines in, so a
-        # failure here is not a case where delivery would otherwise have worked.
+        # The original method imports ``base`` itself a few lines in, and
+        # ``base`` reads the strict flag out of ``media_policy``, so a failure
+        # here is not a case where delivery would otherwise have worked.
         LOGGER.warning(
             "cannot reach upstream's delivery policy; no artifact is staged",
             exc_info=True,
         )
         return []
 
+    # The same predicate ``validate_media_delivery_path`` branches on. It moved
+    # out of ``base`` (where it was ``_media_delivery_strict_mode``) into
+    # ``gateway.media_policy`` in v2026.9.14, so that a routed profile's own
+    # config is consulted under multiplexing; asking it rather than the
+    # environment keeps this screen and upstream's answering the same question.
     try:
-        strict = base._media_delivery_strict_mode()
+        strict = media_policy.media_delivery_strict()
     except AttributeError:
         LOGGER.warning(
             "cannot tell whether strict media delivery is on; no artifact is "

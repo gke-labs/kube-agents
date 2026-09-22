@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -182,25 +181,17 @@ func a2aBusTokenVolumeMount() corev1.VolumeMount {
 // beside it, below. ReservedVolumeNames carries what the pair does and does
 // not buy.
 //
-// The input slices belong to the CR, so the copy is not incidental.
+// The input slices belong to the CR, so the copy stripContainerMountsMatching
+// makes is not incidental.
 func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
-	mountsIt := func(c corev1.Container) bool {
-		return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
-			return m.Name == a2aBusTokenVolume
-		})
-	}
-	if !slices.ContainsFunc(containers, mountsIt) {
-		return containers
-	}
-	out := slices.Clone(containers)
-	for i := range out {
-		if !mountsIt(out[i]) {
-			continue
-		}
-		out[i].VolumeMounts = a2aStripBusTokenVolumeMounts(out[i].VolumeMounts)
-	}
-	return out
+	return stripContainerMountsMatching(containers, a2aIsBusTokenMount)
 }
+
+// a2aIsBusTokenMount is the predicate the two mount strips on either side of
+// it share, named rather than written twice so they cannot drift apart. Name
+// matching is the whole of what it claims; a2aStripBusTokenMounts says what a
+// name match does not buy.
+func a2aIsBusTokenMount(m corev1.VolumeMount) bool { return m.Name == a2aBusTokenVolume }
 
 // a2aStripBusTokenVolumeMounts is the same removal against a bare mount list,
 // for the one user-authored mount surface that reaches a container the operator
@@ -218,17 +209,7 @@ func a2aStripBusTokenMounts(containers []corev1.Container) []corev1.Container {
 // user-authored mounts only and the platform-agent container gets its real
 // mount from mountIntoContainer after the strip.
 func a2aStripBusTokenVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMount {
-	if !slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return m.Name == a2aBusTokenVolume }) {
-		return mounts
-	}
-	keep := make([]corev1.VolumeMount, 0, len(mounts))
-	for _, m := range mounts {
-		if m.Name == a2aBusTokenVolume {
-			continue
-		}
-		keep = append(keep, m)
-	}
-	return keep
+	return stripMatching(mounts, a2aIsBusTokenMount)
 }
 
 // a2aStripBusTokenVolume removes a user-supplied volume that shadows the
@@ -238,17 +219,7 @@ func a2aStripBusTokenVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMo
 // volumes with one name is a Deployment server-side apply refuses outright,
 // which wedges every reconcile of the CR with nothing in status to say why.
 func a2aStripBusTokenVolume(volumes []corev1.Volume) []corev1.Volume {
-	if !slices.ContainsFunc(volumes, func(v corev1.Volume) bool { return v.Name == a2aBusTokenVolume }) {
-		return volumes
-	}
-	keep := make([]corev1.Volume, 0, len(volumes))
-	for _, v := range volumes {
-		if v.Name == a2aBusTokenVolume {
-			continue
-		}
-		keep = append(keep, v)
-	}
-	return keep
+	return stripMatching(volumes, func(v corev1.Volume) bool { return v.Name == a2aBusTokenVolume })
 }
 
 // a2aBusCredentialVolumeNames is the set of user-authored volumes, on both of
@@ -295,56 +266,18 @@ func a2aBusCredentialVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]
 // a2aBusTokenVolumeSource to the pod separately -- so the only volumes this
 // can drop are the author's.
 func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []corev1.Volume {
-	carries := func(v corev1.Volume) bool { return len(agentv1alpha1.BusCredentialRoutes(v, agentName)) > 0 }
-	if !slices.ContainsFunc(volumes, carries) {
-		return volumes
-	}
-	keep := make([]corev1.Volume, 0, len(volumes))
-	for _, v := range volumes {
-		if carries(v) {
-			continue
-		}
-		keep = append(keep, v)
-	}
-	return keep
+	return stripMatching(volumes, func(v corev1.Volume) bool {
+		return len(agentv1alpha1.BusCredentialRoutes(v, agentName)) > 0
+	})
 }
 
-// a2aStripVolumeMountsNamed removes the mounts naming a dropped volume from a
-// bare mount list. The mounts go with the volume: a mount naming a volume the
-// pod does not declare is a Deployment the API server refuses, which wedges
-// every reconcile of the CR with nothing in status to say why.
-func a2aStripVolumeMountsNamed(mounts []corev1.VolumeMount, dropped map[string]bool) []corev1.VolumeMount {
-	if !slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return dropped[m.Name] }) {
-		return mounts
-	}
-	keep := make([]corev1.VolumeMount, 0, len(mounts))
-	for _, m := range mounts {
-		if dropped[m.Name] {
-			continue
-		}
-		keep = append(keep, m)
-	}
-	return keep
-}
-
-// a2aStripMountsNamed is a2aStripVolumeMountsNamed over the CR's own
-// containers. Copied rather than edited in place, for the reason
-// a2aStripBusTokenMounts gives: the slice is the manager's cached CR.
-func a2aStripMountsNamed(containers []corev1.Container, dropped map[string]bool) []corev1.Container {
-	mountsOne := func(c corev1.Container) bool {
-		return slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool { return dropped[m.Name] })
-	}
-	if len(dropped) == 0 || !slices.ContainsFunc(containers, mountsOne) {
-		return containers
-	}
-	out := slices.Clone(containers)
-	for i := range out {
-		if mountsOne(out[i]) {
-			out[i].VolumeMounts = a2aStripVolumeMountsNamed(out[i].VolumeMounts, dropped)
-		}
-	}
-	return out
-}
+// The two mount strips that used to live here -- one over a bare mount list,
+// one over a list of containers -- were character-for-character
+// stripVolumeMountsNamed and stripContainerMountsNamed in
+// platformagent_manifests.go. They were written separately because
+// gke-labs#1675 had not landed yet. The callers use those two directly now;
+// what is bus-specific is the name set a2aBusCredentialVolumeNames builds, not
+// the removal.
 
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not
 // a bus identity: the callout authenticates to NATS with a password, because it

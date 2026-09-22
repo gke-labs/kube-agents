@@ -149,6 +149,21 @@ after merge (#658). CI runs the same check in
 `docker-build.yml`. The docstring in `scripts/check_image_layers.py` owns which image the gate points
 at and why — read it before changing the target.
 
+**Third-party download retries.** A non-piped `curl` that fetches over the network in
+`deploy/docker/Dockerfile`, `deploy/sandbox/Dockerfile` or `hack/ci-env.sh` needs both
+`--retry N` and `--retry-all-errors` — the count alone does not survive a connection reset
+mid-transfer, and without either a bad second from the upstream CDN fails a build that has
+nothing to do with the download. `tests/test_third_party_download_retry.py` fails the pull
+request otherwise, and its `DOWNLOAD_SOURCES` is the hand-maintained list of files it walks — a new
+file that downloads something is not covered until it is added there. A download piped into a
+consumer is exempt, because curl retries by restarting the transfer and the consumer has already
+been fed the bytes of the failed one.
+
+That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`
+against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
+cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
+
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
 
@@ -185,8 +200,9 @@ loop while you work:
   check; see **Shell scripts** above for the release to install.
 - `make validate` — the structure check in the `Validate Repo Structure` job; fails if skills
   live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
-- `make -C k8s-operator test` — manifests, generate, fmt, vet, the envtest download, the
-  operator's Python tests, then `go test`; what the `Operator Tests` job runs.
+- `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suites under
+  `k8s-operator/internal/controller` and `agents/platform/scripts`, then the envtest download and
+  `go test`; what the `Operator Tests` job runs.
 - `make test-integration` — the seam tier only, for a component another one talks to across a
   process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
   Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints

@@ -171,8 +171,8 @@ kanban:
   # dead wait to every delegation before the worker was claimed.
   dispatch_interval_seconds: 5
   # Which terminal events wake this agent for a follow-up turn. Upstream wakes
-  # on all five and offers no way to say otherwise; the image patches that key
-  # in (deploy/docker/patches/kanban_notifier.py).
+  # on every kind in its _WAKE_KINDS tuple and offers no way to say otherwise;
+  # the image patches that key in (deploy/docker/patches/kanban_notifier.py).
   #
   # `completed` is deliberately absent. The notifier has already delivered the
   # worker's own status line and its full `result` to the thread by the time it
@@ -187,8 +187,8 @@ kanban:
   # This key governs push-capable adapters only. The notifier skips its own
   # send() for an adapter with no push channel (the API server) because that
   # send can only fail, and there the wake self-post IS the delivery — so the
-  # patch ignores this list on that path and wakes on all five. Otherwise a
-  # card completing over the API server would be announced to nobody.
+  # patch ignores this list on that path and wakes on every upstream kind.
+  # Otherwise a card completing over the API server would be announced to nobody.
   wake_on_events:
     - gave_up
     - crashed

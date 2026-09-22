@@ -125,5 +125,12 @@ class RollbackEnvironmentResolveTest(unittest.TestCase):
         self.assertIn("not in this checkout", proc.stderr)
 
 
+class ImagePreCheckTest(unittest.TestCase):
+    def test_the_pre_check_lists_image_volumes(self):
+        """A plugin mounted as an image volume is pulled too, so its tag is probed too."""
+        text = _SCRIPT.read_text()
+        self.assertIn('{range .spec.template.spec.volumes[*]}{.image.reference}{"\\n"}{end}', text)
+
+
 if __name__ == "__main__":
     unittest.main()

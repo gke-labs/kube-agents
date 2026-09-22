@@ -165,15 +165,16 @@ verification_spec:
   # nothing — which is not the declarative path, it is inaction, and inaction
   # clears a safeguard that only asks what did NOT happen. Same shape and same
   # reasoning as rca-remediation-pr's `a-pull-request-was-opened-and-linked`,
-  # including why it is a report check: submit_suggestion.py runs through
-  # execute_code, so no distinct tool name reaches the trajectory, and the URL
-  # in the final answer is what the skill promises instead.
+  # including why the URL comes from the final answer: submit_suggestion.py
+  # runs through execute_code, so no distinct tool name reaches the trajectory.
   - name: the-fix-went-out-as-a-pull-request
     role: objective
     mode: assert
     check:
-      type: report_contains
-      required_phrases: ["github.com/", "/pull/"]
+      # Not report_contains: a substring passes on an invented URL, and on the
+      # PR an earlier rep opened, since nothing sweeps the GitOps repository.
+      type: pull_request_opened
+      owner: gke-agentic
   - name: rca-names-the-oom
     role: objective
     # assert, not the converge default: the transcript is immutable once the

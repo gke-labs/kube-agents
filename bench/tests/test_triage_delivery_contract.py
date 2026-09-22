@@ -91,11 +91,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 #: The cases whose delivery objective this module pins. Named, not globbed: a
 #: glob over the directory would cover exactly these files today and silently
 #: cover nothing on the day one is renamed. `incident-triage-oom-event-probe`
-#: (#1023) carries the incumbent's check verbatim; a further case adopting the
-#: delivery contract is added here rather than left to a pattern.
+#: (#1023) and `autoops-crashloop-config-triage` (#1103) carry the incumbent's
+#: check verbatim; a further case adopting the delivery contract is added here
+#: rather than left to a pattern.
 CASE_PATHS = [
     REPO_ROOT / "bench" / "tasks" / "autoops-warning-event-triage" / "task.yaml",
     REPO_ROOT / "bench" / "tasks" / "incident-triage-oom-event-probe" / "task.yaml",
+    REPO_ROOT / "bench" / "tasks" / "autoops-crashloop-config-triage" / "task.yaml",
 ]
 CHECK_NAME = "triage-delivers-an-actionable-report"
 

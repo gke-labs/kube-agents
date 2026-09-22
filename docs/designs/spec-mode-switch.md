@@ -89,7 +89,17 @@ hanging at the dial. Found live during stage 1 bring-up (8/26).
 
 ## What the operator renders
 
-- `today`: exactly what it renders now. A normal install cannot tell this feature exists.
+- `today`: exactly what it renders now. A normal install cannot tell this feature exists
+  from what the operator RENDERS. Admission is the exception, and deliberately: the
+  reservations that keep a user-authored volume from carrying the bus credential are not
+  mode-gated, so a CR that names `a2a-bus-token` or sources the bus's audience or Secrets
+  is refused under `today` too. The two source refusals name the bus in the message, and so does the
+  reserved-name refusal on a container's `volumeMounts` -- it says the volume is rendered
+  for a single container. The one on the volume itself only echoes the name back, which is
+  thinner than it should be for an admin who has never heard of `a2a-bus-token`. Gating them would let an
+  install store such a volume under `today` and then flip to `next`, where the render
+  strips it silently and the author never hears anything. A reservation that only starts
+  reserving once the thing exists is not a reservation.
 - `next`: everything above, plus the NATS component and the gateway skeleton. Next is
   additive - today's path keeps running until stage 4 starts retiring pieces.
 

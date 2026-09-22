@@ -285,26 +285,17 @@ class MaybeInheritWorkerSubscriptionsTest(unittest.TestCase):
             self.assertEqual(maybe_inherit_worker_subscriptions(conn, CHILD), 0)
 
 
-# The create handler, reduced to the two lines the patch anchors on.
+# The create handler (v2026.9.14 shape), reduced to the line the patch anchors on
+# and its neighbours: the create above it, the return below it.
 UPSTREAM_TOOLS = '''\
-def _handle_create(args, **kw):
-    try:
-        kb, conn = _connect(board=board)
-        try:
-            new_tid = kb.create_task(
-                conn,
-                title=str(title).strip(),
-            )
-            new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
-            return _ok(
-                task_id=new_tid,
-                subscribed=subscribed,
-            )
-        finally:
-            conn.close()
-    except Exception as e:
-        return tool_error(f"kanban_create: {e}")
+@_kanban_handler("kanban_create")
+def _handle_create(args: dict, **kw) -> str:
+    with _board(args.get("board")) as (kb, conn):
+        new_tid = kb.create_task(
+            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+            creator_task_id=self_tid)
+        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 '''
 
 
@@ -321,12 +312,13 @@ class ApplyTest(unittest.TestCase):
     def test_the_anchor_matches_upstream_exactly_once(self):
         self.assertEqual(UPSTREAM_TOOLS.count(ANCHOR), 1)
 
-    def test_the_hook_lands_after_the_auto_subscribe_attempt(self):
+    def test_the_hook_lands_between_the_read_back_and_the_return(self):
         patched = patch_tree(UPSTREAM_TOOLS)
-        auto_sub = patched.index("subscribed = _maybe_auto_subscribe(conn, new_tid)")
+        created = patched.index("new_tid = kb.create_task(")
+        read_back = patched.index("landed = _fields(kb.get_task(conn, new_tid)")
         hook = patched.index("_kanban_inherit_worker_subs(conn, new_tid)")
         result = patched.index("return _ok(")
-        self.assertTrue(auto_sub < hook < result)
+        self.assertTrue(created < read_back < hook < result)
 
     def test_the_import_trailer_is_appended(self):
         patched = patch_tree(UPSTREAM_TOOLS)
@@ -343,8 +335,8 @@ class ApplyTest(unittest.TestCase):
 
     def test_a_drifted_anchor_fails_loudly(self):
         drifted = UPSTREAM_TOOLS.replace(
-            "_maybe_auto_subscribe(conn, new_tid)",
-            "_maybe_auto_subscribe(conn, new_tid, board)",
+            "kb.get_task(conn, new_tid), _CREATED_FIELDS",
+            "kb.get_task(conn, new_tid, board), _CREATED_FIELDS",
         )
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(drifted)

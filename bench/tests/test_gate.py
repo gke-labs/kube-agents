@@ -22,8 +22,10 @@ the JSON hand-off -- so those are what this module pins. In particular:
    `suite` is what turns it into an exit code. A `case` that exited non-zero
    would abort the loop under `set -e` and silently drop the remaining tasks.
    It exits 2 only when it could not grade at all.
-2. **`suite` exits 1 on red, 0 on green**, and reds on a case result the loop
-   never wrote -- unaccounted work is not a pass.
+2. **`suite` exits 1 on red, 0 on green, and 2 on not evaluated** -- an
+   admitted case that lost every repetition to infrastructure, or every case
+   lost -- and reds on a case result the loop never wrote: unaccounted work
+   is not a pass, and it is not weather either.
 3. **The `Task <id> Result: [...]` line keeps its shape**, because people and
    scripts grep build logs for it.
 4. **The environment carries every threshold**, since all of them are meant
@@ -81,6 +83,7 @@ def _clean_env(monkeypatch):
         "GIT_COMMIT",
         "EVAL_BASELINE_STORE",
         "EVAL_BASELINE_MAX_OBJECTS",
+        "EVAL_BASELINE_CAT_WORKERS",
         "BUILD_ID",
         "PROW_JOB_ID",
     ):
@@ -462,6 +465,65 @@ def test_an_unreadable_case_result_reds_the_suite(tmp_path, capsys):
     path.write_text("{ truncated", encoding="utf-8")
     assert main(["suite", "--case-result", str(path)]) == 1
     assert "unreadable case result" in capsys.readouterr().err
+
+
+def wiped_case_file(tmp_path: Path, name: str, **fields) -> Path:
+    """What `case` writes for a case whose every repetition hit infrastructure."""
+    return case_file(
+        tmp_path, name, rung=99, rung_name="INFRA", passes=0, scored=0,
+        pass_rate=None, label="RESOURCE_PREPARATION_FAILED",
+        reason="all 3 repetition(s) failed on infrastructure before the case could be evaluated",
+        **fields,
+    )
+
+
+def test_a_not_evaluated_suite_exits_two_and_says_rerun(tmp_path, capsys):
+    """The contract the shell branches on: exit 2, `outcome` in the JSON, and
+    a banner that tells the author what to do instead of a red to debug."""
+    out = tmp_path / "verdict.json"
+    rc = main([
+        "suite",
+        "--case-result", str(case_file(tmp_path, "a")),
+        "--case-result", str(wiped_case_file(tmp_path, "b")),
+        "--json-out", str(out),
+    ])
+    assert rc == 2
+    printed = capsys.readouterr().out
+    assert "**NOT EVALUATED**" in printed
+    assert "**RED**" not in printed and "**GREEN**" not in printed
+    assert "rerun when the environment is healthy" in printed
+    assert "`b`" in printed and "do not debug the change" in printed
+    assert "### Why it cannot report green" in printed
+    assert "### Why it is red" not in printed
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert doc["green"] is False
+    assert doc["outcome"] == "not_evaluated"
+    assert doc["not_evaluated"] == ["b"]
+
+
+def test_a_wiped_unadmitted_case_leaves_the_suite_green(tmp_path, capsys):
+    rc = main([
+        "suite",
+        "--case-result", str(case_file(tmp_path, "a")),
+        "--case-result", str(wiped_case_file(tmp_path, "b", admitted=False)),
+    ])
+    assert rc == 0
+    assert "**GREEN**" in capsys.readouterr().out
+
+
+def test_a_blocking_case_beside_a_wiped_one_exits_one(tmp_path, capsys):
+    """Red outranks not-evaluated: the collapse is the finding to act on."""
+    rc = main([
+        "suite",
+        "--case-result", str(case_file(
+            tmp_path, "a", blocking=True, rung=4, rung_name="COLLAPSE", reason="failed 3/3"
+        )),
+        "--case-result", str(wiped_case_file(tmp_path, "b")),
+    ])
+    assert rc == 1
+    printed = capsys.readouterr().out
+    assert "**RED**" in printed and "### Why it is red" in printed
+    assert "NOT EVALUATED" not in printed
 
 
 def test_the_markdown_escapes_a_pipe_in_a_reason(tmp_path):

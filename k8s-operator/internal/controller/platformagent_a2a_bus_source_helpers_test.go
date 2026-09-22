@@ -64,7 +64,7 @@ func TestTheNameHalfAndTheSourceHalfAreTwoDifferentChecks(t *testing.T) {
 		t.Errorf("a CR with no user volumes drops %v", got)
 	}
 	in := clean.Spec.Deployment.Sidecars
-	if out := a2aStripMountsNamed(in, nil); &out[0] != &in[0] {
-		t.Error("a2aStripMountsNamed copied the containers with nothing to drop; a clean CR should render its own slices")
+	if out := stripContainerMountsNamed(in, nil); &out[0] != &in[0] {
+		t.Error("stripContainerMountsNamed copied the containers with nothing to drop; a clean CR should render its own slices")
 	}
 }

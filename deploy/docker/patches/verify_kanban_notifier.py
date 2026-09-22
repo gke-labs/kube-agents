@@ -8,7 +8,7 @@ replaces ``verify_kanban_wake_kinds.py`` and the delivery half of
 file), and it additionally covers the clip wiring, which previously had nothing
 behind it but two ``grep -q``\\ s in the Dockerfile.
 
-The applier only proves its two anchors matched, and a matched anchor is the
+The applier only proves its three anchors matched, and a matched anchor is the
 weaker half of all five concerns here:
 
 * **Clip.** A textual grep proves ``_clip_handoff`` is called; it does not prove
@@ -26,7 +26,7 @@ weaker half of all five concerns here:
   ``t_c31a1f00`` quietly coming back.
 * **Marker.** Worse again, because it writes into gateway session state that
   nothing else in the build reads back. A note parked on a session *id* instead
-  of a session key, a store that dropped ``lookup_by_session_id``, a ``run.py``
+  of a session key, a store that dropped ``lookup_by_session_id``, a ``run_turn_runner.py``
   that stopped draining ``sidecar_notes`` — each is a silent no-op producing
   precisely what the unpatched gateway produced, which is the 9m46s of dead wait
   on task ``t_a8f58a2a``.
@@ -37,6 +37,14 @@ weaker half of all five concerns here:
   looks perfect and a reply — "apply Option A", or a bare "apply" where the
   report proposed a single fix — that reaches an agent with no idea what it
   authorises. That is #802.
+
+Since v2026.9.14 the notifier's delivery lives in
+``gateway/kanban_watchers_notifier.py`` (``_KanbanNotification``, the
+``_EVENT_FORMATTERS`` table); ``gateway/kanban_watchers.py`` only owns the loop.
+The source and the names below are read from the former, and the ordering
+checks read the method each call sits in rather than a file offset, because the
+marker (``build_wake_text``) and the incident row (``_send_pings``) are no
+longer in one block.
 
 So this drives the *patched* runtime rather than reading it: the real
 ``hermes_cli.config.load_config``, the real ``gateway.wake.adapter_supports_push``,
@@ -55,7 +63,6 @@ Usage::
 from __future__ import annotations
 
 import os
-import re
 import sys
 
 FAILURES: list[str] = []
@@ -69,12 +76,15 @@ def check(label: str, condition: object, detail: str = "") -> None:
     print(f"  FAIL {label}{': ' + detail if detail else ''}")
 
 
-import gateway.kanban_watchers as watchers  # noqa: E402
+import ast  # noqa: E402
+
+import gateway.kanban_watchers_notifier as notifier  # noqa: E402
 from gateway.kanban_notifier import (  # noqa: E402
     CONFIG_KEY,
     DEFAULT_LIMIT,
     DEFAULT_WAKE_KINDS,
     RESULT_LIMIT,
+    UNDELIVERED_OUTCOME_KINDS,
     _adapter_can_push,
     _load_kanban_config,
     clip_handoff,
@@ -83,8 +93,30 @@ from gateway.kanban_notifier import (  # noqa: E402
     wake_kinds_for,
 )
 
-with open("gateway/kanban_watchers.py", encoding="utf-8") as _notifier_src:
+with open("gateway/kanban_watchers_notifier.py", encoding="utf-8") as _notifier_src:
     NOTIFIER_SOURCE = _notifier_src.read()
+
+_NOTIFIER_TREE = ast.parse(NOTIFIER_SOURCE)
+NOTIFICATION_CLASS = "_KanbanNotification"
+
+
+def method_source(method_name: str) -> str:
+    """Source of one ``_KanbanNotification`` method, or ``""`` when it is gone."""
+    for node in _NOTIFIER_TREE.body:
+        if isinstance(node, ast.ClassDef) and node.name == NOTIFICATION_CLASS:
+            for item in node.body:
+                if (
+                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name == method_name
+                ):
+                    return ast.get_source_segment(NOTIFIER_SOURCE, item) or ""
+    return ""
+
+
+BUILD_WAKE = method_source("build_wake_text")
+SEND_PINGS = method_source("_send_pings")
+SEND_EVENT = method_source("_send_event")
+DELIVER = method_source("deliver")
 
 FAILURE_ONLY = {"wake_on_events": ["gave_up", "crashed", "timed_out", "blocked"]}
 
@@ -106,17 +138,17 @@ class Event:
 print("import wiring:")
 check(
     "the notifier resolved the clip import",
-    hasattr(watchers, "_clip_handoff"),
+    hasattr(notifier, "_clip_handoff"),
     "the trailer import did not execute",
 )
 check(
     "the notifier resolved the delivery import",
-    hasattr(watchers, "_kanban_handoff_with_result"),
+    hasattr(notifier, "_kanban_handoff_with_result"),
     "the trailer import did not execute",
 )
 check(
     "the notifier resolved the wake-kinds import",
-    hasattr(watchers, "_wake_kinds_for"),
+    hasattr(notifier, "_wake_kinds_for"),
     "the trailer import did not execute",
 )
 check(
@@ -138,15 +170,16 @@ check(
 print("handoff clip:")
 check(
     "the summary branch clips on a token boundary",
-    "h = _clip_handoff(payload_summary)" in NOTIFIER_SOURCE,
+    "wake_handoff = _clip_handoff(payload_summary)" in NOTIFIER_SOURCE,
 )
 check(
     "the no-summary branch clips on a token boundary",
-    "r = _clip_handoff(task.result)" in NOTIFIER_SOURCE,
+    "wake_handoff = _clip_handoff(n.task.result)" in NOTIFIER_SOURCE,
 )
 check(
     "neither of upstream's hard slices survived",
-    "lines[0][:200]" not in NOTIFIER_SOURCE and "lines[0][:160]" not in NOTIFIER_SOURCE,
+    "_first_line(str(payload_summary), 200)" not in NOTIFIER_SOURCE
+    and "_first_line(n.task.result, 160)" not in NOTIFIER_SOURCE,
     "a surviving slice still severs the URL this patch exists to protect",
 )
 
@@ -158,25 +191,25 @@ PRODUCTION_SUMMARY = (
 )
 check(
     "the production summary that broke now survives whole",
-    watchers._clip_handoff(PRODUCTION_SUMMARY) == PRODUCTION_SUMMARY
-    and LEDGER_URL in watchers._clip_handoff(PRODUCTION_SUMMARY),
+    notifier._clip_handoff(PRODUCTION_SUMMARY) == PRODUCTION_SUMMARY
+    and LEDGER_URL in notifier._clip_handoff(PRODUCTION_SUMMARY),
 )
 check(
     "a URL is dropped rather than severed when the clip does bite",
-    "https://" not in watchers._clip_handoff(PRODUCTION_SUMMARY, 200)
-    and len(watchers._clip_handoff(PRODUCTION_SUMMARY, 200)) <= 200,
+    "https://" not in notifier._clip_handoff(PRODUCTION_SUMMARY, 200)
+    and len(notifier._clip_handoff(PRODUCTION_SUMMARY, 200)) <= 200,
     "a truncated link is a dead link; the whole token has to go",
 )
 check(
     "lines after the first are no longer discarded",
-    watchers._clip_handoff("First line.\nSecond line.\nThird line.").count("\n") == 2,
+    notifier._clip_handoff("First line.\nSecond line.\nThird line.").count("\n") == 2,
 )
 
 # --- 3. Delivery --------------------------------------------------------------
 print("result delivery:")
 check(
     "the completion message's tail is built by the patch",
-    "handoff = _kanban_handoff_with_result(handoff, task)" in NOTIFIER_SOURCE,
+    "handoff = _kanban_handoff_with_result(handoff, n.task)" in NOTIFIER_SOURCE,
     "an appending hook cannot drop the clip the notifier already built",
 )
 
@@ -202,10 +235,10 @@ check(
 )
 check(
     "a dead task row leaves the status line the notifier already built",
-    watchers._kanban_handoff_with_result("\nstatus", None) == "\nstatus",
+    notifier._kanban_handoff_with_result("\nstatus", None) == "\nstatus",
 )
 
-# The branch that has no event summary: kanban_watchers.py builds the status
+# The branch that has no event summary: _fmt_completed builds the status
 # line out of a clip of task.result, so the message used to carry the opening
 # of the report and then the report. On the 60-line catalogue below, jobs 1 to
 # 19 arrived twice.
@@ -222,7 +255,7 @@ check(
     "the fixture is over the status line's budget",
     len(long_catalogue) > DEFAULT_LIMIT,
 )
-no_summary_tail = watchers._kanban_handoff_with_result(
+no_summary_tail = notifier._kanban_handoff_with_result(
     "\n" + clip_handoff(long_catalogue), _ClippedTask()
 )
 check(
@@ -240,7 +273,7 @@ check(
 )
 check(
     "a status line that is not the report is kept",
-    "Cataloged all 9" in watchers._kanban_handoff_with_result(
+    "Cataloged all 9" in notifier._kanban_handoff_with_result(
         "\nCataloged all 9 cron jobs.", _ClippedTask()
     ),
 )
@@ -248,15 +281,19 @@ check(
 # --- 4. The whitelist still covers every kind the notifier knows about --------
 # `resolve_wake_kinds` treats DEFAULT_WAKE_KINDS as a whitelist so a typo in
 # config cannot be mistaken for a real kind. The cost of that is drift: if a
-# base-image bump teaches the notifier a sixth terminal kind, the whitelist
-# silently filters it out and an operator listing it gets a warning about an
-# "unknown" kind their gateway plainly understands. The notifier enumerates the
-# kinds it can describe in its own `_parts` block, so that block is the source
-# of truth to compare against.
+# base-image bump teaches the notifier a new wake kind, the whitelist silently
+# filters it out and an operator listing it gets a warning about an "unknown"
+# kind their gateway plainly understands — and, worse, the no-send paths that
+# always apply the *whole* default set would stop waking for it. Since
+# v2026.9.14 the notifier enumerates the kinds it can describe as the
+# module-level `_WAKE_KINDS` tuple (`build_wake_text` orders its `_parts` by
+# it), so that tuple is the source of truth to compare against, and each kind
+# needs a locale string for the wake text to say anything.
 print("whitelist drift:")
 check(
     "the notifier calls the helper with both no-send tests",
-    'd["events"], adapter=adapter, passive_delivered=send_passive' in NOTIFIER_SOURCE,
+    'self.d["events"], adapter=self.adapter, passive_delivered=self.send_passive'
+    in BUILD_WAKE,
     "adapter= alone is not enough: delivery_mode='wake' skips the text ping on "
     "a push adapter, and narrowing the wake there drops the completion",
 )
@@ -267,7 +304,7 @@ check(
 # check above can see.
 check(
     "and upstream's per-subscription wake gate still wraps it",
-    "if wake_agent" in NOTIFIER_SOURCE,
+    "if self.wake_agent" in BUILD_WAKE,
     "delivery_mode=notify subscribers would be woken anyway",
 )
 # `send_passive` is upstream's own name for "this mode gets a text ping". The
@@ -275,20 +312,21 @@ check(
 # exactly what a future upstream refactor of delivery_mode would do.
 check(
     "and send_passive is still what upstream derives from delivery_mode",
-    'send_passive = mode != "wake"' in NOTIFIER_SOURCE,
+    'self.send_passive = mode != "wake"' in NOTIFIER_SOURCE,
     "the anchor above would bind a name that no longer means "
     "'a ping was sent'",
 )
 check(
-    "upstream's hardcoded tuple is gone",
-    "_WAKE_KINDS = (" not in NOTIFIER_SOURCE and "in _WAKE_KINDS}" not in NOTIFIER_SOURCE,
-    "a second definition would shadow the configurable one",
+    "upstream's hardcoded wake set is gone",
+    "in _WAKE_KINDS} if self.wake_agent" not in BUILD_WAKE
+    and "in _WAKE_KINDS}" not in BUILD_WAKE,
+    "a second computation would shadow the configurable one",
 )
-notifier_kinds = set(re.findall(r'if "(\w+)" in _wake_kinds', NOTIFIER_SOURCE))
+notifier_kinds = set(getattr(notifier, "_WAKE_KINDS", ()))
 check(
     "the notifier's own kind list was located",
     notifier_kinds,
-    "the `if \"<kind>\" in _wake_kinds` block moved; re-derive this check",
+    "gateway.kanban_watchers_notifier._WAKE_KINDS moved; re-derive this check",
 )
 check(
     "every kind the notifier can describe is in DEFAULT_WAKE_KINDS",
@@ -300,6 +338,14 @@ check(
     "DEFAULT_WAKE_KINDS claims nothing the notifier cannot describe",
     set(DEFAULT_WAKE_KINDS) <= notifier_kinds,
     f"whitelist has {sorted(set(DEFAULT_WAKE_KINDS) - notifier_kinds)} extra",
+)
+from agent.i18n import t as _t  # noqa: E402
+
+_unworded = [k for k in DEFAULT_WAKE_KINDS if _t(f"gateway.kanban.wake.{k}") in ("", f"gateway.kanban.wake.{k}")]
+check(
+    "every default wake kind has a locale string for the wake text",
+    not _unworded,
+    f"{_unworded} would render as a bare key in the creator's synthetic turn",
 )
 
 # --- 5. The real config loader is reachable ----------------------------------
@@ -401,6 +447,42 @@ check(
     "keeps narrowing",
     wake_kinds_for(completed, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter) == set(),
 )
+# The review-flow kinds are governed by the key like every other kind: the
+# deployed config lists the four failure kinds, so on a push adapter a review
+# handoff does not wake the creator. Section 9 checks that it is then left
+# unrecorded rather than noted as "already delivered".
+review = [Event("review_requested")]
+check(
+    "a review request does not wake the creator under the four-kind config",
+    wake_kinds_for(review, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter) == set(),
+    "wake_on_events governs all eight kinds on the ping-then-wake path",
+)
+check(
+    "no review-flow kind wakes under an explicit empty list on a push adapter",
+    all(
+        wake_kinds_for([Event(kind)], cfg({"wake_on_events": []}), adapter=BasePlatformAdapter)
+        == set()
+        for kind in UNDELIVERED_OUTCOME_KINDS
+    ),
+)
+check(
+    "every review-flow kind wakes on the api_server path",
+    all(
+        wake_kinds_for([Event(kind)], cfg(FAILURE_ONLY), adapter=APIServerAdapter) == {kind}
+        for kind in UNDELIVERED_OUTCOME_KINDS
+    ),
+    "there the wake self-post is the only delivery",
+)
+check(
+    "a review request listed in the key wakes on a push adapter",
+    wake_kinds_for(review, cfg({"wake_on_events": ["review_requested"]}),
+                   adapter=BasePlatformAdapter) == {"review_requested"},
+)
+check(
+    "the review-flow kinds are all kinds upstream wakes for",
+    set(UNDELIVERED_OUTCOME_KINDS) <= notifier_kinds,
+    f"UNDELIVERED_OUTCOME_KINDS={UNDELIVERED_OUTCOME_KINDS!r} upstream={sorted(notifier_kinds)!r}",
+)
 
 # --- 8. Failure posture -------------------------------------------------------
 print("fail-soft posture:")
@@ -432,7 +514,7 @@ check(
 # Section 7's narrowing is only safe because of this one, and this one is the
 # most silent thing in the patch: it writes into gateway state that nothing else
 # in the build reads back, so a marker parked on the wrong key, a session store
-# that no longer exposes the reverse lookup, or a run.py that stopped draining
+# that no longer exposes the reverse lookup, or a run_turn_runner.py that stopped draining
 # the sidecar notes all produce *exactly* what the unpatched gateway produced —
 # a creator whose transcript never learns the card finished. That is the 9m46s
 # of dead wait on task t_a8f58a2a, and no exception is raised anywhere along the
@@ -453,7 +535,7 @@ from agent.turn_context import consume_gateway_turn_context_notes  # noqa: E402
 
 check(
     "the notifier resolved the marker import",
-    hasattr(watchers, "_kanban_note_suppressed"),
+    hasattr(notifier, "_kanban_note_suppressed"),
     "the trailer import did not execute",
 )
 check(
@@ -463,25 +545,29 @@ check(
 )
 check(
     "the marker is called with everything it names the card by",
-    'self, d["events"], _wake_kinds, task, sub, board_slug,' in NOTIFIER_SOURCE,
+    'self.runner, self.d["events"], self.wake_kinds, task, sub, self.board_slug,'
+    in BUILD_WAKE,
 )
-_wake_at = NOTIFIER_SOURCE.find(
-    'd["events"], adapter=adapter, passive_delivered=send_passive'
+_wake_at = BUILD_WAKE.find(
+    'self.d["events"], adapter=self.adapter, passive_delivered=self.send_passive'
 )
-_note_at = NOTIFIER_SOURCE.find("_kanban_note_suppressed(")
-# `if task_terminal:` guards this delivery's unsub. It is the tail of the same
-# block the marker sits in, and unlike `self._kanban_unsub` — which upstream
-# also calls from two sibling branches earlier in the loop — it appears once.
-_terminal_at = NOTIFIER_SOURCE.find("if task_terminal:")
+_note_at = BUILD_WAKE.find("_kanban_note_suppressed(")
 check(
     "the marker runs after the wake set it reports on",
     0 <= _wake_at < _note_at,
     "it subtracts the wake set from what upstream would have woken for",
 )
+# deliver() is the only caller of build_wake_text(), and it calls it after
+# _send_pings() returned True and before this delivery's unsub — which is what
+# makes "its result was already delivered to this conversation" true when the
+# note is written, and keeps the subscription row alive while it is.
 check(
-    "the marker runs in the block that owns the terminal event",
-    0 <= _note_at < _terminal_at,
-    "the marker drifted past the unsub; re-derive the wake anchor",
+    "the marker runs once every ping has been sent and before the unsub",
+    0
+    <= DELIVER.find("self._send_pings()")
+    < DELIVER.find("self.build_wake_text()")
+    < DELIVER.find("await self.unsub()"),
+    "deliver() was reordered; re-derive the wake anchor",
 )
 
 # The reverse lookup. task.session_id is a persisted session *id*; per-turn
@@ -509,12 +595,14 @@ for _name in (
 # The two links between the note being staged and the model seeing it. Neither
 # is reachable from here without booting a turn, and either one going away turns
 # the marker into a write nobody reads.
-RUN_SOURCE = open("gateway/run.py").read()
+# v2026.9.14 moved the turn runner out of run.py; the drain now reads
+# ``runner._consume_pending_turn_sidecar_notes(ctx.session_key)`` there.
+RUN_SOURCE = open("gateway/run_turn_runner.py").read()
 TURN_CONTEXT_SOURCE = open("agent/turn_context.py").read()
 check(
-    "run.py still drains the staged notes onto the agent",
+    "run_turn_runner.py still drains the staged notes onto the agent",
     "_gateway_turn_context_notes = " in RUN_SOURCE
-    and "self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)" in RUN_SOURCE,
+    and "_consume_pending_turn_sidecar_notes(ctx.session_key)" in RUN_SOURCE,
     "staged notes would accumulate on the session and never reach a turn",
 )
 check(
@@ -563,6 +651,18 @@ check(
     suppressed_kinds(COMPLETED, wake_kinds_for(COMPLETED, cfg({}),
                                                adapter=BasePlatformAdapter)) == set(),
 )
+REVIEW = [Event("review_requested")]
+REVIEW_WOKEN = wake_kinds_for(REVIEW, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter)
+check(
+    "a review request the config does not wake for is not reported as suppressed",
+    REVIEW_WOKEN == set() and suppressed_kinds(REVIEW, REVIEW_WOKEN) == set(),
+    "the note would tell the creator the result was already delivered while "
+    "the card waits in `review` for its decision",
+)
+check(
+    "and no note is staged for it",
+    note_suppressed_completion(runner, REVIEW, REVIEW_WOKEN, _Card(), SUB, "") is False,
+)
 check(
     "the marker was staged on the creator's session",
     note_suppressed_completion(runner, COMPLETED, set(), _Card(), SUB, "") is True,
@@ -574,7 +674,7 @@ check(
     and runner._peek_session_state(CREATOR_ID) is None,
 )
 
-# Exactly what gateway/run.py does at the top of the creator's next turn.
+# Exactly what gateway/run_turn_runner.py does at the top of the creator's next turn.
 staged = runner._consume_pending_turn_sidecar_notes(CREATOR_KEY)
 check("the next turn reads back one note", len(staged) == 1, f"got {staged!r}")
 check(
@@ -680,7 +780,7 @@ from gateway.kanban_notifier import (  # noqa: E402
 
 check(
     "the notifier resolved the incident import",
-    hasattr(watchers, "_kanban_store_incident"),
+    hasattr(notifier, "_kanban_store_incident"),
     "the trailer import did not execute",
 )
 check(
@@ -689,10 +789,11 @@ check(
 )
 check(
     "it is called with this event and the address the report went to",
-    "_kanban_store_incident(ev, task, sub, posted=send_passive)" in NOTIFIER_SOURCE,
+    "_kanban_store_incident(ev, self.task, self.sub, posted=self.send_passive)"
+    in SEND_PINGS,
     "`sub` is the row kanban_event_routing substituted the chat route into, and "
     "any other source of chat_id is the undeliverable api_server one; `ev` "
-    "rather than d[\"events\"] because this anchor is inside the per-event loop, "
+    "rather than self.d[\"events\"] because _send_pings is the per-event loop, "
     "so the delivery\'s kind set would store the row on its `commented` event "
     "before the `completed` one had sent the report",
 )
@@ -705,21 +806,23 @@ check(
 # check alone would report that as "the row is written before the report", which
 # sends the next reader after a bug that is not there.
 _send_at = NOTIFIER_SOURCE.find("_send_res = await _progress_deliver(")
-_store_at = NOTIFIER_SOURCE.find("_kanban_store_incident(")
 check(
     "the send this ordering is measured against is still there",
-    _send_at >= 0,
-    "kanban_watchers.py no longer sends through _progress_deliver; re-derive "
-    "this anchor before trusting the ordering check below",
+    _send_at >= 0 and "_send_res = await _progress_deliver(" in SEND_EVENT,
+    "kanban_watchers_notifier.py no longer sends through _progress_deliver in "
+    "_send_event; re-derive this anchor before trusting the ordering check below",
 )
+# _send_event is the send; _send_pings awaits it per event and the incident
+# call follows that await inside the same try, so a send that raised never
+# reaches it.
 check(
     "the row is written after the report was sent",
-    0 <= _send_at < _store_at,
+    0 <= SEND_PINGS.find("await self._send_event(ev, msg)") < SEND_PINGS.find("_kanban_store_incident("),
     "a row claiming the reader has a report they were never shown",
 )
 check(
     "the row is written before this delivery's unsub",
-    0 <= _store_at < NOTIFIER_SOURCE.find("if task_terminal:"),
+    0 <= DELIVER.find("self._send_pings()") < DELIVER.find("await self.unsub()"),
     "the subscription carrying chat_id/thread_id is deleted there",
 )
 

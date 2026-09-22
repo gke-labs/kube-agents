@@ -9,23 +9,26 @@ What leaked, and where (issue #603)
 -----------------------------------
 A worker that fetches a token by hand -- ``gcloud auth print-access-token`` or
 the metadata server -- and pastes it into a ``curl`` writes it to disk twice on
-the pinned Hermes (v2026.8.19). Two of the issue's four sinks were already
+the pinned Hermes (v2026.9.14, as on v2026.8.19). Two of the issue's four sinks were already
 redacted upstream: ``hermes_logging.py`` formats ``agent.log`` through
-``RedactingFormatter``, and ``tools/terminal_tool.py`` passes the terminal
-output spill through ``redact_terminal_output``. Two were not:
+``RedactingFormatter``, and ``tools/terminal_tool_result.py`` passes the
+terminal output and its spill file through ``redact_terminal_output``. Two were
+not:
 
 1. **The pattern.** ``agent/redact.py``'s ``_PREFIX_PATTERNS`` has no entry for
    a GCP OAuth access token (``ya29.``), so a bare token -- an ``export
    TOKEN=``, a URL, a model echoing it -- is not recognised anywhere. The
    ``Authorization: Bearer`` header and a JSON ``access_token`` field are.
-2. **The transcript.** ``hermes_cli/kanban_db.py`` opens
-   ``<board>/logs/<task>.log`` and hands it to ``Popen`` as the worker's stdout
-   with stderr merged. Nothing between the worker's prints and that file
-   redacts, and the ``💻 $`` completion line ``agent/display.py`` renders
-   carries the whole command: ``redact_tool_args_for_display`` handles only
-   ``browser_type``, and ``_trunc`` returns the command untruncated at the
-   default ``display.tool_preview_length`` of 0. The reproduction on the
-   live-test install put a 1503-character synthetic token in that line.
+2. **The transcript.** ``hermes_cli/kanban_db_dispatch.py`` opens
+   ``<board>/logs/<task>.log`` (``_open_worker_log``) and hands it to ``Popen``
+   as the worker's stdout with stderr merged. Nothing between the worker's
+   prints and that file redacts, and the ``💻 $`` completion line
+   ``agent/display.py`` renders carries the whole command:
+   ``redact_tool_args_for_display`` handles only ``browser_type``, and
+   ``_cute_trunc`` (``_tail_trunc`` underneath) returns the command untruncated
+   at the default ``display.tool_preview_length`` of 0, which it reads as
+   unlimited. The reproduction on the live-test install put a 1503-character
+   synthetic token in that line.
 
 What this module does
 ---------------------

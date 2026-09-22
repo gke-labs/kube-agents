@@ -180,6 +180,13 @@ is_valid_model_provider() {
   [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai)$ ]]
 }
 
+# MODEL_MAX_TOKENS: a whole number of output tokens, 0 meaning none. Digits
+# only, so a sign, a decimal point or a unit suffix is refused before it
+# reaches terraform.tfvars as a bare word HCL cannot parse.
+is_non_negative_integer() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
 # read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
@@ -266,7 +273,7 @@ warn_on_overreaching_custom_roles() {
 # (us-central1-a). Autopilot clusters are regional, so this is what decides
 # whether the default shape is creatable at a given location. One home for the
 # pattern: install.sh both demotes the default and validates an explicit
-# --cluster-mode against it, and the two must agree.
+# --gke-cluster-mode against it, and the two must agree.
 location_is_region() {
   [[ "${1:-}" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]
 }
@@ -1443,7 +1450,7 @@ write_tfvars_from_state() {
   # deletion-protection apply and upgrade's full apply both became cluster
   # replacements.
   #
-  # CLUSTER_MODE (install.sh --cluster-mode, recorded in install.env) therefore
+  # CLUSTER_MODE (install.sh --gke-cluster-mode, recorded in install.env) therefore
   # decides ONE case: the fresh create, where the probe found no cluster and
   # the interview is the only information there is. Every branch on which a
   # cluster exists assigns cluster_mode from the probe, so a stale or
@@ -1670,7 +1677,7 @@ write_tfvars_from_state() {
   # pool AND the RuntimeClass on the pod; Autopilot ships the gvisor
   # RuntimeClass natively and has no pool to manage, so asking the gke-cluster
   # module for one there fails the plan. Deriving both from the probed
-  # cluster_mode keeps --gvisor=true meaning the same thing on either shape.
+  # cluster_mode keeps --enable-gvisor=true meaning the same thing on either shape.
   #
   # The fallback stays false even though a fresh install now defaults to the
   # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
@@ -1697,7 +1704,7 @@ write_tfvars_from_state() {
       # release channel's current version, which has been past the floor since
       # 2023. There is nothing to describe yet, so checking would only produce
       # the "could not read the version" warning below on every fresh
-      # --cluster-mode=autopilot --gvisor=true install.
+      # --gke-cluster-mode=autopilot --enable-gvisor=true install.
       print_info "Creating Autopilot cluster '${CLUSTER_NAME}': using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
     else
       # Autopilot's gvisor RuntimeClass arrived in a specific GKE version, and
@@ -1725,12 +1732,23 @@ write_tfvars_from_state() {
         print_warning "Could not read the GKE version of Autopilot cluster '${CLUSTER_NAME}'; proceeding as though it supports GKE Sandbox. Below ${GVISOR_AUTOPILOT_MIN_VERSION} the agent Deployment is never created and this run fails at its final check."
       elif ! gke_version_at_least "$master_version" "$GVISOR_AUTOPILOT_MIN_VERSION"; then
         print_error "Autopilot cluster '${CLUSTER_NAME}' runs GKE ${master_version}, and its gvisor RuntimeClass needs ${GVISOR_AUTOPILOT_MIN_VERSION} or later."
-        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in install.env. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
+        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --enable-gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in install.env. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
         print_info "Tearing down instead? uninstall.sh forces ENABLE_GVISOR=false and is never blocked by this check; if you reach it from some other caller, export ENABLE_GVISOR=false first."
         return 1
       fi
       print_info "Cluster '${CLUSTER_NAME}' is Autopilot: using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
     fi
+  fi
+
+  # Empty takes the default, 0, and both render nothing in the chart. Checked
+  # here as well as in install.sh's interview because upgrade.sh and
+  # uninstall.sh regenerate from install.env without it, and a bare word in
+  # HCL would otherwise fail at terraform's parser with a message naming
+  # neither the key nor the file to fix.
+  local model_max_tokens="${MODEL_MAX_TOKENS:-$DEFAULT_MODEL_MAX_TOKENS}"
+  if ! is_non_negative_integer "$model_max_tokens"; then
+    print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
+    return 1
   fi
 
   local old_umask
@@ -1761,7 +1779,7 @@ write_tfvars_from_state() {
     echo ""
     echo "# The DNS endpoint is open and deletion protection is off. cluster_mode is"
     echo "# the live cluster's own shape whenever there is one to probe, and the"
-    echo "# --cluster-mode the install asked for only on a create."
+    echo "# --gke-cluster-mode the install asked for only on a create."
     echo "cluster_mode               = $(hcl_str "${cluster_mode}")"
     echo "create_cluster             = ${create_cluster}"
     echo "# An adoption that chose to install without NetworkPolicy enforcement."
@@ -1780,6 +1798,7 @@ write_tfvars_from_state() {
     echo ""
     echo "model_provider     = $(hcl_str "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")"
     echo "model_default_name = $(hcl_str "${MODEL_DEFAULT_NAME:-}")"
+    echo "model_max_tokens   = ${model_max_tokens}"
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"

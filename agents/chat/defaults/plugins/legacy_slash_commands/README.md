@@ -12,8 +12,8 @@ that slash is registered on the Slack app**. Our provisioning flow creates the
 app from tokens alone, so nothing is registered, and Slack delivers
 `/hermes sethome` as an ordinary channel message. From there:
 
-1. `gateway/run.py` parses the message text and reads the command name as
-   `hermes`.
+1. `gateway/run_inbound.py` (the inbound mixin `gateway/run.py` composes)
+   parses the message text and reads the command name as `hermes`.
 2. `hermes` is not in `COMMAND_REGISTRY` (the registry holds `sethome`,
    `model`, `compress`, … — never `hermes`), so the gateway logs
    `Unrecognized slash command /hermes from slack` and replies "Unknown command
@@ -52,7 +52,7 @@ text>` as a way to ask a question through a single slash entry point.
 
 `pre_gateway_dispatch` fires once per inbound user message, after the
 internal-event guard and **before** auth and command resolution
-(`gateway/run.py`), and a hook may return `{"action": "rewrite", "text": ...}`
+(`gateway/run_inbound.py`, `_hm_pre_gateway_dispatch_hook`), and a hook may return `{"action": "rewrite", "text": ...}`
 to replace `event.text`. Command resolution reads `event.text` afterwards
 (`MessageEvent.get_command()`), so the rewrite lands in time.
 

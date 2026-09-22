@@ -434,6 +434,17 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_check_that_asserts_without_a_field_is_not_rejected(self):
+        # An empty CHECK_ASSERTIONS tuple is the "no field can switch this off"
+        # case, not a missing entry: pull_request_opened fails on a report
+        # naming no pull request with nothing configured. Read as a missing
+        # entry it would reject every case using one.
+        problems = []
+        validator._check_assertions(
+            {"type": "pull_request_opened"}, "check 'x'", problems
+        )
+        self.assertEqual(problems, [])
+
     def test_main_exits_non_zero_when_a_case_is_rejected(self):
         # Every other test here reads the problem list that validate_case
         # returns. None of them runs main(), so none of them would notice if

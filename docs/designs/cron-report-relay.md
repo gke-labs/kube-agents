@@ -484,7 +484,7 @@ use, is upstream's sender and carries no such guard.
 ## How the switch is wired: `chat` is a platform
 
 Nothing in Hermes is patched. Upstream already routes `deliver=<name>` through
-the platform registry, and `cron/scheduler.py::_plugin_cron_env_var` says so in
+the platform registry, and `cron/scheduler_delivery.py::_plugin_cron_env_var` says so in
 its own words — a plugin that sets `cron_deliver_env_var` gets "cron delivery
 support without editing this module". So the relay ships as a bundled platform
 plugin, [`deploy/docker/plugins/chat/`](../../deploy/docker/plugins/chat/),

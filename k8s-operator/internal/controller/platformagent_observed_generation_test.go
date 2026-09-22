@@ -178,7 +178,7 @@ func TestDegradedStatusRecordsTheGenerationItWasComputedFrom(t *testing.T) {
 	agent := observedGenerationAgent(5)
 	r := observedGenerationReconciler(agent, &statusWriteCounter{})
 
-	if err := r.updateStatusDegraded(context.Background(), agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured in this cluster"); err != nil {
+	if err := r.updateStatusDegraded(context.Background(), agent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured in this cluster", workloadNotRendered); err != nil {
 		t.Fatalf("updateStatusDegraded failed: %v", err)
 	}
 	if agent.Status.Phase != "Degraded" {

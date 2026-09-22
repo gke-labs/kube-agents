@@ -10,7 +10,11 @@ the thread called two of them wrong. Calibrating the detector against invented
 examples would prove nothing — these are the actual dispute.
 """
 
+import pathlib
+import tempfile
 import unittest
+
+from apply_kanban_report_format import HANDLER, NEW_BODY_ARG, OLD_BODY_ARG, RELATIVE, apply
 
 from kanban_report_format import (
     DEFECT_ADVICE,
@@ -327,6 +331,69 @@ class WellShapedFixtureTest(unittest.TestCase):
         from test_kanban_notifier import STRUCTURED_RESULT
 
         self.assertEqual(serious_defects(STRUCTURED_RESULT), ())
+
+
+# =============================================================================
+# The applier
+# =============================================================================
+
+# tools/kanban_tools.py reduced to the handler the anchor sits inside and one
+# neighbour, so the span check has something to tell apart.
+UPSTREAM_TOOLS = '''\
+def _handle_show(args: dict, **kw) -> str:
+    return _ok(task_id=args.get("task_id"))
+
+
+@_kanban_handler("kanban_create")
+def _handle_create(args: dict, **kw) -> str:
+    with _board(args.get("board")) as (kb, conn):
+        task = kb.create_task(
+            conn,
+            title=args["title"],
+            body=args.get("body"),
+            assignee=args.get("assignee"),
+        )
+    return _ok(task_id=task.id)
+'''
+
+#: The same keyword, moved to a handler the stanza must not reach.
+MOVED_TOOLS = UPSTREAM_TOOLS.replace(
+    '            body=args.get("body"),\n', ""
+).replace(
+    '    return _ok(task_id=args.get("task_id"))\n',
+    '    return _ok(task_id=args.get("task_id"), body=args.get("body"),)\n',
+)
+
+
+class ApplierTest(unittest.TestCase):
+    def _stage(self, source):
+        root = pathlib.Path(tempfile.mkdtemp())
+        target = root / RELATIVE
+        target.parent.mkdir(parents=True)
+        target.write_text(source)
+        return root, target
+
+    def test_the_anchor_inside_the_create_handler_is_wrapped(self):
+        root, target = self._stage(UPSTREAM_TOOLS)
+        apply(root)
+        patched = target.read_text()
+        self.assertIn(NEW_BODY_ARG, patched)
+        self.assertNotIn(OLD_BODY_ARG, patched)
+
+    def test_the_same_keyword_in_another_handler_fails_the_build(self):
+        # Still exactly one anchor in the file, so the count check alone would
+        # have wrapped the wrong call.
+        self.assertEqual(MOVED_TOOLS.count(OLD_BODY_ARG), 1)
+        self.assertNotIn(HANDLER, MOVED_TOOLS.split(OLD_BODY_ARG)[0].rsplit("def ", 1)[-1])
+        root, _ = self._stage(MOVED_TOOLS)
+        with self.assertRaises(SystemExit) as raised:
+            apply(root)
+        self.assertIn(HANDLER, str(raised.exception))
+
+    def test_a_missing_create_handler_fails_the_build(self):
+        root, _ = self._stage(UPSTREAM_TOOLS.replace("def _handle_create(", "def _handle_make("))
+        with self.assertRaises(SystemExit):
+            apply(root)
 
 
 if __name__ == "__main__":

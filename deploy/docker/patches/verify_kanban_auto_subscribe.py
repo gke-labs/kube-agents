@@ -46,9 +46,11 @@ os.environ.pop("HERMES_KANBAN_TASK", None)
 os.environ.pop("HERMES_SESSION_KEY", None)
 
 from hermes_cli import kanban_db as K  # noqa: E402
+from hermes_cli import kanban_db_connect as KC  # noqa: E402
+from hermes_cli import kanban_db_notify as KN  # noqa: E402
 import tools.kanban_tools as kt  # noqa: E402
 
-conn = K.connect(DB)
+conn = KC.connect(DB)
 
 
 def subs(task_id):
@@ -80,7 +82,7 @@ TERMINAL_KINDS = (
 
 def would_replay(task_id):
     """The events the notifier's next tick would post for ``task_id``."""
-    _, events = K.unseen_events_for_sub(
+    _, events = KN.unseen_events_for_sub(
         conn,
         task_id=task_id,
         platform="slack",
@@ -108,7 +110,7 @@ check(
 print("worker-created cards:")
 # The coordinator card, subscribed the way the chat agent's session was.
 coordinator = K.create_task(conn, title="coordinator", assignee="platform")
-K.add_notify_sub(
+KN.add_notify_sub(
     conn,
     task_id=coordinator,
     platform="slack",

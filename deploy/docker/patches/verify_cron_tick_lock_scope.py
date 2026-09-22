@@ -2,7 +2,7 @@
 """Build gate for the cron tick-lock-scope patch.
 
 Run by deploy/docker/Dockerfile from /opt/hermes after
-apply_cron_tick_lock_scope.py. The applier only proves fourteen anchors
+apply_cron_tick_lock_scope.py. The applier only proves twelve anchors
 matched; it proves nothing about WHERE the release landed, and a release placed
 one statement too early would silently break at-most-once.
 
@@ -18,7 +18,8 @@ harmful:
    backstop and nothing else -- if it still touches ``lock_fd`` directly, the
    old wide-scope unlock survived alongside the new one.
 
-2. THE CLAIM IS CARRIED, NOT LOOKED UP. Assert the dispatch guard binds
+2. THE CLAIM IS CARRIED, NOT LOOKED UP. Assert the dispatch guard
+   (``_submit_with_guard``, module-level since v2026.9.14) binds
    ``_job_lock`` from ``_job_locks.claim(...)``, hands that object to
    ``_run_and_release`` as a default argument, releases through it, and that
    ``_job_locks.release(`` appears nowhere. Releasing by job id meant
@@ -36,18 +37,24 @@ harmful:
 
    This is where the flock lives *because* of that last assertion. Before the
    split it sat in ``_execute_job_now`` and ran strictly before the store CAS,
-   so a refused claim cost nothing; now the CAS is one frame up and
-   ``next_run_at`` is already advanced when the flock is refused. The trade is
+   so a refused claim cost nothing; now the CAS is one frame up, so the fire
+   claim is stamped and a recurring job's ``next_run_at`` re-anchored from now
+   when the flock is refused (no occurrence identity: the manual claim stamps
+   none, so the pending slot is not marked done). The trade is
    deliberate -- guarding the run body covers every caller, guarding one caller
    covers one -- and it is the trade upstream already makes for its own
    ``try_register_running_job``, which sits directly above the claim, after the
    same CAS. The checks pin both halves: the CAS stays with the caller and the
    caller takes no second flock.
 
-4. THE SPAWNED TICK SWEEPS FIRST. Assert ``hermes_cli/cron.py::cron_tick``
-   calls ``recover_interrupted_executions`` before ``tick``, and inside a
-   ``try`` -- a bookkeeping sweep that raises must never cost the profile its
-   tick.
+4. THE SPAWNED TICK SWEEPS. This used to be the applier's own edit to
+   ``hermes_cli/cron.py::cron_tick``; since v2026.9.14 upstream's ``tick``
+   calls ``_maybe_reap_dead_owners`` (#86721), which runs
+   ``recover_interrupted_executions`` behind a throttle held in a module
+   global. The edit is retired and this check pins what replaced it: the
+   call is wired, it precedes dispatch, the sweep is inside a ``try`` so a
+   bookkeeping failure cannot cost the profile its tick, and the throttle
+   starts unset so a freshly spawned process never skips its first reap.
 
 5. HEAD-OF-LINE IS GONE, AND THE GUARD IS ARMED. Against a throwaway
    HERMES_HOME with one ``no_agent`` job whose script sleeps, run a real
@@ -61,8 +68,9 @@ harmful:
 
 6. A STUCK LEDGER ROW IS REAPED. Leave a ``running`` row behind from a child
    that exits without finishing it -- the live platform profile had six of
-   these, the oldest a day old -- then run the patched ``cron_tick`` in another
-   child and assert the row became ``unknown``.
+   these, the oldest a day old -- then run ``cron_tick`` in another child and
+   assert the row became ``unknown``. The sweep it exercises is upstream's
+   (check 4); the row is what the retired edit used to be for.
 
 Checks 5 and 6 are real cross-process exercises, not AST assertions: separate
 interpreters hold the locks and own the ledger rows, and this process is the
@@ -91,6 +99,10 @@ from pathlib import Path
 HERMES = Path(os.environ.get("HERMES_ROOT", "/opt/hermes"))
 if str(HERMES) not in sys.path:
     sys.path.insert(0, str(HERMES))
+
+#: The module global upstream's ``_maybe_reap_dead_owners`` throttles on; the
+#: sweep check reads it back to prove the spawned tick really ran the sweep.
+REAP_THROTTLE_NAME = "_last_dead_owner_reap_at"
 
 FAILURES: list[str] = []
 
@@ -188,12 +200,14 @@ def check_release_placement() -> None:
 
 
 def check_claim_is_carried() -> None:
-    print("claim ownership (cron/scheduler.py dispatch guard):")
+    print("claim ownership (cron/scheduler.py::_submit_with_guard):")
     scheduler = HERMES / "cron" / "scheduler.py"
     source = scheduler.read_text()
-    _tree, fn = function_named(scheduler, "tick")
+    _tree, fn = function_named(scheduler, "_submit_with_guard")
+    check("_submit_with_guard still owns the dispatch guard", fn is not None,
+          "v2026.9.14 lifted the guard out of tick() into this module-level "
+          "helper; if it moved again the flock claim went with it")
     if fn is None:
-        check("tick() is still a module-level function", False)
         return
     src = ast.unparse(fn)
 
@@ -266,20 +280,28 @@ def check_dispatch_claims_the_flock() -> None:
           "that does not go through _run_claimed_job takes no per-job flock")
 
     # The CAS now happens in the caller, one frame up, so a lost flock is
-    # discovered after next_run_at has already advanced. That is a real cost
+    # discovered after the fire claim is stamped and a recurring job's
+    # next_run_at re-anchored from now (no occurrence identity: the manual
+    # claim stamps none, so the pending slot is not marked done). That is a real cost
     # and it is deliberate: guarding _run_claimed_job covers all four dispatch
     # paths, guarding _execute_job_now covers one, and it is the same trade
     # upstream already makes for its own try_register_running_job — which sits
     # directly above the claim, after the same CAS. Asserted so the claim
     # cannot drift back into a single caller unnoticed.
+    # v2026.9.14 moved the store CAS itself into _claim_for_manual_run, which
+    # the sync (_execute_job_now) and background (_try_dispatch_background_run)
+    # paths share; both are still one frame up from the flock.
     _tree2, outer = function_named(path, "_execute_job_now")
+    _tree3, claimer = function_named(path, "_claim_for_manual_run")
     check("_execute_job_now still exists", outer is not None)
-    if outer is not None:
+    check("_claim_for_manual_run still holds the store CAS", claimer is not None)
+    if outer is not None and claimer is not None:
         check("the CAS stays with the caller",
-              len(call_linenos(outer, named_call("claim_job_for_fire"))) == 1,
+              len(call_linenos(outer, named_call("_claim_for_manual_run"))) == 1
+              and len(call_linenos(claimer, named_call("claim_job_for_fire"))) == 1,
               "found none — the store CAS is what makes this a *claimed* job")
         check("and the caller takes no flock of its own",
-              not job_lock_claims(outer),
+              not job_lock_claims(outer) and not job_lock_claims(claimer),
               "two claims of one job on one thread is a self-deadlock, not "
               "a stronger guard")
 
@@ -294,29 +316,50 @@ def check_dispatch_claims_the_flock() -> None:
               f"claim silently suppresses the job: {finally_src!r}")
 
 
-# --- 4. hermes_cli/cron.py ---------------------------------------------------
-def check_spawned_tick_sweeps_first() -> None:
-    print("recovery sweep (hermes_cli/cron.py::cron_tick):")
-    path = HERMES / "hermes_cli" / "cron.py"
-    _tree, fn = function_named(path, "cron_tick")
-    check("cron_tick still exists", fn is not None)
-    if fn is None:
+# --- 4. cron/scheduler.py: upstream's per-tick sweep ------------------------
+
+
+def check_spawned_tick_sweeps() -> None:
+    print("recovery sweep (cron/scheduler.py::tick -> _maybe_reap_dead_owners):")
+    scheduler = HERMES / "cron" / "scheduler.py"
+    tree, tick_fn = function_named(scheduler, "tick")
+    _tree2, reaper = function_named(scheduler, "_maybe_reap_dead_owners")
+    check("tick() is still a module-level function", tick_fn is not None)
+    check("_maybe_reap_dead_owners still exists", reaper is not None,
+          "upstream's replacement for this applier's retired cron_tick edit "
+          "is gone — a spawned tick is this profile's entire scheduler "
+          "lifecycle, so nothing else will ever reap a stuck row")
+    if tick_fn is None or reaper is None:
         return
 
-    sweeps = call_linenos(fn, named_call("recover_interrupted_executions"))
-    ticks = call_linenos(fn, named_call("tick"))
-    check("it sweeps interrupted executions", len(sweeps) == 1,
-          f"found {len(sweeps)} — a spawned tick is this profile's entire "
-          "scheduler lifecycle, so nothing else will ever reap a stuck row")
-    check("it still ticks", len(ticks) == 1, f"found {len(ticks)}")
-    if sweeps and ticks:
-        check("the sweep runs before the tick", sweeps[0] < ticks[0],
-              f"sweep at {sweeps[0]}, tick at {ticks[0]}")
+    reaps = call_linenos(tick_fn, named_call("_maybe_reap_dead_owners"))
+    dues = call_linenos(tick_fn, named_call("get_due_jobs"))
+    check("tick reaps dead owners", len(reaps) == 1, f"found {len(reaps)}")
+    check("it still reads the due set", len(dues) == 1, f"found {len(dues)}")
+    if reaps and dues:
+        check("the reap runs before dispatch", reaps[0] < dues[0],
+              f"reap at {reaps[0]}, get_due_jobs at {dues[0]}")
 
+    sweeps = call_linenos(reaper, named_call("recover_interrupted_executions"))
+    check("the reaper runs the recovery sweep", len(sweeps) == 1,
+          f"found {len(sweeps)}")
     guarded = any(sweeps and t.lineno <= sweeps[0] <= (t.end_lineno or t.lineno)
-                  for t in ast.walk(fn) if isinstance(t, ast.Try))
+                  for t in ast.walk(reaper) if isinstance(t, ast.Try))
     check("the sweep is wrapped in a try", guarded,
           "bookkeeping that raises would cost the profile its tick")
+
+    # The throttle is a module global, so a spawned `hermes cron tick` starts
+    # with it unset and reaps on its first (only) tick. A default that was not
+    # None would silently turn the sweep back off for this profile.
+    throttle = [n for n in tree.body
+                if isinstance(n, (ast.Assign, ast.AnnAssign))
+                and any(getattr(t, "id", None) == REAP_THROTTLE_NAME
+                        for t in (n.targets if isinstance(n, ast.Assign)
+                                  else [n.target]))]
+    check("the reap throttle starts unset in a fresh process",
+          len(throttle) == 1 and isinstance(throttle[0].value, ast.Constant)
+          and throttle[0].value.value is None,
+          f"found {[ast.unparse(n) for n in throttle]!r}")
 
 
 # --- 5 + 6. behavioural ------------------------------------------------------
@@ -485,6 +528,8 @@ def check_behaviour() -> None:
 
 def check_recovery_sweep() -> None:
     print("recovery sweep (a stuck row from a process that is gone):")
+    # Driven through the real CLI entry point, so this is the behaviour the
+    # wiring check above stands for: a spawned tick, in a fresh process, reaps.
     with tempfile.TemporaryDirectory() as d:
         home = Path(d)
         write_job_store(home, [])
@@ -528,7 +573,7 @@ if __name__ == "__main__":
     check_release_placement()
     check_claim_is_carried()
     check_dispatch_claims_the_flock()
-    check_spawned_tick_sweeps_first()
+    check_spawned_tick_sweeps()
     check_behaviour()
     check_recovery_sweep()
     print()

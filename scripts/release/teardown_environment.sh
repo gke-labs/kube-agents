@@ -54,6 +54,10 @@ case "${TEARDOWN_STATUS}" in
     # install. Here the environment is simply still running and still being
     # billed, and nothing later in the pipeline will remove it, so the only
     # useful outcome is a red job somebody looks at.
+    UNINSTALL_BY_HAND="./uninstall.sh --non-interactive -y --gcp-project-id=${GCP_PROJECT_ID} --gcp-region=${GCP_REGION} --gke-cluster-name=${GKE_CLUSTER_NAME}"
+    if [ -n "${NAMESPACE:-}" ]; then
+      UNINSTALL_BY_HAND+=" --agent-namespace=${NAMESPACE}"
+    fi
     teardown_report_failure \
       "${TEARDOWN_STATUS}" "${TEARDOWN_LOG}" \
       "uninstall.sh exited ${TEARDOWN_STATUS}; the environment is STILL RUNNING and no later step will remove it." \
@@ -64,7 +68,7 @@ case "${TEARDOWN_STATUS}" in
       "" \
       "Remove it by hand — one line, so it can be copied out of here whole:" \
       "" \
-      "\`./uninstall.sh --non-interactive -y --project-id=${GCP_PROJECT_ID} --region=${GCP_REGION} --cluster-name=${GKE_CLUSTER_NAME}\`" \
+      "\`${UNINSTALL_BY_HAND}\`" \
       "" \
       "On the RC pipeline the alternative is the next scheduled run's pre-install" \
       "teardown, three hours away, which will fail the same way if the cause is not" \

@@ -444,19 +444,40 @@ ConfigMap changed, the checksum did not, the Deployment did not roll. The
 gateway mounts this with subPath, and a subPath ConfigMap mount never receives
 in-place updates, so the running pod would have kept the old file indefinitely.
 
-Takes a dict of provider, model, callbacks.
+Takes a dict of provider, model, callbacks, and maxTokens (optional; 0 or
+absent renders no max_tokens).
 */}}
 {{- define "kube-agents.litellmConfig" -}}
+{{- /*
+  max_tokens on every alias when .maxTokens is above zero, and no key at all
+  otherwise, so the default render stays byte-identical to the kustomize base
+  (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
+  no such key on purpose. One value for all three aliases: they are one
+  upstream model, and the budget is the backend's property, not the alias's.
+  LiteLLM's router spreads litellm_params underneath the request's own
+  arguments, so this is what a request that names no max_tokens gets, not a
+  ceiling on one that does; values.yaml says what that means for the agent.
+*/}}
+{{- $maxTokens := int (.maxTokens | default 0) -}}
 model_list:
   - model_name: model-default
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
   - model_name: hermes-agent
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
   - model_name: {{ .model }}
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*

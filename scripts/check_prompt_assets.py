@@ -830,7 +830,7 @@ def check_cron_delivery() -> list[Finding]:
             # than reporting a shape it would have run happily.
             #
             # `,` and nothing else, case-folded below. The parser this guards
-            # is `cron/scheduler.py::_resolve_delivery_targets` -- the code that
+            # is `cron/scheduler_delivery.py::_resolve_delivery_targets` -- the code that
             # decides where a report actually goes -- and it splits on `,`
             # alone. This once also split on `;`, on the authority of the chat
             # relay's own token reader, which is not that parser: it decides

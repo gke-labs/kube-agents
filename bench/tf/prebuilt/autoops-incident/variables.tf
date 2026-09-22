@@ -78,8 +78,9 @@ variable "agent_container" {
 # ---------------------------------------------------------------------------
 
 # Static, not per-BUILD_ID. Two runs cannot collide on it: Boskos leases one
-# project per run so no two runs share a host cluster, and the runner's task
-# loop is sequential. Nor can the watcher's 24h dedup window suppress a second
+# project per run so no two runs share a host cluster, and no other task
+# names this namespace (the fan-out can co-run tasks, so uniqueness across
+# tasks is what matters now, not loop order). Nor can the watcher's 24h dedup window suppress a second
 # run's incident, which is the failure a static name would usually invite --
 # the dedup key is {pod UID, reason} (k8s-event-watcher/types.go, EventKey), and
 # every run's Deployment mints a fresh pod with a fresh UID.

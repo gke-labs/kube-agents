@@ -263,10 +263,20 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
+	webPW := string(creds.Data["web-password"])
 
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
 	_, gw := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
+	// The consumer-info oracle. It was `gateway` while that user held
+	// $JS.API.>; the narrowing #1666 asked for scoped it and took
+	// CONSUMER.INFO with it, so reading
+	// a consumer back moved to `web`, which holds CONSUMER.INFO.TASKS.* by
+	// enumeration and is now the only principal that can answer. `gateway`
+	// stays for what it still holds and what this test needs it for: owning
+	// the relay durable, publishing a submission, and the subscribe grants
+	// the deliver-subject cases turn on.
+	_, webJS := a2aConnectAs(t, s.ClientURL(), "web", webPW)
 	bridge, js := a2aConnectAs(t, s.ClientURL(), "bridge", bridgePW)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -321,9 +331,9 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		t.Fatalf("the pull delivered nothing: %v", batch.Error())
 	}
 	allowed("$JS.ACK TASKS (msg.Ack)", delivered.Ack())
-	// The ack landed, read from the gateway's side because bridge holds no
-	// CONSUMER.INFO.
-	relayView, err := gw.Consumer(ctx, "TASKS", "bridge-platform")
+	// The ack landed, read from web's side because bridge holds no
+	// CONSUMER.INFO (and, since #1666, neither does gateway).
+	relayView, err := webJS.Consumer(ctx, "TASKS", "bridge-platform")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +475,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	if got := tasks.CachedInfo().State.Msgs; got != 3 {
 		t.Errorf("TASKS holds %d messages after the refused calls, want 3", got)
 	}
-	if _, err := gw.Consumer(ctx, "TASKS", "gateway-relay"); err != nil {
+	if _, err := webJS.Consumer(ctx, "TASKS", "gateway-relay"); err != nil {
 		t.Errorf("the gateway's relay durable after the bridge's refused DELETE: %v", err)
 	}
 
@@ -538,21 +548,25 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 			t.Errorf("TOPICS-STATE gained %d messages but only %d sit under a2a.tasks.* subjects; the deliver-subject route rewrote a subject, which would be forgery",
 				info.State.Msgs-before, underTaskSubjects)
 		}
-		// Read back through the gateway rather than seed. Every other
-		// read here is a STREAM.INFO, which seed still holds, but this one
-		// asks for a stored message and #1306 scoped seed's grant to
-		// STREAM.CREATE and STREAM.INFO on the streams it provisions --
-		// reading content is not the provisioning identity's to do. Gateway
-		// still holds $JS.API.> (a2aBridgeJetStreamGrants records why), so
-		// it is the identity that can answer this. Asking as seed does not
-		// fail, it hangs: a refused request is not an error nats.go reports,
-		// so the call waits out ctx instead.
-		st, err := gw.Stream(ctx, "TOPICS-STATE")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := st.GetLastMsgForSubject(ctx, "a2a.topics.shared.probe"); !errors.Is(err, jetstream.ErrMsgNotFound) {
-			t.Errorf("a read of the probe topic by subject sees something after the diverted consumer: %v", err)
+		// Read the probe subject back through STREAM.INFO's per-subject
+		// counts rather than a stored-message get, because after the
+		// gateway's narrowing no principal this test can dial holds a
+		// content read on TOPICS-STATE. It used to be the gateway, on the
+		// strength of that user's $JS.API.>; the narrowing #1666 asked for
+		// scoped that grant to TASKS and the session registry. A5 then split
+		// `worker` in two and gave the topic streams to `agent`, which is
+		// callout-authenticated and so has no password this embedded server
+		// accepts. Seed is the reader of every other measurement here and
+		// holds STREAM.INFO on the streams it provisions; asking it for a
+		// stored message would not fail, it would hang, because #1306 scoped
+		// its grant and a refused request is not an error nats.go reports.
+		//
+		// The property is the same one: if the diverted delivery had been
+		// rewritten onto the probe topic's subject, that subject would carry
+		// it, and a subject-filtered STREAM.INFO reports exactly that count.
+		probe := streamInfo("TOPICS-STATE", jetstream.WithSubjectFilter("a2a.topics.shared.probe"))
+		if n := probe.State.Subjects["a2a.topics.shared.probe"]; n != 0 {
+			t.Errorf("a read of the probe topic by subject sees %d messages after the diverted consumer", n)
 		}
 
 		// 3. DIRECTORY with a principal holding a WILDCARD subscription that
@@ -689,7 +703,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		// task events, and no permissions violation is logged anywhere,
 		// because the call is inside the allow-list.
 		update("retune gateway-relay's filter_subject", relayConfig(`"filter_subject":"a2a.tasks.none"`))
-		relay, err := gw.Consumer(ctx, "TASKS", "gateway-relay")
+		relay, err := webJS.Consumer(ctx, "TASKS", "gateway-relay")
 		if err != nil {
 			t.Fatalf("gateway-relay after the bridge's update: %v", err)
 		}
@@ -708,7 +722,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		deadline := time.Now().Add(30 * time.Second)
 		var gone bool
 		for time.Now().Before(deadline) {
-			if _, err := gw.Consumer(ctx, "TASKS", "gateway-relay"); errors.Is(err, jetstream.ErrConsumerNotFound) {
+			if _, err := webJS.Consumer(ctx, "TASKS", "gateway-relay"); errors.Is(err, jetstream.ErrConsumerNotFound) {
 				gone = true
 				break
 			}

@@ -2,11 +2,11 @@
 """Build gate for the kanban scheduling patches.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_scheduling.py``. The applier only proves seven anchors matched
-exactly once. That says nothing about whether the engine those seven edits
+``apply_kanban_scheduling.py``. The applier only proves six anchors matched
+exactly once. That says nothing about whether the engine those six edits
 produce actually schedules correctly, and every fault they fix was emergent
 scheduling behaviour rather than a bad string — so every case below is driven
-against the real patched ``hermes_cli.kanban_db`` on a real board, through the
+against the real patched ``hermes_cli.kanban_db`` / ``kanban_db_dispatch`` on a real board, through the
 real ``create_task`` / ``claim_task`` / ``block_task`` / ``detect_crashed_workers``
 / ``_record_task_failure`` / ``recompute_ready``, in the order ``dispatch_once``
 calls them.
@@ -89,6 +89,14 @@ def check(label: str, condition: object, detail: str = "") -> None:
 
 from hermes_cli import kanban_db as K  # noqa: E402
 
+# Hermes v2026.9.14 split kanban_db: crash detection, the breaker and the
+# concurrency counter live in kanban_db_dispatch, connect() in
+# kanban_db_connect. The origin module re-exports the public names through a
+# revert-scheduled compat shim (a warning per name) and the private ones not
+# at all, so each is driven where it is defined.
+from hermes_cli import kanban_db_connect as KC  # noqa: E402
+from hermes_cli import kanban_db_dispatch as KD  # noqa: E402
+
 # Imported under its own name as well as through the trailer, so this gate fails
 # if the module did not land at ``hermes_cli/kanban_scheduling.py`` — and so the
 # discriminator's constants can be asserted by name rather than by string.
@@ -102,7 +110,7 @@ def fresh():
     """A real board, created through the engine's own schema path.
 
     The name comes from a counter. Deriving it from ``len(list(TMP.iterdir()))``
-    looks equivalent and is not, and the way it fails is silent: ``K.connect``
+    looks equivalent and is not, and the way it fails is silent: ``KC.connect``
     opens the board in WAL mode, so each one owns a ``-wal`` and a ``-shm`` as
     well as the ``.db`` and an ``.init.lock``. Rebinding ``conn = fresh()``
     drops the last reference to the previous connection, CPython closes it, and
@@ -123,7 +131,7 @@ def fresh():
     invalidates every check after it, so there is nothing to be gained by
     carrying on and counting failures.
     """
-    conn = K.connect(TMP / f"kanban{next(_BOARDS)}.db")
+    conn = KC.connect(TMP / f"kanban{next(_BOARDS)}.db")
     leftovers = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
     if leftovers:
         raise SystemExit(
@@ -305,7 +313,7 @@ conn.execute(
 conn.commit()
 check("the card is running under the old claim", status(conn, orphan) == "running")
 
-crashed = K.detect_crashed_workers(conn)
+crashed = KD.detect_crashed_workers(conn)
 check(
     "the successor does not report its predecessor's worker as a crash",
     orphan not in crashed,
@@ -344,7 +352,7 @@ def reclaim_cycle(conn, tid, cycle):
         "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (DEAD_PID, tid)
     )
     conn.commit()
-    K.detect_crashed_workers(conn)
+    KD.detect_crashed_workers(conn)
     K.recompute_ready(conn)
 
 
@@ -391,7 +399,7 @@ for n, tid in enumerate(fleet):
         "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (DEAD_PID, tid)
     )
 conn.commit()
-K.detect_crashed_workers(conn)
+KD.detect_crashed_workers(conn)
 check(
     "a container restart hands every in-flight card back at once",
     all(status(conn, t) == "ready" for t in fleet),
@@ -415,7 +423,7 @@ conn.execute(
 conn.commit()
 check(
     "our own dead worker is still detected",
-    mine in K.detect_crashed_workers(conn),
+    mine in KD.detect_crashed_workers(conn),
     "the fence disabled crash detection instead of narrowing it",
 )
 
@@ -429,7 +437,7 @@ conn.execute(
     "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (os.getpid(), live)
 )
 conn.commit()
-K.detect_crashed_workers(conn)
+KD.detect_crashed_workers(conn)
 check(
     "a live foreign worker keeps its claim",
     status(conn, live) == "running",
@@ -506,7 +514,7 @@ conn = fresh()
 rolled = new_card(conn, "card in flight when the pod was replaced")
 K.recompute_ready(conn)
 dead_foreign_claim(conn, rolled, f"{OTHER_POD}:4", claimed_at=PRE_BOOT)
-K.detect_crashed_workers(conn)
+KD.detect_crashed_workers(conn)
 check(
     "a pre-boot claim from a replaced pod is handed straight back",
     status(conn, rolled) == "ready",
@@ -531,7 +539,7 @@ conn = fresh()
 concurrent = new_card(conn, "card claimed by another pod after we started")
 K.recompute_ready(conn)
 dead_foreign_claim(conn, concurrent, f"{OTHER_POD}:5", claimed_at=int(time.time()))
-K.detect_crashed_workers(conn)
+KD.detect_crashed_workers(conn)
 check(
     "a claim made after this process started is still handed back",
     status(conn, concurrent) == "ready",
@@ -552,7 +560,7 @@ conn = fresh()
 runless = new_card(conn, "card whose run row is gone")
 K.recompute_ready(conn)
 dead_foreign_claim(conn, runless, f"{OTHER_POD}:6", drop_run=True)
-K.detect_crashed_workers(conn)
+KD.detect_crashed_workers(conn)
 check(
     "an unreadable claim time is charged rather than forgiven",
     failures(conn, runless) == 1
@@ -576,7 +584,7 @@ for cycle in range(K.DEFAULT_FAILURE_LIMIT + 2):
         f"platform-agent-gateway-{cycle}-{cycle:05d}:{7 + cycle}",
         claimed_at=PRE_BOOT,
     )
-    K.detect_crashed_workers(conn)
+    KD.detect_crashed_workers(conn)
     K.recompute_ready(conn)
 check(
     f"{K.DEFAULT_FAILURE_LIMIT + 2} pod replacements never park the card",
@@ -639,7 +647,7 @@ check(
 # predecessor's workers out of the bucket in the first place.
 print("failure fingerprints:")
 for template in ("pid {} not alive", "pid {} exited with code 137"):
-    prints = {K._error_fingerprint(template.format(p)) for p in range(1044, 1050)}
+    prints = {KD._error_fingerprint(template.format(p)) for p in range(1044, 1050)}
     check(
         f"six workers felled by one event share a fingerprint ({template})",
         len(prints) == 1,
@@ -647,8 +655,8 @@ for template in ("pid {} not alive", "pid {} exited with code 137"):
     )
 check(
     "distinct faults keep distinct fingerprints",
-    K._error_fingerprint("pid 1044 exited with code 137")
-    != K._error_fingerprint("pid 1044 killed by signal 9"),
+    KD._error_fingerprint("pid 1044 exited with code 137")
+    != KD._error_fingerprint("pid 1044 killed by signal 9"),
 )
 
 # And the detector it feeds must actually fire, through the real engine.
@@ -664,7 +672,7 @@ for tid, p in zip(burst, DEAD_PIDS):
         "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (p, tid)
     )
 conn.commit()
-K.detect_crashed_workers(conn)
+KD.detect_crashed_workers(conn)
 check(
     "four of our own workers dying the same way in one tick reads as systemic",
     all(status(conn, t) == "blocked" for t in burst),
@@ -682,7 +690,7 @@ for tid, p in zip(pair, DEAD_PIDS):
         "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (p, tid)
     )
 conn.commit()
-K.detect_crashed_workers(conn)
+KD.detect_crashed_workers(conn)
 check(
     "two crashes in a tick are just two crashes",
     all(status(conn, t) == "ready" for t in pair),
@@ -699,10 +707,11 @@ check(
 # What ``dispatch_once`` passes to ``recompute_ready`` under the shipped
 # configuration (``kanban.failure_limit`` unset on every profile).
 DISPATCHER_LIMIT = K.DEFAULT_SPAWN_FAILURE_LIMIT
-PROTOCOL_LIMIT = K._PROTOCOL_VIOLATION_FAILURE_LIMIT
+PROTOCOL_LIMIT = KD._PROTOCOL_VIOLATION_FAILURE_LIMIT
 # The constant the patch itself floors against. It is a distinct name from
 # ``DEFAULT_SPAWN_FAILURE_LIMIT`` above, currently aliased to it in kanban_db.py
-# (``DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT``). Referencing both
+# (``DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT``, the constant itself
+# being defined in kanban_db_dispatch and imported back). Referencing both
 # separately means the day they diverge this gate fails rather than passing on a
 # coincidence.
 FLOOR = K.DEFAULT_FAILURE_LIMIT
@@ -783,7 +792,7 @@ conn = board()
 #    passes force_trip=True, so the raw counter lands at 1 -- below the
 #    dispatcher's 2, which is what let recompute_ready undo the trip.
 make(conn, "proto")
-K._record_task_failure(
+KD._record_task_failure(
     conn,
     "proto",
     error="clean exit without a terminal kanban call",
@@ -805,7 +814,7 @@ check(
 
 # 2. Systemic same-error crash. The caller lowers the limit to 1.
 make(conn, "systemic")
-K._record_task_failure(
+KD._record_task_failure(
     conn, "systemic", error="container OOMKilled", outcome="crashed",
     failure_limit=1,
 )
@@ -824,7 +833,7 @@ check(
 # 7. A per-task max_retries override must be honoured, not flattened to the
 #    module default -- recompute_ready resolves against max_retries first.
 make(conn, "override", max_retries=5)
-K._record_task_failure(
+KD._record_task_failure(
     conn, "override", error="clean exit without a terminal kanban call",
     outcome="crashed", failure_limit=5, force_trip=True,
 )
@@ -845,7 +854,7 @@ check(
 #    that bind could be left unpatched and everything above would still pass.
 make(conn, "spawn")
 claim(conn, "spawn")
-K._record_task_failure(
+KD._record_task_failure(
     conn, "spawn", error="failed to spawn worker", outcome="spawn_failed",
     failure_limit=1, release_claim=True, end_run=True,
 )
@@ -874,7 +883,7 @@ check(
 
 # --- 3: no inflation on the ordinary path -----------------------------------
 make(conn, "normal")
-K._record_task_failure(
+KD._record_task_failure(
     conn, "normal", error="boom 1", outcome="crashed",
     failure_limit=DISPATCHER_LIMIT,
 )
@@ -883,7 +892,7 @@ check(
     state(conn, "normal") == ("ready", 1),
     f"got {state(conn, 'normal')}, want ('ready', 1)",
 )
-K._record_task_failure(
+KD._record_task_failure(
     conn, "normal", error="boom 2", outcome="crashed",
     failure_limit=DISPATCHER_LIMIT,
 )
@@ -938,7 +947,7 @@ conn = board()
 #    does not change status -- so any fix that reads the gave_up EVENT instead
 #    of the counter pins this card in blocked forever.
 make(conn, "reassigned")
-K._record_task_failure(
+KD._record_task_failure(
     conn, "reassigned", error="pv", outcome="crashed",
     failure_limit=PROTOCOL_LIMIT, force_trip=True,
 )
@@ -966,7 +975,7 @@ check(
 #     the dispatcher's 2, so recompute_ready promoted the card whatever
 #     assign_task did. Now the stored count is the exhausted budget and the
 #     no-op assign no longer frees it. Reassign elsewhere, or unblock.
-K._record_task_failure(
+KD._record_task_failure(
     conn, "reassigned", error="container OOMKilled", outcome="crashed",
     failure_limit=1,
 )
@@ -987,7 +996,7 @@ check(
 
 # 5. unblock_task is the operator's exit.
 make(conn, "unblocked")
-K._record_task_failure(
+KD._record_task_failure(
     conn, "unblocked", error="pv", outcome="crashed",
     failure_limit=PROTOCOL_LIMIT, force_trip=True,
 )
@@ -1093,7 +1102,7 @@ def spawns(conn, cap):
         asked.append(getattr(task, "id", task))
         return FAKE_PID
 
-    K.dispatch_once(conn, spawn_fn=spawn_fn, max_in_progress=cap)
+    KD.dispatch_once(conn, spawn_fn=spawn_fn, max_in_progress=cap)
     return asked
 
 

@@ -15,18 +15,25 @@ assert on that.
 """
 
 import pathlib
-import subprocess
+import sys
 import unittest
 
-_OPERATOR_DIR = pathlib.Path(__file__).resolve().parents[1] / "k8s-operator"
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+from _run_make import run_make  # noqa: E402
+
+_OPERATOR_DIR = _HERE.parent / "k8s-operator"
+
+#: These recipes only print, but the sweep this suite runs inside can be slow.
+_MAKE_TIMEOUT_SECONDS = 60
 
 
 def _make_n(target):
-    result = subprocess.run(
-        ["make", "-n", target, "IMG=example.com/operator:test"],
+    result = run_make(
+        ["-n", target, "IMG=example.com/operator:test"],
+        timeout=_MAKE_TIMEOUT_SECONDS,
         cwd=_OPERATOR_DIR,
-        capture_output=True,
-        text=True,
     )
     if result.returncode != 0:
         raise AssertionError(
@@ -85,11 +92,10 @@ class DeployContractTest(unittest.TestCase):
 
 def _check_img(img, env=None):
     """Run the real check-img target (no cluster needed) and return the result."""
-    return subprocess.run(
-        ["make", "-s", "check-img", f"IMG={img}", *(env or [])],
+    return run_make(
+        ["-s", "check-img", f"IMG={img}", *(env or [])],
+        timeout=_MAKE_TIMEOUT_SECONDS,
         cwd=_OPERATOR_DIR,
-        capture_output=True,
-        text=True,
     )
 
 

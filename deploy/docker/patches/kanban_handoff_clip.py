@@ -1,7 +1,7 @@
 """URL-safe clipping for the kanban notifier's completion handoff.
 
 Installed into the image at ``/opt/hermes/gateway/kanban_handoff_clip.py`` and
-wired into ``gateway/kanban_watchers.py`` by
+wired into ``gateway/kanban_watchers_notifier.py`` by
 ``deploy/docker/patches/apply_kanban_notifier.py``.
 
 A module of its own rather than part of ``gateway/kanban_notifier.py``, which

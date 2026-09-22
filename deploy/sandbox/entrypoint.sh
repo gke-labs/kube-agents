@@ -375,6 +375,11 @@ done
 #    are different volumes that only happen to share a path: forwarding the agent
 #    container's value would point every skill here at a directory this container
 #    does not have the moment an install moves `spec.harness.hermes.agentHome`.
+#    The profile within that root is narrowed later, per session, by
+#    sandbox-session-command, from the profile name the agent image's ssh
+#    client sends as HERMES_PROFILE_HOME (the AcceptEnv in sshd_config's agent
+#    Match block); that is a name rebased onto this root, never a path from
+#    the other one.
 #
 #    They have to be set at all because step 1a is only half the delivery. A
 #    SKILL.md says `"$HERMES_HOME"/scripts/github_token_refresh.py` as often as it

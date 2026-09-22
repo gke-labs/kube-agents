@@ -35,6 +35,9 @@ export PR_ID="${PULL_NUMBER:-local}"
 HELM_VERSION="v3.21.4"
 HELM_SHA256_LINUX_AMD64="61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14"
 HELM_SHA256_LINUX_ARM64="b54c04b4e0b2540bbdc08c17a121dab70e9a2ed0de5705528fec68a5fd3b85a7"
+# get.helm.sh has bad seconds, and a failed transfer here fails a Prow job that
+# had nothing to do with helm.
+readonly HELM_DOWNLOAD_RETRIES=5
 
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
@@ -56,7 +59,7 @@ ensure_helm() {
   dir="/tmp/kube-agents-helm-${HELM_VERSION}-${arch}"
   if [ ! -x "${dir}/helm" ]; then
     mkdir -p "$dir"
-    curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" -o "${dir}/helm.tar.gz"
+    curl -fsSL --retry "$HELM_DOWNLOAD_RETRIES" --retry-all-errors "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" -o "${dir}/helm.tar.gz"
     echo "${sha}  ${dir}/helm.tar.gz" | sha256sum -c - >/dev/null
     tar -xzf "${dir}/helm.tar.gz" -C "$dir" --strip-components=1 "linux-${arch}/helm"
     rm -f "${dir}/helm.tar.gz"

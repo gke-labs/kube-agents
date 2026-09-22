@@ -98,6 +98,7 @@ def install_scanner(behaviour) -> None:
 
 def main() -> int:
     import tools.approval as ap
+    import tools.approval_context as approval_context
     import tools.cron_tirith_scan as cts
 
     # The patch must be reachable by the name the wiring imports it under. A
@@ -111,15 +112,23 @@ def main() -> int:
 
     # Pin the session predicates. Each is upstream's own and is not what this
     # patch changes; leaving them live would let a build host's environment
-    # pick the branch under test.
+    # pick the branch under test. The predicates are from-imported by name into
+    # tools.approval, so pinning them there is what the gate's own calls see.
     ap._is_interactive_cli = lambda: False
     ap._is_gateway_approval_context = lambda: False
+    ap._is_single_query_approval_context = lambda: False
+    ap._is_unattended_platform_approval_context = lambda: False
     ap._is_cron_approval_context = lambda: state["cron"]
-    ap._get_cron_approval_mode = lambda: state["mode"]
+    # The mode getters are NOT imported by name since v2026.9.14: the patched
+    # arm reads approval_context._get_cron_approval_mode() and upstream's own
+    # _Unattended.mode() resolves the getter on approval_context at call time,
+    # so a pin on tools.approval would be a no-op and the build host's
+    # config.yaml (or its absence: default deny) would decide the branch.
+    approval_context._get_cron_approval_mode = lambda: state["mode"]
     # approvals.mode: "off" is a global bypass that returns before the cron arm
     # is reached. Pin it away from "off" so the checks below test the cron arm
     # and not the bypass.
-    ap._get_approval_mode = lambda: "smart"
+    approval_context._get_approval_mode = lambda: "smart"
     ap._command_matches_permanent_allowlist = lambda command: False
     ap._match_user_deny_rule = lambda command: None
 

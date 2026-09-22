@@ -101,13 +101,15 @@ const (
 	// a2aDNSPort is name resolution, granted on both protocols.
 	a2aDNSPort = int32(53)
 
-	// The streams the bridge's and the agent's JetStream API grants name,
+	// The streams the bridge's, the agent's and the gateway's JetStream API
+	// grants name,
 	// spelled as the provision script creates them. A KV bucket is a stream
 	// called KV_<bucket>, so the bucket name and the prefix are held apart.
 	a2aTasksStream         = "TASKS"
 	a2aTopicsStateStream   = "TOPICS-STATE"
 	a2aTopicsJournalStream = "TOPICS-JOURNAL"
 	a2aRuntimeStateBucket  = "runtime-state"
+	a2aSessionStateBucket  = "session-state"
 	a2aKVStreamPrefix      = "KV_"
 
 	// a2aNATSConfGrantLine renders one allow-list entry at the depth of
@@ -378,13 +380,16 @@ const (
 	// outside this number and are not counted anywhere. lib.TasksGet opens an
 	// ordered consumer and its cleanup stops the local subscription only --
 	// the consumer itself waits out its InactiveThreshold, which TasksGet
-	// leaves unset, so nats.go's five-minute default applies. Every call
-	// therefore leaves one consumer on the stream for five minutes after it
-	// returns. That makes the missing term a call RATE over a rolling
-	// five-minute window rather than a concurrency, and the callers are not
-	// just the web rail: the gateway's sweep, reap and relay paths replay
-	// too. gke-labs#1739 owns the term and the number; this constant
-	// deliberately does not move for it here.
+	// sets to five seconds (lib.EphemeralConsumerInactiveThreshold). A call
+	// that finds events therefore leaves one consumer on the stream for five
+	// seconds after it returns. That makes the missing term a call RATE over
+	// a rolling five-second window rather than a concurrency, and the callers
+	// are not just the web rail: the gateway's sweep, reap and relay paths
+	// replay too. The window was five minutes -- nats.go's default, left in
+	// place -- until TasksGet set the threshold, so the rate this constant
+	// absorbs is 60x lower than the number was sized against. gke-labs#1739
+	// owns the term and the number; this constant deliberately does not move
+	// for it here.
 	a2aTasksReservedConsumers = 16
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
@@ -663,9 +668,17 @@ func a2aSeedJetStreamGrants() []string {
 //
 // CONSUMER.DELETE on TASKS is withheld, and it is the one subject nats.go
 // does emit here without a grant. The only emitter is the ordered consumer's
-// reset path, which fires DeleteConsumer in a goroutine and ignores the
-// result; an ephemeral it could not delete is reaped by its own five-minute
-// inactive threshold.
+// reset path, which fires DeleteConsumer for the consumer it is replacing in
+// a goroutine and ignores the result; the ephemeral it could not delete is
+// reaped by the inactive threshold lib.TasksGet sets on it,
+// lib.EphemeralConsumerInactiveThreshold (five seconds -- nats.go's own
+// ordered default is five MINUTES, which is what the replay carried before
+// gke-labs/kube-agents#1739). TasksGet does not delete its own replay
+// consumer, and that is a decision rather than an omission: under this grant
+// the delete is a refused publish on a subject with no reply, so the bridge
+// would pay an Error-level permissions violation on every task it dispatches
+// -- the line an operator is taught to read as a missing grant -- to reclaim
+// the last five seconds of one consumer slot.
 //
 // Withholding it raises the price of reaching another principal's durable and
 // does not close the route, which is the correction to what this comment said
@@ -686,7 +699,9 @@ func a2aSeedJetStreamGrants() []string {
 // NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
 // literally named that. What closes it is the auth callout giving each
 // principal its own user. DELETE stays out as the one destructive verb here
-// that nothing on the bridge path needs.
+// that nothing on the bridge path needs: its one emitter ignores the result
+// and the threshold gets there anyway, so the grant's absence costs a log
+// line on a reset and up to five seconds of a consumer slot, not a behaviour.
 //
 // One route this list narrows but cannot close, because it lives in a request
 // body: a push consumer's deliver_subject. CONSUMER.CREATE on TASKS (or on the
@@ -752,6 +767,142 @@ func a2aAgentJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".>",
 		"$JS.API.STREAM.INFO." + a2aTopicsJournalStream,
 		"$JS.API.DIRECT.GET." + a2aTopicsJournalStream + ".>",
+	}
+}
+
+// a2aGatewayJetStreamGrants is the gateway's publish allow-list for the
+// JetStream API, replacing the `$JS.API.>` wildcard this user shipped with
+// (gke-labs/kube-agents#1666). It is the third and last of these: seed came
+// off the wildcard in #1306 and worker in #1393, and with this one no
+// rendered principal holds it.
+//
+// The gateway is the task requester, the chat-session supervisor and the
+// session registry's owner. The wildcard covered STREAM.DELETE on every
+// stream in the account, which #1666 measured live: one call as this user
+// destroyed TASKS, taking every task's event history and its five live
+// consumers with it, and the provision Job then recreated the stream empty on
+// the next reconcile -- so the loss reads as healthy from the operator's side.
+// It also made the ack scoping beside it moot. That grant is scoped to TASKS
+// precisely so this user cannot +TERM another principal's in-flight delivery,
+// and `$JS.API.CONSUMER.DELETE.TASKS.*` sat inside the wildcard the whole
+// time.
+//
+// The list is what the gateway's own binaries emit, read out of nats.go
+// v1.53.1 and then measured against a real server running this render
+// (TestGatewayJetStreamGrantOnARealServer). Per stream:
+//
+//   - TASKS: STREAM.INFO (js.Stream, in lib.TasksGet), CONSUMER.CREATE (the
+//     `gateway-relay` durable through CreateOrUpdateConsumer, and the
+//     replay's ordered consumer), CONSUMER.MSG.NEXT (every pull on both),
+//     and DIRECT.GET (GetLastMsgForSubject: tasks/get's replay horizon).
+//     Acks are $JS.ACK.TASKS.>, granted beside this list.
+//
+//     CONSUMER.CREATE ends in `>` rather than naming the durable, and both
+//     reasons are load-bearing. The relay carries TWO filter subjects
+//     (`…events` and `…supervisor`, since the supervisor split), and nats.go
+//     puts the filter in the API subject only when there is exactly one
+//     (jetstream/consumer.go, apiConsumerCreateWithFilterSubjectT), so the
+//     relay's own create is `CONSUMER.CREATE.TASKS.gateway-relay` while a
+//     single-filter rebind would be four tokens longer. And the replay's
+//     ordered consumers take server-generated names
+//     (jetstream.go, OrderedConsumer, which seeds namePrefix from nuid.Next),
+//     so no literal exists to name.
+//
+//   - KV_session-state, the session registry: STREAM.INFO (js.KeyValue binds
+//     a bucket by reading its stream), DIRECT.GET (kv.Get, which every
+//     registry read goes through -- Get, SessionForTask, and the reap scan's
+//     per-key read), and CONSUMER.CREATE with CONSUMER.DELETE
+//     (kv.ListKeysFiltered is a push ordered consumer that nats.go creates
+//     and then deletes on Unsubscribe, and the reap loop runs it on a timer).
+//     Create, Put and Delete are publishes on $KV.session-state.>, granted
+//     beside this list.
+//
+// Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
+// provision script creates has allow_direct set: the script says
+// --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
+// picks the route from the stream's own config (jetstream/stream.go, getMsg),
+// so the fallback is never emitted and is not granted.
+//
+// What the wildcard granted that nothing on the gateway path uses, and this
+// list now refuses: STREAM.DELETE, PURGE, UPDATE, MSG.DELETE, RESTORE and
+// SNAPSHOT on every stream, #1666's TASKS deletion included; every verb on
+// DIRECTORY (the gateway keeps SUBSCRIBE on the cards, which is the read
+// discovery needs), on KV_runtime-state and on KV_cap; every verb on the two
+// topic streams, which nothing in a2a/gateway touches; STREAM.CREATE;
+// enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST); and
+// account INFO, which jetstream.New never asks for.
+//
+// CONSUMER.INFO is withheld, and it is worth stating because it costs
+// something. Nothing on the gateway path binds a consumer by name -- the
+// relay is CreateOrUpdateConsumer, the replay is an ordered consumer -- and on
+// nats.go v1.53.1 neither re-verifies itself with Info() after a reconnect
+// either: the Consume status loop re-issues a pull on CONNECTED, and the
+// ordered consumer's reset is a CONSUMER.CREATE. TestGatewayConsumersSurviveABusRestart
+// holds that across a server restart rather than resting on the reading. What
+// it costs is that the gateway can no longer read back the state of a
+// consumer it owns, which is a diagnostic it never used and the `web` user
+// still holds.
+//
+// CONSUMER.DELETE on TASKS is withheld too, and it is the one subject nats.go
+// emits here without a grant. The only emitter is the ordered consumer's
+// reset path, which fires DeleteConsumer in a goroutine and ignores the
+// result (jetstream/ordered.go, reset). What it buys is removing this user's
+// route to another principal's durable by name -- a session pod's three
+// consumers included -- and it is not free. Two costs, both on the reset path
+// and neither on the steady state:
+//
+//   - The refused request reaches nats.go's async error handler, which in
+//     a2a/lib's client logs at Error level (a2a/lib/client.go, the
+//     ErrorHandler option). So a bus bounce or a heartbeat gap while N
+//     tasks/get replays are in flight writes N "permissions violation for
+//     publish to $JS.API.CONSUMER.DELETE.TASKS.<name>" lines into the
+//     gateway's own log, for a refusal that is by design. Measured in
+//     TestGatewayConsumersSurviveABusRestart, which asserts that this is the
+//     only violation the restart produces.
+//   - The pre-reset ephemeral is not removed immediately; it waits out its
+//     own five-minute inactive threshold -- nats.go's ordered-consumer
+//     default (jetstream/ordered.go), which lib.TasksGet does not override --
+//     holding a TASKS consumer slot against max_consumers. Stopping an
+//     ordered iterator never deleted its consumer under the wildcard either,
+//     so the per-replay ephemeral is pre-existing -- what this adds is that
+//     the RESET path's old consumer lingers too. Measured on the rendered
+//     config: a reconnect that leaves the server running holds two slots per
+//     replay in flight, the old consumer and its replacement, until the
+//     threshold expires; a bus bounce leaves only the replacement, because
+//     these consumers are memory storage with one replica and the restarting
+//     server drops them. Those slots are the gateway's and never a session's,
+//     so whatever sizes TASKS' max_consumers has to count concurrent
+//     tasks/get replays beside the session cap. A budget that counts sessions
+//     alone runs out under replay load and refuses a legitimate session's
+//     consumer create, which reads as an undersized stream.
+//
+// Neither is worth the grant, but the cost is stated rather than described as
+// free, which is what this comment said first.
+//
+// Two routes this list narrows but cannot close, both recorded here because
+// they survive any per-stream scoping of a principal that may create
+// consumers at all. CONSUMER.CREATE is create-OR-UPDATE by name and the
+// server has no ownership concept for a consumer name, so within TASKS every
+// consumer is this user's to reconfigure or to have reaped through an
+// inactive_threshold it sets -- measured for `bridge` in
+// a2aBridgeJetStreamGrants, identical here. And a push consumer's
+// deliver_subject is a body field no subject grant can see. Neither is new;
+// $JS.API.> permitted both, with every stream as a source rather than one.
+// What closes them is per-task consumers created by the dispatcher, not a
+// grant. The gateway is also the principal these residues matter least for:
+// it is the requester and the supervisor, so it already writes the task plane
+// by grant.
+func a2aGatewayJetStreamGrants() []string {
+	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	return []string{
+		"$JS.API.STREAM.INFO." + a2aTasksStream,
+		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
+		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
+		"$JS.API.STREAM.INFO." + kvSessionState,
+		"$JS.API.DIRECT.GET." + kvSessionState + ".>",
+		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*",
 	}
 }
 
@@ -855,15 +1006,17 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // permissions block with allow lists denies everything else — with per-user
 // _INBOX prefixes so the reply path cannot leak what the subject grants
 // withheld. Seed's JetStream API grant is scoped to the streams it provisions,
-// the bridge's and the agent's to the streams each one uses, all by name and by
-// verb (a2aSeedJetStreamGrants, a2aBridgeJetStreamGrants,
-// a2aAgentJetStreamGrants), and provision has moved
+// the bridge's and the agent's to the streams each one uses, and the gateway's
+// to TASKS and its own session registry, all by name and by verb
+// (a2aSeedJetStreamGrants, a2aBridgeJetStreamGrants, a2aAgentJetStreamGrants,
+// a2aGatewayJetStreamGrants), and provision has moved
 // to the callout and holds the enumerated subjects too (its identity entry
-// spells them). Gateway alone still holds a bare $JS.API.>, which is playground
-// posture; narrowing it is the same change again with its own table of what it
-// emits, and it wants its own live proof because it owns the relay durable and
-// the session registry. It is also the one identity that cannot narrow on this
-// branch's terms: it has no client presenting a token yet.
+// spells them). No rendered principal holds a bare $JS.API.> any more: the
+// gateway was the last, and the narrowing #1666 asked for took it. What
+// per-stream enumeration still
+// cannot express is inside a granted stream -- a consumer's name, its
+// durability and its deliver subject are request-body fields -- and those
+// residues are recorded on the grant functions and in the deployment spec.
 //
 // This comment is only true of the identity table below it: read that, not this.
 //

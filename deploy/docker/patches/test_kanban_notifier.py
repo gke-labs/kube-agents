@@ -1,16 +1,18 @@
 """Unit tests for the kanban notifier patch installed by deploy/docker/Dockerfile.
 
 Merges what were ``test_kanban_wake_kinds.py`` and ``test_kanban_result_delivery.py``,
-and adds :class:`LegacyEquivalenceTest`, which pins the claim the merge rests on:
-one applier with two anchors produces the same patched source as the three it
-replaced. ``test_kanban_handoff_clip.py`` stays separate — it tests the shared
-text utility, which has no anchor into upstream source.
+and adds :class:`MinimalDiffTest`, which pins what the applier does to upstream's
+``gateway/kanban_watchers_notifier.py``: exactly the lines named in the applier are
+removed and added, so each behaviour stays visible as one block.
+``test_kanban_handoff_clip.py`` stays separate — it tests the shared text
+utility, which has no anchor into upstream source.
 
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 """
 
 import ast
 import contextlib
+import difflib
 import json
 import logging
 import os
@@ -24,10 +26,15 @@ from unittest import mock
 
 from apply_kanban_notifier import (
     HANDOFF_ANCHOR,
+    HANDOFF_PATCHED,
+    INCIDENT_ANCHOR,
     INCIDENT_CALL,
+    INCIDENT_PATCHED,
     MARKER_CALL,
     RELATIVE,
+    TRAILER,
     WAKE_ANCHOR,
+    WAKE_PATCHED,
     apply,
 )
 from apply_kanban_progress_lines import SEND_ANCHOR, SEND_PATCHED
@@ -38,6 +45,7 @@ from kanban_notifier import (
     NOTE_SIGNATURE,
     RESULT_LIMIT,
     SEPARATOR,
+    UNDELIVERED_OUTCOME_KINDS,
     UNSTRUCTURED_MIN_CHARS,
     _warned_config,
     actionable_report,
@@ -169,18 +177,20 @@ class ResultBlockTest(unittest.TestCase):
 def notifier_tail(payload_summary, task):
     """Build the completion message's tail the way the patched notifier does.
 
-    The three lines before the call are copied from the ``completed`` branch of
-    ``gateway/kanban_watchers.py`` — see UPSTREAM_WATCHERS below, which carries
-    the same code at its real indentation. They matter to these tests because
-    the ``elif`` is where ``handoff`` becomes a clip of the very field this
-    module delivers, and testing ``handoff_with_result`` on a status line
-    invented by the test would miss that entirely.
+    The lines before the call are copied from ``_fmt_completed`` in
+    ``gateway/kanban_watchers_notifier.py`` as the applier leaves it — see
+    UPSTREAM_NOTIFIER below, which carries the unpatched code at its real
+    indentation. They matter to these tests because the ``elif`` is where
+    ``handoff`` becomes a clip of the very field this module delivers, and
+    testing ``handoff_with_result`` on a status line invented by the test would
+    miss that entirely.
     """
-    handoff = ""
+    wake_handoff = None
     if payload_summary:
-        handoff = f"\n{clip_handoff(payload_summary)}"
+        wake_handoff = clip_handoff(payload_summary)
     elif task and task.result:
-        handoff = f"\n{clip_handoff(task.result)}"
+        wake_handoff = clip_handoff(task.result)
+    handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
     return handoff_with_result(handoff, task)
 
 
@@ -606,11 +616,17 @@ class ResolveWakeKindsTest(unittest.TestCase):
         self.assertEqual(len(captured.output), 1)
 
     def test_default_set_matches_the_upstream_tuple(self):
-        # If a base-image bump adds a terminal kind, this test is the reminder
-        # to decide whether the front door should wake for it.
+        # If a base-image bump adds a wake kind, this test is the reminder to
+        # decide whether the front door should wake for it. This is
+        # ``_WAKE_KINDS`` in gateway/kanban_watchers_notifier.py at v2026.9.14;
+        # verify_kanban_notifier.py checks the same equality against the real
+        # module inside the image.
         self.assertEqual(
             DEFAULT_WAKE_KINDS,
-            ("completed", "gave_up", "crashed", "timed_out", "blocked"),
+            (
+                "completed", "gave_up", "crashed", "timed_out", "blocked",
+                "review_requested", "changes_requested", "block_loop_detected",
+            ),
         )
 
 
@@ -797,6 +813,97 @@ COMPLETED_AT = 1786216184.0
 #: Distinguishes "the caller passed no task" from "the caller passed None",
 #: which is a case the notifier has to survive and a default cannot express.
 UNSET = object()
+
+
+class UndeliveredOutcomeKindsTest(unittest.TestCase):
+    """The review-flow kinds are governed by ``kanban.wake_on_events`` like every
+    other kind, and are never recorded as a delivered result.
+
+    The deployed config (agents/chat/config.yaml and the operator default)
+    lists the four failure kinds, so on a push adapter a ``review_requested``
+    card does not wake the front door. What must not follow from that is a
+    note telling the creator the result was "already delivered": the card is
+    waiting in ``review``, and nothing was.
+    """
+
+    def test_the_three_are_the_upstream_review_flow_kinds(self):
+        self.assertEqual(
+            UNDELIVERED_OUTCOME_KINDS,
+            ("review_requested", "changes_requested", "block_loop_detected"),
+        )
+        for kind in UNDELIVERED_OUTCOME_KINDS:
+            self.assertIn(kind, DEFAULT_WAKE_KINDS)
+
+    def test_review_requested_does_not_wake_on_a_push_adapter_under_the_four_kind_config(self):
+        events = [Event("review_requested")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=Adapter(True)), set())
+
+    def test_the_config_governs_every_review_flow_kind_on_the_push_path(self):
+        for kind in UNDELIVERED_OUTCOME_KINDS:
+            for kanban in ({"wake_on_events": FAILURE_ONLY}, {"wake_on_events": []},
+                           {"wake_on_events": None}):
+                self.assertEqual(
+                    wake_kinds_for([Event(kind)], loader(kanban), adapter=Adapter(True)),
+                    set(),
+                    (kind, kanban),
+                )
+            # Unset, the default set applies and upstream's behaviour holds.
+            self.assertEqual(
+                wake_kinds_for([Event(kind)], loader({}), adapter=Adapter(True)), {kind}
+            )
+            self.assertEqual(
+                wake_kinds_for([Event(kind)], loader({"wake_on_events": [kind]}),
+                               adapter=Adapter(True)),
+                {kind},
+            )
+
+    def test_review_requested_wakes_where_no_ping_was_sent(self):
+        events = [Event("review_requested")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(
+            wake_kinds_for(events, cfg, adapter=Adapter(False)), {"review_requested"}
+        )
+        self.assertEqual(
+            wake_kinds_for(events, cfg, adapter=Adapter(True), passive_delivered=False),
+            {"review_requested"},
+        )
+
+    def test_the_configured_set_is_still_what_the_operator_wrote(self):
+        self.assertEqual(
+            set(resolve_wake_kinds(loader({"wake_on_events": FAILURE_ONLY}))),
+            set(FAILURE_ONLY),
+        )
+
+    def test_a_review_flow_kind_is_never_reported_as_suppressed(self):
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        for kind in UNDELIVERED_OUTCOME_KINDS:
+            events = [Event(kind)]
+            woken = wake_kinds_for(events, cfg, adapter=Adapter(True))
+            self.assertEqual(woken, set(), kind)
+            self.assertEqual(suppressed_kinds(events, woken), set(), kind)
+        events = [Event("completed"), Event("review_requested")]
+        self.assertEqual(suppressed_kinds(events, set()), {"completed"})
+
+    def test_no_completion_note_is_staged_for_a_review_handoff(self):
+        _warned_config.clear()
+        runner = _Runner()
+        for kind in UNDELIVERED_OUTCOME_KINDS:
+            staged = note_suppressed_completion(
+                runner, [Event(kind)], set(), _Card(), sub_for(), "", now=COMPLETED_AT
+            )
+            self.assertFalse(staged, kind)
+        self.assertEqual(runner._sessions, {})
+
+    def test_the_four_configured_kinds_behave_as_before(self):
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        for kind in FAILURE_ONLY:
+            self.assertEqual(wake_kinds_for([Event(kind)], cfg, adapter=Adapter(True)), {kind})
+        self.assertEqual(wake_kinds_for([Event("completed")], cfg, adapter=Adapter(True)), set())
+        self.assertEqual(
+            suppressed_kinds([Event("completed")], wake_kinds_for([Event("completed")], cfg)),
+            {"completed"},
+        )
 
 
 class SuppressedKindsTest(unittest.TestCase):
@@ -1410,58 +1517,83 @@ class StoreIncidentReportTest(unittest.TestCase):
 # The applier
 # =============================================================================
 
-# The notifier loop reduced to the lines the patch rewrites, kept at its real
-# nesting depth because both anchors are indentation-sensitive. The `msg = (`
-# block below carries no anchor any more — it is here because the hook has to
-# land between the clip and it, and that ordering is the whole contract.
-UPSTREAM_WATCHERS = '''\
-class GatewayKanbanWatchers:
-    async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        while self._running:
+# gateway/kanban_watchers_notifier.py reduced to the lines the patch rewrites,
+# kept at their real nesting because all three anchors are indentation-
+# sensitive: ``_fmt_completed`` is module-level, ``build_wake_text`` and
+# ``_send_pings`` are methods of ``_KanbanNotification``. The ``return f"✔`` line
+# carries no anchor — it is here because the hook has to land between the clip
+# and it, and that ordering is the whole contract. ``_WAKE_KINDS`` stays at
+# module level in the patched file too: ``build_wake_text`` still orders the
+# wake text's parts by it.
+UPSTREAM_NOTIFIER = '''\
+_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+
+
+def _first_line(text, limit):
+    lines = text.strip().splitlines()
+    return lines[0][:limit] if lines else text[:limit]
+
+
+def _fmt_completed(ev, n) -> tuple:
+    # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
+    wake_handoff = None
+    payload_summary = _payload(ev, "summary")
+    if payload_summary:
+        wake_handoff = _first_line(str(payload_summary), 200)
+    elif n.task and n.task.result:
+        wake_handoff = _first_line(n.task.result, 160)
+    handoff = f"\\n{wake_handoff}" if wake_handoff is not None else ""
+    return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
+
+
+class _KanbanNotification:
+    def __init__(self, runner, d):
+        self.runner = runner
+        self.d = d
+        self.sub = sub = d["sub"]
+        self.task = d["task"]
+        self.board_slug = d.get("board")
+        mode = sub.get("delivery_mode") or "notify"
+        self.wake_agent = mode in ("notify+wake", "wake")
+        self.send_passive = mode != "wake"
+        self.wake_kinds = set()
+
+    def build_wake_text(self) -> None:
+        task, sub = self.task, self.sub
+        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        if not self.wake_kinds:
+            return
+
+    async def _send_pings(self) -> bool:
+        for ev in self.d["events"]:
+            msg = self.format_event(ev)
+            if msg is None:
+                continue
             try:
-                for d in deliveries:
-                    mode = sub.get("delivery_mode") or "notify"
-                    wake_agent = mode in ("notify+wake", "wake")
-                    send_passive = mode != "wake"
-                    for ev in d["events"]:
-                        kind = ev.kind
-                        if kind == "completed":
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\\n{h}"
-                                wake_handoff = h
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\\n{r}"
-                                wake_handoff = r
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            msg = "blocked"
-                        await adapter.send(sub["chat_id"], msg)
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
-                            else set()
-                        )
-                        if "completed" in _wake_kinds:
-                            pass
-            except Exception:
-                pass
+                await self._send_event(ev, msg)
+                self.clear_failures()
+            except Exception as exc:
+                await self.delivery_failed(exc)
+                return False
+        return True
+
+    async def deliver(self) -> None:
+        if not await self._send_pings():
+            return
+        self.build_wake_text()
+        await self.advance()
+        await self.unsub()
 '''
+
+#: Drifts that break exactly one anchor each, for the tests that need to name
+#: which part of the notifier moved.
+HANDOFF_DRIFT = ("_first_line(str(payload_summary), 200)", "_first_line(str(payload_summary), 220)")
+WAKE_DRIFT = ("if ev.kind in _WAKE_KINDS}", "if ev.kind in _WAKE_KINDS and ev}")
+INCIDENT_DRIFT = ("                self.clear_failures()\n", "                self.clear_failures()  # noqa\n")
 
 
 def patch_tree(source):
-    """Write ``source`` as gateway/kanban_watchers.py under a temp root and patch it."""
+    """Write ``source`` as the notifier module under a temp root and patch it."""
     root = Path(tempfile.mkdtemp())
     target = root / RELATIVE
     target.parent.mkdir(parents=True)
@@ -1470,58 +1602,89 @@ def patch_tree(source):
     return target.read_text()
 
 
-class ApplyTest(unittest.TestCase):
-    def test_both_anchors_match_upstream_exactly_once(self):
-        self.assertEqual(UPSTREAM_WATCHERS.count(HANDOFF_ANCHOR), 1)
-        self.assertEqual(UPSTREAM_WATCHERS.count(WAKE_ANCHOR), 1)
+def _enclosing_method(source, needle):
+    """Name of the one ``_KanbanNotification`` method whose source holds ``needle``."""
+    holders = []
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == "_KanbanNotification":
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if needle in ast.get_source_segment(source, item):
+                        holders.append(item.name)
+    if len(holders) != 1:
+        raise AssertionError(f"{needle!r} is in {holders or 'no method'}, expected exactly one")
+    return holders[0]
 
-    def test_the_message_block_is_no_longer_an_anchor(self):
-        # The reduction the merge buys. The old delivery applier had to match
-        # the `msg = (` f-strings — three lines of nested quotes and unicode —
-        # purely to find an insertion point after clip lines another patch
-        # owned. Owning both, this applier appends the hook to its own
-        # replacement instead, so upstream can reword that message freely.
-        self.assertNotIn("msg = (", HANDOFF_ANCHOR + WAKE_ANCHOR)
+
+def method_source(source, name):
+    """Source of one ``_KanbanNotification`` method in ``source``."""
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == "_KanbanNotification":
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name:
+                    return ast.get_source_segment(source, item)
+    raise AssertionError(f"no _KanbanNotification.{name} in source")
+
+
+class ApplyTest(unittest.TestCase):
+    def test_all_three_anchors_match_upstream_exactly_once(self):
+        for anchor in (HANDOFF_ANCHOR, WAKE_ANCHOR, INCIDENT_ANCHOR):
+            self.assertEqual(UPSTREAM_NOTIFIER.count(anchor), 1, anchor)
+
+    def test_the_message_line_is_not_an_anchor(self):
+        # The old delivery applier had to match the `msg = (` f-strings —
+        # nested quotes and unicode — purely to find an insertion point after
+        # clip lines another patch owned. Owning the clip, this applier appends
+        # the hook to its own replacement instead, so upstream can reword the
+        # completion message freely.
+        self.assertNotIn("✔", HANDOFF_ANCHOR + WAKE_ANCHOR + INCIDENT_ANCHOR)
 
     def test_both_of_upstreams_hard_slices_are_replaced(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertIn("h = _clip_handoff(payload_summary)", patched)
-        self.assertIn("r = _clip_handoff(task.result)", patched)
-        self.assertNotIn("lines[0][:200]", patched)
-        self.assertNotIn("lines[0][:160]", patched)
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        self.assertIn("wake_handoff = _clip_handoff(payload_summary)", patched)
+        self.assertIn("wake_handoff = _clip_handoff(n.task.result)", patched)
+        self.assertNotIn("_first_line(str(payload_summary), 200)", patched)
+        self.assertNotIn("_first_line(n.task.result, 160)", patched)
 
-    def test_the_hardcoded_tuple_is_replaced_by_the_helper(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
+    def test_the_hardcoded_set_is_replaced_by_the_helper(self):
+        patched = patch_tree(UPSTREAM_NOTIFIER)
         # Both keyword arguments are part of the assertion: the notifier must
         # hand the helper the adapter and the delivery mode, or neither no-send
-        # carve-out above ever engages.
+        # carve-out ever engages.
         self.assertIn(
-            'd["events"], adapter=adapter, passive_delivered=send_passive', patched
+            'self.d["events"], adapter=self.adapter, passive_delivered=self.send_passive',
+            patched,
         )
-        self.assertNotIn('_WAKE_KINDS = ("completed"', patched)
-        self.assertNotIn("in _WAKE_KINDS}", patched)
+        self.assertNotIn("in _WAKE_KINDS} if self.wake_agent", patched)
         # Upstream's own per-subscription gate survives the replacement. Losing
         # it would wake a mode="notify" subscriber this patch never had an
         # opinion about.
-        self.assertIn("if wake_agent", patched)
+        self.assertIn("if self.wake_agent", patched)
         self.assertIn("else set()", patched)
+
+    def test_upstreams_wake_tuple_is_left_alone(self):
+        # ``build_wake_text`` still orders the wake text's parts by the
+        # module-level tuple; only the set comprehension that read it as the
+        # wake *decision* is replaced.
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        self.assertIn("_WAKE_KINDS = (", patched)
 
     def test_the_hook_lands_after_the_clip_and_before_the_message(self):
         # Ordering is the whole contract: the hook has to see the handoff the
         # clip produced in order to decide the clip was redundant, and the
         # message has to be built from what the hook returned.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        clip = patched.rindex("r = _clip_handoff(task.result)")
-        hook = patched.index("handoff = _kanban_handoff_with_result(handoff, task)")
-        message = patched.index("msg = (")
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        clip = patched.rindex("wake_handoff = _clip_handoff(n.task.result)")
+        hook = patched.index("handoff = _kanban_handoff_with_result(handoff, n.task)")
+        message = patched.index('return f"✔ {n.head} done')
         self.assertTrue(clip < hook < message)
 
     def test_the_hook_replaces_the_handoff_rather_than_appending_to_it(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
+        patched = patch_tree(UPSTREAM_NOTIFIER)
         self.assertNotIn("handoff +=", patched)
 
     def test_one_import_trailer_carries_every_name(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
+        patched = patch_tree(UPSTREAM_NOTIFIER)
         self.assertIn("from gateway.kanban_notifier import", patched)
         for name in (
             "clip_handoff as _clip_handoff",
@@ -1531,32 +1694,35 @@ class ApplyTest(unittest.TestCase):
             "wake_kinds_for as _wake_kinds_for",
         ):
             self.assertIn(name, patched)
-        # Three trailers became one; a second would mean a duplicated build step.
         self.assertEqual(patched.count("from gateway.kanban_notifier import"), 1)
 
     def test_the_patched_module_still_parses(self):
-        ast.parse(patch_tree(UPSTREAM_WATCHERS))
+        ast.parse(patch_tree(UPSTREAM_NOTIFIER))
 
     def test_a_drifted_handoff_anchor_fails_loudly(self):
-        drifted = UPSTREAM_WATCHERS.replace("lines[0][:200]", "lines[0][:220]")
         with self.assertRaises(SystemExit) as ctx:
-            patch_tree(drifted)
+            patch_tree(UPSTREAM_NOTIFIER.replace(*HANDOFF_DRIFT))
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("completion handoff", str(ctx.exception))
 
     def test_a_drifted_wake_anchor_fails_loudly(self):
-        # Names the failing anchor: with two edits in one applier, "found 0" on
-        # its own would not say which half of the notifier moved.
-        drifted = UPSTREAM_WATCHERS.replace('"blocked")', '"blocked", "abandoned")')
+        # Names the failing anchor: with three edits in one applier, "found 0"
+        # on its own would not say which part of the notifier moved.
         with self.assertRaises(SystemExit) as ctx:
-            patch_tree(drifted)
+            patch_tree(UPSTREAM_NOTIFIER.replace(*WAKE_DRIFT))
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("wake set", str(ctx.exception))
 
-    def test_a_drifted_second_anchor_leaves_the_file_untouched(self):
+    def test_a_drifted_incident_anchor_fails_loudly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(UPSTREAM_NOTIFIER.replace(*INCIDENT_DRIFT))
+        self.assertIn("found 0", str(ctx.exception))
+        self.assertIn("incident row", str(ctx.exception))
+
+    def test_a_drifted_later_anchor_leaves_the_file_untouched(self):
         # The applier edits a string and writes once at the end, so a failure
-        # on the second anchor must not leave the first edit on disk.
-        drifted = UPSTREAM_WATCHERS.replace('"blocked")', '"blocked", "abandoned")')
+        # on a later anchor must not leave the earlier edits on disk.
+        drifted = UPSTREAM_NOTIFIER.replace(*INCIDENT_DRIFT)
         root = Path(tempfile.mkdtemp())
         target = root / RELATIVE
         target.parent.mkdir(parents=True)
@@ -1566,21 +1732,21 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(target.read_text(), drifted)
 
     def test_applying_twice_fails_rather_than_silently_no_opping(self):
-        # Both anchors are destroyed by their own replacement, so a re-run would
-        # fail on "found 0" anyway — but that message blames upstream drift for
-        # what is really a duplicated build step, and the old delivery applier
-        # had an anchor that survived patching and did silently stack.
+        # All three anchors are destroyed by their own replacement, so a re-run
+        # would fail on "found 0" anyway — but that message blames upstream
+        # drift for what is really a duplicated build step, and the old delivery
+        # applier had an anchor that survived patching and did silently stack.
         root = Path(tempfile.mkdtemp())
         target = root / RELATIVE
         target.parent.mkdir(parents=True)
-        target.write_text(UPSTREAM_WATCHERS)
+        target.write_text(UPSTREAM_NOTIFIER)
         apply(root)
         with self.assertRaises(SystemExit) as ctx:
             apply(root)
         self.assertIn("already patched", str(ctx.exception))
         patched = target.read_text()
         self.assertEqual(
-            patched.count("handoff = _kanban_handoff_with_result(handoff, task)"), 1
+            patched.count("handoff = _kanban_handoff_with_result(handoff, n.task)"), 1
         )
         self.assertEqual(patched.count("from gateway.kanban_notifier import"), 1)
 
@@ -1590,156 +1756,66 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("does not exist", str(ctx.exception))
 
 
-# The three edits this applier replaces, as they were: the Dockerfile's inline
-# `kanban_handoff_clip` rewrite, `apply_kanban_wake_kinds.py`, and
-# `apply_kanban_result_delivery.py`. Kept here rather than deleted with them so
-# the equivalence claim stays checkable after the originals are gone.
-LEGACY_CLIP = (
-    (
-        "h = lines[0][:200] if lines else payload_summary[:200]",
-        "h = _clip_handoff(payload_summary)",
-    ),
-    (
-        "r = lines[0][:160] if lines else task.result[:160]",
-        "r = _clip_handoff(task.result)",
-    ),
-)
-LEGACY_WAKE = (
-    '                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")\n'
-    '                        _wake_kinds = (\n'
-    '                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}\n'
-    '                            if wake_agent\n'
-    '                            else set()\n'
-    '                        )\n',
-    '                        _wake_kinds = (\n'
-    '                            _wake_kinds_for(d["events"], adapter=adapter)\n'
-    '                            if wake_agent\n'
-    '                            else set()\n'
-    '                        )\n',
-)
-LEGACY_DELIVERY = (
-    '                            msg = (\n',
-    "                            handoff = _kanban_handoff_with_result(handoff, task)\n"
-    "                            msg = (\n",
-)
+def _diff_lines(before, after):
+    """(removed, added) lines between two texts, in order, as a unified diff sees them."""
+    removed, added = [], []
+    for line in difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0):
+        if line.startswith(("---", "+++", "@@")):
+            continue
+        if line.startswith("-"):
+            removed.append(line[1:])
+        elif line.startswith("+"):
+            added.append(line[1:])
+    return removed, added
 
 
-def legacy_pipeline(source):
-    """Replay the three superseded edits in the order the Dockerfile ran them."""
-    for old, new in LEGACY_CLIP:
-        assert source.count(old) == 1, old
-        source = source.replace(old, new)
-    for old, new in (LEGACY_WAKE, LEGACY_DELIVERY):
-        assert source.count(old) == 1, old
-        source = source.replace(old, new)
-    return source
+class MinimalDiffTest(unittest.TestCase):
+    """What the applier does to upstream is exactly what its constants say.
 
-
-#: The wake call as the merged applier emits it, and as the three superseded
-#: appliers emitted it. They differ by ``passive_delivered=send_passive``, which
-#: is a behaviour change and not a refactor: v2026.8.13's ``delivery_mode="wake"``
-#: skips the text ping on a push adapter, so the narrowing had to learn a second
-#: way for "the answer is already in the thread" to be false. Held as literals
-#: rather than read off the applier so that changing the applier changes this
-#: file too, where a reviewer will see it.
-WAKE_CALL_MERGED = (
-    "                            _wake_kinds_for(\n"
-    '                                d["events"], adapter=adapter, passive_delivered=send_passive\n'
-    "                            )\n"
-)
-WAKE_CALL_LEGACY = '                            _wake_kinds_for(d["events"], adapter=adapter)\n'
-
-
-def strip_patch_furniture(text, drop_added_calls=True, normalise_wake_call=True):
-    """Reduce patched source to the part the legacy pipeline can be compared to.
-
-    Five things are dropped or rewritten, and only five:
-
-    * the import trailer — three trailers became one;
-    * the ``see <module>`` comments — they now name one module;
-    * the marker call and the incident-store call, when ``drop_added_calls`` is
-      set. These are the pieces of emitted code with no legacy counterpart,
-      because they are new behaviours (sections 4 and 5 of
-      ``kanban_notifier.py``);
-    * the wake call's ``passive_delivered=`` argument, when
-      ``normalise_wake_call`` is set — the third new behaviour, and the reason
-      the merged call wraps where the legacy one did not.
-
-    Subtracting those is what lets :class:`LegacyEquivalenceTest` keep making
-    its original claim about everything else; that the subtractions are the
-    *whole* difference is asserted separately for each, so nothing can hide
-    behind any of them.
-    """
-    marker = "\n\n# kube-agents patch: see gateway/"
-    body = text[: text.index(marker)] if marker in text else text
-    if drop_added_calls:
-        body = body.replace(INCIDENT_CALL, "").replace(MARKER_CALL, "")
-    if normalise_wake_call:
-        body = body.replace(WAKE_CALL_MERGED, WAKE_CALL_LEGACY)
-    return "\n".join(
-        line for line in body.splitlines()
-        if "# kube-agents patch: see gateway/" not in line
-    )
-
-
-class LegacyEquivalenceTest(unittest.TestCase):
-    """The merge is a refactor, and this is the proof.
-
-    Two anchors in one applier produce the same patched notifier as the four
-    anchors across three appliers did. Anything else — a dropped ``lines = …``,
-    a reordered hook, a changed clip call — would be a behaviour change wearing
-    a refactor's clothes, and the duplicate-delivery bug this code path already
-    shipped once is exactly the kind of thing that hides in "while I was in
-    there".
-
-    Three later additions are deliberate exceptions, and they are the only
-    ones: the completion marker, the incident-store call, and the wake call's
-    ``passive_delivered=`` argument. Each is normalised away before the
-    comparison and pinned by its own test —
-    :meth:`test_the_added_calls_are_the_only_departure_from_legacy`,
-    :meth:`test_the_incident_call_is_emitted_exactly_once` and
-    :meth:`test_the_wake_call_carries_the_delivery_mode_argument` — so the
-    equivalence claim narrowed by exactly three reviewable blocks rather than
-    quietly weakening.
+    The old ``LegacyEquivalenceTest`` proved the merged applier reproduced three
+    superseded appliers byte for byte; those appliers never saw the v2026.9.14
+    notifier, so that claim has nothing left to be checked against. What can
+    still be pinned is that the patch is *only* its named blocks: the lines
+    removed from upstream are the two hard slices and the wake-set
+    comprehension, and the lines added are the replacements those three anchors
+    spell out plus the trailer. Anything else — a "while I was in there" — shows
+    up here as an unexplained line, which is what a behaviour change wearing a
+    refactor's clothes looks like.
     """
 
-    def test_the_merged_applier_reproduces_the_legacy_output(self):
+    def test_exactly_upstreams_three_lines_are_removed(self):
+        removed, _ = _diff_lines(UPSTREAM_NOTIFIER, patch_tree(UPSTREAM_NOTIFIER))
         self.assertEqual(
-            strip_patch_furniture(legacy_pipeline(UPSTREAM_WATCHERS)),
-            strip_patch_furniture(patch_tree(UPSTREAM_WATCHERS)),
+            removed,
+            [
+                "        wake_handoff = _first_line(str(payload_summary), 200)",
+                "        wake_handoff = _first_line(n.task.result, 160)",
+                '        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()',
+            ],
         )
 
-    def test_the_added_calls_are_the_only_departure_from_legacy(self):
-        # Without this, strip_patch_furniture's replace() would be a hole any
-        # future edit could be slipped through. Compare the two outputs with
-        # nothing subtracted and require every added line to belong to one of
-        # the two added calls.
-        legacy = strip_patch_furniture(
-            legacy_pipeline(UPSTREAM_WATCHERS), drop_added_calls=False
-        ).splitlines()
-        merged = strip_patch_furniture(
-            patch_tree(UPSTREAM_WATCHERS), drop_added_calls=False
-        ).splitlines()
-        added = [line for line in merged if line not in legacy]
-        # The marker call's closing `)` is not among them: since v2026.8.13 the
-        # wake-set assignment legacy also produces is a parenthesized
-        # conditional, so a bare `)` at that indent already appears in both.
-        # Membership, not identity, is what this comparison can see.
-        self.assertEqual(added, [
-            line
-            for line in (INCIDENT_CALL + MARKER_CALL).splitlines()
-            if line not in legacy
-        ])
-        self.assertIn("wake_configured=wake_agent,", "\n".join(added))
-        self.assertIn(INCIDENT_CALL.strip(), "\n".join(added))
-        # ...and nothing was removed, either.
-        self.assertEqual([line for line in legacy if line not in merged], [])
+    def test_exactly_the_named_blocks_are_added(self):
+        _, added = _diff_lines(UPSTREAM_NOTIFIER, patch_tree(UPSTREAM_NOTIFIER))
+        expected = []
+        for anchor, patched in (
+            (HANDOFF_ANCHOR, HANDOFF_PATCHED),
+            (WAKE_ANCHOR, WAKE_PATCHED),
+            (INCIDENT_ANCHOR, INCIDENT_PATCHED),
+        ):
+            expected += _diff_lines(anchor, patched)[1]
+        expected += TRAILER.splitlines()
+        # Multiset rather than order: the file-level diff can align a shared
+        # closing paren differently from the per-block one. Order is pinned by
+        # the tests below.
+        self.assertEqual(sorted(added), sorted(expected))
+        self.assertIn(MARKER_CALL.splitlines()[0], added)
+        self.assertIn(INCIDENT_CALL.rstrip("\n"), added)
 
     def test_the_marker_call_is_emitted_exactly_once(self):
         # A second copy would announce the same card twice on one turn, and is
         # what a re-applied patch used to produce before SENTINELS grew a guard
         # for this name.
-        patched = patch_tree(UPSTREAM_WATCHERS)
+        patched = patch_tree(UPSTREAM_NOTIFIER)
         self.assertEqual(patched.count("_kanban_note_suppressed("), 1)
         self.assertEqual(patched.count("as _kanban_note_suppressed,"), 1)
         self.assertIn(MARKER_CALL, patched)
@@ -1748,79 +1824,81 @@ class LegacyEquivalenceTest(unittest.TestCase):
         # A second copy would POST the same row twice per delivery. Harmless
         # against INSERT OR IGNORE, but it would double the loopback traffic on
         # the notifier's poll loop and mask a duplicated build step.
-        patched = patch_tree(UPSTREAM_WATCHERS)
+        patched = patch_tree(UPSTREAM_NOTIFIER)
         self.assertEqual(patched.count("_kanban_store_incident("), 1)
         self.assertEqual(patched.count("as _kanban_store_incident,"), 1)
         self.assertIn(INCIDENT_CALL, patched)
 
     def test_the_incident_call_is_passed_this_event_and_not_the_delivery(self):
-        # The anchor is 24 spaces in, which is inside `for ev in d["events"]:`
-        # as well as `for d in deliveries:` — so this call runs once per event.
-        # Handed `d["events"]` it would fire on a delivery's `commented` event
-        # too, writing the row before the `completed` iteration sends the
-        # report the row claims the reader has. `posted=send_passive` is the
-        # other half: with delivery_mode="wake" nothing is posted at all.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertIn("_kanban_store_incident(ev, task, sub", patched)
-        self.assertNotIn('_kanban_store_incident(d["events"]', patched)
-        self.assertIn("posted=send_passive", INCIDENT_CALL)
+        # `_send_pings` is the per-event loop, so this call runs once per
+        # event. Handed `self.d["events"]` it would fire on a delivery's
+        # `commented` event too, writing the row before the `completed`
+        # iteration sends the report the row claims the reader has.
+        # `posted=self.send_passive` is the other half: with
+        # delivery_mode="wake" nothing is posted at all.
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        self.assertIn("_kanban_store_incident(ev, self.task, self.sub", patched)
+        self.assertNotIn('_kanban_store_incident(self.d["events"]', patched)
+        self.assertIn("posted=self.send_passive", INCIDENT_CALL)
 
     def test_the_incident_call_runs_after_the_report_was_sent(self):
-        # The row asserts that the reader HAS this report, so it must not be
-        # written on a path that has not sent it. Upstream's `adapter.send` is
-        # the last thing before this anchor.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        send = patched.index("await adapter.send(")
-        store = patched.index(INCIDENT_CALL.strip())
-        self.assertLess(send, store)
+        # The row asserts that the reader HAS this report, so it must follow
+        # the await that sent it, inside the same try.
+        pings = method_source(patch_tree(UPSTREAM_NOTIFIER), "_send_pings")
+        self.assertLess(pings.index("await self._send_event(ev, msg)"), pings.index(INCIDENT_CALL.strip()))
+        self.assertLess(pings.index(INCIDENT_CALL.strip()), pings.index("except Exception as exc:"))
 
-    def test_the_incident_call_comes_before_the_marker_call(self):
-        # Ordering is not load-bearing — neither can raise — but it is asserted
-        # so a reordering is a deliberate edit rather than a rebase artifact.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertLess(
-            patched.index(INCIDENT_CALL.strip()),
-            patched.index("_kanban_note_suppressed(\n"),
-        )
-
-    def test_the_marker_call_reads_the_wake_set_it_is_reporting_on(self):
+    def test_the_marker_sits_in_build_wake_text_after_the_wake_set(self):
         # It subtracts the wake set from what upstream would have woken for, so
-        # it cannot run before `_wake_kinds` exists.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        wake = patched.index(
-            'd["events"], adapter=adapter, passive_delivered=send_passive'
+        # it cannot run before `self.wake_kinds` is assigned.
+        wake = method_source(patch_tree(UPSTREAM_NOTIFIER), "build_wake_text")
+        self.assertLess(
+            wake.index('self.d["events"], adapter=self.adapter, passive_delivered=self.send_passive'),
+            wake.index("_kanban_note_suppressed(\n"),
         )
-        note = patched.index("_kanban_note_suppressed(\n")
-        self.assertLess(wake, note)
+
+    def test_the_incident_row_precedes_the_marker_at_runtime(self):
+        # The order the two records matter in: the row the *user's* next message
+        # needs, then the note the *agent's* next turn needs. The applier decides
+        # which method each insert lands in; deliver() -- upstream's, untouched,
+        # mirrored by the fixture -- decides the order those methods run. So
+        # read the landing methods out of the patched output rather than
+        # assuming _send_pings / build_wake_text, and assert deliver() calls
+        # the row's method before the marker's.
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        row_method = _enclosing_method(patched, INCIDENT_CALL.strip())
+        marker_method = _enclosing_method(patched, "_kanban_note_suppressed(")
+        self.assertNotEqual(row_method, marker_method)
+        deliver = method_source(patched, "deliver")
+        self.assertLess(
+            deliver.index(f"self.{row_method}()"),
+            deliver.index(f"self.{marker_method}()"),
+        )
 
     def test_the_wake_call_carries_the_delivery_mode_argument(self):
-        # The second departure from legacy, pinned the way the marker call is:
-        # strip_patch_furniture rewrites the merged call back to the legacy
-        # one-liner, and without this that rewrite would be a hole a dropped
-        # argument could vanish through — leaving a build that narrows the wake
-        # for delivery_mode="wake" subscribers, whose wake IS the delivery.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertIn(WAKE_CALL_MERGED, patched)
-        self.assertNotIn(WAKE_CALL_LEGACY, patched)
-        # And it binds upstream's own name for "this mode gets a text ping",
-        # not a literal that would silently stop tracking the mode.
-        self.assertIn('send_passive = mode != "wake"', patched)
-
-    def test_upstreams_own_lines_are_left_alone(self):
-        # Both `lines = …` assignments are dead once the clip lands, but they
-        # are upstream's dead code, not ours. Removing them would put an edit
-        # in the patch that no anchor and no test was asking for.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertIn("lines = payload_summary.strip().splitlines()", patched)
-        self.assertIn("lines = task.result.strip().splitlines()", patched)
+        # Without `passive_delivered=` the build narrows the wake for
+        # delivery_mode="wake" subscribers, whose wake IS the delivery. It binds
+        # upstream's own name for "this mode gets a text ping", not a literal
+        # that would silently stop tracking the mode. Asserted on what the
+        # applier inserted -- the lines in the output that are not in the
+        # fixture -- and on the verifier's check that the name upstream still
+        # derives from delivery_mode is the one bound here.
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        inserted = [
+            line for line in patched.splitlines() if line not in UPSTREAM_NOTIFIER.splitlines()
+        ]
+        wake_call = [line for line in inserted if "passive_delivered=" in line]
+        self.assertEqual(len(wake_call), 1, inserted)
+        self.assertIn("passive_delivered=self.send_passive", wake_call[0])
+        self.assertIn('self.send_passive = mode != "wake"', VERIFIER_SOURCE)
 
 
 class VerifierSendAnchorTest(unittest.TestCase):
     """The one literal in ``verify_kanban_notifier.py`` another patch owns.
 
     The verifier asserts the incident row is written after the report was sent
-    by comparing source offsets, and the send it measures against is not
-    upstream's ``await adapter.send(`` — ``apply_kanban_progress_lines.py``
+    by locating the send inside ``_send_event``, and the send it measures against
+    is not upstream's ``await adapter.send(`` — ``apply_kanban_progress_lines.py``
     rewrites that line earlier in the same build. Nothing else couples the two
     files, and a mismatch is silent in the worst way: ``str.find`` returns -1,
     the offset comparison fails, and the build reports "the row is written

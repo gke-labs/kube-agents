@@ -7,19 +7,23 @@ once; that says nothing about whether the branch sits where ``_retry_after``
 is decided, whether the error the worker actually sees reaches it as a rate
 limit, or whether the parser reads that error.
 
-Three things are checked:
+Four things are checked:
 
-1. **Placement.** Parsed out of the patched ``agent/conversation_loop.py``: the
-   branch is inside the block that assigns ``_retry_after = None``, runs after
-   the header read and before the ``wait_time`` assignment that consumes it,
-   and is gated on ``not _retry_after`` so a header still wins.
+1. **Placement.** Parsed out of the patched ``agent/turn_recovery.py``: the
+   branch is inside ``compute_error_backoff``, runs after the ``Retry-After``
+   header read and upstream's own ``retry_after`` body-field read, before the
+   ``wait_time`` assignment that consumes it, and is gated on
+   ``not _retry_after`` so a header or field still wins.
 2. **Composition.** The error shape the worker receives during a storm, an
    ``openai.RateLimitError`` whose message is LiteLLM's pass-through of a Google
    ``RetryInfo`` body with no ``Retry-After`` header, is classified
    ``rate_limit`` by the real ``agent.error_classifier`` (otherwise
    ``is_rate_limited`` is False and the branch never runs) and yields the body's
    delay from the real parser.
-3. **Bounds.** The cap matches the header path's 600 s, and an error without a
+3. **The real backoff.** ``compute_error_backoff`` itself, driven with that
+   error and a display-only agent, returns the body's delay; a plain 429 keeps
+   the stock backoff and a ``Retry-After`` header still wins.
+4. **Bounds.** The cap matches the header path's 600 s, and an error without a
    delay yields ``None`` so the stock backoff still applies.
 
 Usage::
@@ -41,8 +45,17 @@ HERMES = Path(os.environ.get("HERMES_ROOT", "/opt/hermes"))
 #: The delay Google quoted throughout the 2026-09-03 storm.
 STORM_DELAY_SECONDS = 54.0
 
-#: Cap on the ``Retry-After`` header path in ``conversation_loop.py``.
+#: Cap on the ``Retry-After`` header path in ``turn_recovery.py``.
 HEADER_CAP_SECONDS = 600.0
+
+#: A ``Retry-After`` header that disagrees with the body's 54 s, to prove the
+#: header still wins; the same number both as the header string and the wait.
+HEADER_RETRY_AFTER_SECONDS = 7
+
+#: Where the storm's requests went, and what the agent called the model. Only
+#: ``compute_error_backoff``'s signature needs them; the values are inert.
+STORM_BASE_URL = "http://litellm/v1"
+STORM_MODEL = "gemini"
 
 GOOGLE_429_BODY = {
     "error": {
@@ -72,7 +85,11 @@ HUGE_DELAY_BODY = {
 BRANCH_TEST = ast.unparse(
     ast.parse("is_rate_limited and not _retry_after", mode="eval").body
 )
-HEADER_TEST = "is_rate_limited"
+#: Upstream's header parser, called on the error's response headers.
+HEADER_PARSER = "parse_retry_after_seconds"
+#: Upstream's own body read is gated on the header having said nothing.
+BODY_FIELD_TEST = "_retry_after is None"
+BACKOFF_DEF = "compute_error_backoff"
 MARKER = "_kube_retry_delay_from_error"
 
 
@@ -89,9 +106,9 @@ if str(HERMES) not in sys.path:
 
 
 # --- 1. Placement -----------------------------------------------------------
-print("retryDelay branch (agent/conversation_loop.py):")
+print("retryDelay branch (agent/turn_recovery.py):")
 
-loop_tree = ast.parse((HERMES / "agent" / "conversation_loop.py").read_text())
+loop_tree = ast.parse((HERMES / "agent" / "turn_recovery.py").read_text())
 
 branches = [
     node
@@ -117,6 +134,21 @@ if len(branches) == 1:
             if isinstance(block, list) and branch in block:
                 enclosing = block
     check("the branch sits in a statement block", enclosing is not None)
+    backoff = next(
+        (
+            n
+            for n in ast.walk(loop_tree)
+            if isinstance(n, ast.FunctionDef) and n.name == BACKOFF_DEF
+        ),
+        None,
+    )
+    check(
+        f"the branch is inside {BACKOFF_DEF}, with api_error and is_rate_limited as parameters",
+        backoff is not None
+        and branch in list(ast.walk(backoff))
+        and {"api_error", "is_rate_limited"}
+        <= {a.arg for a in backoff.args.args + backoff.args.kwonlyargs},
+    )
 
 if enclosing is not None:
     index = enclosing.index(branch)
@@ -131,18 +163,35 @@ if enclosing is not None:
             and any(ast.unparse(t) == name for t in s.targets)
         ]
 
+    header_reads = [
+        s
+        for s in _assigns(before, "_retry_after")
+        if HEADER_PARSER in ast.unparse(s.value) and "headers" in ast.unparse(s.value)
+    ]
     check(
-        "_retry_after is initialised before the branch",
-        any(ast.unparse(s.value) == "None" for s in _assigns(before, "_retry_after")),
-        "the branch would read an unbound name on a non-rate-limit error",
+        "the Retry-After header is read into _retry_after before the branch",
+        len(header_reads) == 1,
+        "the header has to win; the branch is gated on its answer",
     )
     check(
-        "the Retry-After header is read before the branch",
+        "upstream's retry_after body-field read also precedes the branch",
         any(
-            isinstance(s, ast.If) and ast.unparse(s.test) == HEADER_TEST
+            isinstance(s, ast.If)
+            and ast.unparse(s.test) == BODY_FIELD_TEST
+            and "retry_after" in ast.unparse(s)
             for s in before
         ),
-        "the header has to win; the branch is gated on its answer",
+        "the field has to win too; Google's body has no such field, so the branch still runs",
+    )
+    check(
+        "the cap and the zero-clear precede the branch",
+        any(
+            isinstance(s, ast.If)
+            and "600" in ast.unparse(s)
+            and "_retry_after = None" in ast.unparse(s)
+            for s in before
+        ),
+        "a delay this branch sets is capped and zero-cleared by the parser itself",
     )
     waits = _assigns(after, "wait_time")
     check(
@@ -180,7 +229,7 @@ from hermes_cli.rate_limit_retry_delay import (  # noqa: E402
 
 def sdk_error(body):
     """An ``openai.RateLimitError`` the way the SDK raises it off a 429."""
-    request = httpx.Request("POST", "http://litellm/v1/chat/completions")
+    request = httpx.Request("POST", f"{STORM_BASE_URL}/chat/completions")
     response = httpx.Response(429, request=request, json=body)
     return openai.RateLimitError(
         f"Error code: 429 - {body}", response=response, body=body.get("error")
@@ -196,7 +245,7 @@ check(
     and not headers.get("Retry-After"),
     "then the header path already covered it and this patch is moot",
 )
-classified = classify_api_error(storm, provider="openai", model="gemini")
+classified = classify_api_error(storm, provider="openai", model=STORM_MODEL)
 check(
     "the real classifier calls it a rate limit",
     classified.reason == FailoverReason.rate_limit,
@@ -224,6 +273,67 @@ except _Wrapper as wrapped:
         "a wrapped error is read through its cause chain",
         retry_delay_from_error(wrapped) == STORM_DELAY_SECONDS,
     )
+
+
+# --- 2b. The real backoff, end to end ---------------------------------------
+print("the real compute_error_backoff with the storm error:")
+
+from agent.turn_recovery import compute_error_backoff  # noqa: E402
+
+#: The retry the storm error is on, and the ceiling; any values reach the wait.
+STORM_RETRY_COUNT = 1
+STORM_MAX_RETRIES = 3
+
+
+class _QuietAgent:
+    """The four things compute_error_backoff asks of the agent; all display."""
+
+    def _buffer_status(self, text):
+        pass
+
+    def _emit_status(self, text):
+        pass
+
+    def _emit_wait_notice(self, text):
+        pass
+
+    def _client_log_context(self):
+        return ""
+
+
+def _wait_for(error, *, is_rate_limited):
+    return compute_error_backoff(
+        _QuietAgent(), error, retry_count=STORM_RETRY_COUNT, max_retries=STORM_MAX_RETRIES,
+        is_rate_limited=is_rate_limited, is_zai_coding_overload=False,
+        base_url=STORM_BASE_URL, model=STORM_MODEL,
+    )
+
+
+check(
+    "the patched backoff waits out the body's delay",
+    _wait_for(storm, is_rate_limited=True) == STORM_DELAY_SECONDS,
+    f"got {_wait_for(storm, is_rate_limited=True)!r}",
+)
+check(
+    "a plain 429 keeps the stock jittered backoff",
+    _wait_for(sdk_error(PLAIN_429_BODY), is_rate_limited=True) < STORM_DELAY_SECONDS,
+)
+check(
+    "a header still wins over the body",
+    compute_error_backoff(
+        _QuietAgent(),
+        openai.RateLimitError(
+            f"Error code: 429 - {GOOGLE_429_BODY}",
+            response=httpx.Response(
+                429, request=httpx.Request("POST", f"{STORM_BASE_URL}/chat/completions"),
+                json=GOOGLE_429_BODY, headers={"retry-after": str(HEADER_RETRY_AFTER_SECONDS)},
+            ),
+            body=GOOGLE_429_BODY.get("error"),
+        ),
+        retry_count=STORM_RETRY_COUNT, max_retries=STORM_MAX_RETRIES, is_rate_limited=True,
+        is_zai_coding_overload=False, base_url=STORM_BASE_URL, model=STORM_MODEL,
+    ) == HEADER_RETRY_AFTER_SECONDS,
+)
 
 
 # --- 3. Bounds --------------------------------------------------------------

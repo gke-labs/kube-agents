@@ -1211,7 +1211,7 @@ class CronDeliveryTests(unittest.TestCase):
     def test_a_semicolon_is_not_a_separator_and_is_reported(self):
         """The gate must mirror the parser that *delivers*, not the relay's.
 
-        `cron/scheduler.py::_resolve_delivery_targets` splits on `,` alone, so
+        `cron/scheduler_delivery.py::_resolve_delivery_targets` splits on `,` alone, so
         `chat;slack` is one part it cannot resolve, and beside a part that
         does it drops silently while the job records `ok`. Splitting on `;`
         here -- on the authority of the chat relay's token reader, which only

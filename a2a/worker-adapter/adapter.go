@@ -161,20 +161,24 @@ const (
 	// reaped session leaves three consumers on TASKS forever, and the
 	// successor incarnation — which mints a fresh name — leaves three more.
 	//
-	// Five seconds is this adapter's own number, not an inherited one:
-	// nats.go's ordered consumers default to five MINUTES
-	// (jetstream/ordered.go, v1.53.1), and an earlier version of this
-	// comment cited that default as five seconds, which is wrong by 60x.
-	// The short threshold is a deliberate departure from it, and NOT
-	// because the threshold only fires after the pod is gone -- an earlier
-	// version of this comment claimed that too and it is not true. A
-	// disconnect longer than five seconds reaps these consumers with
+	// This is lib.EphemeralConsumerInactiveThreshold, the five seconds
+	// lib.TasksGet sets on its replay consumer, so the module's ephemerals
+	// on TASKS reap on one clock. An earlier version of this comment said
+	// the number came from nats.go's ordered consumers, which "use five
+	// seconds": they do not. The ordered-consumer default is five MINUTES
+	// (nats.go v1.53.1, jetstream/ordered.go:635, replaced only by a caller's
+	// non-zero value at :646) -- wrong by 60x -- and that belief is what let
+	// TasksGet ship with the default in place (#1739).
+	//
+	// The threshold is short NOT because it only fires after the pod is gone
+	// -- an earlier version of this comment claimed that too and it is not
+	// true. A disconnect longer than five seconds reaps these consumers with
 	// the adapter still very much alive, and because they are MemoryStorage
 	// with Replicas 1 a nats-server restart destroys them outright. Both are
 	// routine. What makes the short threshold safe is not that the window
 	// never opens; it is that consumeIn supervises its own consumer and
 	// rebuilds it when it does.
-	consumerInactiveThreshold = 5 * time.Second
+	consumerInactiveThreshold = lib.EphemeralConsumerInactiveThreshold
 
 	// inRecreateAttempts and inRecreateBackoff bound the in consumer's
 	// recovery after the server drops it. Five seconds apart for a minute is
