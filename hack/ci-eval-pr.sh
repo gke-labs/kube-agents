@@ -838,9 +838,11 @@ export BENCH_TF_ROOT="./tf"
 # passed every onboarding check, was registered, and 404'd on the first pull
 # request that leased it (gke-labs/kube-agents#994).
 #
-# EVAL_LEDGER_APP_KEY_FILE set: mint a read-only installation token from App
-# 4739812 instead, once per fan-out unit, because a token lasts an hour and
-# units launch across the whole run. Unset: the mounted PAT stands. A mint that
+# EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
+# instead, once per fan-out unit, because a token lasts an hour and units
+# launch across the whole run; grading's mint asks for nothing beyond the
+# installation's grant, and the ledger reset below mints its own, narrowed
+# to one repository and issues: write. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
 # repetition inside the fan-out; it never falls back to the PAT, which would
 # let a smoke test pass while proving nothing about the credential it was added
@@ -860,6 +862,11 @@ LEDGER_MINT_RETRYABLE=75
 # the case this covers, and it costs 10s to rule out; a longer ladder would sit
 # inside a unit that is holding both locks.
 LEDGER_MINT_ATTEMPTS=3
+# The ledger reset's own mint (ledger_reset_token): one retry, 2s apart. It
+# runs under the task lock like the grading mint, and a reset that cannot
+# mint is reported and skipped rather than retried into the unit's budget.
+LEDGER_RESET_MINT_ATTEMPTS=2
+LEDGER_RESET_MINT_RETRY_DELAY=2
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
@@ -890,6 +897,11 @@ def temporary(message):
 key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
 app_id = os.environ["EVAL_LEDGER_APP_ID"]
 installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
+# What the token may reach. Empty -- the default, and what every grading mint
+# sends -- means the installation's whole grant. The ledger reset below sets
+# it to one repository and `issues: write` (ledger_reset_token); a token
+# narrowed at mint cannot be widened by whoever holds it afterwards.
+mint_body = os.environ.get("LEDGER_MINT_BODY", "").strip()
 
 
 def b64(raw):
@@ -919,14 +931,16 @@ if signed.returncode != 0:
     )
 jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
 
+mint_headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json", "User-Agent": "kube-agents-ci-eval-pr"}
+mint_data = None
+if mint_body:
+    mint_data = mint_body.encode()
+    mint_headers["Content-Type"] = "application/json"
 request = urllib.request.Request(
     "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
     method="POST",
-    headers={
-        "Authorization": "Bearer " + jwt,
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "kube-agents-ci-eval-pr",
-    },
+    headers=mint_headers,
+    data=mint_data,
 )
 try:
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -937,7 +951,9 @@ except urllib.error.HTTPError as exc:
     # and a caller holding two locks should hear about them on the first.
     # 403 stays terminal with them: on this endpoint it is a suspended
     # installation as often as a secondary rate limit, and the two read alike
-    # from here.
+    # from here. 422 is terminal too: with a body it means the installation
+    # does not hold a permission or repository the body asked for, which is
+    # an organisation-settings change, not something a retry reaches.
     message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
         exc.code,
         exc.reason,
@@ -1008,6 +1024,108 @@ if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
 else
   mint_ledger_token "preflight" || exit 1
 fi
+
+# ─── Empty ledgers: close what an earlier run left open ──────────────────────
+# A fleet-audit stream keeps one open ledger issue per audit in the leased
+# project's GitOps repository, and audit_report.py `start` finds it as the
+# highest open issue labelled audit:<id> -- since #1691 handing the worker
+# every finding its body carries, by name. Nothing closed it between runs, so
+# on a pool project every repetition of an audit case began with the ledger
+# the previous lease left, already carrying the planted defect; a repetition
+# could pass by keeping a carried finding rather than finding it, and a false
+# clean close by repetition 2 left repetition 3 a different start than 1.
+#
+# hack/ci_reset_audit_ledgers.py closes those issues (a comment naming this
+# build, then state closed; nothing deleted), and it is called twice: here,
+# once the lease is known and before any unit, for every stream; and in
+# run_one_unit, under the task lock and before devops-bench, for that unit's
+# stream alone -- so repetitions 2 and 3 start as repetition 1 did, and a
+# sibling lane's stream, which has its own label, is never touched. Every
+# repetition then opens a fresh ledger, one closed issue per repetition in a
+# repository that exists to be written to; the sibling that sweeps the
+# agent's leftover pull requests is #1832's.
+#
+# Never any repository but the leased project's: the repository is the one
+# gitops_repo_for_project() in hack/ci-deploy.sh maps for PROJECT_ID (lifted
+# from that file, the mapping's one home), the helper refuses a repository
+# that is not <org>/<PROJECT_ID>-infra, and the token is minted narrowed to
+# that repository and issues: write -- three guards that fail independently.
+# The token stays out of BENCH_GITHUB_TOKEN, which grading keeps read-only.
+# A reset that cannot run (no App key, an unmapped project, a mint the
+# installation refuses because issues: write was not granted to App
+# EVAL_LEDGER_APP_ID, docs/ci-pool-projects.md 5.4) says so and the run goes
+# on as it always did; it never reds a pull request.
+eval_gitops_repo() { # <project-id>
+  # Lifted rather than sourced: sourcing hack/ci-deploy.sh would run the
+  # deploy. tests/test_ci_gitops_repo.py pins every pair of the mapping.
+  local body
+  body="$(sed -n '/^gitops_repo_for_project() {$/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+  [ -n "${body}" ] || return 1
+  eval "${body}"
+  gitops_repo_for_project "$1"
+}
+
+# Emits the token on stdout, nothing else; diagnostics on stderr. Narrowed
+# twice at mint, to the one repository and to issues: write. One retry on a
+# transient failure, as mint_ledger_token does; a 422 comes back on the
+# first attempt and means the grant is missing.
+ledger_reset_token() { # <owner/repo>
+  local body minted rc attempt=1
+  body="{\"repositories\":[\"${1##*/}\"],\"permissions\":{\"issues\":\"write\"}}"
+  while :; do
+    # `&&` rather than `if`: the status of a failed `if` test is 0 by the
+    # time the body would read it, and this needs the mint's own.
+    minted="$(LEDGER_MINT_BODY="${body}" _ledger_token_mint)" && { printf '%s\n' "${minted%% *}"; return 0; }
+    rc=$?
+    if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_RESET_MINT_ATTEMPTS}" ]; then
+      return 1
+    fi
+    sleep "${LEDGER_RESET_MINT_RETRY_DELAY}"
+    attempt=$((attempt + 1))
+  done
+}
+
+# The audit id a case grades its ledger under: the `audit:` key of its
+# ledger_issue_contains checks in task.yaml (the seven audit cases each carry
+# one, all distinct). Empty for a case that writes no ledger.
+ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
+  local file="$1"
+  case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
+  [ -f "${file}" ] || return 0
+  # awk with `exit`, not `sed | head`: under pipefail a `head` that closes the
+  # pipe after the first of several matches can hand sed a SIGPIPE, and the
+  # caller assigns this inside `set -e`.
+  awk 'match($0, /^[[:space:]]*audit:[[:space:]]*/) { id = substr($0, RLENGTH + 1); sub(/[^A-Za-z0-9_.-].*$/, "", id); print id; exit }' "${file}"
+}
+
+# Returns 0 whatever happens; the reason it could not reset is printed.
+reset_audit_ledgers() { # <label> [audit-id]
+  local label="$1" audit_id="${2:-}" scope token out rc=0
+  scope="every audit stream"
+  [ -n "${audit_id}" ] && scope="the ${audit_id} stream"
+  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    echo "Ledger reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; ${scope} keeps whatever ledger is open"
+    return 0
+  fi
+  if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
+    echo "Ledger reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh); ${scope} keeps whatever ledger is open"
+    return 0
+  fi
+  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}")"; then
+    echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation has not been granted issues: write (docs/ci-pool-projects.md 5.4)." >&2
+    return 0
+  fi
+  local args=(--repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}")
+  [ -n "${audit_id}" ] && args+=(--audit "${audit_id}")
+  # The token rides in the environment of this one process, never on argv.
+  out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
+  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger reset (${label}): /"
+  [ "${rc}" -eq 0 ] || echo "WARNING: Ledger reset (${label}): the helper exited ${rc}; ${scope} may keep an open ledger and this run grades against it as every run before did." >&2
+  return 0
+}
+
+EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+reset_audit_ledgers "lease"
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -1793,6 +1911,15 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
     return 0
+  fi
+  # This stream's open ledger, closed before the unit runs and while the task
+  # lock keeps its sibling repetitions out: repetitions 2 and 3 audit from the
+  # empty ledger repetition 1 had (the lease-time reset above). Only this
+  # stream's label, so an audit case running in another lane keeps its own.
+  local audit_id
+  audit_id="$(ledger_audit_id_for_task "${task}")"
+  if [ -n "${audit_id}" ]; then
+    reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
