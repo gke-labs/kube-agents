@@ -17,9 +17,11 @@
 # Isolation class: read-only. Eligible tier: nightly.
 #
 # Status: NIGHTLY-ACTIVE (registered in hack/eval/nightly-cases.txt).
-# Its eval loop was not run (`validated: false` per docs/designs/bench-case-format.md):
-# the contributor environment is single-cluster (kyber-test) lacking role
-# crashloop-workload on seeded cluster A of the 3-cluster standing dirty fleet
+# Lands `validated: false` per docs/designs/bench-case-format.md, held subject to
+# maintainer waiver on review (OWNERS approvers / maintainers on PR #1670) per the
+# precedent of #1412 / #1525 (upgrades-api-deprecation-clean-repo): the eval loop was
+# not run locally because the contributor environment is single-cluster (kyber-test)
+# lacking role crashloop-workload on seeded cluster A of the 3-cluster standing dirty fleet
 # (bench/tf/fleet/README.md), and out-of-band multi-cluster fleet provisioning
 # exceeds agent autonomy and IAM permissions. It builds its empirical baseline
 # during nightly evaluation in Boskos-leased pool projects.

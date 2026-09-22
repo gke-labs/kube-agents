@@ -137,4 +137,4 @@ net, not the primary path.
 python3 /opt/data/scripts/cluster_agent_profile.py list
 ```
 
-Lists the currently provisioned Cluster Agent profiles (one per managed cluster).
+Lists the active, fully scaffolded Cluster Agent profiles (one per managed cluster). Pass `--all` to include incomplete or un-scaffolded profile directories.
