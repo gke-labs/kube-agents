@@ -112,7 +112,13 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
-  echo -e "\n\033[91m\033[1m✗ Error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of install.sh instead.
+  local source_file="${BASH_SOURCE[1]:-$0}"
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_json_report "FAILED" "${line_no}" "${bash_cmd}" 2>/dev/null || true
   # A half-written install.env must not be left where the next run would load
   # it. The real file is only ever moved into place complete.
@@ -1524,7 +1530,7 @@ verify_local_source_ref() {
     # BAKED_RELEASE_VERSION is stamped during release automation.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
       local bundle_version=""
-      if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
+      if bundle_version="$(trap - ERR; matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
         SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
         print_success "Verified install sources match official release bundle ${bundle_version}."
         return 0
@@ -1544,7 +1550,7 @@ verify_local_source_ref() {
   fi
 
   local expected_commit current_commit
-  if ! expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+  if ! expected_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
     if [ "$lenient" = "true" ]; then
       print_warning "Cannot verify source/image alignment: ref '$expected_ref' is not present in this checkout."
       SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
@@ -1631,7 +1637,7 @@ refresh_existing_clone() {
     print_info "Using existing repository at $repo_dir as-is: it is not the root of a Git worktree."
     return 0
   fi
-  if ! head_commit="$(git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null)"; then
+  if ! head_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null)"; then
     print_info "Using existing repository at $repo_dir as-is: it has no commit checked out."
     return 0
   fi
@@ -1646,14 +1652,14 @@ refresh_existing_clone() {
     return 0
   fi
   head_branch="$(git -C "$repo_dir" symbolic-ref --short -q HEAD || true)"
-  if expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+  if expected_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
     if [ "$head_commit" = "$expected_commit" ]; then
       print_info "Using existing repository at $repo_dir: already at '$expected_ref' ($head_commit)."
       return 0
     fi
     print_info "Using existing repository at $repo_dir: it already has '$expected_ref' ($expected_commit); checking it out."
   else
-    if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    if [ "$(trap - ERR; git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
       depth_opt="$KUBE_AGENTS_FETCH_DEPTH_OPT"
     fi
     print_info "Using existing repository at $repo_dir: fetching '$expected_ref' from $KUBE_AGENTS_REPO_URL..."

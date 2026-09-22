@@ -64,7 +64,13 @@ on_error() {
   if [ "$exit_code" = "$EXIT_NOTHING_TO_TEAR_DOWN" ]; then
     exit_code=1
   fi
-  echo -e "\n\033[91m\033[1m✗ Teardown error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of uninstall.sh instead.
+  local source_file="${BASH_SOURCE[1]:-$0}"
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n\033[91m\033[1m✗ Teardown error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_report "FAILED" "true" "${line_no}" "${bash_cmd}" 2>/dev/null || true
   # A tfvars the generator was midway through writing is mode 600, carries
   # every secret this run was given, and is named one character from the file

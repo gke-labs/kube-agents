@@ -5251,7 +5251,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         proc = self._run_func(f'run_lifecycle_apply "{repo_dir}" "{log_file}"')
 
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Error encountered at line", proc.stderr)
+        # on_error names the frame that called it: install.sh itself, in the
+        # dispatcher, since the failure is reported from there.
+        self.assertIn(f"Error encountered at {_INSTALL_SH}:", proc.stderr)
+        self.assertIn(" in handle_pipeline_status (exit code 1): ", proc.stderr)
         self.assertIn("./lifecycle.sh apply -auto-approve -input=false", proc.stderr)
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
@@ -5270,6 +5273,33 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
         self.assertTrue(log_file.exists())
         self.assertIn("Apply complete", log_file.read_text())
+
+    def test_a_failure_inside_a_sourced_library_names_its_file_and_function(self):
+        """The abort banner points at the frame that failed.
+
+        $LINENO counts from the top of whichever file the failing command sat
+        in. Printed alone, a failure inside a sourced helper read as a line of
+        install.sh, where that line is unrelated code (#1798). The banner now
+        carries the file and the function; the JSON report is unchanged and
+        still records the status alone.
+        """
+        lib = self._tmp_path / "helper_lib.sh"
+        lib.write_text("library_probe() {\n  false\n}\n")
+        proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
+
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertIn(f"Error encountered at {lib}:", proc.stderr)
+        self.assertIn(" in library_probe (exit code 1): false", proc.stderr)
+        # The report the handler wrote on the way out. Same file the other
+        # write_json_report tests read.
+        report = json.loads(pathlib.Path("/tmp/kube-agents-install-report.json").read_text())
+        self.assertEqual(report["status"], "FAILED")
+        for absent in ("message", "line", "line_no", "command", "function", "source_file"):
+            self.assertNotIn(absent, report)
+        for value in report.values():
+            self.assertNotIn("library_probe", str(value))
+            self.assertNotIn("Error encountered", str(value))
 
     def test_pipeline_status_handles_empty_array_safely_under_set_u(self):
         source = _INSTALL_SH.read_text()

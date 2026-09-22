@@ -248,6 +248,23 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("done", proc.stdout, proc.stderr)
         self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
 
+    def test_missing_deployment_does_not_fire_err_trap(self):
+        # running_image_tag's kubectl probe: no Deployment to read (a first
+        # install, or a context that cannot reach the cluster) is an empty
+        # answer the caller handles, not an abort. Same mechanism as above:
+        # inside the $(...) the probe is a bare failing command, so without
+        # `trap - ERR` in the substitution bash 3.2 fires the inherited trap
+        # there (#1798). The default kubectl stub exits 1.
+        script = (
+            "set -E\n"
+            "trap 'echo \"ERR_TRAP_FIRED\" >&2' ERR\n"
+            'tag="$(running_image_tag kubeagents-system)"\n'
+            'echo "tag=[$tag] done"\n'
+        )
+        proc = self._run(script)
+        self.assertIn("tag=[] done", proc.stdout, proc.stderr)
+        self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
+
     # ── tf_state_manages_resource: whose release is this? ────────────────────
 
     def test_managed_root_resource_with_an_instance_is_ours(self):
@@ -1599,6 +1616,30 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("Rolling back", proc.stderr)
+
+    def test_missing_release_does_not_fire_err_trap(self):
+        # A first install onto an existing cluster: `helm status` exits 1
+        # because no release exists, helm_release_status answers empty and the
+        # caller carries on. Under the front doors' `set -E` the $(...) around
+        # the probe inherits their ERR trap, and on bash 3.2 (macOS's default)
+        # the trap fires inside the subshell unless `trap - ERR` clears it
+        # there: an abort banner and a FAILED report from a successful run
+        # (#1798). CI's bash never fires it here, so this guards by
+        # construction, as test_missing_state_does_not_fire_err_trap does.
+        helm_script = (
+            '#!/usr/bin/env bash\n'
+            'echo "Error: release: not found" >&2\n'
+            'exit 1\n'
+        )
+        script = (
+            "set -E\n"
+            "trap 'echo \"ERR_TRAP_FIRED\" >&2' ERR\n"
+            'status="$(helm_release_status kube-agents kubeagents-system)"\n'
+            'echo "status=[$status] done"\n'
+        )
+        proc = self._run_helm_test(script, helm_script)
+        self.assertIn("status=[] done", proc.stdout, proc.stderr)
+        self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
 
     # ── clear_failed_initial_helm_release: the retry after a first apply died ─
 

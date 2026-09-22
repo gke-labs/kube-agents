@@ -65,7 +65,13 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
-  echo -e "\n${C_RED}${C_BOLD}✗ Upgrade error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}${C_RESET}" >&2
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of upgrade.sh instead.
+  local source_file="${BASH_SOURCE[1]:-$0}"
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n${C_RED}${C_BOLD}✗ Upgrade error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}${C_RESET}" >&2
   write_report "FAILED" 2>/dev/null || true
   # A tfvars the generator was midway through writing is mode 600, carries
   # every secret this run was given, and is named one character from the file
@@ -451,7 +457,7 @@ verify_local_source_ref() {
     # BAKED_RELEASE_VERSION is stamped during release automation.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
       local bundle_version=""
-      if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
+      if bundle_version="$(trap - ERR; matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
         print_success "Verified upgrade sources match official release bundle ${bundle_version}."
         return 0
       fi
@@ -467,7 +473,7 @@ verify_local_source_ref() {
   fi
 
   local expected_commit current_commit
-  if ! expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+  if ! expected_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
     return 1
   fi
