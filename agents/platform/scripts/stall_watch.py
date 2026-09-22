@@ -114,8 +114,8 @@ KINDS_ENV = "STALL_WATCH_KINDS"
 REPORT_SCRIPT_ENV = "STALL_WATCH_REPORT_SCRIPT"
 #: The value of STALL_WATCH_KINDS that hands stall_report.py its own default.
 ALL_KINDS = "all"
-#: Controllers whose silent stalls this watch exists for. Kinds a cluster does
-#: not serve cost one warning each inside stall_report.py and nothing here.
+#: Controllers whose silent stalls this watch exists for. Per cluster, the
+#: list is cut to what the cluster serves before it is handed to the script.
 DEFAULT_KINDS = (
     "deployments",
     "statefulsets",
@@ -173,9 +173,13 @@ INCOMPLETE_LISTING_MARKERS = ("did not respond", "may be incomplete")
 LISTING_SCOPE = "cluster listing"
 BUDGET_SCOPE = "sweep budget"
 #: Wall-clock budget for one sweep. Hermes kills a no_agent script at an hour
-#: and the schedule is half of that; a fleet the budget cannot cover is read in
-#: the same order every tick and the remainder is reported, not lost.
+#: and the schedule is half of that. A fleet the budget cannot cover is read
+#: from where the last tick stopped, so every scope is reached in turn and the
+#: remainder is reported, not lost.
 TICK_BUDGET_SECONDS = 1500
+#: Ledger key for where an exhausted sweep stopped: the cluster and namespace
+#: the next tick starts from.
+CURSOR_KEY = "cursor"
 
 #: The fleet-wide system-namespace set, spelled as the Workload Reliability
 #: Audit's exclusion S1 spells it. `kubeagents-system` is deliberately absent:
@@ -370,11 +374,14 @@ def fetch_credentials(project: str, cluster: str, location: str) -> str:
 
 def served_kinds(kubeconfig: str) -> set[str] | None:
     """The namespaced, listable resources the cluster serves, as kubectl names
-    them (`deployments.apps`) and by bare plural (`deployments`); None when
-    the listing failed, in which case the kind list is passed unfiltered."""
+    them (`deployments.apps`) and by bare plural (`deployments`), so a bare
+    configured kind matches and a grouped one matches only its own group
+    (Istio's `gateways` does not stand in for the Gateway API's); None when
+    the listing was empty, in which case the kind list is passed unfiltered."""
+    # kubectl prints the full list and still exits non-zero when one aggregated
+    # API (metrics-server, say) fails discovery; only an empty listing is a
+    # failure, the same reading stall_report.namespaced_resources makes.
     r = run_sandbox(list(API_RESOURCES_ARGV), timeout=API_RESOURCES_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
-    if r.returncode != 0:
-        return None
     served: set[str] = set()
     for line in r.stdout.splitlines():
         name = line.strip()
@@ -390,7 +397,7 @@ def kinds_for(served: set[str] | None) -> str | None:
     configured = kinds_argument()
     if configured is None or served is None:
         return configured
-    kept = [k for k in configured.split(KINDS_SEPARATOR) if k in served or k.split(".", 1)[0] in served]
+    kept = [k for k in configured.split(KINDS_SEPARATOR) if k in served]
     return KINDS_SEPARATOR.join(kept) if kept else configured
 
 
@@ -433,7 +440,7 @@ def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | No
 
 
 def empty_state() -> dict:
-    return {"version": STATE_SCHEMA_VERSION, "stalls": {}, "unreadable": {}, "sweep_error": None, "updated_at": None}
+    return {"version": STATE_SCHEMA_VERSION, "stalls": {}, "unreadable": {}, "sweep_error": None, "updated_at": None, CURSOR_KEY: None}
 
 
 def load_state(path: Path) -> dict:
@@ -524,6 +531,8 @@ class Sweep:
         self.listed_namespaces: dict[str, set[str]] = {}
         self.unreadable: dict[str, str] = {}
         self.budget_exhausted = False
+        #: Where the budget stopped the sweep, for the next tick to start from.
+        self.cursor: dict | None = None
 
     @property
     def clusters(self) -> int:
@@ -569,12 +578,13 @@ class Sweep:
         namespaces = self.listed_namespaces.get(cid)
         return namespace is not None and namespaces is not None and namespace not in namespaces
 
-    def out_of_budget(self, started: float) -> bool:
+    def out_of_budget(self, started: float, cid: str, namespace: str | None = None) -> bool:
         if self.budget_exhausted:
             return True
         if time.monotonic() - started <= TICK_BUDGET_SECONDS:
             return False
         self.budget_exhausted = True
+        self.cursor = {"cluster": cid, "namespace": namespace}
         self.unreadable[BUDGET_SCOPE] = (
             f"sweep budget of {TICK_BUDGET_SECONDS}s exhausted after {self.clusters} clusters and "
             f"{self.namespaces} namespaces; the rest were not read this tick"
@@ -588,7 +598,18 @@ class Sweep:
 READ_FAILURES = (RuntimeError, subprocess.TimeoutExpired, OSError)
 
 
-def sweep_fleet(project: str) -> Sweep:
+def rotate_to_cursor(sweepable: list, cursor: dict | None) -> list:
+    """Start from the cluster an exhausted sweep stopped at, wrapping around,
+    so a fleet the budget cannot cover is still read in full over ticks."""
+    if not cursor:
+        return sweepable
+    for i, (cid, _) in enumerate(sweepable):
+        if cid == cursor.get("cluster"):
+            return sweepable[i:] + sweepable[:i]
+    return sweepable
+
+
+def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
     sweep = Sweep()
     started = time.monotonic()
     source = report_source()
@@ -606,13 +627,14 @@ def sweep_fleet(project: str) -> Sweep:
             sweepable.append((cid, cluster))
         else:
             sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
-    for cid, cluster in sweepable:
+    for cid, cluster in rotate_to_cursor(sweepable, cursor):
         name, location = cluster["name"], cluster["location"]
-        if sweep.out_of_budget(started):
+        if sweep.out_of_budget(started, cid):
             break
         try:
             kubeconfig = fetch_credentials(project, name, location)
             namespaces = list_namespaces(kubeconfig)
+            kinds = kinds_for(served_kinds(kubeconfig))
         except sandbox_exec.SandboxUnavailable:
             raise
         except READ_FAILURES as exc:
@@ -620,9 +642,12 @@ def sweep_fleet(project: str) -> Sweep:
             continue
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
-        kinds = kinds_for(served_kinds(kubeconfig))
+        if cursor and cursor.get("cluster") == cid and cursor.get("namespace") in namespaces:
+            # Resume inside the cluster the last tick stopped in; the namespaces
+            # before the cursor were read then and are unknown now, not gone.
+            namespaces = namespaces[namespaces.index(cursor["namespace"]):]
         for namespace in namespaces:
-            if sweep.out_of_budget(started):
+            if sweep.out_of_budget(started, cid, namespace):
                 break
             try:
                 findings, complete = scan_namespace(kubeconfig, namespace, source, kinds)
@@ -761,7 +786,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         project = project_id()
         if not project:
             raise RuntimeError(f"no GCP project: set {PROJECT_ENVS[0]} or configure gcloud in the sandbox")
-        sweep = sweep_fleet(project)
+        sweep = sweep_fleet(project, state.get(CURSOR_KEY))
     except Exception as exc:  # noqa: BLE001 - a failed sweep is reported once, not raised every tick
         text = failure_text(exc)
         if state.get("sweep_error") != text:
@@ -772,6 +797,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         if state.get("sweep_error"):
             lines.append(SWEEP_RECOVERED_LINE)
         state["sweep_error"] = None
+        state[CURSOR_KEY] = sweep.cursor
         lines += diff_and_update(state, sweep, now)
     if not dry_run:
         save_state(state_path, state)

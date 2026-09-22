@@ -84,7 +84,8 @@ class FakeFleet:
     Unlisted(status) is listed but not swept; a cluster key `name@location`
     or a Located value puts it somewhere other than the default location."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False):
+        self.api_resources_rc_one = api_resources_rc_one
         self.listing_stderr = listing_stderr
         self.hidden = set(hidden)
         #: api-resources answer; None serves every default kind under its group name.
@@ -120,8 +121,11 @@ class FakeFleet:
             names = list(namespaces) + self.namespaces_extra
             return completed(argv, "".join(f"namespace/{n}\n" for n in names))
         if argv[:2] == ["kubectl", "api-resources"]:
+            if isinstance(self.served, Exception):
+                raise self.served
             served = self.served if self.served is not None else SERVED_DEFAULT
-            return completed(argv, "".join(f"{n}\n" for n in served))
+            rc = 1 if self.api_resources_rc_one else 0
+            return completed(argv, "".join(f"{n}\n" for n in served), returncode=rc, stderr="error: unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1" if rc else "")
         if argv[:3] == [stall_watch.PYTHON_EXECUTABLE, stall_watch.PYTHON_ISOLATED_FLAG, stall_watch.STDIN_SCRIPT_ARG]:
             namespace = argv[argv.index("--namespace") + 1]
             if self.sandbox_dies_at == (self._cluster_from(kubeconfig)[0], namespace):
@@ -515,6 +519,51 @@ class Scope(Base):
         _, fake = self.run_tick({"c": {"payments": []}}, served=[])
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
         self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS), "an unreadable api-resources leaves the list unfiltered")
+
+    def test_a_full_listing_with_a_failed_aggregated_api_still_filters(self):
+        # kubectl api-resources prints everything and exits 1 when metrics-server
+        # is down; the list is what matters.
+        no_cert_manager = [n for n in SERVED_DEFAULT if not n.startswith("certificates")]
+        _, fake = self.run_tick({"c": {"payments": []}}, served=no_cert_manager, api_resources_rc_one=True)
+        scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
+        self.assertNotIn("certificates.cert-manager.io", scan[scan.index("--kind") + 1].split(","))
+
+    def test_a_grouped_kind_matches_only_its_own_group(self):
+        istio = [n for n in SERVED_DEFAULT if n != "gateways.gateway.networking.k8s.io"] + ["gateways.networking.istio.io"]
+        _, fake = self.run_tick({"c": {"payments": []}}, served=istio)
+        scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
+        kinds = scan[scan.index("--kind") + 1].split(",")
+        self.assertNotIn("gateways.gateway.networking.k8s.io", kinds, "Istio's gateways do not stand in for the Gateway API's")
+        self.assertIn("httproutes.gateway.networking.k8s.io", kinds)
+
+    def test_an_api_resources_timeout_is_confined_to_its_cluster(self):
+        self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}})
+        lines, fake = self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}}, served=subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS))
+        text = "\n".join(lines)
+        self.assertIn(f"- {label('a')}: timed out after 60s", text)
+        self.assertIn(f"- {label('b')}: timed out after 60s", text)
+        self.assertNotIn(stall_watch.SWEEP_FAILED_PREFIX, text)
+        self.assertEqual(len(self.ledger()["stalls"]), 1)
+
+    def test_an_exhausted_sweep_resumes_where_it_stopped(self):
+        fleet = {"a": {"n1": [], "n2": []}, "b": {"n3": []}, "c": {"n4": [dict(DEPLOYMENT_ROW, namespace="n4")]}}
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        # tick 1: started, before a, before a/n1, before a/n2 (over) -> cursor a/n2
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
+            _, fake = self.run_tick(fleet)
+        self.assertEqual(fake.scanned(), ["n1"])
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id("a", LOCATION), "namespace": "n2"})
+        # tick 2: resumes at a/n2, then b, then runs out before c -> cursor c
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 8):
+            _, fake = self.run_tick(fleet)
+        self.assertEqual(fake.scanned(), ["n2", "n3"])
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY]["cluster"], stall_watch.cluster_id("c", LOCATION))
+        # tick 3: starts at c, wraps to a and b, completes -> cursor cleared, c's stall announced
+        lines, fake = self.run_tick(fleet)
+        self.assertEqual(fake.scanned(), ["n4", "n1", "n2", "n3"])
+        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
+        self.assertIn(stall_watch.NEW_HEADING, lines)
+        self.assertIn(stall_watch.READABLE_AGAIN_HEADING, lines)
 
     def test_the_project_comes_from_the_operators_variable_without_a_gcloud_hop(self):
         with patch.dict(os.environ, {stall_watch.PROJECT_ENVS[0]: "", "GCP_PROJECT_ID": "from-operator"}):
