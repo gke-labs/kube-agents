@@ -46,49 +46,65 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
-## `stall-watch` reads the fleet and reports only what changed
+## `stall-watch` hands a stall to a Cluster Agent card
 
-`stall-watch` is a `no_agent` script that delivers a report, like
-`kanban-board-health`, and not a poller: it files no card and wakes no model.
-Every thirty minutes it lists the project's clusters and, for every namespace of
-every running or reconciling cluster that is not a system namespace, runs the
-Cluster Agent's `stall_report.py` over a bounded list of controller kinds. It
-keeps a ledger of the rows it has already announced and prints one bullet per
-object when the object first appears and when its last row clears, plus a
-cluster or namespace it could not read and one it can read again. A stall that
-lasts a week is announced once, and a clean tick prints nothing. A namespace or
-cluster the tick could not read keeps its rows; one that is gone from the
-listing clears them at once; a `repeating-warnings` row, which exists only while
-its event recurred inside the script's window, clears only after two consecutive
-scans without it, so a warning that comes back every hour does not flap in and
-out of chat. A scan that skipped a kind the cluster serves updates its rows and clears none, and the kind list is filtered per cluster to what `kubectl api-resources` says it serves, so such a skip is a failure and never a missing CRD. A lost sandbox ends the sweep as one reported failure rather than one line per namespace. A report is held under the relay's 12,000-character cut, event text cut at 400 characters per row, and what did not fit is not ledgered, so it is announced on the next tick rather than counted once and never named. A cluster listing gcloud itself calls incomplete clears no row for a cluster absent from it,
-and a sweep stops at a wall-clock budget short of the schedule and reports what
-it did not reach, because Hermes kills a script that runs an hour and a ledger
-never written is a tick that never happened.
+`stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
+minutes it lists the project's clusters and, for every namespace of every
+running or reconciling cluster that is not a system namespace, runs the Cluster
+Agent's `stall_report.py` over a bounded list of controller kinds, keeping a
+ledger of the rows it has seen. On a new stall episode it files one kanban card
+per cluster and namespace, assigned to that cluster's Cluster Agent profile when
+one is scaffolded, telling it to run `gke-stall-detection` on the namespace and
+record the finding, and to `platform` otherwise, told to fetch the cluster's
+credentials and run `stall_report.py` itself, since the skill is a Cluster Agent's. That is the same
+card, diagnosis and chat thread a user's own question produces, which is the
+point: one detector and one experience whether the cron or a person noticed
+first. A new object in a namespace whose card is still open is a comment on that
+card; when every object in the namespace has cleared, the card gets a closing
+comment and is completed. A `repeating-warnings` or `dangling-reference` row
+clears only after two consecutive scans without it, so a warning that recurs
+hourly or a referent listing that failed once does not close and reopen a card.
+
+The card's progress reaches chat because the script writes the card's
+`kanban_notify_subs` row itself: a cron child has no session identity for
+`kanban_create` to copy, and a card without a row is invisible to the gateway
+notifier. The row targets every platform whose home channel the tick spawner
+restores into the child's environment (`GOOGLE_CHAT_HOME_CHANNEL`,
+`SLACK_HOME_CHANNEL`), with the same `notify+wake` delivery a user-filed card
+gets. `deliver: chat` then carries two one-liners, "stall noticed in
+`<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened" and "stall cleared
+...; card `<id>` closed", plus the sweep-failed and sweep-recovered lines every
+roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
+cluster that timed out, a namespace whose scan failed or skipped a kind the
+cluster serves, a listing gcloud called incomplete, a sweep that hit its
+25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
+an exhausted sweep resumes where it stopped.
 
 Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
 through `sandbox_exec`, because the agent container carries no kubectl (with the
 sandbox switched off the calls run locally and fail with `No such file or
 directory: 'gcloud'`, the same failure every `sandbox_exec` caller sees in that
-state). The script itself
-travels on the command's stdin, read from the agent image's copy in
-`/opt/defaults/scripts` and run with `python3 -I -`: what the `hermes` login
-executes is never a file under the sandbox's agent-owned `/opt/data`, and
-isolated mode keeps that directory, which is the command's working directory,
-off the module path, so a `json.py` the model dropped there is not the code that
-runs. The per-cluster kubeconfigs stay in `/home/hermes/.kubeconfigs`, where
-`platform_mcp_server.py` keeps its own, under a prefix of their own. The kind
-list is `DEFAULT_KINDS` in the script and is not operator-configurable on this
-release: `STALL_WATCH_KINDS` replaces it for a run started by hand in the pod
-(`all` hands `stall_report.py` its every-kind default), but the operator's env
-allowlist does not carry it, so a value on the CR's `spec.deployment.env` never
-reaches the script. The k8s-event-watcher and this job split the work by signal:
-a Warning whose reason is on the watcher's list is the watcher's within seconds;
-a condition, a reference or an event the list never names is this job's within
-the half hour. It declares `risk: high` because what it relays into chat is event
-text and object names from every namespace of every cluster in the project, the
-management cluster included, which is the untrusted-input case the tier contract
-below names.
+state). The script itself travels on the command's stdin, read from the agent
+image's copy in `/opt/defaults/scripts` and run with `python3 -I -`: what the
+`hermes` login executes is never a file under the sandbox's agent-owned
+`/opt/data`, and isolated mode keeps that directory, which is the command's
+working directory, off the module path, so a `json.py` the model dropped there is
+not the code that runs. The per-cluster kubeconfigs stay in
+`/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
+prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
+cluster to what `kubectl api-resources` says it serves, and is not
+operator-configurable on this release: `STALL_WATCH_KINDS` replaces it for a run
+started by hand in the pod (`all` hands `stall_report.py` its every-kind
+default), but the operator's env allowlist does not carry it, so a value on the
+CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
+this job split the work by signal: a Warning whose reason is on the watcher's
+list is the watcher's within seconds; a condition, a reference or an event the
+list never names is this job's within the half hour. It declares `risk: high`
+because what it puts in a card body and relays into chat is event text and
+object names from every namespace of every cluster in the project, the
+management cluster included; the card body marks those rows as data rather than
+instructions, and the Cluster Agent's read-only skill and preflight bound what
+it does with them.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 

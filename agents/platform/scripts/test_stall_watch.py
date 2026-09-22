@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for stall_watch.py: the fleet sweep is faked at the sandbox hop."""
+"""Tests for stall_watch.py: the fleet sweep is faked at the sandbox hop and
+the board at the kanban command, with a real sqlite file for the
+subscription rows."""
 
 import io
 import json
 import os
+import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -17,6 +21,7 @@ import stall_watch  # noqa: E402
 
 PROJECT = "proj"
 LOCATION = "us-central1"
+HOME_CHANNEL = "spaces/TESTSPACE"
 GATEWAY_SECRET = "Secret storefront/storefront-tls not found."
 
 
@@ -25,7 +30,7 @@ def completed(argv, stdout="", returncode=0, stderr=""):
 
 
 def finding(namespace, obj, heuristic, detail, stalled_for="20m", stalled_seconds=1200):
-    # The shape stall_report.py on main emits per row: no condition message.
+    # The shape stall_report.py emits per row.
     return {
         "object": obj,
         "namespace": namespace,
@@ -61,6 +66,16 @@ TIMEOUT = subprocess.TimeoutExpired("gcloud", stall_watch.GET_CREDENTIALS_TIMEOU
 SERVED_DEFAULT = ["deployments.apps", "statefulsets.apps", "daemonsets.apps", "jobs.batch", "gateways.gateway.networking.k8s.io", "httproutes.gateway.networking.k8s.io", "certificates.cert-manager.io", "pods", "configmaps"]
 NOT_SCANNED = "warning: deployments in checkout not scanned; its objects are missing from the count: kubectl exited 1\n"
 
+BOARD_SCHEMA = """
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT, status TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);
+CREATE TABLE kanban_notify_subs (
+    task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT, user_id_alt TEXT, chat_type TEXT, notifier_profile TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'notify', delivery_metadata TEXT, created_at INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (task_id, platform, chat_id, thread_id));
+"""
+
 
 class Unlisted:
     """A cluster the project lists with a status that is not swept."""
@@ -81,18 +96,16 @@ class Located:
 class FakeFleet:
     """Answers the sandbox hops for a fleet described as
     {cluster: {namespace: [findings]}}. A namespace mapped to an exception or
-    an exit code cannot be read and one mapped to a string returns that text;
-    a cluster mapped to an exception cannot be reached; a cluster mapped to
-    Unlisted(status) is listed but not swept; a cluster key `name@location`
-    or a Located value puts it somewhere other than the default location."""
+    an exit code cannot be read, one mapped to a string returns that text, one
+    mapped to (rows, stderr) returns both; a cluster mapped to an exception
+    cannot be reached; Unlisted(status) is listed but not swept; a key
+    `name@location` or a Located value puts it somewhere else."""
 
     def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False):
         self.api_resources_rc_one = api_resources_rc_one
         self.listing_stderr = listing_stderr
         self.hidden = set(hidden)
-        #: api-resources answer; None serves every default kind under its group name.
         self.served = served
-        #: (cluster, namespace) whose scan raises SandboxUnavailable.
         self.sandbox_dies_at = sandbox_dies_at
         self.fleet = {}
         for key, spec in fleet.items():
@@ -155,6 +168,55 @@ class FakeFleet:
         return name, location
 
 
+class FakeBoard:
+    """Answers the kanban commands and mirrors each card into the sqlite board
+    the subscription writer reads."""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.calls = []
+        self.cards = {}
+        self.fail_next_create = False
+        self.fail_show = False
+        self.fail_complete = False
+
+    def __call__(self, command):
+        self.calls.append(command)
+        argv = shlex.split(command)
+        if argv[0] == "create":
+            if self.fail_next_create:
+                self.fail_next_create = False
+                raise RuntimeError("board locked")
+            opts = {argv[i]: argv[i + 1] for i in range(1, len(argv) - 1) if argv[i].startswith("--") and argv[i] != "--json"}
+            tid = f"t_{len(self.cards) + 1:08x}"
+            self.cards[tid] = {"status": "ready", "assignee": opts.get("--assignee"), "title": argv[-1], "body": opts.get("--body", ""), "key": opts.get("--idempotency-key"), "comments": []}
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("INSERT INTO tasks (id, title, body, assignee, status, created_at) VALUES (?, ?, ?, ?, 'ready', 1)", (tid, argv[-1], opts.get("--body", ""), opts.get("--assignee")))
+            conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'created', 1)", (tid,))
+            conn.commit()
+            conn.close()
+            return json.dumps({"id": tid, "status": "ready"})
+        if argv[0] == "show":
+            tid = argv[-1]
+            if self.fail_show or tid not in self.cards:
+                raise RuntimeError("board locked")
+            return json.dumps({"task": {"id": tid, "status": self.cards[tid]["status"]}})
+        if argv[0] == "comment":
+            self.cards[argv[1]]["comments"].append(argv[2])
+            return "ok"
+        if argv[0] == "complete":
+            tid = argv[-1]
+            if self.fail_complete:
+                raise RuntimeError("claim fenced")
+            self.cards[tid]["status"] = "done"
+            self.cards[tid]["result"] = argv[argv.index("--result") + 1]
+            return "ok"
+        raise AssertionError(f"unexpected kanban command {command}")
+
+    def opened(self):
+        return [c for c in self.calls if c.startswith("create ")]
+
+
 def label(name, location=LOCATION):
     return f"`{name}` ({location})"
 
@@ -163,9 +225,19 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.state = Path(self.tmp.name) / "stall_watch.json"
-        env = {stall_watch.PROJECT_ENVS[0]: PROJECT, "PLATFORM_AGENT_HOME": self.tmp.name}
-        for var in (stall_watch.KINDS_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, *stall_watch.PROJECT_ENVS[1:]):
+        self.home = Path(self.tmp.name)
+        self.state = self.home / "stall_watch.json"
+        self.db = self.home / stall_watch.BOARD_DB_NAME
+        conn = sqlite3.connect(self.db)
+        conn.executescript(BOARD_SCHEMA)
+        conn.close()
+        env = {
+            stall_watch.PROJECT_ENVS[0]: PROJECT,
+            "PLATFORM_AGENT_HOME": self.tmp.name,
+            "GOOGLE_CHAT_HOME_CHANNEL": HOME_CHANNEL,
+            stall_watch.RELAY_LABEL_ENV: "cron-reports",
+        }
+        for var in (stall_watch.KINDS_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, "GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID", "SLACK_HOME_CHANNEL", *stall_watch.PROJECT_ENVS[1:]):
             env[var] = ""
         patcher = patch.dict(os.environ, env)
         patcher.start()
@@ -174,6 +246,10 @@ class Base(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         p = patch.object(stall_watch, "dns_endpoint_args", return_value=[])
+        p.start()
+        self.addCleanup(p.stop)
+        self.board = FakeBoard(str(self.db))
+        p = patch.object(stall_watch, "kanban", self.board)
         p.start()
         self.addCleanup(p.stop)
 
@@ -186,41 +262,223 @@ class Base(unittest.TestCase):
     def ledger(self):
         return json.loads(self.state.read_text())
 
+    def subs(self, task_id):
+        conn = sqlite3.connect(self.db)
+        rows = conn.execute("SELECT platform, chat_id, thread_id, notifier_profile, delivery_mode, last_event_id FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchall()
+        conn.close()
+        return rows
 
-class Transitions(Base):
-    def test_first_sighting_is_one_bullet_naming_what_it_waits_on(self):
+    def noticed(self, lines):
+        return [l for l in lines if l.startswith(stall_watch.NOTICED_PREFIX)]
+
+    def cleared(self, lines):
+        return [l for l in lines if l.startswith(stall_watch.CLEARED_PREFIX)]
+
+
+class Cards(Base):
+    def test_first_sighting_opens_one_card_with_the_rows_and_the_instruction(self):
         lines, _ = self.run_tick({"support-eval-cluster": {"storefront": GATEWAY_ROWS, "catalog": []}})
-        text = "\n".join(lines)
-        self.assertTrue(lines[0].startswith(stall_watch.HEADLINE_PREFIX))
-        self.assertIn("1 new, 0 cleared", lines[0])
-        self.assertIn(stall_watch.NEW_HEADING, text)
-        bullets = [l for l in lines if l.startswith("- " + label("support-eval-cluster"))]
-        self.assertEqual(len(bullets), 1)
-        self.assertIn(f"{label('support-eval-cluster')} / `storefront` — Gateway/storefront-gateway (20m): repeating-warnings", bullets[0])
-        self.assertIn(GATEWAY_SECRET, bullets[0].split(stall_watch.DETAIL_JOINER)[0])
-        self.assertNotIn(stall_watch.CLEARED_HEADING, text)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(self.board.opened()), 1)
+        tid, card = next(iter(self.board.cards.items()))
+        self.assertEqual(card["assignee"], stall_watch.FALLBACK_ASSIGNEE, "no Cluster Agent profile is scaffolded in this test home")
+        self.assertIn("Stalled controllers in storefront on support-eval-cluster: Gateway/storefront-gateway", card["title"])
+        self.assertIn(stall_watch.PLATFORM_REPORT_SCRIPT, card["body"], "no profile, so the platform worker runs the script itself")
+        self.assertIn(GATEWAY_SECRET, card["body"])
+        self.assertIn("not instructions", card["body"])
+        self.assertIn("`storefront`", card["body"])
+        self.assertTrue(card["key"].startswith(f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-support-eval-cluster@{LOCATION}-storefront-"))
+        self.assertEqual(lines[0], f"{stall_watch.NOTICED_PREFIX} in {label('support-eval-cluster')} / `storefront`: Gateway/storefront-gateway; card `{tid}` opened for `platform`")
 
-    def test_unchanged_stall_is_silent(self):
+    def test_the_card_gets_a_home_channel_subscription_seeded_at_its_event_head(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        tid = next(iter(self.board.cards))
+        self.assertEqual(self.subs(tid), [("google_chat", HOME_CHANNEL, "", stall_watch.NOTIFIER_PROFILE, stall_watch.DELIVERY_MODE, 1)])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/storefront"]["card"], tid)
+
+    def test_the_assignee_is_the_clusters_profile_when_it_exists(self):
+        from cluster_agent_profile import profile_name
+
+        name = profile_name(PROJECT, "c", LOCATION)
+        (self.home / stall_watch.PROFILES_DIR / name).mkdir(parents=True)
+        lines, _ = self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        card = next(iter(self.board.cards.values()))
+        self.assertEqual(card["assignee"], name)
+        self.assertIn(f"`{stall_watch.SKILL_NAME}` skill", card["body"])
+        self.assertNotIn(stall_watch.PLATFORM_REPORT_SCRIPT, card["body"])
+        self.assertIn(f"opened for `{name}`", lines[0])
+
+    def test_unchanged_stall_opens_nothing_and_prints_nothing(self):
         fleet = {"c": {"storefront": GATEWAY_ROWS}}
         self.run_tick(fleet)
         lines, _ = self.run_tick(fleet)
         self.assertEqual(lines, [])
-        self.assertEqual(len(self.ledger()["stalls"]), 2)
+        self.assertEqual(len(self.board.opened()), 1)
 
-    def test_cleared_stall_is_announced_once(self):
+    def test_a_new_object_in_a_namespace_with_an_open_card_is_a_comment(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        self.run_tick({"c": {"checkout": []}})
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(len(self.board.opened()), 1)
+        card = next(iter(self.board.cards.values()))
+        self.assertEqual(len(card["comments"]), 1)
+        self.assertIn("Deployment/cart-api", card["comments"][0])
+        self.assertIn("Deployment/cart-api", self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["objects"])
+
+    def test_a_new_object_after_the_agent_completed_the_card_opens_a_new_card(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        first = next(iter(self.board.cards))
+        self.board.cards[first]["status"] = "done"
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(len(self.noticed(lines)), 1)
+        self.assertEqual(len(self.board.opened()), 2)
+
+    def test_a_cleared_namespace_comments_completes_and_prints_once(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        tid = next(iter(self.board.cards))
         lines, _ = self.run_tick({"c": {"checkout": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
-        self.assertIn("0 new, 1 cleared", lines[0])
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertIn(f"card `{tid}` closed", lines[0])
+        card = self.board.cards[tid]
+        self.assertEqual(card["status"], "done")
+        self.assertIn("cleared", card["result"])
+        self.assertEqual(len(card["comments"]), 1)
+        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertEqual(lines, [])
 
-    def test_a_healthy_fleet_prints_nothing(self):
+    def test_a_partial_clear_keeps_the_card_open(self):
+        rows = [DEADLINE_ROW, finding("checkout", "Deployment/cart-api", "stale-condition", "Available=False MinimumReplicasUnavailable")]
+        self.run_tick({"c": {"checkout": rows}})
+        lines, _ = self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(next(iter(self.board.cards.values()))["status"], "ready")
+
+    def test_a_failed_complete_keeps_the_episode_and_retries_next_tick(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        tid = next(iter(self.board.cards))
+        self.board.fail_complete = True
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(lines, [], "nothing is said to have closed")
+        self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertEqual(len(self.board.cards[tid]["comments"]), 1)
+        self.board.fail_complete = False
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertEqual(len(self.board.cards[tid]["comments"]), 1, "the clearing comment is not repeated")
+
+    def test_a_card_the_worker_is_running_is_not_completed_under_it(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        tid = next(iter(self.board.cards))
+        self.board.cards[tid]["status"] = "running"
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(lines, [])
+        self.assertEqual(self.board.cards[tid]["status"], "running")
+        self.assertEqual(len(self.board.cards[tid]["comments"]), 1)
+        self.board.cards[tid]["status"] = "done"
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+
+    def test_a_board_that_cannot_show_the_card_defers_new_objects(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        self.board.fail_show = True
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(len(self.board.cards), 1, "no second card while the first cannot be read")
+        self.assertEqual(self.ledger()["stalls"], {}, "the scope is unledgered so it is retried")
+        self.board.fail_show = False
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(len(next(iter(self.board.cards.values()))["comments"]), 1)
+
+    def test_the_idempotency_key_is_stable_across_a_retry(self):
+        self.board.fail_next_create = True
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        first = shlex.split(self.board.calls[0])
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        second = shlex.split(self.board.calls[-1])
+        key = lambda argv: argv[argv.index("--idempotency-key") + 1]
+        self.assertEqual(key(first), key(second))
+
+    def test_a_card_the_agent_already_completed_is_not_completed_again_on_clear(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        tid = next(iter(self.board.cards))
+        self.board.cards[tid]["status"] = "done"
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertFalse(any(c.startswith("complete ") for c in self.board.calls))
+        self.assertEqual(self.board.cards[tid]["comments"], [])
+
+    def test_a_board_that_refuses_the_card_leaves_the_objects_new_for_the_next_tick(self):
+        self.board.fail_next_create = True
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(self.ledger()["stalls"], {})
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(self.noticed(lines)), 1)
+        self.assertEqual(len(self.board.cards), 1, "the refused attempt filed nothing; the retry filed once")
+
+    def test_a_healthy_fleet_opens_nothing_and_prints_nothing(self):
         lines, _ = self.run_tick({"c": {"catalog": [], "checkout": []}})
         self.assertEqual(lines, [])
+        self.assertEqual(self.board.calls, [])
         self.assertTrue(self.state.exists())
 
+    def test_two_clusters_two_cards(self):
+        lines, _ = self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(self.noticed(lines)), 2)
+        self.assertEqual(len(self.board.opened()), 2)
+
+    def test_same_named_clusters_in_two_locations_are_two_scopes(self):
+        fleet = {"c": {"payments": [DEPLOYMENT_ROW]}, "c@europe-west1": Located("europe-west1", {"payments": []})}
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(len(self.noticed(lines)), 1)
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(lines, [], "the second cluster's empty namespace does not clear the first cluster's row")
+
+    def test_a_long_event_message_is_cut_in_the_card_but_kept_in_the_ledger(self):
+        long_row = finding("ns", "Gateway/g", "repeating-warnings", "SYNC x9: " + "x" * 5000)
+        self.run_tick({"c": {"ns": [long_row]}})
+        card = next(iter(self.board.cards.values()))
+        self.assertIn(stall_watch.TRUNCATION_MARKER, card["body"])
+        self.assertLess(len(card["body"]), 1500)
+        self.assertEqual(len(list(self.ledger()["stalls"].values())[0]["detail"]), len(long_row["detail"]))
+
+    def test_a_title_with_many_objects_is_capped(self):
+        rows = [finding("ns", f"Deployment/very-long-deployment-name-{i:02d}", "generation-lag", "generation 2 observed 1") for i in range(12)]
+        self.run_tick({"c": {"ns": rows}})
+        card = next(iter(self.board.cards.values()))
+        self.assertLessEqual(len(card["title"]), stall_watch.CARD_TITLE_MAX_CHARS)
+        self.assertEqual(card["body"].count("\n- "), 12)
+
+
+class Subscriptions(Base):
+    def test_home_targets_read_the_shipped_platforms_and_nothing_else(self):
+        with patch.dict(os.environ, {"SLACK_HOME_CHANNEL": "C123", "SLACK_HOME_CHANNEL_THREAD_ID": "171.9", "TEAMS_HOME_CHANNEL": "19:abc"}):
+            self.assertEqual(stall_watch.home_targets(), [("google_chat", HOME_CHANNEL, ""), ("slack", "C123", "171.9")])
+
+    def test_without_a_home_channel_no_row_is_written_and_the_card_still_opens(self):
+        with patch.dict(os.environ, {"GOOGLE_CHAT_HOME_CHANNEL": ""}):
+            lines, _ = self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        self.assertEqual(len(self.noticed(lines)), 1)
+        self.assertEqual(self.subs(next(iter(self.board.cards))), [])
+
+    def test_a_card_not_on_the_board_gets_no_row(self):
+        self.assertEqual(stall_watch.subscribe_card("t_deadbeef", self.db), 0)
+
+    def test_subscribing_twice_writes_once(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        tid = next(iter(self.board.cards))
+        self.assertEqual(stall_watch.subscribe_card(tid, self.db), 0)
+        self.assertEqual(len(self.subs(tid)), 1)
+
+
+class Ledger(Base):
     def test_a_rising_event_count_is_the_same_row(self):
         sync = lambda n: finding("storefront", "Gateway/storefront-gateway", "repeating-warnings", f"SYNC x{n}: {GATEWAY_SECRET}")
         self.run_tick({"c": {"storefront": [sync(12)]}})
@@ -233,141 +491,58 @@ class Transitions(Base):
         self.assertIn("SYNC x13:", list(second.values())[0]["detail"])
 
     def test_a_warning_that_recurs_outside_the_window_does_not_flap(self):
-        # A repeating-warnings row exists only while the event recurred inside
-        # stall_report.py's window, so an hourly warning is absent every other
-        # scan; it clears only after two consecutive scans without it.
         only_sync = {"c": {"storefront": [GATEWAY_SYNC_ROW]}}
         quiet = {"c": {"storefront": []}}
         self.run_tick(only_sync)
         self.assertEqual(self.run_tick(quiet)[0], [])
-        self.assertEqual(self.ledger()["stalls"][next(iter(self.ledger()["stalls"]))]["missed"], 1)
         self.assertEqual(self.run_tick(only_sync)[0], [])
         self.assertEqual(self.run_tick(quiet)[0], [])
         lines, _ = self.run_tick(quiet)
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
-        self.assertEqual(self.ledger()["stalls"], {})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertEqual(len(self.board.opened()), 1)
 
     def test_a_dangling_reference_survives_one_failed_referent_listing(self):
-        # The referent `-o name` listing failing while the object listing
-        # succeeded drops the row from a scan marked complete; one miss is not
-        # a clear.
         forbidden = "warning: cannot list configmaps in checkout; references to configmaps are not checked: timeout\n"
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        lines, _ = self.run_tick({"c": {"checkout": ([], forbidden)}})
-        self.assertEqual(lines, [])
-        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        self.assertEqual(lines, [], "never cleared, so not new")
+        self.assertEqual(self.run_tick({"c": {"checkout": ([], forbidden)}})[0], [])
+        self.assertEqual(self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})[0], [], "never cleared, so not new")
         self.run_tick({"c": {"checkout": []}})
         lines, _ = self.run_tick({"c": {"checkout": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
+        self.assertEqual(len(self.cleared(lines)), 1)
 
     def test_a_condition_row_clears_on_the_first_scan_without_it(self):
         self.run_tick({"c": {"storefront": [GATEWAY_CONDITION_ROW]}})
         lines, _ = self.run_tick({"c": {"storefront": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
+        self.assertEqual(len(self.cleared(lines)), 1)
 
-    def test_a_row_joining_a_known_object_is_folded_in_silently(self):
-        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        deadline = finding("checkout", "Deployment/checkout-api", "stale-condition", "Progressing=False ProgressDeadlineExceeded", stalled_for="10m", stalled_seconds=600)
-        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, deadline]}})
-        self.assertEqual(lines, [])
-        self.assertEqual(len(self.ledger()["stalls"]), 2)
-        self.run_tick({"c": {"checkout": [deadline]}})
-        lines, _ = self.run_tick({"c": {"checkout": [deadline]}})
-        self.assertEqual(lines, [], "one row clearing while the object stays stalled is not a recovery")
+    def test_a_scan_that_skipped_a_kind_clears_nothing_in_that_namespace(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        lines, _ = self.run_tick({"c": {"checkout": ([], NOT_SCANNED)}})
+        self.assertEqual(lines, [], "the deployments read failed this tick; the row is unknown, not gone")
+        self.assertEqual(len(self.ledger()["stalls"]), 1)
+        self.assertEqual(self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})[0], [], "never cleared, so not new")
         lines, _ = self.run_tick({"c": {"checkout": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
+        self.assertEqual(len(self.cleared(lines)), 1)
 
-    def test_an_object_with_many_rows_is_one_bullet_with_its_oldest_age(self):
-        rows = [
-            finding("storefront", "Gateway/storefront-gateway", "stale-condition", d)
-            for d in ("Programmed=False Invalid", "Ready=False NotReady", "listeners[https] Ready=False NotReady", "listeners[https] Programmed=False Invalid")
-        ]
-        rows[0].update(stalled_for="6d0h", stalled_seconds=518400)
-        rows[1].update(stalled_for="2d19h", stalled_seconds=241200)
-        rows += GATEWAY_ROWS
-        lines, _ = self.run_tick({"c": {"storefront": rows}})
-        bullets = [l for l in lines if l.startswith("- " + label("c"))]
-        self.assertEqual(len(bullets), 1)
-        self.assertIn("Gateway/storefront-gateway (6d0h):", bullets[0])
-        self.assertIn(GATEWAY_SECRET, bullets[0].split(stall_watch.DETAIL_JOINER)[0])
-        self.assertIn("and 3 more", bullets[0])
-
-    def test_two_clusters_two_kinds_of_stall(self):
-        lines, _ = self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"checkout": [DEPLOYMENT_ROW]}})
-        text = "\n".join(lines)
-        self.assertIn("2 new, 0 cleared (swept 2 clusters, 2 namespaces; 2 stalled objects open)", lines[0])
-        self.assertIn(f"{label('a')} / `storefront`", text)
-        self.assertIn(f"{label('b')} / `checkout` — Deployment/checkout-api (20m): dangling-reference", text)
-
-    def test_same_named_clusters_in_two_locations_are_two_scopes(self):
-        fleet = {"c": {"payments": [DEPLOYMENT_ROW]}, "c@europe-west1": Located("europe-west1", {"payments": []})}
-        lines, _ = self.run_tick(fleet)
-        self.assertIn("1 new", lines[0])
-        lines, _ = self.run_tick(fleet)
-        self.assertEqual(lines, [], "the second cluster's empty namespace does not clear the first cluster's row")
-        keys = list(self.ledger()["stalls"])
-        self.assertEqual(len(keys), 1)
-        self.assertTrue(keys[0].startswith(f"c{stall_watch.CLUSTER_ID_SEPARATOR}{LOCATION}{stall_watch.LEDGER_KEY_SEPARATOR}"))
+    def test_a_partial_scan_still_adds_new_rows(self):
+        lines, _ = self.run_tick({"c": {"checkout": ([DEPLOYMENT_ROW], NOT_SCANNED)}})
+        self.assertEqual(len(self.noticed(lines)), 1)
 
 
 class Gone(Base):
-    def test_a_long_event_message_is_cut_in_the_bullet_but_kept_in_the_ledger(self):
-        long_row = finding("ns", "Gateway/g", "repeating-warnings", "SYNC x9: " + "x" * 5000)
-        lines, _ = self.run_tick({"c": {"ns": [long_row]}})
-        bullet = next(l for l in lines if l.startswith("- " + label("c")))
-        self.assertLess(len(bullet), stall_watch.ROW_DETAIL_MAX_CHARS + 120)
-        self.assertTrue(bullet.endswith(stall_watch.TRUNCATION_MARKER))
-        self.assertEqual(len(list(self.ledger()["stalls"].values())[0]["detail"]), len(long_row["detail"]))
-
-    def test_new_objects_past_the_cap_wait_for_the_next_tick(self):
-        rows = [finding("ns", f"Deployment/app-{i:02d}", "generation-lag", "generation 2 observed 1") for i in range(stall_watch.MAX_LISTED_ROWS + 5)]
-        lines, _ = self.run_tick({"c": {"ns": rows}})
-        self.assertIn(f"- and 5{stall_watch.DEFERRED_SUFFIX}", lines)
-        self.assertIn(f"{stall_watch.MAX_LISTED_ROWS} new, 0 cleared", lines[0])
-        self.assertEqual(len(self.ledger()["stalls"]), stall_watch.MAX_LISTED_ROWS)
-        lines, _ = self.run_tick({"c": {"ns": rows}})
-        self.assertIn("5 new, 0 cleared", lines[0])
-        self.assertEqual(sum(1 for l in lines if l.startswith("- " + label("c"))), 5)
-        self.assertEqual(len(self.ledger()["stalls"]), stall_watch.MAX_LISTED_ROWS + 5)
-        self.assertEqual(self.run_tick({"c": {"ns": rows}})[0], [])
-
-    def test_the_report_stays_under_the_relay_cap_and_defers_the_rest(self):
-        rows = [finding("ns", f"Gateway/g-{i:02d}", "repeating-warnings", f"SYNC x{i}: " + "m" * 380) for i in range(28)]
-        lines, _ = self.run_tick({"c": {"ns": rows}})
-        self.assertLessEqual(sum(len(l) + 1 for l in lines), stall_watch.REPORT_MAX_CHARS)
-        deferred = next(l for l in lines if l.endswith(stall_watch.DEFERRED_SUFFIX))
-        n = int(deferred.split()[2])
-        self.assertGreater(n, 0)
-        self.assertEqual(len(self.ledger()["stalls"]), 28 - n)
-        lines, _ = self.run_tick({"c": {"ns": rows}})
-        self.assertIn(f"{n} new" if n <= stall_watch.MAX_LISTED_ROWS else "", lines[0])
-
-    def test_cleared_objects_past_the_cap_clear_on_the_next_tick(self):
-        rows = [finding("ns", f"Deployment/app-{i:02d}", "generation-lag", "generation 2 observed 1") for i in range(stall_watch.MAX_LISTED_ROWS + 5)]
-        self.run_tick({"c": {"ns": rows}})
-        self.run_tick({"c": {"ns": rows}})
-        lines, _ = self.run_tick({"c": {"ns": []}})
-        self.assertIn(f"0 new, {stall_watch.MAX_LISTED_ROWS} cleared", lines[0])
-        self.assertEqual(len(self.ledger()["stalls"]), 5)
-        lines, _ = self.run_tick({"c": {"ns": []}})
-        self.assertIn("0 new, 5 cleared", lines[0])
-        self.assertEqual(self.ledger()["stalls"], {})
-
     def test_a_deleted_namespace_clears_its_object_at_once(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS, "catalog": []}})
         lines, _ = self.run_tick({"c": {"catalog": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
-        self.assertIn("0 new, 1 cleared", lines[0])
+        self.assertEqual(len(self.cleared(lines)), 1)
         self.assertEqual(self.ledger()["stalls"], {})
+        self.assertEqual(next(iter(self.board.cards.values()))["status"], "done")
 
-    def test_a_deleted_cluster_clears_its_objects_and_its_unreadable_entry(self):
+    def test_a_deleted_cluster_clears_its_objects(self):
         self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"catalog": []}})
         self.run_tick({"a": TIMEOUT, "b": {"catalog": []}})
-        self.assertEqual(list(self.ledger()["unreadable"]), [stall_watch.cluster_id("a", LOCATION)])
+        self.assertIn(f"a@{LOCATION}", self.ledger()["unreadable"])
         lines, _ = self.run_tick({"b": {"catalog": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
-        self.assertNotIn(stall_watch.READABLE_AGAIN_HEADING, lines)
+        self.assertEqual(len(self.cleared(lines)), 1)
         self.assertEqual(self.ledger()["stalls"], {})
         self.assertEqual(self.ledger()["unreadable"], {})
 
@@ -377,88 +552,60 @@ class Gone(Base):
         self.assertEqual(lines, [])
         self.assertEqual(fake.scanned(), ["storefront"])
         lines, _ = self.run_tick({"c": Unlisted("PROVISIONING")})
-        text = "\n".join(lines)
-        self.assertIn(f"- {label('c')}: status=PROVISIONING", text)
-        self.assertNotIn(stall_watch.CLEARED_HEADING, text)
+        self.assertEqual(lines, [])
+        self.assertEqual(self.ledger()["unreadable"], {f"c@{LOCATION}": "status=PROVISIONING"})
         self.assertEqual(len(self.ledger()["stalls"]), 2)
-        lines, _ = self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
-        self.assertEqual(lines[1:], [stall_watch.READABLE_AGAIN_HEADING, f"- {label('c')}"])
-        self.assertIn("0 new, 0 cleared", lines[0])
-
-
-class Unreadable(Base):
-    def test_a_cluster_with_only_system_namespaces_counts_as_read(self):
-        # Readable again has to fire on a cluster that has nothing to scan, or
-        # its entry is stuck and every later failure on it is suppressed.
-        self.run_tick({"c": Unlisted("PROVISIONING")})
-        lines, _ = self.run_tick({"c": {}}, namespaces_extra=["kube-system"])
-        self.assertEqual(lines[1:], [stall_watch.READABLE_AGAIN_HEADING, f"- {label('c')}"])
-        self.assertEqual(self.ledger()["unreadable"], {})
-        lines, _ = self.run_tick({"c": Unlisted("STOPPING")})
-        self.assertIn(f"- {label('c')}: status=STOPPING", "\n".join(lines))
 
     def test_a_listing_gcloud_calls_incomplete_clears_nothing(self):
         self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"catalog": []}})
         partial = "WARNING: The following zones did not respond: us-central1-a. List results may be incomplete."
         lines, _ = self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"catalog": []}}, listing_stderr=partial, hidden=["a"])
-        text = "\n".join(lines)
-        self.assertNotIn(stall_watch.CLEARED_HEADING, text)
-        self.assertIn("- the cluster listing: incomplete: WARNING: The following zones did not respond", text)
-        self.assertEqual(len(self.ledger()["stalls"]), 2)
-        lines, _ = self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"catalog": []}})
-        self.assertEqual(lines[1:], [stall_watch.READABLE_AGAIN_HEADING, "- the cluster listing"])
+        self.assertEqual(lines, [])
+        self.assertIn(stall_watch.LISTING_SCOPE, self.ledger()["unreadable"])
         self.assertEqual(len(self.ledger()["stalls"]), 2)
         lines, _ = self.run_tick({"b": {"catalog": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines, "a complete listing without the cluster is a deletion")
+        self.assertEqual(len(self.cleared(lines)), 1, "a complete listing without the cluster is a deletion")
 
-    def test_the_sweep_stops_at_its_budget_and_says_what_it_skipped(self):
-        fleet = {"c": {"a": [], "b": [dict(DEPLOYMENT_ROW, namespace="b")], "d": []}}
-        self.run_tick(fleet)
-        over = stall_watch.TICK_BUDGET_SECONDS + 1
-        # started, before cluster c, before a, before b (over budget), then whatever else asks
-        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over, over, over, over, over]):
-            lines, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["a"])
-        text = "\n".join(lines)
-        self.assertIn(f"- the rest of the fleet (sweep budget): sweep budget of {stall_watch.TICK_BUDGET_SECONDS}s exhausted after 1 clusters and 1 namespaces", text)
-        self.assertNotIn(stall_watch.CLEARED_HEADING, text)
+
+class Unreadable(Base):
+    def test_unreachable_cluster_keeps_its_rows(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        lines, _ = self.run_tick({"c": TIMEOUT})
+        self.assertEqual(lines, [])
+        self.assertEqual(self.ledger()["unreadable"], {f"c@{LOCATION}": "timed out after 60s"})
+        self.assertEqual(len(self.ledger()["stalls"]), 2)
+
+    def test_unreadable_namespace_keeps_its_rows(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
+        lines, _ = self.run_tick({"c": {"storefront": stall_watch.REPORT_UNREADABLE_EXIT, "checkout": []}})
+        self.assertEqual(len(self.cleared(lines)), 1, "checkout cleared; storefront was not read")
+        self.assertIn(f"c@{LOCATION}/storefront", self.ledger()["unreadable"])
+        self.assertEqual(len(self.ledger()["stalls"]), 2)
+
+    def test_a_scan_timeout_ends_that_clusters_sweep_for_the_tick(self):
+        self.run_tick({"c": {"a": [], "b": [], "d": [dict(DEPLOYMENT_ROW, namespace="d")]}})
+        scan_timeout = subprocess.TimeoutExpired("python3", stall_watch.NAMESPACE_SCAN_TIMEOUT_SECONDS)
+        lines, fake = self.run_tick({"c": {"a": [], "b": scan_timeout, "d": []}})
+        self.assertEqual(fake.scanned(), ["a", "b"], "the namespace after the timeout is not scanned")
+        self.assertEqual(lines, [])
+        self.assertIn("namespace b timed out after 300s", self.ledger()["unreadable"][f"c@{LOCATION}"])
         self.assertEqual(len(self.ledger()["stalls"]), 1)
-        lines, _ = self.run_tick(fleet)
-        self.assertEqual(lines[1:], [stall_watch.READABLE_AGAIN_HEADING, "- the rest of the fleet (sweep budget)"])
 
-    def test_a_cluster_the_budget_never_reached_is_unread_not_gone(self):
-        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": [dict(DEPLOYMENT_ROW, namespace="ns")]}}
-        self.run_tick(fleet)
-        over = stall_watch.TICK_BUDGET_SECONDS + 1
-        # started, before cluster a, before a/ns, before cluster b (over budget)
-        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over, over, over, over, over]):
-            lines, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["ns"])
-        text = "\n".join(lines)
-        self.assertNotIn(stall_watch.CLEARED_HEADING, text, "c was listed but never read; its row is unknown, not gone")
-        self.assertIn("exhausted after 1 clusters and 1 namespaces", text)
+    def test_an_api_resources_timeout_is_confined_to_its_cluster(self):
+        self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}})
+        lines, _ = self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}}, served=subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS))
+        self.assertEqual(lines, [])
+        self.assertEqual(set(self.ledger()["unreadable"]), {f"a@{LOCATION}", f"b@{LOCATION}"})
         self.assertEqual(len(self.ledger()["stalls"]), 1)
-        self.assertEqual(self.ledger()["unreadable"].keys() - {stall_watch.BUDGET_SCOPE}, set())
 
-    def test_a_scan_that_skipped_a_kind_clears_nothing_in_that_namespace(self):
-        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        lines, _ = self.run_tick({"c": {"checkout": ([], NOT_SCANNED)}})
-        self.assertEqual(lines, [], "the deployments read failed this tick; the row is unknown, not gone")
-        self.assertEqual(len(self.ledger()["stalls"]), 1)
-        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        self.assertEqual(lines, [], "the object was never cleared, so it is not new either")
-        self.run_tick({"c": {"checkout": []}})
-        lines, _ = self.run_tick({"c": {"checkout": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
+    def test_unparsable_output_marks_one_scope_not_the_sweep(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
+        lines, _ = self.run_tick({"c": {"storefront": '{"namespace": "storefront", "find', "checkout": []}})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertIn("unparsable", self.ledger()["unreadable"][f"c@{LOCATION}/storefront"])
+        self.assertIsNone(self.ledger()["sweep_error"])
 
-    def test_a_partial_scan_still_adds_new_rows_and_counts_as_readable(self):
-        self.run_tick({"c": TIMEOUT})
-        lines, _ = self.run_tick({"c": {"checkout": ([DEPLOYMENT_ROW], NOT_SCANNED)}})
-        text = "\n".join(lines)
-        self.assertIn("Deployment/checkout-api", text)
-        self.assertIn(stall_watch.READABLE_AGAIN_HEADING, text)
-
-    def test_a_lost_sandbox_is_one_sweep_failure_not_one_line_per_namespace(self):
+    def test_a_lost_sandbox_is_one_sweep_failure(self):
         fleet = {"a": {"n1": [], "n2": [DEPLOYMENT_ROW], "n3": []}, "b": {"n4": []}}
         self.run_tick(fleet)
         lines, fake = self.run_tick(fleet, sandbox_dies_at=("a", "n2"))
@@ -467,58 +614,8 @@ class Unreadable(Base):
         self.assertIn("Connection refused", lines[0])
         self.assertEqual(fake.scanned(), ["n1", "n2"], "nothing after the lost hop is attempted")
         self.assertEqual(len(self.ledger()["stalls"]), 1)
-        self.assertEqual(self.ledger()["unreadable"], {})
         lines, _ = self.run_tick(fleet)
         self.assertEqual(lines, [stall_watch.SWEEP_RECOVERED_LINE])
-
-    def test_unreachable_cluster_keeps_its_rows_and_is_reported_once(self):
-        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
-        lines, _ = self.run_tick({"c": TIMEOUT})
-        text = "\n".join(lines)
-        self.assertIn(stall_watch.UNREADABLE_HEADING, text)
-        self.assertIn(f"- {label('c')}: timed out after 60s", text)
-        self.assertIn("swept 0 clusters, 0 namespaces", lines[0])
-        self.assertNotIn(stall_watch.CLEARED_HEADING, text)
-        self.assertEqual(len(self.ledger()["stalls"]), 2)
-        lines, _ = self.run_tick({"c": TIMEOUT})
-        self.assertEqual(lines, [])
-
-    def test_cluster_readable_again_is_reported_and_its_rows_can_clear(self):
-        self.run_tick({"c": {"storefront": [GATEWAY_CONDITION_ROW]}})
-        self.run_tick({"c": TIMEOUT})
-        lines, _ = self.run_tick({"c": {"storefront": []}})
-        text = "\n".join(lines)
-        self.assertIn(stall_watch.READABLE_AGAIN_HEADING, text)
-        self.assertIn(stall_watch.CLEARED_HEADING, text)
-        self.assertEqual(self.ledger()["unreadable"], {})
-
-    def test_unreadable_namespace_keeps_its_rows(self):
-        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
-        lines, _ = self.run_tick({"c": {"storefront": stall_watch.REPORT_UNREADABLE_EXIT, "checkout": []}})
-        text = "\n".join(lines)
-        self.assertIn(f"- {label('c')} / `storefront`: no kind could be read", text)
-        self.assertIn("Deployment/checkout-api", text)
-        self.assertNotIn("Gateway/storefront-gateway", text)
-        self.assertIn("swept 1 clusters, 1 namespaces", lines[0])
-        self.assertEqual(len(self.ledger()["stalls"]), 2)
-
-    def test_a_scan_timeout_ends_that_clusters_sweep_for_the_tick(self):
-        self.run_tick({"c": {"a": [], "b": [], "d": [dict(DEPLOYMENT_ROW, namespace="d")]}})
-        scan_timeout = subprocess.TimeoutExpired("python3", stall_watch.NAMESPACE_SCAN_TIMEOUT_SECONDS)
-        lines, fake = self.run_tick({"c": {"a": [], "b": scan_timeout, "d": []}})
-        self.assertEqual(fake.scanned(), ["a", "b"], "the namespace after the timeout is not scanned")
-        text = "\n".join(lines)
-        self.assertIn(f"- {label('c')}: namespace b timed out after 300s; the cluster's remaining namespaces were skipped this tick", text)
-        self.assertNotIn(stall_watch.CLEARED_HEADING, text, "an unscanned namespace keeps its rows")
-        self.assertEqual(len(self.ledger()["stalls"]), 1)
-
-    def test_unparsable_output_marks_one_scope_not_the_sweep(self):
-        self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
-        lines, _ = self.run_tick({"c": {"storefront": '{"namespace": "storefront", "find', "checkout": []}})
-        text = "\n".join(lines)
-        self.assertIn(f"- {label('c')} / `storefront`: stall_report.py returned unparsable output", text)
-        self.assertIn(stall_watch.CLEARED_HEADING, text)
-        self.assertIsNone(self.ledger()["sweep_error"])
 
     def test_failed_cluster_list_is_reported_once_and_recovery_once(self):
         def broken(argv, *, timeout, kubeconfig=None, stdin=None):
@@ -534,6 +631,33 @@ class Unreadable(Base):
         lines, _ = self.run_tick({"c": {"catalog": []}})
         self.assertEqual(lines, [stall_watch.SWEEP_RECOVERED_LINE])
 
+    def test_the_sweep_stops_at_its_budget_and_a_cluster_it_never_reached_is_unread(self):
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": [dict(DEPLOYMENT_ROW, namespace="ns")]}}
+        self.run_tick(fleet)
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
+            lines, fake = self.run_tick(fleet)
+        self.assertEqual(fake.scanned(), ["ns"])
+        self.assertEqual(lines, [], "c was listed but never read; its row is unknown, not gone")
+        self.assertIn("exhausted after 1 clusters and 1 namespaces", self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE])
+        self.assertEqual(len(self.ledger()["stalls"]), 1)
+
+    def test_an_exhausted_sweep_resumes_where_it_stopped(self):
+        fleet = {"a": {"n1": [], "n2": []}, "b": {"n3": []}, "c": {"n4": [dict(DEPLOYMENT_ROW, namespace="n4")]}}
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
+            _, fake = self.run_tick(fleet)
+        self.assertEqual(fake.scanned(), ["n1"])
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id("a", LOCATION), "namespace": "n2"})
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 8):
+            _, fake = self.run_tick(fleet)
+        self.assertEqual(fake.scanned(), ["n2", "n3"])
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY]["cluster"], stall_watch.cluster_id("c", LOCATION))
+        lines, fake = self.run_tick(fleet)
+        self.assertEqual(fake.scanned(), ["n4", "n1", "n2", "n3"])
+        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
+        self.assertEqual(len(self.noticed(lines)), 1)
+
 
 class Scope(Base):
     def test_system_namespaces_are_skipped_and_the_harness_is_not(self):
@@ -542,11 +666,10 @@ class Scope(Base):
         self.assertEqual(sorted(fake.scanned()), ["kubeagents-system", "payments"])
 
     def test_a_terminating_namespace_is_still_read_so_its_rows_can_clear(self):
-        gone = [dict(r, namespace="old") for r in GATEWAY_ROWS]
+        gone = [dict(GATEWAY_CONDITION_ROW, namespace="old")]
         self.run_tick({"c": {"old": gone}})
-        self.run_tick({"c": {"old": []}})
         lines, _ = self.run_tick({"c": {"old": []}})
-        self.assertIn(stall_watch.CLEARED_HEADING, lines)
+        self.assertEqual(len(self.cleared(lines)), 1)
 
     def test_default_kinds_are_passed_and_all_lets_the_script_decide(self):
         _, fake = self.run_tick({"c": {"payments": []}})
@@ -565,14 +688,11 @@ class Scope(Base):
         kinds = scan[scan.index("--kind") + 1].split(",")
         self.assertNotIn("certificates.cert-manager.io", kinds)
         self.assertIn("deployments", kinds, "a bare plural matches its grouped api-resources name")
-        self.assertIn("gateways.gateway.networking.k8s.io", kinds)
         _, fake = self.run_tick({"c": {"payments": []}}, served=[])
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
-        self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS), "an unreadable api-resources leaves the list unfiltered")
+        self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS), "an empty api-resources leaves the list unfiltered")
 
     def test_a_full_listing_with_a_failed_aggregated_api_still_filters(self):
-        # kubectl api-resources prints everything and exits 1 when metrics-server
-        # is down; the list is what matters.
         no_cert_manager = [n for n in SERVED_DEFAULT if not n.startswith("certificates")]
         _, fake = self.run_tick({"c": {"payments": []}}, served=no_cert_manager, api_resources_rc_one=True)
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
@@ -585,35 +705,6 @@ class Scope(Base):
         kinds = scan[scan.index("--kind") + 1].split(",")
         self.assertNotIn("gateways.gateway.networking.k8s.io", kinds, "Istio's gateways do not stand in for the Gateway API's")
         self.assertIn("httproutes.gateway.networking.k8s.io", kinds)
-
-    def test_an_api_resources_timeout_is_confined_to_its_cluster(self):
-        self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}})
-        lines, fake = self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}}, served=subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS))
-        text = "\n".join(lines)
-        self.assertIn(f"- {label('a')}: timed out after 60s", text)
-        self.assertIn(f"- {label('b')}: timed out after 60s", text)
-        self.assertNotIn(stall_watch.SWEEP_FAILED_PREFIX, text)
-        self.assertEqual(len(self.ledger()["stalls"]), 1)
-
-    def test_an_exhausted_sweep_resumes_where_it_stopped(self):
-        fleet = {"a": {"n1": [], "n2": []}, "b": {"n3": []}, "c": {"n4": [dict(DEPLOYMENT_ROW, namespace="n4")]}}
-        over = stall_watch.TICK_BUDGET_SECONDS + 1
-        # tick 1: started, before a, before a/n1, before a/n2 (over) -> cursor a/n2
-        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
-            _, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["n1"])
-        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id("a", LOCATION), "namespace": "n2"})
-        # tick 2: resumes at a/n2, then b, then runs out before c -> cursor c
-        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 8):
-            _, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["n2", "n3"])
-        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY]["cluster"], stall_watch.cluster_id("c", LOCATION))
-        # tick 3: starts at c, wraps to a and b, completes -> cursor cleared, c's stall announced
-        lines, fake = self.run_tick(fleet)
-        self.assertEqual(fake.scanned(), ["n4", "n1", "n2", "n3"])
-        self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
-        self.assertIn(stall_watch.NEW_HEADING, lines)
-        self.assertIn(stall_watch.READABLE_AGAIN_HEADING, lines)
 
     def test_the_project_comes_from_the_operators_variable_without_a_gcloud_hop(self):
         with patch.dict(os.environ, {stall_watch.PROJECT_ENVS[0]: "", "GCP_PROJECT_ID": "from-operator"}):
@@ -631,13 +722,10 @@ class Scope(Base):
         self.assertTrue(kubeconfig.endswith(f"{stall_watch.KUBECONFIG_FILE_PREFIX}proj_c_{LOCATION}{stall_watch.KUBECONFIG_FILE_SUFFIX}"))
 
     def test_isolated_mode_ignores_a_decoy_module_in_the_working_directory(self):
-        # The sandbox command runs with the model-owned /opt/data as its cwd.
-        # Without -I that directory is first on sys.path and a json.py there is
-        # the code that runs; with it the streamed script sees only the stdlib.
         source = stall_watch.report_source()
         with tempfile.TemporaryDirectory() as cwd:
             (Path(cwd) / "json.py").write_text("raise SystemExit(99)\n")
-            argv = stall_watch.report_argv("payments")
+            argv = stall_watch.report_argv("payments", None)
             argv[0] = sys.executable
             isolated = subprocess.run(argv + ["--help"], input=source, capture_output=True, text=True, cwd=cwd)
             naive = subprocess.run([sys.executable, stall_watch.STDIN_SCRIPT_ARG, "--help"], input=source, capture_output=True, text=True, cwd=cwd)
@@ -645,16 +733,25 @@ class Scope(Base):
         self.assertIn("--threshold-minutes", isolated.stdout)
         self.assertEqual(naive.returncode, 99, "the decoy is what a non-isolated interpreter would have run")
 
+    def test_only_kubeconfig_and_stdin_cross_into_the_sandbox(self):
+        with patch.object(stall_watch.sandbox_exec, "run", return_value=completed([], "[]")) as run:
+            stall_watch.run_sandbox(["python3", "-I", "-"], timeout=5, kubeconfig="/k", stdin="print(1)")
+        self.assertEqual(run.call_args.kwargs["remote_env"], {"KUBECONFIG": "/k"})
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+        self.assertEqual(run.call_args.kwargs["stdin"], "print(1)")
+        self.assertNotIn("principal", run.call_args.kwargs)
+
     def test_production_kubeconfig_path_is_under_hermes_home_with_the_watch_prefix(self):
         with patch.object(stall_watch.sandbox_exec, "sandbox_enabled", return_value=True):
             path = stall_watch.kubeconfig_path("my-proj", "a cluster", "us-central1")
         self.assertEqual(path, f"{stall_watch.SANDBOX_KUBECONFIG_DIR}/{stall_watch.KUBECONFIG_FILE_PREFIX}my-proj_a-cluster_us-central1{stall_watch.KUBECONFIG_FILE_SUFFIX}")
-        self.assertFalse(Path(stall_watch.SANDBOX_KUBECONFIG_DIR).exists() and Path(path).exists(), "nothing is created locally for the sandbox path")
 
     def test_the_report_source_prefers_the_image_copy_and_honours_the_override(self):
         with tempfile.TemporaryDirectory() as d:
-            image = Path(d) / "image.py"; image.write_text("IMAGE")
-            override = Path(d) / "override.py"; override.write_text("OVERRIDE")
+            image = Path(d) / "image.py"
+            image.write_text("IMAGE")
+            override = Path(d) / "override.py"
+            override.write_text("OVERRIDE")
             with patch.object(stall_watch, "IMAGE_REPORT_SCRIPT", str(image)):
                 self.assertEqual(stall_watch.report_source(), "IMAGE")
                 with patch.dict(os.environ, {stall_watch.REPORT_SCRIPT_ENV: str(override)}):
@@ -665,32 +762,44 @@ class Scope(Base):
                 with self.assertRaises(RuntimeError):
                     stall_watch.report_source()
 
-    def test_only_kubeconfig_and_stdin_cross_into_the_sandbox(self):
-        with patch.object(stall_watch.sandbox_exec, "run", return_value=completed([], "[]")) as run:
-            stall_watch.run_sandbox(["python3", "-I", "-"], timeout=5, kubeconfig="/k", stdin="print(1)")
-        self.assertEqual(run.call_args.kwargs["remote_env"], {"KUBECONFIG": "/k"})
-        self.assertEqual(run.call_args.kwargs["timeout"], 5)
-        self.assertEqual(run.call_args.kwargs["stdin"], "print(1)")
-        self.assertNotIn("principal", run.call_args.kwargs)
-
     def test_state_is_written_atomically_and_versioned(self):
         self.run_tick({"c": {"payments": []}})
         self.assertFalse(self.state.with_name(self.state.name + stall_watch.STATE_TMP_SUFFIX).exists())
         self.assertEqual(self.ledger()["version"], stall_watch.STATE_SCHEMA_VERSION)
 
     def test_a_ledger_from_another_version_is_discarded(self):
-        self.state.write_text(json.dumps({"version": 1, "stalls": {"x": {}}}))
+        self.state.write_text(json.dumps({"version": 2, "stalls": {"x": {}}}))
         self.assertEqual(stall_watch.load_state(self.state)["stalls"], {})
 
 
 class Output(Base):
+    def test_a_dry_run_opens_no_card_and_says_what_it_would_do(self):
+        fake = FakeFleet({"c": {"storefront": GATEWAY_ROWS}})
+        with patch.object(stall_watch, "run_sandbox", fake):
+            lines = stall_watch.tick(self.state, dry_run=True)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(f"{stall_watch.DRY_RUN_PREFIX} would open a card"), lines[0])
+        self.assertIn("Gateway/storefront-gateway", lines[0])
+        self.assertEqual(self.board.calls, [])
+        self.assertFalse(self.state.exists())
+
+    def test_a_dry_run_on_an_open_episode_says_it_would_comment(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        calls = len(self.board.calls)
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        fake = FakeFleet({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        with patch.object(stall_watch, "run_sandbox", fake):
+            lines = stall_watch.tick(self.state, dry_run=True)
+        self.assertTrue(lines[0].startswith(f"{stall_watch.DRY_RUN_PREFIX} would comment on card"), lines[0])
+        self.assertEqual(len(self.board.calls), calls)
+
     def test_main_prints_lines_and_exits_zero(self):
         fake = FakeFleet({"c": {"storefront": GATEWAY_ROWS}})
         out = io.StringIO()
         with patch.object(stall_watch, "run_sandbox", fake), redirect_stdout(out):
             rc = stall_watch.main(["--state", str(self.state)])
         self.assertEqual(rc, 0)
-        self.assertIn(stall_watch.NEW_HEADING, out.getvalue())
+        self.assertIn(stall_watch.NOTICED_PREFIX, out.getvalue())
         out = io.StringIO()
         with patch.object(stall_watch, "run_sandbox", fake), redirect_stdout(out):
             stall_watch.main(["--state", str(self.state)])
