@@ -14,9 +14,13 @@ someone asks a Cluster Agent to run ``gke-stall-detection``, nothing looks
 This is a ``no_agent`` entry on the Platform Agent's roster. The tick prompts
 no model. Each tick:
 
-1. lists the project's clusters; ``RUNNING`` and ``RECONCILING`` clusters are
-   swept (a reconciling control plane still answers), any other status is
-   recorded as unreadable with the status rather than skipped;
+1. lists the project's clusters; ``RUNNING`` and ``RECONCILING`` clusters
+   with a scaffolded Cluster Agent profile are swept (a reconciling control
+   plane still answers), any other status is recorded as unreadable with the
+   status rather than skipped, and a cluster with no profile, one the
+   reconciler's ``RECONCILE_EXCLUDE`` pruned or has not yet scaffolded, is
+   left unread: the exclusion is the operator keeping a model turn off that
+   cluster, and this watch follows the same roster;
 2. per cluster, fetches credentials into a per-cluster kubeconfig and lists
    the namespaces that are not system namespaces;
 3. per namespace, runs the Cluster Agent's ``stall_report.py --json`` over a
@@ -30,8 +34,10 @@ no model. Each tick:
    what makes the gateway notifier post its progress and completion; a new
    object in a namespace whose card is still open is a comment on that card;
    when every object in the namespace has cleared, the card gets a closing
-   comment and is completed. Chat gets one line when a card opens and one
-   when it closes, and nothing else.
+   comment and is completed. At most ``MAX_CARDS_PER_TICK`` cards open per
+   tick; the namespaces past that wait for the next one. Chat gets one line
+   when a card opens, one when it closes, one when namespaces were held for
+   the next tick, and nothing else.
 
 Every ``gcloud``, ``kubectl`` and ``stall_report.py`` call runs in the shell
 sandbox through ``sandbox_exec.run``: the agent container carries no kubectl
@@ -236,9 +242,19 @@ REPORT_UNREADABLE_EXIT = 2
 
 #: Where the ledger keeps an open card per `cluster/namespace` scope.
 EPISODES_KEY = "episodes"
-#: The card's assignee is that cluster's Cluster Agent profile when one is
-#: scaffolded, else the Platform Agent, with the same instruction.
-FALLBACK_ASSIGNEE = "platform"
+#: Only a cluster with a scaffolded Cluster Agent profile is swept, and its
+#: card goes to that profile. A cluster without one, pruned through the
+#: reconciler's RECONCILE_EXCLUDE or not yet scaffolded, is neither read nor
+#: filed for: the exclusion is the operator keeping a model turn off that
+#: cluster, and a card would hand its rows to another profile instead.
+NO_PROFILE_REASON = "no Cluster Agent profile; not read"
+#: Cards opened per tick. Each is a Cluster Agent turn, and the number of
+#: namespaces with a new stall is chosen by whoever can create namespaces, so
+#: the rest wait for the next tick the way the budget holds unread namespaces.
+#: The default of github_scan_gate's PR_AGENT_MAX_PER_TICK.
+MAX_CARDS_PER_TICK = 3
+#: Object names a chat line or card comment spells out before counting the rest.
+MAX_OBJECTS_IN_LINE = 8
 CARD_IDEMPOTENCY_PREFIX = "stall-watch"
 CARD_TITLE_MAX_CHARS = 120
 MAX_ROWS_IN_CARD = 60
@@ -274,24 +290,16 @@ MAX_UNKNOWN_CARD_TICKS = 3
 #: stall clears; the watch comments and lets the worker finish, then closes
 #: the episode once the card reaches a terminal status.
 RUNNING_CARD_STATUS = "running"
-#: The episode id in a card's idempotency key is the stall's own start, taken
-#: from the scan's own clock and the row's age rather than from the tick's
-#: clock, and rounded to ten minutes, so a retry after a lost board response
-#: reuses it however long the rest of the sweep took. A repeating-warnings
-#: row's age is an event span, not a start, and does not take part.
-EPISODE_ID_RESOLUTION_SECONDS = 600
-#: The board answers a repeated idempotency key with the existing card, a
-#: finished one included, so a key also carries the scope's episode
-#: generation: it advances whenever an episode ends, and a stall that comes
-#: back after its card was completed gets a new card, while a retry inside one
-#: episode still gets the card it lost the id of.
+#: A card's idempotency key is the scope and its episode generation, with
+#: nothing from any clock in it: a retry after a lost board response, however
+#: many ticks later, presents the key the board already has and gets that card
+#: back. The board answers a repeated key with the existing card, a finished
+#: one included, so the generation advances whenever an episode ends, and a
+#: stall that comes back after its card was completed gets a new card.
 GENERATIONS_KEY = "generations"
 #: Plurals kubectl forms with -es or -ies, so a skipped `ingresses` holds
 #: Ingress rows and `networkpolicies` holds NetworkPolicy rows.
 PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
-#: Where stall_report.py sits for a Platform Agent worker, which has no
-#: gke-stall-detection skill of its own to view.
-PLATFORM_REPORT_SCRIPT = "/opt/data/scripts/stall_report.py"
 #: Consecutive scans a row must be absent from before it clears, per
 #: heuristic; one for everything not named here. A repeating-warnings row
 #: exists only while its event recurred inside the report's window, and a
@@ -618,6 +626,9 @@ class Sweep:
         #: gcloud vouched for the listing being complete.
         self.listed_clusters: set[str] = set()
         self.listing_complete = True
+        #: Listed clusters with no Cluster Agent profile: not read, not listed
+        #: here, so their rows clear the way a deleted cluster's do.
+        self.unmanaged: set[str] = set()
         #: Clusters whose namespace listing succeeded, and those namespaces.
         self.read_clusters: set[str] = set()
         self.listed_namespaces: dict[str, set[str]] = {}
@@ -700,6 +711,10 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
     sweepable = []
     for cluster in clusters:
         cid = cluster_id(cluster["name"], cluster["location"])
+        if cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
+            sweep.unmanaged.add(cid)
+            sweep.unreadable[scope_key(cid)] = NO_PROFILE_REASON
+            continue
         sweep.listed_clusters.add(cid)
         if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
             sweepable.append((cid, cluster))
@@ -864,15 +879,15 @@ def card_exists(task_id: str, db_path: Path | None = None) -> bool | None:
         return None
 
 
-def assignee_for(project: str, cluster: str, location: str) -> str:
-    """The cluster's Cluster Agent profile when it is scaffolded, else the
-    Platform Agent. Named the way cluster_agent_profile.py names profiles."""
+def cluster_agent_for(project: str, cluster: str, location: str) -> str | None:
+    """The cluster's Cluster Agent profile when the reconciler has scaffolded
+    one, else None. Named the way cluster_agent_profile.py names profiles."""
     from cluster_agent_profile import profile_name  # lazy: pulls the scaffold module's imports
 
     name = profile_name(project, cluster, location)
     if (Path(gitops_workspace.agent_home()) / PROFILES_DIR / name).is_dir():
         return name
-    return FALLBACK_ASSIGNEE
+    return None
 
 
 def scope_label_text(scope: str) -> str:
@@ -882,6 +897,18 @@ def scope_label_text(scope: str) -> str:
 
 def object_names(rows: list[dict]) -> list[str]:
     return sorted({r["object"] for r in rows})
+
+
+def names_text(names: list[str]) -> str:
+    """The first MAX_OBJECTS_IN_LINE names and a count of the rest, so a
+    namespace with hundreds of stalled objects is one bounded line."""
+    shown = names[:MAX_OBJECTS_IN_LINE]
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f" and {rest} more" if rest else "")
+
+
+def card_key(cid: str, namespace: str, generation: int) -> str:
+    return f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-g{generation}"
 
 
 def card_title(cluster: str, namespace: str, rows: list[dict]) -> str:
@@ -899,21 +926,13 @@ def rows_block(rows: list[dict]) -> str:
     return "\n".join(shown)
 
 
-def card_body(project: str, cluster: str, location: str, namespace: str, rows: list[dict], now: str, assignee: str) -> str:
-    if assignee == FALLBACK_ASSIGNEE:
-        how = (
-            f"This cluster has no Cluster Agent profile, so the work is yours. Get credentials for it into a "
-            f"kubeconfig of its own under `$HERMES_HOME/.kubeconfigs/` (`gcloud container clusters get-credentials "
-            f"{cluster} --location={location} --project={project}`), run "
-            f"`python3 {PLATFORM_REPORT_SCRIPT} --namespace {namespace}` under that kubeconfig, "
-        )
-    else:
-        how = f"Run the `{SKILL_NAME}` skill on that namespace, "
+def card_body(project: str, cluster: str, location: str, namespace: str, rows: list[dict], now: str) -> str:
     return (
         f"The scheduled stall watch found controllers in namespace `{namespace}` of cluster "
         f"`{cluster}` ({location}, project `{project}`) that have stopped making progress without "
         f"erroring. First seen by the watch at {now}.\n\n"
-        f"{how}confirm which of the objects below are still stalled, identify what each is waiting on "
+        f"Run the `{SKILL_NAME}` skill on that namespace, "
+        f"confirm which of the objects below are still stalled, identify what each is waiting on "
         f"(the missing referent, the condition that never turned True, the repeating warning), and record "
         f"the finding with `kanban_complete` in the report format your instructions give. Change nothing "
         f"in the cluster.\n\n"
@@ -1056,17 +1075,6 @@ def unledger_scope(state: dict, scope: str) -> None:
         del state["stalls"][key]
 
 
-def episode_id(rows: list[dict], now_epoch: int) -> int:
-    """The stall's start, from each row's scan clock and age, to the bucket."""
-    starts = [
-        int(r.get("scanned_at") or now_epoch) - int(r.get("stalled_seconds") or 0)
-        for r in rows
-        if r.get("heuristic") != REPEATING_WARNINGS_HEURISTIC
-    ]
-    start = min(starts) if starts else min(int(r.get("scanned_at") or now_epoch) for r in rows)
-    return start // EPISODE_ID_RESOLUTION_SECONDS
-
-
 def end_episode(state: dict, scope: str) -> dict:
     """Drop the scope's episode and advance its generation, so the next card
     for the scope carries a key the board has not seen."""
@@ -1100,7 +1108,7 @@ def comment_pending(episode: dict, namespace: str) -> None:
     pending = sorted(set(episode.get("pending", [])))
     if not pending:
         return
-    if comment_card(episode["card"], f"The watch now also sees these objects stalled in `{namespace}`: {', '.join(pending)}"):
+    if comment_card(episode["card"], f"The watch now also sees these objects stalled in `{namespace}`: {names_text(pending)}"):
         episode["objects"] = sorted(set(episode.get("objects", [])) | set(pending))
         episode["pending"] = []
 
@@ -1111,13 +1119,21 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     no board and says what it would have done."""
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
+    opened = held = 0
     for scope, rows in sorted(new_by_scope.items()):
         cid, namespace = split_scope(scope)
         name, _, location = cid.partition(CLUSTER_ID_SEPARATOR)
         episode = episodes.get(scope)
         if dry_run:
-            what = f"would comment on card `{episode['card']}` for" if episode else "would open a card for"
-            lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {', '.join(object_names(rows))}")
+            if episode:
+                what = f"would comment on card `{episode['card']}` for"
+            elif opened < MAX_CARDS_PER_TICK:
+                what = "would open a card for"
+                opened += 1
+            else:
+                held += 1
+                continue
+            lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {names_text(object_names(rows))}")
             continue
         if episode:
             status = card_status(episode["card"])
@@ -1132,34 +1148,40 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 continue
             if status is not None:
                 end_episode(state, scope)
-        assignee = assignee_for(sweep.project, name, location)
+        if opened >= MAX_CARDS_PER_TICK:
+            # The rows leave the ledger, so the next tick sees the objects as
+            # new and files for them then.
+            unledger_scope(state, scope)
+            held += 1
+            continue
+        assignee = cluster_agent_for(sweep.project, name, location)
+        if assignee is None:
+            # The profile went between the sweep and the card; the next sweep
+            # leaves the cluster out.
+            sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no card for {scope}\n")
+            unledger_scope(state, scope)
+            continue
         generation = int(state.setdefault(GENERATIONS_KEY, {}).get(scope) or 0)
         # A card replacing a gone or finished one carries every object the
         # scope still holds, not only the ones that appeared this tick.
         known = [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
         seen = {(r["object"], r["heuristic"], r["detail"]) for r in rows}
         rows = rows + [e for e in known if (e["object"], e["heuristic"], e["detail"]) not in seen]
-        task_id = open_card(
-            card_title(name, namespace, rows),
-            card_body(sweep.project, name, location, namespace, rows, now, assignee),
-            assignee,
-            f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-{episode_id(rows, int(time.time()))}-g{generation}",
-        )
+        title = card_title(name, namespace, rows)
+        body = card_body(sweep.project, name, location, namespace, rows, now)
+        task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
         if task_id and (card_status(task_id) or "") in TERMINAL_CARD_STATUSES:
             # The board handed back a finished card for a key it had seen; move
             # the generation on and file once more.
-            state[GENERATIONS_KEY][scope] = generation + 1
-            task_id = open_card(
-                card_title(name, namespace, rows),
-                card_body(sweep.project, name, location, namespace, rows, now, assignee),
-                assignee,
-                f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-{episode_id(rows, int(time.time()))}-g{generation + 1}",
-            )
+            generation += 1
+            state[GENERATIONS_KEY][scope] = generation
+            task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
         if not task_id:
             # No card yet, so nothing to comment on: the rows leave the ledger
             # and the next tick sees the objects as new and tries the board again.
             unledger_scope(state, scope)
             continue
+        opened += 1
         episodes[scope] = {
             "card": task_id,
             "assignee": assignee,
@@ -1168,9 +1190,12 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             "subscribed": subscribe_card(task_id) > 0,
         }
         lines.append(
-            f"{NOTICED_PREFIX} in {cluster_label(cid)} / `{namespace}`: {', '.join(object_names(rows))}; "
+            f"{NOTICED_PREFIX} in {cluster_label(cid)} / `{namespace}`: {names_text(object_names(rows))}; "
             f"card `{task_id}` opened for `{assignee}`"
         )
+    if held:
+        text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; cards follow on later ticks, {MAX_CARDS_PER_TICK} a tick"
+        lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
     if not dry_run:
         for scope, episode in episodes.items():
             if not episode.get("subscribed", True):
@@ -1180,7 +1205,12 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
     for scope in sorted(set(episodes) - open_scopes):
         episode = episodes[scope]
-        cleared = ", ".join(object_names(cleared_by_scope.get(scope, [])) or episode.get("objects", []))
+        cleared = names_text(object_names(cleared_by_scope.get(scope, [])) or episode.get("objects", []))
+        if split_scope(scope)[0] in sweep.unmanaged:
+            cleared = "the cluster left the Cluster Agent roster"
+            note = f"The cluster left the Cluster Agent roster; the watch no longer reads it, as of {now}."
+        else:
+            note = f"The watch no longer sees a stall in `{namespace_of(scope)}`: {cleared} cleared at {now}."
         if dry_run:
             lines.append(f"{DRY_RUN_PREFIX} would close card `{episode['card']}` for {scope_label_text(scope)}")
             continue
@@ -1191,13 +1221,13 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         episode["unknown"] = 0
         if status not in TERMINAL_CARD_STATUSES:
             if not episode.get("cleared_at"):
-                if not comment_card(episode["card"], f"The watch no longer sees a stall in `{namespace_of(scope)}`: {cleared} cleared at {now}."):
+                if not comment_card(episode["card"], note):
                     continue
                 episode["cleared_at"] = now
             if status == RUNNING_CARD_STATUS:
                 # The worker is on it; it completes its own card. Closed next tick.
                 continue
-            if not complete_card(episode["card"], f"Stall cleared at {now}: {cleared}. Closed by the stall watch."):
+            if not complete_card(episode["card"], f"{note} Closed by the stall watch."):
                 continue
         end_episode(state, scope)
         lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}; card `{episode['card']}` closed")

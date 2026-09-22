@@ -50,28 +50,37 @@ and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
 `stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
 minutes it lists the project's clusters and, for every namespace of every
-running or reconciling cluster that is not a system namespace, runs the Cluster
-Agent's `stall_report.py` over a bounded list of controller kinds, keeping a
-ledger of the rows it has seen. On a new stall episode it files one kanban card
-per cluster and namespace, assigned to that cluster's Cluster Agent profile when
-one is scaffolded, telling it to run `gke-stall-detection` on the namespace and
-record the finding, and to `platform` otherwise, told to fetch the cluster's
-credentials and run `stall_report.py` itself, since the skill is a Cluster Agent's. That is the same
-card, diagnosis and chat thread a user's own question produces, which is the
-point: one detector and one experience whether the cron or a person noticed
-first. A new object in a namespace whose card is still open is a comment on that
-card; when every object in the namespace has cleared, the card gets a closing
-comment and is completed. A `repeating-warnings` or `dangling-reference` row
-clears only after two consecutive scans without it, so a warning that recurs
-hourly or a referent listing that failed once does not close and reopen a card.
+running or reconciling cluster that has a Cluster Agent profile and is not a
+system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
+of controller kinds, keeping a ledger of the rows it has seen. On a new stall
+episode it files one kanban card per cluster and namespace, assigned to that
+cluster's Cluster Agent profile, telling it to run `gke-stall-detection` on the
+namespace and record the finding. That is the same card, diagnosis and chat
+thread a user's own question produces, which is the point: one detector and one
+experience whether the cron or a person noticed first. The watch follows the
+reconciler's roster: a cluster with no profile, one `RECONCILE_EXCLUDE` pruned
+or one not yet scaffolded, is neither read nor filed for, because the exclusion
+is the operator keeping a model turn off that cluster and a card would hand its
+rows to another profile; a cluster that leaves the roster has its rows cleared
+and its open card completed with a comment saying so. At most three cards open
+per tick (`MAX_CARDS_PER_TICK`, the default of the pull-request poller's
+`PR_AGENT_MAX_PER_TICK`), since each is a Cluster Agent turn and the number of
+namespaces with a new stall is chosen by whoever can create namespaces; the rest
+wait for the next tick, and chat gets one line saying how many. A new object in
+a namespace whose card is still open is a comment on that card; when every
+object in the namespace has cleared, the card gets a closing comment and is
+completed. A `repeating-warnings` or `dangling-reference` row clears only after
+two consecutive scans without it, so a warning that recurs hourly or a referent
+listing that failed once does not close and reopen a card.
 
 The card's progress reaches chat because the script writes the card's
 `kanban_notify_subs` row itself: a cron child has no session identity for
 `kanban_create` to copy, and a card without a row is invisible to the gateway
-notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries two one-liners, "stall noticed in
-`<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened" and "stall cleared
-...; card `<id>` closed", plus the sweep-failed and sweep-recovered lines every
-roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
+notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries three one-liners, "stall noticed in
+`<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened", "stall cleared
+...; card `<id>` closed" and "stall noticed in `<n>` more namespaces; cards
+follow on later ticks", each naming at most eight objects, plus the sweep-failed
+and sweep-recovered lines every roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
 cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a listing gcloud called incomplete, a sweep that hit its
 25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
 an exhausted sweep resumes where it stopped.
@@ -97,10 +106,10 @@ this job split the work by signal: a Warning whose reason is on the watcher's
 list is the watcher's within seconds; a condition, a reference or an event the
 list never names is this job's within the half hour. It declares `risk: high`
 because what it puts in a card body and relays into chat is event text and
-object names from every namespace of every cluster in the project, the
-management cluster included; the card body marks those rows as data rather than
-instructions, and the Cluster Agent's read-only skill and preflight bound what
-it does with them.
+object names from every namespace of every cluster on the Cluster Agent roster,
+the management cluster included unless `RECONCILE_EXCLUDE` names it; the card
+body marks those rows as data rather than instructions, and the Cluster Agent's
+read-only skill and preflight bound what it does with them.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 

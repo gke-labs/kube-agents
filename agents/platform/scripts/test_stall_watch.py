@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -276,8 +277,25 @@ class Base(unittest.TestCase):
 
         (self.home / stall_watch.CONFIG_FILE_NAME).write_text(yaml.safe_dump(config))
 
-    def run_tick(self, fleet, **kw):
+    def profile_dir(self, name, location=LOCATION):
+        from cluster_agent_profile import profile_name
+
+        return self.home / stall_watch.PROFILES_DIR / profile_name(PROJECT, name, location)
+
+    def scaffold(self, *clusters, location=LOCATION):
+        """What cluster_agent_reconcile leaves for a cluster on its roster."""
+        for name in clusters:
+            self.profile_dir(name, location).mkdir(parents=True, exist_ok=True)
+
+    def run_tick(self, fleet, unmanaged=(), **kw):
+        """Every cluster in the fleet has a Cluster Agent profile unless
+        `unmanaged` names it, the way the reconciler prunes one."""
         fake = FakeFleet(fleet, **kw)
+        for name, location in fake.fleet:
+            if name in unmanaged:
+                shutil.rmtree(self.profile_dir(name, location), ignore_errors=True)
+            else:
+                self.scaffold(name, location=location)
         with patch.object(stall_watch, "run_sandbox", fake):
             lines = stall_watch.tick(self.state, dry_run=False)
         return lines, fake
@@ -304,14 +322,15 @@ class Cards(Base):
         self.assertEqual(len(lines), 1)
         self.assertEqual(len(self.board.opened()), 1)
         tid, card = next(iter(self.board.cards.items()))
-        self.assertEqual(card["assignee"], stall_watch.FALLBACK_ASSIGNEE, "no Cluster Agent profile is scaffolded in this test home")
+        profile = self.profile_dir("support-eval-cluster").name
+        self.assertEqual(card["assignee"], profile)
         self.assertIn("Stalled controllers in storefront on support-eval-cluster: Gateway/storefront-gateway", card["title"])
-        self.assertIn(stall_watch.PLATFORM_REPORT_SCRIPT, card["body"], "no profile, so the platform worker runs the script itself")
+        self.assertIn(f"`{stall_watch.SKILL_NAME}` skill", card["body"])
         self.assertIn(GATEWAY_SECRET, card["body"])
         self.assertIn("not instructions", card["body"])
         self.assertIn("`storefront`", card["body"])
-        self.assertTrue(card["key"].startswith(f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-support-eval-cluster@{LOCATION}-storefront-"))
-        self.assertEqual(lines[0], f"{stall_watch.NOTICED_PREFIX} in {label('support-eval-cluster')} / `storefront`: Gateway/storefront-gateway; card `{tid}` opened for `platform`")
+        self.assertEqual(card["key"], f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-support-eval-cluster@{LOCATION}-storefront-g0")
+        self.assertEqual(lines[0], f"{stall_watch.NOTICED_PREFIX} in {label('support-eval-cluster')} / `storefront`: Gateway/storefront-gateway; card `{tid}` opened for `{profile}`")
 
     def test_the_card_gets_a_home_channel_subscription_seeded_at_its_event_head(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
@@ -319,17 +338,66 @@ class Cards(Base):
         self.assertEqual(self.subs(tid), [("google_chat", HOME_CHANNEL, "", stall_watch.NOTIFIER_PROFILE, stall_watch.DELIVERY_MODE, 1)])
         self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/storefront"]["card"], tid)
 
-    def test_the_assignee_is_the_clusters_profile_when_it_exists(self):
-        from cluster_agent_profile import profile_name
+    def test_a_cluster_without_a_cluster_agent_profile_is_neither_read_nor_filed_for(self):
+        # RECONCILE_EXCLUDE prunes the profile to keep a model turn off that
+        # cluster; the watch follows the same roster rather than handing the
+        # cluster's rows to another profile.
+        lines, fake = self.run_tick({"c": {"storefront": GATEWAY_ROWS}, "mgmt": {"checkout": [DEPLOYMENT_ROW]}}, unmanaged=("mgmt",))
+        self.assertEqual(len(self.board.opened()), 1)
+        self.assertEqual(fake.scanned(), ["storefront"])
+        self.assertNotIn("mgmt", [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]])
+        self.assertEqual(len(lines), 1)
+        self.assertIn("storefront", lines[0])
+        self.assertEqual(self.ledger()["unreadable"][f"mgmt@{LOCATION}"], stall_watch.NO_PROFILE_REASON)
 
-        name = profile_name(PROJECT, "c", LOCATION)
-        (self.home / stall_watch.PROFILES_DIR / name).mkdir(parents=True)
-        lines, _ = self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+    def test_a_cluster_that_leaves_the_roster_clears_its_rows_and_closes_its_card_as_such(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = next(iter(self.board.cards))
+        lines, _ = self.run_tick(fleet, unmanaged=("c",))
+        self.assertEqual(self.ledger()["stalls"], {})
+        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("left the Cluster Agent roster", self.board.cards[tid]["result"])
+        self.assertNotIn("cleared at", self.board.cards[tid]["comments"][0])
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(stall_watch.CLEARED_PREFIX), lines[0])
+        self.assertIn("left the Cluster Agent roster", lines[0])
+        self.assertNotIn("Deployment/checkout-api", lines[0])
+
+    def test_at_most_three_cards_open_a_tick_and_the_rest_follow_on_later_ticks(self):
+        fleet = {"c": {f"tenant-{i}": [finding(f"tenant-{i}", f"Deployment/api-{i}", "stale-condition", "Progressing=False ProgressDeadlineExceeded")] for i in range(5)}}
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(len(self.board.opened()), stall_watch.MAX_CARDS_PER_TICK)
+        self.assertEqual(len(self.noticed(lines)), stall_watch.MAX_CARDS_PER_TICK + 1)
+        self.assertEqual(lines[-1], f"{stall_watch.NOTICED_PREFIX} in 2 more namespaces; cards follow on later ticks, {stall_watch.MAX_CARDS_PER_TICK} a tick")
+        self.assertEqual(len(self.ledger()["stalls"]), stall_watch.MAX_CARDS_PER_TICK, "a held namespace's rows wait for the tick that files for them")
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(len(self.board.opened()), 5)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(sorted(c["title"].split(" in ")[1].split(" on ")[0] for c in self.board.cards.values()), [f"tenant-{i}" for i in range(5)])
+        self.assertEqual(self.run_tick(fleet)[0], [])
+
+    def test_a_dry_run_holds_the_same_namespaces(self):
+        fleet = {"c": {f"tenant-{i}": [DEADLINE_ROW | {"namespace": f"tenant-{i}"}] for i in range(4)}}
+        self.scaffold("c")
+        fake = FakeFleet(fleet)
+        with patch.object(stall_watch, "run_sandbox", fake):
+            lines = stall_watch.tick(self.state, dry_run=True)
+        self.assertEqual(len(lines), stall_watch.MAX_CARDS_PER_TICK + 1)
+        self.assertEqual(lines[-1], f"{stall_watch.DRY_RUN_PREFIX} {stall_watch.NOTICED_PREFIX} in 1 more namespace; cards follow on later ticks, {stall_watch.MAX_CARDS_PER_TICK} a tick")
+        self.assertEqual(self.board.calls, [])
+
+    def test_a_chat_line_names_a_bounded_number_of_objects(self):
+        rows = [finding("checkout", f"Deployment/svc-{i:02d}", "stale-condition", "Progressing=False ProgressDeadlineExceeded") for i in range(12)]
+        lines, _ = self.run_tick({"c": {"checkout": rows}})
+        self.assertIn("Deployment/svc-07 and", lines[0])
+        self.assertNotIn("Deployment/svc-08", lines[0])
+        self.assertIn(f"and {12 - stall_watch.MAX_OBJECTS_IN_LINE} more; card", lines[0])
         card = next(iter(self.board.cards.values()))
-        self.assertEqual(card["assignee"], name)
-        self.assertIn(f"`{stall_watch.SKILL_NAME}` skill", card["body"])
-        self.assertNotIn(stall_watch.PLATFORM_REPORT_SCRIPT, card["body"])
-        self.assertIn(f"opened for `{name}`", lines[0])
+        self.assertEqual(card["body"].count("Deployment/svc-"), 12, "the card body carries every row")
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertIn(f"and {12 - stall_watch.MAX_OBJECTS_IN_LINE} more; card", lines[0])
 
     def test_unchanged_stall_opens_nothing_and_prints_nothing(self):
         fleet = {"c": {"storefront": GATEWAY_ROWS}}
@@ -540,24 +608,20 @@ class Cards(Base):
         self.assertNotIn(f"card `{first}`", lines[0])
         self.assertEqual(len(self.board.cards), 2)
 
-    def test_the_idempotency_key_is_stable_across_a_retry_however_long_the_sweeps_take(self):
-        # A real stall's age grows with the clock; the fake reports it relative
-        # to a fixed start, and the two ticks run 1,700 s apart with different
-        # scan-to-card latencies, crossing several ten-minute boundaries.
-        start = 1_800_000_000
-        def rows_at(now):
-            return [dict(DEPLOYMENT_ROW, stalled_seconds=now - start), finding("checkout", "Deployment/checkout-api", "repeating-warnings", "SYNC x9: x", stalled_seconds=900)]
-        clock = {"now": start + 1000}
+    def test_the_idempotency_key_carries_no_clock_so_a_retry_reuses_it(self):
+        # The stall's reported age and the scan clock both move between the
+        # failed create and the retry; neither is in the key.
+        clock = {"now": 1_800_000_000}
         with patch.object(stall_watch.time, "time", lambda: clock["now"]):
             self.board.fail_next_create = True
-            self.run_tick({"c": {"checkout": rows_at(clock["now"])}})
+            self.run_tick({"c": {"checkout": [dict(DEPLOYMENT_ROW, stalled_seconds=1000)]}})
             first = shlex.split(self.board.calls[0])
-            clock["now"] = start + 2700
-            self.run_tick({"c": {"checkout": rows_at(clock["now"])}})
+            clock["now"] += 2700
+            self.run_tick({"c": {"checkout": [dict(DEPLOYMENT_ROW, stalled_seconds=3705)]}})
             second = shlex.split([c for c in self.board.calls if c.startswith("create ")][-1])
         key = lambda argv: argv[argv.index("--idempotency-key") + 1]
         self.assertEqual(key(first), key(second))
-        self.assertTrue(key(first).endswith(f"-{start // stall_watch.EPISODE_ID_RESOLUTION_SECONDS}-g0"), key(first))
+        self.assertEqual(key(first), f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-c@{LOCATION}-checkout-g0")
 
     def test_a_card_the_agent_already_completed_is_not_completed_again_on_clear(self):
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
@@ -1028,6 +1092,7 @@ class Scope(Base):
 
 class Output(Base):
     def test_a_dry_run_opens_no_card_and_says_what_it_would_do(self):
+        self.scaffold("c")
         fake = FakeFleet({"c": {"storefront": GATEWAY_ROWS}})
         with patch.object(stall_watch, "run_sandbox", fake):
             lines = stall_watch.tick(self.state, dry_run=True)
@@ -1048,6 +1113,7 @@ class Output(Base):
         self.assertEqual(len(self.board.calls), calls)
 
     def test_main_prints_lines_and_exits_zero(self):
+        self.scaffold("c")
         fake = FakeFleet({"c": {"storefront": GATEWAY_ROWS}})
         out = io.StringIO()
         with patch.object(stall_watch, "run_sandbox", fake), redirect_stdout(out):
