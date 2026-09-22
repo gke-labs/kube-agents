@@ -464,14 +464,21 @@ def served_kinds(kubeconfig: str) -> set[str] | None:
     return served or None
 
 
-def kinds_for(served: set[str] | None) -> str | None:
-    """The --kind value for one cluster: the configured list minus what the
-    cluster does not serve, or None to let the script scan every kind."""
+def kinds_for(served: set[str] | None) -> tuple[str | None, set[str]]:
+    """The --kind value for one cluster, the configured list minus what the
+    cluster does not serve (None lets the script scan every kind), and the
+    kinds the filter removed. A removed kind is never asked for, so its rows
+    are held as unread in every namespace of the cluster rather than judged
+    absent: a discovery listing that dropped a served group must not close a
+    card under a live stall."""
     configured = kinds_argument()
     if configured is None or served is None:
-        return configured
+        return configured, set()
     kept = [k for k in configured.split(KINDS_SEPARATOR) if k in served]
-    return KINDS_SEPARATOR.join(kept) if kept else configured
+    dropped = {k for k in configured.split(KINDS_SEPARATOR) if k not in served}
+    if not kept:
+        return configured, set()
+    return KINDS_SEPARATOR.join(kept), dropped
 
 
 def is_system_namespace(name: str) -> bool:
@@ -705,7 +712,7 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
         try:
             kubeconfig = fetch_credentials(project, name, location)
             namespaces = list_namespaces(kubeconfig)
-            kinds = kinds_for(served_kinds(kubeconfig))
+            kinds, dropped = kinds_for(served_kinds(kubeconfig))
         except sandbox_exec.SandboxUnavailable:
             raise
         except READ_FAILURES as exc:
@@ -722,6 +729,7 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
                 break
             try:
                 findings, skipped = scan_namespace(kubeconfig, namespace, source, kinds)
+                skipped = skipped | dropped
             except sandbox_exec.SandboxUnavailable:
                 raise
             except subprocess.TimeoutExpired as exc:
@@ -956,11 +964,17 @@ def home_targets() -> list[tuple[str, str, str]]:
     that has a home channel: from the agent home's config.yaml first, the way
     the tick spawner reads it, and from `<PLATFORM>_HOME_CHANNEL` only for a
     platform the file does not settle, which is a run started by hand. The
-    platform list is chat_platforms.CHAT_PLATFORMS, so a channel for a platform
-    the notifier has no adapter for never becomes a row. A scheduled report
+    platform list is what chat_platforms says this install has enabled, so a
+    stale home channel for a platform the CR turned off, or a platform the
+    notifier has no adapter for, never becomes a row. A scheduled report
     posts flat, so no thread is carried from the file."""
-    from chat_platforms import CHAT_PLATFORMS  # lazy: a sibling the tests can still import
+    import chat_platforms  # lazy: a sibling the tests can still import
 
+    try:
+        platforms_on = list(chat_platforms.enabled_chat_platforms())
+    except Exception as exc:  # noqa: BLE001 - the shipped list is the fallback
+        sys.stderr.write(f"stall_watch: could not tell which chat platforms are enabled: {exc}\n")
+        platforms_on = list(chat_platforms.CHAT_PLATFORMS)
     configured: dict[str, str] = {}
     try:
         import yaml
@@ -975,7 +989,7 @@ def home_targets() -> list[tuple[str, str, str]]:
     except Exception as exc:  # noqa: BLE001 - no file, or not ours to parse: the environment is what is left
         sys.stderr.write(f"stall_watch: could not read home channels from {CONFIG_FILE_NAME}: {exc}\n")
     targets = []
-    for platform in CHAT_PLATFORMS:
+    for platform in platforms_on:
         if platform in configured:
             targets.append((platform, configured[platform], ""))
             continue
@@ -1062,14 +1076,19 @@ def end_episode(state: dict, scope: str) -> dict:
 
 
 def episode_gone(state: dict, scope: str, task_id: str) -> bool:
-    """A card the board no longer has, or one it could not describe for
-    MAX_UNKNOWN_CARD_TICKS ticks running, ends its episode; otherwise the
-    unknown is counted and the caller retries next tick."""
+    """Called when the board could not describe the card. A card the board's
+    tasks table no longer has ends its episode at once; otherwise the unknown
+    is counted, whatever the tasks table says, and the episode ends after
+    MAX_UNKNOWN_CARD_TICKS such ticks running. The counter resets only when a
+    status is read."""
     episode = state[EPISODES_KEY][scope]
-    exists = card_exists(task_id)
-    episode["unknown"] = 0 if exists else int(episode.get("unknown") or 0) + 1
-    if exists is False or episode["unknown"] >= MAX_UNKNOWN_CARD_TICKS:
+    if card_exists(task_id) is False:
         sys.stderr.write(f"stall_watch: card {task_id} for {scope} is gone from the board; its episode ends\n")
+        end_episode(state, scope)
+        return True
+    episode["unknown"] = int(episode.get("unknown") or 0) + 1
+    if episode["unknown"] >= MAX_UNKNOWN_CARD_TICKS:
+        sys.stderr.write(f"stall_watch: the board could not describe card {task_id} for {scope} on {episode['unknown']} ticks running; its episode ends\n")
         end_episode(state, scope)
         return True
     return False
@@ -1169,6 +1188,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if status is None:
             episode_gone(state, scope, episode["card"])
             continue
+        episode["unknown"] = 0
         if status not in TERMINAL_CARD_STATUSES:
             if not episode.get("cleared_at"):
                 if not comment_card(episode["card"], f"The watch no longer sees a stall in `{namespace_of(scope)}`: {cleared} cleared at {now}."):

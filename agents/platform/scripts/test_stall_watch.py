@@ -455,15 +455,25 @@ class Cards(Base):
         self.assertEqual(lines, [])
         self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
 
-    def test_a_board_that_cannot_answer_for_three_ticks_ends_the_episode(self):
+    def test_a_board_that_cannot_describe_the_card_for_three_ticks_ends_the_episode(self):
+        # The card row is on the board throughout; only `show` fails.
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
-        with patch.object(stall_watch, "card_exists", return_value=None):
-            self.board.fail_show = True
-            for _ in range(stall_watch.MAX_UNKNOWN_CARD_TICKS - 1):
-                self.run_tick({"c": {"checkout": []}})
-                self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.board.fail_show = True
+        for _ in range(stall_watch.MAX_UNKNOWN_CARD_TICKS - 1):
             self.run_tick({"c": {"checkout": []}})
+            self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.run_tick({"c": {"checkout": []}})
         self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
+
+    def test_a_status_read_resets_the_unknown_count(self):
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
+        self.board.fail_show = True
+        self.run_tick({"c": {"checkout": []}})
+        self.run_tick({"c": {"checkout": []}})
+        self.board.fail_show = False
+        self.board.fail_complete = True
+        self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["unknown"], 0)
 
     def test_one_failed_comment_does_not_complete_the_card_as_cleared(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
@@ -609,6 +619,14 @@ class Subscriptions(Base):
     def test_config_wins_over_the_environment_and_the_environment_fills_the_rest(self):
         with patch.dict(os.environ, {"GOOGLE_CHAT_HOME_CHANNEL": "spaces/STALE", "SLACK_HOME_CHANNEL": "C123", "SLACK_HOME_CHANNEL_THREAD_ID": "171.9", "TEAMS_HOME_CHANNEL": "19:abc"}):
             self.assertEqual(stall_watch.home_targets(), [("google_chat", HOME_CHANNEL, ""), ("slack", "C123", "171.9")])
+
+    def test_a_home_channel_for_a_platform_the_install_disabled_is_not_a_target(self):
+        import chat_platforms
+
+        with patch.object(chat_platforms, "enabled_chat_platforms", return_value=["slack"]):
+            self.assertEqual(stall_watch.home_targets(), [])
+        with patch.object(chat_platforms, "enabled_chat_platforms", side_effect=RuntimeError("no config")):
+            self.assertEqual(stall_watch.home_targets(), [("google_chat", HOME_CHANNEL, "")], "the shipped list is the fallback")
 
     def test_a_scheduled_tick_writes_the_row_with_no_home_channel_variable_at_all(self):
         # The production case: the environment carries no *_HOME_CHANNEL and
@@ -915,6 +933,18 @@ class Scope(Base):
         _, fake = self.run_tick({"c": {"payments": []}}, served=[])
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
         self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS), "an empty api-resources leaves the list unfiltered")
+
+    def test_a_kind_the_discovery_listing_dropped_is_held_not_cleared(self):
+        gateway = dict(GATEWAY_CONDITION_ROW, namespace="checkout")
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW, gateway]}})
+        no_apps = [n for n in SERVED_DEFAULT if not n.endswith(".apps")]
+        lines, fake = self.run_tick({"c": {"checkout": []}}, served=no_apps)
+        scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
+        self.assertNotIn("deployments", scan[scan.index("--kind") + 1].split(","))
+        self.assertEqual(lines, [], "the Gateway row cleared but the Deployment row is unread, so the episode stays open")
+        kinds_left = sorted(e["object"].split("/")[0] for e in self.ledger()["stalls"].values())
+        self.assertEqual(kinds_left, ["Deployment"])
+        self.assertEqual(next(iter(self.board.cards.values()))["status"], "ready")
 
     def test_a_full_listing_with_a_failed_aggregated_api_still_filters(self):
         no_cert_manager = [n for n in SERVED_DEFAULT if not n.startswith("certificates")]
