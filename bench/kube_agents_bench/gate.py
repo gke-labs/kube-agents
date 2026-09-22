@@ -54,8 +54,9 @@ skips it and says so, so a case recorded in a lane is never appended again by
 the pass after the fan-out. ``--lines-out`` appends for the same reason. And a
 run the Prow deadline ends before its suite step gets a table anyway: the
 shell's EXIT trap runs ``suite --partial NOTE`` over the cases graded by then,
-which banners the markdown and marks the JSON so nothing downstream can read
-it as the run's verdict.
+which banners the markdown and marks the JSON ``partial: true`` so nothing
+downstream reads it as the run's verdict: hack/ci-eval-rc.sh's driver does
+not let a partial JSON turn an exit 2 into NOT RUN.
 """
 
 from __future__ import annotations
