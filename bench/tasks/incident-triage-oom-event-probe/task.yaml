@@ -28,9 +28,10 @@
 # card, which costs the infra lock and a multi-minute card wait per
 # repetition (#1218 moved it to the nightly for exactly that), and every
 # triage card for the host cluster blocks until #1593 scaffolds its Cluster
-# Agent profile. So the domain has had no presubmit-eligible case since
-# 2026-09-03 (the docs/designs/domains.yaml allowlist entry). This case is
-# the non-tofu probe that entry asks for: the prompt IS the warning payload
+# Agent profile. So the domain had no presubmit-eligible case from
+# 2026-09-03 to 2026-09-22 (the docs/designs/domains.yaml allowlist entry
+# this case's seat deleted). This case is the non-tofu probe that entry
+# asked for: the prompt IS the warning payload
 # the watcher would hand the front door, in the shape of _triage_task_body
 # (agents/platform/scripts/session_kv_server.py), pointed at the seeded
 # fleet's standing OOM crashloop instead of a planted one. No stack, no

@@ -760,11 +760,11 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # still parked outside the matrix, and that was the point: the warnings it
 # prints per project ("carries no clusters labelled environment=seeded") are
 # how a pool project still needing bench/tf/fleet applied was found BEFORE
-# these tasks started gating PRs rather than after. Twelve of the active
-# tasks below read the seeded fleet (six domain probes, the fleet-audits
-# canary, cluster-agent-crashloop-debug, the three cluster-debugging cases
-# beside it and the incident-triage probe over the same crashloop), so
-# those warnings have consumers. It costs one
+# these tasks started gating PRs rather than after. Most of the active
+# tasks below read the seeded fleet -- the six domain probes, the
+# fleet-audits canary, the cluster-debugging family, the incident-triage
+# probe over the same crashloop, and the remediation cases that propose
+# fixes for those fixtures -- so those warnings have consumers. It costs one
 # clusters.list, one get-credentials per seeded cluster, and one namespace
 # read per probe -- seconds, against a job measured in tens of minutes.
 #

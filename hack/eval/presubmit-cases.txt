@@ -98,9 +98,10 @@
 # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
 # validation run: cost and signal were unmeasured (the 2026-08-26 run hit the
 # job deadline before reaching it), so that entry's first smoke WAS the
-# measurement. The one active case that WRITES: it files a remediation PR
-# against the leased project's throwaway GitOps repo via submit-suggestion.
-# Priced at 700s in unit_cost_hint.
+# measurement. One of the two active cases that WRITE (pdb-remediation-pr
+# below is the other): it files a remediation PR against the leased
+# project's throwaway GitOps repo via submit-suggestion. Priced at 700s in
+# unit_cost_hint.
 ./tasks/rca-remediation-pr/task.yaml
 
 # pdb-remediation-pr -- the remediation domain's second case (#1079), moved

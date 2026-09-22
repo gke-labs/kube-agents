@@ -652,7 +652,7 @@ class CaseNotesTest(unittest.TestCase):
         for name in ("agent-kanban-smoke", "capacity-pinned-pool-probe", "compliance-rbac-overgrant", "gpu-stress-test-diagnosis"):
             self.assertIn(name, notes)
         self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985", "#1171"])
-        self.assertEqual(notes["capacity-pinned-pool-probe"]["issues"], ["#1010"])
+        self.assertEqual(notes["capacity-pinned-pool-probe"]["issues"], ["#1840", "#1874"])
         for entry in notes.values():
             self.assertEqual(set(entry), {"note", "issues"})
 

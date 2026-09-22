@@ -5,11 +5,13 @@ Three files replaced three bash arrays in hack/ci-eval-pr.sh on 2026-09-15
 are pinned here. The parser: comments, blank lines, trailing notes and the
 old script's default line all read as the shell reads them, and a malformed
 entry raises rather than being skipped, because the shell stops the job on
-it. The contents: the presubmit file and the blocking roster hold exactly the
+it. The contents: the presubmit file and the blocking roster held exactly the
 sets the script carried at the split -- what runs on every pull request and
-what blocks did not move -- and the nightly file holds the script's nightly
-array plus the nine cases the TASKS array held commented out, which the
-same decision moved into the nightly (#1546, #1564). A later roster change
+what blocks did not move that day; the admissions and promotions since are
+pinned beside them (ADMITTED_AFTER_THE_SPLIT, PROMOTED_AFTER_THE_SPLIT) --
+and the nightly file holds the script's nightly array plus the nine cases
+the TASKS array held commented out, which the same decision moved into the
+nightly (#1546, #1564), less the cases promoted out of it since. A later roster change
 edits the expected sets here in the same pull request; that is the point of
 pinning them, since the files are what the eval-crew rule in hack/OWNERS
 guards.
