@@ -54,8 +54,15 @@ Loaded from a design, planning, or capacity-check request — for example the
 ### Record what you executed as typed evidence
 
 Use the `record_evidence` tool — one record per check, built from the real
-command output, never from memory. If `record_evidence` or `attach_artifact`
-is not among your tools, do not stop and do not skip the check: put the same
+command output, never from memory. **"Design-only", "planning-only", and
+"text output only" in a task never waive these records**: those
+constraints forbid mutations — applying, submitting, creating — and the
+typed records are not mutations, they are how the work is delivered. A
+task that asks for the answer "as text" still gets its `record_evidence`
+call per check and its `attach_artifact` call per manifest, alongside the
+prose; skipping them delivers a claim, not evidence. If `record_evidence`
+or `attach_artifact` is not among your tools, do not stop and do not skip
+the check: put the same
 JSON under an `## Evidence` heading in your report, and the manifests as
 fenced YAML there, so the record still reaches the reader.
 
@@ -302,13 +309,10 @@ Attach each with `attach_artifact` (`type: provisioning_request`,
 `target`. Planning only: hand both manifests to the user, apply nothing,
 submit nothing.
 
-**"Planning-only" and "text output only" never waive the records.** Those
-constraints forbid mutations — applying, submitting, creating. The typed
-records are not mutations; they are how planning work is delivered, and a
-task that asks for the plan "as text" still gets its `record_evidence`
-calls per probe and its `attach_artifact` calls per manifest, alongside
-the prose. Skipping them because the task said "text output" delivers a
-claim, not evidence.
+**Anchor the probe at the clock, not at a buffer.** The range's `from` is
+now — the moment you run the command — not now plus a safety margin; the
+API's own window search supplies any slack, and the recorder refuses a
+window anchored away from the probe's time.
 
 **Report.** Carry this section, filled in:
 
