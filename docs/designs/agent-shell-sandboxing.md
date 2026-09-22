@@ -2796,11 +2796,12 @@ get-credentials` and `kubectl` behind it on every tick, and `github_token_refres
   MCP tool that lets the model ask the agent pod to create a profile rather than
   running a script that has to live there. Inventing that layout inside a call site was
   the alternative, and it is how two layouts end up shipping.
-- **Cron has not been exercised against a sandboxed agent.** The finding that
-  `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
-  doubt, but no roster has run in this configuration, and the bootstrap handoff the
-  section above specifies is designed and unimplemented. Onboarding is broken until it
-  lands, and broken silently.
+- **The bootstrap handoff is designed and unimplemented.** `no_agent` scripts stay in the
+  agent pod, and four of them (`kanban-workspace-gc`, `cluster-agent-reconcile`,
+  `stall-watch`, and `github_token_refresh.py`'s forward) reach the sandbox through
+  `sandbox_exec` from a shipped roster, so cron against a sandboxed agent is exercised.
+  What is not is the bootstrap handoff the section above specifies. Onboarding is broken
+  until it lands, and broken silently.
 - **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
   backend, or falls back to a local shell in the agent pod, is unexercised. A fallback
   would be a hole rather than a degradation.

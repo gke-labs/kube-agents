@@ -61,7 +61,7 @@ cluster the tick could not read keeps its rows; one that is gone from the
 listing clears them at once; a `repeating-warnings` row, which exists only while
 its event recurred inside the script's window, clears only after two consecutive
 scans without it, so a warning that comes back every hour does not flap in and
-out of chat. A cluster listing gcloud itself calls incomplete clears no row for a cluster absent from it,
+out of chat. A scan that skipped a kind the cluster serves updates its rows and clears none, and the kind list is filtered per cluster to what `kubectl api-resources` says it serves, so such a skip is a failure and never a missing CRD. A lost sandbox ends the sweep as one reported failure rather than one line per namespace. A cluster listing gcloud itself calls incomplete clears no row for a cluster absent from it,
 and a sweep stops at a wall-clock budget short of the schedule and reports what
 it did not reach, because Hermes kills a script that runs an hour and a ledger
 never written is a tick that never happened.

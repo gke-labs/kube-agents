@@ -55,6 +55,9 @@ DEPLOYMENT_ROW = finding(
     "template.spec.containers[0].envFrom[0].configMapRef -> ConfigMap/checkout-feature-flags not found",
 )
 TIMEOUT = subprocess.TimeoutExpired("gcloud", stall_watch.GET_CREDENTIALS_TIMEOUT_SECONDS)
+#: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
+SERVED_DEFAULT = ["deployments.apps", "statefulsets.apps", "daemonsets.apps", "jobs.batch", "gateways.gateway.networking.k8s.io", "httproutes.gateway.networking.k8s.io", "certificates.cert-manager.io", "pods", "configmaps"]
+NOT_SCANNED = "warning: deployments in checkout not scanned; its objects are missing from the count: kubectl exited 1\n"
 
 
 class Unlisted:
@@ -81,9 +84,13 @@ class FakeFleet:
     Unlisted(status) is listed but not swept; a cluster key `name@location`
     or a Located value puts it somewhere other than the default location."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=()):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None):
         self.listing_stderr = listing_stderr
         self.hidden = set(hidden)
+        #: api-resources answer; None serves every default kind under its group name.
+        self.served = served
+        #: (cluster, namespace) whose scan raises SandboxUnavailable.
+        self.sandbox_dies_at = sandbox_dies_at
         self.fleet = {}
         for key, spec in fleet.items():
             name, _, location = key.partition(stall_watch.CLUSTER_ID_SEPARATOR)
@@ -112,8 +119,13 @@ class FakeFleet:
         if argv[:3] == ["kubectl", "get", "namespaces"]:
             names = list(namespaces) + self.namespaces_extra
             return completed(argv, "".join(f"namespace/{n}\n" for n in names))
+        if argv[:2] == ["kubectl", "api-resources"]:
+            served = self.served if self.served is not None else SERVED_DEFAULT
+            return completed(argv, "".join(f"{n}\n" for n in served))
         if argv[:3] == [stall_watch.PYTHON_EXECUTABLE, stall_watch.PYTHON_ISOLATED_FLAG, stall_watch.STDIN_SCRIPT_ARG]:
             namespace = argv[argv.index("--namespace") + 1]
+            if self.sandbox_dies_at == (self._cluster_from(kubeconfig)[0], namespace):
+                raise stall_watch.sandbox_exec.SandboxUnavailable("ssh: connect to host sandbox port 22: Connection refused")
             result = namespaces[namespace]
             if isinstance(result, Exception):
                 raise result
@@ -121,7 +133,10 @@ class FakeFleet:
                 return completed(argv, "", returncode=result, stderr="cannot list anything")
             if isinstance(result, str):
                 return completed(argv, result)
-            return completed(argv, json.dumps({"namespace": namespace, "stalled_resources": len(result), "findings": result}))
+            stderr = ""
+            if isinstance(result, tuple):
+                result, stderr = result
+            return completed(argv, json.dumps({"namespace": namespace, "stalled_resources": len(result), "findings": result}), stderr=stderr)
         raise AssertionError(f"unexpected sandbox call {argv}")
 
     def scanned(self):
@@ -372,6 +387,36 @@ class Unreadable(Base):
         self.assertEqual(len(self.ledger()["stalls"]), 1)
         self.assertEqual(self.ledger()["unreadable"].keys() - {stall_watch.BUDGET_SCOPE}, set())
 
+    def test_a_scan_that_skipped_a_kind_clears_nothing_in_that_namespace(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        lines, _ = self.run_tick({"c": {"checkout": ([], NOT_SCANNED)}})
+        self.assertEqual(lines, [], "the deployments read failed this tick; the row is unknown, not gone")
+        self.assertEqual(len(self.ledger()["stalls"]), 1)
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(lines, [], "the object was never cleared, so it is not new either")
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertIn(stall_watch.CLEARED_HEADING, lines)
+
+    def test_a_partial_scan_still_adds_new_rows_and_counts_as_readable(self):
+        self.run_tick({"c": TIMEOUT})
+        lines, _ = self.run_tick({"c": {"checkout": ([DEPLOYMENT_ROW], NOT_SCANNED)}})
+        text = "\n".join(lines)
+        self.assertIn("Deployment/checkout-api", text)
+        self.assertIn(stall_watch.READABLE_AGAIN_HEADING, text)
+
+    def test_a_lost_sandbox_is_one_sweep_failure_not_one_line_per_namespace(self):
+        fleet = {"a": {"n1": [], "n2": [DEPLOYMENT_ROW], "n3": []}, "b": {"n4": []}}
+        self.run_tick(fleet)
+        lines, fake = self.run_tick(fleet, sandbox_dies_at=("a", "n2"))
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(stall_watch.SWEEP_FAILED_PREFIX), lines[0])
+        self.assertIn("Connection refused", lines[0])
+        self.assertEqual(fake.scanned(), ["n1", "n2"], "nothing after the lost hop is attempted")
+        self.assertEqual(len(self.ledger()["stalls"]), 1)
+        self.assertEqual(self.ledger()["unreadable"], {})
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(lines, [stall_watch.SWEEP_RECOVERED_LINE])
+
     def test_unreachable_cluster_keeps_its_rows_and_is_reported_once(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
         lines, _ = self.run_tick({"c": TIMEOUT})
@@ -458,6 +503,18 @@ class Scope(Base):
             _, fake = self.run_tick({"c": {"payments": []}})
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
         self.assertNotIn("--kind", scan)
+
+    def test_kinds_a_cluster_does_not_serve_are_not_asked_for(self):
+        no_cert_manager = [n for n in SERVED_DEFAULT if not n.startswith("certificates")]
+        _, fake = self.run_tick({"c": {"payments": []}}, served=no_cert_manager)
+        scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
+        kinds = scan[scan.index("--kind") + 1].split(",")
+        self.assertNotIn("certificates.cert-manager.io", kinds)
+        self.assertIn("deployments", kinds, "a bare plural matches its grouped api-resources name")
+        self.assertIn("gateways.gateway.networking.k8s.io", kinds)
+        _, fake = self.run_tick({"c": {"payments": []}}, served=[])
+        scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
+        self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS), "an unreadable api-resources leaves the list unfiltered")
 
     def test_the_project_comes_from_the_operators_variable_without_a_gcloud_hop(self):
         with patch.dict(os.environ, {stall_watch.PROJECT_ENVS[0]: "", "GCP_PROJECT_ID": "from-operator"}):

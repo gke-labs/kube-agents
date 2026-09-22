@@ -65,13 +65,15 @@ recurred inside the script's window, so a warning that comes back every hour
 would otherwise flap in and out; such a row clears only after two
 consecutive scans without it. A namespace or cluster this tick could not
 read keeps its rows rather than clearing them, because absence of evidence
-is not recovery; one that is gone from the listing clears them at once,
-because deleting the namespace is how the motivating case usually ends. A
-listing gcloud itself calls incomplete clears no row for a cluster absent
-from it, and a sweep stops at
-a wall-clock budget short of the schedule and reports what it did not reach,
-because Hermes kills a script that runs an hour and a ledger never written
-is a tick that never happened.
+is not recovery, and so does a scan that skipped a kind the cluster serves
+(the kind list is filtered per cluster to what it serves, so such a skip is
+a failure and never a missing CRD); one that is gone from the listing clears
+them at once, because deleting the namespace is how the motivating case
+usually ends. A listing gcloud itself calls incomplete clears no row for a
+cluster absent from it, and a sweep stops at a wall-clock budget short of
+the schedule and reports what it did not reach, because Hermes kills a
+script that runs an hour and a ledger never written is a tick that never
+happened.
 """
 
 from __future__ import annotations
@@ -154,6 +156,15 @@ KUBECONFIG_SLUG_REPLACEMENT = "-"
 SWEEPABLE_CLUSTER_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 #: `kubectl get namespaces -o name` prints one of these per line.
 NAMESPACE_NAME_PREFIX = "namespace/"
+#: The kind list is filtered to what a cluster serves, from one
+#: `kubectl api-resources` per cluster, so a warning from the report script
+#: about a kind it could not scan is always a failure and never "this cluster
+#: has no cert-manager".
+API_RESOURCES_ARGV = ("kubectl", "api-resources", "--namespaced=true", "--verbs=list", "-o", "name")
+API_RESOURCES_TIMEOUT_SECONDS = 60
+#: stall_report.py exits 0 after skipping a kind or the events it could not
+#: read and says so on stderr; such a scan updates rows and clears none.
+PARTIAL_SCAN_MARKERS = ("not scanned", "not read")
 #: gcloud exits 0 on a partial listing and says so on stderr ("The following
 #: zones did not respond ... List results may be incomplete."); a cluster
 #: absent from such a listing is unknown, not gone.
@@ -292,9 +303,8 @@ def report_source() -> str:
     raise RuntimeError(f"stall_report.py not found at {', '.join(candidates)}")
 
 
-def report_argv(namespace: str) -> list[str]:
+def report_argv(namespace: str, kinds: str | None = None) -> list[str]:
     cmd = [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG, "--namespace", namespace, "--json"]
-    kinds = kinds_argument()
     if kinds:
         cmd += ["--kind", kinds]
     return cmd
@@ -358,6 +368,32 @@ def fetch_credentials(project: str, cluster: str, location: str) -> str:
     return path
 
 
+def served_kinds(kubeconfig: str) -> set[str] | None:
+    """The namespaced, listable resources the cluster serves, as kubectl names
+    them (`deployments.apps`) and by bare plural (`deployments`); None when
+    the listing failed, in which case the kind list is passed unfiltered."""
+    r = run_sandbox(list(API_RESOURCES_ARGV), timeout=API_RESOURCES_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+    if r.returncode != 0:
+        return None
+    served: set[str] = set()
+    for line in r.stdout.splitlines():
+        name = line.strip()
+        if name:
+            served.add(name)
+            served.add(name.split(".", 1)[0])
+    return served or None
+
+
+def kinds_for(served: set[str] | None) -> str | None:
+    """The --kind value for one cluster: the configured list minus what the
+    cluster does not serve, or None to let the script scan every kind."""
+    configured = kinds_argument()
+    if configured is None or served is None:
+        return configured
+    kept = [k for k in configured.split(KINDS_SEPARATOR) if k in served or k.split(".", 1)[0] in served]
+    return KINDS_SEPARATOR.join(kept) if kept else configured
+
+
 def is_system_namespace(name: str) -> bool:
     return name in SYSTEM_NAMESPACES or name.startswith(SYSTEM_NAMESPACE_PREFIXES)
 
@@ -377,16 +413,18 @@ def list_namespaces(kubeconfig: str) -> list[str]:
     return sorted(n for n in names if n and not is_system_namespace(n))
 
 
-def scan_namespace(kubeconfig: str, namespace: str, source: str) -> list[dict]:
-    """The findings stall_report.py reports for one namespace. Raises when the
-    namespace could not be read, so the caller keeps its ledger rows."""
-    r = run_sandbox(report_argv(namespace), timeout=NAMESPACE_SCAN_TIMEOUT_SECONDS, kubeconfig=kubeconfig, stdin=source)
+def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None) -> tuple[list[dict], bool]:
+    """The findings stall_report.py reports for one namespace, and whether it
+    read everything it was asked to. Raises when the namespace could not be
+    read at all, so the caller keeps its ledger rows."""
+    r = run_sandbox(report_argv(namespace, kinds), timeout=NAMESPACE_SCAN_TIMEOUT_SECONDS, kubeconfig=kubeconfig, stdin=source)
     if r.returncode == REPORT_UNREADABLE_EXIT:
         raise RuntimeError(f"no kind could be read: {stderr_excerpt(r.stderr)}")
     if r.returncode != 0:
         raise RuntimeError(f"stall_report.py exited {r.returncode}: {stderr_excerpt(r.stderr)}")
     report = parse_json(r.stdout, "stall_report.py") or {}
-    return report.get("findings") or []
+    complete = not any(m in (r.stderr or "") for m in PARTIAL_SCAN_MARKERS)
+    return report.get("findings") or [], complete
 
 
 # --------------------------------------------------------------------------
@@ -473,8 +511,10 @@ class Sweep:
 
     def __init__(self) -> None:
         self.rows: dict[str, dict] = {}
-        #: `cluster/namespace` scopes whose scan completed this tick.
+        #: `cluster/namespace` scopes whose scan ran this tick, and the subset
+        #: that skipped a kind or the events: those update rows and clear none.
         self.read_scopes: set[str] = set()
+        self.partial_scopes: set[str] = set()
         #: Every cluster the project listed, whatever its status, and whether
         #: gcloud vouched for the listing being complete.
         self.listed_clusters: set[str] = set()
@@ -503,7 +543,10 @@ class Sweep:
         namespaces = self.listed_namespaces.get(cid)
         if namespaces is not None and namespace not in namespaces:
             return GONE
-        return ABSENT if scope_key(cid, namespace) in self.read_scopes else UNKNOWN
+        scope = scope_key(cid, namespace)
+        if scope in self.partial_scopes or scope not in self.read_scopes:
+            return UNKNOWN
+        return ABSENT
 
     def scope_read(self, scope: str) -> bool:
         """A namespace scope counts as read when it was scanned; a cluster
@@ -539,7 +582,10 @@ class Sweep:
         return True
 
 
-READ_FAILURES = (RuntimeError, subprocess.TimeoutExpired, sandbox_exec.SandboxUnavailable, OSError)
+#: What one scope may fail with and the sweep carry on. SandboxUnavailable is a
+#: RuntimeError, so the handlers re-raise it first: with the sandbox gone
+#: nothing else this tick can succeed, and the tick reports one sweep failure.
+READ_FAILURES = (RuntimeError, subprocess.TimeoutExpired, OSError)
 
 
 def sweep_fleet(project: str) -> Sweep:
@@ -567,16 +613,21 @@ def sweep_fleet(project: str) -> Sweep:
         try:
             kubeconfig = fetch_credentials(project, name, location)
             namespaces = list_namespaces(kubeconfig)
+        except sandbox_exec.SandboxUnavailable:
+            raise
         except READ_FAILURES as exc:
             sweep.unreadable[scope_key(cid)] = failure_text(exc)
             continue
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
+        kinds = kinds_for(served_kinds(kubeconfig))
         for namespace in namespaces:
             if sweep.out_of_budget(started):
                 break
             try:
-                findings = scan_namespace(kubeconfig, namespace, source)
+                findings, complete = scan_namespace(kubeconfig, namespace, source, kinds)
+            except sandbox_exec.SandboxUnavailable:
+                raise
             except subprocess.TimeoutExpired as exc:
                 sweep.unreadable[scope_key(cid)] = (
                     f"namespace {namespace} {failure_text(exc)}; the cluster's remaining namespaces were skipped this tick"
@@ -586,6 +637,8 @@ def sweep_fleet(project: str) -> Sweep:
                 sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
                 continue
             sweep.read_scopes.add(scope_key(cid, namespace))
+            if not complete:
+                sweep.partial_scopes.add(scope_key(cid, namespace))
             for f in findings:
                 sweep.rows[ledger_key(cid, f)] = {
                     "cluster": cid,
