@@ -360,6 +360,12 @@ _NO_RUN_CLOCK_REASON = (
 # and a report naming a dozen is one to read by hand.
 _MAX_PR_CANDIDATES = 8
 
+# Page size for the pull request's commit listing. The head is on the last
+# page, so the page number is computed from the total the pulls endpoint
+# reports; GitHub caps the listing at 250, and a pull request longer than that
+# simply yields no head commit rather than the wrong one.
+_PR_COMMITS_PAGE_SIZE = 100
+
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check cannot tell a pull request this run opened from "
@@ -949,14 +955,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
-    ``owner`` when one is set; it is not closed unmerged; and it was written --
+    ``owner`` when one is set; it is not closed unmerged; it was written --
     created or updated -- at or after this run started, less
-    ``max_clock_skew_sec``. Updating counts because
-    the skill reuses a branch and edits the pull request already open on it --
-    which also means the stamp proves only that the pull request was written to
-    during the run, by anyone. One surviving candidate is enough — a reply may
-    link the ticket it came from beside the fix — and a candidate GitHub cannot
-    answer for ends the check only when no other candidate passes.
+    ``max_clock_skew_sec``; it changes at least one file; and its head commit
+    is no older than the same start. Updating counts because the skill reuses a
+    branch and edits the pull request already open on it, which is the
+    documented behaviour rather than a defect -- so the stamp alone proves only
+    that somebody wrote to the pull request, and the head commit is what
+    separates a run that pushed a fix from one that left a comment. That is
+    also what makes reps inside a job gradable: rep 2 pushing onto rep 1's
+    branch moves the head commit, rep 2 quoting rep 1's URL does not. One
+    surviving candidate is enough — a reply may link the ticket it came from
+    beside the fix — and a candidate GitHub cannot answer for ends the check
+    only when no other candidate passes.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -967,7 +978,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     ``status="error"`` naming the permission to add, never a fail: an
     unreadable API is the absence of an observation. 404 on both is either the
     number or a repository this credential cannot see; nothing in the API
-    separates them, so both are graded as absence.
+    separates them, so both are graded as absence. ``_head_push`` then reads
+    ``/pulls/{n}`` outright, which needs ``pull_requests: read`` --
+    ``hack/ci-eval-pr.sh`` mints it.
     """
 
     type: Literal["pull_request_opened"]
@@ -1030,6 +1043,63 @@ class PullRequestOpenedVerifier(BaseVerifier):
             f"unexpected GitHub response {status_code} for "
             f"{owner}/{repo}#{number}; this check could not be evaluated"
         )
+
+    def _head_push(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        resolved: dict,
+        token: str,
+        budget: float,
+    ) -> tuple[int | None, datetime | None, str | None]:
+        """``(changed files, head commit date, unevaluable reason)``.
+
+        Both reads want ``pull_requests: read``. ``/pulls/{n}`` carries the
+        file count and the commit total, and is skipped when ``_resolve``
+        already fell through to it; dating the head commit needs the commits
+        listing, whose last page holds it. ``/commits/{sha}`` would be one call
+        and wants ``contents: read``, which grading does not carry.
+
+        A date this cannot establish comes back ``None`` and the caller does
+        not reject on it: an observation the API would not give is not
+        evidence that a run pushed nothing.
+        """
+        base = f"https://api.github.com/repos/{owner}/{repo}"
+        payload = resolved
+        if "changed_files" not in payload:
+            status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            if status != 200 or not isinstance(payload, dict):
+                return (
+                    None,
+                    None,
+                    f"GitHub answered {status} for {owner}/{repo}#{number} on "
+                    f"the pulls endpoint; the token behind "
+                    f"{LEDGER_TOKEN_ENV_VARS[0]} needs `pull_requests: read` to "
+                    "grade what a run pushed, so this check could not be "
+                    "evaluated",
+                )
+        changed = payload.get("changed_files")
+        changed = changed if isinstance(changed, int) else None
+        total = payload.get("commits")
+        head_sha = (payload.get("head") or {}).get("sha") or ""
+        if not isinstance(total, int) or total < 1:
+            return changed, None, None
+        page = (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE
+        status, commits = _http_get_json(
+            f"{base}/pulls/{number}/commits"
+            f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
+            token,
+            budget,
+        )
+        if status != 200 or not isinstance(commits, list):
+            return changed, None, None
+        for entry in reversed(commits):
+            if not isinstance(entry, dict) or entry.get("sha") != head_sha:
+                continue
+            committer = (entry.get("commit") or {}).get("committer") or {}
+            return changed, _parse_github_time(committer.get("date")), None
+        return changed, None, None
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1123,16 +1193,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # later rep pushes onto the branch the first one used, `gh pr
             # create` answers "already exists", and the skill edits that pull
             # request and returns its URL. That work lands in `updated_at`
-            # alone. The stamp moves on any write by anyone, so a rep that only
-            # comments on a leftover passes too; the head commit would separate
-            # the two, and the grading token now carries pull_requests: read. A
-            # rep that resubmits byte-identical content writes nothing at all --
-            # the skill raises before the push -- so a correct rep lands here
-            # too, which is why the reason names both readings.
-            # hack/ci-teardown.sh (#1755 item 2) closes these, but per job
-            # rather than between reps -- so a leftover an earlier rep of this
-            # same job opened is still here to be written to, and only #1755
-            # item 3 settles that.
+            # alone. The stamp moves on any write by anyone, so passing here is
+            # necessary and not sufficient -- the head commit check below is
+            # what says the run pushed something. A rep that resubmits
+            # byte-identical content writes nothing at all (the skill raises
+            # before the push), so a correct rep lands here too, which is why
+            # the reason names both readings.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()
@@ -1144,14 +1210,39 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "resubmitted unchanged"
                 )
                 continue
+            # What the stamp above cannot say: whether the run pushed a fix or
+            # only wrote to a pull request. `updated_at` moves on a comment and
+            # on a label. The head commit moves on neither.
+            changed, pushed, unevaluable = self._head_push(
+                owner, repo, number, payload, token, budget
+            )
+            if unevaluable:
+                unresolved.append(unevaluable)
+                continue
+            if changed == 0:
+                rejected.append(
+                    f"{slug}: changes no files, so it carries no proposed fix"
+                )
+                continue
+            if pushed and (started - pushed).total_seconds() > self.max_clock_skew_sec:
+                rejected.append(
+                    f"{slug}: its head commit dates from {pushed.isoformat()}, "
+                    f"before this run started ({started.isoformat()}) — this run "
+                    "wrote to a pull request an earlier one pushed the fix to"
+                )
+                continue
             return done(
                 True,
                 f"{slug} was {'opened' if touched == created else 'updated'} at "
-                f"{touched.isoformat()}, during this run",
+                f"{touched.isoformat()}, during this run, and carries "
+                f"{changed if changed is not None else 'an unreported number of'} "
+                "changed file(s)",
                 raw={
                     "pull_request": slug,
                     "created_at": created.isoformat(),
                     "updated_at": updated.isoformat() if updated else None,
+                    "changed_files": changed,
+                    "head_committed_at": pushed.isoformat() if pushed else None,
                 },
             )
 

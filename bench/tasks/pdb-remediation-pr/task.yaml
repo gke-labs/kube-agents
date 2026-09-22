@@ -101,9 +101,9 @@ verification_spec:
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      # Not report_contains: a substring passes on an invented URL, and on the
-      # PR an earlier rep opened, which the teardown sweep does not reach: it
-      # runs per job, not between reps.
+      # Not report_contains: a substring passes on an invented URL, and on
+      # the PR an earlier rep opened. This resolves the URL and reads the head
+      # commit, so a rep that only quoted an earlier rep's PR fails.
       type: pull_request_opened
       # gke-agentic/<project>-infra on every pool project, so the org half is a
       # fair exact match and breaks loudly if the org moves.
