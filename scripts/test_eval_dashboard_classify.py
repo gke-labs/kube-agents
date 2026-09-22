@@ -340,6 +340,18 @@ class StormAndSetupTest(unittest.TestCase):
         verdict = classify_run(run(1, 913, T0, minutes=8, result="ABORTED"), [])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))
 
+    def test_an_aborted_run_with_graded_cases_is_still_not_a_verdict(self):
+        """Since the fan-out grades each case as it finishes (#1491), a
+        presubmit a newer push superseded uploads the blocks of the cases
+        that finished before Prow stopped it. Five passing cases out of a
+        matrix the run never completed must not read as "all passed"."""
+        graded = [task(n, "ppp") for n in sorted(ADMITTED)[:5]]
+        target = run(1, 913, T0, minutes=40, result="ABORTED", tasks=graded)
+        verdict = classify_run(target, [target])
+        self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))
+        self.assertIn("5 gate cases had been graded by then", verdict["lede"])
+        self.assertEqual(len(verdict["cases"]), 5, "the graded cases still travel with the run")
+
     def test_prows_green_wins_over_collapsed_cases(self):
         target = run(1, 1, T0, result="SUCCESS", tasks=gate_tasks(["agent-kanban-smoke"], letters="ffi"))
         verdict = classify_run(target, [target])
