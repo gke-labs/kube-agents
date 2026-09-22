@@ -259,6 +259,17 @@ class CutOffReportTest(unittest.TestCase):
     def test_a_failed_suite_is_a_warning_not_a_lost_line(self):
         result, _ = self.run_report(self.GRADED_ONE + "\nuv() { return 1; }")
         self.assertIn("WARNING: the partial verdict table could not be written", result.stdout)
+        self.assertIn("exited 1", result.stdout)
+        self.assertIn("1 of 3 cases graded", result.stdout)
+
+    def test_a_red_subset_is_a_table_not_a_warning(self):
+        """`bench-gate suite` writes the table and then exits 1 when the cases
+        it covers are not green (2 when they are not evaluated); that is the
+        ordinary shape of a partial night, and the table landed."""
+        result, _ = self.run_report(
+            self.GRADED_ONE + '\nuv() { : > "${ARTIFACT_DIR}/eval-verdict.md"; return 1; }'
+        )
+        self.assertNotIn("WARNING", result.stdout)
         self.assertIn("1 of 3 cases graded", result.stdout)
 
 

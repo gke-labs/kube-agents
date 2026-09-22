@@ -859,7 +859,7 @@ def test_a_partial_suite_says_so_first_in_the_markdown_and_in_the_json(tmp_path,
         "suite", "--case-result", str(case_file(tmp_path, "a")),
         "--partial", note, "--markdown-out", str(md), "--json-out", str(js),
     ])
-    assert rc == 0, "the status of the cases it does cover; the trap ignores it"
+    assert rc == 0, "the status of the cases it does cover; the trap warns only when no table landed"
     text = md.read_text(encoding="utf-8")
     assert text.startswith("> **PARTIAL — not this run's verdict.** " + note + ". Only the cases graded before the run ended")
     assert "this table gates nothing" in text

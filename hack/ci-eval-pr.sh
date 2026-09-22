@@ -685,12 +685,16 @@ report_partial_verdict() {
     recorded="${recorded:-0}"
   fi
   local note="this run ended before its verdict (a deadline, or an error after the fan-out began); ${graded} of ${total} cases had every repetition graded by then"
+  local suite_status=0
   (cd "${BENCH_DIR}" && uv run bench-gate suite \
     "${partial_args[@]}" \
     --partial "${note}" \
     --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
-    --json-out "${ARTIFACT_DIR}/eval-verdict.json") >/dev/null || \
-    echo "WARNING: the partial verdict table could not be written (bench-gate suite --partial failed); the graded cases are still in this log and in case-*.json."
+    --json-out "${ARTIFACT_DIR}/eval-verdict.json") >/dev/null || suite_status=$?
+  # 1 (the covered cases are red) and 2 (not evaluated) are returned after the
+  # table is written; only a table that never landed is worth a warning.
+  [ -f "${ARTIFACT_DIR}/eval-verdict.md" ] || \
+    echo "WARNING: the partial verdict table could not be written (bench-gate suite --partial exited ${suite_status}); the graded cases are still in this log and in case-*.json."
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Eval ended before its verdict: ${graded} of ${total} cases graded, ${recorded} recorded to the baseline store; partial table in ${ARTIFACT_DIR}/eval-verdict.md ==="
 }
 
