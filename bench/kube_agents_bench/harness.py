@@ -1488,7 +1488,11 @@ class KubeAgentsHarness(AgentHarness):
             at its budget, and whether a stop was already pending on the
             record so none was sent.
             """
-            timed_out = exchange.outcome in (inject.OUTCOME_DEADLINE, inject.OUTCOME_QUEUED)
+            timed_out = exchange.outcome in (
+                inject.OUTCOME_DEADLINE,
+                inject.OUTCOME_QUEUED,
+                inject.OUTCOME_PARKED,
+            )
             leaves_active = timed_out or exchange.outcome in (
                 inject.OUTCOME_NEVER_STARTED,
                 inject.OUTCOME_UNCLASSIFIED,
@@ -1590,6 +1594,22 @@ class KubeAgentsHarness(AgentHarness):
                 f"never working) for the whole {timeout:.0f}s budget; {bounded}, {ended}. The "
                 "bridge's BRIDGE_CONCURRENCY is below the run's parallelism, or its slots are "
                 "held by earlier tasks"
+            )
+
+        if exchange.outcome == inject.OUTCOME_PARKED:
+            # An executor took the task past submitted and never brought it
+            # to working: parked at input-required or auth-required for the
+            # rest of the budget. No model ran, so there is nothing to grade,
+            # and a record with no working or final entry is one rung 3 would
+            # refuse as not a run (Fold.started is that rule). The cancel
+            # above bounds it.
+            parked_at = ", ".join(exchange.fold.executor_states) or "no state"
+            ended = exchange.fold.terminal or "no terminal inside the settle"
+            bounded = _stop_word(task, stop_pending)
+            return _infra_failure(
+                f"task {exchange.task_id} on {exchange.conversation} was parked ({parked_at}, "
+                f"never working) for the whole {timeout:.0f}s budget; {bounded}, {ended}. An "
+                "executor took the task and did not run it"
             )
 
         if exchange.fold.gateway_declared:

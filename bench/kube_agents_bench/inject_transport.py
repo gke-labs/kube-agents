@@ -71,6 +71,7 @@ __all__ = [
     "OUTCOME_DEADLINE",
     "OUTCOME_NEVER_STARTED",
     "OUTCOME_NOT_ACCEPTED",
+    "OUTCOME_PARKED",
     "OUTCOME_QUEUED",
     "OUTCOME_STREAM_TERMINAL",
     "OUTCOME_TERMINAL",
@@ -107,6 +108,7 @@ __all__ = [
     "message_id",
     "parse_reason",
     "refusal_detail",
+    "shows_a_run",
 ]
 
 _log = logging.getLogger("kube_agents_bench.inject_transport")
@@ -185,6 +187,21 @@ STATE_FAILED = "failed"
 STATE_CANCELED = "canceled"
 STATE_REJECTED = "rejected"
 TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
+
+
+def shows_a_run(state: str | None, final: bool) -> bool:
+    """Whether one status event is an executor's evidence that a model ran.
+
+    A final event, or ``working``, and nothing else. ``submitted`` is the
+    bridge queueing the task; ``input-required`` and ``auth-required`` with
+    no ``working`` before them are an executor parking it. :attr:`Fold.started`
+    and the scorer's liveness rung (``scoring._a2a_run_evidence``, which
+    re-declares the two literals rather than importing them) are both this
+    rule, so the harness never grades a deadline fold the rung would then
+    refuse as not a run.
+    """
+    return final is True or state == STATE_WORKING
+
 
 # Who declared a terminal (``TerminalSource`` in a2a/gateway/adapter.go).
 # Only the first is the agent's own outcome. A gateway-declared one is a task
@@ -296,8 +313,13 @@ def refusal_detail(refusal: str) -> str:
 # ``OUTCOME_QUEUED``: at the deadline the stream had never shown more than
 # ``submitted`` -- the bridge queued the task behind its concurrency cap for
 # the whole budget and never ran it; infrastructure, and the task is
-# cancelled. ``OUTCOME_DEADLINE``: at the deadline the executor was working;
-# a graded timeout, and the task is cancelled. ``OUTCOME_UNCLASSIFIED``: the
+# cancelled. ``OUTCOME_PARKED``: at the deadline the stream had shown a state
+# past ``submitted`` but never ``working`` or a terminal -- an executor took
+# the task and parked it (``input-required``, ``auth-required``) without
+# running it; nothing ran, the scorer's rung 3 would refuse the record, so
+# infrastructure, and the task is cancelled. ``OUTCOME_DEADLINE``: at the
+# deadline the executor had reached ``working``; a graded timeout, and the
+# task is cancelled. ``OUTCOME_UNCLASSIFIED``: the
 # read at the deadline could not say -- the gateway could not look, or the
 # record no longer held the task and no terminal was ever seen; infrastructure,
 # nothing graded. ``OUTCOME_STREAM_TERMINAL``: the record still held the task
@@ -309,14 +331,15 @@ def refusal_detail(refusal: str) -> str:
 # the executor's, infrastructure when it is the gateway's (the supervisor
 # ended an executor that died or never ran); never cancelled.
 #
-# Every outcome that leaves an active task -- never-started, queued, deadline,
-# and an unclassifiable read -- is followed by a cancel naming the task the
+# Every outcome that leaves an active task -- never-started, queued, parked,
+# deadline, and an unclassifiable read -- is followed by a cancel naming the task the
 # POST was answered with. The classification never comes from the cancel's
 # answer; the cancel bounds a stray run (see :meth:`InjectTask.cancel`).
 OUTCOME_TERMINAL = "terminal"
 OUTCOME_NOT_ACCEPTED = "not-accepted"
 OUTCOME_DEADLINE = "deadline"
 OUTCOME_QUEUED = "queued"
+OUTCOME_PARKED = "parked"
 OUTCOME_NEVER_STARTED = "never-started"
 OUTCOME_UNCLASSIFIED = "unclassified"
 OUTCOME_STREAM_TERMINAL = "stream-terminal"
@@ -615,6 +638,20 @@ class Fold:
         if token == REASON_CANCELED_BEFORE_START:
             return "the bridge cancelled the task out of its queue before it ran"
         return ""
+
+    @property
+    def started(self) -> bool:
+        """Whether an executor brought the task to ``working`` or a terminal.
+
+        The bridge publishes ``submitted`` on accept and queues the task
+        behind its workers; ``working`` is the first event a subprocess
+        produces. A fold that never got there is a task an executor took and
+        nobody ran, whether it sat at ``submitted`` or was parked at
+        ``input-required`` or ``auth-required`` first. The rule is
+        :func:`shows_a_run`, the one the scorer's liveness rung applies, so a
+        deadline fold graded here is one the rung will grade too.
+        """
+        return self.final or any(shows_a_run(state, False) for state in self.executor_states)
 
     @property
     def queued_only(self) -> bool:
@@ -1099,13 +1136,14 @@ class InjectTask:
     def _classify(self, fold: Fold, task_id: str, after: int) -> Exchange:
         """The deadline read: ask the gateway what its record holds, send nothing.
 
-        One read, and one of five answers. A terminal the fold now has, or
+        One read, and one of six answers. A terminal the fold now has, or
         the stream shows: finished. Nothing on the stream past the grace: no
         executor took it. Only ``submitted`` ever: queued behind the bridge's
         cap for the whole budget, whether or not a cancel is already pending
         on the record -- nothing ran either way, and grading it would put a
-        record with no run on it in front of the scorer. ``working``,
-        detached or not: a graded timeout.
+        record with no run on it in front of the scorer. Past ``submitted``
+        but never ``working``: an executor parked it, and the same holds.
+        ``working`` at any point, detached or not: a graded timeout.
         Anything else -- the record no longer holds the task and this side
         never saw a terminal, or the gateway could not look and no earlier
         read saw an executor state either -- cannot be classified. A read
@@ -1135,9 +1173,23 @@ class InjectTask:
             # floor, which check_budget refuses, so this is a gateway whose
             # reported grace changed under the run. Not classifiable.
             return Exchange(fold, OUTCOME_UNCLASSIFIED, self.conversation, task_id, probe)
+        return Exchange(fold, self._deadline_outcome(fold), self.conversation, task_id, probe)
+
+    @staticmethod
+    def _deadline_outcome(fold: Fold) -> str:
+        """Which of the three deadline outcomes an active task's lifecycle is.
+
+        ``Fold.started`` is the scorer's rung-3 predicate: a fold it grades
+        as a deadline is a record the rung accepts, and a fold short of it
+        is infrastructure -- queued when the stream never left
+        ``submitted``, parked when an executor took it further and never ran
+        it.
+        """
         if fold.queued_only:
-            return Exchange(fold, OUTCOME_QUEUED, self.conversation, task_id, probe)
-        return Exchange(fold, OUTCOME_DEADLINE, self.conversation, task_id, probe)
+            return OUTCOME_QUEUED
+        if not fold.started:
+            return OUTCOME_PARKED
+        return OUTCOME_DEADLINE
 
     def _classify_from_the_polls(self, fold: Fold, task_id: str, probe: Probe) -> Exchange:
         """The deadline read could not look: classify from the reads before it.
@@ -1162,9 +1214,7 @@ class InjectTask:
             len(seen),
             seen[-1],
         )
-        if fold.queued_only:
-            return Exchange(fold, OUTCOME_QUEUED, self.conversation, task_id, probe)
-        return Exchange(fold, OUTCOME_DEADLINE, self.conversation, task_id, probe)
+        return Exchange(fold, self._deadline_outcome(fold), self.conversation, task_id, probe)
 
     def _finish(self, fold: Fold, task_id: str, after: int, probe: Probe) -> Exchange:
         """A read showed the task terminal on the stream: wait for the relay.
@@ -1243,8 +1293,8 @@ class InjectTask:
 
         Sent only after a read has classified the task, never before, and in
         every outcome that leaves an active task: working at the budget (a
-        graded timeout), queued for the whole budget, never taken by any
-        executor, and a read that could not classify. The classification is
+        graded timeout), queued or parked for the whole budget, never taken
+        by any executor, and a read that could not classify. The classification is
         the read's; nothing here changes it. The cancel names ``task_id`` --
         the id the opening POST was answered with -- so the gateway publishes
         it whether or not its record still holds the task: for a task nobody

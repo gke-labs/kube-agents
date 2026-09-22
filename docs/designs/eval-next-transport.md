@@ -147,10 +147,11 @@ the presubmit exports nothing new until it chooses to. The exchange:
    final status entry as liveness evidence in place of a token total; `working` counts because
    a graded timeout, canceled at the budget with the cancel unconfirmed, has no final entry and
    would otherwise block as not a real run, and a `submitted` entry alone still blocks. A task
-   nobody took reaches the scorer as infrastructure through the harness's marker, never as a
-   record the rung blocks. That
-   scorer rule lands with the diagnostic transport, and whichever of the two transports merges
-   first brings it.
+   nobody took, and one an executor took and never brought to `working` by the budget, reaches
+   the scorer as infrastructure through the harness's marker, never as a record the rung
+   blocks: the harness's deadline predicate (`Fold.started`) and the rung's are one rule,
+   `shows_a_run`, held together by a test. The inject transport brings the scorer rule; the
+   diagnostic transport reuses it.
 
 The adapter binds to localhost or a ClusterIP Service. A NetworkPolicy edge fences it from every
 in-cluster pod but the eval runner's path; it does not govern the port-forward the harness uses,
@@ -234,7 +235,7 @@ that reads "status". The harness therefore sends no message at the deadline. It 
 conversation's state through the adapter's read route, a pure read that mutates nothing: the
 heal is a write under the per-conversation lock, and a route that performed it from outside
 `handleInbound` would be a second writer racing the next inbound message for the record. The
-harness classifies from one of six outcomes, by the state the route's fold returns: no active
+harness classifies from one of seven outcomes, by the state the route's fold returns: no active
 task and a terminal posted, the run finished as the deadline fired, so it is graded like any
 other; an active task with no executor event, nobody took it, infrastructure, whether or not the
 gateway has released the conversation yet; an active task at `submitted` and never `working`, an
@@ -247,8 +248,11 @@ cancel, because there is nothing left to cancel; the record then holds a finishe
 something releases it, which on a key never reused is nothing and costs nothing. The sixth is
 the state a failed publish leaves, no active task and no terminal, the fold none and the last
 posted message the failure edit; the harness ordinarily met that edit in step 3 long before
-the deadline, and at the deadline it grades the same, infrastructure, no cancel. In every other
-outcome that leaves an active task, the no-executor one included, the cancel then goes out for
+the deadline, and at the deadline it grades the same, infrastructure, no cancel. The seventh is
+an active task past `submitted` that never reached `working` (`input-required`,
+`auth-required`): an executor took it and parked it, infrastructure by the rule the scorer's
+liveness rung applies, so no fold the harness grades is a record the rung then refuses. In every
+other outcome that leaves an active task, the no-executor one included, the cancel then goes out for
 the task id the adapter answered with, whether or not the record still holds it. The
 classification comes from the read and never from
 the cancel's answer: a cancel sent to a task nobody consumed gets "cancel sent" back and no

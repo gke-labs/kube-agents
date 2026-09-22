@@ -90,7 +90,7 @@ none), so its liveness signal is the executor's own events instead — a traject
 `a2a.status-update` whose `args.final` is true (the task ended) or whose `args.state` is `working`
 (the executor spawned the persona; a task the harness cancelled at its budget has no final entry)
 stands in for a null total and nothing else; a null total with no such entry, or with only a
-`submitted` entry (queued, never run), still fails the rung, and so does a total of zero. There is no `metadata`
+`submitted` entry (queued, never run), still fails the rung, and so does a total of zero. The harness applies the same predicate before a record exists (`Fold.started` in `bench/kube_agents_bench/inject_transport.py` is `shows_a_run`, this rung's rule, and a test holds the two together): a task that reached neither `working` nor a terminal by its deadline, and a terminal the executor wrote for its own fault (the bridge's and the worker adapter's `reason:` tokens, or a `rejected` submission), are recorded as infrastructure, so those entries reaching the rung is the backstop. There is no `metadata`
 block on a devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a

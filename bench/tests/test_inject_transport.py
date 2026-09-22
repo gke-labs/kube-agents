@@ -44,6 +44,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from kube_agents_bench import harness
 from kube_agents_bench import inject_transport as inject
+from kube_agents_bench import scoring
 from kube_agents_bench.harness import KubeAgentsHarness
 
 # The gateway's own placeholder, which the relay then edits in place. Spelled
@@ -1140,6 +1141,48 @@ def test_a_queued_task_at_the_deadline_is_infrastructure(
     assert stub_gateway.calls.index("probe") < stub_gateway.calls.index("cancel")
 
 
+def test_a_parked_task_at_the_deadline_is_infrastructure(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An executor that takes a task past submitted and parks it (input-required,
+    auth-required) without ever reaching working has not run it. Grading it
+    would hand rung 3 a record with no working or final entry, which it
+    refuses as not a run and reds the job over; so infrastructure, and the
+    cancel bounds the parked task."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
+    stub_gateway.executor_states = ["submitted", "input-required"]
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("wait for input")
+
+    assert infra(result)
+    assert "was parked" in result.errors[0]
+    assert "input-required" in result.errors[0]
+    assert "sat queued" not in result.errors[0]
+    assert result.output == ""
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+    assert stub_gateway.calls.index("probe") < stub_gateway.calls.index("cancel")
+
+
+def test_a_task_parked_then_working_at_the_deadline_is_a_graded_timeout(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """working anywhere in the lifecycle starts the task, whatever state the
+    executor parked it at first: the graded timeout, with the lifecycle on
+    the record for the rung to read."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.executor_states = ["submitted", "input-required", "working"]
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert not infra(result)
+    assert result.output == "partial findings"
+    assert any("did not reach a terminal state" in e for e in result.errors)
+    assert ("working", False) in status_entries(result)
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+
+
 def test_a_queued_task_already_detached_is_infrastructure_not_graded(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1727,6 +1770,52 @@ def test_the_fold_records_the_lifecycle_once_per_state() -> None:
     ]
     assert fold.terminal == "completed"
     assert not fold.queued_only
+    assert fold.started
     queued = inject.Fold("task-2")
     queued.note_executor_state("submitted")
     assert queued.queued_only
+    assert not queued.started
+    parked = inject.Fold("task-3")
+    parked.note_executor_state("submitted")
+    parked.note_executor_state("input-required")
+    assert not parked.queued_only
+    assert not parked.started
+    parked.note_executor_state("working")
+    assert parked.started
+
+
+@pytest.mark.parametrize(
+    "states",
+    [
+        ["submitted"],
+        ["submitted", "input-required"],
+        ["submitted", "auth-required"],
+        ["submitted", "working"],
+        ["submitted", "input-required", "working"],
+        ["working", "input-required"],
+        ["submitted", "canceled"],
+        ["submitted", "auth-required", "completed"],
+        ["submitted", "input-required", "rejected"],
+    ],
+)
+def test_the_fold_and_the_liveness_rung_agree_on_every_history(states: list[str]) -> None:
+    """``Fold.started`` decides whether the harness grades a deadline fold;
+    the scorer's rung 3 decides whether the graded record is a run. Both are
+    ``shows_a_run`` over the same status entries -- the scorer re-declares the
+    literals rather than importing them -- so a fold the harness grades is
+    never a record the rung then blocks the job over."""
+    fold = inject.Fold("task-1")
+    for state in states:
+        if state in inject.TERMINAL_STATES:
+            fold.mark_terminal(state, inject.TERMINAL_SOURCE_EXECUTOR, "")
+        else:
+            fold.note_executor_state(state)
+    assert fold.started == scoring._a2a_run_evidence(fold.trajectory)
+    assert fold.started == any(
+        inject.shows_a_run(s, s in inject.TERMINAL_STATES) for s in states
+    )
+    assert inject.InjectTask._deadline_outcome(fold) == (
+        inject.OUTCOME_DEADLINE if fold.started
+        else inject.OUTCOME_QUEUED if set(states) == {"submitted"}
+        else inject.OUTCOME_PARKED
+    )
