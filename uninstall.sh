@@ -13,6 +13,10 @@
 
 set -Eeuo pipefail
 
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+UNINSTALL_SCRIPT_NAME="uninstall.sh"
+
 # ANSI Color Tokens
 C_CYAN="\033[1;36m"
 C_GREEN="\033[1;32m"
@@ -67,8 +71,13 @@ on_error() {
   # The frame that ran the failing command: a sourced library's file and the
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
-  # number sent the reader to that line of uninstall.sh instead.
-  local source_file="${BASH_SOURCE[1]:-$0}"
+  # number sent the reader to that line of uninstall.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$UNINSTALL_SCRIPT_NAME" ;;
+  esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Teardown error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_report "FAILED" "true" "${line_no}" "${bash_cmd}" 2>/dev/null || true

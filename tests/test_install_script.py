@@ -5301,6 +5301,34 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             self.assertNotIn("library_probe", str(value))
             self.assertNotIn("Error encountered", str(value))
 
+    def test_a_failure_in_a_piped_script_names_install_sh_not_bash(self):
+        """The curl | bash entry has no file for bash to name a frame after.
+
+        Read from stdin, BASH_SOURCE for this script's own frames is `main` on
+        a modern bash and unset on bash 3.2, and $0 is `bash`. The banner
+        names the script instead, so the line number has a file to belong to.
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "piped_step() {\n  false\n}\n"
+            "piped_step\n"
+        )
+        proc = subprocess.run(
+            ["bash"],
+            input=script,
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+            ),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("Error encountered at install.sh:", proc.stderr)
+        self.assertIn(" in piped_step (exit code 1): false", proc.stderr)
+        self.assertNotIn(" at bash:", proc.stderr)
+        self.assertNotIn(" at main:", proc.stderr)
+
     def test_pipeline_status_handles_empty_array_safely_under_set_u(self):
         source = _INSTALL_SH.read_text()
         self.assertIn(
@@ -5718,8 +5746,11 @@ class SpinnerTerminalBranchTest(PtyChildTestMixin, unittest.TestCase):
         """
         source = _INSTALL_SH.read_text()
         self.assertIn('sleep "$SPINNER_INTERVAL_SECS" || true', source)
+        # `trap - ERR` inside the substitution as well: the `||` shields the
+        # parent shell only, and bash 3.2 runs the inherited trap in the
+        # subshell before the `||` is consulted (#1798).
         self.assertIn(
-            '''status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\\r' | cut -c1-"$status_width")" || status_line=""''',
+            '''status_line="$(trap - ERR; tail -n 1 "$log_file" 2>/dev/null | tr -d '\\r' | cut -c1-"$status_width")" || status_line=""''',
             source,
         )
 

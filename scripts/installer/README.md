@@ -245,7 +245,13 @@ dotenv and `vars.sh` was generated with `printf %q`.
 - **[installer_common.sh](installer_common.sh)**: the `install.env` loader, validators,
   GitHub org checks, and the `terraform.tfvars` generator (table above). Sources the
   defaults from [`install.defaults.env`](../../install.defaults.env) rather than
-  declaring any itself.
+  declaring any itself. One convention binds it and every front door: they run `set -E`
+  with an ERR trap that each `$(...)` inherits, and bash 3.2 (macOS's `/bin/bash`) runs
+  that trap inside the subshell even when the caller handles the failure. A probe whose
+  non-zero exit is a tolerated answer (a release, deployment, ref or state object that is
+  not there) therefore runs `trap - ERR` inside its substitution, as `helm_release_status`
+  and `tf_state_read` do; without it the miss prints an abort banner and writes a FAILED
+  report from a run that succeeds.
 - **[common.sh](common.sh)**: utilities the dev tooling and the Prow CI scripts
   (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
   registry and third-party-image resolution, cluster connection helpers. Sources

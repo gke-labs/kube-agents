@@ -14,6 +14,10 @@
 
 set -Eeuo pipefail
 
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+INSTALL_SCRIPT_NAME="install.sh"
+
 # ─── Install sources ──────────────────────────────────────────────────────────
 # Where the sources come from when this script runs alone (curl | bash) and
 # where it puts them. upgrade.sh and uninstall.sh carry the same URL for the
@@ -115,8 +119,13 @@ on_error() {
   # The frame that ran the failing command: a sourced library's file and the
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
-  # number sent the reader to that line of install.sh instead.
-  local source_file="${BASH_SOURCE[1]:-$0}"
+  # number sent the reader to that line of install.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+  esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_json_report "FAILED" "${line_no}" "${bash_cmd}" 2>/dev/null || true
@@ -1855,8 +1864,10 @@ run_with_spinner() {
     # so the handler below never runs, the worker is orphaned, the cursor stays
     # hidden, and the cancellation is recorded as a FAILED install report.
     # `|| true` keeps errexit out of the loop and leaves the INT trap the only
-    # way out of it.
-    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")" || status_line=""
+    # way out of it. `trap - ERR` inside the substitution: the `||` shields the
+    # parent shell only, and on bash 3.2 the inherited trap would fire in the
+    # subshell first.
+    status_line="$(trap - ERR; tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")" || status_line=""
     printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
       "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$msg" \
       "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
