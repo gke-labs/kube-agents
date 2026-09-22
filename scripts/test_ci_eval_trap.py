@@ -15,7 +15,13 @@ reintroduces an errexit-fatal command ahead of the dumper.
 import pathlib
 import re
 import subprocess
+import sys
+import tempfile
 import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from eval_dashboard import collect  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
@@ -41,6 +47,7 @@ def run_trap(exit_code: int) -> subprocess.CompletedProcess:
         [
             "set -euo pipefail",
             "collect_bench_results() { echo 'called collect_bench_results'; }",
+            "report_partial_verdict() { echo 'called report_partial_verdict'; }",
             "profile_report() { echo \"called profile_report $1\"; }",
             "dump_prow_artifacts_on_failure() { echo \"called dumper with $?\"; }",
             trap_body(),
@@ -128,6 +135,14 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
         )
         self.assertLess(out.index("called profile_report"), out.index("called dumper"))
 
+    def test_the_cut_off_report_runs_before_anything_slow(self):
+        """On a deadline kill the grace period is five minutes; the partial
+        table goes first, ahead of the artifact dump and the dashboard."""
+        out = run_trap(143).stdout
+        self.assertLess(out.index("called collect_bench_results"), out.index("called report_partial_verdict"))
+        self.assertLess(out.index("called report_partial_verdict"), out.index("called profile_report"))
+        self.assertLess(out.index("called report_partial_verdict"), out.index("called dumper"))
+
     def test_the_regression_this_guards(self):
         """Without the errexit guard the dumper is unreachable on a red run.
 
@@ -151,6 +166,100 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
             ["bash", "-c", script], capture_output=True, text=True, check=False
         )
         self.assertNotIn("called dumper", result.stdout)
+
+
+class CutOffReportTest(unittest.TestCase):
+    """report_partial_verdict tables the cases graded before a deadline kill.
+
+    It runs `bench-gate suite --partial` over the cases the fan-out marked
+    `.graded`, prints a line that names how many were graded and recorded,
+    and stays quiet when the run wrote its own verdict, never got as far as
+    the fan-out, or graded nothing. The line is deliberately not a verdict
+    line: the collector must keep `eval_verdict` null so the night reads as
+    truncated -- now with its graded cases counted.
+    """
+
+    def lifted(self) -> str:
+        src = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r"^report_partial_verdict\(\) \{\n.*?^\}$", src, re.S | re.M)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"report_partial_verdict() not found in {SCRIPT}")
+        return match.group(0)
+
+    def run_report(self, setup: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        capture = tmp / "uv-args"
+        script = "\n".join(
+            [
+                "set -uo pipefail",
+                self.lifted(),
+                # The fake bench-gate: records its arguments and writes the table.
+                f'uv() {{ printf "%s\\n" "$@" > "{capture}"; echo "| table |"; : > "${{ARTIFACT_DIR}}/eval-verdict.md"; }}',
+                f'BENCH_DIR="{tmp}"',
+                f'STATE_DIR="{tmp}/state"; mkdir -p "${{STATE_DIR}}"',
+                f'ARTIFACT_DIR="{tmp}/artifacts"; mkdir -p "${{ARTIFACT_DIR}}"',
+                "TASK_NAMES=(case-a case-b case-c)",
+                f'EVAL_RECORDED_MANIFEST="{tmp}/artifacts/baseline-recorded.jsonl"',
+                setup,
+                "report_partial_verdict",
+            ]
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        return result, capture
+
+    GRADED_ONE = "\n".join(
+        [
+            ': > "${STATE_DIR}/case-a.graded"; echo "{}" > "${ARTIFACT_DIR}/case-case-a.json"',
+            # Marked graded but its JSON never landed: not a graded case.
+            ': > "${STATE_DIR}/case-b.graded"',
+            'echo \'{"case": "case-a"}\' > "${EVAL_RECORDED_MANIFEST}"',
+        ]
+    )
+
+    def test_it_tables_the_graded_cases_and_says_how_many(self):
+        result, capture = self.run_report(self.GRADED_ONE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Eval ended before its verdict: 1 of 3 cases graded, 1 recorded to the baseline store; partial table in",
+            result.stdout,
+        )
+        args = capture.read_text().splitlines()
+        self.assertEqual(args[:2], ["run", "bench-gate"])
+        self.assertEqual(args[2], "suite")
+        self.assertEqual(args.count("--case-result"), 1)
+        self.assertTrue(args[args.index("--case-result") + 1].endswith("/case-case-a.json"))
+        self.assertIn("1 of 3 cases had every repetition graded by then", args[args.index("--partial") + 1])
+        self.assertTrue(args[args.index("--markdown-out") + 1].endswith("/eval-verdict.md"))
+        self.assertTrue(args[args.index("--json-out") + 1].endswith("/eval-verdict.json"))
+        # The suite's own stdout (the markdown) stays out of the job log.
+        self.assertNotIn("| table |", result.stdout)
+
+    def test_the_line_is_not_a_verdict_line(self):
+        result, _ = self.run_report(self.GRADED_ONE)
+        line = [l for l in result.stdout.splitlines() if "Eval ended before its verdict" in l][0]
+        self.assertIsNone(collect.parse_build_log(line)["eval_verdict"])
+        self.assertTrue(line.startswith("==="), "a header, so it closes any open grading block")
+
+    def test_it_stays_quiet_when_the_run_wrote_its_own_verdict(self):
+        result, capture = self.run_report(self.GRADED_ONE + "\nEVAL_SUITE_REACHED=1")
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(capture.exists())
+
+    def test_it_stays_quiet_before_the_fan_out_exists(self):
+        result, capture = self.run_report("unset STATE_DIR")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(capture.exists())
+
+    def test_nothing_graded_is_said_not_tabled(self):
+        result, capture = self.run_report("")
+        self.assertIn("Eval ended before its verdict with no case fully graded (3 in the matrix)", result.stdout)
+        self.assertFalse(capture.exists())
+
+    def test_a_failed_suite_is_a_warning_not_a_lost_line(self):
+        result, _ = self.run_report(self.GRADED_ONE + "\nuv() { return 1; }")
+        self.assertIn("WARNING: the partial verdict table could not be written", result.stdout)
+        self.assertIn("1 of 3 cases graded", result.stdout)
 
 
 if __name__ == "__main__":
