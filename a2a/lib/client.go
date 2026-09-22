@@ -504,6 +504,17 @@ type Subscription interface {
 // subscription survives connection rebuilds: its spec, not its JetStream
 // objects, is what the client retains.
 func (c *Client) SubscribeDurable(ctx context.Context, cfg SubscribeConfig, handler func(*Envelope)) (Subscription, error) {
+	return c.SubscribeDurableAttributed(ctx, cfg, func(_ string, env *Envelope) { handler(env) })
+}
+
+// SubscribeDurableAttributed is SubscribeDurable with the subject each
+// envelope arrived on handed to the handler beside it. The envelope carries
+// no subject of its own, and on a consumer whose filter spans more than one
+// subject class the class is the fact a handler may need: a terminal off a
+// task's `…supervisor` subject is the supervisor's word where the same
+// envelope off `…events` is the executor's (CheckSubjectAgreement has
+// already held the envelope to the subject by the time the handler sees it).
+func (c *Client) SubscribeDurableAttributed(ctx context.Context, cfg SubscribeConfig, handler func(subject string, env *Envelope)) (Subscription, error) {
 	switch {
 	case cfg.Stream == "":
 		return nil, fmt.Errorf("SubscribeConfig.Stream is required")
@@ -574,7 +585,7 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 type durableSub struct {
 	c       *Client
 	cfg     SubscribeConfig
-	handler func(*Envelope)
+	handler func(subject string, env *Envelope)
 	seen    *dedupSet
 	stopped atomic.Bool
 
@@ -652,7 +663,7 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 		_ = msg.Ack()
 		return
 	}
-	s.handler(env)
+	s.handler(msg.Subject(), env)
 	_ = msg.Ack()
 }
 

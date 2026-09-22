@@ -39,11 +39,35 @@ type relayState struct {
 	lastLine string
 }
 
+// relayItem is one queued event with the subject it arrived on. The relay's
+// durable spans a task's `…events` and `…supervisor` subjects, and the
+// subject is the only thing that says whose word a terminal is: the
+// executor's off the first, the supervisor's -- this gateway's, about an
+// executor that died or never ran -- off the second. The envelope does not
+// carry it, so it rides beside the envelope to the terminal.
+type relayItem struct {
+	env     *lib.Envelope
+	subject string
+}
+
+// terminalSourceOf attributes a terminal by the subject it arrived on, the
+// rule the heal (healActiveTask) and the read route (probeConversation)
+// apply to the fold's terminal subject, so one supervisor terminal is the
+// supervisor's on every path it can reach the adapter by. The envelope has
+// already been held to its subject at delivery (CheckSubjectAgreement), so
+// the class token is the whole decision.
+func terminalSourceOf(subject string) TerminalSource {
+	if _, _, class, ok := lib.ParseTaskSubject(subject); ok && class == lib.TaskClassSupervisor {
+		return TerminalFromSupervisor
+	}
+	return TerminalFromExecutor
+}
+
 // relayEvent routes one event to its conversation's queue. Runs on the
 // durable consumer's dispatch goroutine, so it must not block: the actual
 // rendering — session lock, KV, chat REST calls — happens on the per-session
 // worker, where one slow conversation stalls only itself.
-func (g *Gateway) relayEvent(ctx context.Context, env *lib.Envelope) {
+func (g *Gateway) relayEvent(ctx context.Context, subject string, env *lib.Envelope) {
 	if env.Kind != lib.KindStatusUpdate && env.Kind != lib.KindArtifactUpdate {
 		return
 	}
@@ -54,14 +78,14 @@ func (g *Gateway) relayEvent(ctx context.Context, env *lib.Envelope) {
 		// index was already retired); not ours to render.
 		return
 	}
-	g.events.enqueue(sessionKey, env)
+	g.events.enqueue(sessionKey, relayItem{env: env, subject: subject})
 }
 
 // relayBatch renders a session's queued events in order. Rolling-line edits
 // are coalesced: only the last event of the batch renders the line, so a
 // backlog of progress artifacts becomes one edit instead of a rate-limited
 // stampede. Posts (results, failures, input asks) always render.
-func (g *Gateway) relayBatch(sessionKey string, batch []*lib.Envelope) {
+func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
 	defer l.Unlock()
@@ -82,15 +106,15 @@ func (g *Gateway) relayBatch(sessionKey string, batch []*lib.Envelope) {
 		g.log.Error("relay: session record unavailable; requeueing batch", "session", sessionKey, "err", err)
 		go func() {
 			time.Sleep(requeueDelay)
-			for _, env := range batch {
-				g.events.enqueue(sessionKey, env)
+			for _, item := range batch {
+				g.events.enqueue(sessionKey, item)
 			}
 		}()
 		return
 	}
 
-	for i, env := range batch {
-		g.applyEvent(ctx, rec, env, i == len(batch)-1)
+	for i, item := range batch {
+		g.applyEvent(ctx, rec, item, i == len(batch)-1)
 	}
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
@@ -100,7 +124,8 @@ func (g *Gateway) relayBatch(sessionKey string, batch []*lib.Envelope) {
 
 // applyEvent folds one event into the render state. render gates only the
 // rolling-line edit; posts always happen.
-func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, env *lib.Envelope, render bool) {
+func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
+	env := item.env
 	g.mu.Lock()
 	rs, ok := g.relays[env.TaskID]
 	if !ok {
@@ -116,7 +141,7 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, env *lib.E
 			g.log.Error("relay: malformed status-update", "taskId", env.TaskID, "err", err)
 			return
 		}
-		g.applyStatus(ctx, rec, rs, env.TaskID, s, render)
+		g.applyStatus(ctx, rec, rs, env.TaskID, s, terminalSourceOf(item.subject), render)
 	case lib.KindArtifactUpdate:
 		var a lib.ArtifactUpdate
 		if err := json.Unmarshal(env.Payload, &a); err != nil {
@@ -127,11 +152,11 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, env *lib.E
 	}
 }
 
-func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, render bool) {
+func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource, render bool) {
 	rs.state = s.Status.State
 	switch {
 	case s.Final:
-		g.relayTerminal(ctx, rec, rs, taskID, s)
+		g.relayTerminal(ctx, rec, rs, taskID, s, source)
 	case s.Status.State == lib.StateInputRequired:
 		ask := ""
 		if s.Status.Message != nil {
@@ -180,8 +205,9 @@ func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID strin
 
 // relayTerminal posts the deliverable (or the failure), releases the
 // session's serialization, and retires the task's index — the stream is
-// the durable record; the index only exists to route live events.
-func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate) {
+// the durable record; the index only exists to route live events. source is
+// whose word the terminal is, read off the subject it arrived on.
+func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
 	result := joinTextParts(rs.result)
 	if result == "" && s.Status.State == lib.StateCompleted {
 		// Render state is cache; if a restart lost it, the stream still has
@@ -245,17 +271,15 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// an observer that treats this as "the task is over" has already been
 	// handed everything the conversation received for it. See TaskObserver.
 	//
-	// Reported as the executor's. A supervisor terminal reaches this same
-	// path (the relay's durable covers both `…events` and `…supervisor`), and
-	// that one is the gateway's word rather than an executor's -- but only
-	// the envelope's subject distinguishes them, and the fold three calls up
-	// no longer has it. Left as is because every supervisor terminal today
-	// comes from the session-pod paths, which a fixed-route install never
-	// takes; splitting it means threading the subject class through
-	// applyEvent, which is worth doing when session routing is armed
-	// somewhere that grades the answer. Until then the two views of one
-	// supervisor terminal disagree: the read route's fold (probeConversation)
-	// attributes it by subject and says supervisor, this path says executor.
+	// With whose word it is. A supervisor terminal reaches this same path
+	// (the relay's durable covers both `…events` and `…supervisor`), and that
+	// one is the gateway's word about an executor that died or never ran,
+	// not an answer; only the subject distinguishes the two, so the subject
+	// rides with the envelope from the durable to here (relayItem) and is
+	// attributed the way the heal and the read route attribute the fold's
+	// terminal. A program grading off the door takes the executor's terminal
+	// and classifies the supervisor's as the install's, and it must read the
+	// same answer whichever of the three paths delivered the terminal first.
 	//
 	// The reason is the terminal's status message, verbatim: the bridge and
 	// the worker adapter write `reason: <token>[ - detail]` there, and a
@@ -266,7 +290,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
-	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, TerminalFromExecutor, reason)
+	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, source, reason)
 }
 
 // updateRollingLine edits the task's single status message in place. Under

@@ -1985,7 +1985,10 @@ func TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn(t *testing.T) {
 	if err := r.bus.Publish(ctx, lib.TaskSupervisorSubject("platform", origin.TaskID), env); err != nil {
 		t.Fatal(err)
 	}
-	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	relayed := r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	if relayed.Source != string(TerminalFromSupervisor) {
+		t.Fatalf("the relay's terminal entry source = %q, want the supervisor's own source", relayed.Source)
+	}
 	r.restoreActiveTask(t, reply.Conversation, origin, time.Minute)
 
 	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
@@ -1997,6 +2000,68 @@ func TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn(t *testing.T) {
 	}
 	if probe.Reason != reason {
 		t.Fatalf("probe.Reason = %q, want the terminal's message verbatim", probe.Reason)
+	}
+}
+
+// TestInjectRelayAndReadRouteAgreeOnWhoseTerminalItIs: one terminal, three
+// paths to the door -- the live relay, the heal, and the read route -- and
+// the same attribution on each, because a program grading off the door
+// folds whichever arrives first and keeps that source. The relay's durable
+// spans the events and the supervisor subject and the envelope carries no
+// subject, so the relay used to label every terminal the executor's while
+// the other two labelled by subject; the subject now rides with the envelope
+// to the terminal. Checked for an executor's terminal off `…events` and the
+// supervisor's off `…supervisor`.
+func TestInjectRelayAndReadRouteAgreeOnWhoseTerminalItIs(t *testing.T) {
+	cases := []struct {
+		name    string
+		from    lib.Party
+		subject func(addressee, taskID string) string
+		want    TerminalSource
+	}{
+		{"executor", lib.Party{Session: "platform", AgentType: "test-executor"}, lib.TaskEventsSubject, TerminalFromExecutor},
+		{"supervisor", gatewayParty, lib.TaskSupervisorSubject, TerminalFromSupervisor},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startInjectRig(t)
+			reply := r.inject(t, "case-whose-"+tc.name, injectTestAuthor, "answer me")
+			origin := r.awaitTask(t, "platform")
+			ctx := context.Background()
+			if err := r.execFor(t, origin, "platform").PublishStatus(ctx, lib.StateWorking, false); err != nil {
+				t.Fatal(err)
+			}
+			const reason = "reason: worker-evicted - SIGTERM"
+			payload, err := json.Marshal(lib.StatusUpdate{
+				TaskID: origin.TaskID, ContextID: origin.ContextID,
+				Status: lib.TaskStatus{State: lib.StateFailed, Message: &lib.Message{
+					Role: "agent", MessageID: "msg-whose", Parts: []lib.Part{{Kind: "text", Text: reason}},
+				}},
+				Final: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := lib.NewStatusUpdateEnvelope(tc.from, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.bus.Publish(ctx, tc.subject("platform", origin.TaskID), env); err != nil {
+				t.Fatal(err)
+			}
+
+			// The live relay's delivery.
+			relayed := r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+			if relayed.State != string(lib.StateFailed) || relayed.Source != string(tc.want) || relayed.Reason != reason {
+				t.Fatalf("the relay's terminal entry = %+v, want failed from %q with the reason verbatim", relayed, tc.want)
+			}
+			// The read route's fold of the same terminal.
+			r.restoreActiveTask(t, reply.Conversation, origin, time.Minute)
+			probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+			if !probe.Final || probe.TerminalSource != string(tc.want) || probe.Reason != reason {
+				t.Fatalf("the read route's probe = %+v, want the same terminal from %q", probe, tc.want)
+			}
+		})
 	}
 }
 

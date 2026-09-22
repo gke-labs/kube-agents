@@ -91,7 +91,7 @@ type Gateway struct {
 	// events on unordered goroutines) and events orders relay work per
 	// session, so no conversation can block another.
 	inbox  *keyedQueue[InboundMessage]
-	events *keyedQueue[*lib.Envelope]
+	events *keyedQueue[relayItem]
 
 	mu sync.Mutex
 	// sessionLocks serializes work per conversation; tasks serialize per
@@ -295,13 +295,17 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// with the single filter, and rebinding it to the pair is an update the
 	// server accepts (lib's rebind test).
 	agreement := SupervisorAgreement(g.cfg)
-	sub, err := g.client.SubscribeDurable(ctx, lib.SubscribeConfig{
+	// Attributed: the subject each envelope arrived on rides with it, because
+	// it is the only thing that tells a supervisor terminal from an
+	// executor's, and the relay owes the adapter that distinction
+	// (TerminalSource) the same way the heal and the read route give it.
+	sub, err := g.client.SubscribeDurableAttributed(ctx, lib.SubscribeConfig{
 		Stream:    lib.TasksStream,
 		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
 		Durable:   g.relayDurable,
 		Session:   gatewayParty.Session,
 		Agreement: &agreement,
-	}, func(env *lib.Envelope) { g.relayEvent(ctx, env) })
+	}, func(subject string, env *lib.Envelope) { g.relayEvent(ctx, subject, env) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)
 	}
