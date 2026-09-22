@@ -78,12 +78,14 @@ names:
 - **Exactly one stream:** check `cronjob(action='runs')` first; a run of that stream already in
   flight holds the per-job lock this session does not, so say it is running and stop. Otherwise run
   that stream's SOP here, in this session, through the two-command lifecycle below —
-  `audit_report.py start`, the sweep, `audit_report.py finish` — and report every check you did not
-  run as a coverage gap: a cluster you could not read goes in `scope.skipped`, a check that could
-  have run on a cluster and did not goes in that cluster's `limitations`, so `finish` reports the
-  run `partial` and names each gap. Never skip a check silently: a document that omits the checks
-  it never ran reads exactly like a complete one, and the roster check exists to catch that. This
-  is the interim until the trigger has a path from here (#1876).
+  `audit_report.py start`, the sweep, `audit_report.py finish` — spelling the script
+  `"$HERMES_HOME"/skills/fleet-audit/scripts/audit_report.py`, because a card's working directory is
+  its own kanban workspace and the `./skills/...` form below does not resolve there. Report every
+  check you did not run as a coverage gap: a cluster you could not read goes in `scope.skipped`, a
+  check that could have run on a cluster and did not goes in that cluster's `limitations`, so
+  `finish` reports the run `partial` and names each gap. Never skip a check silently: a document
+  that omits the checks it never ran reads exactly like a complete one, and the roster check exists
+  to catch that. This is the interim until the trigger has a path from here (#1876).
 - **More than one stream:** say the on-demand trigger is unavailable and that each stream will run
   on its own schedule. Do not improvise several streams in one turn — see the next paragraph.
 
@@ -106,9 +108,13 @@ arrives through its own `deliver` setting; repeating it here sends the same cont
 
 ## The two-command lifecycle
 
-Run both commands from your normal working directory — the profile directory, where `./skills/...`
-resolves. **You are not in a git checkout, and you do not need to be.** The audit crons start in the
-profile directory; the harness establishes its own workspace at
+Run both commands from your normal working directory. The commands below are spelt `./skills/...`,
+which resolves because a cron turn starts in the profile directory; a card dispatch starts in the
+task's kanban workspace (`…/kanban/workspaces/<task-id>`), where that form is `No such file or
+directory`, so from a card spell the script
+`"$HERMES_HOME"/skills/fleet-audit/scripts/audit_report.py` (`$HERMES_HOME` is the profile directory
+in both contexts). **You are not in a git checkout, and you do not need to be.** The harness
+establishes its own workspace at
 `/opt/data/gitops/<audit-id>/<owner>__<name>` and resolves every `remediation.path` against it. The
 workspace is keyed by audit id because the audit streams share the volume with each other and with
 every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule can no
