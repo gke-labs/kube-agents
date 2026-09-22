@@ -315,7 +315,6 @@ DEFAULT_CLEAR_AFTER_MISSED_SCANS = 1
 #: or a chat line at the length the report script's own table uses.
 ROW_DETAIL_MAX_CHARS = 400
 TRUNCATION_MARKER = "..."
-DETAIL_JOINER = "; "
 LEDGER_KEY_SEPARATOR = "|"
 #: A cluster is `name@location`: two projects' clusters may share a name
 #: across regions, and the kubeconfig and every sibling key on both.
@@ -759,7 +758,6 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
             except READ_FAILURES as exc:
                 sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
                 continue
-            scanned_at = int(time.time())
             sweep.read_scopes.add(scope_key(cid, namespace))
             if skipped:
                 sweep.partial_scopes[scope_key(cid, namespace)] = skipped
@@ -772,8 +770,6 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
                     "heuristic": f.get("heuristic", ""),
                     "detail": f.get("detail", ""),
                     "stalled_for": f.get("stalled_for", ""),
-                    "stalled_seconds": int(f.get("stalled_seconds") or 0),
-                    "scanned_at": scanned_at,
                 }
     return sweep
 
@@ -930,11 +926,11 @@ def rows_block(rows: list[dict]) -> str:
     return "\n".join(shown)
 
 
-def card_body(project: str, cluster: str, location: str, namespace: str, rows: list[dict], now: str) -> str:
+def card_body(project: str, cluster: str, location: str, namespace: str, rows: list[dict], first_seen: str) -> str:
     return (
         f"The scheduled stall watch found controllers in namespace `{namespace}` of cluster "
         f"`{cluster}` ({location}, project `{project}`) that have stopped making progress without "
-        f"erroring. First seen by the watch at {now}.\n\n"
+        f"erroring. First seen by the watch at {first_seen}.\n\n"
         f"Run the `{SKILL_NAME}` skill on that namespace, "
         f"confirm which of the objects below are still stalled, identify what each is waiting on "
         f"(the missing referent, the condition that never turned True, the repeating warning), and record "
@@ -1036,7 +1032,8 @@ def board_path() -> Path:
 
 def subscribe_card(task_id: str, db_path: Path | None = None) -> int:
     """Write the card's chat subscription rows for the home channels, seeded at
-    the card's current event head so its creation is not replayed. Returns the
+    the card's first event so its creation is not replayed and everything after
+    it is, however many ticks late the write lands. Returns the
     number of the card's rows on the board once the write is committed, so a
     row already there counts and a write the commit lost does not; fail-soft,
     since a card without a row still gets worked and the next tick tries again."""
@@ -1053,7 +1050,7 @@ def subscribe_card(task_id: str, db_path: Path | None = None) -> int:
             if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
                 sys.stderr.write(f"stall_watch: card {task_id} is not on the board at {path}; no subscription written\n")
                 return 0
-            head = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
+            head = conn.execute("SELECT COALESCE(MIN(id), 0) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
             created = int(time.time())
             for platform, chat_id, thread_id in targets:
                 conn.execute(
@@ -1131,7 +1128,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     candidates = dict(new_by_scope)
     for entry in state["stalls"].values():
         scope = scope_key(entry["cluster"], entry["namespace"])
-        if scope not in candidates and scope not in episodes and scope in sweep.read_scopes:
+        # A row missed this tick is on its way out and does not file a card.
+        if scope not in candidates and scope not in episodes and scope in sweep.read_scopes and not entry.get("missed"):
             candidates[scope] = []
     opened = held = 0
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
@@ -1178,7 +1176,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         generation = int(state.setdefault(GENERATIONS_KEY, {}).get(scope) or 0)
         title = card_title(name, namespace, rows)
-        body = card_body(sweep.project, name, location, namespace, rows, now)
+        body = card_body(sweep.project, name, location, namespace, rows, scope_first_seen(state, scope) or now)
         task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
         skipped = 0
         while task_id and (card_status(task_id) or "") in TERMINAL_CARD_STATUSES:

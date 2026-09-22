@@ -267,6 +267,13 @@ class Base(unittest.TestCase):
         p = patch.object(stall_watch, "dns_endpoint_args", return_value=[])
         p.start()
         self.addCleanup(p.stop)
+        import chat_platforms
+
+        # The host's own /etc/hermes and /opt/data config must not decide which platforms are on.
+        for attr in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            p = patch.object(chat_platforms, attr, str(self.home / "absent" / attr))
+            p.start()
+            self.addCleanup(p.stop)
         self.board = FakeBoard(str(self.db))
         p = patch.object(stall_watch, "kanban", self.board)
         p.start()
@@ -394,8 +401,19 @@ class Cards(Base):
         filed = [c["title"].split(" in ")[1].split(" on ")[0] for c in self.board.cards.values()]
         self.assertIn("payments", filed, filed)
         self.assertEqual(filed[3], "payments", "the namespace held since the earlier tick is filed first")
+        payments = next(c for c in self.board.cards.values() if " in payments on " in c["title"])
+        self.assertIn("First seen by the watch at 2026-09-22T10:00:00+00:00.", payments["body"], "the card dates the stall to its first sighting, not the tick that filed it")
         self.assertEqual(len(self.board.opened()), 6)
         self.assertEqual(len(self.cleared(lines)), 3, "the deleted tenant namespaces closed their cards")
+
+    def test_a_held_namespace_whose_rows_vanish_gets_no_card(self):
+        fleet = {"c": {f"tenant-{i}": [DEPLOYMENT_ROW | {"namespace": f"tenant-{i}"}] for i in range(4)}}
+        self.run_tick(fleet)
+        self.assertEqual(len(self.board.opened()), 3)
+        fleet["c"]["tenant-3"] = []
+        self.run_tick(fleet)
+        self.assertTrue(any(e["namespace"] == "tenant-3" for e in self.ledger()["stalls"].values()), "the row is still inside its hysteresis")
+        self.assertEqual(len(self.board.opened()), 3, "a row missed this tick does not file a card")
 
     def test_a_namespace_not_read_this_tick_is_not_filed_from_its_ledgered_rows(self):
         fleet = {"c": {f"tenant-{i}": [DEADLINE_ROW | {"namespace": f"tenant-{i}"}] for i in range(4)}}
@@ -593,9 +611,18 @@ class Cards(Base):
         tid = next(iter(self.board.cards))
         self.assertFalse(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
         self.assertEqual(self.subs(tid), [])
+        conn = sqlite3.connect(self.db)
+        created = conn.execute("SELECT MIN(id) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
+        conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'claimed', 2)", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'completed', 3)", (tid,))
+        conn.commit()
+        conn.close()
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
-        self.assertEqual(len(self.subs(tid)), 1)
+        rows = self.subs(tid)
+        self.assertEqual(len(rows), 1)
+        # A cursor seeded at the current head would swallow the completion.
+        self.assertEqual(rows[0][-1], created)
 
     def test_a_stall_that_comes_back_after_its_card_was_completed_gets_a_new_card(self):
         # The board answers a repeated key with the finished card; the key must
