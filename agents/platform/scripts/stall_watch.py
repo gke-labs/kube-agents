@@ -60,13 +60,14 @@ on purpose: a Pod that cannot start raises the Warning reasons the event
 watcher is gated on, and its owner shows here through its own condition or
 reference.
 
-Why a ledger. A stall lasts hours or days, and a report that reprinted it
-every thirty minutes would be muted within the hour. The ledger holds one
-entry per row ``stall_report.py`` emits, but chat gets one bullet per object:
-an object is announced when its first row appears and when its last row
-clears, and a row that joins an object already announced (a Deployment that
-adds ProgressDeadlineExceeded ten minutes after its dangling reference) is
-folded in silently. A ``repeating-warnings`` row exists only while its event
+Why a ledger. A stall lasts hours or days, and a watch that filed a card for
+it every thirty minutes would be muted within the hour. The ledger holds one
+entry per row ``stall_report.py`` emits and one episode per namespace with an
+open card: the card opens when a namespace's first row appears and closes
+when its last row clears, a new object in the namespace is a comment on the
+card, and a row that joins an object already on it (a Deployment that adds
+ProgressDeadlineExceeded ten minutes after its dangling reference) is folded
+in silently. A ``repeating-warnings`` row exists only while its event
 recurred inside the script's window, so a warning that comes back every hour
 would otherwise flap in and out; such a row clears only after two
 consecutive scans without it. A namespace or cluster this tick could not
@@ -180,6 +181,7 @@ EVENTS_NOT_READ_PATTERN = re.compile(r"warning: events in \S+ not read")
 EVENTS_MARKER = "events"
 REPEATING_WARNINGS_HEURISTIC = "repeating-warnings"
 PLURAL_IES = "ies"
+PLURAL_ES = "es"
 #: gcloud exits 0 on a partial listing and says so on stderr ("The following
 #: zones did not respond ... List results may be incomplete."); a cluster
 #: absent from such a listing is unknown, not gone.
@@ -253,9 +255,14 @@ TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
 #: (`<PLATFORM>_HOME_CHANNEL`; `CHAT_HOME_CHANNEL` is the relay's own label and
 #: names no channel).
 BOARD_DB_NAME = "kanban.db"
+#: The home channels come from the agent home's config.yaml,
+#: `platforms.<p>.home_channel.chat_id`, the field the tick spawner reads for
+#: the same reason: Hermes' build_subprocess_env strips every `*_HOME_CHANNEL`
+#: from a no_agent child, so on a scheduled tick the environment never has one.
+#: The environment is read only as a fallback, for a run started by hand.
+CONFIG_FILE_NAME = "config.yaml"
 HOME_CHANNEL_SUFFIX = "_HOME_CHANNEL"
 HOME_CHANNEL_THREAD_SUFFIX = "_HOME_CHANNEL_THREAD_ID"
-RELAY_LABEL_ENV = "CHAT_HOME_CHANNEL"
 NOTIFIER_PROFILE = "default"
 DELIVERY_MODE = "notify+wake"
 BOARD_BUSY_TIMEOUT_SECONDS = 10
@@ -270,9 +277,15 @@ MAX_UNKNOWN_CARD_TICKS = 3
 #: stall clears; the watch comments and lets the worker finish, then closes
 #: the episode once the card reaches a terminal status.
 RUNNING_CARD_STATUS = "running"
-#: The episode id in a card's idempotency key is the stall's own start,
-#: rounded to the minute, so a retry after a lost board response reuses it.
-EPISODE_ID_RESOLUTION_SECONDS = 60
+#: The episode id in a card's idempotency key is the stall's own start, taken
+#: from the scan's own clock and the row's age rather than from the tick's
+#: clock, and rounded to ten minutes, so a retry after a lost board response
+#: reuses it however long the rest of the sweep took. A repeating-warnings
+#: row's age is an event span, not a start, and does not take part.
+EPISODE_ID_RESOLUTION_SECONDS = 600
+#: Plurals kubectl forms with -es or -ies, so a skipped `ingresses` holds
+#: Ingress rows and `networkpolicies` holds NetworkPolicy rows.
+PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
 #: Where stall_report.py sits for a Platform Agent worker, which has no
 #: gke-stall-detection skill of its own to view.
 PLATFORM_REPORT_SCRIPT = "/opt/data/scripts/stall_report.py"
@@ -490,7 +503,12 @@ def resource_names_kind(resource: str, kind: str) -> bool:
     """Whether a kubectl resource name (`deployments`, `gateways.gateway...`)
     is the plural of an object's Kind (`Deployment`, `Gateway`)."""
     plural = resource.split(".", 1)[0].lower()
-    singular = plural[: -len(PLURAL_IES)] + "y" if plural.endswith(PLURAL_IES) else plural.rstrip("s")
+    if plural.endswith(PLURAL_IES):
+        singular = plural[: -len(PLURAL_IES)] + "y"
+    elif plural.endswith(PLURAL_ES_SUFFIXES):
+        singular = plural[: -len(PLURAL_ES)]
+    else:
+        singular = plural.rstrip("s")
     return singular == kind.lower()
 
 
@@ -711,6 +729,7 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
             except READ_FAILURES as exc:
                 sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
                 continue
+            scanned_at = int(time.time())
             sweep.read_scopes.add(scope_key(cid, namespace))
             if skipped:
                 sweep.partial_scopes[scope_key(cid, namespace)] = skipped
@@ -724,6 +743,7 @@ def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
                     "detail": f.get("detail", ""),
                     "stalled_for": f.get("stalled_for", ""),
                     "stalled_seconds": int(f.get("stalled_seconds") or 0),
+                    "scanned_at": scanned_at,
                 }
     return sweep
 
@@ -930,19 +950,36 @@ def complete_card(task_id: str, result: str) -> bool:
 
 def home_targets() -> list[tuple[str, str, str]]:
     """(platform, chat_id, thread_id) for every chat platform the harness ships
-    whose home channel the tick spawner put in the environment. The platform
-    list is chat_platforms.CHAT_PLATFORMS, so a channel variable for a platform
-    the notifier has no adapter for never becomes a row."""
+    that has a home channel: from the agent home's config.yaml first, the way
+    the tick spawner reads it, and from `<PLATFORM>_HOME_CHANNEL` only for a
+    platform the file does not settle, which is a run started by hand. The
+    platform list is chat_platforms.CHAT_PLATFORMS, so a channel for a platform
+    the notifier has no adapter for never becomes a row. A scheduled report
+    posts flat, so no thread is carried from the file."""
     from chat_platforms import CHAT_PLATFORMS  # lazy: a sibling the tests can still import
 
+    configured: dict[str, str] = {}
+    try:
+        import yaml
+
+        config = yaml.safe_load((Path(gitops_workspace.agent_home()) / CONFIG_FILE_NAME).read_text()) or {}
+        platforms = config.get("platforms") if isinstance(config, dict) else None
+        for platform, block in (platforms or {}).items() if isinstance(platforms, dict) else []:
+            home = block.get("home_channel") if isinstance(block, dict) else None
+            chat_id = home.get("chat_id") if isinstance(home, dict) else None
+            if chat_id:
+                configured[str(platform)] = str(chat_id).strip()
+    except Exception as exc:  # noqa: BLE001 - no file, or not ours to parse: the environment is what is left
+        sys.stderr.write(f"stall_watch: could not read home channels from {CONFIG_FILE_NAME}: {exc}\n")
     targets = []
     for platform in CHAT_PLATFORMS:
-        key = platform.upper() + HOME_CHANNEL_SUFFIX
-        value = os.environ.get(key, "").strip()
-        if not value:
+        if platform in configured:
+            targets.append((platform, configured[platform], ""))
             continue
-        thread = os.environ.get(platform.upper() + HOME_CHANNEL_THREAD_SUFFIX, "").strip()
-        targets.append((platform, value, thread))
+        value = os.environ.get(platform.upper() + HOME_CHANNEL_SUFFIX, "").strip()
+        if value:
+            thread = os.environ.get(platform.upper() + HOME_CHANNEL_THREAD_SUFFIX, "").strip()
+            targets.append((platform, value, thread))
     return targets
 
 
@@ -1001,8 +1038,14 @@ def unledger_scope(state: dict, scope: str) -> None:
 
 
 def episode_id(rows: list[dict], now_epoch: int) -> int:
-    oldest = max((int(r.get("stalled_seconds") or 0) for r in rows), default=0)
-    return (now_epoch - oldest) // EPISODE_ID_RESOLUTION_SECONDS
+    """The stall's start, from each row's scan clock and age, to the bucket."""
+    starts = [
+        int(r.get("scanned_at") or now_epoch) - int(r.get("stalled_seconds") or 0)
+        for r in rows
+        if r.get("heuristic") != REPEATING_WARNINGS_HEURISTIC
+    ]
+    start = min(starts) if starts else min(int(r.get("scanned_at") or now_epoch) for r in rows)
+    return start // EPISODE_ID_RESOLUTION_SECONDS
 
 
 def episode_gone(episodes: dict, scope: str, task_id: str) -> bool:
@@ -1019,16 +1062,23 @@ def episode_gone(episodes: dict, scope: str, task_id: str) -> bool:
     return False
 
 
+def comment_pending(episode: dict, namespace: str) -> None:
+    """Tell the card about objects that joined while it was open; what the
+    board refused stays pending and is tried again next tick."""
+    pending = sorted(set(episode.get("pending", [])))
+    if not pending:
+        return
+    if comment_card(episode["card"], f"The watch now also sees these objects stalled in `{namespace}`: {', '.join(pending)}"):
+        episode["objects"] = sorted(set(episode.get("objects", [])) | set(pending))
+        episode["pending"] = []
+
+
 def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scope: dict, now: str, *, dry_run: bool = False) -> list[str]:
     """Open, comment on and close cards for the tick's episodes; return the
     chat lines, one per card opened and one per card closed. A dry run touches
     no board and says what it would have done."""
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
-    # Judged before the loop below unledgers anything, so a scope whose rows
-    # were dropped to be retried is never mistaken for a cleared one.
-    open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
-    deferred: set[str] = set()
     for scope, rows in sorted(new_by_scope.items()):
         cid, namespace = split_scope(scope)
         name, _, location = cid.partition(CLUSTER_ID_SEPARATOR)
@@ -1039,20 +1089,17 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         if episode:
             status = card_status(episode["card"])
-            if status is None:
-                if not episode_gone(episodes, scope, episode["card"]):
-                    unledger_scope(state, scope)
-                    deferred.add(scope)
-                    continue
-                episode = None
-            elif status not in TERMINAL_CARD_STATUSES:
-                if comment_card(episode["card"], f"The watch now also sees these objects stalled in `{namespace}`:\n\n{rows_block(rows)}"):
-                    episode["objects"] = sorted(set(episode.get("objects", [])) | set(object_names(rows)))
-                    episode["unknown"] = 0
-                else:
-                    unledger_scope(state, scope)
-                    deferred.add(scope)
+            if status is None and not episode_gone(episodes, scope, episode["card"]):
+                # The rows stay ledgered; the comment waits for a board that answers.
+                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(rows)))
                 continue
+            if status is not None and status not in TERMINAL_CARD_STATUSES:
+                episode["unknown"] = 0
+                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(rows)))
+                comment_pending(episode, namespace)
+                continue
+            if status is not None:
+                episodes.pop(scope)
         assignee = assignee_for(sweep.project, name, location)
         task_id = open_card(
             card_title(name, namespace, rows),
@@ -1061,19 +1108,29 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-{episode_id(rows, int(time.time()))}",
         )
         if not task_id:
+            # No card yet, so nothing to comment on: the rows leave the ledger
+            # and the next tick sees the objects as new and tries the board again.
             unledger_scope(state, scope)
-            deferred.add(scope)
             continue
-        subscribed = subscribe_card(task_id) > 0 or not home_targets()
-        episodes[scope] = {"card": task_id, "assignee": assignee, "opened_at": now, "objects": object_names(rows), "subscribed": subscribed}
+        episodes[scope] = {
+            "card": task_id,
+            "assignee": assignee,
+            "opened_at": now,
+            "objects": object_names(rows),
+            "subscribed": subscribe_card(task_id) > 0,
+        }
         lines.append(
             f"{NOTICED_PREFIX} in {cluster_label(cid)} / `{namespace}`: {', '.join(object_names(rows))}; "
             f"card `{task_id}` opened for `{assignee}`"
         )
-    for scope, episode in episodes.items():
-        if not dry_run and not episode.get("subscribed", True) and home_targets():
-            episode["subscribed"] = subscribe_card(episode["card"]) > 0
-    for scope in sorted(set(episodes) - open_scopes - deferred):
+    if not dry_run:
+        for scope, episode in episodes.items():
+            if not episode.get("subscribed", True):
+                episode["subscribed"] = subscribe_card(episode["card"]) > 0
+            if episode.get("pending") and scope not in new_by_scope:
+                comment_pending(episode, namespace_of(scope))
+    open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
+    for scope in sorted(set(episodes) - open_scopes):
         episode = episodes[scope]
         cleared = ", ".join(object_names(cleared_by_scope.get(scope, [])) or episode.get("objects", []))
         if dry_run:
@@ -1094,7 +1151,6 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             if not complete_card(episode["card"], f"Stall cleared at {now}: {cleared}. Closed by the stall watch."):
                 continue
         episodes.pop(scope)
-        cid, _ = split_scope(scope)
         lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}; card `{episode['card']}` closed")
     return lines
 

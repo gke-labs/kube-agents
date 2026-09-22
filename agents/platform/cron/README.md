@@ -68,10 +68,7 @@ hourly or a referent listing that failed once does not close and reopen a card.
 The card's progress reaches chat because the script writes the card's
 `kanban_notify_subs` row itself: a cron child has no session identity for
 `kanban_create` to copy, and a card without a row is invisible to the gateway
-notifier. The row targets every platform whose home channel the tick spawner
-restores into the child's environment (`GOOGLE_CHAT_HOME_CHANNEL`,
-`SLACK_HOME_CHANNEL`), with the same `notify+wake` delivery a user-filed card
-gets. `deliver: chat` then carries two one-liners, "stall noticed in
+notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries two one-liners, "stall noticed in
 `<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened" and "stall cleared
 ...; card `<id>` closed", plus the sweep-failed and sweep-recovered lines every
 roster entry owes. A clean tick prints nothing. Anything a tick could not read (a

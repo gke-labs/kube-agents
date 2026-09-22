@@ -245,13 +245,11 @@ class Base(unittest.TestCase):
         conn = sqlite3.connect(self.db)
         conn.executescript(BOARD_SCHEMA)
         conn.close()
-        env = {
-            stall_watch.PROJECT_ENVS[0]: PROJECT,
-            "PLATFORM_AGENT_HOME": self.tmp.name,
-            "GOOGLE_CHAT_HOME_CHANNEL": HOME_CHANNEL,
-            stall_watch.RELAY_LABEL_ENV: "cron-reports",
-        }
-        for var in (stall_watch.KINDS_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, "GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID", "SLACK_HOME_CHANNEL", *stall_watch.PROJECT_ENVS[1:]):
+        self.write_config({"platforms": {"google_chat": {"home_channel": {"platform": "google_chat", "chat_id": HOME_CHANNEL, "name": "Home"}}}})
+        # A scheduled tick's environment: Hermes' build_subprocess_env strips
+        # every *_HOME_CHANNEL, so none is set here unless a test says so.
+        env = {stall_watch.PROJECT_ENVS[0]: PROJECT, "PLATFORM_AGENT_HOME": self.tmp.name}
+        for var in (stall_watch.KINDS_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_THREAD_ID", *stall_watch.PROJECT_ENVS[1:]):
             env[var] = ""
         patcher = patch.dict(os.environ, env)
         patcher.start()
@@ -266,6 +264,11 @@ class Base(unittest.TestCase):
         p = patch.object(stall_watch, "kanban", self.board)
         p.start()
         self.addCleanup(p.stop)
+
+    def write_config(self, config):
+        import yaml
+
+        (self.home / stall_watch.CONFIG_FILE_NAME).write_text(yaml.safe_dump(config))
 
     def run_tick(self, fleet, **kw):
         fake = FakeFleet(fleet, **kw)
@@ -397,18 +400,37 @@ class Cards(Base):
         self.assertEqual(len(self.cleared(lines)), 1)
         self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
 
-    def test_a_board_that_cannot_show_the_card_defers_new_objects(self):
+    def test_a_board_that_cannot_show_the_card_keeps_the_rows_and_the_comment_pending(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
         self.board.fail_show = True
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
         self.assertEqual(lines, [])
         self.assertEqual(len(self.board.cards), 1, "no second card while the first cannot be read")
-        self.assertEqual(self.ledger()["stalls"], {}, "the scope is unledgered so it is retried")
+        self.assertEqual(len(self.ledger()["stalls"]), 2, "the rows stay ledgered")
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["pending"], ["Deployment/cart-api"])
         self.board.fail_show = False
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
         self.assertEqual(lines, [])
-        self.assertEqual(len(next(iter(self.board.cards.values()))["comments"]), 1)
+        card = next(iter(self.board.cards.values()))
+        self.assertEqual(len(card["comments"]), 1)
+        self.assertIn("Deployment/cart-api", card["comments"][0])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["pending"], [])
+
+    def test_a_pending_comment_after_a_board_hiccup_survives_an_unreadable_tick(self):
+        # The bot's scenario: hiccup on the tick a new object joins, then the
+        # cluster is unreadable on the next one; the card must not be closed.
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        self.board.fail_show = True
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.board.fail_show = False
+        lines, _ = self.run_tick({"c": TIMEOUT})
+        self.assertEqual(lines, [])
+        card = next(iter(self.board.cards.values()))
+        self.assertEqual(card["status"], "ready")
+        self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertEqual(len(card["comments"]), 1, "the pending comment went out once the board answered, even on an unreadable tick")
 
     def test_a_card_gone_from_the_board_ends_its_episode_and_a_new_stall_opens_a_new_card(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
@@ -446,10 +468,11 @@ class Cards(Base):
         self.assertEqual(lines, [])
         self.assertEqual(self.board.cards[tid]["status"], "ready", "the stall is still present; nothing completed it")
         self.assertEqual(self.board.cards[tid]["comments"], [])
-        self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertEqual(len(self.ledger()["stalls"]), 2, "the rows stay; only the comment is pending")
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
         self.assertEqual(lines, [])
-        self.assertEqual(len(self.board.cards[tid]["comments"]), 1)
+        self.assertEqual(len(self.board.cards[tid]["comments"]), 1, "sent once, from the pending list, not once per tick")
+        self.assertNotIn("also sees these objects stalled in `checkout`:\n", self.board.cards[tid]["comments"][0])
 
     def test_a_failed_subscription_is_retried_on_a_later_tick(self):
         with patch.object(stall_watch, "subscribe_card", return_value=0):
@@ -461,14 +484,24 @@ class Cards(Base):
         self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
         self.assertEqual(len(self.subs(tid)), 1)
 
-    def test_the_idempotency_key_is_stable_across_a_retry(self):
-        self.board.fail_next_create = True
-        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        first = shlex.split(self.board.calls[0])
-        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        second = shlex.split(self.board.calls[-1])
+    def test_the_idempotency_key_is_stable_across_a_retry_however_long_the_sweeps_take(self):
+        # A real stall's age grows with the clock; the fake reports it relative
+        # to a fixed start, and the two ticks run 1,700 s apart with different
+        # scan-to-card latencies, crossing several ten-minute boundaries.
+        start = 1_800_000_000
+        def rows_at(now):
+            return [dict(DEPLOYMENT_ROW, stalled_seconds=now - start), finding("checkout", "Deployment/checkout-api", "repeating-warnings", "SYNC x9: x", stalled_seconds=900)]
+        clock = {"now": start + 1000}
+        with patch.object(stall_watch.time, "time", lambda: clock["now"]):
+            self.board.fail_next_create = True
+            self.run_tick({"c": {"checkout": rows_at(clock["now"])}})
+            first = shlex.split(self.board.calls[0])
+            clock["now"] = start + 2700
+            self.run_tick({"c": {"checkout": rows_at(clock["now"])}})
+            second = shlex.split(self.board.calls[-1])
         key = lambda argv: argv[argv.index("--idempotency-key") + 1]
         self.assertEqual(key(first), key(second))
+        self.assertTrue(key(first).endswith(f"-{start // stall_watch.EPISODE_ID_RESOLUTION_SECONDS}"))
 
     def test_a_card_the_agent_already_completed_is_not_completed_again_on_clear(self):
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
@@ -523,15 +556,28 @@ class Cards(Base):
 
 
 class Subscriptions(Base):
-    def test_home_targets_read_the_shipped_platforms_and_nothing_else(self):
-        with patch.dict(os.environ, {"SLACK_HOME_CHANNEL": "C123", "SLACK_HOME_CHANNEL_THREAD_ID": "171.9", "TEAMS_HOME_CHANNEL": "19:abc"}):
+    def test_home_targets_come_from_config_when_the_environment_is_scrubbed(self):
+        self.assertEqual(os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"), "")
+        self.assertEqual(stall_watch.home_targets(), [("google_chat", HOME_CHANNEL, "")])
+
+    def test_config_wins_over_the_environment_and_the_environment_fills_the_rest(self):
+        with patch.dict(os.environ, {"GOOGLE_CHAT_HOME_CHANNEL": "spaces/STALE", "SLACK_HOME_CHANNEL": "C123", "SLACK_HOME_CHANNEL_THREAD_ID": "171.9", "TEAMS_HOME_CHANNEL": "19:abc"}):
             self.assertEqual(stall_watch.home_targets(), [("google_chat", HOME_CHANNEL, ""), ("slack", "C123", "171.9")])
 
-    def test_without_a_home_channel_no_row_is_written_and_the_card_still_opens(self):
-        with patch.dict(os.environ, {"GOOGLE_CHAT_HOME_CHANNEL": ""}):
-            lines, _ = self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+    def test_a_scheduled_tick_writes_the_row_with_no_home_channel_variable_at_all(self):
+        # The production case: the environment carries no *_HOME_CHANNEL and
+        # the row still lands, from config.yaml.
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        tid = next(iter(self.board.cards))
+        self.assertEqual(self.subs(tid)[0][:2], ("google_chat", HOME_CHANNEL))
+        self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/storefront"]["subscribed"])
+
+    def test_without_any_home_channel_no_row_is_written_and_the_card_still_opens(self):
+        (self.home / stall_watch.CONFIG_FILE_NAME).unlink()
+        lines, _ = self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
         self.assertEqual(len(self.noticed(lines)), 1)
         self.assertEqual(self.subs(next(iter(self.board.cards))), [])
+        self.assertFalse(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/storefront"]["subscribed"])
 
     def test_a_card_not_on_the_board_gets_no_row(self):
         self.assertEqual(stall_watch.subscribe_card("t_deadbeef", self.db), 0)
@@ -600,10 +646,27 @@ class Ledger(Base):
         left = sorted(e["heuristic"] for e in self.ledger()["stalls"].values())
         self.assertEqual(left, ["repeating-warnings"], "the condition row cleared; the warning row waits for a scan that read events")
 
-    def test_a_skipped_grouped_kind_matches_its_object_kind(self):
-        self.assertTrue(stall_watch.resource_names_kind("gateways.gateway.networking.k8s.io", "Gateway"))
-        self.assertTrue(stall_watch.resource_names_kind("networkpolicies.networking.k8s.io", "NetworkPolicy"))
+    def test_a_skipped_resource_matches_its_object_kind(self):
+        for resource, kind in (("gateways.gateway.networking.k8s.io", "Gateway"), ("networkpolicies.networking.k8s.io", "NetworkPolicy"), ("ingresses.networking.k8s.io", "Ingress"), ("statefulsets", "StatefulSet"), ("jobs.batch", "Job")):
+            self.assertTrue(stall_watch.resource_names_kind(resource, kind), (resource, kind))
         self.assertFalse(stall_watch.resource_names_kind("deployments", "Gateway"))
+
+    def test_the_system_namespace_set_is_the_reliability_audits_s1(self):
+        # Read the SOP the way the roster test reads it, so a namespace added
+        # to S1 is required to reach this script too.
+        import re
+        sop = (Path(stall_watch.__file__).resolve().parents[1] / "governance" / "obtainability_audit_sop.md").read_text()
+        anchor = "**S1 — system namespace:**"
+        tail = sop[sop.index(anchor) + len(anchor):].split("\n", 1)[0]
+        connector = re.compile(r"^,?\s*(or\s+)?(plus\s+)?(any namespace matching\s+)?$")
+        found, end = [], None
+        for match in re.finditer(r"`([A-Za-z0-9\-.*]+)`", tail):
+            if end is not None and not connector.match(tail[end : match.start()]):
+                break
+            found.append(match.group(1))
+            end = match.end()
+        ours = set(stall_watch.SYSTEM_NAMESPACES) | {p + "*" for p in stall_watch.SYSTEM_NAMESPACE_PREFIXES}
+        self.assertEqual(ours, set(found))
 
     def test_a_partial_scan_still_adds_new_rows(self):
         lines, _ = self.run_tick({"c": {"checkout": ([DEPLOYMENT_ROW], NOT_SCANNED)}})
