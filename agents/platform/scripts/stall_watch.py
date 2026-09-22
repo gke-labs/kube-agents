@@ -1201,7 +1201,9 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         if status is None:
             # The key may have handed back a finished card; adopt nothing the
-            # board cannot describe, and let the next tick ask again.
+            # board cannot describe, and let the next tick ask again. The card
+            # was filed all the same, so it counts against this tick's ceiling.
+            opened += 1
             sys.stderr.write(f"stall_watch: could not read the status of card {task_id} for {scope}; the next tick asks again\n")
             continue
         opened += 1

@@ -665,6 +665,11 @@ class Cards(Base):
         self.assertNotEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["card"], old)
         self.assertEqual(len(self.noticed(lines)), 1)
 
+    def test_cards_the_board_cannot_describe_still_count_against_the_ceiling(self):
+        self.board.fail_show = True
+        self.run_tick({"c": {f"tenant-{i}": [DEPLOYMENT_ROW | {"namespace": f"tenant-{i}"}] for i in range(5)}})
+        self.assertEqual(len(self.board.cards), stall_watch.MAX_CARDS_PER_TICK)
+
     def test_a_finished_card_handed_back_for_a_repeated_key_is_not_adopted(self):
         # Defence in depth: even if the key repeats, a terminal card is never
         # recorded as the episode's card.

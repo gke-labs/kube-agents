@@ -10,9 +10,9 @@
 # prompt is the card body stall_watch.card_body files, so the case grades the
 # brief the cron actually sends.
 #
-# The objective needs the object and its missing referent together: naming
-# inventory-api alone is in any report, and "inventory-flags" alone could be a
-# guess from the Deployment's spec without checking the ConfigMap is absent.
+# Both object names are in the prompt, so a report that restates the brief
+# names them without running anything. The objective also needs the skill's
+# contracted closing line, "stalled resources: 1", which only a scan prints.
 # Two safeguards join when #1873 lands the role, since a fleet check may only
 # name a role fixtures.json defines: the ConfigMap inventory-flags stays absent
 # in seeded-stall, and inventory-api's envFrom still names it. They catch the
@@ -51,9 +51,9 @@ fixtures:
   - stalled-controller
 
 verification_spec:
-  - name: the-report-names-the-missing-configmap
+  - name: the-scan-reports-the-missing-configmap
     role: objective
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["inventory-api", "inventory-flags"]
+      required_phrases: ["inventory-flags", "stalled resources: 1"]

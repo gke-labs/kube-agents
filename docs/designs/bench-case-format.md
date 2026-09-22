@@ -328,7 +328,7 @@ statement of the rule; `bench/CUSTOM-TASKS.md`, `bench/CONTRIBUTING.md` and
 `scripts/validate_bench_cases.py` checks all of the above without a cluster, and
 `make bench-case-check` runs it in about a second. It rejects a `task_id:` spelling or an
 id that disagrees with its directory, a `domain:` that is missing or not in
-`domains.yaml`, a `fixtures:` role the fleet catalog does not define, a cluster-reading
+`domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
 as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
