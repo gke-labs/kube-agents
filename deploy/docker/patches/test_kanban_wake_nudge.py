@@ -14,9 +14,12 @@ import unittest
 from pathlib import Path
 
 from apply_kanban_wake_nudge import (
+    COMPLETE_ANCHOR,
     CREATE_ANCHOR,
     DB_RELATIVE,
+    DISPATCHER_MONITOR_ANCHOR,
     DISPATCHER_SLEEP_ANCHOR,
+    NOTIFIER_MONITOR_ANCHOR,
     NOTIFIER_SLEEP_ANCHOR,
     UNBLOCK_ANCHOR,
     WATCHERS_RELATIVE,
@@ -279,8 +282,7 @@ def create_task(conn, **kwargs):
 
 def complete_task(conn, task_id):
     _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    recompute_ready(conn)  # separate txn so children see ``done``
     _cleanup_workspace(conn, task_id)
     return True
 
@@ -301,43 +303,43 @@ def unblock_task(conn, task_id):
         return True
 '''
 
-# The consumers, reduced to the two loops the patch rewrites.
+# The consumers, reduced to the two loops the patch rewrites and the shared
+# sleep they both call (v2026.9.14; the sleep call is byte-identical at both
+# sites, which is why each sleep anchor carries the log line above it).
 UPSTREAM_WATCHERS = '''\
 class GatewayKanbanWatchersMixin:
+    async def _sleep_between_ticks(self, interval: float) -> None:
+        interval = max(interval, 1.0)
+        slept = 0.0
+        while slept < interval and self._running:
+            await asyncio.sleep(min(1.0, interval - slept))
+            slept += 1.0
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
-        _GC_INTERVAL_SECONDS = 3600.0
-        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup
+        # Stale done-sub GC: subs survive ``done``, so boards that never
+        # archive would accumulate rows scanned every tick. One DELETE per
+        # board, at startup (0 → first tick) and at most hourly.
+        _gc_next_at = 0.0
 
         while self._running:
             try:
                 deliveries = await asyncio.to_thread(collect)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
-            # Sleep with cancellation checks.
-            for _ in range(int(max(1, interval))):
-                if not self._running:
-                    return
-                await asyncio.sleep(1)
+            await self._sleep_between_ticks(interval)
 
     async def _kanban_dispatcher_watcher(self) -> None:
-        logger.info(
-            "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
-        )
+        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
             try:
                 results = await asyncio.to_thread(tick)
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
-            slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
+            await self._sleep_between_ticks(interval)
 
         self._release_kanban_dispatcher_lock()
 '''
@@ -358,10 +360,23 @@ def patch_tree(db_source=UPSTREAM_DB, watchers_source=UPSTREAM_WATCHERS):
 
 class ApplyTest(unittest.TestCase):
     def test_every_anchor_matches_the_miniature_upstream_exactly_once(self):
-        for anchor in (CREATE_ANCHOR, UNBLOCK_ANCHOR):
+        for anchor in (CREATE_ANCHOR, COMPLETE_ANCHOR, UNBLOCK_ANCHOR):
             self.assertEqual(UPSTREAM_DB.count(anchor), 1, anchor)
-        for anchor in (NOTIFIER_SLEEP_ANCHOR, DISPATCHER_SLEEP_ANCHOR):
+        for anchor in (
+            NOTIFIER_MONITOR_ANCHOR,
+            NOTIFIER_SLEEP_ANCHOR,
+            DISPATCHER_MONITOR_ANCHOR,
+            DISPATCHER_SLEEP_ANCHOR,
+        ):
             self.assertEqual(UPSTREAM_WATCHERS.count(anchor), 1, anchor)
+
+    def test_the_shared_sleep_call_alone_is_ambiguous(self):
+        # The reason both sleep anchors carry the log line above them: the call
+        # is byte-identical at both sites, so `substitute` would SystemExit on
+        # expected=1 and raising the count would hide a loop upstream added.
+        self.assertEqual(
+            UPSTREAM_WATCHERS.count("            await self._sleep_between_ticks(interval)\n"), 2
+        )
 
     def test_all_three_producers_gain_a_nudge(self):
         db, _ = patch_tree()
@@ -394,8 +409,15 @@ class ApplyTest(unittest.TestCase):
             watchers.count("_wake_monitor = _KanbanWakeMonitor(_kb.kanban_db_path)"), 2
         )
         self.assertEqual(watchers.count("await _kanban_wait_interval("), 2)
-        # The notifier's shutdown `return` must survive the swap.
-        self.assertIn("            ):\n                return", watchers)
+        # Neither loop may keep the shared fixed sleep: a loop that still calls
+        # it never sees a nudge and silently keeps the full-interval poll.
+        self.assertNotIn("await self._sleep_between_ticks(interval)", watchers)
+        # The helper itself stays: it is upstream's method, not this patch's.
+        self.assertIn("async def _sleep_between_ticks(self, interval: float)", watchers)
+        # The dispatcher must fall through to its lock release, not return.
+        self.assertIn(
+            "            )\n\n        self._release_kanban_dispatcher_lock()", watchers
+        )
 
     def test_the_import_trailers_are_appended(self):
         db, watchers = patch_tree()
@@ -412,7 +434,9 @@ class ApplyTest(unittest.TestCase):
         ast.parse(watchers)
 
     def test_a_drifted_anchor_fails_loudly_and_names_the_edit(self):
-        drifted = UPSTREAM_WATCHERS.replace("await asyncio.sleep(1)", "await asyncio.sleep(2)")
+        drifted = UPSTREAM_WATCHERS.replace(
+            "await self._sleep_between_ticks(interval)", "await self._sleep_between_ticks(interval, jitter)"
+        )
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(watchers_source=drifted)
         self.assertIn("notifier sleep", str(ctx.exception))
@@ -425,8 +449,26 @@ class ApplyTest(unittest.TestCase):
         (root / WATCHERS_RELATIVE).parent.mkdir(parents=True)
         (root / WATCHERS_RELATIVE).write_text(UPSTREAM_WATCHERS)
         apply(root)
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as ctx:
             apply(root)
+        # The complete_task anchor survives its own edit, so this has to be the
+        # sentinel speaking, not a lucky "found 0" on some other anchor.
+        self.assertIn("already patched", str(ctx.exception))
+        self.assertEqual((root / DB_RELATIVE).read_text().count("_kanban_record_wake(conn)"), 3)
+
+    def test_a_drifted_watcher_anchor_leaves_kanban_db_untouched(self):
+        # Producers that nudge watchers which never learned to listen would be
+        # a half-applied patch that every grep for the producer side passes.
+        drifted = UPSTREAM_WATCHERS.replace("_gc_next_at = 0.0", "_gc_next_at = 0")
+        root = Path(tempfile.mkdtemp())
+        (root / DB_RELATIVE).parent.mkdir(parents=True)
+        (root / DB_RELATIVE).write_text(UPSTREAM_DB)
+        (root / WATCHERS_RELATIVE).parent.mkdir(parents=True)
+        (root / WATCHERS_RELATIVE).write_text(drifted)
+        with self.assertRaises(SystemExit) as ctx:
+            apply(root)
+        self.assertIn("notifier monitor", str(ctx.exception))
+        self.assertEqual((root / DB_RELATIVE).read_text(), UPSTREAM_DB)
 
     def test_a_missing_file_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:

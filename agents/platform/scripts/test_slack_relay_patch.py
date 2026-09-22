@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import dataclasses
 import importlib.util
 import io
@@ -603,6 +604,30 @@ class SlackRelayPatchTest(unittest.TestCase):
 
         self.assertFalse(connected)
         self.assertEqual(adapter.config.token, "relay:")
+
+    def test_download_bytes_accepts_upstream_html_label_keyword(self):
+        """v2026.9.14 gave ``_download_slack_file_bytes`` a keyword-only
+        ``html_label`` and has ``_download_slack_file`` pass it. Both methods
+        are replaced here, but the shim keeps upstream's shape, so a caller
+        written against upstream cannot TypeError on the relayed one."""
+        adapter = self._create_adapter(token="")
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeHTTPResponse({"data": base64.b64encode(b"bytes").decode()})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            content = asyncio.run(
+                adapter._download_slack_file_bytes(
+                    "https://files.slack.com/f", team_id="T1", html_label="media"
+                )
+            )
+
+        self.assertEqual(content, b"bytes")
+        self.assertEqual(captured["url"], RELAY_URL + "/v1/chat/slack/files/download")
+        self.assertEqual(captured["payload"], {"url": "https://files.slack.com/f", "teamId": "T1"})
 
 
 class SlackStandaloneRelaySendTest(unittest.TestCase):

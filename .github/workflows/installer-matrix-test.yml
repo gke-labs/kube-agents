@@ -104,18 +104,18 @@ jobs:
       # steps below and turn them into no-ops.
       - name: Validate Dry-Run Installer (Non-Interactive)
         run: |
-          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./install.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1" --image-tag="$GITHUB_SHA"
+          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./install.sh --dry-run -y --gcp-project-id="ci-test-project" --gke-cluster-name="ci-test-cluster" --gcp-region="us-central1" --image-tag="$GITHUB_SHA"
 
       - name: Validate Dry-Run Teardown (Non-Interactive)
         run: |
-          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./uninstall.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1"
+          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./uninstall.sh --dry-run -y --gcp-project-id="ci-test-project" --gke-cluster-name="ci-test-cluster" --gcp-region="us-central1"
 
       - name: Validate Dry-Run Upgrade (Non-Interactive)
         run: |
-          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./upgrade.sh --dry-run -y --upgrade-mode=full --project-id="ci-test-project" --image-tag="$GITHUB_SHA"
+          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./upgrade.sh --dry-run -y --upgrade-mode=full --gcp-project-id="ci-test-project" --image-tag="$GITHUB_SHA"
 
       # The gcloud stub answers NOT_FOUND, so every dry run here takes the
-      # fresh-create path — the one case where --cluster-mode has a say. That
+      # fresh-create path — the one case where --gke-cluster-mode has a say. That
       # makes the generated tfvars the whole assertion.
       - name: Validate Dry-Run Installer Cluster Mode
         run: |
@@ -123,16 +123,16 @@ jobs:
           tfvars="terraform/examples/full-install/terraform.tfvars"
           for mode in standard autopilot; do
             PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./install.sh --dry-run -y \
-              --project-id="ci-test-project" --cluster-name="ci-test-cluster" \
-              --region="us-central1" --cluster-mode="$mode" --image-tag="$GITHUB_SHA"
+              --gcp-project-id="ci-test-project" --gke-cluster-name="ci-test-cluster" \
+              --gcp-region="us-central1" --gke-cluster-mode="$mode" --image-tag="$GITHUB_SHA"
             if ! grep -qE "^cluster_mode[[:space:]]+= \"${mode}\"\$" "$tfvars"; then
-              echo "--cluster-mode=${mode} did not reach terraform.tfvars:" >&2
+              echo "--gke-cluster-mode=${mode} did not reach terraform.tfvars:" >&2
               grep cluster_mode "$tfvars" >&2
               exit 1
             fi
           done
 
-          # Adoption: the live cluster's shape overrules --cluster-mode.
+          # Adoption: the live cluster's shape overrules --gke-cluster-mode.
           #
           # This used to assert the same thing about vars.sh, because the
           # installer wrote the probed shape back there and upgrade.sh and
@@ -143,11 +143,11 @@ jobs:
           # is the whole contract. terraform.tfvars is also what CI can check
           # on a dry run, which deliberately creates no install.env.
           STUB_LIVE_AUTOPILOT=true PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" \
-            ./install.sh --dry-run -y --project-id="ci-test-project" \
-            --cluster-name="ci-test-cluster" --region="us-central1" \
-            --cluster-mode="standard" --image-tag="$GITHUB_SHA"
+            ./install.sh --dry-run -y --gcp-project-id="ci-test-project" \
+            --gke-cluster-name="ci-test-cluster" --gcp-region="us-central1" \
+            --gke-cluster-mode="standard" --image-tag="$GITHUB_SHA"
           if ! grep -qE "^cluster_mode[[:space:]]+= \"autopilot\"\$" "$tfvars"; then
-            echo "the live Autopilot cluster did not overrule --cluster-mode=standard:" >&2
+            echo "the live Autopilot cluster did not overrule --gke-cluster-mode=standard:" >&2
             grep -iE "cluster_mode" "$tfvars" >&2
             exit 1
           fi

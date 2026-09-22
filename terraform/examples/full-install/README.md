@@ -47,7 +47,9 @@ install without the interview.
   checkout with Workload Identity annotations and the credentials Secret
   composed from your variables. `model_provider` selects which provider
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
-  `model_default_name` overrides the per-provider default model.
+  `model_default_name` overrides the per-provider default model;
+  `model_max_tokens` (default `0`, meaning none) sets the output-token budget
+  the gateway asks for on a request that names none.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.

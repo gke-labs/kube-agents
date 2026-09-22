@@ -99,173 +99,235 @@ class ProgressNoteTest(unittest.TestCase):
 
 # --- the applier's own safety net -------------------------------------------
 #
-# The inserted branch ends in `continue`, which is only legal where the anchor
-# actually sits: inside the notifier's per-event loop. If upstream ever moves
-# that elif chain out of a loop, the anchor would still match and the patch
-# would still apply — and ast.parse() would still say the file is fine, because
-# a misplaced `continue` is a compile-time error, not a syntax one. The build
-# would ship an image whose gateway raises on import.
+# The send anchor carries upstream's own ``await``, so a synchronous
+# ``_send_event`` cannot match it; what an anchor cannot check is that the
+# text it matched, or the text it inserted, is legal where it sits. An
+# ``await`` outside a coroutine is exactly what ast.parse() accepts and
+# compile() rejects, so a fixture with a plain ``def`` around the anchor is
+# the one shape that tells the two apart: it pins that patchlib compiles what
+# it wrote rather than parsing it, the same net that catches an inserted
+# branch spliced one indent level out of its ``for``.
 
-_KINDS_ANCHOR_HOST = "class Watcher:\n    def run(self):\n"
 # The tuple the applier widens. Spelled out here rather than imported from the
 # applier, because the whole point of locating it by name is that the applier no
 # longer holds a copy of upstream's membership: a fixture that imported one
-# could not tell the locator from the literal anchor it replaced.
+# could not tell the locator from the literal anchor it replaced. Module-level
+# since v2026.9.14 (gateway/kanban_watchers_notifier.py).
 _KINDS_ASSIGN = (
-    '        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", '
-    '"timed_out", "status", "archived", "unblocked", "block_loop_detected")\n'
+    'TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", '
+    '"timed_out", "status", "archived", "unblocked", "block_loop_detected", '
+    '"review_requested", "changes_requested")\n'
 )
-_RENDER_ANCHOR_HOST_TAIL = (
-    "            if True:\n"
-    "                if True:\n"
-    "                    if True:\n"
-    '                        if kind == "completed":\n'
-    '                            msg = "done"\n'
+# The formatter the heartbeat def is inserted after, and the table it is
+# registered in — upstream's shape, reduced to what the locator and the anchor
+# read.
+_FORMATTERS_HOST = (
+    "\n\n"
+    "def _fmt_completed(ev, n) -> tuple:\n"
+    '    return "done", None, None\n'
+    "\n\n"
+    "def _fmt_changes_requested(ev, n) -> tuple:\n"
+    '    return "changes", None, None\n'
+    "\n\n"
+    "# archived / unblocked are claimed but intentionally silent.\n"
 )
-_RENDER_ANCHOR_BODY = '                            msg = "status"\n'
-# The send anchor sits at the same depth as the elif chain, and `try:` needs a
-# handler for the file to compile at all.
-_SEND_ANCHOR_TAIL = (
-    "                        except Exception:\n"
-    "                            pass\n"
+_FORMATTERS_BODY = (
+    '    "completed": _fmt_completed,\n'
+    "}\n"
+)
+# The class the header and send anchors sit in. ``tag`` is the local upstream
+# computes on the line above the header anchor.
+_CLASS_HEAD = (
+    "\n\nclass _KanbanNotification:\n"
+    "    def __init__(self, runner, d):\n"
+    "        self.runner = runner\n"
+    '        tag = "@w "\n'
+    '        self.board_tag = "[b] "\n'
+    '        self.task_id = "t_1"\n'
 )
 
 
-def _watchers_source(loop: bool, kinds: str = _KINDS_ASSIGN) -> str:
-    """A stand-in kanban_watchers.py carrying both anchors at their real indents.
-
-    ``loop=False`` puts the elif chain at the same indentation but outside any
-    loop — the shape the applier has to reject. ``kinds`` overrides the
-    TERMINAL_KINDS assignment, for the drift cases the locator has to survive.
-    """
-    outer = (
-        "    for d in deliveries:\n        for ev in d:\n"
-        if loop
-        else "    if deliveries:\n        if deliveries:\n"
-    )
+def _send_method(coroutine: bool) -> str:
+    keyword = "async def" if coroutine else "def"
     return (
-        _KINDS_ANCHOR_HOST
-        + kinds
-        # `async def`, because the send anchor's replacement awaits: compile()
-        # rejects an await that lands outside a coroutine, so this shape is
-        # also what proves the anchor is inside one.
-        + "\n\nasync def notify(deliveries, kind, board_tag, tag):\n"
-        + outer
-        + _RENDER_ANCHOR_HOST_TAIL
-        + applier.RENDER_ANCHOR
-        + _RENDER_ANCHOR_BODY
-        + applier.SEND_ANCHOR
-        + _SEND_ANCHOR_TAIL
+        f"\n    {keyword} _send_event(self, ev, msg):\n"
+        "        sub, adapter, metadata = self.sub, self.adapter, {}\n"
     )
 
 
-_TOOLS_SOURCE = (
-    "HEARTBEAT = {\n"
+def _notifier_source(coroutine: bool, kinds: str = _KINDS_ASSIGN) -> str:
+    """A stand-in kanban_watchers_notifier.py carrying every site at its real shape.
+
+    ``coroutine=False`` makes ``_send_event`` a plain ``def`` — the shape the
+    applier has to reject, because its replacement awaits. ``kinds`` overrides
+    the TERMINAL_KINDS assignment, for the drift cases the locator has to
+    survive.
+    """
+    return (
+        kinds
+        + _FORMATTERS_HOST
+        + applier.FORMATTERS_ANCHOR
+        + _FORMATTERS_BODY
+        + _CLASS_HEAD
+        + applier.HEADER_ANCHOR
+        + _send_method(coroutine)
+        + applier.SEND_ANCHOR
+    )
+
+
+# The schema module builds every tool's schema through _schema()/_prop(); the
+# two anchors are the argument text of the heartbeat one.
+_SCHEMAS_SOURCE = (
+    "KANBAN_HEARTBEAT_SCHEMA = _schema(\n"
+    '    "kanban_heartbeat",\n'
     + applier.SCHEMA_ANCHOR
-    + '    "parameters": {\n'
-    + '        "properties": {\n'
+    + "    {\n"
     + applier.NOTE_ANCHOR
-    + "        },\n"
     + "    },\n"
-    + "}\n"
+    + "    [],\n"
+    + ")\n"
 )
 
 
 class ApplierTest(unittest.TestCase):
-    def _tree(self, loop: bool, kinds: str = _KINDS_ASSIGN) -> Path:
+    def _tree(self, coroutine: bool = True, kinds: str = _KINDS_ASSIGN) -> Path:
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root)
         (root / "gateway").mkdir()
         (root / "tools").mkdir()
-        (root / "gateway" / "kanban_watchers.py").write_text(
-            _watchers_source(loop, kinds)
+        (root / applier.NOTIFIER_RELATIVE).write_text(
+            _notifier_source(coroutine, kinds)
         )
-        (root / "tools" / "kanban_tools.py").write_text(_TOOLS_SOURCE)
+        (root / applier.SCHEMAS_RELATIVE).write_text(_SCHEMAS_SOURCE)
         return root
 
+    def _notifier(self, root: Path) -> str:
+        return (root / applier.NOTIFIER_RELATIVE).read_text()
+
     def test_it_patches_a_tree_that_matches_the_shipped_image(self):
-        root = self._tree(loop=True)
+        root = self._tree()
         applier.apply(root)
-        patched = (root / "gateway" / "kanban_watchers.py").read_text()
-        self.assertIn('elif kind == "heartbeat":', patched)
+        patched = self._notifier(root)
+        self.assertIn('"heartbeat": _fmt_heartbeat,', patched)
+        self.assertIn("def _fmt_heartbeat(ev, n) -> tuple:", patched)
         self.assertIn('+ ("heartbeat",)', patched)
+        self.assertIn("self.progress_header = ", patched)
         self.assertIn("from gateway.kanban_progress_lines import progress_note", patched)
         self.assertIn("from gateway.kanban_progress_lines import deliver", patched)
         # Every line the notifier posts now goes through deliver(), so a
         # surviving bare send() would be a line that skipped the rolling
-        # message entirely.
+        # message entirely — and the map has to hang off the runner, because
+        # the notification object is rebuilt for every delivery.
         self.assertIn("_send_res = await _progress_deliver(", patched)
+        self.assertIn("self.runner, adapter, sub, ev.kind, ev, msg, metadata,", patched)
         self.assertNotIn("_send_res = await adapter.send(", patched)
-        # _WAKE_KINDS is untouched by design; the point of a progress line is
-        # that it costs no LLM turn.
-        self.assertIn("A one-line progress update", (root / "tools" / "kanban_tools.py").read_text())
+        self.assertIn(
+            "A one-line progress update",
+            (root / applier.SCHEMAS_RELATIVE).read_text(),
+        )
 
-    def test_a_continue_outside_a_loop_fails_the_build(self):
-        root = self._tree(loop=False)
+    def test_the_formatter_lands_between_the_last_upstream_one_and_the_table(self):
+        # The table references the def at import time, so the def has to come
+        # before it; sitting after upstream's last formatter keeps the file
+        # reading in upstream's order.
+        root = self._tree()
+        applier.apply(root)
+        patched = self._notifier(root)
+        self.assertLess(
+            patched.index("def _fmt_changes_requested"),
+            patched.index("def _fmt_heartbeat"),
+        )
+        self.assertLess(patched.index("def _fmt_heartbeat"), patched.index("_EVENT_FORMATTERS"))
+        ast.parse(patched)
+
+    def test_a_noteless_heartbeat_formats_to_none(self):
+        # The silent path: format_event() returns the formatter's message and
+        # _send_pings() skips a None, which is what keeps ~2,100 auto-heartbeats
+        # off the thread. Exercised on the applier's own emitted source.
+        namespace = {"_progress_note": progress_note}
+        exec(applier.FORMATTER_DEF, namespace)  # noqa: S102 - the patch's own text
+        fmt = namespace["_fmt_heartbeat"]
+        n = SimpleNamespace(progress_header="[default] @platform ")
+        self.assertEqual(fmt(SimpleNamespace(payload=None), n), (None, None, None))
+        self.assertEqual(fmt(SimpleNamespace(payload={}), n), (None, None, None))
+        self.assertEqual(
+            fmt(SimpleNamespace(payload={"note": "scanned 3 of 7"}), n),
+            ("⏳ [default] @platform scanned 3 of 7", None, None),
+        )
+
+    def test_an_await_outside_a_coroutine_fails_the_build(self):
+        root = self._tree(coroutine=False)
         with self.assertRaises(SystemExit) as caught:
             applier.apply(root)
         self.assertIn("no longer parses", str(caught.exception))
         # ast.parse would have waved this through, which is why it is gone.
-        ast.parse(_watchers_source(loop=False))
+        ast.parse(_notifier_source(coroutine=False))
 
     def test_a_drifted_anchor_fails_the_build(self):
-        root = self._tree(loop=True)
-        path = root / "gateway" / "kanban_watchers.py"
-        path.write_text(path.read_text().replace(applier.RENDER_ANCHOR, ""))
+        root = self._tree()
+        path = root / applier.NOTIFIER_RELATIVE
+        path.write_text(path.read_text().replace(applier.SEND_ANCHOR, ""))
         with self.assertRaises(SystemExit) as caught:
             applier.apply(root)
         self.assertIn("found 0", str(caught.exception))
+        self.assertIn("notifier send", str(caught.exception))
+
+    def test_a_missing_last_formatter_fails_the_build(self):
+        root = self._tree()
+        path = root / applier.NOTIFIER_RELATIVE
+        path.write_text(path.read_text().replace("_fmt_changes_requested", "_fmt_review_changes"))
+        with self.assertRaises(SystemExit) as caught:
+            applier.apply(root)
+        self.assertIn("expected 1 module-level def _fmt_changes_requested()", str(caught.exception))
 
 
 # --- what the TERMINAL_KINDS locator buys over the literal it replaced --------
 #
 # The literal anchor on that line failed the build on every upstream edit to the
-# tuple, and v2026.8.13 made exactly such an edit ("review_requested"). These
-# pin the trade the locator makes: membership upstream owns may change, the
-# tuple still being the terminal-kind filter may not.
+# tuple, and v2026.8.13 and v2026.9.14 each made exactly such an edit
+# ("review_requested", then "changes_requested"). These pin the trade the
+# locator makes: membership upstream owns may change, the tuple still being the
+# terminal-kind filter may not.
 
 
 class TerminalKindsLocatorTest(ApplierTest):
     def test_an_upstream_added_kind_still_patches(self):
         widened = _KINDS_ASSIGN.replace(
-            '"block_loop_detected")', '"block_loop_detected", "review_requested")'
+            '"changes_requested")', '"changes_requested", "abandoned")'
         )
-        root = self._tree(loop=True, kinds=widened)
+        root = self._tree(kinds=widened)
         applier.apply(root)
-        patched = (root / "gateway" / "kanban_watchers.py").read_text()
+        patched = self._notifier(root)
         # Upstream's addition survives, and heartbeat is appended to it.
-        self.assertIn('"review_requested"', patched)
+        self.assertIn('"abandoned"', patched)
         self.assertIn('+ ("heartbeat",)', patched)
 
     def test_a_reformatted_tuple_still_patches(self):
         multiline = (
-            "        TERMINAL_KINDS = (\n"
-            '            "completed",\n'
-            '            "blocked",\n'
-            '            "gave_up",\n'
-            '            "crashed",\n'
-            '            "timed_out",\n'
-            "        )\n"
+            "TERMINAL_KINDS = (\n"
+            '    "completed",\n'
+            '    "blocked",\n'
+            '    "gave_up",\n'
+            '    "crashed",\n'
+            '    "timed_out",\n'
+            ")\n"
         )
-        root = self._tree(loop=True, kinds=multiline)
+        root = self._tree(kinds=multiline)
         applier.apply(root)
-        self.assertIn(
-            '+ ("heartbeat",)',
-            (root / "gateway" / "kanban_watchers.py").read_text(),
-        )
+        self.assertIn('+ ("heartbeat",)', self._notifier(root))
 
     def test_a_filter_that_lost_a_kind_fails_the_build(self):
         # Membership this patch reasons about is asserted, not searched on, so
         # a repurposed tuple fails with what it expected rather than vanishing.
         gutted = _KINDS_ASSIGN.replace('"crashed", ', "")
-        root = self._tree(loop=True, kinds=gutted)
+        root = self._tree(kinds=gutted)
         with self.assertRaises(SystemExit) as caught:
             applier.apply(root)
         self.assertIn("no longer holds 'crashed'", str(caught.exception))
 
     def test_a_renamed_filter_fails_the_build(self):
         renamed = _KINDS_ASSIGN.replace("TERMINAL_KINDS", "CLAIMED_KINDS")
-        root = self._tree(loop=True, kinds=renamed)
+        root = self._tree(kinds=renamed)
         with self.assertRaises(SystemExit) as caught:
             applier.apply(root)
         self.assertIn("expected 1 assignment to TERMINAL_KINDS", str(caught.exception))
@@ -274,7 +336,7 @@ class TerminalKindsLocatorTest(ApplierTest):
         # The kinds edit does not consume an anchor, so the count check cannot
         # catch a re-run; without refuse_if_patched it would append a second
         # "heartbeat".
-        root = self._tree(loop=True)
+        root = self._tree()
         applier.apply(root)
         with self.assertRaises(SystemExit) as caught:
             applier.apply(root)

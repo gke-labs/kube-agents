@@ -320,16 +320,12 @@ class RenderingTest(unittest.TestCase):
                 _, _, text = render({**_COORDS, "MEMORY_PROVIDER": provider})
                 self.assertEqual(parse(text)["MEMORY"], expected)
 
-    def test_staging_spells_the_namespace_without_the_agent_prefix(self):
-        """rc and nightly set AGENT_NAMESPACE; staging sets NAMESPACE.
-
-        Both have installs running against them, so neither can be renamed in
-        the GitHub UI without a window where the reconcile reads an empty value.
-        """
+    def test_namespace_is_mapped(self):
+        """NAMESPACE maps to NAMESPACE in install.env."""
         _, _, text = render({**_COORDS, "NAMESPACE": "kubeagents-system"})
         self.assertEqual(parse(text)["NAMESPACE"], "kubeagents-system")
 
-        _, _, text = render({**_COORDS, "AGENT_NAMESPACE": "other-ns"})
+        _, _, text = render({**_COORDS, "NAMESPACE": "other-ns"})
         self.assertEqual(parse(text)["NAMESPACE"], "other-ns")
 
     def test_a_value_with_shell_syntax_in_it_survives_a_round_trip(self):

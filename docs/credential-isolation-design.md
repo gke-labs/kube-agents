@@ -159,6 +159,8 @@ and the route table it feeds
 - PlatformAgent only.
 - Credentials managed by the operator.
 - CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
+- Read-only Google Cloud REST relay for the reads no CLI exposes
+  ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)).
 - Slack and Google Chat credentialed relays.
 - PlatformAgent API bearer-key termination in the `agent-api-auth` sidecar.
 - GitHub installation tokens minted through Minty.
@@ -721,6 +723,19 @@ Consequences:
   `SIGSEGV` on a deeply nested document, where the Python loader raises a
   catchable error. The input is chosen by the sandbox, so this is a
   denial-of-service boundary rather than a performance choice.
+
+### Cloud API reads
+
+`GET /v1/gcp/<host>/<path>?<query>` relays one Google REST read the sandbox cannot
+make itself. The credential runtime holds the request to normal form, checks the
+host, method and path against the code allowlist in
+`agents/platform/scripts/api_policy.py`, forwards it on its own identity with
+only its own `Authorization` and `Accept` headers and the credential-substituting
+query keys removed, and returns the upstream status, `Content-Type` and body
+unchanged under a response cap and a deadline. The shell role alone may call it;
+token-issuing hosts are refused before the table, redirects are not followed, and
+a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
+[`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
 
 ### Chat
 

@@ -618,7 +618,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("create_cluster             = true", content)
 
     def test_tfvars_fresh_create_honours_cluster_mode(self):
-        # --cluster-mode reaches the generator through the exported environment. The probe found
+        # --gke-cluster-mode reaches the generator through the exported environment. The probe found
         # nothing, so the interview's choice is the only shape on offer.
         #
         # Asks for "standard" specifically: autopilot is now DEFAULT_CLUSTER_MODE,
@@ -707,10 +707,46 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("accept_no_network_policy   = true", dest.read_text())
 
+    def test_tfvars_carry_model_max_tokens(self):
+        # Empty and unset both take DEFAULT_MODEL_MAX_TOKENS (0), which renders
+        # nothing; a value is emitted as a bare HCL number, not a string.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, "model_max_tokens   = 0"),
+                ({"MODEL_MAX_TOKENS": ""}, "model_max_tokens   = 0"),
+                ({"MODEL_MAX_TOKENS": "4096"}, "model_max_tokens   = 4096"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_model_max_tokens_that_is_not_a_whole_number(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator is the check that reaches it; a bare
+        # word would otherwise fail at terraform's parser.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("4k", "-1", "4096.5"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "MODEL_MAX_TOKENS": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn("MODEL_MAX_TOKENS", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
         # gvisor RuntimeClass natively. Passing ENABLE_GVISOR straight through
-        # made --gvisor=true unusable there rather than sandboxing the agent.
+        # made --enable-gvisor=true unusable there rather than sandboxing the agent.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -877,7 +913,7 @@ class InstallerCommonTest(unittest.TestCase):
         )
 
     def test_tfvars_autopilot_floor_names_a_way_out_for_every_caller(self):
-        # The abort's remedy has to work for whoever hit it. --gvisor=false is
+        # The abort's remedy has to work for whoever hit it. --enable-gvisor=false is
         # install.sh's; upgrade.sh rejects that flag and reads install.env
         # instead, so naming only the flag sends its callers to a dead end.
         proc = self._run(
@@ -889,7 +925,7 @@ class InstallerCommonTest(unittest.TestCase):
             describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
-        self.assertIn("--gvisor=false", proc.stderr)
+        self.assertIn("--enable-gvisor=false", proc.stderr)
         self.assertIn("install.env", proc.stderr)
 
     def test_tfvars_gvisor_off_clears_the_floor_on_a_sub_floor_autopilot(self):

@@ -268,15 +268,17 @@ class ApplyTest(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.target = self.root / RELATIVE
         self.target.parent.mkdir(parents=True, exist_ok=True)
+        # _resolve_notify_target (v2026.9.14 shape), reduced to the anchor and
+        # the reads around it: the early return above, the kwargs dict below.
         self.target.write_text(
-            "def _maybe_auto_subscribe(conn, tid):\n"
-            "    try:\n"
-            "        platform = get_session_env('HERMES_SESSION_PLATFORM', '')\n"
-            "        chat_id = get_session_env('HERMES_SESSION_CHAT_ID', '')\n"
+            "def _resolve_notify_target():\n"
+            "    from gateway.session_context import get_session_env as env\n"
+            "    platform, chat_id = env('HERMES_SESSION_PLATFORM', ''), env('HERMES_SESSION_CHAT_ID', '')\n"
+            "    if not platform or not chat_id:\n"
+            "        return None\n"
             + ANCHOR
-            + "        return (platform, chat_id, thread_id)\n"
-            "    except Exception:\n"
-            "        return False\n"
+            + "    return dict(platform=platform, chat_id=chat_id, thread_id=thread_id,\n"
+            "                delivery_mode='notify+wake' if platform != 'tui' else None)\n"
         )
 
     def test_the_edit_lands_and_still_parses(self):
@@ -290,7 +292,7 @@ class ApplyTest(unittest.TestCase):
         apply(self.root)
         patched = self.target.read_text()
         self.assertLess(
-            patched.index('thread_id = get_session_env("HERMES_SESSION_THREAD_ID"'),
+            patched.index('thread_id = env("HERMES_SESSION_THREAD_ID"'),
             patched.index("platform, chat_id, thread_id = _kanban_event_route("),
         )
 
@@ -300,7 +302,7 @@ class ApplyTest(unittest.TestCase):
             apply(self.root)
 
     def test_a_tree_without_the_anchor_is_refused(self):
-        self.target.write_text("def _maybe_auto_subscribe(conn, tid):\n    return False\n")
+        self.target.write_text("def _resolve_notify_target():\n    return None\n")
         with self.assertRaises(SystemExit):
             apply(self.root)
 

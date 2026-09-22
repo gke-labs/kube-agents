@@ -146,6 +146,10 @@
         "modelDefaultName": {
           "type": "string"
         },
+        "maxTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
         "vertex": {
           "type": "object",
           "additionalProperties": false,

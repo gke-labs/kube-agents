@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -65,6 +66,25 @@ const (
 	// is not the same as an object we failed to read. It happens on clusters
 	// where nothing has ever used Server-Side Apply against the object.
 	noOwnersLabel = "none"
+
+	// maxUnreachableClusters bounds how many distinct cluster identities the
+	// shutdown report will name, for the same reason classify.go bounds the
+	// unattributed principal list: the key comes from the record, so the number
+	// of distinct values is set by what arrives rather than by anything this
+	// process controls, and an unbounded map keyed on it grows with the traffic.
+	// A project with more than this many clusters has a fleet-wide onboarding
+	// gap rather than a list of stragglers to read, so the names stop being the
+	// useful part well before the cap.
+	maxUnreachableClusters = 128
+
+	// unreachableOverflowLabel collects every cluster past the cap, so the count
+	// stays exact even where the names stop.
+	unreachableOverflowLabel = "(other clusters; name list capped)"
+
+	// unreachableListSeparator separates rendered cluster entries in the
+	// shutdown line, matching unattributedListSeparator, which renders the other
+	// name-and-count list that line's neighbour prints.
+	unreachableListSeparator = ", "
 )
 
 // joinOutcome says what happened when the detector tried to enrich a record
@@ -99,9 +119,12 @@ const (
 	joinGone joinOutcome = "gone"
 
 	// joinUnreachable is a record for a cluster this process has no client for.
-	// In single-cluster mode that is every cluster but one. It is the outcome
-	// the fan-in in the next task removes, and until then the count is how an
-	// operator sees how much of the stream is going unenriched.
+	//
+	// The fan-in shrank this rather than removing it, and what is left is the
+	// useful part: a cluster in the project with no Cluster Agent profile and no
+	// credential flag naming it -- one not onboarded, or one whose profile was
+	// skipped at discovery. joiner.UnreachableClusters names them, because after
+	// the fan-in the count alone no longer says which.
 	joinUnreachable joinOutcome = "unreachable"
 
 	// joinFailed is any other lookup error: RBAC, a network fault, a timeout,
@@ -209,21 +232,38 @@ type clusterIdentity struct {
 	Cluster  string
 }
 
-// matches reports whether a record was audited on this exact cluster.
-//
-// A record missing any of the three fails to match and is reported unreachable.
-// That is the safe direction: the alternative is treating an incompletely
-// labelled record as local and enriching it from whatever object of that name
-// this cluster happens to hold.
-func (c clusterIdentity) matches(record AuditRecord) bool {
-	return record.Project == c.Project &&
-		record.Location == c.Location &&
-		record.Cluster == c.Cluster
-}
-
 // String renders the identity for the startup line.
 func (c clusterIdentity) String() string {
 	return fmt.Sprintf("%s/%s/%s", c.Project, c.Location, c.Cluster)
+}
+
+// complete reports whether all three parts are present.
+//
+// An audit record missing any of them cannot be routed to a cluster, and is
+// reported unreachable rather than matched. That is the safe direction: the
+// alternative is treating an incompletely labelled record as belonging to
+// whichever registered cluster happens to share the parts it does carry, and
+// enriching it from that cluster's object of the same name.
+//
+// Keeping the partial identity out of the unreachable-cluster list is a
+// separate job, done by noteUnreachable: refusing the record here produces the
+// same joinUnreachable outcome a missed lookup would, so this test cannot be
+// what stops "proj//" being named there.
+func (c clusterIdentity) complete() bool {
+	return c.Project != "" && c.Location != "" && c.Cluster != ""
+}
+
+// recordIdentity reads the cluster an audit record was produced on.
+//
+// The three fields come from resource.labels on the Cloud Logging entry, which
+// GKE sets from the control plane that served the call -- so this is the
+// cluster's own account of itself, not an inference from the object.
+func recordIdentity(record AuditRecord) clusterIdentity {
+	return clusterIdentity{
+		Project:  record.Project,
+		Location: record.Location,
+		Cluster:  record.Cluster,
+	}
 }
 
 // joiner is T3's handler: for each record T2 forwards, it reads the live
@@ -235,16 +275,16 @@ func (c clusterIdentity) String() string {
 // which is exactly why the constraint is written down here rather than left to
 // be rediscovered.
 type joiner struct {
-	// getter reads live objects. Nil disables the join entirely: every record
-	// is forwarded with joinUnreachable, which is the mode the detector runs in
-	// when it has no cluster credentials.
-	getter objectGetter
-
-	// cluster identifies the GKE cluster getter is connected to. A record from
-	// any other cluster is joinUnreachable, because the object it names does not
-	// exist on this one -- and a same-named object that does exist here would be
-	// a different object entirely, which is the failure this guard prevents.
-	cluster clusterIdentity
+	// clusters routes a record to the client that can read its cluster, keyed
+	// by the identity the record carries. A record whose cluster is absent is
+	// joinUnreachable -- never served by another entry, because a same-named
+	// object on the wrong cluster is a different object entirely, which is the
+	// failure this map's key exists to prevent.
+	//
+	// Empty disables the join: every record naming a live object is forwarded
+	// unreachable, which is the mode the detector runs in with no credential
+	// flags and no --profiles-dir.
+	clusters map[clusterIdentity]objectGetter
 
 	// gitopsManagers are the field managers that are the GitOps controller.
 	// Empty means unconfigured, and an unconfigured detector makes no
@@ -256,19 +296,28 @@ type joiner struct {
 
 	next   driftEventHandler
 	counts joinCounts
+
+	// unreachable counts records per cluster this process cannot read, so the
+	// shutdown report can name them. Capped at maxUnreachableClusters; past
+	// that, new clusters are counted under unreachableOverflowLabel.
+	unreachable map[string]int
 }
 
-// newJoiner builds the handler. A nil getter is legal and documented on the
-// field: the detector runs without cluster access today.
-func newJoiner(getter objectGetter, cluster clusterIdentity, gitopsManagers map[string]bool, next driftEventHandler) *joiner {
+// newJoiner builds the handler. An empty or nil cluster set is legal and
+// documented on the field: the detector supports running with no cluster access
+// at all.
+func newJoiner(clusters map[clusterIdentity]objectGetter, gitopsManagers map[string]bool, next driftEventHandler) *joiner {
 	return &joiner{
-		getter:         getter,
-		cluster:        cluster,
+		clusters:       clusters,
 		gitopsManagers: gitopsManagers,
 		timeout:        joinRequestTimeout,
 		next:           next,
+		unreachable:    map[string]int{},
 	}
 }
+
+// Clusters reports how many clusters the join can read, for the startup line.
+func (j *joiner) Clusters() int { return len(j.clusters) }
 
 // parseGitopsManagers splits the --gitops-managers flag into a set, reusing
 // splitCSV so that this flag trims and drops empties exactly as T2's two
@@ -303,11 +352,69 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 		j.counts.Gone++
 	case joinUnreachable:
 		j.counts.Unreachable++
+		j.noteUnreachable(recordIdentity(record))
 	case joinFailed:
 		j.counts.Failed++
 	}
 
 	j.next(ctx, event)
+}
+
+// noteUnreachable records one sighting of a cluster this process has no client
+// for, so UnreachableClusters can name it.
+//
+// Keyed on the rendered identity rather than the struct because the overflow
+// bucket is a label and not a cluster, and a map keyed on clusterIdentity has
+// nowhere to put it.
+//
+// An incomplete identity is counted in Unreachable but not named here. The list
+// is read as clusters to go and onboard, and a record whose resource.labels are
+// missing a part renders as "proj//", which is not a cluster anyone can act on.
+// The count still moves, so nothing is hidden -- a gap between the unreachable
+// total and the sum of the named entries is how this shows up.
+func (j *joiner) noteUnreachable(identity clusterIdentity) {
+	if !identity.complete() {
+		return
+	}
+	if j.unreachable == nil {
+		j.unreachable = map[string]int{}
+	}
+	name := identity.String()
+	// A cluster already being counted keeps counting past the cap; only a new
+	// name folds into the overflow bucket, which is how classify.go bounds its
+	// principal set without distorting the counts it already holds.
+	if _, known := j.unreachable[name]; !known && len(j.unreachable) >= maxUnreachableClusters {
+		name = unreachableOverflowLabel
+	}
+	j.unreachable[name]++
+}
+
+// UnreachableClusters renders "cluster=count" entries for the shutdown line,
+// most frequent first.
+//
+// The count alone says how much the join missed; this says which cluster to go
+// and onboard, which is the difference between a number and an action. Empty
+// when nothing was missed, so the caller can leave the clause off entirely.
+func (j *joiner) UnreachableClusters() []string {
+	names := make([]string, 0, len(j.unreachable))
+	for name := range j.unreachable {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(a, b int) bool {
+		if j.unreachable[names[a]] != j.unreachable[names[b]] {
+			return j.unreachable[names[a]] > j.unreachable[names[b]]
+		}
+		return names[a] < names[b]
+	})
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		// %q for the same reason classify.go quotes a principal: the project,
+		// location and cluster come out of the audit record rather than from
+		// anything this process validated, so an unquoted one could forge what
+		// reads as a separate log line.
+		out = append(out, fmt.Sprintf("%q=%d", name, j.unreachable[name]))
+	}
+	return out
 }
 
 // join performs the lookup and classifies the result. Split from Handle so the
@@ -329,7 +436,15 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 		return event
 	}
 
-	if j.getter == nil || !j.cluster.matches(record) {
+	// An incomplete identity is refused rather than left to miss on its own.
+	// Every registered key is complete today -- the direct one is validated at
+	// startup and ReadIdentity rejects a partial cluster_identity -- so this
+	// changes no outcome now; it is here so that a record carrying only a
+	// project can never be served by a cluster that happens to share the parts
+	// it does carry.
+	identity := recordIdentity(record)
+	getter, ok := j.clusters[identity]
+	if !ok || !identity.complete() {
 		event.Outcome = joinUnreachable
 		return event
 	}
@@ -337,7 +452,7 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 	lookupCtx, cancel := context.WithTimeout(ctx, j.timeout)
 	defer cancel()
 
-	obj, err := j.getter.Get(lookupCtx, record.Resource)
+	obj, err := getter.Get(lookupCtx, record.Resource)
 	switch {
 	case apierrors.IsNotFound(err) && !pathNotServed(err):
 		event.Outcome = joinGone

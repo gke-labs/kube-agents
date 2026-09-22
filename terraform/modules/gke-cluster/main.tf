@@ -340,4 +340,32 @@ locals {
     google_container_cluster.standard[*].name,
     data.google_container_cluster.existing[*].name,
   ))
+
+  cluster_endpoint = one(concat(
+    google_container_cluster.autopilot[*].endpoint,
+    google_container_cluster.standard[*].endpoint,
+    data.google_container_cluster.existing[*].endpoint,
+  ))
+
+  # Which of the control plane's two endpoints `endpoint` gave us, and so which
+  # certificate a client dialling it will be offered.
+  #
+  # The provider documents `endpoint` as the master's IP address, and on any
+  # cluster with IP access enabled it is. On a cluster with IP access disabled
+  # GKE puts the DNS-based endpoint's hostname in the same field -- nothing here
+  # asks for it -- and that endpoint is terminated at Google Front End with a
+  # certificate from a publicly trusted CA, while the IP endpoints get one
+  # signed by the cluster root CA that cluster_ca_certificate returns. A
+  # consumer pairing the two therefore has to know which it received, and the
+  # suffix is the only thing in the value that says so.
+  #
+  # Derived from the endpoint rather than from ip_endpoints_config because it is
+  # the endpoint that will actually be dialled: whatever the cluster's
+  # configuration says, the certificate offered is the one belonging to the host
+  # in this value.
+  cluster_endpoint_is_dns = endswith(local.cluster_endpoint, local.gke_dns_endpoint_suffix)
+
+  # The domain GKE's DNS-based control plane endpoints live under, as
+  # gke-<hash>.<region>.gke.goog.
+  gke_dns_endpoint_suffix = ".gke.goog"
 }

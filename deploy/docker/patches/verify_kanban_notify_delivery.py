@@ -18,21 +18,31 @@ before the fatal signal.
 So this drives the *patched* runtime against a real board rather than reading
 it, and it checks two classes of thing:
 
-* **That the patch is wired.** The three names the notifier loop resolves at
+* **That the patch is wired.** The three names the notifier module resolves at
   call time, and the absence of upstream's claim. A trailer import that did not
   execute is a ``NameError`` on the first delivery — loud, but only in
   production.
 * **That the assumption the patch rests on still holds.** This is the one worth
   the file. The fix is "read without writing, write after delivering", and it is
-  correct only while ``kanban_db.unseen_events_for_sub`` remains a pure read.
-  Upstream owns that function. If a base-image bump ever gave it a cursor write
-  — the way its sibling ``claim_unseen_events_for_sub`` has one — the notifier
-  would go straight back to at-most-once delivery with no diagnostic anywhere,
-  and every check above would still pass. Section 3 opens a real database and
-  looks.
+  correct only while ``kanban_db_notify.unseen_events_for_sub`` remains a pure
+  read. Upstream owns that function. If a base-image bump ever gave it a cursor
+  write — the way its sibling ``claim_unseen_events_for_sub`` has one — the
+  notifier would go straight back to at-most-once delivery with no diagnostic
+  anywhere, and every check above would still pass. Section 3 opens a real
+  database and looks.
+
+Since v2026.9.14 the claim and the advance live in
+``gateway/kanban_watchers_notifier.py`` and the rewind on the mixin in
+``gateway/kanban_watchers.py``; the source checks read whichever file owns the
+site. Upstream also grew a durable per-ping checkpoint
+(``last_ping_event_id``); section 2 confirms it is still consulted, because
+the companion's duplicate story now leans on it.
 
 Section 5 replays the incident itself: an event read, a process that dies before
 sending, and a second process that must still find the event waiting for it.
+Section 10 replays it again through the real ``_Collector`` and the real
+``_KanbanNotification.deliver()`` with a recording push adapter, so the
+replacement text at both notifier anchors is executed rather than only parsed.
 
 Usage::
 
@@ -41,6 +51,7 @@ Usage::
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import tempfile
@@ -65,7 +76,13 @@ DB = TMP / "kanban.db"
 os.environ["HERMES_KANBAN_DB"] = str(DB)
 
 from hermes_cli import kanban_db as K  # noqa: E402
+# The notify functions and ``connect`` moved out of kanban_db in v2026.9.14;
+# kanban_db only re-exports them through a deprecation shim scheduled for
+# removal, so this drives their real homes.
+from hermes_cli import kanban_db_notify as KN  # noqa: E402
+from hermes_cli.kanban_db_connect import connect as _connect  # noqa: E402
 import gateway.kanban_watchers as watchers  # noqa: E402
+import gateway.kanban_watchers_notifier as notifier  # noqa: E402
 from gateway.kanban_notify_delivery import (  # noqa: E402
     MAX_TRACKED,
     advance_after_delivery,
@@ -75,14 +92,13 @@ from gateway.kanban_notify_delivery import (  # noqa: E402
     sub_key,
 )
 
-NOTIFIER_SOURCE = open("gateway/kanban_watchers.py").read()
+NOTIFIER_SOURCE = open("gateway/kanban_watchers_notifier.py").read()
+MIXIN_SOURCE = open("gateway/kanban_watchers.py").read()
 
-# The kinds the notifier claims for a subscriber. A completion left behind the
-# cursor is a report that never reaches the user's thread.
-TERMINAL_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked", "block_loop_detected",
-)
+# The kinds the notifier claims for a subscriber, as the notifier itself spells
+# them. A completion left behind the cursor is a report that never reaches the
+# user's thread.
+TERMINAL_KINDS = notifier.TERMINAL_KINDS
 
 PLATFORM = "slack"
 CHAT = "D0BKGRBM6RH"
@@ -97,17 +113,17 @@ THREAD = "1786279791.090359"
 print("import wiring:")
 check(
     "the notifier resolved the read import",
-    hasattr(watchers, "_kanban_read_unclaimed"),
+    hasattr(notifier, "_kanban_read_unclaimed"),
     "the trailer import did not execute",
 )
 check(
     "the notifier resolved the mark import",
-    hasattr(watchers, "_kanban_mark_delivered"),
+    hasattr(notifier, "_kanban_mark_delivered"),
     "the trailer import did not execute",
 )
 check(
     "the notifier resolved the advance import",
-    hasattr(watchers, "_kanban_advance_delivered"),
+    hasattr(notifier, "_kanban_advance_delivered"),
     "the trailer import did not execute",
 )
 check(
@@ -122,7 +138,7 @@ check(
 print("the claim is gone:")
 check(
     "upstream's claim call does not survive anywhere in the notifier",
-    "_kb.claim_unseen_events_for_sub(" not in NOTIFIER_SOURCE,
+    "claim_unseen_events_for_sub(" not in NOTIFIER_SOURCE,
     "a surviving claim still commits the cursor before anything is delivered",
 )
 check(
@@ -130,30 +146,52 @@ check(
     "old_cursor, cursor, events = _kanban_read_unclaimed(" in NOTIFIER_SOURCE,
 )
 check(
-    "the read is handed the watcher",
-    "watcher=self," in NOTIFIER_SOURCE,
+    "the read is handed the runner, the one object that outlives a tick",
+    "watcher=self.runner," in NOTIFIER_SOURCE,
     "without it there is no high-water map and a failing cursor write "
-    "re-sends the same notification every tick forever",
+    "re-sends the same notification every tick forever; _Collector is "
+    "rebuilt per tick, so hanging the map off it would forget every mark",
 )
 check(
     "the task row is still read after the events, not before",
     0
     < NOTIFIER_SOURCE.find("_kanban_read_unclaimed(")
-    < NOTIFIER_SOURCE.find('task = _kb.get_task(conn, sub["task_id"])'),
+    < NOTIFIER_SOURCE.find('task = self.kb.get_task(conn, sub["task_id"])'),
     "hoisting get_task above the read splits complete_task's single "
     "transaction and makes a stale, result-less task row the likely read",
 )
 check(
     "the success path marks before it writes",
     0
-    < NOTIFIER_SOURCE.find('_kanban_mark_delivered(self, sub, d["cursor"])')
+    < NOTIFIER_SOURCE.find('_kanban_mark_delivered(self.runner, self.sub, self.d["cursor"])')
     < NOTIFIER_SOURCE.find("_kanban_advance_delivered,"),
 )
 check(
+    "the mark sits after the last send leg, not before it",
+    0
+    < NOTIFIER_SOURCE.find("await self.wake()")
+    < NOTIFIER_SOURCE.find('_kanban_mark_delivered(self.runner, self.sub, self.d["cursor"])'),
+    "marking before the wake would suppress the retry of a wake that failed",
+)
+check(
+    "the unknown-platform skip keeps upstream's direct advance",
+    NOTIFIER_SOURCE.count("await self.advance()") == 1,
+    f"found {NOTIFIER_SOURCE.count('await self.advance()')}; nothing is "
+    "delivered on that path, so there is nothing to mark",
+)
+check(
     "the vestigial rewind no longer writes",
-    "_kb.rewind_notify_cursor(" not in NOTIFIER_SOURCE,
+    '"rewind_notify_cursor"' not in MIXIN_SOURCE,
     "rewinding a claim that was never made drags a concurrent writer's "
     "cursor backwards and forces a duplicate",
+)
+check(
+    "upstream's durable per-ping checkpoint is still consulted",
+    'if ev.id <= self.sub.get("last_ping_event_id", 0):' in NOTIFIER_SOURCE
+    and '"record_notify_ping"' in NOTIFIER_SOURCE,
+    "the companion's duplicate story leans on it: without it a crash between "
+    "send and advance re-posts the ping, which the in-process map only bounds "
+    "within one process",
 )
 
 
@@ -164,10 +202,10 @@ check(
 # that call ever migrates, delivery silently reverts to at-most-once and every
 # check above still passes. This is the reason this file opens a database.
 print("upstream's read contract:")
-conn = K.connect(DB)
+conn = _connect(DB)
 
 CARD = K.create_task(conn, title="workload reliability audit", assignee="platform")
-K.add_notify_sub(
+KN.add_notify_sub(
     conn,
     task_id=CARD,
     platform=PLATFORM,
@@ -187,7 +225,7 @@ def sub_row():
     """The subscription exactly as the notifier's collect loop receives it."""
     rows = [
         s
-        for s in K.list_notify_subs(conn, CARD)
+        for s in KN.list_notify_subs(conn, CARD)
         if s["platform"] == PLATFORM and s["chat_id"] == CHAT
     ]
     return rows[0] if rows else None
@@ -212,7 +250,7 @@ check(
 
 START = cursor_now()
 _before_read = START
-_read = K.unseen_events_for_sub(
+_read = KN.unseen_events_for_sub(
     conn,
     task_id=CARD,
     platform=PLATFORM,
@@ -244,12 +282,18 @@ check(
 )
 check(
     "the claiming sibling still exists to be distinguished from it",
-    callable(getattr(K, "claim_unseen_events_for_sub", None)),
+    callable(getattr(KN, "claim_unseen_events_for_sub", None)),
     "if it is gone, re-derive this gate against whatever replaced it",
 )
 check(
     "advance_notify_cursor is still the durable write the patch calls",
-    callable(getattr(K, "advance_notify_cursor", None)),
+    callable(getattr(KN, "advance_notify_cursor", None)),
+)
+check(
+    "record_notify_ping writes the ping checkpoint, not the wake cursor",
+    callable(getattr(KN, "record_notify_ping", None))
+    and "last_event_id =" not in inspect.getsource(KN.record_notify_ping),
+    "if the checkpoint ever moved last_event_id it would be a second claim",
 )
 
 
@@ -259,7 +303,6 @@ check(
 # own `except`, which by design swallows it — so the write would stop happening
 # and the only symptom would be a WARNING nobody reads.
 print("the watcher method:")
-import inspect  # noqa: E402
 
 _advance = getattr(watchers.GatewayKanbanWatchersMixin, "_kanban_advance", None)
 check("the watcher still has _kanban_advance", callable(_advance))
@@ -293,7 +336,7 @@ class _Watcher(watchers.GatewayKanbanWatchersMixin):
 print("the incident, replayed:")
 proc1 = _Watcher()
 old_cursor, cursor, events = read_unclaimed(
-    K, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=proc1,
+    KN, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=proc1,
 )
 check(
     "the first tick sees the completion",
@@ -317,7 +360,7 @@ check(
 del proc1
 proc2 = _Watcher()
 _, cursor2, events2 = read_unclaimed(
-    K, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=proc2,
+    KN, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=proc2,
 )
 check(
     "a fresh process still finds the notification waiting",
@@ -343,7 +386,7 @@ check(
     "otherwise the map grows once per delivery for the life of the process",
 )
 _, _, events3 = read_unclaimed(
-    K, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=proc2,
+    KN, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=proc2,
 )
 check(
     "the delivered event is not offered again",
@@ -375,7 +418,7 @@ sends = 0
 # cursor and drops it. Reading it after the loop would test the wrong instant.
 outstanding = None
 for _ in range(5):
-    _, c, evs = read_unclaimed(K, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=broken)
+    _, c, evs = read_unclaimed(KN, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=broken)
     if not evs:
         continue
     sends += 1
@@ -421,7 +464,7 @@ def cursor_on_a_fresh_connection():
     new connection, and re-delivery is exactly what an unread repair costs, so
     the durability claim has to be made from one.
     """
-    other = K.connect(DB)
+    other = _connect(DB)
     try:
         row = other.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
@@ -458,8 +501,10 @@ check(
 
 
 # --- 9. The rewind is inert ----------------------------------------------------
-# It still has three call sites, each of which also performs the control flow
-# that ends the delivery attempt, so the method stays and the body goes.
+# ``_KanbanNotification.rewind()`` still calls it from every handled failure
+# path, each of which also performs the ``return`` that ends the delivery
+# attempt, so the method stays and the body goes. The cursor is placed exactly
+# where the CAS would match, so an un-neutered rewind visibly moves it.
 print("the rewind:")
 _rewind = getattr(watchers.GatewayKanbanWatchersMixin, "_kanban_rewind", None)
 check("the method is still there for its three call sites", callable(_rewind))
@@ -471,6 +516,146 @@ if callable(_rewind):
         cursor_now() == AT,
         f"cursor moved {AT} -> {cursor_now()}; the rewind still writes",
     )
+
+# --- 10. The patched tail, end to end --------------------------------------------
+# Sections 5-7 call the helpers by hand. This runs the real per-tick collect
+# (through the patched ``_Collector._claim_for_sub``) and the real
+# ``_KanbanNotification.deliver()`` (through the patched tail) against the
+# board, with a push adapter that records sends: the replacement text at both
+# notifier anchors has to execute, not merely parse.
+print("the patched tail, end to end:")
+import asyncio  # noqa: E402
+from gateway.config import Platform as _Platform  # noqa: E402
+from gateway.platforms.base import SendResult  # noqa: E402
+
+
+class _PushAdapter:
+    """A push-capable adapter (no ``supports_async_delivery`` flag) that records sends."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.sent.append((chat_id, content))
+        return SendResult(success=True, message_id=f"m{len(self.sent)}")
+
+    def extract_local_files(self, text):
+        return [], text
+
+
+class _Runner(watchers.GatewayKanbanWatchersMixin):
+    """Just enough of GatewayRunner for the collector and one delivery."""
+
+    config = None
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.adapters = {_Platform(PLATFORM): adapter}
+
+    def _authorization_adapter(self, platform, owner_profile):
+        return self.adapters.get(platform)
+
+    def _active_profile_name(self):
+        return "default"
+
+
+def collect(runner):
+    return notifier._notifier_collect(
+        runner, K, notifier_profile="default", gc_due=False, gc_retention_days=30,
+    )
+
+
+def deliver(runner, d):
+    asyncio.run(
+        notifier._KanbanNotification(runner, d, platform_cls=_Platform, sub_fail_counts={}).deliver()
+    )
+
+
+def ping_checkpoint():
+    row = conn.execute(
+        "SELECT last_ping_event_id FROM kanban_notify_subs "
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+        (CARD, PLATFORM, CHAT, THREAD),
+    ).fetchone()
+    return None if row is None else int(row["last_ping_event_id"] or 0)
+
+
+with K.write_txn(conn):
+    K._append_event(conn, CARD, "completed", {"summary": "end-to-end report"})
+E2E_START = cursor_now()
+tick1 = collect(_Runner(_PushAdapter()))
+check(
+    "the real collect offers the completion",
+    [e.kind for d in tick1 for e in d["events"]] == ["completed"],
+    f"got {[e.kind for d in tick1 for e in d['events']]}",
+)
+check(
+    "and the real collect moved no cursor",
+    cursor_now() == E2E_START,
+    f"cursor {E2E_START} -> {cursor_now()} on collect; the claim is back",
+)
+# ...the process dies here, deliveries in hand, nothing sent.
+del tick1
+runner2 = _Runner(_PushAdapter())
+tick2 = collect(runner2)
+check(
+    "a fresh process's collect still offers it",
+    len(tick2) == 1 and [e.kind for e in tick2[0]["events"]] == ["completed"],
+)
+deliver(runner2, tick2[0])
+E2E_CURSOR = tick2[0]["cursor"]
+check(
+    "the real deliver() sent the ping once",
+    len(runner2.adapter.sent) == 1 and "end-to-end report" in runner2.adapter.sent[0][1],
+    f"sent {runner2.adapter.sent!r}",
+)
+check(
+    "the patched tail advanced the durable cursor",
+    cursor_now() == E2E_CURSOR,
+    f"cursor is {cursor_now()}, expected {E2E_CURSOR}",
+)
+check(
+    "upstream's ping checkpoint landed alongside it",
+    ping_checkpoint() == E2E_CURSOR,
+    f"last_ping_event_id is {ping_checkpoint()}, expected {E2E_CURSOR}",
+)
+check(
+    "the runner's high-water map drained after the write",
+    high_water(runner2) == {},
+    f"holds {high_water(runner2)!r}",
+)
+check("the next tick offers nothing", collect(runner2) == [])
+
+
+class _BrokenRunner(_Runner):
+    def _kanban_advance(self, sub, cursor, board=None):
+        raise RuntimeError("disk I/O error")
+
+
+with K.write_txn(conn):
+    K._append_event(conn, CARD, "status", {"status": "review"})
+broken = _BrokenRunner(_PushAdapter())
+E2E_BEFORE = cursor_now()
+first = collect(broken)
+check("a status change is offered", len(first) == 1)
+try:
+    deliver(broken, first[0])
+    tail_raised = None
+except Exception as exc:  # noqa: BLE001
+    tail_raised = exc
+check(
+    "a failing advance does not escape deliver() and abort the tick",
+    tail_raised is None,
+    f"raised {tail_raised!r}",
+)
+check("the ping still went out once", len(broken.adapter.sent) == 1)
+second = collect(broken)
+check(
+    "the next collect repairs the cursor instead of re-offering",
+    second == [] and cursor_now() == E2E_BEFORE + 1,
+    f"offered {len(second)}, cursor {cursor_now()} (expected {E2E_BEFORE + 1})",
+)
+check("and no second ping was sent", len(broken.adapter.sent) == 1)
 
 print()
 if FAILURES:

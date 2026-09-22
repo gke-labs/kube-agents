@@ -338,9 +338,10 @@ Layout:
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is
-  known (the bridge's list is the operator's `a2aBridgeJetStreamGrants` and the agent
-  CLI's is `a2aAgentJetStreamGrants`; a user still holding `$JS.API.>` holds playground
-  posture); `$JS.ACK.<its streams>.>` for explicit
+  known (the bridge's list is the operator's `a2aBridgeJetStreamGrants`, the agent
+  CLI's is `a2aAgentJetStreamGrants` and the gateway's is
+  `a2aGatewayJetStreamGrants`; no rendered principal holds `$JS.API.>` any more, and a
+  user that gains one back holds playground posture); `$JS.ACK.<its streams>.>` for explicit
   acks - an ack is a publish, and missing this grant means every consumer redelivers
   forever while TCP health stays green, the NR-5 incident class created at connect time;
   and `$JS.FC.>` for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
@@ -355,6 +356,12 @@ Layout:
   `$JS.ACK.TASKS.>` for the gateway and the bridge - and the principals whose reads
   are ordered or ack-none hold no ack grant at all. What scoping still cannot express is
   per-consumer scope inside a granted stream, since NATS wildcards match whole tokens.
+  Enumerating leaves one refusal that is expected rather than a fault: the gateway's
+  `tasks/get` replay reads through an ordered consumer whose reset path publishes
+  `$JS.API.CONSUMER.DELETE.TASKS.<server-generated name>` and ignores the answer, so a
+  reconnect writes one refusal per replay in flight into the bus log and into the
+  gateway's own log at Error. That subject is the only violation a rendered principal
+  produces by design; any other one is a missed grant.
 - **Topic publish grants are exact, never namespace wildcards.** Publish grants match
   the provisioned topic list subject-for-subject. A wildcard over a topic namespace
   turns provisioned-only into silent loss - a publish to an unprovisioned topic sails
@@ -645,6 +652,46 @@ default ServiceAccount token already carries - so without the binding the bus wo
 any readable token in the cluster as proof of that pod's identity. A long-lived client
 MUST re-read the file when it reconnects rather than caching its first read, or it fails
 exactly when the bus restarts, which this spec calls a routine operation.
+
+The audience also has to be reserved, and reserving it is not the same as owning it. The
+projection is the platform-agent container's, but the callout resolves the POD's
+ServiceAccount, so any container in that pod presenting a token for this audience
+authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
+copied into the pod verbatim. The operator therefore refuses and strips user-authored
+volumes by SOURCE as well as by name: a projection of this audience under any name, and a
+`secret` volume or projected `secret` source naming one of the three Secrets the bus
+renders. (Those two source fields only - the ones that mount the Secret into the
+container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef` hand it to a
+node plugin instead, and are not matched.) The three are `<agent>-a2a-nats-creds`,
+which holds the static users' passwords; `<agent>-a2a-nats-config`, whose `nats.conf`
+interpolates every one of those passwords in clear text; and `<agent>-a2a-callout-keys`,
+which signs the bus's own tokens. The Secrets are cheaper than the projection, because
+reading one needs no token at all. All of them are closed together, because closing one
+narrows the expensive route, leaves the cheap ones, and names the class while doing it.
+
+Two layers, and they are not the same layer. The admission refusal is unconditional, is
+the only one that tells the CR's author why, and covers mounts as well as volumes:
+`extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
+against the reserved names. The render strip is gated on the A2A surface, so it runs
+under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
+recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
+on that function). On the mounts it goes further than admission does: besides the
+reserved names it drops any mount naming a volume it has just dropped by source, because
+a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
+layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
+at all; that is deliberate, because it is the supported route for the Hermes bridge
+sidecar, which is meant to hold `bridge-password`.
+
+Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
+pod-scoped and the callout cannot see which container presented one, so this is a guard
+against a misconfigured CR rather than a boundary against a hostile sidecar. It is worth
+having because the CR is authored by the platform operator and not by the agent -
+[`security-requirements.md`](../security-requirements.md) already puts administrator-supplied volumes and mounts outside
+the sandbox guarantee for the same reason. What would change that reading is a change in
+who may write the CR: a tenant-facing role on `platformagents`, or the CR moving into a
+repository the agent can open pull requests against. The only construction that would be
+a boundary is a separate pod for the bus identity, which is also what the `bridge`
+sidecar's static password is waiting on.
 
 The callout service runs in its own `AUTH` account - not `$SYS`, despite subscribing to
 a `$SYS.REQ.*` subject - with 2 replicas, joined in a queue group. The queue group is

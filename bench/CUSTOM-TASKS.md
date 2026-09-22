@@ -367,8 +367,9 @@ silently running the check with defaults.
 | `resource_property`       | `kind` (required), `resource_name` _or_ `selector`, `namespace`, `path`, `op`, `value`, `across_matches`                                                                                                      | Compares a JSONPath property of the matched objects. The general-purpose one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `scaling_complete`        | `deployment` (required), `min_replicas`, `max_replicas`, `namespace`                                                                                                                                          | Polls `status.readyReplicas` into `[min, max]`. Leaving `max_replicas` unset checks scale-up only; setting it catches scale-down and cost targets too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `report_contains`         | `required_phrases` (all must appear), `any_of_phrases` (at least one must), `forbidden_phrases` (none may), `scope` (`final` \| `full`, default `final`)                                                      | Case-insensitive substring checks against the agent's answer, not the cluster. `final` is what the user ultimately receives: the delegating turn's closing message plus, when work was delegated, the delivered card results and artifacts — poll-turn recitals excluded. `full` is the accumulated output (every settled closer on top of that), which passes a phrase merely quoted in progress chatter and false-fails a forbidden phrase in quoted material; use it only for genuinely whole-transcript checks. Registered from this repository's `kube_agents_bench.verifiers` via the `devops_bench.verifiers` entry point. |
-| `tool_called`             | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false)                                                                                                                       | Counts the **delegating turn's** calls only — poll turns are excluded by design and a delegated worker's calls never reach the trajectory, so this asserts what the router did, never what a worker did on a cluster; use cluster-state checks (`resource_property`) for mutation safeguards. `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in router-level safeguards, where an attempt should trip the check.                                                                                                                |
+| `tool_called`             | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false)                                                                                                                       | Counts the **delegating turn's** calls only — poll turns are excluded by design and the delegated workers' calls, which the harness appends to the trajectory tagged with the profile that made them, are skipped by that tag, so this asserts what the router did, never what a worker did on a cluster; use cluster-state checks (`resource_property`) for mutation safeguards. `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in router-level safeguards, where an attempt should trip the check.                            |
 | `ledger_issue_contains`   | `audit` (required, one of the eight fleet-audit stream ids), `required_phrases`, `any_of_phrases`, `forbidden_phrases`, `scope` (`body` \| `finding_ids`, default `body`), `max_clock_skew_sec` (default 120) | The same phrase semantics as `report_contains`, but against the **GitHub ledger issue this run published** rather than the chat reply — the surface a fleet audit actually writes its findings to. See [Grading a fleet audit](#grading-a-fleet-audit) below, which you must read before using it: it needs a credential, and its freshness binding is what stops it passing forever.                                                                                                                                                                                                                                             |
+| `pull_request_opened`     | `owner` (the organisation the PR must sit under, `""` for any), `max_clock_skew_sec` (default 120)                                                                                                            | Resolves every `github.com/<owner>/<repo>/pull/<n>` URL in the agent's reply through the GitHub API and passes when one of them is a pull request under `owner`, not closed unmerged, that this run created or updated. What a remediation case grades on, in place of `report_contains` over `/pull/`. See [Grading a remediation pull request](#grading-a-remediation-pull-request).                                                                                                                                                                                                                                            |
 | `fleet_resource_property` | every `resource_property` field except `kubeconfig`, plus `fixture_role` (**required**)                                                                                                                       | `resource_property` against the **standing seeded fleet**, addressed by the ROLE a fixture plays rather than by cluster name. Also splits "the fixture is gone" (a fail) from "the cluster was unreachable" (an error), which upstream cannot. See [Addressing a seeded-fleet fixture by role](#addressing-a-seeded-fleet-fixture-by-role).                                                                                                                                                                                                                                                                                       |
 
 The three transcript verifiers read the run's stash (`kube_agents_bench/transcript.py`), so unlike
@@ -391,7 +392,8 @@ tool output the agent never reported on. `ledger_issue_contains` grades the arti
 **Finding the issue.** From the run's own final message, because that is the only channel that
 exists: `start` prints `"issue": null` until a ledger exists, the audit's on-disk `.lease` marker
 records the repo and the stream but no issue number, and the audit runs in a delegated worker whose
-tool calls never reach the trajectory. What does cross back is `finish`'s `issue_url`, which the
+tool calls reach the trajectory only as clipped, tagged entries that no verifier reads for content.
+What does cross back is `finish`'s `issue_url`, which the
 SOP requires every non-silent report to carry in full — and an on-demand run, which is what an eval
 task is, is never silent. The URL is a **pointer only**: every phrase assertion is made against
 what the GitHub API returns for it.
@@ -482,6 +484,43 @@ invisible drop-out. `none` requires that no element resolves a satisfying value.
     op: exists
     across_matches: every
 ```
+
+##### Grading a remediation pull request
+
+A remediation case asks the agent to propose a fix as a pull request against the eval GitOps
+repository, and the URL comes back in the final answer: `submit_suggestion.py` runs through
+`execute_code`, so no distinct tool name reaches the trajectory to assert on.
+
+`report_contains` over `["github.com/", "/pull/"]` was the first way to grade that, and it cannot
+work. It reads the reply as text and fetches nothing, so an invented URL passes — and nothing
+sweeps the GitOps repositories between repetitions, so the pull request rep 1 opened is still
+there for rep 2 and rep 3 to link. The repeats of a case were grading each other's leftovers.
+
+`pull_request_opened` resolves the URL instead and compares GitHub's stamps against
+`TranscriptSnapshot.started_at`, less `max_clock_skew_sec` for the gap between GitHub's clock and
+the runner's. Created during the run passes, and so does updated during it: the
+skill derives the branch from the change, so a later repetition pushes onto the branch the first
+one used and edits the pull request already open on it. That stamp moves on any write by anyone,
+so what it proves is that the pull request was written to during the run — a repetition that only
+comments on a leftover passes as well. Telling those apart needs the head commit, which the ledger
+App cannot read; sweeping the GitOps repository between repetitions is what removes leftovers.
+A pull request closed without being merged is rejected: closing moves `updated_at` too, and what
+the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
+match across every pool project that breaks loudly if the organisation ever moves.
+
+It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`
+mints that token for every fan-out unit, not only the audit ones. It asks `/repos/{o}/{r}/issues/{n}`
+first, because a pull request is an issue to that API and `issues: read` is what the ledger App
+carries; `/pulls/{n}` is tried only when that is denied or absent. The check errors only on a fault
+of ours: a 401, which is the token having expired rather than a permission, and a denial from both
+endpoints, which names `pull_requests: read` as the permission to add. Everything else is graded.
+A 403 from one endpoint proves the repository is reachable, so the other's 404 is the number's own;
+404 from both is either the number or a repository this credential cannot see, and nothing in the
+API separates them. Both fail. Erroring instead would red the eval job for every open pull request
+over one repository name the agent invented, and an installation missing a pool repository is what
+`scripts/verify_ci_pool_project.py` catches at onboarding. A candidate GitHub refuses ends the check
+only when no other URL in the reply resolves: an error is admission-blind, so a mistyped slug beside
+the real pull request must not red the eval job.
 
 ##### Addressing a seeded-fleet fixture by role
 

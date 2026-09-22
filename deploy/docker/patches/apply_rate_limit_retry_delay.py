@@ -1,13 +1,17 @@
 """Make the retry loop wait out Google's ``retryDelay`` on a 429.
 
-One anchored edit in ``agent/conversation_loop.py``: the rate-limit branch of
-the retry loop's error handler reads a ``Retry-After`` header into
-``_retry_after`` and then computes ``wait_time`` from it. Between the two, when
-the header said nothing, ask ``hermes_cli/rate_limit_retry_delay.py`` for the
-``google.rpc.RetryInfo`` delay in the error body. Setting ``_retry_after`` is
-what makes the rest of upstream's block behave as if the header had been there:
-``wait_time`` takes it, the adaptive Z.AI backoff is skipped (it is gated on
-``not _retry_after``) and the status line says how long the wait is.
+One anchored edit in ``agent/turn_recovery.py`` (the retry loop's backoff moved
+there from ``agent/conversation_loop.py`` in the v2026.9.14 split):
+``compute_error_backoff`` reads a ``Retry-After`` header, then a
+``retry_after`` field in a dict error body, into ``_retry_after``, caps it, and
+then computes ``wait_time`` from it. Between the cap and the wait, when neither
+said anything, ask ``hermes_cli/rate_limit_retry_delay.py`` for the
+``google.rpc.RetryInfo`` delay in the error body — which Google puts in the
+text of the message, not in a ``retry_after`` field, so upstream's own body
+read does not see it. Setting ``_retry_after`` is what makes the rest of
+upstream's function behave as if the header had been there: ``wait_time``
+takes it, the adaptive Z.AI backoff is skipped (it is gated on
+``_retry_after is None``) and the status line says how long the wait is.
 
 The insert sits ahead of its anchor rather than consuming it, so the anchor
 count cannot tell a fresh file from a patched one; the marker check can. See
@@ -21,33 +25,33 @@ from pathlib import Path
 
 import patchlib
 
-LOOP_RELATIVE = "agent/conversation_loop.py"
+LOOP_RELATIVE = "agent/turn_recovery.py"
 
 # The one line in the file that turns the header into a wait. Anchoring on it
-# pins the insert to the point where ``_retry_after`` is fully decided and
-# ``is_rate_limited`` is in scope, which is what the branch needs.
+# pins the insert to the point where ``_retry_after`` is fully decided (read,
+# capped, zero-cleared) and ``is_rate_limited`` is in scope, which is what the
+# branch needs.
 WAIT_ANCHOR = (
-    "                wait_time = _retry_after if _retry_after else "
+    "    wait_time = _retry_after if _retry_after is not None else "
     "jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)\n"
 )
 
-WAIT_INSERT = '''                # kube-agents patch: Google's 429 carries its reset window in
-                # the body (google.rpc.RetryInfo.retryDelay), not in a
-                # Retry-After header, and LiteLLM passes that body through as
-                # the error text. Without this the retries land 2-6s apart
-                # against a ~54s window and exhaust before it opens. Read the
-                # body only when the header said nothing; same 600s cap.
-                # See hermes_cli/rate_limit_retry_delay.py.
-                if is_rate_limited and not _retry_after:
-                    try:
-                        from hermes_cli.rate_limit_retry_delay import (
-                            retry_delay_from_error as _kube_retry_delay_from_error,
-                        )
+WAIT_INSERT = '''    # kube-agents patch: Google's 429 carries its reset window in the body
+    # (google.rpc.RetryInfo.retryDelay), not in a Retry-After header or a
+    # retry_after field, and LiteLLM passes that body through as the error
+    # text. Without this the retries land 2-6s apart against a ~54s window and
+    # exhaust before it opens. Read the body only when the header and the
+    # field said nothing; same 600s cap. See hermes_cli/rate_limit_retry_delay.py.
+    if is_rate_limited and not _retry_after:
+        try:
+            from hermes_cli.rate_limit_retry_delay import (
+                retry_delay_from_error as _kube_retry_delay_from_error,
+            )
 
-                        _retry_after = _kube_retry_delay_from_error(api_error)
-                    except Exception:
-                        logger.debug("retryDelay parse failed", exc_info=True)
-                        _retry_after = None
+            _retry_after = _kube_retry_delay_from_error(api_error)
+        except Exception:
+            logger.debug("retryDelay parse failed", exc_info=True)
+            _retry_after = None
 '''
 
 MARKER = "_kube_retry_delay_from_error"

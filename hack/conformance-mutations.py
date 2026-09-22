@@ -48,7 +48,7 @@ class Mutation:
 
     id: str
     path: str
-    #: (old, new) applied with str.replace, or a callable taking/returning text.
+    #: (old, new), applied as a single str.replace of the first occurrence.
     edit: tuple[str, str]
     #: Substring matching the test name that must go red.
     kills: str
@@ -121,7 +121,11 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-kubectl-kuberc-env",
         "agents/platform/scripts/credential_proxy.py",
-        ('"KUBECTL_KUBERC": "false"', '"KUBECTL_KUBERC_UNUSED": "false"'),
+        # Indented to pin the sandbox environment the test reads. The
+        # unindented spelling occurs first, in `_GIT_PROBE_ENVIRONMENT`,
+        # and a one-shot replace aimed there proves nothing.
+        ('            "KUBECTL_KUBERC": "false",',
+         '            "KUBECTL_KUBERC_UNUSED": "false",'),
         "test_A3_default_path_kuberc_is_disabled",
         "rename the env var while 'tidying', leaving the default-path kuberc "
         "feature on and the protection resting on mount geometry alone",
@@ -404,6 +408,25 @@ Mutation(
         "the new rules too -- arbitrary code execution with a writable token",
     ),
     Mutation(
+        # The same attack as the row above, spelled so a case-sensitive filter
+        # never sees it: GitHub resolves `uses:` case-insensitively, so this
+        # runs the identical action. The test walked straight past it and
+        # reported OK until the filter was lowercased. Pins the action SHA
+        # because the flip and the ref are not contiguous otherwise -- a pin
+        # bump reports STALE here, and the fix is to paste the new SHA in.
+        "B4-pull-request-target-checkout-case",
+        ".github/workflows/risk_classify.yml",
+        ("        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+         "        with:\n"
+         "          ref: ${{ github.event.repository.default_branch }}",
+         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+         "        with:\n"
+         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "capitalise both the action name and the expression context while "
+        "repointing the ref, which is the shape a case-flip evasion takes",
+    ),
+    Mutation(
         "B6-codeowners-bot",
         "examples/gitops-repo/CODEOWNERS.example",
         ("@your-org/security", "@kube-agents-bot[bot]"),
@@ -486,7 +509,9 @@ Mutation(
     Mutation(
         "C1-git-ext-transport",
         "agents/platform/scripts/credential_proxy.py",
-        ('"GIT_ALLOW_PROTOCOL": "https",', '"GIT_ALLOW_PROTOCOL": "https:ext",'),
+        # Indented for the same reason as A3-kubectl-kuberc-env above.
+        ('            "GIT_ALLOW_PROTOCOL": "https",',
+         '            "GIT_ALLOW_PROTOCOL": "https:ext",'),
         "test_C1_git_in_the_broker_cannot_execute_arbitrary_code",
         "re-admit the ext:: transport, which is the whole of the RCE: "
         "`git clone \'ext::sh -c <cmd>\'` runs <cmd> in the credential holder. "
@@ -654,7 +679,7 @@ Mutation(
     Mutation(
         "C4-base-image-digest",
         "tags.env",
-        ("@sha256:3811ed13da874fba2ac99b6d492db9a203d34cb6dccf90d886948c00d0ccec09", ""),
+        ("@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294", ""),
         "test_C4_the_agent_base_image_is_pinned_by_digest",
         "drop the digest and keep the tag, which reads as equivalent",
     ),
@@ -1240,6 +1265,37 @@ Mutation(
         "each workload would hold the union of the two grant sets -- the task "
         "plane and the blackboard in one credential, which is `worker` rebuilt "
         "by the mechanism meant to retire it",
+    ),
+    Mutation(
+        # The guard this branch adds, mutated the way it would really fail:
+        # not by deleting the guard, but by the glob going wrong underneath
+        # it. Breaking the pattern empties the set, which before the guard
+        # left B2's absence assertion -- and B4's checkout filter -- green
+        # over nothing at all.
+        "B-workflow-glob-emptied",
+        "tests/conformance/test_B_write_path.py",
+        ('.glob("*.y*ml")', '.glob("*.y*ml.disabled")'),
+        "test_B2_no_workflow_approves_or_merges_a_pull_request",
+        "point the workflow glob at nothing, which turns every assertion "
+        "over the set vacuously green",
+    ),
+    Mutation(
+        # The other way the set empties: not the glob, but the parse. Every
+        # workflow here spells the trigger block `on:`, which YAML 1.1 reads
+        # as the boolean True, so the key a trigger filter asks for only
+        # exists because `_workflow_documents` puts it there. Aimed at the
+        # normalisation rather than at a filter because it is the one line
+        # whose removal empties every trigger-filtered subset in this file at
+        # once, which is what the preconditions on those subsets exist for.
+        "B-workflow-on-normalisation-dropped",
+        "tests/conformance/test_B_write_path.py",
+        ('        if True in document:  # `on:` is the YAML 1.1 boolean `y`/`yes`/`on`\n'
+         '            document["on"] = document.pop(True)\n', ""),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "drop the YAML 1.1 `on:` -> True normalisation, the way a tidy-up "
+        "deletes a workaround whose comment reads as trivia -- every trigger "
+        "filter in this file then selects nothing, and the tests that walk "
+        "those subsets pass over the empty set",
     ),
     Mutation(
         "harness-fixture-emptied",

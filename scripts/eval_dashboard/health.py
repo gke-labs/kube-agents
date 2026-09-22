@@ -15,16 +15,18 @@ written health.json in -- and, when the hourly seeded-fleet scan has
 published one, fixture-state.json (scripts/eval_dashboard/fixture_state.py)
 -- health.json out::
 
-    {state, since, cause, failing_cases, evidence, advice, slow, metrics, generated_at}
+    {state, since, cause, failing_cases, evidence, advice, slow, pool, metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
 constants below -- each names the incident it was tuned on -- and the state
 machine that applies hysteresis to them is `transition`. The previous state
 is an input (`--prev`) rather than something remembered, so the scheduled
-job that runs this is stateless between ticks. `slow` is the one finding
-that is not a state: a gate whose green runs take far longer than usual
-(rule 7, #1586) is a note the poster sends once and the Brief shows, while
-the state stays what the rules above say.
+job that runs this is stateless between ticks. `slow` and `pool` are the
+findings that are not states: green runs taking far longer than usual
+(rule 7, #1586), and runs waiting in a queue before they start (rule 8,
+#1607, read from the pool-pressure periodic's artifact rather than measured
+here). The poster sends each once and the Brief shows them, while the state
+stays what the rules above say.
 
 The credibility test is the replay: `--replay` walks a data.json as if the
 job had run every `--step` and prints the state timeline, and
@@ -50,6 +52,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import pathlib
 import re
 import sys
@@ -309,6 +312,38 @@ SLOW_BASELINE = timedelta(days=7)
 SLOW_BASELINE_MIN_RUNS = 20
 SLOW_FACTOR = 1.2
 SLOW_CLEAR_FACTOR = 1.1
+
+# --- Rule 8: a backed-up pool -> a note beside the state, never a state (#1607)
+# Runs are timed from their start, so nothing else here sees a run that sat in
+# the queue first. The pool-pressure periodic (#1069) measures that hourly and
+# already grades itself against the runbook's thresholds; this rule reads its
+# verdict rather than deriving a second one.
+#
+# A note, not a state: the runs still pass, they just start late, and DEGRADED
+# would tell people to retest, which lengthens the queue being reported.
+# Unlike rule 7 it is not held back outside GREEN -- a different job reading
+# different data cannot be the incident's own symptom, and when leases are the
+# incident the wait is the explanation.
+#
+# POOL_STALE_AFTER is the dead-man's switch: latest-build.txt keeps resolving
+# after the periodic dies, so a stopped job reads as an unchanging healthy
+# artifact. Two missed hourly runs plus the job's 30m timeout is 2.5h, rounded
+# up so a run that starts late is not a stale reading.
+POOL_STALE_AFTER = timedelta(hours=3)
+POOL_BREACH = "BREACH"
+POOL_UNMEASURED = "UNMEASURED"
+POOL_STALE = "STALE"
+SECONDS_PER_MINUTE = 60
+# Longer than a queued run can really have waited: the sweep only looks back a
+# week. Past it the figure is corrupt, and dating a backlog from it puts the
+# start outside the range a datetime can hold.
+POOL_MAX_WAIT = timedelta(days=30)
+# pool_pressure.py buckets waits by UTC calendar day and emits no row for a day
+# with no runs, so the newest row is not always the newest day. "Last 24h" from
+# window_end spans two such days; a row older than that is a different day's
+# number under the digest's heading.
+POOL_DIGEST_DAYS = 2
+POOL_DAY_FORMAT = "%Y-%m-%d"
 
 # --- Roster ------------------------------------------------------------------
 # The admitted roster is the source of truth for what can red a pull request
@@ -982,6 +1017,291 @@ def slow_evidence(slow: dict) -> str:
     )
 
 
+def _as_seconds(minutes) -> int | None:
+    """pool-pressure.json reports minutes; health.json stores seconds.
+
+    The product is what gets checked, not the input: json.loads returns both
+    `1e308`, finite until multiplied, and integers no float can hold. Bools
+    are a data error rather than 1 and 0, as render.is_number has it.
+    """
+    if not isinstance(minutes, (int, float)) or isinstance(minutes, bool):
+        return None
+    try:
+        seconds = float(minutes) * SECONDS_PER_MINUTE
+    except OverflowError:  # an int too large to be a float
+        return None
+    return int(seconds) if math.isfinite(seconds) else None
+
+
+def _section(artifact: dict, key: str) -> dict:
+    """A named object out of the artifact, `{}` when it is anything else.
+
+    pool-pressure.json is another job's output and nothing validates its shape
+    on the way in. A wrong type raises inside adjudicate, and the Actions step
+    calling it has no continue-on-error, so one malformed artifact would stop
+    the dashboard and the chat bot every 15 minutes until someone noticed.
+    """
+    value = artifact.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _rows(section: dict, key: str = "days") -> list:
+    """An array field, `[]` when the artifact put something else there."""
+    rows = section.get(key)
+    return rows if isinstance(rows, list) else []
+
+
+def wait_text(seconds) -> str:
+    """A measured wait: "24s" below a minute, "22 min" above. Whole minutes
+    would print an ordinary 24-second wait as "0 min". post_health imports it
+    so the chat message and the evidence line agree."""
+    if seconds is None:
+        return "?"
+    return f"{int(seconds)}s" if seconds < SECONDS_PER_MINUTE else f"{seconds // SECONDS_PER_MINUTE} min"
+
+
+def minutes_text(seconds) -> str:
+    """A threshold, which the runbook always states in whole minutes.
+
+    post_health imports it, as it does wait_text, so the chat message and the
+    evidence line cannot drift.
+    """
+    return "?" if seconds is None else str(int(seconds // SECONDS_PER_MINUTE))
+
+
+def _longest_wait_s(queue: dict) -> int | None:
+    """The longest current wait for a project, or None if Deck was not read.
+
+    None and zero say different things -- "we cannot tell" against "nothing is
+    waiting" -- and the message gate treats them differently. A figure over
+    POOL_MAX_WAIT is dropped like an unparseable one: it costs its own run,
+    not the tick that would otherwise date a backlog from it and raise.
+    """
+    if not queue.get("read"):
+        return None
+    cap = int(POOL_MAX_WAIT.total_seconds())
+    waits = [_as_seconds(run.get("minutes")) for run in _rows(queue, "waiting_runs") if isinstance(run, dict)]
+    return max([w for w in waits if w is not None and w <= cap], default=0)
+
+
+def _over_limit(row: dict, thresholds: dict) -> bool:
+    """Whether a stretch's own percentiles are over either limit.
+
+    `days[]` rows carry the periodic's `breached` flag; the recent block does
+    not, because it is evidence and never a verdict. Strict `>` and either
+    half, as `DayRow.breached` compares. False when a limit is missing: the
+    question cannot be answered, and the periodic's own flagged day can.
+    """
+    limits = (_as_seconds(thresholds.get("p50_minutes")), _as_seconds(thresholds.get("p95_minutes")))
+    return any(
+        limit is not None and (_as_seconds(row.get(key)) or 0) > limit
+        for key, limit in zip(("p50_minutes", "p95_minutes"), limits)
+    )
+
+
+def _worst_breached_day(trend: dict, thresholds: dict) -> dict | None:
+    """The `days[]` row that breached hardest, or None if no day did.
+
+    Hardest is the largest excess over either limit, so a day that went over on
+    p95 alone is still picked ahead of a quiet one. A row's own `breached` flag
+    is what `trend.breached_days` is built from, sample minimum included.
+    """
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    if not days:
+        return None
+    # Through _as_seconds on both sides: the ratio is the same in either unit,
+    # and it is the file's existing filter for a figure that is not a number.
+    limits = (_as_seconds(thresholds.get("p50_minutes")), _as_seconds(thresholds.get("p95_minutes")))
+
+    def excess(row: dict) -> float:
+        return max(
+            (_as_seconds(row.get(key)) or 0) / limit if limit else 0
+            for key, limit in zip(("p50_minutes", "p95_minutes"), limits)
+        )
+
+    return max(days, key=excess)
+
+
+def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict | None:
+    """Rule 8: the note's numbers while the pool is backed up, else None.
+
+    `artifact` is the pool-pressure periodic's pool-pressure.json, None when
+    the job has published none. `prev` is the previous tick's note and carries
+    the episode's `since`, as rule 7's does. The verdict is the periodic's and
+    is not re-derived; staleness is the exception, because an artifact cannot
+    report that it has stopped being written.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    measured = parse_iso(artifact.get("window_end"))
+    verdict = artifact.get("verdict")
+    if measured is None or now - measured > POOL_STALE_AFTER:
+        # Stale outranks the verdict it carries: the numbers may be hours old.
+        verdict = POOL_STALE
+    elif verdict not in (POOL_BREACH, POOL_UNMEASURED):
+        return None
+    # `since` opens on the first note and carries through the episode, but a
+    # BREACH does not inherit one from a stretch that only ever said the queue
+    # could not be read: "runs are waiting since Monday" over two days nobody
+    # measured claims more than the readings do. `breach_seen` is what makes
+    # the two directions differ -- a breach that goes STALE and comes back
+    # keeps its real start, because that start was measured.
+    before = prev or {}
+    breach_seen = bool(before.get("breach_seen")) or verdict == POOL_BREACH
+    carried = before.get("since") if verdict != POOL_BREACH or before.get("breach_seen") else None
+    note = {
+        "since": carried or iso(now),
+        "verdict": verdict,
+        "breach_seen": breach_seen,
+        "measured_at": iso(measured) if measured else None,
+    }
+    if verdict == POOL_STALE:
+        # No numbers at all. A reading from hours ago is not evidence about
+        # now, and a field that is present will eventually be rendered as
+        # though it were current.
+        return note
+    trend = _section(artifact, "trend")
+    pool = _section(artifact, "pool")
+    thresholds = _section(artifact, "thresholds")
+    # The numbers that justify the verdict, not the window's. The periodic
+    # breaches on a single day's row or on a run waiting past p95 right now
+    # (pool_pressure.py's `breached_days or live_breach`) and never on the
+    # seven-day aggregate, which after one bad day sits back inside its own
+    # limit -- printing it under "onboard a project" contradicts the alert.
+    #
+    # The recent stretch comes first when it has the runs to be judged and is
+    # itself over a limit, because a verdict that lasts a week outlives the day
+    # that earned it: a Thursday incident is otherwise evidenced by Monday. It
+    # has to breach on its own to be quoted at all -- a stretch inside both
+    # limits is the same contradiction, only newer. Below the sample floor, or
+    # back inside them, the worst breached day is what is left to show.
+    recent = _section(artifact, "recent")
+    quotable = bool(recent.get("judged")) and _over_limit(recent, thresholds)
+    day = {} if quotable else (_worst_breached_day(trend, thresholds) or {})
+    source = recent if quotable else day
+    longest = _longest_wait_s(_section(artifact, "queue"))
+    limit_p50 = _as_seconds(thresholds.get("p50_minutes"))
+    backlog = None if longest is None or limit_p50 is None else longest > limit_p50
+    return note | {
+        "day": day.get("day"),
+        "window_hours": recent.get("hours") if quotable else None,
+        "p50_s": _as_seconds(source.get("p50_minutes")),
+        "p95_s": _as_seconds(source.get("p95_minutes")),
+        # The longest current wait, and whether it is a backlog. Judged once
+        # here: the alert, the digest and the Brief all ask, and a verdict
+        # lasting a week outlives the queue that earned it. Against the p50
+        # limit, the periodic's own bar for a bad day -- `over_threshold`, the
+        # subset already past p95, misses a pool full all afternoon at half an
+        # hour a run. None when nothing can answer: Deck unread, or no limit.
+        "waiting_longest_s": longest,
+        "waiting_now": backlog,
+        # When this backlog began, not when the episode did: the verdict spans
+        # a week, so "waiting since Monday" can stand over a Thursday jam. The
+        # oldest queued run dates it, and only while there is one.
+        "waiting_since": iso(measured - timedelta(seconds=longest)) if backlog else None,
+        "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
+        "threshold_p50_s": limit_p50,
+        "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
+        "free": pool.get("free"),
+        "total": pool.get("total"),
+        "cause": artifact.get("cause"),
+        # The cap the newest run in the window ran under. Only the
+        # CONCURRENCY_CAP message quotes it, and without it that message
+        # cannot say what to raise the cap from.
+        "max_concurrency": artifact.get("max_concurrency"),
+    }
+
+
+def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
+    """The digest's `typical wait`: the median of the artifact's newest day.
+
+    `trend.p50_minutes` is the seven-day figure and belongs to the note; the
+    digest headline says "last 24h", so it reads the newest judged `days[]`
+    row. None when there is no artifact, it is too old, or every row inside the
+    heading went unjudged -- a quiet weekend would otherwise print Friday's
+    median as today's.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    measured = parse_iso(artifact.get("window_end"))
+    if measured is None or now - measured > POOL_STALE_AFTER:
+        return None
+    # The newest judged row, not the newest row. The producer withholds a
+    # verdict below its sample floor, and at 13:00 UTC today's row holds only
+    # the overnight runs -- one slow run would otherwise be the morning's
+    # typical wait. Withholding the figure instead costs the headline on every
+    # quiet morning, and a night with no runs at all already falls back, since
+    # the producer writes no row for an empty day. Rows are oldest first, so
+    # the first one outside POOL_DIGEST_DAYS ends the walk.
+    for row in reversed(_rows(_section(artifact, "trend"))):
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = datetime.strptime(row["day"], POOL_DAY_FORMAT).date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (measured.date() - day).days >= POOL_DIGEST_DAYS:
+            break
+        if row.get("judged"):
+            return _as_seconds(row.get("p50_minutes"))
+    return None
+
+
+def pool_evidence(pool: dict) -> str:
+    if pool["verdict"] == POOL_STALE:
+        return (
+            f"queue wait unmeasured: last reading {pool['measured_at'] or 'never'};"
+            " the hourly pool-pressure job has missed the last few"
+        )
+    if pool["verdict"] == POOL_UNMEASURED:
+        return "pool pressure: the hourly check ran but could not read how long recent runs waited"
+    # UNKNOWN *is* the pool read failing, so the counts are absent on exactly
+    # the breach that most wants explaining. Say the wait and stop.
+    counted = pool["free"] is not None and pool["total"] is not None
+    projects = f"; {pool['free']} of {pool['total']} projects free" if counted else ""
+    return f"backed-up pool: {pool_measurement(pool)}{projects}"
+
+
+def pool_span(pool: dict) -> str | None:
+    """Which stretch the note's numbers cover, or None when it carries none.
+
+    `pool_note` sets `window_hours` when the periodic could judge the recent
+    stretch and `day` when it fell back to the worst breached day, so the three
+    readers that quote numbers do not each decide which it was. A label with no
+    numbers under it is worse than no label: a breach carried by the live queue
+    alone has neither, and would otherwise read "median wait ?".
+    """
+    if pool.get("p50_s") is None and pool.get("p95_s") is None:
+        return None
+    hours = pool.get("window_hours")
+    if hours:
+        return f"last {hours}h"
+    return f"worst day {pool['day']}" if pool.get("day") else None
+
+
+def pool_measurement(pool: dict) -> str:
+    """Where the breach is, in the periodic's own terms: the stretch it
+    measured, the live queue, or both. post_health and the page read the same
+    fields."""
+    parts = []
+    span = pool_span(pool)
+    if span:
+        parts.append(
+            f"{span} median {wait_text(pool['p50_s'])} against"
+            f" {minutes_text(pool['threshold_p50_s'])} min,"
+            f" p95 {wait_text(pool['p95_s'])} against"
+            f" {minutes_text(pool['threshold_p95_s'])}"
+        )
+    if pool.get("over_threshold"):
+        parts.append(
+            f"{pool['over_threshold']} run{'' if pool['over_threshold'] == 1 else 's'}"
+            f" waiting now past {minutes_text(pool['threshold_p95_s'])} min"
+        )
+    # A BREACH always has one or the other; this is what a contract violation
+    # reads as, rather than a sentence with a blank in it.
+    return "; ".join(parts) or "the periodic reported a breach with no measured stretch and no live queue"
+
+
 # --------------------------------------------------------------------------- #
 # Advice
 # --------------------------------------------------------------------------- #
@@ -1307,6 +1627,7 @@ def adjudicate(
     runs: list | None = None,
     wall_clock: datetime | None = None,
     posted: dict | None = None,
+    pool_pressure: dict | None = None,
     fixture_state_doc: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
@@ -1317,9 +1638,12 @@ def adjudicate(
     poster's state file (post_health.py), read for the tracking issue the
     bot filed: it rides in `issue` and the advice while the state is not
     GREEN and the condition is the one it was filed for (issue_for), and is
-    dropped on recovery. `fixture_state_doc` is the hourly fleet scan's
-    fixture-state.json when one is published; rule 3c reads it and the
-    `fixture_state` block below summarises it for the poster.
+    dropped on recovery; it also holds the pool episode's start across a tick
+    that read no artifact. `pool_pressure` is the pool-pressure periodic's
+    artifact (rule 8); absent, the note and the digest's wait are None.
+    `fixture_state_doc` is the hourly fleet scan's fixture-state.json when one
+    is published; rule 3c reads it and the `fixture_state` block below
+    summarises it for the poster.
     """
     if runs is None:
         runs = load_runs(data)
@@ -1360,6 +1684,29 @@ def adjudicate(
     slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None) if decided["state"] == GREEN else None
     if slow:
         evidence.append(slow_evidence(slow))
+    # Rule 8 rides beside the state in every state, unlike rule 7: the wait is
+    # a different job's measurement of different data, so it cannot be this
+    # incident's own symptom, and when leases are the incident it is the
+    # explanation.
+    # Aged against the wall clock: `now` is data.json's horizon, and one Prow
+    # stall freezes it and the artifact together, so the switch never fires.
+    pool_clock = wall_clock or now
+    # A tick that read no artifact writes no note, so the next one has no
+    # `prev` note to take the episode start from. health.json carries it
+    # across those ticks itself: it is written every tick, muted or not,
+    # where the poster's state file freezes on a mute or a crash and would
+    # hand a later episode an older episode's start.
+    prior = ((prev or {}).get("pool") or {})
+    before_metrics = (prev or {}).get("metrics") or {}
+    held = prior.get("since") or before_metrics.get("pool_since")
+    # Whether the open episode has ever measured a breach, carried the same way
+    # and for the same reason as its start: pool_note refuses to date a breach
+    # from a monitoring-only stretch, and a blind tick must not answer that
+    # question by forgetting.
+    seen = prior.get("breach_seen") if prior else before_metrics.get("pool_breach_seen")
+    pool = pool_note(pool_pressure, pool_clock, {"since": held, "breach_seen": bool(seen)})
+    if pool:
+        evidence.append(pool_evidence(pool))
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])
@@ -1385,10 +1732,24 @@ def adjudicate(
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "slow": slow,
+        "pool": pool,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),
     }
+    # Beside the digest's other 24h numbers, but not derived from the runs
+    # `metrics` reads -- the wait comes from the periodic, not from data.json.
+    out["metrics"]["queue_wait_p50_s"] = pool_wait_p50_s(pool_pressure, pool_clock)
+    # Whether the artifact was there at all, which no other field answers: the
+    # note is None both for a healthy pool and for a fetch that failed, and
+    # queue_wait_p50_s is None on a quiet day too. The poster needs the
+    # difference -- going blind must not read as the episode ending.
+    out["metrics"]["queue_wait_read"] = isinstance(pool_pressure, dict)
+    # The open episode's start, kept only across blind ticks: a tick that read
+    # the artifact and wrote no note ended the episode, so the next breach is
+    # a new one and starts from its own clock.
+    out["metrics"]["pool_since"] = pool["since"] if pool else (None if out["metrics"]["queue_wait_read"] else held)
+    out["metrics"]["pool_breach_seen"] = pool["breach_seen"] if pool else (False if out["metrics"]["queue_wait_read"] else bool(seen))
     if age is not None:
         out["metrics"]["data_age_s"] = int(age.total_seconds())
     return out
@@ -1607,6 +1968,7 @@ def parse_args(argv):
         help="evaluate as of this time and skip the staleness check (default: data.json's generated_at, aged against the wall clock)",
     )
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
+    parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
     parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
     parser.add_argument("--case-notes", type=pathlib.Path, default=DEFAULT_CASE_NOTES, help="case-notes.yaml for tracking issues")
     roster = parser.add_mutually_exclusive_group()
@@ -1654,6 +2016,7 @@ def main(argv=None) -> int:
             notes,
             wall_clock=None if args.now else wall_clock,
             posted=load_json(args.posted_state),
+            pool_pressure=load_json(args.pool_pressure),
             fixture_state_doc=load_json(args.fixture_state),
         )
         text = json.dumps(health, indent=2) + "\n"

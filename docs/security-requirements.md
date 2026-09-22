@@ -75,13 +75,13 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 
 ### 6. Credential Isolation
 
-- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee. The operator-managed exceptions are the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker and, under the unsupported `mode: next` toggle, a second one bound to the `a2a-bus` audience; see the discussion below.
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee, with one operator-enforced carve-out inside it: an administrator-supplied volume whose source would deliver the A2A bus credential to a second container, or a volume or mount named `a2a-bus-token`, is refused at admission, and on an install running the A2A surface stripped from the render as well (the same Secrets read through `env` are not, which is the supported route for the bridge sidecar). The operator-managed exceptions are the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker and, under the unsupported `mode: next` toggle, a second one bound to the `a2a-bus` audience; see the discussion below.
 - Credentialed commands execute in the credential broker Pod, not in the agent sandbox.
 - The credential broker receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
-- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
+- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support. The one non-CLI interface is the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by a code allowlist (`agents/platform/scripts/api_policy.py`) and open to the shell role only; see [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md).
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the broker for this reason.
 
 The sandbox and the credential runtime must not share a process namespace, and must not run as the

@@ -1,6 +1,7 @@
 import argparse
 import base64
 import contextlib
+import http.client
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ import queue
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -7256,6 +7258,849 @@ class ReadCredentialSelectionTest(unittest.TestCase):
         self.assertEqual("core.hooksPath", without[0][0])
         self.assertEqual(list(credential_proxy.GIT_FORCED_CONFIG), without[1:])
         self.assertNotIn("http.https://github.com/.extraheader", dict(without))
+
+class ApiRelayOverTheSocketTest(unittest.TestCase):
+    """The read-only Cloud API relay, driven over a real socket.
+
+    A fake upstream stands in for monitoring.googleapis.com and records what
+    reached it, so every property the design's security review claims is
+    checked at the edge: which headers leave the broker, which query keys do
+    not, which callers are turned away, and what the audit trail says about
+    each. `GoogleApiRelay.fetch` runs for real; only the connection is pointed
+    at the fake and the token is fixed.
+    """
+
+    CALLER = "system:serviceaccount:kubeagents-system:kubeagents-platform-agent-shell"
+    ALLOWED = "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries"
+
+    def setUp(self):
+        owner = self
+        self.upstream_requests = []
+        self.reply = {"status": 200, "content_type": "application/json; charset=UTF-8",
+                      "body": b'{"timeSeries":[]}', "headers": {}, "delay": 0.0,
+                      # (pieces, seconds between them): send the body a piece at
+                      # a time, flushing each, for the deadline tests.
+                      "trickle": None,
+                      # Announce the full Content-Length, send this many bytes,
+                      # then close the connection.
+                      "truncate_to": None,
+                      # Write this exact byte string as the whole response and
+                      # close, for responses BaseHTTPRequestHandler cannot frame.
+                      "raw": None}
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # noqa: N802
+                owner.upstream_requests.append((self.path, dict(self.headers)))
+                reply = owner.reply
+                time.sleep(reply["delay"])
+                try:
+                    if reply["raw"] is not None:
+                        self.wfile.write(reply["raw"])
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return
+                    self.send_response(reply["status"])
+                    if reply["content_type"]:
+                        self.send_header("Content-Type", reply["content_type"])
+                    for name, value in reply["headers"].items():
+                        self.send_header(name, value)
+                    self.send_header("Content-Length", str(len(reply["body"])))
+                    self.end_headers()
+                    if reply["truncate_to"] is not None:
+                        self.wfile.write(reply["body"][: reply["truncate_to"]])
+                        self.wfile.flush()
+                        self.close_connection = True
+                    elif reply["trickle"] is None:
+                        self.wfile.write(reply["body"])
+                    else:
+                        pieces, gap = reply["trickle"]
+                        for piece in pieces:
+                            self.wfile.write(piece)
+                            self.wfile.flush()
+                            time.sleep(gap)
+                except OSError:
+                    # The broker gave up on us (the deadline test); nothing to report.
+                    pass
+
+            def log_message(self, _message, *_args):
+                return
+
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
+        self.addCleanup(self.upstream.server_close)
+        self.addCleanup(self.upstream.shutdown)
+
+        class FakeRelay(credential_proxy.GoogleApiRelay):
+            """The real fetch over a plain connection to the fake upstream."""
+
+            def __init__(self, port):
+                super().__init__()
+                self.port = port
+                self.hosts = []
+
+            def authorization_header(self):
+                return "Bearer broker-token"
+
+            def connection(self, host):
+                self.hosts.append(host)
+                return http.client.HTTPConnection(
+                    "127.0.0.1", self.port, timeout=credential_proxy.API_RELAY_CONNECT_TIMEOUT_S
+                )
+
+        self.relay = FakeRelay(self.upstream.server_address[1])
+
+        for attribute in ("api_relay", "authenticator", "policy", "executor",
+                          "max_request_bytes", "enforce_read_only"):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        CredentialProxyHandler.api_relay = self.relay
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        # Above _BODY_LARGER_THAN_SOCKET_BUFFERS, so the refused-POST drain test
+        # exercises a body the drain actually reads rather than declines.
+        CredentialProxyHandler.max_request_bytes = 16 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                "kubeagents-credential-proxy": credential_proxy.CALLER_ROLE_SHELL,
+                "kubeagents-credential-proxy-chat": credential_proxy.CALLER_ROLE_CHAT,
+            },
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+        roles = {
+            "shell-token": credential_proxy.CALLER_ROLE_SHELL,
+            "chat-token": credential_proxy.CALLER_ROLE_CHAT,
+        }
+        caller = self.CALLER
+
+        def fake_review(token):
+            if token not in roles:
+                raise credential_proxy.AuthenticationError("not our token")
+            return credential_proxy.Principal(workload=caller, uid="sa-uid", role=roles[token])
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _request(self, path, token="shell-token", method="GET", headers=None, body=None):
+        # http.client rather than urllib: the request target goes on the wire
+        # exactly as written, which is what the normal-form tests need.
+        sent = dict(headers or {})
+        if token is not None:
+            sent["Authorization"] = f"Bearer {token}"
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        try:
+            connection.request(method, path, body=body, headers=sent)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def _raw(self, target: bytes, token=b"shell-token"):
+        """Send a request line as bytes; for targets http.client itself refuses to send."""
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"GET " + target + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer " + token + b"\r\n\r\n"
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            return response.status, dict(response.getheaders()), response.read()
+
+    def _json_request(self, *args, **kwargs):
+        status, headers, body = self._request(*args, **kwargs)
+        return status, headers, json.loads(body)
+
+    # -- the happy path --------------------------------------------------
+
+    def test_a_permitted_read_reaches_the_upstream_with_exactly_two_headers(self):
+        query = (
+            "filter=metric.type%3D%22kubernetes.io%2Fcontainer%2Fcpu%2Fcore_usage_time%22"
+            "&interval.startTime=2026-09-08T00%3A00%3A00Z&key=AIzaFAKE&access_token=x"
+            "&oauth_token=y&bearer_token=z&pageSize=1000"
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, body = self._request(
+                f"{self.ALLOWED}?{query}",
+                headers={"X-Goog-User-Project": "someone-else", "Accept": "text/plain",
+                         "Cookie": "session=1"},
+            )
+        self.assertEqual(200, status)
+        self.assertEqual(b'{"timeSeries":[]}', body)
+        self.assertEqual("application/json; charset=UTF-8", headers["Content-Type"])
+
+        self.assertEqual(["monitoring.googleapis.com"], self.relay.hosts)
+        self.assertEqual(1, len(self.upstream_requests))
+        path, upstream_headers = self.upstream_requests[0]
+        # The three credential keys are gone; every other pair is byte-for-byte.
+        self.assertEqual(
+            "/v3/projects/kagents-dev/timeSeries"
+            "?filter=metric.type%3D%22kubernetes.io%2Fcontainer%2Fcpu%2Fcore_usage_time%22"
+            "&interval.startTime=2026-09-08T00%3A00%3A00Z&pageSize=1000",
+            path,
+        )
+        self.assertEqual(
+            {"Host", "Authorization", "Accept"},
+            set(upstream_headers),
+            "the upstream request carries the broker's two headers and Host, nothing else",
+        )
+        self.assertEqual("Bearer broker-token", upstream_headers["Authorization"])
+        self.assertEqual("application/json", upstream_headers["Accept"])
+
+        lines = [record.getMessage() for record in logs.records]
+        opened = [line for line in lines if line.startswith("api request_id=")]
+        self.assertEqual(1, len(opened))
+        self.assertIn(f"principal={self.CALLER}", opened[0])
+        self.assertIn(" host=monitoring.googleapis.com path=v3/projects/kagents-dev/timeSeries", opened[0])
+        forwarded = [line for line in lines if line.startswith("api forwarded request_id=")]
+        self.assertEqual(1, len(forwarded))
+        self.assertIn(" host=monitoring.googleapis.com status=200 bytes=17 duration_ms=", forwarded[0])
+        request_id = opened[0].split()[1]
+        self.assertIn(request_id, forwarded[0], "the two lines share one request id")
+
+    def test_the_upstream_status_and_body_come_back_unchanged(self):
+        for status, content_type, body in (
+            (403, "application/json; charset=UTF-8", b'{"error":{"code":403,"status":"PERMISSION_DENIED"}}'),
+            (429, "application/json", b'{"error":{"code":429}}'),
+            (404, "text/html", b"<html>gone</html>"),
+        ):
+            with self.subTest(status=status):
+                self.reply.update(status=status, content_type=content_type, body=body)
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    got_status, headers, got_body = self._request(self.ALLOWED)
+                self.assertEqual(status, got_status)
+                self.assertEqual(content_type, headers["Content-Type"])
+                self.assertEqual(body, got_body)
+                self.assertTrue(
+                    any(f"api forwarded request_id=" in r.getMessage() and f"status={status}" in r.getMessage()
+                        for r in logs.records)
+                )
+
+    def test_a_close_delimited_upstream_response_is_relayed_in_full(self):
+        # getresponse() sets connection.sock to None when the upstream says
+        # Connection: close; the body is still readable through the response's
+        # own handle. Re-arming the deadline on connection.sock raised
+        # AttributeError on the first read, which no clause caught: a
+        # traceback, no response, and a request line with no verdict.
+        body = b'{"timeSeries":[' + b"x" * 200_000 + b"]}"
+        self.reply.update(body=body, headers={"Connection": "close"})
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(body, got)
+        self.assertEqual("application/json; charset=UTF-8", headers["Content-Type"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api forwarded request_id="), lines[1])
+        self.assertIn(f" status=200 bytes={len(body)} ", lines[1])
+
+    def test_an_http10_upstream_without_content_length_is_read_to_eof(self):
+        body = b'{"metricDescriptors":[' + b"y" * 70_000 + b"]}"
+        self.reply.update(raw=b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n" + body)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(body, got)
+        self.assertEqual("application/json", headers["Content-Type"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api forwarded request_id="), lines[1])
+
+    def test_a_front_end_414_with_connection_close_passes_through(self):
+        self.reply.update(status=414, content_type="text/html; charset=UTF-8",
+                          body=b"<html>414 Request-URI Too Large</html>",
+                          headers={"Connection": "close"})
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, got = self._request(self.ALLOWED)
+        self.assertEqual(414, status)
+        self.assertEqual(b"<html>414 Request-URI Too Large</html>", got)
+        self.assertEqual("text/html; charset=UTF-8", headers["Content-Type"])
+        self.assertTrue(any("api forwarded request_id=" in r.getMessage() and "status=414" in r.getMessage()
+                            for r in logs.records))
+
+    def test_a_query_over_the_length_cap_never_leaves_the_broker(self):
+        cap = credential_proxy.API_RELAY_MAX_QUERY_BYTES
+        over = "filter=" + "a" * (cap - len("filter=") + 1)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(f"{self.ALLOWED}?{over}")
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertIn(str(cap), payload["error"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertTrue(any("api rejected request_id=" in r.getMessage() and "code=API_RELAY_BAD_QUERY" in r.getMessage()
+                            for r in logs.records))
+        # Exactly at the cap is forwarded.
+        at_cap = "filter=" + "a" * (cap - len("filter="))
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._request(f"{self.ALLOWED}?{at_cap}")
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+        self.assertEqual(f"/v3/projects/kagents-dev/timeSeries?{at_cap}", self.upstream_requests[0][0])
+
+    def test_an_upstream_response_with_no_content_type_still_passes(self):
+        self.reply.update(content_type="", body=b"raw")
+        status, headers, body = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(b"raw", body)
+        self.assertNotIn("Content-Type", headers)
+
+    # -- who may call ----------------------------------------------------
+
+    def test_the_route_demands_the_shell_role(self):
+        # Through the constant as well as the literal path: required_roles()
+        # answers () on a miss and the role check then admits everyone, so
+        # the table entry has to be spelled from the same constant the
+        # dispatch uses.
+        for path in (self.ALLOWED, credential_proxy.API_RELAY_PREFIX + "x"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    (credential_proxy.CALLER_ROLE_SHELL,),
+                    credential_proxy.required_roles(path),
+                )
+        self.assertEqual("/v1/gcp/", credential_proxy.API_RELAY_PREFIX)
+
+    def test_the_chat_gateway_is_refused_before_anything_is_read(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED, token="chat-token")
+        self.assertEqual(403, status)
+        self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertFalse(any("api request_id=" in r.getMessage() for r in logs.records),
+                         "a caller the role table turns away never opens an api line")
+
+    def test_an_unauthenticated_caller_is_401(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(self.ALLOWED, token=None)
+        self.assertEqual(401, status)
+        self.assertEqual([], self.upstream_requests)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, _ = self._json_request(self.ALLOWED, token="forged")
+        self.assertEqual(401, status)
+        self.assertEqual([], self.upstream_requests)
+
+    # -- normal form -----------------------------------------------------
+
+    def test_a_path_not_in_normal_form_is_400_and_names_the_reason(self):
+        PATH, HOST, QUERY = "API_RELAY_BAD_PATH", "API_RELAY_BAD_HOST", "API_RELAY_BAD_QUERY"
+        cases = (
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/../other/timeSeries", PATH, "`..`"),
+            ("/v1/gcp/monitoring.googleapis.com/v3//projects/kagents-dev/timeSeries", PATH, "empty"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/./projects/kagents-dev/timeSeries", PATH, "`.`"),
+            ("/v1/gcp/monitoring.googleapis.com/v3%2Fprojects/kagents-dev/timeSeries", PATH, "percent-encoded slash"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries%2f", PATH, "percent-encoded slash"),
+            ("/v1/gcp/https://monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "scheme"),
+            ("/v1/gcp/monitoring.googleapis.com:443/v3/projects/kagents-dev/timeSeries", HOST, "port"),
+            ("/v1/gcp/user@monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "user info"),
+            ("/v1/gcp/Monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "lower-case"),
+            ("/v1/gcp/monitoring%2egoogleapis.com/v3/projects/kagents-dev/timeSeries", HOST, "encoding"),
+            ("/v1/gcp//v3/projects/kagents-dev/timeSeries", HOST, "no upstream host"),
+            ("/v1/gcp/", HOST, "no upstream host"),
+            ("/v1/gcp/monitoring.googleapis.com", PATH, "no API path"),
+            ("/v1/gcp/monitoring.googleapis.com/", PATH, "no API path"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?filter=%zz", QUERY, "percent-escapes"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?filter=a%2", QUERY, "percent-escapes"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a={b}", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=\\b", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=b|c", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=%22b%22&c=\"d\"", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=<b>", QUERY, "query characters"),
+            ("/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries?a=b^c", QUERY, "query characters"),
+        )
+        for path, code, reason in cases:
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._json_request(path)
+                self.assertEqual(400, status)
+                self.assertEqual(code, payload["code"])
+                self.assertIn(reason, payload["error"])
+                self.assertEqual([], self.upstream_requests)
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api request_id=") for line in lines))
+                rejected = [line for line in lines if line.startswith("api rejected request_id=")]
+                self.assertEqual(1, len(rejected))
+                self.assertIn(f" code={code} reason=", rejected[0])
+
+    def test_brackets_in_the_query_are_forwarded_byte_for_byte(self):
+        # `[` and `]` are RFC 3986 gen-delims, but http.client sends them raw
+        # and Google accepts them; the Managed Prometheus routes need them
+        # (`match[]=`, and `[5m]` in every range vector), and `requests` and
+        # `curl -g` leave them unquoted. An earlier shape refused them, which
+        # refused the routes.
+        prometheus = "/v1/gcp/monitoring.googleapis.com/v1/projects/kagents-dev/location/global/prometheus/api/v1"
+        for path, upstream_target in (
+            (f"{prometheus}/series?match[]=up&match[]=node_cpu_seconds_total",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/series?match[]=up&match[]=node_cpu_seconds_total"),
+            (f"{prometheus}/query?query=rate(container_cpu_usage_seconds_total[5m])",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/query?query=rate(container_cpu_usage_seconds_total[5m])"),
+            (f"{prometheus}/query?query=up[5m]",
+             "/v1/projects/kagents-dev/location/global/prometheus/api/v1/query?query=up[5m]"),
+            (f"{self.ALLOWED}?a=[b]", "/v3/projects/kagents-dev/timeSeries?a=[b]"),
+        ):
+            with self.subTest(path=path):
+                self.upstream_requests.clear()
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, _ = self._request(path)
+                self.assertEqual(200, status)
+                self.assertEqual([upstream_target], [p for p, _ in self.upstream_requests])
+                self.assertTrue(any(r.getMessage().startswith("api forwarded request_id=") for r in logs.records))
+
+    def test_a_query_byte_http_client_cannot_send_is_400_not_a_dropped_connection(self):
+        # http.client's own client side refuses these targets, so they go on
+        # the wire raw. Before the query check, a raw UTF-8 byte reached
+        # putrequest as UnicodeEncodeError -- a ValueError neither except
+        # clause caught -- and the caller read zero bytes while the log held a
+        # request line with no verdict; a DEL reached it as InvalidURL and was
+        # misreported as an unreachable upstream.
+        allowed = self.ALLOWED.encode()
+        for suffix in (b"?filter=caf\xc3\xa9", b"?filter=\xff", b"?filter=a\x7fb", b"?filter=a\x01b"):
+            with self.subTest(suffix=suffix):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, headers, body = self._raw(allowed + suffix)
+                self.assertEqual(400, status)
+                payload = json.loads(body)
+                self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts)
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api rejected request_id=") and "code=API_RELAY_BAD_QUERY" in line
+                                    for line in lines))
+
+    def test_a_value_error_from_the_upstream_request_line_is_still_a_400(self):
+        # The second line of defence: if a target ever reaches fetch that
+        # http.client will not send, the answer is the same 400, not a
+        # traceback on the server and a reset on the client.
+        def raising_fetch(host, target, authorization):
+            raise UnicodeEncodeError("ascii", "\xe9", 0, 1, "ordinal not in range(128)")
+
+        self.relay.fetch = raising_fetch
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertTrue(any("api rejected request_id=" in r.getMessage() and "reason=UnicodeEncodeError" in r.getMessage()
+                            for r in logs.records))
+
+        def raising_invalid_url(host, target, authorization):
+            raise http.client.InvalidURL("URL can't contain control characters")
+
+        self.relay.fetch = raising_invalid_url
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+
+    # -- the policy, over the wire ---------------------------------------
+
+    def test_a_policy_refusal_is_403_in_the_exec_shape_with_its_audit_line(self):
+        cases = (
+            ("GET", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/alertPolicies", "gcp.api.path"),
+            ("GET", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries/x", "gcp.api.path"),
+            ("GET", "/v1/gcp/iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/x:generateAccessToken",
+             "gcp.api.host-refused"),
+            ("GET", "/v1/gcp/metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+             "gcp.api.host-refused"),
+            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries", "gcp.api.host"),
+            ("GET", "/v1/gcp/evil.example.com/anything", "gcp.api.host"),
+            ("POST", self.ALLOWED, "gcp.api.method"),
+            ("POST", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries:query", "gcp.api.method"),
+        )
+        for method, path, rule in cases:
+            with self.subTest(method=method, path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._json_request(path, method=method)
+                self.assertEqual(403, status)
+                self.assertEqual(
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": rule},
+                    {key: payload[key] for key in ("status", "code", "rule")},
+                )
+                self.assertTrue(payload["message"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts, "a refused request never opens a connection")
+                lines = [r.getMessage() for r in logs.records]
+                self.assertTrue(any(line.startswith("api request_id=") for line in lines))
+                blocked = [line for line in lines if line.startswith("api blocked request_id=")]
+                self.assertEqual(1, len(blocked))
+                self.assertTrue(blocked[0].endswith(f" rule={rule}"), blocked[0])
+
+    def test_a_refused_post_with_a_large_body_still_receives_its_403(self):
+        # A body larger than the socket buffers is still being written when
+        # the handler answers; closing on it sends a reset that swallows the
+        # response unless the body is drained first.
+        body = b"x" * _BODY_LARGER_THAN_SOCKET_BUFFERS
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request(
+                self.ALLOWED, method="POST", body=body,
+                headers={"Content-Type": "application/json"},
+            )
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.method", payload["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    # -- the upstream misbehaving ----------------------------------------
+
+    def test_a_body_one_byte_over_the_cap_is_502(self):
+        cap = 4096
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            self.reply.update(body=b"x" * (cap + 1))
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, _, payload = self._json_request(self.ALLOWED)
+            self.assertEqual(502, status)
+            self.assertEqual("UPSTREAM_RESPONSE_TOO_LARGE", payload["code"])
+            self.assertIn("pageSize", payload["error"])
+            self.assertTrue(any("api response too large request_id=" in r.getMessage() for r in logs.records))
+
+            self.reply.update(body=b"x" * cap)
+            status, _, body = self._request(self.ALLOWED)
+            self.assertEqual(200, status)
+            self.assertEqual(cap, len(body), "a body exactly at the cap passes")
+
+    def test_a_redirect_is_not_followed(self):
+        self.reply.update(status=302, content_type="text/html", body=b"",
+                          headers={"Location": "https://evil.example/collect"})
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, headers, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_REDIRECTED", payload["code"])
+        self.assertNotIn("Location", headers)
+        self.assertEqual(1, len(self.upstream_requests), "one request, no follow")
+        self.assertEqual(["monitoring.googleapis.com"], self.relay.hosts)
+        self.assertTrue(any("api redirect refused request_id=" in r.getMessage() and "status=302" in r.getMessage()
+                            for r in logs.records))
+
+    def test_an_upstream_that_outlives_the_deadline_is_504(self):
+        self.reply.update(delay=2.0)
+        with mock.patch.object(credential_proxy, "API_RELAY_DEADLINE_S", 0.3):
+            started = time.monotonic()
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(504, status)
+        self.assertEqual("UPSTREAM_TIMEOUT", payload["code"])
+        self.assertLess(time.monotonic() - started, 1.5, "the deadline, not the upstream, ended the wait")
+        self.assertTrue(any("api upstream timeout request_id=" in r.getMessage() for r in logs.records))
+
+    def test_a_connect_that_hangs_is_502_naming_the_connect_timeout(self):
+        # A dropped SYN raises TimeoutError from connect() after the connect
+        # timeout. That is "unreachable", not the read deadline, and the log
+        # names the timeout that fired.
+        class HangingConnection(http.client.HTTPConnection):
+            def connect(self):
+                raise TimeoutError("timed out")
+
+        self.relay.connection = lambda host: HangingConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        connect_lines = [r.getMessage() for r in logs.records
+                         if r.getMessage().startswith("api upstream connect timeout request_id=")]
+        self.assertEqual(1, len(connect_lines))
+        self.assertIn(f"connect_timeout_s={credential_proxy.API_RELAY_CONNECT_TIMEOUT_S}", connect_lines[0])
+        self.assertFalse(any("deadline_s=" in r.getMessage() for r in logs.records))
+
+    def test_a_trickling_upstream_is_cut_at_the_deadline_not_at_the_end_of_the_body(self):
+        # Ten pieces, 0.2 s apart: two seconds of body. With read(n) each
+        # recv re-armed the socket timeout, so the whole body arrived and the
+        # deadline never fired; with read1 the deadline is checked per recv.
+        pieces = [b"x" * 1024] * 10
+        self.reply.update(body=b"".join(pieces), trickle=(pieces, 0.2))
+        with mock.patch.object(credential_proxy, "API_RELAY_DEADLINE_S", 0.5):
+            started = time.monotonic()
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, _, payload = self._json_request(self.ALLOWED)
+            elapsed = time.monotonic() - started
+        self.assertEqual(504, status)
+        self.assertEqual("UPSTREAM_TIMEOUT", payload["code"])
+        self.assertLess(elapsed, 1.2, f"answered after {elapsed:.2f}s; the deadline was 0.5s")
+
+    def test_a_tls_verification_failure_is_502_not_a_400(self):
+        # ssl.SSLCertVerificationError is a ValueError as well as an SSLError,
+        # so a belt clause written for ValueError answered a broken CA bundle
+        # or a TLS-intercepting egress as a bad query. It is the upstream's
+        # fault and is answered as one.
+        class UnverifiableConnection(http.client.HTTPConnection):
+            def connect(self):
+                raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+        self.relay.connection = lambda host: UnverifiableConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        verdicts = [r.getMessage() for r in logs.records if r.getMessage().startswith("api upstream unreachable")]
+        self.assertEqual(1, len(verdicts))
+        self.assertIn("type=SSLCertVerificationError", verdicts[0])
+        self.assertFalse(any("API_RELAY_BAD_QUERY" in r.getMessage() for r in logs.records))
+
+    def test_a_target_putrequest_will_not_send_is_still_a_400_at_the_connection(self):
+        # The belt path, pinned at the level it protects: putrequest refusing
+        # the target, after a successful connect.
+        class RefusingConnection(http.client.HTTPConnection):
+            def putrequest(self, method, url, **kwargs):
+                raise UnicodeEncodeError("ascii", "\xe9", 0, 1, "ordinal not in range(128)")
+
+        self.relay.connection = lambda host: RefusingConnection("127.0.0.1", self.relay.port, timeout=1)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
+        self.assertTrue(any("reason=UnicodeEncodeError" in r.getMessage() for r in logs.records))
+
+    def test_an_upstream_that_closes_short_of_its_content_length_is_502(self):
+        # read1 returns b"" on an early EOF without raising for a
+        # Content-Length-framed body; without the owed-bytes check a page cut
+        # short relayed as a well-framed 200.
+        body = b'{"timeSeries":[' + b"x" * 4096 + b"]}"
+        self.reply.update(body=body, truncate_to=1000)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_TRUNCATED", payload["code"])
+        self.assertNotIn("timeSeries", json.dumps(payload), "none of the partial body is relayed")
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[1].startswith("api upstream truncated request_id="), lines[1])
+        self.assertIn(f" received=1000 expected={len(body)}", lines[1])
+        self.assertFalse(any(line.startswith("api forwarded") for line in lines))
+
+    def test_an_unreachable_upstream_is_502(self):
+        # Point the relay at a port nothing listens on.
+        spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        self.relay.port = spare.server_address[1]
+        spare.server_close()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNAVAILABLE", payload["code"])
+        self.assertTrue(any("api upstream unreachable request_id=" in r.getMessage() for r in logs.records))
+
+    # -- the broker's own side -------------------------------------------
+
+    def test_no_relay_armed_is_503_after_the_policy_has_answered(self):
+        CredentialProxyHandler.api_relay = None
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(503, status)
+        self.assertEqual("API_RELAY_DISABLED", payload["code"])
+        lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(lines[0].startswith("api request_id="))
+        self.assertTrue(lines[1].startswith("api disabled request_id="), lines[1])
+        self.assertTrue(lines[1].endswith(" rule=gcp.api.monitoring.timeseries-list"))
+        # The policy still answers first: a refusal reads as a refusal, not an outage.
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, _, payload = self._json_request("/v1/gcp/logging.googleapis.com/v2/entries")
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.host", payload["rule"])
+
+    def test_a_relayed_content_type_cannot_split_the_response(self):
+        # The one upstream header the relay re-emits is upstream text, so it
+        # gets the same CR/LF strip the agent API proxy gives every header.
+        def injecting_fetch(host, target, authorization):
+            return credential_proxy.ApiRelayResponse(
+                200, "application/json\r\nX-Injected: 1\r\nSet-Cookie: a=b", b"{}"
+            )
+
+        self.relay.fetch = injecting_fetch
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, headers, body = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        self.assertEqual(b"{}", body)
+        self.assertNotIn("X-Injected", headers)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual("application/jsonX-Injected: 1Set-Cookie: a=b", headers["Content-Type"])
+
+    def test_the_tls_context_is_built_once_per_relay(self):
+        relay = credential_proxy.GoogleApiRelay()
+        first = relay.connection("monitoring.googleapis.com")
+        second = relay.connection("monitoring.googleapis.com")
+        self.assertIs(first._context, second._context)
+
+    def test_a_credential_the_broker_cannot_obtain_is_503_and_names_only_the_type(self):
+        def failing():
+            raise RuntimeError("could not read /var/run/secrets/tokens/gcp-ksa/token")
+
+        self.relay.authorization_header = failing
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, _, payload = self._json_request(self.ALLOWED)
+        self.assertEqual(503, status)
+        self.assertEqual("RELAY_CREDENTIAL_UNAVAILABLE", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        joined = "\n".join(r.getMessage() for r in logs.records)
+        self.assertIn("api credential unavailable request_id=", joined)
+        self.assertIn("type=RuntimeError", joined)
+        self.assertNotIn("/var/run/secrets", joined)
+
+
+class ApiRelayAuditLineCannotBeForgedTest(unittest.TestCase):
+    """Caller text in the api lines goes through the same sanitizer as argv[0].
+
+    Driven on a handler object rather than over the socket: `urlsplit` strips
+    `\\n` and `\\r` from a request target, but not the vertical tab or the
+    Unicode line separator, and `str.splitlines` treats both as record
+    boundaries. Whatever the transport lets through, the record stays one line.
+    """
+
+    FORGERY = (
+        "\x0b2026-01-01 00:00:00,000 INFO credential-proxy api request_id=y "
+        "principal=system:serviceaccount:kubeagents-system:other host=x path=y "
+    )
+
+    def _handler(self, path, command="GET"):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.command = command
+        handler.path = path
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:agent-shell",
+            uid="u",
+            role=credential_proxy.CALLER_ROLE_SHELL,
+        )
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        return handler
+
+    def _assert_one_line_each(self, logs):
+        for record in logs.records:
+            message = record.getMessage()
+            self.assertEqual([message], message.splitlines(), message)
+
+    def test_a_forged_host_stays_on_one_line(self):
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com{self.FORGERY}/v3/projects/p/timeSeries")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        self.assertEqual(HTTPStatus.BAD_REQUEST, handler.replies[0][0])
+        self._assert_one_line_each(logs)
+
+    def test_a_forged_path_stays_on_one_line(self):
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com/v3/projects/p/timeSeries{self.FORGERY}")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        # The segment carrying the forgery is not in normal form; either way,
+        # the line that already logged it is intact.
+        self.assertIn(handler.replies[0][0], (HTTPStatus.BAD_REQUEST, HTTPStatus.FORBIDDEN))
+        self._assert_one_line_each(logs)
+
+    def test_the_path_is_logged_wider_than_the_default_but_still_capped(self):
+        long_path = "v3/projects/kagents-dev/" + "a" * 600
+        handler = self._handler(f"/v1/gcp/monitoring.googleapis.com/{long_path}")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_api_relay()
+        opened = next(r.getMessage() for r in logs.records if r.getMessage().startswith("api request_id="))
+        logged = opened.split(" path=", 1)[1]
+        self.assertEqual(credential_proxy.API_RELAY_PATH_LOG_LENGTH, len(logged))
+
+
+class GoogleApiRelayCredentialTest(unittest.TestCase):
+    """The relay's token is google-auth's, obtained once and refreshed by it."""
+
+    def _google(self, credentials, defaults):
+        google = types.ModuleType("google")
+        auth = types.ModuleType("google.auth")
+        transport = types.ModuleType("google.auth.transport")
+        requests_transport = types.ModuleType("google.auth.transport.requests")
+
+        def default(scopes=None):
+            defaults.append(scopes)
+            return credentials, "kagents-dev"
+
+        auth.default = default
+        requests_transport.Request = lambda: "request"
+        google.auth = auth
+        auth.transport = transport
+        transport.requests = requests_transport
+        return {
+            "google": google,
+            "google.auth": auth,
+            "google.auth.transport": transport,
+            "google.auth.transport.requests": requests_transport,
+        }
+
+    def test_default_once_refresh_only_when_lapsed(self):
+        class FakeCredentials:
+            def __init__(self):
+                self.valid = False
+                self.token = None
+                self.refreshed_with = []
+
+            def refresh(self, request):
+                self.refreshed_with.append(request)
+                self.token = f"tok{len(self.refreshed_with)}"
+                self.valid = True
+
+        credentials = FakeCredentials()
+        defaults = []
+        with mock.patch.dict(sys.modules, self._google(credentials, defaults)):
+            relay = credential_proxy.GoogleApiRelay()
+            self.assertEqual("Bearer tok1", relay.authorization_header())
+            self.assertEqual("Bearer tok1", relay.authorization_header(), "a valid token is reused")
+            credentials.valid = False
+            self.assertEqual("Bearer tok2", relay.authorization_header(), "a lapsed one is refreshed")
+        self.assertEqual(1, len(defaults), "google.auth.default is called once")
+        self.assertEqual([credential_proxy.scoped_sa_pool.CLOUD_PLATFORM_SCOPE], defaults[0])
+        self.assertEqual(["request", "request"], credentials.refreshed_with)
+
+    def test_construction_imports_nothing(self):
+        # A broker without the cloud libraries still starts; the route answers
+        # 503 on first use instead.
+        with mock.patch.dict(sys.modules, {"google": None, "google.auth": None}):
+            relay = credential_proxy.GoogleApiRelay()
+            with self.assertRaises(ImportError):
+                relay.authorization_header()
+
+    def test_the_upstream_connection_is_tls_on_443_with_a_bounded_connect(self):
+        connection = credential_proxy.GoogleApiRelay().connection("monitoring.googleapis.com")
+        self.assertIsInstance(connection, http.client.HTTPSConnection)
+        self.assertEqual("monitoring.googleapis.com", connection.host)
+        self.assertEqual(credential_proxy.API_RELAY_UPSTREAM_PORT, connection.port)
+        self.assertEqual(credential_proxy.API_RELAY_CONNECT_TIMEOUT_S, connection.timeout)
+
+
+class ApiRelayQueryStrippingTest(unittest.TestCase):
+    """The credential keys go; every other pair is forwarded as written."""
+
+    def test_the_four_keys_are_removed_wherever_they_sit(self):
+        strip = credential_proxy.strip_credential_query_keys
+        self.assertEqual("", strip("key=a"))
+        self.assertEqual("filter=x", strip("key=a&filter=x"))
+        self.assertEqual("filter=x", strip("filter=x&access_token=b"))
+        self.assertEqual("filter=x&pageSize=5", strip("filter=x&oauth_token=c&pageSize=5"))
+        self.assertEqual("filter=x", strip("bearer_token=d&filter=x"))
+        self.assertEqual("filter=x", strip("key&filter=x&access_token"))
+        self.assertEqual("filter=x", strip("k%65y=a&filter=x"), "the key is compared decoded")
+
+    def test_everything_else_is_byte_for_byte(self):
+        query = "filter=metric.type%3D%22a%2Fb%22+AND+x&interval.endTime=2026-09-15T00%3A00%3A00Z&&pageSize=1000"
+        self.assertEqual(query.replace("&&", "&"), credential_proxy.strip_credential_query_keys(query))
+
+    def test_a_key_that_merely_contains_a_stripped_one_stays(self):
+        self.assertEqual(
+            "keyed=1&my_access_token=2&oauth_token_x=3",
+            credential_proxy.strip_credential_query_keys("keyed=1&my_access_token=2&oauth_token_x=3"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

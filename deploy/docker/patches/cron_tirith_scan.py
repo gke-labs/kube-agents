@@ -6,22 +6,30 @@ into ``tools/approval.py`` by ``deploy/docker/Dockerfile``.
 The defect
 ----------
 ``tools/approval.py``'s ``check_all_command_guards`` is the single pre-exec gate
-every ``terminal()`` command passes through. Its non-interactive branch reads::
+every ``terminal()`` command passes through. Its non-interactive branch reads
+(v2026.9.14; v2026.8.19 spelled the same thing as an inline
+``if _is_cron_approval_context(): if _get_cron_approval_mode() == "deny":`` arm)::
 
     if not is_cli and not is_gateway and not is_ask:
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
-                ...detect_dangerous_command(), then check_command_security()...
-        return {"approved": True, "message": None}
+        for ctx in _unattended_contexts():        # single-query, cron, ...
+            result = _unattended_deny(command, ctx)
+            if result is not None:
+                return result
+        return _approved()
+
+    def _unattended_deny(command, ctx):
+        if ctx.mode() != "deny":
+            return None
+        ...detect_dangerous_command(), then check_command_security()...
 
 Upstream put the Tirith call *inside* the ``deny`` arm. ``approvals.cron_mode``
-has exactly two effective values — ``_get_cron_approval_mode`` maps
-``{approve, off, allow, yes}`` to ``approve`` and everything else, including a
-typo, to ``deny`` — so setting ``approve`` does not merely stop the run blocking
-on a prompt it cannot answer. It returns ``approved`` before the scanner is ever
-reached, and every command in every cron run executes with no content scan at
-all.
+has exactly two effective values — ``_get_cron_approval_mode`` (in
+``tools/approval_context.py``) maps ``{approve, off, allow, yes}`` to
+``approve`` and everything else, including a typo, to ``deny`` — so setting
+``approve`` does not merely stop the run blocking on a prompt it cannot answer.
+``_unattended_deny`` returns ``None`` before the scanner is ever reached, the
+loop falls through to ``_approved()``, and every command in every cron run
+executes with no content scan at all.
 
 That conflation is the bug. Answering the approval prompt and scanning the
 command are separate questions, and only the first one needs a human. An
@@ -209,8 +217,9 @@ def cron_scan_enabled(config: Optional[dict]) -> bool:
 def tirith_fail_open(config: Optional[dict]) -> bool:
     """Whether an unavailable scanner should allow the command through.
 
-    Mirrors the ``ImportError`` handler on ``check_all_command_guards``' cron
-    ``deny`` arm exactly, including its ordering: ``tirith_fail_open`` is only
+    Mirrors the ``ImportError`` handler on the cron ``deny`` arm
+    (``_unattended_deny`` in ``tools/approval.py``, ``_tirith_fail_open`` in
+    ``tools/approval_context.py``) exactly, including its ordering: ``tirith_fail_open`` is only
     consulted when ``tirith_enabled`` is true, so an operator who switched
     Tirith off entirely is not then blocked by its absence.
     """

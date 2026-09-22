@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import ast
+from contextlib import contextmanager
 import sqlite3
 import tempfile
 import unittest
@@ -231,33 +232,27 @@ class FailsTowardUpstreamTest(unittest.TestCase):
         self.assertEqual(out["comment_reaches"], READER_NEXT)
 
 
-# The comment handler, reduced to the two lines the patch anchors on plus the
-# neighbours that make the shape real: `conn` is still open, and add_comment has
-# already committed.
+# The comment handler (v2026.9.14 shape), reduced to the two lines the patch
+# anchors on plus the neighbours that make the shape real: `conn` is still open
+# inside the ``with _board(...)`` block, and add_comment has already committed.
 UPSTREAM_TOOLS = '''\
+@_kanban_handler("kanban_comment")
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     tid = args.get("task_id")
-    body = args.get("body")
+    body = str(args.get("body"))
     author = os.environ.get("HERMES_PROFILE") or "worker"
-    board = args.get("board")
-    try:
-        kb, conn = _connect(board=board)
-        try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            return _ok(task_id=tid, comment_id=cid)
-        finally:
-            conn.close()
-    except ValueError as e:
-        return tool_error(f"kanban_comment: {e}")
+    with _board(args.get("board")) as (kb, conn):
+        cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        return _ok(task_id=tid, comment_id=cid)
 '''
 
-# The other handlers' returns, verbatim from the real module, as a collision
+# The other handlers' returns, in the real module's shape, as a collision
 # guard: the anchor must not match anything outside _handle_comment.
 NEIGHBOURS = '''\
-            return _ok(task_id=tid)
-            return _ok(task_id=tid, attachment_id=aid)
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        return _ok(task_id=tid)
+        return _ok(parent_id=parent_id, child_id=child_id)
+        cid = kb.add_comment(conn, tid, author=author, body=str(body))
 '''
 
 
@@ -277,12 +272,17 @@ class ApplyTest(unittest.TestCase):
     def test_the_anchor_does_not_match_a_neighbouring_return(self):
         self.assertEqual(NEIGHBOURS.count(ANCHOR), 0)
 
-    def test_the_lookup_lands_between_the_write_and_the_return(self):
+    def test_the_lookup_lands_after_the_write_inside_the_board_block(self):
         patched = patch_tree(UPSTREAM_TOOLS)
         write = patched.index("cid = kb.add_comment(")
         call = patched.index(SENTINEL)
-        close = patched.index("conn.close()")
-        self.assertTrue(write < call < close, "the lookup must see an open conn")
+        self.assertLess(write, call)
+        # `with _board(...)` closes conn on exit; the lookup must still be
+        # inside the block, i.e. indented deeper than the `with` itself.
+        with_line = next(l for l in patched.splitlines() if l.lstrip().startswith("with _board("))
+        call_line = next(l for l in patched.splitlines() if SENTINEL in l)
+        depth = lambda l: len(l) - len(l.lstrip())
+        self.assertGreater(depth(call_line), depth(with_line), "the lookup must see an open conn")
 
     def test_upstream_return_fields_are_preserved(self):
         patched = patch_tree(UPSTREAM_TOOLS)
@@ -307,15 +307,21 @@ class ApplyTest(unittest.TestCase):
             "from kanban_comment_status import (  # noqa: E402",
         )
         conn = board("done")
+
+        @contextmanager
+        def _board(board=None):
+            yield FakeKb(conn), conn
+
         ns = {
             "os": __import__("os"),
             "_ok": lambda **f: {"ok": True, **f},
             "tool_error": lambda m: {"ok": False, "error": m},
-            "_connect": lambda board=None: (FakeKb(conn), conn),
+            "_board": _board,
+            "_kanban_handler": lambda name: (lambda fn: fn),
         }
         exec(compile(patched, "<patched>", "exec"), ns)
-        # The handler closes conn in its `finally`; the lookup has already run
-        # by then, which is the property this test is checking.
+        # `with _board(...)` closes conn on exit; the lookup has already run by
+        # then, which is the property this test is checking.
         with mock.patch.object(FakeKb, "add_comment", create=True, return_value=7):
             out = ns["_handle_comment"]({"task_id": CARD, "body": "annotating"})
         self.assertEqual(out["ok"], True)

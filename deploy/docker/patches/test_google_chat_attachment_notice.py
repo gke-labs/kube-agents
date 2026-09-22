@@ -53,10 +53,11 @@ class _ImportBlocker:
         return None
 
 # Verbatim from plugins/platforms/google_chat/adapter.py in the pinned base
-# image, from ``async def`` to the closing paren of its ``return``. Everything
-# above the class is scaffolding: the real module reaches this method with
-# ``SendResult`` imported from gateway and a module logger already configured,
-# neither of which is worth dragging a Hermes tree in for.
+# image (v2026.9.14), from ``async def`` to the closing paren of its ``return``.
+# Everything above the class is scaffolding: the real module reaches this method
+# with ``SendResult`` imported from gateway, a module logger already configured,
+# and the module-level ``_thread_body`` helper (copied verbatim too), none of
+# which is worth dragging a Hermes tree in for.
 UPSTREAM = '''\
 from __future__ import annotations
 
@@ -79,48 +80,33 @@ class SendResult:
         self.error = error
 
 
-class GoogleChatAdapter:
-    async def _post_attachment_fallback(
-        self,
-        chat_id: str,
-        path: str,
-        filename: str,
-        caption: Optional[str],
-        thread_id: Optional[str],
-    ) -> SendResult:
-        """Post a text notice when native attachment delivery is unavailable.
+def _thread_body(text: str, thread_id: Optional[str]) -> Dict[str, Any]:
+    """``{"text": ...}`` plus ``thread.name`` when replying into a thread."""
+    body: Dict[str, Any] = {"text": text}
+    if thread_id:
+        body["thread"] = {"name": thread_id}
+    return body
 
-        Tells the user that file delivery requires a one-time consent
-        flow (``/setup-files``) and reports the local-host path so the
-        file isn't lost. Returns ``success=False`` so callers know the
-        attachment did not land.
-        """
-        lines = []
-        if caption:
-            lines.append(caption)
+
+class GoogleChatAdapter:
+    async def _post_attachment_fallback(self, chat_id: str, path: str, filename: str, caption: Optional[str],
+                                        thread_id: Optional[str]) -> SendResult:
+        """Post the ``/setup-files`` notice (plus host path) when native delivery is
+        unavailable. Always returns ``success=False``."""
+        lines = [caption] if caption else []
         lines.extend([
             f"⚠️ No he podido adjuntar **{filename}**.",
-            "Google Chat s\xf3lo permite adjuntar archivos cuando el bot tiene "
-            "permiso expl\xedcito tuyo (OAuth de usuario). Es un consentimiento "
-            "\xfanico que se hace desde este chat.",
+            "Google Chat s\xf3lo permite adjuntar archivos cuando el bot tiene permiso expl\xedcito tuyo (OAuth de usuario). "
+            "Es un consentimiento \xfanico que se hace desde este chat.",
             "**Para activarlo:** env\xeda `/setup-files` y sigue las instrucciones.",
             f"Mientras tanto el archivo est\xe1 en el host: `{path}`",
         ])
-        body: Dict[str, Any] = {"text": "\\n".join(lines)}
-        if thread_id:
-            body["thread"] = {"name": thread_id}
         try:
-            await self._create_message(chat_id, body)
+            await self._create_message(chat_id, _thread_body("\\n".join(lines), thread_id))
         except Exception:
-            logger.debug(
-                "[GoogleChat] attachment fallback notice send failed",
-                exc_info=True,
-            )
+            logger.debug("[GoogleChat] attachment fallback notice send failed", exc_info=True)
         return SendResult(
-            success=False,
-            error="google_chat: native attachment requires user OAuth — "
-            "run /setup-files in chat",
-        )
+            success=False, error="google_chat: native attachment requires user OAuth — run /setup-files in chat")
 '''
 
 # The report from card t_e5e1ba5e, whose notice was the reported message.
@@ -502,8 +488,8 @@ class DriftTest(unittest.TestCase):
         that would otherwise ship Spanish again with a green build.
         """
         moved = UPSTREAM.replace(
-            "        Tells the user that file delivery requires a one-time consent\n",
-            "        Tells the user that file delivery needs a one-time consent\n",
+            "        unavailable. Always returns ``success=False``.\"\"\"\n",
+            "        unavailable. Always answers ``success=False``.\"\"\"\n",
         )
         self.assertNotEqual(moved, UPSTREAM)
         root, _ = build(moved)

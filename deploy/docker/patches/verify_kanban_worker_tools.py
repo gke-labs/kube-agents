@@ -2,10 +2,11 @@
 """Build gate for the worker-only kanban tool patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_worker_tools.py``. The applier proves only that eight anchors
+``apply_kanban_worker_tools.py``. The applier proves only that its locators
 matched exactly once, and the Dockerfile's ``grep -c`` proves only that the
-string ``check_fn=_check_kanban_worker_mode`` appears seven times. Neither says
-anything about which function that name is bound to at import time, nor about
+gate override ``_gate = _check_kanban_worker_mode`` appears once inside
+upstream's registration loop. Neither says which tools that loop actually
+handed the gate to, nor which function the name is bound to at import time, nor
 what it answers, and the gate has two answers to get right:
 
 1. **A dispatcher-spawned worker keeps everything.** This patch exists to shrink
@@ -76,43 +77,68 @@ ORCHESTRATOR_GATES = {
     "kanban_unblock": "_check_kanban_orchestrator_mode",
 }
 
+#: The one statement the applier adds inside upstream's registration loop. The
+#: Dockerfile greps for the same text; counted here so a re-run that stacked a
+#: second override cannot hide behind a ``grep -q``.
+GATE_OVERRIDE = "_gate = _check_kanban_worker_mode"
 
-# --- 1. Every registration names the gate it should -------------------------
-print("registrations (tools/kanban_tools.py):")
 
-tree = ast.parse((HERMES / "tools" / "kanban_tools.py").read_text())
+# --- 1. The registration loop carries the override once ---------------------
+# Upstream registers table-driven: one ``registry.register`` call in a ``for``
+# over ``_TOOLS``, so there is no per-tool statement to read a ``check_fn=`` off.
+# What the source can still prove is that the override is present exactly once
+# and sits inside that loop, above the call it has to reach.
+print("registration loop (tools/kanban_tools.py):")
 
-gates: dict[str, str] = {}
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    kwargs = {kw.arg: kw.value for kw in node.keywords if kw.arg}
-    name = kwargs.get("name")
-    if not isinstance(name, ast.Constant) or not isinstance(name.value, str):
-        continue
-    if "check_fn" not in kwargs:
-        continue
-    gates[name.value] = ast.unparse(kwargs["check_fn"])
+source = (HERMES / "tools" / "kanban_tools.py").read_text()
+check(
+    "the gate override is spliced exactly once",
+    source.count(GATE_OVERRIDE) == 1,
+    f"found {source.count(GATE_OVERRIDE)}",
+)
 
-for tool in WORKER_ONLY_TOOLS:
+tree = ast.parse(source)
+loops = [
+    node
+    for node in tree.body
+    if isinstance(node, ast.For)
+    and any(
+        isinstance(inner, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "_gate" for t in inner.targets)
+        and isinstance(inner.value, ast.Name)
+        and inner.value.id == "_check_kanban_worker_mode"
+        for inner in ast.walk(node)
+    )
+]
+check("the override lives inside the module-level registration loop", len(loops) == 1)
+if loops:
+    body = loops[0].body
+    override_at = next(
+        (i for i, stmt in enumerate(body) if isinstance(stmt, ast.If)), None
+    )
+    register_at = next(
+        (
+            i
+            for i, stmt in enumerate(body)
+            if isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and ast.unparse(stmt.value.func) == "registry.register"
+        ),
+        None,
+    )
     check(
-        f"{tool} is gated on the worker check",
-        gates.get(tool) == "_check_kanban_worker_mode",
-        f"registered with {gates.get(tool)!r}",
+        "and precedes the registry.register call it has to reach",
+        override_at is not None and register_at is not None and override_at < register_at,
+        f"override at {override_at}, register at {register_at}",
     )
 
-for tool, gate in ORCHESTRATOR_GATES.items():
-    check(
-        f"{tool} still uses upstream's {gate}",
-        gates.get(tool) == gate,
-        f"registered with {gates.get(tool)!r}",
-    )
 
-
-# --- 2. The name resolves to this module's function -------------------------
-# An import that landed below the registrations would raise NameError at module
-# load; one that landed anywhere and shadowed the wrong callable would not. The
-# live registry is the only place that distinction is visible.
+# --- 2. The live registry hands each tool the gate it should -----------------
+# The loop's choice is only visible after it ran. An import that landed below
+# the loop would raise NameError at module load; one that landed anywhere and
+# shadowed the wrong callable would not. The live registry is the only place
+# those distinctions are visible, and the only place the per-tool assertion the
+# old per-registration anchors made can still be made.
 print("live registry:")
 
 import tools.kanban_tools as kanban_tools  # noqa: E402
@@ -123,6 +149,14 @@ for tool in WORKER_ONLY_TOOLS:
     check(
         f"{tool} is registered with this module's gate",
         entry is not None and entry.check_fn is check_kanban_worker_mode,
+        "missing from the registry" if entry is None else f"check_fn={entry.check_fn!r}",
+    )
+
+for tool, gate in ORCHESTRATOR_GATES.items():
+    entry = registry.get_entry(tool)
+    check(
+        f"{tool} still uses upstream's {gate}",
+        entry is not None and entry.check_fn is getattr(kanban_tools, gate),
         "missing from the registry" if entry is None else f"check_fn={entry.check_fn!r}",
     )
 
@@ -252,6 +286,33 @@ check(
     "a worker is offered every worker-only tool",
     set(WORKER_ONLY_TOOLS) <= worker_tools,
     f"missing {sorted(set(WORKER_ONLY_TOOLS) - worker_tools)}",
+)
+check(
+    "including the two review-flow tools v2026.9.14 added",
+    {"kanban_request_review", "kanban_request_changes"} <= worker_tools,
+    f"offered {sorted(worker_tools)}",
+)
+
+# The orchestrator/chat profile: no HERMES_KANBAN_TASK, the kanban toolset on.
+# This is the surface the patch exists to shrink, and the one on which
+# upstream's _worker_guard is a no-op — _enforce_worker_task_ownership has no
+# task to enforce against — so a schema that leaks here is a tool the front
+# door can call against any card.
+_worker_task = os.environ.pop("HERMES_KANBAN_TASK", None)
+try:
+    orchestrator_tools = kanban_tool_names()
+finally:
+    if _worker_task is not None:
+        os.environ["HERMES_KANBAN_TASK"] = _worker_task
+check(
+    "an orchestrator profile is offered none of the worker-only tools",
+    not (set(WORKER_ONLY_TOOLS) & orchestrator_tools),
+    f"leaked {sorted(set(WORKER_ONLY_TOOLS) & orchestrator_tools)}",
+)
+check(
+    "and keeps the surface SOUL.md leaves it",
+    {"kanban_create", "kanban_show", "kanban_comment"} <= orchestrator_tools,
+    f"offered {sorted(orchestrator_tools)}",
 )
 
 with delegated_child_context():

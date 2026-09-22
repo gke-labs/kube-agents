@@ -22,6 +22,13 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
+
+# Must precede every Hermes import. cron.scheduler.run_one_job writes an
+# execution row before it delegates to the (stubbed) body below, and
+# cron/executions.py resolves its ledger from get_hermes_home() at call time,
+# so without this the build stage's own store would collect a probe row.
+os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="cron-run-scope-verify-")
 
 CALLER_CARD = "t_caller"
 JOB_ID = "obtainability-audit"
@@ -39,6 +46,21 @@ def check(label: str, actual: object, expected: object) -> None:
         print(f"  ok  {label}")
 
 
+def rejection(kt, fn, *args) -> str | None:
+    """The tool_error a kanban helper refused with, or None when it let the call through.
+
+    v2026.9.14 made the ownership helpers raise ``_Reject`` — a finished
+    ``tool_error`` payload the ``_kanban_handler`` wrapper renders — instead of
+    returning the string. The patch raises the same way, so the checks read the
+    refusal back out of the exception.
+    """
+    try:
+        fn(*args)
+    except kt._Reject as exc:
+        return str(exc.args[0])
+    return None
+
+
 def main() -> int:
     # The worker environment a dispatched cron job inherits.
     os.environ["HERMES_KANBAN_TASK"] = CALLER_CARD
@@ -51,10 +73,14 @@ def main() -> int:
     # --- outside a cron run: the worker keeps its ambient card --------------
     check("worker default task", kt._default_task_id(None), CALLER_CARD)
     check("worker default risk", current_cron_risk(), "high")
-    check("worker owns its card", kt._enforce_worker_task_ownership(CALLER_CARD), None)
+    check(
+        "worker owns its card",
+        rejection(kt, kt._enforce_worker_task_ownership, CALLER_CARD),
+        None,
+    )
     check(
         "worker refused a foreign card",
-        bool(kt._enforce_worker_task_ownership("t_other")),
+        bool(rejection(kt, kt._enforce_worker_task_ownership, "t_other")),
         True,
     )
 
@@ -74,15 +100,16 @@ def main() -> int:
 
     # --- inside a cron run: the caller's card is out of reach ---------------
     # Both markers, because the real path sets both: cron.scheduler.run_job
-    # enters upstream's non_dispatcher_owned_context, and the patch wraps the
-    # call to run_one_job in its own scope. Upstream's is what withholds the
-    # ambient card as of v2026.8.13 — the patch stopped rewriting
-    # _default_task_id when it did — so this is the one place left that would
-    # notice if that mechanism went away underneath us.
+    # enters upstream's non_dispatcher_owned_context (from _CronRunScope.enter()
+    # since v2026.9.14), and the patch wraps the call to run_one_job in its own
+    # scope. Upstream's is what withholds the ambient card as of v2026.8.13 —
+    # the patch stopped rewriting _default_task_id when it did — so this is the
+    # one place left that would notice if that mechanism went away underneath
+    # us.
     with cron_run_scope(JOB_ID), non_dispatcher_owned_context():
         check("cron run risk default", current_cron_risk(), "high")
         check("cron run has no ambient card", kt._default_task_id(None), None)
-        denied = kt._enforce_worker_task_ownership(CALLER_CARD)
+        denied = rejection(kt, kt._enforce_worker_task_ownership, CALLER_CARD)
         check("cron run refused the caller's card", bool(denied), True)
         check("refusal names the job", JOB_ID in (denied or ""), True)
         check("cron run may still name another task", kt._default_task_id("t_x"), "t_x")
@@ -93,7 +120,11 @@ def main() -> int:
         check("refusal names the job too", JOB_ID in out, True)
 
     check("card is back after the run", kt._default_task_id(None), CALLER_CARD)
-    check("ownership restored", kt._enforce_worker_task_ownership(CALLER_CARD), None)
+    check(
+        "ownership restored",
+        rejection(kt, kt._enforce_worker_task_ownership, CALLER_CARD),
+        None,
+    )
 
     # --- the out-param reaches the code that writes it ----------------------
     # Everything below stubs run_one_job out, which is the right shape for
@@ -122,7 +153,11 @@ def main() -> int:
 
     # And that the wrapper forwards it, rather than accepting it and dropping
     # it on the floor — which is the same production failure with a quieter
-    # symptom, an empty report instead of a NameError.
+    # symptom, an empty report instead of a NameError. The wrapper is otherwise
+    # real: it writes a ledger row (into the throwaway HERMES_HOME above) and
+    # asks v2026.9.14's restart-safe worker dispatch whether to leave the
+    # process, which answers in_process wherever there is no user systemd
+    # session — every container, so the out-param can reach the body at all.
     forwarded: dict = {}
     _real_body = sched._run_one_job_body
     sched._run_one_job_body = lambda job, **kw: forwarded.update(kw) or True
@@ -141,6 +176,57 @@ def main() -> int:
         "with cron_run_scope(" in sched_src,
         True,
     )
+
+    # --- and the body fills it in, on the real save/deliver/mark path ------
+    # v2026.9.14 split the body's tail into _save_compose_deliver (over a
+    # _RunDelivery record) and _finish_completed_run, and the patch now writes
+    # the report from the seam between them, carrying the saved path across on
+    # the record. Every check above either stubs the body or reads its source,
+    # so none of them would notice a write that names the wrong local — the
+    # NameError-on-first-tick failure this file exists to catch, one refactor
+    # later. Stub only the edges: the agent (run_job), the disk
+    # (save_job_output), the adapters (_deliver_result) and the job store
+    # (mark_job_run, claim_dispatch). The execution ledger, the delivery record
+    # and the bookkeeping tail are the real ones.
+    edges = {
+        name: getattr(sched, name)
+        for name in (
+            "run_job",
+            "save_job_output",
+            "_deliver_result",
+            "mark_job_run",
+            "claim_dispatch",
+        )
+    }
+    body_response = f"Audit complete. Ledger updated at {LEDGER_URL}"
+    sched.run_job = lambda job, **kw: (True, "# doc\n", body_response, None)
+    sched.save_job_output = lambda job_id, output: OUTPUT_FILE
+    sched._deliver_result = lambda job, content, **kw: None
+    sched.mark_job_run = lambda job_id, success, error, **kw: True
+    sched.claim_dispatch = lambda job_id: True
+    body_outcome: dict = {}
+    try:
+        with cron_run_scope(JOB_ID):
+            processed = sched._run_one_job_body(
+                {"id": JOB_ID, "name": "Workload Reliability Audit", "deliver": "local"},
+                outcome=body_outcome,
+            )
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"_run_one_job_body raised {type(exc).__name__}: {exc}")
+        processed = None
+    finally:
+        for name, real in edges.items():
+            setattr(sched, name, real)
+    check("the real body processed the run", processed, True)
+    check("the real body reported the response", body_outcome.get("response"), body_response)
+    check("the real body reported success", body_outcome.get("success"), True)
+    check("the real body reported no error", body_outcome.get("error"), None)
+    check(
+        "the real body reported the saved path, as a string",
+        body_outcome.get("output_file"),
+        str(OUTPUT_FILE),
+    )
+    check("the real body reported the delivery error slot", "delivery_error" in body_outcome, True)
 
     # --- newly created cron jobs get default risk stamped --------------------
     import cron.jobs as cj

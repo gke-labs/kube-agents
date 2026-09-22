@@ -174,7 +174,7 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler.py::_resolve_delivery_targets`
+values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
@@ -195,6 +195,12 @@ under "Detecting a broken leg".
 `test_every_watchdog_declares_all_delivery` in
 `../skills/fleet-audit/scripts/test_audit_report.py` enforces this, and carries
 the exemption by name, pinned to a `no_agent` entry whose script exists.
+
+A misspelled `deliver` part next to one that resolves is dropped by the scheduler
+with the run still recording `ok`. `check_cron_delivery` in
+`scripts/check_prompt_assets.py` (`make prompt-check`) refuses a value outside the
+`CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
+the typo fails the pull request instead.
 
 ## `deliver: "chat"` — reporting through the Chat Agent
 

@@ -55,6 +55,13 @@ CASE_NOTES = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "case-
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 8, 0, 0, tzinfo=UTC)
+# Figures json.loads produces that int() cannot take: the `Infinity` and `NaN`
+# literals it accepts, a finite float whose product with 60 is not, and an
+# integer no float can hold.
+INF = float("inf")
+NAN = float("nan")
+OVERFLOWS = 1e308
+HUGE_INT = 10**400
 
 CRASHLOOP_TRIO = [
     "cluster-agent-crashloop-debug",
@@ -817,6 +824,556 @@ class SlowGate(unittest.TestCase):
         result = adjudicate(doc, T0)
         self.assertEqual(result["slow"]["infra_reps"], 3)
         self.assertTrue(result["evidence"][-1].endswith("; 3 reps lost to infra"), result["evidence"])
+
+
+# --------------------------------------------------------------------------- #
+# Rule 8: pool pressure
+# --------------------------------------------------------------------------- #
+
+
+def pressure(
+    verdict="OK",
+    cause=None,
+    window_end=T0,
+    p50=0.4,
+    p95=0.5,
+    today_p50=None,
+    free=25,
+    bad_day="2026-09-06",
+    bad_p50=24.1,
+    bad_p95=157.3,
+    over_threshold=0,
+    **over,
+):
+    """pool-pressure.json in the shape the periodic publishes it.
+
+    Three sets of numbers, deliberately far apart. `p50`/`p95` are the
+    seven-day window, which the periodic never judges on and which the note
+    must therefore not quote. `bad_p50`/`bad_p95` are the breached day's row,
+    which is what it judged and what the note owes the reader. `today_p50` is
+    the newest row, which only the digest reads. A test that swaps two of them
+    fails on the value.
+    """
+    breach = verdict == "BREACH"
+    days = [
+        {
+            "day": "2026-09-07",
+            "runs": 65,
+            "p50_minutes": p50 if today_p50 is None else today_p50,
+            "p95_minutes": p95,
+            "worst_minutes": 2.5,
+            "max_concurrency": 30,
+            "breached": False,
+            "judged": True,
+        }
+    ]
+    if breach and bad_day:
+        # Oldest first, as the periodic writes them: the digest reads days[-1].
+        days.insert(
+            0,
+            {
+                "day": bad_day,
+                "runs": 12,
+                "p50_minutes": bad_p50,
+                "p95_minutes": bad_p95,
+                "worst_minutes": 175.2,
+                "max_concurrency": 30,
+                "breached": True,
+                "judged": True,
+            },
+        )
+    return {
+        "job": "pull-kube-agents-smoke-test",
+        "window_start": health.iso(window_end - timedelta(days=7)),
+        "window_end": health.iso(window_end),
+        "max_concurrency": 30,
+        "cause": cause,
+        "breached": breach,
+        "verdict": verdict,
+        "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
+        "pool": {"busy": 30 - free, "free": free, "total": 30, "in_transition": 0, "stranded": 0},
+        "queue": {"read": True, "waiting": over_threshold, "running": 3, "over_threshold": over_threshold},
+        "trend": {
+            "runs": 586,
+            "p50_minutes": p50,
+            "p95_minutes": p95,
+            "worst_minutes": 175.2,
+            "days": days,
+            "breached_days": [bad_day] if breach and bad_day else [],
+        },
+    } | over
+
+
+def pooled(doc=None, now=T0, prev=None, posted=None, wall_clock=None, **artifact):
+    return health.adjudicate(
+        doc or data(),
+        now,
+        prev,
+        health.Roster.fixed(ADMITTED),
+        posted=posted,
+        wall_clock=wall_clock,
+        pool_pressure=pressure(**artifact),
+    )
+
+
+class PoolNote(unittest.TestCase):
+    def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
+        # The #1069 incident's shape. The seven-day window keeps its quiet
+        # default of 0.4/0.5 min throughout: the periodic breaches on a day's
+        # row or on the live queue and never on the aggregate, so a note built
+        # from the aggregate would print "24s against a 15 min limit" under
+        # "the pool is full, buy another project".
+        result = pooled(verdict="BREACH", cause="CAPACITY", free=0)
+        self.assertEqual(result["state"], "GREEN", "a backed-up pool is a note, not a state")
+        self.assertEqual(
+            result["pool"],
+            {
+                "since": health.iso(T0),
+                "verdict": "BREACH",
+                "measured_at": health.iso(T0),
+                "breach_seen": True,
+                "day": "2026-09-06",
+                "window_hours": None,
+                "p50_s": 1446,
+                "p95_s": 9438,
+                "waiting_longest_s": 0,
+                "waiting_now": False,
+                "waiting_since": None,
+                "over_threshold": 0,
+                "threshold_p50_s": 900,
+                "threshold_p95_s": 2700,
+                "free": 0,
+                "total": 30,
+                "cause": "CAPACITY",
+                "max_concurrency": 30,
+            },
+        )
+        self.assertIn(
+            "backed-up pool: worst day 2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
+            " 0 of 30 projects free",
+            result["evidence"],
+        )
+
+    def test_the_recent_stretch_beats_the_worst_day_when_the_periodic_judged_it(self):
+        # The verdict lasts a week, so Monday's row is still the worst day on
+        # Thursday. Quoting it dates the evidence to a queue that has drained.
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 18.0,
+                  "p95_minutes": 52.0, "worst_minutes": 61.0}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertEqual(note["window_hours"], 3)
+        self.assertIsNone(note["day"], "one label, so the messages need no tie-break")
+        self.assertEqual(note["p50_s"], 1080)
+        self.assertEqual(note["p95_s"], 3120)
+        self.assertEqual(
+            health.pool_measurement(note),
+            "last 3h median 18 min against 15 min, p95 52 min against 45",
+        )
+
+    def test_the_worst_day_stands_in_when_the_recent_stretch_is_too_thin_to_judge(self):
+        # A quiet Sunday holds fewer runs than the periodic will judge on, and
+        # it withholds the percentiles rather than quoting a handful.
+        recent = {"hours": 3, "runs": 2, "judged": False, "p50_minutes": None,
+                  "p95_minutes": None, "worst_minutes": None}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertIsNone(note["window_hours"])
+        self.assertEqual(note["day"], "2026-09-06")
+        self.assertEqual(note["p50_s"], 1446)
+
+    def test_a_recent_stretch_inside_both_limits_is_not_the_breach_evidence(self):
+        # Monday's row holds the verdict all week; by Thursday afternoon the
+        # last three hours are busy and fine. Quoting them would print "median
+        # wait 24s against a 15 min limit" under "queue backed up".
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 0.4,
+                  "p95_minutes": 0.5, "worst_minutes": 1.0}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertIsNone(note["window_hours"])
+        self.assertEqual(note["day"], "2026-09-06")
+        self.assertEqual(note["p50_s"], 1446)
+
+    def test_a_recent_stretch_over_p95_alone_is_still_the_breach_evidence(self):
+        # Either half, as a day's row breaches: a compliant median under a p95
+        # that is double the limit is a queue, not a quiet stretch.
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 2.0,
+                  "p95_minutes": 90.0, "worst_minutes": 120.0}
+        note = pooled(verdict="BREACH", cause="CAPACITY", free=0, recent=recent)["pool"]
+        self.assertEqual(note["window_hours"], 3)
+        self.assertEqual(note["p95_s"], 5400)
+
+    def test_a_live_breach_with_nothing_over_a_limit_carries_no_numbers(self):
+        # Runs queued past p95 right now are not in the sweep, so a live breach
+        # can have no breached day and a fine recent stretch. A span over no
+        # numbers reads "median wait ?"; pool_span returns None instead.
+        recent = {"hours": 3, "runs": 31, "judged": True, "p50_minutes": 0.4,
+                  "p95_minutes": 0.5, "worst_minutes": 1.0}
+        note = pooled(verdict="BREACH", cause="CONTROL_PLANE", free=25,
+                      over_threshold=4, bad_day=None, recent=recent)["pool"]
+        self.assertIsNone(note["window_hours"])
+        self.assertIsNone(note["day"])
+        self.assertIsNone(health.pool_span(note))
+        self.assertEqual(health.pool_measurement(note), "4 runs waiting now past 45 min")
+
+    def test_a_breach_after_a_monitoring_stretch_is_dated_from_the_breach(self):
+        # The periodic dies Monday and comes back Wednesday reporting a queue.
+        # Carrying Monday's start would put "runs are waiting to start since
+        # Monday" on the lede over two days nobody measured.
+        dead = T0 - timedelta(hours=4)
+        stale = pooled(verdict="BREACH", cause="CAPACITY", window_end=dead)
+        self.assertEqual(stale["pool"]["verdict"], "STALE")
+        self.assertFalse(stale["pool"]["breach_seen"])
+        back = T0 + timedelta(days=2)
+        note = pooled(now=back, prev=stale, verdict="BREACH", cause="CAPACITY", window_end=back)["pool"]
+        self.assertEqual(note["since"], health.iso(back), "dated from the first reading that saw it")
+        self.assertTrue(note["breach_seen"])
+
+    def test_a_breach_that_goes_stale_and_returns_keeps_its_real_start(self):
+        # The other direction, and why breach_seen exists rather than a plain
+        # verdict comparison: that start was measured.
+        first = pooled(verdict="BREACH", cause="CAPACITY")
+        blind_at = T0 + timedelta(hours=1)
+        stale = pooled(now=blind_at, prev=first, verdict="BREACH", cause="CAPACITY", window_end=blind_at - timedelta(hours=4))
+        self.assertEqual(stale["pool"]["verdict"], "STALE")
+        back = blind_at + timedelta(hours=1)
+        note = pooled(now=back, prev=stale, verdict="BREACH", cause="CAPACITY", window_end=back)["pool"]
+        self.assertEqual(note["since"], health.iso(T0), "one episode, and it breached at the start")
+
+    def test_a_blind_tick_does_not_forget_that_the_episode_never_breached(self):
+        # The same question across a tick that read no artifact. metrics
+        # carries it beside the start, or the breach would date itself from
+        # the monitoring stretch again.
+        dead = T0 - timedelta(hours=4)
+        stale = pooled(verdict="BREACH", cause="CAPACITY", window_end=dead)
+        blind_at = T0 + timedelta(minutes=15)
+        blind = health.adjudicate(data(), blind_at, stale, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(blind["pool"])
+        self.assertFalse(blind["metrics"]["pool_breach_seen"])
+        back = blind_at + timedelta(minutes=15)
+        note = pooled(now=back, prev=blind, verdict="BREACH", cause="CAPACITY", window_end=back)["pool"]
+        self.assertEqual(note["since"], health.iso(back))
+
+    def test_the_longest_live_wait_separates_an_unread_queue_from_an_empty_one(self):
+        # The gate posts on an unread queue and withholds on an empty one, so
+        # None and 0 cannot collapse into each other.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        artifact["queue"]["waiting_runs"] = [{"minutes": 3.0, "pull": 1}, {"minutes": 31.5, "pull": 2}]
+        self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 1890)
+        artifact["queue"]["waiting_runs"] = []
+        self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 0)
+        artifact["queue"]["read"] = False
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_longest_s"])
+
+    def test_whether_the_queue_is_a_backlog_is_judged_once_for_every_reader(self):
+        # The alert, the digest line and the Brief sentence all ask it, so the
+        # answer is derived here rather than three times. The bar is the p50
+        # limit, and it is strict: a wait exactly at the limit is not over it.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        limit = artifact["thresholds"]["p50_minutes"]
+        for name, minutes, expected in (("over", limit + 0.5, True), ("at", limit, False), ("under", limit - 0.5, False)):
+            with self.subTest(name):
+                artifact["queue"]["waiting_runs"] = [{"minutes": minutes, "pull": 1}]
+                self.assertIs(health.pool_note(artifact, T0, None)["waiting_now"], expected)
+        # Two ways to have no answer, and neither may read as "nothing is
+        # waiting": the readers say less on None instead of claiming it cleared.
+        artifact["queue"]["read"] = False
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_now"])
+        artifact["queue"]["read"] = True
+        artifact["queue"]["waiting_runs"] = [{"minutes": limit + 99, "pull": 1}]
+        artifact["thresholds"].pop("p50_minutes")
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_now"])
+
+    def test_a_backlog_is_dated_from_the_oldest_run_in_it(self):
+        # The episode's `since` spans the verdict, which lasts a week, so under
+        # a Thursday jam it can read Monday -- three days the queue was not
+        # measured waiting. The oldest queued run dates the jam itself.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        artifact["queue"]["waiting_runs"] = [{"minutes": 40, "pull": 1}, {"minutes": 9, "pull": 2}]
+        note = health.pool_note(artifact, T0, None)
+        measured = health.parse_iso(note["measured_at"])
+        self.assertEqual(health.parse_iso(note["waiting_since"]), measured - timedelta(minutes=40))
+        # Nothing to date: no backlog, and no reading of the queue at all.
+        artifact["queue"]["waiting_runs"] = [{"minutes": 9, "pull": 2}]
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_since"])
+        artifact["queue"]["read"] = False
+        self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_since"])
+
+    def test_a_malformed_waiting_queue_costs_the_figure_not_the_tick(self):
+        # Same filter as the rest of the artifact reader: the adjudicate step
+        # is not continue-on-error.
+        shapes = (
+            ("a dict", {"minutes": 9}),
+            ("a string in the list", ["9"]),
+            ("a figure infinite", [{"minutes": INF}]),
+            # Finite, so _as_seconds returns it, and larger than a date can be
+            # moved back by: without the cap it dates the backlog and raises.
+            ("a figure past any real wait", [{"minutes": 2e9}]),
+        )
+        for name, runs in shapes:
+            with self.subTest(name):
+                artifact = pressure(verdict="BREACH", cause="CAPACITY")
+                artifact["queue"]["waiting_runs"] = runs
+                self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 0)
+        # And it costs only its own run: the jam beside it is still measured.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY")
+        artifact["queue"]["waiting_runs"] = [{"minutes": 2e9}, {"minutes": 40}]
+        self.assertEqual(health.pool_note(artifact, T0, None)["waiting_longest_s"], 2400)
+
+    def test_the_digest_wait_is_withheld_on_a_day_the_producer_would_not_judge(self):
+        # At 13:00 UTC the newest row holds only the overnight runs. One slow
+        # run would otherwise be the morning's "typical wait" and the evidence
+        # the queue had cleared.
+        artifact = pressure(verdict="OK", today_p50=40.0)
+        artifact["trend"]["days"][-1] |= {"runs": 1, "judged": False}
+        self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
+        artifact["trend"]["days"][-1]["judged"] = True
+        self.assertEqual(health.pool_wait_p50_s(artifact, T0), 2400)
+
+    def test_a_quiet_night_falls_back_to_the_last_day_the_producer_judged(self):
+        # A night with no runs at all already prints yesterday's median, because
+        # the producer emits no row for an empty day. Three overnight runs must
+        # not say less than none: the floor above withholds the unjudged row,
+        # not the figure, and this is the headline that teaches normal.
+        artifact = pressure(verdict="OK")
+        artifact["trend"]["days"].append(
+            {"day": "2026-09-08", "runs": 3, "p50_minutes": 90.0, "p95_minutes": 95.0, "judged": False})
+        self.assertEqual(health.pool_wait_p50_s(artifact, T0), 24)
+        # Bounded by the same two days: reaching back past them would print
+        # Friday's median under a Monday heading, which is what POOL_DIGEST_DAYS
+        # was added to stop.
+        artifact["trend"]["days"][0]["day"] = "2026-09-06"
+        self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
+
+    def test_the_worst_breached_day_wins_even_when_it_breached_on_p95_alone(self):
+        # Excess over either limit, so a day that went over on p95 only is
+        # still picked ahead of a quieter day that went over on p50.
+        artifact = pressure(verdict="BREACH", cause="CAPACITY", bad_p50=16.0, bad_p95=46.0)
+        artifact["trend"]["days"].insert(
+            1,
+            {"day": "2026-09-06b", "runs": 9, "p50_minutes": 2.0, "p95_minutes": 300.0,
+             "worst_minutes": 301.0, "max_concurrency": 30, "breached": True, "judged": True},
+        )
+        note = health.pool_note(artifact, T0, None)
+        self.assertEqual(note["day"], "2026-09-06b")
+        self.assertEqual(note["p50_s"], 120, "the day's own median, low though it is")
+        self.assertEqual(note["p95_s"], 18000)
+
+    def test_a_breach_with_no_bad_day_quotes_the_runs_queued_right_now(self):
+        # pool_pressure.py breaches on `breached_days or live_breach`, so one
+        # run stuck past p95 breaches a week that has no bad day in it at all.
+        result = pooled(verdict="BREACH", cause="CAPACITY", free=0, bad_day=None, over_threshold=3)
+        note = result["pool"]
+        self.assertIsNone(note["day"])
+        self.assertIsNone(note["p50_s"], "no day breached, so there is no day's median to quote")
+        self.assertEqual(note["over_threshold"], 3)
+        self.assertIn(
+            "backed-up pool: 3 runs waiting now past 45 min; 0 of 30 projects free",
+            result["evidence"],
+        )
+
+    def test_a_breach_that_could_not_count_the_pool_says_the_wait_and_stops(self):
+        # pool_pressure.cause() returns UNKNOWN exactly when the occupancy read
+        # failed, and writes free/total as null in the same breath -- so this is
+        # every UNKNOWN breach, not a corner of one.
+        unread = {"read": False, "error": "boskos: connection refused",
+                  "busy": None, "free": None, "total": None, "in_transition": None, "stranded": None}
+        result = pooled(verdict="BREACH", cause="UNKNOWN", pool=unread)
+        line = next(one for one in result["evidence"] if one.startswith("backed-up pool"))
+        self.assertNotIn("None", line)
+        self.assertEqual(
+            "backed-up pool: worst day 2026-09-06 median 24 min against 15 min, p95 157 min against 45",
+            line,
+        )
+
+    def test_a_breach_on_both_counts_reports_both(self):
+        note = pooled(verdict="BREACH", cause="CAPACITY", over_threshold=1)["pool"]
+        self.assertEqual(
+            health.pool_measurement(note),
+            "worst day 2026-09-06 median 24 min against 15 min, p95 157 min against 45;"
+            " 1 run waiting now past 45 min",
+        )
+
+    def test_a_fresh_pass_and_a_missing_artifact_are_both_silent(self):
+        self.assertIsNone(pooled(verdict="OK")["pool"])
+        bare = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(bare["pool"])
+        self.assertIsNone(bare["metrics"]["queue_wait_p50_s"])
+        self.assertFalse(any(line.startswith("backed-up pool") for line in bare["evidence"]), bare["evidence"])
+
+    def test_the_read_flag_separates_a_healthy_pool_from_a_missing_artifact(self):
+        # Both leave `pool` null, and a stale artifact leaves the digest
+        # number null too; only this bit says the fetch worked.
+        self.assertTrue(pooled(verdict="OK")["metrics"]["queue_wait_read"])
+        self.assertTrue(pooled(verdict="OK", window_end=T0 - timedelta(hours=4))["metrics"]["queue_wait_read"])
+        bare = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED))
+        self.assertFalse(bare["metrics"]["queue_wait_read"])
+
+    def test_the_workflow_sentinel_reads_as_stale_with_nothing_to_quote(self):
+        # What ci-health.yml substitutes when the copy or the parse fails. It
+        # is a dict, so it counts as a reading, but it has no window_end --
+        # the same STALE the dead-man's switch gives, minus a last reading.
+        sentinel = {"note": "build 2099957253191766016 published no usable pool-pressure.json"}
+        result = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED), pool_pressure=sentinel)
+        self.assertEqual(
+            result["pool"],
+            {"since": health.iso(T0), "verdict": "STALE", "breach_seen": False, "measured_at": None},
+        )
+        self.assertTrue(result["metrics"]["queue_wait_read"], "the fetch worked; the periodic did not")
+        self.assertIsNone(result["metrics"]["queue_wait_p50_s"])
+
+    def test_a_section_of_the_wrong_type_costs_the_figure_not_the_tick(self):
+        # Another job writes this file and nothing validates it on the way in.
+        # The step that calls adjudicate has no continue-on-error, so a raise
+        # here stops the dashboard and the bot every 15 minutes.
+        window = health.iso(T0)
+        for name, artifact in (
+            ("trend a list", {"trend": []}),
+            ("days a dict", {"trend": {"days": {"friday": 1}}}),
+            ("days a string", {"trend": {"days": "none"}}),
+            ("pool a string", {"pool": "full"}),
+            ("queue a list", {"queue": []}),
+            ("thresholds a list", {"thresholds": []}),
+            (
+                "a threshold as a string",
+                {
+                    "thresholds": {"p50_minutes": "15", "p95_minutes": "45"},
+                    "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": 22.0}]},
+                },
+            ),
+            (
+                "a day's minutes as a string",
+                {
+                    "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
+                    "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": "22"}]},
+                },
+            ),
+            # Rows dated to T0 and judged so the digest figure is really read:
+            # a row two days back leaves before _as_seconds on
+            # POOL_DIGEST_DAYS, and an unjudged one before the sample floor.
+            *(
+                (
+                    f"a day's minutes {name}",
+                    {
+                        "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
+                        "trend": {"days": [{"day": "2026-09-08", "breached": True, "judged": True, "p50_minutes": value}]},
+                    },
+                )
+                for name, value in (
+                    ("infinite", INF),
+                    ("NaN", NAN),
+                    ("a bool", True),
+                    ("overflowing on the way to seconds", OVERFLOWS),
+                    ("an integer too large to be a float", HUGE_INT),
+                )
+            ),
+            (
+                "a threshold infinite",
+                {
+                    "thresholds": {"p50_minutes": INF, "p95_minutes": 45},
+                    "trend": {"days": [{"day": "2026-09-06", "breached": True, "p50_minutes": 22.0}]},
+                },
+            ),
+        ):
+            with self.subTest(name):
+                bad = {"window_end": window, "verdict": "BREACH"} | artifact
+                self.assertEqual(health.pool_note(bad, T0, None)["verdict"], "BREACH")
+                self.assertIsNone(health.pool_wait_p50_s(bad, T0))
+
+    def test_an_episode_keeps_its_start_and_a_new_one_gets_a_new_start(self):
+        first = pooled(verdict="BREACH", cause="CAPACITY")
+        later = T0 + timedelta(hours=2)
+        held = pooled(now=later, prev=first, verdict="BREACH", cause="CAPACITY", bad_p50=20.0, window_end=later)
+        self.assertEqual(held["pool"]["since"], health.iso(T0))
+        self.assertEqual(held["pool"]["p50_s"], 1200, "the numbers are this tick's")
+        cleared = pooled(now=later, prev=held, verdict="OK", window_end=later)
+        self.assertIsNone(cleared["pool"])
+        again = T0 + timedelta(hours=5)
+        self.assertEqual(
+            pooled(now=again, prev=cleared, verdict="BREACH", cause="CAPACITY", window_end=again)["pool"]["since"],
+            health.iso(again),
+        )
+
+    def test_a_blind_tick_does_not_restart_the_episode(self):
+        # The in-flight skip makes a missing artifact an hourly event, so a
+        # start carried only through the previous note would reset about every
+        # hour. health.json holds it in metrics.pool_since across those ticks.
+        first = pooled(verdict="BREACH", cause="CAPACITY")
+        blind_at = T0 + timedelta(minutes=15)
+        blind = health.adjudicate(data(), blind_at, first, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(blind["pool"], "no artifact is no note")
+        self.assertEqual(blind["metrics"]["pool_since"], health.iso(T0), "the start outlives the note")
+        back = blind_at + timedelta(minutes=15)
+        carried = pooled(now=back, prev=blind, verdict="BREACH", cause="CAPACITY", window_end=back)
+        self.assertEqual(carried["pool"]["since"], health.iso(T0), "one episode, not two")
+
+    def test_a_read_tick_with_no_note_ends_the_episode_for_good(self):
+        # The counterpart: an episode that really ended must not come back,
+        # however many blind ticks follow it.
+        first = pooled(verdict="BREACH", cause="CAPACITY")
+        over_at = T0 + timedelta(hours=1)
+        over = pooled(now=over_at, prev=first, verdict="OK", window_end=over_at)
+        self.assertIsNone(over["pool"])
+        self.assertIsNone(over["metrics"]["pool_since"], "a reading with no note is the episode over")
+        blind_at = over_at + timedelta(minutes=15)
+        blind = health.adjudicate(data(), blind_at, over, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(blind["metrics"]["pool_since"], "a blind tick holds nothing when nothing is open")
+        again = T0 + timedelta(days=2)
+        fresh = pooled(now=again, prev=blind, verdict="BREACH", cause="CAPACITY", window_end=again)
+        self.assertEqual(fresh["pool"]["since"], health.iso(again), "a new episode, dated from itself")
+
+    def test_a_previous_document_with_no_metrics_does_not_stop_the_tick(self):
+        # load_json checks that health.json is a dict and nothing more, and
+        # the adjudicate step is not continue-on-error: a null field here
+        # stops the dashboard and the bot every 15 minutes.
+        note = pooled(prev={"metrics": None}, verdict="BREACH", cause="CAPACITY")["pool"]
+        self.assertEqual(note["since"], health.iso(T0))
+
+    def test_an_artifact_that_stopped_moving_carries_no_numbers(self):
+        # latest-build.txt keeps resolving after the periodic dies, so a stale
+        # window_end is the only signal that the numbers stopped.
+        measured = T0 - timedelta(hours=4)
+        note = pooled(verdict="BREACH", cause="CAPACITY", window_end=measured)["pool"]
+        self.assertEqual(note, {"since": health.iso(T0), "verdict": "STALE", "breach_seen": False, "measured_at": health.iso(measured)})
+        self.assertIn(
+            f"queue wait unmeasured: last reading {health.iso(measured)};"
+            " the hourly pool-pressure job has missed the last few",
+            pooled(verdict="BREACH", cause="CAPACITY", window_end=measured)["evidence"],
+        )
+        # Two missed hourly runs plus the job's own timeout: still fresh at 3h.
+        self.assertEqual(pooled(verdict="BREACH", cause="CAPACITY", window_end=T0 - timedelta(hours=3))["pool"]["verdict"], "BREACH")
+
+    def test_the_artifact_ages_against_the_wall_clock_not_the_data_horizon(self):
+        # The branch every production tick takes: main() passes a wall clock
+        # unless --now. One Prow stall freezes data.json's horizon and the
+        # artifact together, so ageing against `now` never fires the switch.
+        stalled = pooled(verdict="BREACH", cause="CAPACITY", window_end=T0, wall_clock=T0 + timedelta(hours=4))
+        self.assertEqual(stalled["pool"]["verdict"], "STALE")
+        self.assertIsNone(stalled["metrics"]["queue_wait_p50_s"])
+
+    def test_a_stale_artifact_also_drops_the_digest_number(self):
+        self.assertIsNone(pooled(verdict="OK", window_end=T0 - timedelta(hours=4))["metrics"]["queue_wait_p50_s"])
+
+    def test_unmeasured_is_a_note_even_though_nothing_breached(self):
+        result = pooled(verdict="UNMEASURED")
+        self.assertEqual(result["pool"]["verdict"], "UNMEASURED")
+        self.assertIn("pool pressure: the hourly check ran but could not read how long recent runs waited", result["evidence"])
+
+    def test_the_digest_wait_is_todays_median_not_the_seven_day_one(self):
+        # "last 24h" in the headline: the seven-day median under it would be a
+        # different window's number wearing the same label.
+        result = pooled(verdict="OK", p50=9.0, today_p50=0.4)
+        self.assertEqual(result["metrics"]["queue_wait_p50_s"], 24)
+
+    def test_the_note_rides_beside_an_incident_unlike_the_slow_one(self):
+        # Three setup deaths on two pull requests make the state DEGRADED
+        # (rule 3). Rule 7 is suppressed there; rule 8 is not -- a different
+        # job measuring different data cannot be this incident's own symptom.
+        doc = data(*(run(300 + i, pr, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE") for i, pr in enumerate([1, 1, 2])))
+        result = pooled(doc=doc, verdict="BREACH", cause="CAPACITY", p50=24.1)
+        self.assertEqual(result["state"], "DEGRADED")
+        self.assertIsNotNone(result["pool"])
+
+    def test_a_sub_minute_wait_reads_in_seconds(self):
+        self.assertEqual(health.wait_text(24), "24s")
+        self.assertEqual(health.wait_text(1320), "22 min")
+        self.assertEqual(health.wait_text(None), "?")
 
 
 class Advice(unittest.TestCase):

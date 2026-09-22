@@ -5,26 +5,24 @@ Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two anchored
 edits in ``tools/kanban_tools.py`` plus an import trailer:
 
 * the ``kanban_create`` handler gains ``_kanban_record_worker_child`` right
-  after ``kanban_auto_subscribe``'s subscription-inheritance hook, so fan-out
-  attribution and subscription inheritance describe the same set of cards;
+  after the created card is read back — the same upstream line
+  ``kanban_auto_subscribe`` hooks its subscription inheritance on, so fan-out
+  attribution and subscription inheritance describe the same set of cards
+  whichever of the two runs first;
 * the ``kanban_complete`` handler gains the children gate immediately before
   ``kanban_result_required``'s result gate — refusing the completion outright
   is the more fundamental answer than critiquing the result's emptiness, and
   going first means the worker's one result-nudge is not spent on a
   completion that was never going to be accepted.
 
-**Ordering: this applier must run AFTER ``apply_kanban_result_required.py``
-and AFTER ``apply_kanban_auto_subscribe.py``.** Both anchors here are text
-those patches introduced, on purpose: the sites this patch needs — "right
-after subscription inheritance", "right before the result gate" — are only
-addressable in the patched tree, and deriving anchors against a different
-tree than the build produces is how an anchor rots undetected (the same
-argument ``apply_kanban_notify_delivery.py`` makes for its ordering). Neither
-anchor can drift silently: the completion anchor IS
-``kanban_result_required.NEW_GATE``, imported, and the create anchor is
-asserted at import time to be the last line of
-``apply_kanban_auto_subscribe.PATCHED`` — so a change to either owning patch
-breaks this one at import time, not at 3am in a build.
+**Ordering: this applier must run AFTER ``apply_kanban_result_required.py``.**
+The completion anchor IS ``kanban_result_required.NEW_GATE``, imported, so a
+change to that patch breaks this one at import time rather than mid-build.
+It no longer needs ``apply_kanban_auto_subscribe.py`` to have run: since
+v2026.9.14 upstream's ``create_task`` inherits the creator card's
+subscriptions itself, that patch is a candidate for retirement, and anchoring
+on its inserted line would have made retiring it a build break here. Both
+hooks anchor on upstream's own line instead and stack in either order.
 
 Why the change is needed is documented in the module docstring of
 ``deploy/docker/patches/kanban_children_settled.py``. Usage::
@@ -40,30 +38,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import patchlib  # noqa: E402
-from apply_kanban_auto_subscribe import PATCHED as AUTO_SUBSCRIBE_PATCHED  # noqa: E402
 from kanban_result_required import NEW_GATE as RESULT_GATE  # noqa: E402
 
 RELATIVE = "tools/kanban_tools.py"
 
-# The line apply_kanban_auto_subscribe.py inserts into the kanban_create
-# handler. `conn` is open (the `kb.get_task(conn, new_tid)` two lines up) and
-# `new_tid` is the created card. Asserted against the owning patch below so a
-# rewrite there breaks this applier at import time rather than mid-build.
-CREATE_ANCHOR = "            _kanban_inherit_worker_subs(conn, new_tid)\n"
-
-if not AUTO_SUBSCRIBE_PATCHED.endswith(CREATE_ANCHOR):
-    raise SystemExit(
-        "apply_kanban_children_settled: apply_kanban_auto_subscribe.PATCHED no "
-        "longer ends with the line this patch anchors on. Re-derive "
-        "CREATE_ANCHOR against the auto-subscribe patch before building."
-    )
+# The line in the kanban_create handler that reads the created card back.
+# `conn` is open (inside `with _board(...) as (kb, conn)`) and `new_tid` is the
+# created card; `kb.create_task` has returned, so the child exists. The same
+# line apply_kanban_auto_subscribe.py anchors on, by design (see above).
+CREATE_ANCHOR = "        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)\n"
 
 CREATE_HOOK = CREATE_ANCHOR + (
-    "            # kube-agents patch: remember which running card fanned this\n"
-    "            # one out, so kanban_complete can refuse to hand back a\n"
-    "            # dispatch receipt while it is unfinished (issue #1010).\n"
-    "            # See tools/kanban_children_settled.py.\n"
-    "            _kanban_record_worker_child(conn, new_tid)\n"
+    "        # kube-agents patch: remember which running card fanned this\n"
+    "        # one out, so kanban_complete can refuse to hand back a\n"
+    "        # dispatch receipt while it is unfinished (issue #1010).\n"
+    "        # See tools/kanban_children_settled.py.\n"
+    "        _kanban_record_worker_child(conn, new_tid)\n"
 )
 
 COMPLETE_GATE = (
@@ -80,10 +70,13 @@ COMPLETE_GATE = (
 
 # Appended rather than inserted: every name is resolved when a tool handler
 # runs, long after the module finishes importing. Same placement the
-# kanban_auto_subscribe trailer uses.
+# kanban_auto_subscribe trailer uses. `connect` comes from
+# hermes_cli.kanban_db_connect, where upstream moved it in the Sep 2026
+# decomposition; the old hermes_cli.kanban_db path is a plugin-compat shim
+# that warns and is scheduled for removal.
 TRAILER = (
     "\n\n# kube-agents patch: see tools/kanban_children_settled.py\n"
-    "from hermes_cli.kanban_db import (  # noqa: E402\n"
+    "from hermes_cli.kanban_db_connect import (  # noqa: E402\n"
     "    connect as _kanban_children_connect,\n"
     ")\n"
     "from tools.kanban_children_settled import (  # noqa: E402\n"

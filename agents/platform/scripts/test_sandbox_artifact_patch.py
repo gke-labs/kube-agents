@@ -41,27 +41,34 @@ FAKE_DENIED_HOME_SUBPATHS = (".ssh", ".aws")
 
 
 def install_fake_platforms_base(test, *, strict=False, upstream_denies=False):
-    """Stand in for ``gateway.platforms.base``, which is in the base image.
+    """Stand in for ``gateway.platforms.base`` and ``gateway.media_policy``,
+    both of which are in the base image.
 
-    ``_screen`` fails closed when it cannot reach that module, so without this
-    every delivery test would assert on an empty staging list for the wrong
-    reason. ``upstream_denies`` drives upstream's own
-    ``_path_under_denied_prefix``, which is the half resolved against the
-    gateway's home; the two tuples drive the half resolved against the
-    sandbox's.
+    ``_screen`` fails closed when it cannot reach either module, so without
+    this every delivery test would assert on an empty staging list for the
+    wrong reason. ``strict`` drives ``media_policy.media_delivery_strict``,
+    the predicate upstream's own validator branches on. ``upstream_denies``
+    drives upstream's own ``_path_under_denied_prefix``, which is the half
+    resolved against the gateway's home; the two tuples drive the half
+    resolved against the sandbox's.
     """
     base = types.ModuleType("gateway.platforms.base")
     base._MEDIA_DELIVERY_DENIED_PREFIXES = FAKE_DENIED_PREFIXES
     base._MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = FAKE_DENIED_HOME_SUBPATHS
-    base._media_delivery_strict_mode = lambda: strict
     base._path_under_denied_prefix = lambda resolved: upstream_denies
+    media_policy = types.ModuleType("gateway.media_policy")
+    media_policy.media_delivery_strict = lambda: strict
     platforms = types.ModuleType("gateway.platforms")
     platforms.base = base
 
     package = sys.modules.setdefault("gateway", types.ModuleType("gateway"))
     saved = {
         name: sys.modules.get(name)
-        for name in ("gateway.platforms", "gateway.platforms.base")
+        for name in (
+            "gateway.platforms",
+            "gateway.platforms.base",
+            "gateway.media_policy",
+        )
     }
 
     def restore():
@@ -73,8 +80,10 @@ def install_fake_platforms_base(test, *, strict=False, upstream_denies=False):
 
     test.addCleanup(restore)
     package.platforms = platforms
+    package.media_policy = media_policy
     sys.modules["gateway.platforms"] = platforms
     sys.modules["gateway.platforms.base"] = base
+    sys.modules["gateway.media_policy"] = media_policy
     return base
 
 
@@ -363,6 +372,22 @@ class ScreenTest(unittest.TestCase):
             saved = sys.modules.pop(name, None)
             if saved is not None:
                 self.addCleanup(sys.modules.__setitem__, name, saved)
+        self.assertEqual(sandbox_artifact_patch._screen(["/opt/data/report.md"]), [])
+
+    def test_an_unreachable_media_policy_fails_closed(self):
+        # The strict predicate moved out of ``base`` in v2026.9.14. A base
+        # image that moves it again must stage nothing, not stage everything.
+        install_fake_platforms_base(self)
+        saved = sys.modules.pop("gateway.media_policy")
+        self.addCleanup(sys.modules.__setitem__, "gateway.media_policy", saved)
+        # ``from gateway import media_policy`` reads the package attribute
+        # before it consults ``sys.modules``, so both have to go.
+        del sys.modules["gateway"].media_policy
+        self.assertEqual(sandbox_artifact_patch._screen(["/opt/data/report.md"]), [])
+
+    def test_a_missing_strict_predicate_fails_closed(self):
+        install_fake_platforms_base(self)
+        del sys.modules["gateway.media_policy"].media_delivery_strict
         self.assertEqual(sandbox_artifact_patch._screen(["/opt/data/report.md"]), [])
 
     def test_ignores_non_strings_and_a_non_list(self):

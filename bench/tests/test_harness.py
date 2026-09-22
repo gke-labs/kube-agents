@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
-from kube_agents_bench import harness, transcript
+from kube_agents_bench import harness, transcript, worker_trajectory
 from kube_agents_bench.cases import CaseSpec
 from kube_agents_bench.harness import KubeAgentsHarness
 from kube_agents_bench.parsing import merge_new as _merge_new
@@ -2757,10 +2757,12 @@ def test_artifacts_are_read_before_the_card_state_is_purged(
     KubeAgentsHarness().run("Find the root cause.")
 
     kinds = ["purge" if "rm -rf" in s else "read" for s in no_cluster_exec]
-    # Two reads: the artifact listing, then the card's worker log (for the
-    # worker_commands check); the purge comes after both.
-    assert kinds == ["read", "read", "purge"]
+    # Three reads: the artifact listing, the card's worker log (for the
+    # worker_commands check), then the workers' session stores (for the
+    # worker trajectory); the purge comes after all of them.
+    assert kinds == ["read", "read", "read", "purge"]
     assert harness._LOGS_DIR in no_cluster_exec[1]
+    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[2]
 
 
 def test_a_run_that_delegates_nothing_touches_no_pod(

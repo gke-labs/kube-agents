@@ -117,8 +117,8 @@ def memory_is_read_only() -> bool:
 
     Profile-scoped: ``load_config()`` resolves through ``HERMES_HOME``, and a
     kanban worker is launched with ``HERMES_HOME`` pointed at its own profile
-    directory (``hermes_cli/kanban_db.py`` — ``env["HERMES_HOME"] =
-    resolve_profile_env(profile_arg)``). So the platform specialist reads
+    directory (``hermes_cli/kanban_db_dispatch.py`` — ``env["HERMES_HOME"] =
+    profile_home``). So the platform specialist reads
     ``profiles/platform/config.yaml`` and the Chat Agent reads its own.
 
     It is a setting rather than something derived from the session because the

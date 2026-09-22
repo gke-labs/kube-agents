@@ -25,17 +25,48 @@ import yaml
 from . import _harness as h
 from ._harness import command_policy
 
-WORKFLOWS = sorted(
-    # Both extensions: GitHub Actions accepts .yaml too, and every assertion
-    # over this set is an allowlist -- a workflow added as .yaml would
-    # otherwise escape all of them silently.
+_WORKFLOWS = sorted(
+    # Both extensions: GitHub Actions accepts .yaml too, and a workflow added
+    # as .yaml would otherwise escape every assertion over this set silently.
     (h.REPO_ROOT / ".github" / "workflows").glob("*.y*ml")
 )
 
 
+def _workflows():
+    """The workflow set, which is never legitimately empty.
+
+    Four of the five assertions reading this glob answer for an empty set on
+    their own: two compare it against a named allowlist and go red when the
+    expected names go missing, and the `workflow_run` deploy gate and the
+    `pull_request_target` checkout test each carry a non-empty precondition
+    over their own filtered subset. The fifth -- B2's "no workflow approves or
+    merges a pull request" -- asserts an absence, and an absence is true of
+    the empty set.
+
+    That one is not defenceless. Moving `.github/workflows` reds most of this
+    file anyway: C4's SHA-pin sweep keeps its own copy of this glob and guards
+    it, and `autopush-deploy.yml` is a registered `_harness.SOURCES` entry, so
+    the harness self-check goes red too. But what B2 inherits from that is an
+    answer to somebody else's question, and the count of neighbours that
+    happen to catch it moves whenever one of them is edited. This is B2
+    answering its own question, in the place the set is built, for the same
+    reason `_harness.text()` raises rather than returning an empty string.
+
+    The underscore on `_WORKFLOWS` marks the guard as the intended route.  It
+    is a convention, not an enforcement: an assertion that reaches for the
+    global anyway skips the guard silently.
+    """
+    if not _WORKFLOWS:
+        raise AssertionError(
+            f"no workflows matched {h.REPO_ROOT / '.github' / 'workflows'}/*.y*ml; "
+            "the glob is wrong"
+        )
+    return _WORKFLOWS
+
+
 def _workflow_documents():
     """Every workflow, parsed, with YAML 1.1's `on:` -> True quirk normalised."""
-    for path in WORKFLOWS:
+    for path in _workflows():
         document = yaml.safe_load(path.read_text())
         if True in document:  # `on:` is the YAML 1.1 boolean `y`/`yes`/`on`
             document["on"] = document.pop(True)
@@ -311,7 +342,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
             r"hmarr/auto-approve-action",
         )
         offences = []
-        for path in WORKFLOWS:
+        for path in _workflows():
             text = path.read_text()
             for pattern in assenting:
                 for match in re.finditer(pattern, text):
@@ -353,7 +384,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
-        third holder is a red test and a conversation rather than a silent
+        seventh holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow.
         """
         holders = []
@@ -516,33 +547,59 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         branch, so the code that runs is code already merged — and the
         dangerous ingredient is specifically a ref derived from the pull
         request. So every checkout step in such a workflow must carry an
-        explicit `ref:` that does not reference the pull request; a checkout
-        with no `ref:` defaults to the PR merge commit on this trigger, which
-        is the exact failure.
+        explicit `ref:` that does not reference the pull request. A checkout
+        with no `ref:` takes `GITHUB_REF`, which is not written down in the
+        workflow and so is not reviewable in it -- hence the bare `ref:`
+        assertion below, independent of what the trigger resolves it to.
+
+        Both filters are asserted non-empty for the same reason B4's
+        `workflow_run` gate asserts its own: this test says nothing at all
+        about a repository with no `pull_request_target` workflows, or one
+        where none of them checks anything out, so it cannot tell "the trigger
+        is gone" from "the parse stopped seeing it". Three workflows carry the
+        trigger today and two of them run a checkout. If either reaches zero
+        the test should be read again, not passed by default.
         """
-        for path, document in _workflow_documents():
-            triggers = document.get("on") or {}
-            if "pull_request_target" not in triggers:
-                continue
-            text = path.read_text()
+        consumers = [
+            (path, document)
+            for path, document in _workflow_documents()
+            if "pull_request_target" in (document.get("on") or {})
+        ]
+        self.assertTrue(
+            consumers,
+            "no pull_request_target workflows found; the filter is wrong",
+        )
+
+        saw_a_checkout = False
+        for path, document in consumers:
             with self.subTest(workflow=path.name):
                 for job in (document.get("jobs") or {}).values():
                     for step in (job or {}).get("steps") or []:
-                        uses = str((step or {}).get("uses", ""))
-                        if not uses.startswith("actions/checkout"):
-                            continue
-                        ref = str(((step or {}).get("with") or {}).get("ref", ""))
-                        self.assertTrue(
-                            ref,
-                            "a checkout on pull_request_target with no ref: "
-                            "checks out the pull request's merge commit",
-                        )
-                        for fragment in ("pull_request", "head", "merge"):
-                            self.assertNotIn(
-                                fragment,
+                        # GitHub resolves `uses:` case-insensitively, so this
+                        # match has to be too. `Actions/checkout` runs the same
+                        # action and would otherwise walk past the filter. The
+                        # same holds for the expression context in `ref:`:
+                        # `github.event.Pull_Request.HEAD.sha` names the pull
+                        # request head just as the lowercase spelling does, so
+                        # the ref is lowercased before it is examined below.
+                        uses = str((step or {}).get("uses", "")).lower()
+                        if uses.startswith("actions/checkout"):
+                            saw_a_checkout = True
+                            ref = str(
+                                ((step or {}).get("with") or {}).get("ref", "")
+                            ).lower()
+                            self.assertTrue(
                                 ref,
-                                "the checkout ref derives from the pull request",
+                                "a checkout on pull_request_target with no "
+                                "ref: leaves the commit it checks out unstated "
+                                "in the workflow",
                             )
+                            for fragment in ("pull_request", "head", "merge"):
+                                self.assertNotIn(
+                                    fragment,
+                                    ref,
+                                    "the checkout ref derives from the pull request",
+                                )
                 for scope in [document.get("permissions") or {}] + [
                     (job or {}).get("permissions") or {}
                     for job in (document.get("jobs") or {}).values()
@@ -550,6 +607,11 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                     if isinstance(scope, dict):
                         self.assertNotEqual("write", scope.get("contents"))
                         self.assertNotEqual("write", scope.get("id-token"))
+        self.assertTrue(
+            saw_a_checkout,
+            "no pull_request_target workflow runs a checkout step any more; "
+            "the ref half of this test examined nothing",
+        )
 
     def test_B4_contents_write_is_confined_to_the_release_path(self) -> None:
         """The credential that can push to this repository, and where it lives.
@@ -710,21 +772,27 @@ class B6NoSelfApproval(unittest.TestCase):
     def test_B6_every_guarded_path_in_the_template_has_an_owner(self) -> None:
         """A CODEOWNERS entry that covers nothing is the trap this avoids.
 
-        The four path classes the branch-protection note calls guarded --
-        provisioning, agents, namespaces and policy -- each need a rule, or
-        the ruleset that requires code-owner review on them requires review
-        from nobody.
+        The six path classes the branch-protection note calls guarded --
+        provisioning, agents, namespaces, policy, knowledge and .kube-agents
+        -- each need a rule, or the ruleset that requires code-owner review on
+        them requires review from nobody. The last two are the declared-intent
+        pair: a knowledge/ note can move an audit posture off the ledger, and
+        .kube-agents/intent.yaml decides which paths' notes can.
+
+        A class is matched as a whole path segment, not as a substring: the
+        `/.kube-agents/` rule contains the letters `agents`, and a substring
+        test would let it stand in for the deleted `/clusters/*/agents/` rule.
         """
         text = h.text("codeowners_example")
         rules = [
-            line.split()[0]
+            line.split()[0].strip("/").split("/")
             for line in text.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-        for guarded in ("provisioning", "agents", "namespaces", "policy"):
+        for guarded in ("provisioning", "agents", "namespaces", "policy", "knowledge", ".kube-agents"):
             with self.subTest(path=guarded):
                 self.assertTrue(
-                    any(guarded in rule for rule in rules),
+                    any(guarded in segments for segments in rules),
                     f"no CODEOWNERS rule covers {guarded}",
                 )
 

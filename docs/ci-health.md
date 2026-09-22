@@ -18,7 +18,8 @@ it beside the grader's reason (builds graded before 2026-09-15 carry none).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)).
+([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
+one when they stop ([below](#a-backed-up-pool)).
 The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
@@ -58,11 +59,16 @@ condition and the digest carries one line on the latest scan. A
 `workflow_dispatch` of the same workflow is the on-demand refresh button
 (its `fixture_state_scan` input also runs the scan).
 
-Every message ends with a deep link into the dashboard:
+Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
-digest, and the bare `index.html#view=agent` for the slow-gate note, whose
-start is a GREEN tick that names no incident. The scope rides in the URL
+digest, and the bare `index.html#view=agent` for the slow-gate and pool notes,
+which report no incident and so have no window to scope a link to. The two
+that say the pool check itself is not reporting — `wait unknown` and `pool
+check stopped` — link to the periodic's job history instead, the one place
+that shows whether it has started running again. `queue clear` and the two
+data-freshness messages carry no link: what they report is the absence of
+something to show. The scope rides in the URL
 fragment because the host's login redirect drops a query string and a browser
 carries the fragment through the redirect.
 The contract, and the older `?cases=…#gate` form the pages still read (it
@@ -130,9 +136,10 @@ what keeps the replay fixtures cut before the field valid.
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
 PR-caused reds and infra reds (setup deaths and lost pods are folded into the
-infra count) and the typical run length. `health.json`'s `metrics` keeps the
-rest — green rate, wall clock p50/p90, the infra-rep rate, `setup_deaths`,
-`lost_pods`.
+infra count), the typical run length and the typical wait before a run starts.
+`health.json`'s `metrics` keeps the rest — green rate, wall clock p50/p90,
+`queue_wait_p50_s` and whether it was read at all, the infra-rep rate,
+`setup_deaths`, `lost_pods`.
 
 A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
@@ -205,6 +212,108 @@ fired from 2:00 PM ET and stayed quiet over 09-06 to 09-09 and the 09-12/13
 weekend. Model latency is not sampled: the per-repetition eval logs carry
 it, and reading them is not something a tick does.
 
+## A backed-up pool
+
+Every number above is measured from a run's start, so nothing here sees a run
+that sat in the queue first. The `ci-kube-agents-pool-pressure` periodic
+measures that hourly and grades it against the runbook's thresholds; this job
+reads its `pool-pressure.json` and never re-derives the verdict, so the two
+cannot disagree. A missing artifact is not an alert — that is "not wired up",
+not "the pool is fine".
+
+Like the slow note it rides beside the state and never becomes one: the runs
+still pass, they just start late, and DEGRADED would tell people to retest,
+which lengthens the queue being reported. Unlike the slow note it is **not**
+held back outside GREEN — a different job reading different data cannot be
+this incident's own symptom.
+
+The poster sends one line when the note appears, and again if its verdict
+changes inside the episode. The header names the cause, because the four
+causes have four different remedies and one of them spends money:
+
+```text
+⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
+Consider onboarding a project.
+Last 3h: median wait 24 min against a 15 min limit; p95 157 min against 45.
+2 runs waiting right now, past the 45 min p95 limit.
+Runs still pass; /retest makes the queue longer.
+```
+
+Those are the numbers the verdict was reached on. The periodic breaches on a
+day's row or on runs queued past p95 right now, never on the seven-day window,
+which one bad day leaves inside its own limit. A breach on only one of the two
+carries only that line.
+
+The stretch quoted is the last three hours, not the worst day, which a
+week-long verdict leaves up to six days older than the incident. The three
+hours have to be over a limit themselves to be quoted, and hold five runs, as a
+day's row needs; otherwise the worst day is what is left to show, and the label
+says which it was.
+
+A ⏳ also needs a run that has been waiting past the p50 limit at the moment of
+the reading. Not the p95 limit, because a pool full all afternoon with every
+run waiting half an hour is the case this message is for; and not any queued
+run at all, because one triggered seconds ago is not a backlog. The remedy is
+recomputed hourly from a live count of leased projects while the verdict stands
+for a week, so a pool that filled on Monday and drained by Tuesday would
+otherwise post Tuesday's remedy under Monday's numbers with nothing wrong. The
+two ⚪ messages below are exempt; neither advises anything.
+
+Once nothing has waited past the p50 limit the dashboard and the digest keep
+reporting the episode, in the past tense, and say there is no backlog — not
+that the queue is empty, which they do not measure. `runs not starting` needs the
+queue read too: it means the pool looked fine so Prow must be at fault, which
+holds only while something is queued. Unread, the message gives the free count
+and apportions no blame. `pool full` keeps its remedy either way and drops "and
+runs are queuing" whenever Deck did not see a backlog — the leased count is this
+hour's, the queue is Deck's.
+
+A drained queue also ends what the jam said. The verdict holds for a week, so a
+pool that fills every afternoon would otherwise be announced on Monday and
+silent for the rest of it; the causes already named are forgotten on a reading
+that shows nothing waiting, and the next jam is news again — a next jam that has
+to be measured, since an hour Deck could not be read has seen no queue at all.
+The dashboard dates
+a jam from its own oldest queued run rather than from the episode, for the same
+reason: the episode can have opened days before the backlog being described.
+
+`concurrency cap` (raise it), `runs not starting` (projects were free, so the
+delay is Prow's; the message names the build cluster) and `queue backed up`
+(the job could not read how many projects were in use) carry the same lines
+under a different first one.
+
+Unlike the slow note, this one also says when it is over. The window is a
+rolling seven days, so an episode outlives the bad day by up to a week:
+
+```text
+✅ Smoke gate: queue clear — runs are starting on time again, typical wait 24s.
+```
+
+It fires only on a reading that says so. The note also disappears when the
+artifact does, and that is the bot going blind, not the queue clearing. It is
+owed to an episode that breached, not to a ⚪ one, which never claimed the
+queue was bad -- and a breach that goes ⚪ before it drains still gets it.
+
+Two ⚪ messages are about the monitoring, not the pool. `wait unknown` is the
+check running and failing to read how long recent runs waited -- its sweep
+over the window, not the live pool. `pool check stopped` is
+`window_end` more than 3 hours old, or a build that published no artifact at
+all. Both link to the periodic's job history, which tells the two apart. The
+stopped message carries **no numbers**: `latest-build.txt` keeps resolving
+after the periodic dies, so a stopped job reads as an unchanging healthy
+artifact.
+
+This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods and
+fixture drift. A full pool is a capacity fact, not a defect a code change
+closes; its remedies are onboarding and raising the cap, which are planned
+work. Chat, the Brief and the digest carry it, and nothing opens.
+
+The digest carries the median wait every morning whether or not anything is
+wrong (`typical wait`, beside `typical run`), and repeats a one-line version
+of the note while it lasts. The Brief's lede carries the same numbers. There
+is no tile for it: the tiles recompute for the reader's date range, and the
+wait is a fixed 24-hour figure that is not in the run data.
+
 ## The comment on a red pull request
 
 Each tick, `scripts/eval_dashboard/gate_comment.py` finds the
@@ -232,6 +341,13 @@ when there are several):
 Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
 dashboard's run page and the incident brief use; the comment only phrases it.
+
+A run the suite marked **not evaluated** because one admitted case lost every
+repetition to infrastructure while other cases were graded is, to this filter,
+a `FAILURE` with graded repetitions and no gate case failing all of its
+repetitions, so it draws the comment with the hard-failure heading. The comment
+does not read the suite's `outcome`; the banner at the top of that run's
+`eval-verdict.md` is what says the run is not a finding against the change.
 
 One zero-task run does get a comment: a lost pod (the build node went away
 under the job, #1478). It is one line, same marker and dedupe:
@@ -418,8 +534,9 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `stale`, `metrics`, `dashboard_url`,
-`generated_at` — plus `tick`, the ISO 8601 UTC time the line was appended.
+`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `metrics`,
+`dashboard_url`, `generated_at` — plus `tick`, the ISO 8601 UTC time the line
+was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled
 refresh shows as many ticks sharing one `generated_at`. GCS has no append: the
 workflow downloads the object (a missing one is the first tick), appends with
@@ -462,7 +579,11 @@ workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
 configured" and exits 0 before it would file a tracking issue, the comment
 step on pull requests is skipped, and the refresh, the verdict and the
-`health.json` upload carry on. An incoming-webhook URL in Secret Manager
+`health.json` upload carry on. It exits before writing `health-state.json`
+too, so what the poster remembers stands still while muted: an alert already
+sent stays sent. The dashboard is unaffected — the pool episode's start rides
+in `health.json`, which is written every tick, not in the state file.
+An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.

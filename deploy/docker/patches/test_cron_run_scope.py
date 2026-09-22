@@ -255,27 +255,26 @@ class ClipCronResponseTest(unittest.TestCase):
         self.assertGreaterEqual(CRON_RESPONSE_LIMIT, 4000)
 
 
-# The applier is exercised against a miniature of the three real files. The
+# The applier is exercised against a miniature of the four real files. The
 # real anchors are asserted against the shipped image by
-# verify_cron_run_scope.py; what these miniatures carry is the SHAPE the
-# v2026.8.19 split introduced, which is the thing a version bump moves.
+# verify_cron_run_scope.py; what these miniatures carry is the SHAPE upstream
+# has at v2026.9.14, which is the thing a version bump moves.
 #
-# The wrapper/body split is the whole reason this test exists. `run_one_job`
-# stopped being the execute→deliver→mark body and became a wrapper that
-# delegates through `_run_with_fire_claim_heartbeat`; putting the out-param on
-# the wrapper alone leaves both anchors matched, the file parsing, and the body
-# raising NameError on the first real tick.
-SCHEDULER_STUB = '''from typing import Optional
+# The wrapper/body split (v2026.8.19) is the whole reason this test exists.
+# `run_one_job` stopped being the execute→deliver→mark body and became a wrapper
+# that delegates through `_run_with_fire_claim_heartbeat`; putting the out-param
+# on the wrapper alone leaves both anchors matched, the file parsing, and the
+# body raising NameError on the first real tick. v2026.9.14 then split the body
+# itself: save/deliver moved into `_save_compose_deliver` over a `_RunDelivery`
+# record and the bookkeeping tail into `_finish_completed_run`, so the report is
+# written from the seam between them and the saved path rides on the record.
+SCHEDULER_STUB = '''from dataclasses import dataclass
+from typing import Optional
 
 
 def run_one_job(
-    job: dict,
-    *,
-    adapters=None,
-    loop=None,
-    verbose: bool = False,
-    extra_prompt: Optional[str] = None,
-    cancel_event=None,
+    job: dict, *, adapters=None, loop=None, verbose: bool = False,
+    extra_prompt: Optional[str] = None, cancel_event=None,
 ) -> bool:
     """Register the fire owner, then delegate."""
     execution_token = object()
@@ -289,50 +288,64 @@ def run_one_job(
                 verbose=verbose,
                 extra_prompt=extra_prompt,
                 fire_claim_lost=lost_ownership,
-                execution_token=execution_token,
-            ),
-        )
+                execution_token=execution_token))
     finally:
         pass
 
 
+@dataclass
+class _RunDelivery:
+    job: dict
+    success: bool
+    error: Optional[str]
+    delivery_error: Optional[str] = None
+    side_effect_ownership_lost: bool = False
+
+
+def _save_compose_deliver(d, fence, final_response, output, *, adapters, loop, verbose, execution_token):
+    job = d.job
+    with fence.side_effect_fence() as owns_output:
+        if not owns_output:
+            raise RuntimeError
+        output_file = save_job_output(job["id"], output)
+    if verbose:
+        logger.info("Output saved to: %s", output_file)
+    d.delivery_error = None
+
+
+def _finish_completed_run(d, fire_owner, execution_id) -> bool:
+    finish_execution(execution_id, success=d.success, error=d.error)
+    return True
+
+
 def _run_one_job_body(
-    job: dict,
-    *,
-    adapters=None,
-    loop=None,
-    verbose: bool = False,
-    extra_prompt: Optional[str] = None,
-    fire_claim_lost=None,
-    execution_token=None,
+    job: dict, *, adapters=None, loop=None, verbose: bool = False,
+    extra_prompt: Optional[str] = None, fire_claim_lost=None,
+    execution_token: Optional[object] = None,
 ) -> bool:
+    execution_id = "x"
+    delivery_error = None
     try:
         _deferred_agents: list = []
+        _run_kwargs = {
+            "defer_agent_teardown": _deferred_agents,
+            "extra_prompt": extra_prompt,
+            "execution_id": execution_id}
+        if fire_claim_lost is not None:
+            _run_kwargs["cancel_event"] = fire_claim_lost
         try:
-            if fire_claim_lost is None:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                )
-            else:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                    cancel_event=fire_claim_lost,
-                )
+            success, output, final_response, error = run_job(job, **_run_kwargs)
+        except BaseException:
+            raise
+        d = _RunDelivery(job=job, success=success, error=error)
+        try:
+            _save_compose_deliver(
+                d, None, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
+                execution_token=execution_token)
         finally:
-            pass
-        if output:
-            output_file = save_job_output(job["id"], output)
-        finish_execution(
-            execution_id,
-            success=success,
-            error=error,
-            delivery_outcome=delivery_outcome,
-        )
-        return True
+            delivery_error = d.delivery_error
+        fire_owner = None
+        return _finish_completed_run(d, fire_owner, execution_id)
     except Exception:
         finish_execution(execution_id, success=False)
         return False
@@ -342,53 +355,69 @@ CRONJOB_STUB = '''import json
 from typing import Any, Dict, Optional
 
 
+def _dumps(payload):
+    return json.dumps(payload, indent=2)
+
+
 def _notify_provider_jobs_changed_safe() -> None:
     pass
 
 
-def _run_claimed_job(job, job_id, adapters, gateway_loop, extra_prompt):
-    with heartbeat:
+def _run_claimed_job(job, extra_prompt=None):
+    job_id = job["id"]
+    try:
+        from cron.scheduler import release_running_job, run_one_job, try_register_running_job
         try:
-            try:
-                processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
-                    extra_prompt=extra_prompt,
-                )
-            finally:
-                unregister_running_job(job_id)
+            with _run_heartbeat(str(job.get("name") or job_id)):
+                processed = run_one_job(job, adapters=adapters, loop=gateway_loop, extra_prompt=extra_prompt)
         finally:
-            stop_heartbeat()
+            release_running_job(job_id)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
-        return {
-            "claimed": True,
-            "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
-        }
+        run_error = refreshed.get("last_error")
+        return {"claimed": True, "success": bool(processed and ok), "error": run_error}
+    except Exception as e:
+        return {"claimed": True, "success": False, "error": str(e)}
+
+
+def _action_create(a):
+    try:
+        job = create_job_with_scheduler_registration(
+            prompt=a["prompt"] or "",
+            reasoning_effort=a["reasoning_effort"],
+            failure_deliver=a["failure_deliver"])
+    except Exception:
+        pass
+
+
+def _action_run(job, a):
+    exec_result = a["exec_result"]
+    result = a["result"]
+    claimed = exec_result.get("claimed", False)
+    if not claimed:
+        result["execution_skipped"] = exec_result.get("error")
+    elif exec_result.get("error"):
+        result["execution_error"] = exec_result["error"]
+    return _dumps({"success": True, "job": result})
 
 
 def cronjob(
     action: str,
+    job_id: Optional[str] = None,
+    prompt: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    failure_deliver: Optional[str] = None,
     result: Optional[dict] = None,
     exec_result: Optional[dict] = None,
-    reasoning_effort: Optional[str] = None,
     task_id: str = None,
-):
+    session_id: Optional[str] = None,
+    paused: bool = False) -> str:
+    a = dict(locals())
+    del a["task_id"]
     if action == "create":
-        if True:
-            try:
-                create_job_with_scheduler_registration(
-                    reasoning_effort=reasoning_effort,
-                )
-            except Exception:
-                pass
+        return _action_create(a)
     if action == "run":
-        if exec_result is not None:
-            if exec_result.get("skipped"):
-                result["skipped"] = True
-            elif exec_result.get("error"):
-                result["execution_error"] = exec_result["error"]
-            return json.dumps({"success": True, "job": result}, indent=2)
+        return _action_run({"id": job_id}, a)
 '''
 
 JOBS_STUB = '''from typing import Any, Dict, Optional
@@ -398,14 +427,12 @@ def create_job(
     name: str,
     schedule: str,
     prompt: str,
-    monitor_url: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
+    paused: bool = False,
+    paused_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     job = {"name": name, "schedule": schedule, "prompt": prompt}
     with _jobs_lock():
-        jobs = load_jobs()
-        jobs.append(job)
-        save_jobs(jobs)
+        save_jobs(load_jobs() + [job])
     return job
 '''
 
@@ -414,27 +441,35 @@ KANBAN_STUB = '''import os
 from hermes_cli.config import cfg_get, load_config
 
 
-def _task_scope_error(tid):
+class _Reject(Exception):
+    pass
+
+
+def _check(cond, message):
+    if not cond:
+        raise _Reject(message)
+
+
+def _default_task_id(arg):
+    return arg or os.environ.get("HERMES_KANBAN_TASK") or None
+
+
+def _require_task_id(args: dict) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    _check(tid, "task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    return tid
+
+
+def _enforce_worker_task_ownership(tid: str) -> None:
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
-    if not env_tid:
-        # Orchestrator or CLI context — no task-scope restriction.
-        return None
-    return None
-
-
-def kanban_complete(task_id=None):
-    if not task_id:
-        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
-
-
-def kanban_block(task_id=None):
-    if not task_id:
-        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    if env_tid and tid != env_tid:
+        raise _Reject(
+            f"worker is scoped to task {env_tid}; refusing to mutate {tid}.")
 '''
 
 
 class ApplierTest(unittest.TestCase):
-    """The applier against the v2026.8.19 wrapper/body shape."""
+    """The applier against the v2026.9.14 wrapper/body/phase-helper shape."""
 
     def _apply_all(self) -> Path:
         root = Path(tempfile.mkdtemp())
@@ -480,7 +515,29 @@ class ApplierTest(unittest.TestCase):
         scheduler = self._apply()
         body = scheduler[scheduler.index("def _run_one_job_body(") :]
         self.assertIn('outcome["response"] = final_response', body)
-        self.assertIn('outcome["output_file"] = str(output_file)', body)
+        self.assertIn('outcome["output_file"] = d.output_file', body)
+        wrapper = scheduler[: scheduler.index("@dataclass")]
+        self.assertNotIn("outcome[", wrapper)
+
+    def test_the_saved_path_rides_the_delivery_record(self):
+        """save_job_output moved out of the body in v2026.9.14; the path comes
+        back on _RunDelivery, so the record must carry the field and the save
+        phase must fill it as a string."""
+        scheduler = self._apply()
+        record = scheduler[scheduler.index("class _RunDelivery") :]
+        record = record[: record.index("def _save_compose_deliver")]
+        self.assertIn("output_file: Optional[str] = None", record)
+        save = scheduler[scheduler.index("def _save_compose_deliver") :]
+        save = save[: save.index("def _finish_completed_run")]
+        self.assertIn("d.output_file = str(output_file)", save)
+
+    def test_the_report_is_written_before_the_bookkeeping_tail(self):
+        scheduler = self._apply()
+        body = scheduler[scheduler.index("def _run_one_job_body(") :]
+        self.assertLess(
+            body.index('outcome["response"] = final_response'),
+            body.index("return _finish_completed_run(d, fire_owner, execution_id)"),
+        )
 
     def test_the_scoped_run_job_lands_in_the_body(self):
         scheduler = self._apply()
@@ -492,7 +549,7 @@ class ApplierTest(unittest.TestCase):
         cronjob = (root / "tools" / "cronjob_tools.py").read_text()
         ast.parse(cronjob)
         self.assertIn("risk: Optional[str] = None,", cronjob)
-        self.assertIn("risk=risk,", cronjob)
+        self.assertIn('risk=a["risk"],', cronjob)
 
     def test_jobs_create_job_stamps_default_risk(self):
         root = self._apply_all()

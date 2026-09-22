@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Wire tools/cron_tick_lock_scope.py into the Hermes source tree.
 
-Fourteen anchored edits across three files -- eight in ``cron/scheduler.py``,
-five in ``tools/cronjob_tools.py``, one in ``hermes_cli/cron.py``. See the module
-docstring in ``deploy/docker/patches/cron_tick_lock_scope.py`` for what each
-group is for. Usage::
+Twelve anchored edits across two files -- eight in ``cron/scheduler.py``, four
+in ``tools/cronjob_tools.py``. See the module docstring in
+``deploy/docker/patches/cron_tick_lock_scope.py`` for what each group is for.
+Usage::
 
     python3 apply_cron_tick_lock_scope.py [HERMES_ROOT]   # default /opt/hermes
 
@@ -14,6 +14,12 @@ the post-cron_run_scope source in the running image, count == 1 for each.
 Not idempotent, deliberately. A second run raises SystemExit because every
 anchor has been consumed by the first -- that is the intended signal that the
 build is applying the same surgery twice.
+
+Anchors are derived against v2026.9.14, which lifted the dispatch guard out of
+``tick`` into a module-level ``_submit_with_guard`` and the lock handling into
+``_acquire_tick_lock`` / ``_release_tick_lock``. Two of the fourteen edits this
+applier used to make are retired there, because upstream now does what they
+did; the sections that held them say which and why.
 """
 
 import sys
@@ -40,22 +46,21 @@ IMPORT_PATCHED = (
 )
 
 # --- 2. own the tick lock's handle ------------------------------------------
-# v2026.8.19 (#87644) rewrote the acquire handler: `except (OSError, IOError)`
-# became `except OSError as exc`, and the blanket "another instance holds the
-# lock" skip now applies only when _is_lock_contention_errno(exc) agrees, with
-# fd exhaustion re-raised instead of swallowed. The anchor moved to the tail of
-# that handler, which is the last thing before the `try:` this insert has to
-# precede. Reaching the `try:` still means the same thing it always did — this
-# process holds the lock — because both other paths out return or raise.
+# v2026.9.14 moved the acquire into _acquire_tick_lock(), which returns the
+# locked handle or None on contention (and re-raises fd exhaustion, #87644).
+# Reaching the `try:` still means the same thing it always did -- this process
+# holds the lock -- so the handle is wrapped right there.
 ACQUIRE_ANCHOR = (
-    '            logger.error("Cron tick could not acquire tick lock: %s", exc)\n'
-    "        raise\n"
+    "    lock_fd = _acquire_tick_lock(lock_file)\n"
+    "    if lock_fd is None:\n"
+    "        return 0\n"
     "\n"
     "    try:\n"
 )
 ACQUIRE_PATCHED = (
-    '            logger.error("Cron tick could not acquire tick lock: %s", exc)\n'
-    "        raise\n"
+    "    lock_fd = _acquire_tick_lock(lock_file)\n"
+    "    if lock_fd is None:\n"
+    "        return 0\n"
     "\n"
     "    # kube-agents patch: the tick lock guards the scheduling decision, not\n"
     "    # job execution. See tools/cron_tick_lock_scope.py.\n"
@@ -67,7 +72,7 @@ ACQUIRE_PATCHED = (
 # --- 3. release once dispatch is done, before the sync wait -----------------
 RELEASE_ANCHOR = (
     "        if sync:\n"
-    "            # Sync mode (tests / manual ticks): wait for all dispatched jobs,\n"
+    "            for f in concurrent.futures.as_completed(_all_futures):\n"
 )
 RELEASE_PATCHED = (
     "        # kube-agents patch: every due job's next_run_at has been advanced\n"
@@ -78,23 +83,17 @@ RELEASE_PATCHED = (
     "        _tick_lock.release()\n"
     "\n"
     "        if sync:\n"
-    "            # Sync mode (tests / manual ticks): wait for all dispatched jobs,\n"
+    "            for f in concurrent.futures.as_completed(_all_futures):\n"
 )
 
 # --- 4. the finally becomes the idempotent backstop -------------------------
+# The whole release, not a second one beside upstream's: _release_tick_lock
+# flocks the handle before closing it, and AdvisoryLock.release() has already
+# closed it on the dispatch path above, so calling both would raise ValueError
+# out of the finally on every tick that dispatched anything.
 FINALLY_ANCHOR = (
     "    finally:\n"
-    "        if fcntl:\n"
-    "            try:\n"
-    "                fcntl.flock(lock_fd, fcntl.LOCK_UN)\n"
-    "            except (OSError, IOError):\n"
-    "                pass\n"
-    "        elif msvcrt:\n"
-    "            try:\n"
-    "                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)\n"
-    "            except (OSError, IOError):\n"
-    "                pass\n"
-    "        lock_fd.close()\n"
+    "        _release_tick_lock(lock_fd)\n"
 )
 FINALLY_PATCHED = (
     "    finally:\n"
@@ -112,37 +111,36 @@ FINALLY_PATCHED = (
 #
 # v2026.8.13 lifted the inline ``with _running_lock:`` guard this used to sit
 # beside into try_register_running_job()/release_running_job(), so that a
-# manual dispatch could take the same in-flight claim. Nothing about the
-# reasoning changed: that set is still process-local, and the flock below is
-# still the only thing a second `hermes cron tick` process can see.
+# manual dispatch could take the same in-flight claim; v2026.9.14 lifted the
+# whole guard out of tick into the module-level _submit_with_guard(). Nothing
+# about the reasoning changed: that set is still process-local, and the flock
+# below is still the only thing a second `hermes cron tick` process can see.
 GUARD_ANCHOR = (
-    "            if not try_register_running_job(job_id):\n"
-    "                logger.info(\"Job '%s' already running — skipping\", job.get(\"name\", job_id))\n"
-    "                return None\n"
-    "            # Record the attempt before executor dispatch. Recovery classifies\n"
-    "            # abandoned records as unknown; it never automatically retries them.\n"
+    "    if not try_register_running_job(job_id):\n"
+    "        logger.info(\"Job '%s' already running — skipping\", job_label)\n"
+    "        return None\n"
+    "    # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).\n"
 )
 GUARD_PATCHED = (
-    "            if not try_register_running_job(job_id):\n"
-    "                logger.info(\"Job '%s' already running — skipping\", job.get(\"name\", job_id))\n"
-    "                return None\n"
-    "            # kube-agents patch: the set try_register_running_job guards is\n"
-    "            # module-level, so it is empty in every freshly spawned\n"
-    "            # `hermes cron tick`. With the tick lock now released at dispatch, a\n"
-    "            # second process can reach here for the same job if that job\n"
-    "            # outlives its own period. Mirror the claim with a per-job flock the\n"
-    "            # kernel releases on process death.\n"
-    "            # See tools/cron_tick_lock_scope.py.\n"
-    "            _job_lock = _job_locks.claim(job_id)\n"
-    "            if _job_lock is None:\n"
-    "                logger.info(\n"
-    "                    \"Job '%s' already running in another process — skipping\",\n"
-    '                    job.get("name", job_id),\n'
-    "                )\n"
-    "                release_running_job(job_id)\n"
-    "                return None\n"
-    "            # Record the attempt before executor dispatch. Recovery classifies\n"
-    "            # abandoned records as unknown; it never automatically retries them.\n"
+    "    if not try_register_running_job(job_id):\n"
+    "        logger.info(\"Job '%s' already running — skipping\", job_label)\n"
+    "        return None\n"
+    "    # kube-agents patch: the set try_register_running_job guards is\n"
+    "    # module-level, so it is empty in every freshly spawned\n"
+    "    # `hermes cron tick`. With the tick lock now released at dispatch, a\n"
+    "    # second process can reach here for the same job if that job\n"
+    "    # outlives its own period. Mirror the claim with a per-job flock the\n"
+    "    # kernel releases on process death.\n"
+    "    # See tools/cron_tick_lock_scope.py.\n"
+    "    _job_lock = _job_locks.claim(job_id)\n"
+    "    if _job_lock is None:\n"
+    "        logger.info(\n"
+    "            \"Job '%s' already running in another process — skipping\",\n"
+    "            job_label,\n"
+    "        )\n"
+    "        release_running_job(job_id)\n"
+    "        return None\n"
+    "    # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).\n"
 )
 
 # --- 5b. release it when execution creation fails ---------------------------
@@ -150,67 +148,72 @@ GUARD_PATCHED = (
 # releases the in-flight claim and returns None when execution creation fails.
 # That is a third way out of this block between the claim above and the worker
 # that releases it, so the flock has to go with the claim or a failed
-# create_execution wedges the job until the process dies. It also split what
-# used to be one contiguous anchor, which is why 5 is now three edits.
+# create_execution wedges the job until the process dies.
 #
 # `logger.exception(` is what tells this handler apart from the submit-failure
 # one below: both open with the same two calls.
 EXECUTION_ERR_ANCHOR = (
-    "                release_running_job(job_id)\n"
-    "                _clear_run_claim_best_effort()\n"
-    "                logger.exception(\n"
+    "        release_running_job(job_id)\n"
+    "        _clear_run_claim_best_effort()\n"
+    "        logger.exception(\n"
 )
 EXECUTION_ERR_PATCHED = (
-    "                release_running_job(job_id)\n"
-    "                _job_lock.release()\n"
-    "                _clear_run_claim_best_effort()\n"
-    "                logger.exception(\n"
+    "        release_running_job(job_id)\n"
+    "        _job_lock.release()\n"
+    "        _clear_run_claim_best_effort()\n"
+    "        logger.exception(\n"
 )
 
 # --- 5c. the worker owns the claim for the run's duration -------------------
 RUN_AND_RELEASE_ANCHOR = (
-    "            def _run_and_release(j=dispatched_job, ctx=_ctx):\n"
-    "                try:\n"
-    "                    return ctx.run(_process_job, j)\n"
-    "                finally:\n"
-    '                    release_running_job(j["id"])\n'
+    "    def _run_and_release(j=dispatched_job, ctx=_ctx):\n"
+    "        try:\n"
+    "            return ctx.run(process_job, j)\n"
+    "        finally:\n"
+    '            release_running_job(j["id"])\n'
 )
 RUN_AND_RELEASE_PATCHED = (
-    "            def _run_and_release(j=dispatched_job, ctx=_ctx, lock=_job_lock):\n"
-    "                try:\n"
-    "                    return ctx.run(_process_job, j)\n"
-    "                finally:\n"
-    '                    release_running_job(j["id"])\n'
-    "                    lock.release()\n"
+    "    def _run_and_release(j=dispatched_job, ctx=_ctx, lock=_job_lock):\n"
+    "        try:\n"
+    "            return ctx.run(process_job, j)\n"
+    "        finally:\n"
+    '            release_running_job(j["id"])\n'
+    "            lock.release()\n"
 )
 
 # --- 6. release it on the dispatch-failure path too -------------------------
 SUBMIT_ERR_ANCHOR = (
-    "            except Exception as submit_err:\n"
-    "                release_running_job(job_id)\n"
+    "    except Exception as submit_err:\n"
+    "        release_running_job(job_id)\n"
 )
 SUBMIT_ERR_PATCHED = (
-    "            except Exception as submit_err:\n"
-    "                release_running_job(job_id)\n"
-    "                _job_lock.release()\n"
+    "    except Exception as submit_err:\n"
+    "        release_running_job(job_id)\n"
+    "        _job_lock.release()\n"
 )
 
 # --- 7. _execute_job_now's docstring said the CAS was the guard -------------
+# v2026.9.14 compacted the docstring but kept the claim it makes about what the
+# claim does ("so a concurrent tick cannot double-fire"), so the correction is
+# still owed. It is load-bearing prose: it is why nobody looked for the overlap.
+# Its other half, "next_run_at advances", is right and stays: the manual claim
+# (cron/jobs.py, claim_job_for_fire(manual=True)) stamps the fire claim and
+# rewrites a recurring job's next_run_at to compute_next_run(schedule, now);
+# what ``manual`` withholds is the occurrence stamp, nothing else.
 DISPATCH_DOC_ANCHOR = (
-    "    Atomically claims the job first via ``claim_job_for_fire`` — the same\n"
-    "    at-most-once CAS the scheduler/external-provider fire path uses — so a\n"
-    "    concurrently-running gateway ticker cannot also fire it (the claim both\n"
-    "    blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).\n"
-    "    If the claim is lost (another fire is in flight), this is a no-op.\n"
+    '    """Run a job now, outside the scheduler tick: claim via ``claim_job_for_fire`` (the ticker\'s\n'
+    "    CAS, so a concurrent tick cannot double-fire and next_run_at advances), then fire through\n"
+    '    the shared ``run_one_job`` body. Returns {"claimed", "success", "error"}."""\n'
 )
 DISPATCH_DOC_PATCHED = (
-    "    Atomically claims the job first via ``claim_job_for_fire`` — the same\n"
-    "    at-most-once CAS the scheduler/external-provider fire path uses, which\n"
-    "    advances ``next_run_at`` for recurring jobs and settles a race between two\n"
-    "    fires of the same occurrence. If the claim is lost (another fire is in\n"
-    "    flight), this is a no-op. What the CAS never did is block a *concurrent*\n"
-    "    tick; ``_run_claimed_job`` takes a per-job flock for that — see the\n"
-    "    kube-agents patch note there, and ``tools/cron_tick_lock_scope.py``.\n"
+    '    """Run a job now, outside the scheduler tick: claim via ``claim_job_for_fire`` (the ticker\'s\n'
+    "    CAS: it stamps the fire claim, so a second claim inside the claim TTL loses, and re-anchors\n"
+    "    a recurring job's next_run_at from now -- the same slot for a cron expression, now plus one\n"
+    "    period for an interval -- but stamps no occurrence identity, because a manual run is not\n"
+    "    the pending slot), then fire through the shared ``run_one_job`` body. What the CAS never\n"
+    "    did is block a *concurrent* tick; ``_run_claimed_job`` takes a per-job flock for that --\n"
+    "    see the kube-agents patch note there, and ``tools/cron_tick_lock_scope.py``.\n"
+    '    Returns {"claimed", "success", "error"}."""\n'
 )
 
 # --- 8. a dispatched run claims the same lock the ticker does ---------------
@@ -220,12 +223,16 @@ DISPATCH_DOC_PATCHED = (
 # now four call sites for the run half — the flock has to be where the run is or
 # three of them go unguarded.
 #
-# That does put it after claim_job_for_fire has advanced next_run_at, so a
-# refusal here skips a scheduled occurrence for a run that never happened. It is
-# the same trade upstream now makes for its own try_register_running_job()
-# guard, two lines above; a skipped occurrence of a job that is *already
-# executing* is a far smaller harm than the two overlapping runs sharing one
-# output file that this patch exists to stop.
+# That does put it after claim_job_for_fire has run. Since v2026.9.11 every
+# claim on this path is a ``manual`` one (cron/jobs.py, claim_job_for_fire):
+# it stamps the fire claim and re-anchors a recurring job's next_run_at from
+# now -- the same slot for a cron expression, now plus one period for an
+# interval -- but stamps no occurrence identity, so no execution row can make
+# the scheduler treat the pending slot as already done. A refusal here
+# therefore costs the requested run itself, not a scheduled occurrence; that
+# is the same trade upstream makes for its own try_register_running_job()
+# guard two lines above, and a far smaller harm than two overlapping runs
+# sharing one output file, which is what this patch exists to stop.
 DISPATCH_CLAIM_ANCHOR = (
     "        _registered = True\n"
 )
@@ -261,11 +268,7 @@ DISPATCH_IMPORT_ANCHOR = (
     "    _registered = False\n"
     "    fire_owner = None\n"
     "    try:\n"
-    "        from cron.scheduler import (\n"
-    "            release_running_job,\n"
-    "            run_one_job,\n"
-    "            try_register_running_job,\n"
-    "        )\n"
+    "        from cron.scheduler import release_running_job, run_one_job, try_register_running_job\n"
 )
 DISPATCH_IMPORT_PATCHED = (
     "    _registered = False\n"
@@ -282,39 +285,15 @@ DISPATCH_IMPORT_PATCHED = (
 )
 
 # --- 9. release it on every path out of _run_claimed_job --------------------
-# The whole handler is the anchor, not just its last line: _execute_job_now
-# ends in a byte-identical `mark_job_run`/`return` tail, and the `if
-# _registered:` block above it is the only thing that tells the two apart.
-# ``finally`` goes after the ``except``, which is why this appends to the end
-# of the handler rather than opening a clause before it.
+# The tail of the handler is the anchor: the ``mark_job_run`` call with
+# ``expected_fire_owner`` is the one _claim_for_manual_run's own handler does
+# not make, and it is what tells the two apart. ``finally`` goes after the
+# ``except``, which is why this appends to the end of the handler rather than
+# opening a clause before it.
 DISPATCH_RELEASE_ANCHOR = (
-    "    except Exception as e:\n"
-    '        logger.error("Failed to execute cron job %s immediately: %s", job_id, e)\n'
-    "        if _registered:\n"
-    "            # Registration succeeded but we raised before the run's own\n"
-    "            # release ran (e.g. heartbeat setup) — don't leave the job\n"
-    "            # permanently marked in-flight. Only release registrations WE\n"
-    "            # took: a bare discard here could erase a ticker-owned entry.\n"
-    "            try:\n"
-    "                from cron.scheduler import release_running_job as _release\n"
-    "\n"
-    "                _release(job_id)\n"
-    "            except Exception:\n"
-    "                pass\n"
-    "        try:\n"
-    "            mark_job_run(\n"
-    "                job_id,\n"
-    "                False,\n"
-    "                str(e),\n"
-    "                expected_fire_owner=fire_owner,\n"
-    "            )\n"
-    "        except Exception:\n"
-    "            pass\n"
-    "        return {\n"
-    '            "claimed": True,\n'
-    '            "success": False,\n'
-    '            "error": str(e),\n'
-    "        }\n"
+    "        with contextlib.suppress(Exception):\n"
+    "            mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)\n"
+    '        return {"claimed": True, "success": False, "error": str(e)}\n'
 )
 DISPATCH_RELEASE_PATCHED = DISPATCH_RELEASE_ANCHOR + (
     "    finally:\n"
@@ -326,75 +305,25 @@ DISPATCH_RELEASE_PATCHED = DISPATCH_RELEASE_ANCHOR + (
     "            _run_lock.release()\n"
 )
 
-# --- 11. correct the comment that said the CAS was enough --------------------
-# It is load-bearing prose: it is why nobody looked for the overlap. v2026.8.13
-# reworded the second half around the background-dispatch split ("the claim
-# (taken inside both paths below)") but kept the claim it makes about what the
-# claim does, so the correction is still owed.
-STALE_COMMENT_ANCHOR = (
-    "            # Execute the job immediately rather than only scheduling it for the\n"
-    "            # next scheduler tick — a manual `run` should actually run, even when\n"
-    "            # no gateway/ticker is active (the #41037 case). The claim (taken\n"
-    "            # inside both paths below) advances next_run_at and blocks a\n"
-    "            # concurrent tick from double-firing.\n"
-)
-STALE_COMMENT_PATCHED = (
-    "            # Execute the job immediately rather than only scheduling it for the\n"
-    "            # next scheduler tick — a manual `run` should actually run, even when\n"
-    "            # no gateway/ticker is active (the #41037 case). The claim (taken\n"
-    "            # inside both paths below) advances next_run_at.\n"
-    "            # kube-agents patch: what it does NOT do is block a concurrent\n"
-    "            # tick, whatever this comment used to claim. tick() reaches\n"
-    "            # run_one_job via advance_next_runs, which never stamps a\n"
-    "            # fire_claim, and the claim a dispatch does stamp goes stale after\n"
-    "            # 300s while an audit runs for twenty minutes. The per-job flock\n"
-    "            # _run_claimed_job now holds — on both paths below, which is why\n"
-    "            # it sits there and not here — is what actually blocks the\n"
-    "            # overlap. See tools/cron_tick_lock_scope.py.\n"
-)
+# --- 11. (retired at v2026.9.14) the comment that said the CAS was enough ----
+# The `cronjob(action='run')` comment this edit corrected -- "the claim ...
+# blocks a concurrent tick from double-firing" -- was dropped when upstream
+# split the tool into per-action helpers; _action_run now says only that a
+# manual run must actually run. The one place the false claim survives is
+# _execute_job_now's docstring, which edit 7 corrects.
 
-# --- 12. a spawned tick is a scheduler restart, so it sweeps first ----------
-# recover_interrupted_executions() runs only from the two gateway-ticker
-# lifecycles, so the platform profile -- ticked by spawning this CLI -- had
-# never once reaped an abandoned attempt. See the module docstring.
-#
-# v2026.8.19 (#87644) wrapped the tick() call in an OSError handler, so the
-# sweep now goes between the import and that try rather than ahead of a bare
-# call. It stays outside the handler deliberately: a sweep failure is already
-# caught below and must not be reported as a failed tick.
-RECOVER_ANCHOR = (
-    "def cron_tick():\n"
-    '    """Run due jobs once and exit."""\n'
-    "    from cron.scheduler import tick\n"
-    "    try:\n"
-    "        tick(verbose=True)\n"
-)
-RECOVER_PATCHED = (
-    "def cron_tick():\n"
-    '    """Run due jobs once and exit."""\n'
-    "    from cron.scheduler import tick\n"
-    "\n"
-    "    # kube-agents patch: this process IS the platform profile's whole\n"
-    "    # scheduler lifecycle, so the recovery sweep that\n"
-    "    # InProcessCronScheduler.start runs at startup has to happen here or it\n"
-    "    # never happens at all. It only touches rows whose owner process is\n"
-    "    # proved gone, and a sweep that fails must not cost us the tick.\n"
-    "    # See tools/cron_tick_lock_scope.py.\n"
-    "    try:\n"
-    "        from cron.executions import recover_interrupted_executions\n"
-    "\n"
-    "        recovered = recover_interrupted_executions()\n"
-    "        if recovered:\n"
-    "            print(\n"
-    '                f"Recovered {recovered} interrupted execution(s) whose owner "\n'
-    '                f"process is gone; marked unknown."\n'
-    "            )\n"
-    "    except Exception as recover_err:\n"
-    '        print(f"Execution recovery skipped: {recover_err}", file=sys.stderr)\n'
-    "\n"
-    "    try:\n"
-    "        tick(verbose=True)\n"
-)
+# --- 12. (retired at v2026.9.14) a spawned tick sweeps first ----------------
+# This applier used to make hermes_cli/cron.py::cron_tick call
+# recover_interrupted_executions() before tick(), because the sweep ran only
+# from the two gateway-ticker lifecycles and the platform profile -- ticked by
+# spawning this CLI -- had never once reaped an abandoned attempt. Upstream
+# closed that in the run-up to v2026.9.14 (#86721): tick() now calls
+# _maybe_reap_dead_owners(), which runs the same sweep behind a 300s throttle
+# held in a module global -- unset in every freshly spawned process, so a
+# spawned tick sweeps every time -- and _try_dispatch_background_run reaps
+# before every manual dispatch as well. verify_cron_tick_lock_scope.py still
+# asserts both the wiring and the behaviour, so a future upstream change that
+# drops the sweep fails the build rather than quietly re-opening the gap.
 
 PATCHES = (
     (
@@ -417,13 +346,6 @@ PATCHES = (
             (DISPATCH_IMPORT_ANCHOR, DISPATCH_IMPORT_PATCHED, 1),
             (DISPATCH_CLAIM_ANCHOR, DISPATCH_CLAIM_PATCHED, 1),
             (DISPATCH_RELEASE_ANCHOR, DISPATCH_RELEASE_PATCHED, 1),
-            (STALE_COMMENT_ANCHOR, STALE_COMMENT_PATCHED, 1),
-        ),
-    ),
-    (
-        "hermes_cli/cron.py",
-        (
-            (RECOVER_ANCHOR, RECOVER_PATCHED, 1),
         ),
     ),
 )

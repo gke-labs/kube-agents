@@ -60,9 +60,9 @@ During initial installation, `install.sh` can create the Cloud KMS keyring/key a
 
 ```bash
 ./install.sh --non-interactive \
-  --project-id="YOUR_GCP_PROJECT_ID" \
-  --cluster-name="platform-agent-host" \
-  --region="us-central1" \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --gitops-org="YOUR_GITHUB_ORG" \
   --gitops-repo="YOUR_GITOPS_REPO" \
   --github-app-id="YOUR_GITHUB_APP_ID" \
@@ -85,9 +85,9 @@ For automated CI/CD pipelines, release automation, or production environments wh
    Once the key holds an `ENABLED` version in Cloud KMS, invoke `install.sh` without `--github-pem-path`:
    ```bash
    ./install.sh --non-interactive \
-     --project-id="YOUR_GCP_PROJECT_ID" \
-     --cluster-name="platform-agent-host" \
-     --region="us-central1" \
+     --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+     --gke-cluster-name="platform-agent-host" \
+     --gcp-region="us-central1" \
      --gitops-org="YOUR_GITHUB_ORG" \
      --gitops-repo="YOUR_GITOPS_REPO" \
      --github-app-id="YOUR_GITHUB_APP_ID"

@@ -3334,6 +3334,235 @@ func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 	}
 }
 
+// TestGatewayHoldsNoWholesaleJetStreamAPI is the shape check for the gateway's
+// JetStream API grant; the refusal proof is
+// TestGatewayJetStreamGrantOnARealServer, which asks a server. It is the last
+// of these, and it asks what the seed and bridge ones ask, in the same four
+// parts: the publish allow-list pinned exactly, every destructive and
+// out-of-scope route run through subjectMatches against every rendered entry,
+// a structural bound on the grant function's own output, and the subscribe
+// list pinned exactly.
+//
+// The route that motivated #1666 is one row of part 2:
+// $JS.API.STREAM.DELETE.TASKS, which the wildcard permitted and which was
+// measured deleting the stream on a live install.
+func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	got := a2aGrantSubjects(t, conf, "gateway", "publish")
+
+	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
+		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
+		"agents.hb.>", "$KV.session-state.>", "_INBOX.gateway.>",
+	}; !reflect.DeepEqual(sub, want) {
+		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
+	}
+
+	want := []string{
+		"a2a.tasks.*.*.in",
+		"a2a.tasks.*.*.supervisor",
+		"$KV.session-state.>",
+	}
+	want = append(want, a2aGatewayJetStreamGrants()...)
+	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// Verbs no gateway path uses, against every stream the provision script
+	// creates. A named grant only widens the stream it names, so a verb
+	// sampled on TASKS says nothing about the same verb on DIRECTORY.
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
+	forbiddenVerbs := []string{
+		"$JS.API.STREAM.CREATE.",
+		"$JS.API.STREAM.UPDATE.",
+		"$JS.API.STREAM.DELETE.",
+		"$JS.API.STREAM.PURGE.",
+		"$JS.API.STREAM.MSG.DELETE.",
+		"$JS.API.STREAM.MSG.GET.",
+		"$JS.API.STREAM.RESTORE.",
+		"$JS.API.STREAM.SNAPSHOT.",
+		"$JS.API.CONSUMER.NAMES.",
+		"$JS.API.CONSUMER.LIST.",
+	}
+	var forbidden []string
+	for _, s := range provisioned {
+		for _, verb := range forbiddenVerbs {
+			forbidden = append(forbidden, verb+s)
+		}
+		// Nothing on the gateway path binds a consumer by name, on any
+		// stream (a2aGatewayJetStreamGrants says what withholding this
+		// costs).
+		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
+	}
+	// Streams the gateway has no business on at all: not a read, not a
+	// consumer, not a direct get. The directory is the identity plane and
+	// the gateway reads it by subscribing to the cards; the topic streams
+	// are the blackboard, which nothing in a2a/gateway touches; the other
+	// two buckets are the bridge's and the capability envelope's.
+	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
+		forbidden = append(forbidden,
+			"$JS.API.STREAM.INFO."+s,
+			"$JS.API.CONSUMER.CREATE."+s+".x",
+			"$JS.API.CONSUMER.CREATE."+s+".x.a2a.agents.platform",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
+			"$JS.API.CONSUMER.MSG.NEXT."+s+".x",
+			"$JS.API.CONSUMER.DELETE."+s+".x",
+			"$JS.API.DIRECT.GET."+s+".a2a.agents.platform",
+			"$JS.API.DIRECT.GET."+s,
+		)
+	}
+	forbidden = append(forbidden,
+		// A session pod's three consumers, and the bridge's durable: the
+		// gateway may create consumers on TASKS, and create-as-update
+		// reaches them (a2aGatewayJetStreamGrants records that residue),
+		// but deleting one by name is a route this grant does not carry.
+		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.DELETE.TASKS.bridge-platform",
+		"$JS.API.CONSUMER.DELETE.TASKS.x",
+		// Account discovery and enumeration.
+		"$JS.API.INFO",
+		"$JS.API.STREAM.NAMES",
+		"$JS.API.STREAM.LIST",
+		// A stream nobody provisions, for the verbs the gateway does hold.
+		"$JS.API.STREAM.INFO.NOT-PROVISIONED",
+		"$JS.API.CONSUMER.CREATE.NOT-PROVISIONED.x",
+		"$JS.API.DIRECT.GET.NOT-PROVISIONED.x",
+	)
+	for _, subject := range forbidden {
+		for _, grant := range got {
+			if subjectMatches(grant, subject) {
+				t.Errorf("gateway grant %q permits %q; nothing on the gateway path uses it", grant, subject)
+			}
+		}
+	}
+
+	// The other direction, and the one a forbidden list cannot cover: an
+	// entry added inside a2aGatewayJetStreamGrants is invisible to the
+	// DeepEqual above, since want is built from that same function.
+	// Anything outside these shapes has to be argued for in that function's
+	// comment rather than added quietly.
+	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	allowedShapes := map[string]bool{
+		"$JS.API.STREAM.INFO." + a2aTasksStream:              true,
+		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":   true,
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*": true,
+		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>":        true,
+		"$JS.API.STREAM.INFO." + kvSessionState:              true,
+		"$JS.API.DIRECT.GET." + kvSessionState + ".>":        true,
+		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>":   true,
+		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*":   true,
+	}
+	for _, grant := range a2aGatewayJetStreamGrants() {
+		if !allowedShapes[grant] {
+			t.Errorf("gateway holds JetStream API grant %q, which is outside the shapes a2aGatewayJetStreamGrants argues for", grant)
+		}
+	}
+}
+
+// TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit is the other half
+// of the shape check, and the half a forbidden list cannot supply: every
+// $JS.API subject the gateway's own code paths put on the wire has to be
+// INSIDE the grant. A narrowing that misses one is not a green suite and a
+// broken install -- it is a call that never gets a reply, because a refused
+// request is not an error nats.go reports to the caller, so the gateway waits
+// out its context instead. That is #1306's STREAM.NAMES lesson, and it is why
+// this table is written from the call sites rather than from the grant.
+//
+// Each row is a real subject, spelled as nats.go v1.53.1 formats it for that
+// call, with the caller named. The server test runs the calls themselves;
+// this one is the cheap version that fails in milliseconds and says which
+// caller lost its route.
+func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+
+	// The generated tokens nats.go supplies: an ordered consumer's name is
+	// nuid-derived with a serial suffix, and a KV watcher's is a hash.
+	const (
+		orderedConsumerName = "GxQ1Vk8yPqR3Sn7TmW2bLc_1"
+		kvWatcherName       = "7yLm2Qr9"
+		sessionKey          = "sessions.discord_live_thread-2f9a1c3d"
+	)
+	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	eventsSubject := "a2a.tasks.platform.task-0001.events"
+
+	for _, tc := range []struct{ caller, subject string }{
+		// lib.TasksGet, the tasks/get replay behind every status answer,
+		// the reap scan and the spawn watchdog.
+		{"lib.TasksGet js.Stream", "$JS.API.STREAM.INFO." + a2aTasksStream},
+		{"lib.TasksGet GetLastMsgForSubject (events)", "$JS.API.DIRECT.GET." + a2aTasksStream + "." + eventsSubject},
+		{"lib.TasksGet GetLastMsgForSubject (supervisor)", "$JS.API.DIRECT.GET." + a2aTasksStream + ".a2a.tasks.platform.task-0001.supervisor"},
+		{"lib.TasksGet OrderedConsumer", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + orderedConsumerName},
+		{"lib.TasksGet ordered Next", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + "." + orderedConsumerName},
+		// gateway.Run's event relay: two filter subjects, so nats.go puts
+		// the filter in the body and the subject ends at the durable name.
+		{"lib.SubscribeDurable relay create", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay"},
+		{"relay Consume pull", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".gateway-relay"},
+		// The same durable rebound with ONE filter subject, which is the
+		// shape every install already has on disk and the shape a rebind
+		// goes through: nats.go appends the filter to the API subject.
+		{"lib.SubscribeDurable single-filter rebind", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay." + eventsSubject},
+		// gateway.Registry, over the session-state bucket.
+		{"Registry js.KeyValue", "$JS.API.STREAM.INFO." + kvSessionState},
+		{"Registry Get / SessionForTask (kv.Get)", "$JS.API.DIRECT.GET." + kvSessionState + ".$KV." + a2aSessionStateBucket + "." + sessionKey},
+		{"Registry Sessions (ListKeysFiltered watcher)", "$JS.API.CONSUMER.CREATE." + kvSessionState + "." + kvWatcherName + ".$KV." + a2aSessionStateBucket + ".sessions.>"},
+		{"Registry Sessions watcher Stop (Unsubscribe)", "$JS.API.CONSUMER.DELETE." + kvSessionState + "." + kvWatcherName},
+		// The ack the relay's explicit-ack durable publishes, granted
+		// beside the API list rather than in it.
+		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
+	} {
+		var covered bool
+		for _, g := range grants {
+			if subjectMatches(g, tc.subject) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			t.Errorf("no gateway grant covers %q (%s); that call gets no reply and the caller waits out its context",
+				tc.subject, tc.caller)
+		}
+	}
+}
+
+// TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo pins the pair the
+// gateway identity's comment names. The registry's writes are publishes on
+// $KV.<bucket>.>, spelled as a literal in gatewayIdentity; its reads are
+// JetStream API calls on stream KV_<bucket>, built from a2aSessionStateBucket
+// inside a2aGatewayJetStreamGrants. Two spellings of one bucket: change one
+// and the gateway can write the registry and not read it, which is an
+// authorization failure at runtime with nothing failing here to say so.
+//
+// Also held to the provision script, for the same reason the bridge's streams
+// are: a grant naming a bucket nothing creates is a call that times out on a
+// real install and nowhere else.
+func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+
+	dataPlane := "$KV." + a2aSessionStateBucket + ".>"
+	if !slices.Contains(grants, dataPlane) {
+		t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
+			dataPlane, a2aSessionStateBucket)
+	}
+	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	if !slices.Contains(grants, "$JS.API.STREAM.INFO."+kvSessionState) {
+		t.Errorf("the gateway holds no STREAM.INFO on %s; js.KeyValue binds a bucket by reading its stream, so the registry cannot open", kvSessionState)
+	}
+	if script := a2aProvisionScript(a2aTestAgent()); !strings.Contains(script, "kv add "+a2aSessionStateBucket+" ") {
+		t.Errorf("the provision script has no %q; the gateway's grant names a bucket nothing creates", "kv add "+a2aSessionStateBucket)
+	}
+	// Every JetStream grant names TASKS or that bucket's stream, so the two
+	// checks above cover the whole list rather than the entries this test
+	// happens to spell.
+	known := []string{a2aTasksStream, kvSessionState}
+	for _, grant := range a2aGatewayJetStreamGrants() {
+		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
+			t.Errorf("gateway grant %q names a stream outside %v, which is what this pair is held to", grant, known)
+		}
+	}
+}
+
 // a2aGrantStream places one JetStream or KV grant: the stream it names and
 // the verb it holds there, or the account-level discovery request it is.
 //
@@ -3528,9 +3757,13 @@ type a2aGrantRow struct {
 	// accountLevel is the $JS.API discovery the principal may make with no
 	// stream in the subject.
 	accountLevel []string
-	// wholesale records a principal that still holds $JS.API.>; narrowing
-	// it is a behaviour change with its own real-server test, not this
-	// table's to make.
+	// wholesale records a principal that holds $JS.API.>. No row sets it
+	// any more -- seed came off the wildcard in #1306, worker in #1393 and
+	// gateway in #1666 -- and the field stays because the alternative to a
+	// flag is silence: with it, a principal that takes the wildcard back
+	// has to say so on its own row in this table, and the diff is one word
+	// a reviewer can see. Narrowing one is a behaviour change with its own
+	// real-server test, not this table's to make.
 	wholesale bool
 }
 
@@ -3776,10 +4009,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
-				a2aTasksStream: {"ACK"},
-				kvSessionState: {"KV"},
+				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 			},
-			wholesale: true,
 		},
 		a2aBridgeUser: {
 			streams: map[string][]string{

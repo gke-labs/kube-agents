@@ -2,9 +2,10 @@
 
 The gap
 -------
-``agent/conversation_loop.py`` (Hermes v2026.8.19) honours exactly one source of
-"how long until the quota opens": the ``Retry-After`` response header, capped at
-600 s. Everything else waits ``jittered_backoff(base_delay=2.0)``, which puts
+``compute_error_backoff`` in ``agent/turn_recovery.py`` (Hermes v2026.9.14;
+``agent/conversation_loop.py`` before the split) honours two sources of "how
+long until the quota opens": the ``Retry-After`` response header and a
+``retry_after`` field in a dict error body, capped at 600 s. Everything else waits ``jittered_backoff(base_delay=2.0)``, which puts
 the default three retries roughly 2 to 3 s and 4 to 6 s apart.
 
 Google does not send that header. A Gemini or Vertex 429 carries its reset
@@ -32,8 +33,9 @@ What it does
 ``message``, its ``body`` and its response JSON, following the cause chain the
 same five levels ``agent/error_classifier.py`` does, and returns the delay in
 seconds capped at :data:`RETRY_DELAY_CAP_SECONDS` (the header path's cap) or
-``None``. The loop calls it only when the header said nothing, so a provider
-that sends both keeps the header's answer. Nothing here changes the retry count.
+``None``. The loop calls it only when neither the header nor upstream's
+``retry_after`` body field said anything, so a provider that sends either
+keeps that answer. Nothing here changes the retry count.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ RETRY_DELAY_PATTERN = re.compile(
     r"""retryDelay\\*["']?\s*:\s*\\*["']?\s*(\d+(?:\.\d+)?)\s*s\b"""
 )
 
-#: Same cap as the ``Retry-After`` header path in ``conversation_loop.py``:
+#: Same cap as the ``Retry-After`` header path in ``agent/turn_recovery.py``:
 #: 600 s covers every realistic provider reset window and rejects pathological
 #: values (upstream #26293).
 RETRY_DELAY_CAP_SECONDS = 600.0

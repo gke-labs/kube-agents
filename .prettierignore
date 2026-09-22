@@ -39,3 +39,10 @@ bench/tests/fixtures/runs/**/*.json
 # filters to `.md`/`.yaml`/`.yml` and never sees JSON; this entry stops a wider
 # local invocation from rewriting it by accident.
 agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json
+
+# The fleet-audit harness's recorded `finish` transcripts: byte-for-byte what
+# the harness emitted before the collector contract existed, and compared
+# byte-for-byte on every test run. CI's prettier job filters to
+# `.md`/`.yaml`/`.yml` and never sees JSON; this entry stops a wider local
+# invocation from rewriting them by accident.
+agents/platform/skills/fleet-audit/scripts/testdata/finish_without_manifest/*.json

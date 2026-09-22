@@ -13,12 +13,14 @@ insert has to reproduce.
 The fixture mirrors the shape of upstream's function rather than its contents:
 the two ``append`` branches and the ``sort`` are what make the emitted list
 differ from the source literal, so the tests can exec the patched module and
-assert on the manifest instead of on the text just inserted.
+assert on the manifest instead of on the text just inserted. The list is
+written several scopes per line, as upstream has spelled it since v2026.9.14;
+``ONE_PER_LINE`` is the v2026.8.19 spelling, kept so the insert is proven
+against both.
 """
 
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 
@@ -42,13 +44,8 @@ def _build_full_manifest(
     messaging_experience: str | None = None,
 ) -> dict:
     bot_scopes = [
-        "app_mentions:read",
-        "chat:write",
-        "commands",
-        "files:write",
-        "reactions:read",
-        "users:read",
-    ]
+        "app_mentions:read", "chat:write", "commands",
+        "files:write", "reactions:read", "users:read"]
 
     bot_events = [
         "app_mention",
@@ -69,6 +66,28 @@ def _build_full_manifest(
         "settings": {"event_subscriptions": {"bot_events": bot_events}},
     }
 '''
+
+
+# The same list one scope per line, which is how upstream wrote it through
+# v2026.8.19 and how a formatter could write it again.
+ONE_PER_LINE = UPSTREAM.replace(
+    '''\
+    bot_scopes = [
+        "app_mentions:read", "chat:write", "commands",
+        "files:write", "reactions:read", "users:read"]
+''',
+    '''\
+    bot_scopes = [
+        "app_mentions:read",
+        "chat:write",
+        "commands",
+        "files:write",
+        "reactions:read",
+        "users:read",
+    ]
+''',
+)
+assert ONE_PER_LINE != UPSTREAM
 
 
 def build(source=UPSTREAM):
@@ -107,23 +126,35 @@ class ApplyTest(unittest.TestCase):
                 # The sort is upstream's; this pins that we did not disturb it.
                 self.assertEqual(scopes, sorted(scopes))
 
-    def test_insert_follows_reactions_read_at_its_own_indent(self):
+    def test_insert_follows_reactions_read_on_a_packed_line(self):
         root = build()
+        apply(root)
+        source = (root / RELATIVE).read_text()
+        self.assertIn(
+            '"files:write", "reactions:read", "reactions:write", "users:read"]',
+            source,
+        )
+
+    def test_one_scope_per_line_gets_a_line_of_its_own(self):
+        root = build(ONE_PER_LINE)
         apply(root)
         source = (root / RELATIVE).read_text()
         self.assertIn(
             '        "reactions:read",\n        "reactions:write",\n', source
         )
+        manifest = load(root)._build_full_manifest("Hermes", "test")
+        self.assertEqual(
+            manifest["oauth_config"]["scopes"]["bot"].count(WRITE_SCOPE), 1
+        )
 
     def test_indentation_is_taken_from_the_anchor_not_assumed(self):
         # Upstream could reindent the literal — a nested helper, a different
         # formatter. The insert has to follow it rather than hard-code eight
-        # spaces, or the patched file stops parsing.
-        root = build(
-            UPSTREAM.replace(
-                '        "reactions:read",', '            "reactions:read",'
-            )
-        )
+        # spaces, or the patched file stops parsing. Every element moves, as
+        # a reindent would move them: the insert reuses the separator that
+        # follows the anchor element, so reindenting that line alone would
+        # only prove the next line's indent was copied.
+        root = build(ONE_PER_LINE.replace('\n        "', '\n            "'))
         apply(root)
         self.assertIn(
             '            "reactions:read",\n            "reactions:write",\n',
@@ -162,28 +193,20 @@ class DriftTest(unittest.TestCase):
         # Upstream removing the read scope means it has stopped supporting
         # reactions; granting write into that is worse than failing the build.
         self._refuses(
-            UPSTREAM.replace('        "reactions:read",\n', ""),
+            UPSTREAM.replace('"reactions:read", ', ""),
             "no longer holds 'reactions:read'",
         )
 
-    def test_list_collapsed_onto_one_line(self):
+    def test_reactions_read_as_a_bare_last_element(self):
         # expect_contains still passes here — the literal is a list and still
-        # holds the scope — so the line-anchored insert is what has to refuse.
+        # holds the scope — but there is no comma-and-separator to insert after,
+        # so the text-level check is what has to refuse rather than guess.
         self._refuses(
             UPSTREAM.replace(
-                textwrap.dedent('''\
-                    bot_scopes = [
-                            "app_mentions:read",
-                            "chat:write",
-                            "commands",
-                            "files:write",
-                            "reactions:read",
-                            "users:read",
-                        ]'''),
-                'bot_scopes = ["app_mentions:read", "chat:write", "commands", '
                 '"files:write", "reactions:read", "users:read"]',
+                '"files:write", "users:read", "reactions:read"]',
             ),
-            'expected 1 "reactions:read" element on a line of its own',
+            'expected 1 "reactions:read" element followed by a comma',
         )
 
     def test_scopes_not_a_list_literal(self):

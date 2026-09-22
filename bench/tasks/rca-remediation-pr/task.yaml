@@ -91,12 +91,12 @@ owner: maintainers
 fixtures:
   - crashloop-workload
 
-# The PR objective is a report check rather than a tool check, deliberately:
-# submit_suggestion.py runs as a skill script through execute_code, so no
-# distinct tool name reaches the trajectory. What the skill's SKILL.md
-# promises instead is that the script returns the live GitHub PR URL and the
-# agent presents it in the final answer -- and every GitHub PR URL contains
-# "/pull/", a substring nothing else in an RCA reply plausibly carries.
+# The PR objective reads the final answer rather than the trajectory,
+# deliberately: submit_suggestion.py runs as a skill script through
+# execute_code, so no distinct tool name reaches the trajectory. What the
+# skill's SKILL.md promises instead is that the script returns the live GitHub
+# PR URL and the agent presents it in the final answer. The URL is a pointer
+# only -- the check resolves it through GitHub and grades what comes back.
 verification_spec:
   - name: a-pull-request-was-opened-and-linked
     role: objective
@@ -104,11 +104,11 @@ verification_spec:
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # Both halves of a GitHub PR URL, not "/pull/" alone (any PR link
-      # would satisfy that). TODO: tighten to the eval GitOps repository's
-      # own slug once that repository is decided at fleet activation.
-      required_phrases: ["github.com/", "/pull/"]
+      # Not report_contains: a substring passes on an invented URL, and on the
+      # PR an earlier rep opened, since nothing sweeps the GitOps repository.
+      type: pull_request_opened
+      # Closes the TODO this check carried: the repositories are decided.
+      owner: gke-agentic
   - name: rca-names-the-planted-cause
     role: objective
     # assert, not the converge default: the transcript is immutable once the

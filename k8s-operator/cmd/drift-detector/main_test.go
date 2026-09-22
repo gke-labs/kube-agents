@@ -20,6 +20,10 @@ import (
 	"flag"
 	"strings"
 	"testing"
+
+	container "google.golang.org/api/container/v1"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {
@@ -124,7 +128,7 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 	}
 }
 
-// The cluster identity is assembled from three flag values, one of which
+// The direct cluster identity is assembled from three flag values, one of which
 // (--project) is not named after the field it fills, so a transposition or an
 // omission here is invisible to the compiler and to go vet -- the same hazard
 // NewClassifier has and the reason newFilterFromFlags exists at all. The result
@@ -142,21 +146,28 @@ func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
 		t.Fatalf("parseFlags returned error: %v", err)
 	}
 
-	stub := &stubGetter{obj: managedFieldsObject()}
-	filter, join := newFilterFromFlags(f, stub)
-
 	// The project half comes from --project rather than a flag of its own, so
-	// this also pins that wiring: a joiner built with an empty project matches
+	// this also pins that wiring: a set keyed on an empty project matches
 	// nothing, and every record would come out unreachable.
 	want := clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-a"}
-	if join.cluster != want {
-		t.Errorf("joiner.cluster = %+v, want %+v", join.cluster, want)
+	if got := directClusterIdentity(f); got != want {
+		t.Errorf("directClusterIdentity = %+v, want %+v", got, want)
+	}
+
+	// Assembled as realMain assembles it, so the test covers the path the binary
+	// takes rather than a shortcut around buildClusterSet.
+	stub := &stubGetter{obj: managedFieldsObject()}
+	clusters := buildClusterSet(stub, directClusterIdentity(f), nil)
+	filter, join := newFilterFromFlags(f, clusters)
+
+	if got := join.Clusters(); got != 1 {
+		t.Errorf("joiner.Clusters() = %d, want 1 -- the getter did not reach the joiner", got)
+	}
+	if _, ok := join.clusters[want]; !ok {
+		t.Errorf("joiner.clusters = %v, want the flags' identity as a key", join.clusters)
 	}
 	if !join.gitopsManagers["argocd-controller"] {
 		t.Errorf("joiner.gitopsManagers = %v, want argocd-controller in it", join.gitopsManagers)
-	}
-	if join.getter == nil {
-		t.Error("the getter did not reach the joiner")
 	}
 
 	// End to end through the filter: a human change on this cluster has to come
@@ -276,6 +287,17 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 			argv:    []string{"--project", "123456789012", "--in-cluster", "--cluster-name", "prod-a", "--cluster-location", "us-central1"},
 			wantErr: "is a project number",
 		},
+		{
+			// The same refusal reached through the other credential source. The
+			// profile path compares --project twice -- against each record's
+			// project_id, and against each discovered profile's own project to
+			// decide what to register -- so a number here discards the whole
+			// fleet at discovery and then matches nothing either, which reads as
+			// an empty fleet rather than as a bad flag.
+			name:    "project given as a number with only the profile fan-in",
+			argv:    []string{"--project", "123456789012", "--profiles-dir", "/opt/data/profiles"},
+			wantErr: "is a project number",
+		},
 	}
 
 	for _, tc := range tests {
@@ -334,6 +356,100 @@ users:
 	}
 	if want := "refusing to enrich"; !strings.Contains(err.Error(), want) {
 		t.Errorf("realMain error = %q, want it to contain %q", err, want)
+	}
+}
+
+// The identity check runs before the profile scan, and the ordering is load
+// bearing rather than incidental: reversed, a detector refusing to start on a
+// --cluster-name typo would first mint a token and ask the GKE API about every
+// cluster in the fleet. Nothing else pins it -- the two blocks are independent,
+// so a reorder compiles and every other test stays green -- and this is also
+// the only test that drives realMain with both credential sources configured.
+func TestRealMainVerifiesTheDirectClusterBeforeScanningProfiles(t *testing.T) {
+	const reachesUSEast4 = `apiVersion: v1
+kind: Config
+clusters:
+  - name: prod-a
+    cluster:
+      server: https://127.0.0.1:1
+contexts:
+  - name: gke_example-project_us-east4_prod-a
+    context:
+      cluster: prod-a
+      user: prod-a
+current-context: gke_example-project_us-east4_prod-a
+users:
+  - name: prod-a
+    user:
+      token: not-a-real-token
+`
+
+	// stubGKE first, for its TokenSource: Discover mints the token before it
+	// calls Describe and skips the profile if minting fails, so a nil
+	// TokenSource would fall through to Application Default Credentials and
+	// leave described at 0 on any host without them -- green with the ordering
+	// reversed, which is the one thing this test exists to catch.
+	stubGKE(t)
+	described := 0
+	profilesDiscovery.Describe = func(context.Context, clusterprofiles.Identity) (*container.Cluster, error) {
+		described++
+		return nil, errors.New("the scan should not have run")
+	}
+
+	profiles := t.TempDir()
+	writeClusterProfile(t, profiles, "example-project-us-central1-prod-b", "example-project", "prod-b", "us-central1")
+
+	// --cluster-location disagrees with the kubeconfig's own context, which is
+	// the mismatch verifyClusterIdentity is fatal on.
+	argv := []string{
+		"--project", "example-project",
+		"--kubeconfig", writeKubeconfig(t, reachesUSEast4),
+		"--cluster-name", "prod-a",
+		"--cluster-location", "us-central1",
+		"--profiles-dir", profiles,
+	}
+
+	err := realMain(argv)
+	if err == nil {
+		t.Fatalf("realMain(%v) succeeded, want it to refuse the mismatched direct cluster", argv)
+	}
+	if want := "refusing to enrich"; !strings.Contains(err.Error(), want) {
+		t.Errorf("realMain error = %q, want it to contain %q", err, want)
+	}
+	if described != 0 {
+		t.Errorf("GKE describe called %d time(s) before the identity check refused; want 0", described)
+	}
+}
+
+// The line an operator gets when the join came up with nothing. Two of the four
+// branches reach this function looking like an empty profiles directory and are
+// told apart only by the scan: every profile failed (Skipped), or the directory
+// could not be opened at all (DirUnreadable). Report either as "no profiles
+// yet" and the operator goes to wait on cluster-agent-reconcile when the cause
+// is IAM, a mistyped --project, or a broken mount.
+func TestJoinDisabledReason(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		profilesDir string
+		scan        profileScan
+		want        string
+	}{
+		{"no sources at all", "", profileScan{}, "no cluster credentials (--in-cluster, --kubeconfig or --profiles-dir)"},
+		{"a profiles dir with nothing in it yet", "/opt/data/profiles", profileScan{}, "no Cluster Agent profiles in /opt/data/profiles yet, and no --in-cluster or --kubeconfig"},
+		{"a profiles dir where every profile failed", "/opt/data/profiles", profileScan{Skipped: 5}, "all 5 Cluster Agent profile(s) in /opt/data/profiles were skipped for the reasons above, and no --in-cluster or --kubeconfig"},
+		{"one profile, and it failed", "/opt/data/profiles", profileScan{Skipped: 1}, "all 1 Cluster Agent profile(s) in /opt/data/profiles were skipped for the reasons above, and no --in-cluster or --kubeconfig"},
+		{"a profiles dir that could not be read", "/opt/data/profiles", profileScan{DirUnreadable: true}, "the Cluster Agent profiles in /opt/data/profiles could not be read at all (the error is above, and a restart will not clear it), and no --in-cluster or --kubeconfig"},
+		// Cannot arise today -- nothing is skipped per-profile until the
+		// directory has been read -- and pinned anyway, because the branch order
+		// is the only thing deciding it and a reordering would otherwise be
+		// silent.
+		{"unreadable outranks a skip count", "/opt/data/profiles", profileScan{Skipped: 3, DirUnreadable: true}, "the Cluster Agent profiles in /opt/data/profiles could not be read at all (the error is above, and a restart will not clear it), and no --in-cluster or --kubeconfig"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := joinDisabledReason(tc.profilesDir, tc.scan); got != tc.want {
+				t.Errorf("joinDisabledReason(%q, %+v) = %q, want %q", tc.profilesDir, tc.scan, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -16,8 +16,10 @@ from unittest import mock
 from apply_kanban_worker_tools import (
     HANDLERS,
     IMPORT_AFTER,
+    ORCHESTRATOR_CHECK_FN,
     RELATIVE,
     UPSTREAM_CHECK_FN,
+    WORKER_CHECK_FN,
     apply,
     check_handler_mapping,
 )
@@ -31,52 +33,61 @@ ORCHESTRATOR_TOOLS = (
     "kanban_create",
 )
 
-# Reproduces the shape of upstream tools/kanban_tools.py closely enough that the
-# anchors have to be right: the two gate functions, then the registrations.
+# Reproduces the shape of upstream tools/kanban_tools.py (v2026.9.14) closely
+# enough that the locators have to be right: the two gate functions, then the
+# table-driven registration — a ``_TOOLS`` tuple of rows and one ``for`` loop
+# that picks a gate per row and calls ``registry.register`` once.
 GATES = '''\
 import os
+
+from tools.registry import no_cache_check_fn, registry, tool_error
 
 
 def _profile_has_kanban_toolset() -> bool:
     return False
 
 
+@no_cache_check_fn
 def _check_kanban_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
 
 
+@no_cache_check_fn
 def _check_kanban_orchestrator_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
 '''
 
+ORCHESTRATOR_SET_LINE = '_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})\n'
 
-def registration(tool, check_fn, handler=None):
+LOOP = '''\
+for _name, _sch, _handler, _emoji in _TOOLS:
+    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+    registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
+                      check_fn=_gate)
+'''
+
+#: The statement the applier splices after the loop's ``_gate = ...`` line.
+GATE_OVERRIDE = (
+    "    if _name in _WORKER_ONLY_TOOLS:\n"
+    f"        _gate = {WORKER_CHECK_FN}\n"
+)
+
+ALL_TOOLS = ("kanban_list", "kanban_unblock") + ORCHESTRATOR_TOOLS + WORKER_ONLY_TOOLS
+
+
+def row(tool, handler=None, schema=None):
     handler = handler or HANDLERS.get(tool, f"_handle_{tool[len('kanban_'):]}")
-    return (
-        "\n\nregistry.register(\n"
-        f'    name="{tool}",\n'
-        '    toolset="kanban",\n'
-        f"    schema={tool.upper()}_SCHEMA,\n"
-        f"    handler={handler},\n"
-        f"    check_fn={check_fn},\n"
-        '    emoji="x",\n'
-        ")\n"
-    )
+    schema = schema or f"{tool.upper()}_SCHEMA"
+    return f'    ("{tool}", {schema}, {handler}, "x"),\n'
 
 
-def upstream_source():
-    src = GATES
-    src += registration("kanban_list", "_check_kanban_orchestrator_mode")
-    src += registration("kanban_unblock", "_check_kanban_orchestrator_mode")
-    for tool in ORCHESTRATOR_TOOLS:
-        src += registration(tool, "_check_kanban_mode")
-    for tool in WORKER_ONLY_TOOLS:
-        src += registration(tool, "_check_kanban_mode")
-    return src
+def upstream_source(rows=None, orchestrator_set=ORCHESTRATOR_SET_LINE, loop=LOOP):
+    rows = [row(tool) for tool in ALL_TOOLS] if rows is None else rows
+    return GATES + "\n\n" + orchestrator_set + "_TOOLS = (\n" + "".join(rows) + ")\n\n" + loop
 
 
 def patch_tree(source):
@@ -87,6 +98,42 @@ def patch_tree(source):
     target.write_text(source)
     apply(root)
     return target.read_text()
+
+
+def registered_gates(patched):
+    """Execute the patched fixture against a recording registry: tool -> check_fn.
+
+    An anchored edit that parses can still leave the loop choosing the wrong
+    gate; the only proof is what the loop hands ``registry.register``. The two
+    ``tools.*`` modules the fixture and the import block name are faked in
+    ``sys.modules``, the way the delegation-context tests fake theirs.
+    """
+    gates = {}
+
+    class Registry:
+        @staticmethod
+        def register(**kw):
+            gates[kw["name"]] = kw["check_fn"]
+
+    registry_mod = types.ModuleType("tools.registry")
+    registry_mod.registry = Registry()
+    registry_mod.no_cache_check_fn = lambda fn: fn
+    registry_mod.tool_error = lambda m: m
+    worker_mod = types.ModuleType("tools.kanban_worker_tools")
+    worker_mod.WORKER_ONLY_TOOLS = WORKER_ONLY_TOOLS
+    worker_mod.check_kanban_worker_mode = check_kanban_worker_mode
+    tools_pkg = types.ModuleType("tools")
+    tools_pkg.registry = registry_mod
+    tools_pkg.kanban_worker_tools = worker_mod
+    ns = {f"{tool.upper()}_SCHEMA": {"name": tool} for tool in ALL_TOOLS}
+    ns.update({HANDLERS.get(t, f"_handle_{t[len('kanban_'):]}"): (lambda a, **k: a) for t in ALL_TOOLS})
+    with mock.patch.dict(
+        sys.modules,
+        {"tools": tools_pkg, "tools.registry": registry_mod,
+         "tools.kanban_worker_tools": worker_mod},
+    ):
+        exec(compile(patched, "<patched>", "exec"), ns)
+    return gates, ns
 
 
 class CheckWorkerModeTest(unittest.TestCase):
@@ -103,11 +150,22 @@ class CheckWorkerModeTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": ""}):
             self.assertFalse(check_kanban_worker_mode())
 
-    def test_the_forbidden_four_are_all_covered(self):
-        # The four agents/chat/SOUL.md §1.5 names explicitly. If a future edit
+    def test_the_forbidden_six_are_all_covered(self):
+        # The six agents/chat/SOUL.md §1.5 names explicitly. If a future edit
         # trims WORKER_ONLY_TOOLS, the prose and the schema set diverge again.
-        for tool in ("kanban_complete", "kanban_block", "kanban_heartbeat", "kanban_link"):
+        for tool in (
+            "kanban_complete", "kanban_block", "kanban_heartbeat", "kanban_link",
+            "kanban_request_review", "kanban_request_changes",
+        ):
             self.assertIn(tool, WORKER_ONLY_TOOLS)
+
+    def test_the_review_flow_tools_are_worker_only(self):
+        # v2026.9.14 opens both with _worker_guard, whose ownership check is a
+        # no-op without HERMES_KANBAN_TASK — so an orchestrator offered the
+        # schema could call either against any card.
+        self.assertIn("kanban_request_review", WORKER_ONLY_TOOLS)
+        self.assertIn("kanban_request_changes", WORKER_ONLY_TOOLS)
+        self.assertEqual(len(WORKER_ONLY_TOOLS), 9)
 
 
 def with_delegation_context(reader):
@@ -135,7 +193,7 @@ class DelegatedChildTest(unittest.TestCase):
     Upstream's own two gates, ``_check_kanban_mode`` and
     ``_check_kanban_orchestrator_mode``, both open with the same short-circuit;
     without it this was the only kanban gate in the file that said *True* for a
-    child, which would have offered it the seven worker-only tools and none of
+    child, which would have offered it the nine worker-only tools and none of
     the five an orchestrator keeps.
     """
 
@@ -205,28 +263,37 @@ class DelegatedChildTest(unittest.TestCase):
 
 class ApplyTest(unittest.TestCase):
     def test_worker_only_tools_are_regated(self):
-        patched = patch_tree(upstream_source())
+        gates, _ = registered_gates(patch_tree(upstream_source()))
         for tool in WORKER_ONLY_TOOLS:
-            self.assertIn(
-                registration(tool, "_check_kanban_worker_mode"),
-                patched,
-                f"{tool} was not re-gated",
-            )
+            self.assertIs(gates[tool], check_kanban_worker_mode, f"{tool} was not re-gated")
 
     def test_orchestrator_tools_are_left_alone(self):
-        patched = patch_tree(upstream_source())
+        gates, ns = registered_gates(patch_tree(upstream_source()))
         for tool in ORCHESTRATOR_TOOLS:
-            self.assertIn(registration(tool, "_check_kanban_mode"), patched)
+            self.assertIs(gates[tool], ns[UPSTREAM_CHECK_FN], tool)
         for tool in ("kanban_list", "kanban_unblock"):
-            self.assertIn(registration(tool, "_check_kanban_orchestrator_mode"), patched)
+            self.assertIs(gates[tool], ns[ORCHESTRATOR_CHECK_FN], tool)
 
-    def test_the_import_lands_above_the_registrations(self):
+    def test_every_upstream_tool_is_still_registered(self):
+        gates, _ = registered_gates(patch_tree(upstream_source()))
+        self.assertEqual(set(gates), set(ALL_TOOLS))
+
+    def test_the_override_lands_once_inside_the_loop(self):
+        patched = patch_tree(upstream_source())
+        self.assertEqual(patched.count(GATE_OVERRIDE), 1)
+        choice = patched.index(f"_gate = {ORCHESTRATOR_CHECK_FN} if")
+        override = patched.index(GATE_OVERRIDE)
+        register = patched.index("registry.register(")
+        self.assertTrue(choice < override < register)
+
+    def test_the_import_lands_above_the_loop(self):
         patched = patch_tree(upstream_source())
         import_at = patched.index("from tools.kanban_worker_tools import")
-        first_use = patched.index("check_fn=_check_kanban_worker_mode")
-        # check_fn= is evaluated at import time, so a trailing import would
+        first_use = patched.index(f"_gate = {WORKER_CHECK_FN}")
+        # _gate is evaluated at import time, so a trailing import would
         # NameError at module load rather than at first tool call.
         self.assertLess(import_at, first_use)
+        self.assertIn(f"no_cache_check_fn({WORKER_CHECK_FN})", patched)
 
     def test_the_patched_module_still_parses(self):
         ast.parse(patch_tree(upstream_source()))
@@ -234,21 +301,27 @@ class ApplyTest(unittest.TestCase):
     def test_reformatting_the_registration_no_longer_breaks_the_build(self):
         """The point of locating by AST: layout is not the contract.
 
-        The five-line slice this applier used to anchor on would have found
-        nothing here, and eight anchors would have failed at once over
-        whitespace that changes no behaviour.
+        The table rows and the gate conditional are reflowed onto several
+        lines each, with a comment in between; a literal anchor on either
+        would have found nothing, and the patch must not care.
         """
-        reflowed = upstream_source().replace(
-            '    name="kanban_complete",\n    toolset="kanban",\n',
-            '    name="kanban_complete",\n\n    # a comment upstream added\n'
-            '    toolset="kanban",\n',
+        reflowed_rows = [
+            f'    (\n        "{tool}",  # a comment upstream added\n'
+            f"        {tool.upper()}_SCHEMA,\n"
+            f"        {HANDLERS.get(tool, '_handle_' + tool[len('kanban_'):])},\n"
+            '        "x",\n    ),\n'
+            for tool in ALL_TOOLS
+        ]
+        reflowed_loop = LOOP.replace(
+            f"    _gate = {ORCHESTRATOR_CHECK_FN} if _name in _ORCHESTRATOR_TOOLS else {UPSTREAM_CHECK_FN}\n",
+            f"    _gate = (\n        {ORCHESTRATOR_CHECK_FN}\n"
+            f"        if _name in _ORCHESTRATOR_TOOLS\n        else {UPSTREAM_CHECK_FN}\n    )\n",
         )
-        patched = patch_tree(reflowed)
-        self.assertIn("check_fn=_check_kanban_worker_mode", patched)
-        self.assertEqual(
-            patched.count("check_fn=_check_kanban_worker_mode"),
-            len(WORKER_ONLY_TOOLS),
-        )
+        patched = patch_tree(upstream_source(rows=reflowed_rows, loop=reflowed_loop))
+        self.assertEqual(patched.count(GATE_OVERRIDE), 1)
+        gates, _ = registered_gates(patched)
+        for tool in WORKER_ONLY_TOOLS:
+            self.assertIs(gates[tool], check_kanban_worker_mode, tool)
 
     def test_applying_twice_fails_rather_than_silently_no_opping(self):
         root = Path(tempfile.mkdtemp())
@@ -258,9 +331,7 @@ class ApplyTest(unittest.TestCase):
         apply(root)
         with self.assertRaises(SystemExit) as ctx:
             apply(root)
-        # The second run gets as far as the registration and finds the gate
-        # already swapped, which is the loud version of "already patched".
-        self.assertIn(f"where {UPSTREAM_CHECK_FN} was expected", str(ctx.exception))
+        self.assertIn("already patched", str(ctx.exception))
 
     def test_a_missing_file_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -277,7 +348,8 @@ class LocatorFailureTest(unittest.TestCase):
 
     A literal anchor fails loudly by construction — the text is either there or
     it is not. A locator has to be *made* to fail loudly, so each way upstream
-    could move a registration out from under this patch gets a test.
+    could move the table, a row, or the loop's gate choice out from under this
+    patch gets a test.
     """
 
     def assert_refuses(self, source, *expected):
@@ -287,55 +359,69 @@ class LocatorFailureTest(unittest.TestCase):
             self.assertIn(fragment, str(ctx.exception))
         return str(ctx.exception)
 
-    def test_an_absent_registration_fails_loudly(self):
-        source = upstream_source().replace(
-            registration("kanban_link", "_check_kanban_mode"), ""
-        )
-        self.assert_refuses(source, "kanban_link registration", "found 0")
+    def rows_without(self, tool):
+        return [row(t) for t in ALL_TOOLS if t != tool]
 
-    def test_a_duplicated_registration_fails_loudly(self):
-        """Two calls registering the same tool: which one is the patch for?"""
-        source = upstream_source() + registration("kanban_link", "_check_kanban_mode")
-        self.assert_refuses(source, "kanban_link registration", "found 2")
+    def test_an_absent_row_fails_loudly(self):
+        source = upstream_source(rows=self.rows_without("kanban_link"))
+        self.assert_refuses(source, "_TOOLS row for kanban_link", "found 0")
+
+    def test_a_duplicated_row_fails_loudly(self):
+        """Two rows registering the same tool: which one is the patch for?"""
+        source = upstream_source(rows=[row(t) for t in ALL_TOOLS] + [row("kanban_link")])
+        self.assert_refuses(source, "_TOOLS row for kanban_link", "found 2")
 
     def test_a_renamed_tool_fails_loudly(self):
-        source = upstream_source().replace('name="kanban_attach"', 'name="kanban_file"')
-        self.assert_refuses(source, "kanban_attach registration", "found 0")
+        source = upstream_source().replace('("kanban_attach",', '("kanban_file",')
+        self.assert_refuses(source, "_TOOLS row for kanban_attach", "found 0")
 
     def test_a_renamed_handler_fails_loudly(self):
-        """Found the call, but it is no longer wired to what we expected."""
+        """Found the row, but it is no longer wired to what we expected."""
         source = upstream_source().replace(
-            registration("kanban_complete", "_check_kanban_mode"),
-            registration("kanban_complete", "_check_kanban_mode", handler="_handle_finish"),
+            row("kanban_complete"), row("kanban_complete", handler="_handle_finish")
         )
-        self.assert_refuses(
-            source, "kanban_complete registration", "_handle_finish", "_handle_complete"
+        self.assert_refuses(source, "kanban_complete row", "_handle_finish", "_handle_complete")
+
+    def test_a_renamed_schema_fails_loudly(self):
+        source = upstream_source().replace(
+            row("kanban_block"), row("kanban_block", schema="KANBAN_PAUSE_SCHEMA")
         )
+        self.assert_refuses(source, "kanban_block row", "KANBAN_PAUSE_SCHEMA", "KANBAN_BLOCK_SCHEMA")
+
+    def test_a_table_that_is_not_a_tuple_fails_loudly(self):
+        source = upstream_source().replace("_TOOLS = (\n", "_TOOLS = [\n").replace(")\n\nfor ", "]\n\nfor ")
+        self.assert_refuses(source, "_TOOLS is", "not a tuple of rows")
+
+    def test_upstream_routing_a_worker_tool_as_orchestrator_only_fails_loudly(self):
+        """If upstream already hides a tool from workers, this patch's premise is gone."""
+        source = upstream_source(
+            orchestrator_set='_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_link"})\n'
+        )
+        self.assert_refuses(source, "_ORCHESTRATOR_TOOLS now lists kanban_link")
 
     def test_a_renamed_gate_fails_loudly(self):
-        """The check_fn upstream ships is asserted, not merely overwritten."""
-        source = upstream_source().replace(
-            registration("kanban_block", "_check_kanban_mode"),
-            registration("kanban_block", "_check_kanban_task_mode"),
-        )
+        """The check_fn upstream ships is asserted, not merely overridden."""
+        source = upstream_source(loop=LOOP.replace(UPSTREAM_CHECK_FN + "\n", "_check_kanban_task_mode\n"))
+        self.assert_refuses(source, "_gate is", "_check_kanban_task_mode", UPSTREAM_CHECK_FN)
+
+    def test_a_renamed_loop_variable_fails_loudly(self):
+        """Both arms intact, but the choice reads a loop variable the override does not."""
+        source = upstream_source(loop=LOOP.replace("_name", "_tool"))
         self.assert_refuses(
-            source, "kanban_block registration", "_check_kanban_task_mode"
+            source, "_gate chooses on", "_tool in _ORCHESTRATOR_TOOLS", "'_name in ...'"
         )
 
-    def test_a_registration_moved_out_of_module_scope_fails_loudly(self):
-        """Wrapped in a `def register_all()`, the call is no longer ours to find."""
-        source = upstream_source().replace(
-            registration("kanban_heartbeat", "_check_kanban_mode"),
-            "\n\ndef _register_late():\n"
-            + "\n".join(
-                "    " + line
-                for line in registration(
-                    "kanban_heartbeat", "_check_kanban_mode"
-                ).strip("\n").split("\n")
-            )
-            + "\n",
-        )
-        self.assert_refuses(source, "kanban_heartbeat registration", "found 0")
+    def test_a_gate_that_is_no_longer_a_choice_fails_loudly(self):
+        source = upstream_source(loop=LOOP.replace(
+            f"    _gate = {ORCHESTRATOR_CHECK_FN} if _name in _ORCHESTRATOR_TOOLS else {UPSTREAM_CHECK_FN}\n",
+            f"    _gate = {UPSTREAM_CHECK_FN}\n",
+        ))
+        self.assert_refuses(source, "_gate is", "was expected")
+
+    def test_a_second_gate_assignment_fails_loudly(self):
+        """Two ``_gate = ...`` statements: the override would land after only one."""
+        source = upstream_source(loop=LOOP + f"\n_gate = {UPSTREAM_CHECK_FN}\n")
+        self.assert_refuses(source, "assignment to _gate", "found 2")
 
     def test_an_absent_import_site_fails_loudly(self):
         source = upstream_source().replace(f"def {IMPORT_AFTER}()", "def _check_other()")
@@ -351,7 +437,7 @@ class LocatorFailureTest(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         target = root / RELATIVE
         target.parent.mkdir(parents=True)
-        source = upstream_source().replace('name="kanban_attach"', 'name="kanban_file"')
+        source = upstream_source().replace('("kanban_attach",', '("kanban_file",')
         target.write_text(source)
         with self.assertRaises(SystemExit):
             apply(root)

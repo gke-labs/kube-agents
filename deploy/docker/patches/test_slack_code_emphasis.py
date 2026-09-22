@@ -17,7 +17,8 @@ from pathlib import Path
 
 from apply_slack_code_emphasis import BUILD_MARKER, RELATIVE, apply
 
-# Verbatim from plugins/platforms/slack/block_kit.py in the pinned base image,
+# Verbatim from plugins/platforms/slack/block_kit.py in the pinned base image
+# (v2026.9.14),
 # with only the module preamble reduced to the imports this region needs. Every
 # anchor in the applier points into the text below.
 UPSTREAM = '''\
@@ -36,11 +37,8 @@ _STRIKE_RE = re.compile(r"~~(.+?)~~")
 
 def _inline_elements(text: str) -> List[Dict[str, Any]]:
     """Parse a run of inline markdown into rich_text section child elements.
-
-    Produces ``text`` elements (optionally styled bold/italic/strike/code) and
-    ``link`` elements.  Unmatched markup is emitted verbatim as plain text, so
-    this never loses characters.
-    """
+    Produces ``text`` elements (optionally styled bold/italic/strike/code) and ``link`` elements.
+    Unmatched markup is emitted verbatim as plain text, so this never loses characters."""
     elements: List[Dict[str, Any]] = []
 
     def emit_text(s: str, style: Optional[Dict[str, bool]] = None) -> None:
@@ -58,24 +56,20 @@ def _inline_elements(text: str) -> List[Dict[str, Any]]:
         pos = 0
         # inline code is opaque — no nested styling
         for m in _INLINE_CODE_RE.finditer(s):
-            _walk_links(s[pos:m.start()], style)
-            code_style = dict(style)
-            code_style["code"] = True
-            emit_text(m.group(1), code_style or None)
+            _walk_links(s[pos : m.start()], style)
+            emit_text(m.group(1), {**style, "code": True})
             pos = m.end()
         _walk_links(s[pos:], style)
-
     def _walk_links(s: str, style: Dict[str, bool]) -> None:
         pos = 0
         for m in _LINK_RE.finditer(s):
-            _walk_emphasis(s[pos:m.start()], style)
+            _walk_emphasis(s[pos : m.start()], style)
             link_el: Dict[str, Any] = {"type": "link", "url": m.group(2), "text": m.group(1)}
             if style:
                 link_el["style"] = dict(style)
             elements.append(link_el)
             pos = m.end()
         _walk_emphasis(s[pos:], style)
-
     def _walk_emphasis(s: str, style: Dict[str, bool]) -> None:
         if not s:
             return
@@ -83,14 +77,13 @@ def _inline_elements(text: str) -> List[Dict[str, Any]]:
         for rx, key in ((_BOLD_RE, "bold"), (_STRIKE_RE, "strike"), (_ITALIC_RE, "italic")):
             m = rx.search(s)
             if m:
-                _walk_emphasis(s[:m.start()], style)
+                _walk_emphasis(s[: m.start()], style)
                 inner_style = dict(style)
                 inner_style[key] = True
                 _walk_emphasis(m.group(1), inner_style)
-                _walk_emphasis(s[m.end():], style)
+                _walk_emphasis(s[m.end() :], style)
                 return
         emit_text(s, dict(style) if style else None)
-
     walk(text, {})
     return elements or [{"type": "text", "text": text}]
 '''

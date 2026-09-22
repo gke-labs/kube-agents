@@ -52,8 +52,9 @@ flip runbook that step is a blocker, not tidiness.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
-webhook validates sidecar `securityContext` and nothing else about it). The bridge
-depends on exactly that gap - its `NATS_URL` and credentials arrive as sidecar env.
+webhook checks a sidecar's `securityContext`, and checks its `volumeMounts` against the
+reserved volume names, and nothing else about it). The bridge depends on exactly that
+gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
 
@@ -88,6 +89,22 @@ user consumes with explicit ack (unscoped `$JS.ACK.>` is a cross-principal +TERM
 sets `--allow-direct` on every stream so nats.go picks that route, and only that route
 is granted.
 
+Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is granted
+for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
+`lib.TasksGet` on every task it dispatches, and a call that finds events creates an ordered
+consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
+`TasksGet` sets on it, which is why the replay costs a consumer slot for the calls of the last
+five seconds rather than for the last five minutes of them (gke-labs/kube-agents#1739) without
+the bridge needing a destructive verb on TASKS. The slot outlives the call it served: the
+threshold runs from the call returning, not from it starting. A call on a task the retention window no longer holds
+creates no consumer at all -- the horizon read returns `TaskNotFound` before the consumer is
+created. Either way the call emits no refused publish of its own. One does arrive if the
+ordered consumer resets mid-replay -- a bus reconnect is enough -- because nats.go deletes
+the consumer it replaces: that publish on `$JS.API.CONSUMER.DELETE.TASKS.<name>` is refused,
+which costs a log line and leaves the consumer it could not delete to the same threshold.
+It is the one violation this grant produces by design, so any other `Permissions Violation`
+in the bridge's log still means what it says.
+
 **Static is the answer here, not a residue.** `bridge` replaced the shared `worker` user
 rather than inheriting it, and it stays a password principal on purpose. The auth
 callout keys its map on the username TokenReview returns, which names a ServiceAccount;
@@ -120,6 +137,19 @@ Secret of an upgraded install indefinitely. It is dead data rather than a live c
 authenticates to nothing — but the key's presence is not evidence the sidecar has been
 migrated, and a reader checking whether an install has taken the split should read
 `nats.conf` or the sidecar's `env`, not the Secret's key set.
+
+Both edits are in `env`, and that is the supported route on purpose. A `sidecarVolumes`
+entry that mounts `<agent>-a2a-nats-creds` — or the `<agent>-a2a-nats-config` or
+`<agent>-a2a-callout-keys` Secret, or a projection of the `a2a-bus` audience under any
+name — is refused at admission, and stripped from the render on an install running the
+A2A surface, because a volume hands a second container far more than the `bridge`
+principal's one password. `<agent>-a2a-nats-creds` and the `nats.conf` in
+`<agent>-a2a-nats-config` both carry `sys-password`, which is the `$SYS` account, and
+`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The
+agent's own credential is in none of them: under the callout the `agent` principal has
+no shared secret at all, and the `a2a-bus` audience projection is the only route to it
+as a credential. The seed is a way to mint one, which is the other reason that Secret is
+not something to hand a sidecar.
 
 A third edit is owed only by an install that overrode `BRIDGE_PROFILE`, and its failure
 lands in an unhelpful place. The retired `worker` user's subscribe grant was

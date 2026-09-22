@@ -10,8 +10,10 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # script passes), and tell #kube-agents-ci-health on Google Chat only when
 # the state changes plus one digest a day (scripts/eval_dashboard/
 # post_health.py). docs/ci-health.md explains the states, the rules and the
-# advice each one carries. The data and the verdict are fresh together, with
-# no dependency on a Prow periodic. The order inside a tick is adjudicate ->
+# advice each one carries. The data and the verdict are fresh together; the
+# one input fetched outside that collect is pool-pressure's hourly artifact
+# (#1607), and it is optional -- its absence just drops the queue-wait note.
+# The order is adjudicate ->
 # upload health.json -> append history -> render -> publish -> post ->
 # comment, so the Brief a reader opens from a message already shows the
 # verdict the message names.
@@ -139,6 +141,13 @@ permissions:
 
 env:
   DASHBOARD_BUCKET: gs://kube-agents-dashboards/evals
+  # Rule 8's input: where the hourly pool-pressure periodic (#1069) archives
+  # its runs. `latest-build.txt` beside them names the newest.
+  POOL_PRESSURE_LOGS: gs://kube-agents-prow/logs/ci-kube-agents-pool-pressure
+  # How far back the fetch step looks for a build that finished, when the
+  # newest one is still running. Three covers a run of aborted builds without
+  # turning one tick into a walk down the whole archive.
+  POOL_FALLBACK_BUILDS: "3"
   WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   # Step A's identity: the Prow-archive reader (see the header).
   COLLECT_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
@@ -313,6 +322,72 @@ jobs:
               sys.exit("collected zero runs: refusing to publish an empty dashboard over a good one")
           '
 
+      # Rule 8's input (#1607): the hourly pool-pressure periodic's newest
+      # artifact, read here because it lives in the Prow archive and only this
+      # half of the job holds the reader credential. Optional throughout --
+      # no reading means no note and no digest wait, which is what "not wired
+      # up" should look like; health.py judges a present one's age.
+      - name: Fetch the pool-pressure artifact
+        continue-on-error: true
+        run: |
+          mkdir -p work
+          # A NotFound is "the periodic has never run", which is what no note
+          # is meant to look like. Anything else -- a denied read above all --
+          # would otherwise ship the whole feature dark: no note, no digest
+          # figure, and no ⚪ either, because the dead-man's switch only ages
+          # an artifact it managed to read. The two sibling reads below tell
+          # the same two apart the same way.
+          if ! build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt" 2>gsutil.err); then
+            grep -Eq "NotFound|No URLs matched|404" gsutil.err \
+              || echo "::warning::could not read the pool-pressure build pointer (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
+            rm -f gsutil.err
+            exit 0
+          fi
+          rm -f gsutil.err
+          [ -n "$build" ] || exit 0
+          # The pointer moves at job start, so for the ~8 minutes the periodic
+          # runs it names a build with no artifact. finished.json lands with
+          # the artifact, so its absence means "still running" -- and the build
+          # before it holds a reading at most an hour old, well inside
+          # POOL_STALE_AFTER. Skipping instead would drop the note from
+          # health.json, the Brief and the digest for that tick.
+          if ! gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json"; then
+            # Compared as Python ints, not by sort or awk: a build id is 19
+            # digits, which a float rounds until neighbouring builds collide.
+            # The one before it has to have finished too. An aborted build --
+            # evicted pod, lost node -- publishes neither finished.json nor an
+            # artifact, and reading it would write the sentinel and announce
+            # that the periodic had stopped while it was minutes from
+            # publishing. Walking back costs one stat a build and lands on a
+            # real reading, which ages on its own window_end if it is old.
+            newest=$build
+            build=""
+            while read -r prior; do
+              if gsutil -q stat "$POOL_PRESSURE_LOGS/$prior/finished.json"; then build=$prior; break; fi
+            done < <(gsutil -q ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; print("\n".join(str(i) for i in sorted((i for i in ids if i < int(sys.argv[1])), reverse=True)[: int(sys.argv[2])]))' "$newest" "$POOL_FALLBACK_BUILDS")
+            # Nothing finished behind it: the periodic's first build is still
+            # running, or every build in reach was aborted. Neither is the
+            # periodic publishing nothing, so say nothing.
+            [ -n "$build" ] || exit 0
+          fi
+          # The periodic opens the file with a shell redirect before it runs,
+          # so a crash publishes a 0-byte object that copies fine. Parsing is
+          # the only check that catches it, and it costs nothing on the object
+          # health.py is about to parse anyway.
+          if ! gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
+            || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' work/pool-pressure.json 2>/dev/null; then
+            # The build finished and published nothing usable, so the periodic
+            # is running and failing. Ageing `window_end` cannot catch
+            # that -- an artifact never written never gets old -- and staying
+            # quiet would read as "not wired up". A document with no reading in
+            # it is what health.py turns into "the numbers stopped". An object
+            # we simply cannot read gets the same treatment on purpose: either
+            # way the bot has lost sight of the queue, and the message links to
+            # the job's history, which distinguishes the two.
+            printf '{"note": "build %s published no usable pool-pressure.json"}\n' "$build" \
+              > work/pool-pressure.json
+          fi
+
       # The Trend page's input, still as the reader (step A). Best-effort by
       # construction: whatever stops the read (a failed listing, store.py
       # killed by its timeout or crashed, no wall clock left after the
@@ -412,12 +487,15 @@ jobs:
       - name: Adjudicate
         run: |
           # --posted-state is the poster's file, read for the tracking issue
-          # the bot filed so health.json can cite it; --fixture-state is the
-          # hourly scan's document, for the fixture_drift condition.
+          # the bot filed so health.json can cite it, and for the pool
+          # episode's start across a tick that read no artifact.
+          # --fixture-state is the hourly scan's document, for the
+          # fixture_drift condition.
           python3 scripts/eval_dashboard/health.py \
             --data work/data.json \
             --prev work/health-prev.json \
             --posted-state work/health-state.json \
+            --pool-pressure work/pool-pressure.json \
             --fixture-state work/fixture-state.json \
             --out work/health.json
           python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'

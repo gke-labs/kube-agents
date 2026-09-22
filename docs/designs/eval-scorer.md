@@ -141,9 +141,20 @@ environment. Unarmed,
 which is the default, a rate below the margin over a full sample is written into the verdict as a
 note rather than a reason: the flat margin has not been measured against how much an unchanged
 pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
-enough nights to say. Two job-level rules sit alongside it: any blocking case reds the job, and _all_ cases
-failing on infrastructure reds it too — individually that is weather, but all at once means the
-eval infrastructure is down and a green would be a lie about coverage.
+enough nights to say. Two job-level rules sit alongside it. Any blocking case reds the job
+(`suite` exits 1). And green has a coverage floor: an admitted case with no scored repetition —
+every one excluded as infrastructure — makes the run **not evaluated**: `suite` exits 2, the code `case` already uses for
+"could not grade", and writes `outcome: not_evaluated` with the case ids under `not_evaluated`; the
+markdown carries a banner saying rerun when the environment is healthy rather than debug the
+change, and `hack/ci-eval-pr.sh` passes the status through (confirming it against the JSON first,
+since argparse exits 2 too) so the release-candidate lane reports NOT RUN rather than RED. Weather
+that takes one repetition leaves the case scored and trips nothing; only a case lost whole does,
+and only an admitted one. _All_ cases failing on infrastructure is the same floor at its limit and
+reports the same outcome — individually that is weather, but all at once means the eval
+infrastructure is down and a green would be a lie about coverage. A blocking case outranks the
+weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in
+the JSON, derived from `outcome`, so a reader that only knows the boolean sees not-evaluated as
+not green.
 
 **Why the aggregate has a sample floor and the per-case rungs do not.** A flat margin is a
 suite-scale rule, and at small `n` it measures luck. Against a baseline screened at the 19/20
@@ -580,7 +591,10 @@ measured data. Config belongs where it gets reviewed.
 
 The reader lists the whole prefix once, groups the object names by case and then by key directory,
 takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200) **per case per key**, and concatenates
-what survives in one `cat`. 200 objects is roughly 600 runs, two orders of magnitude past the 20
+what survives in one `cat` per case. Those per-case `cat`s run concurrently, at most
+`EVAL_BASELINE_CAT_WORKERS` (default 16) at a time: the cost of a read is one `gcloud` process
+startup per case and almost nothing else, so serially it grew with the matrix. 200 objects is
+roughly 600 runs, two orders of magnitude past the 20
 the admission bar wants, so the cap never binds in practice — but it bounds a read that would
 otherwise grow without limit as one key accumulates years of history, and when it does bind the
 gate says which case was capped and by how much. A cap that is silent reads as "I considered
@@ -606,9 +620,10 @@ that is invisible. If it ever stops being invisible, the fix is to scope the lis
 the key being read rather than the whole prefix, which the layout now makes a one-line change; see
 [Open items](#open-items).
 
-Costs are not the constraint at any of these scales. Standard storage bills actual bytes with no
+Money is not the constraint at any of these scales. Standard storage bills actual bytes with no
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
-run.
+run. Wall clock was: the gate reads the whole store once per graded case, which is why the fetches
+are concurrent.
 
 The key partition also retires a caveat this section used to carry. Under a flat layout and a
 per-case window, a version key that went A → B → A could push the revert's own evidence at key A
