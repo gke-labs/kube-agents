@@ -1008,6 +1008,78 @@ def test_a_transport_failure_after_the_accept_rejoins_the_same_wait(
     assert resumed["wait"] <= 1, f"the budget restarted: {resumed}"
 
 
+def test_the_inject_port_forward_command_names_the_door(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tunnel the presubmit will use forwards the gateway's inject Service
+    on the door's port, not the agent's own Service on its API port. A dropped
+    remote port or a defaulted service keeps every stub-driven test green and
+    surfaces only as an infrastructure classification on every unit of a run,
+    so the command is pinned here."""
+    monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
+
+    cmd = harness._port_forward_command(
+        harness._INJECT_DEFAULT_LOCAL_PORT,
+        harness._DEFAULT_AGENT_SERVICE_NAME + harness._INJECT_SERVICE_SUFFIX,
+        harness._INJECT_REMOTE_PORT,
+    )
+
+    assert cmd == [
+        "kubectl",
+        "port-forward",
+        "svc/platform-agent-a2a-inject",
+        "28099:8099",
+        "-n",
+        "kubeagents-system",
+    ]
+    # The api path's call shape is unchanged by the two new parameters.
+    assert harness._port_forward_command(4242)[2:4] == [
+        "svc/platform-agent",
+        f"4242:{harness.SERVICE_API_PORT}",
+    ]
+
+
+def test_an_own_tunnel_forwards_the_inject_service_and_respawns_it_on_a_drop(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no ``AGENT_INJECT_URL`` the harness owns the tunnel: it forwards
+    the inject Service on the door's port before the POST, and a poll lost
+    mid-task respawns that same forward, never the api path's. The stub
+    stands in for the far end of the tunnel on the local port, and the two
+    forward functions are doubled so no kubectl is run."""
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    local_port = stub_gateway.server_address[1]
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(local_port))
+    established: list[tuple[int, str | None, int]] = []
+    respawned: list[tuple[int, str | None, int]] = []
+
+    def _ensure(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        established.append((port, service, remote_port))
+
+    def _reset(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        respawned.append((port, service, remote_port))
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _ensure)
+    monkeypatch.setattr(harness, "_reset_port_forward", _reset)
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_failures = 1
+    stub_gateway.poll_fail_after_seconds = 0.5
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    door = (local_port, "platform-agent-a2a-inject", harness._INJECT_REMOTE_PORT)
+    assert established == [door]
+    assert respawned == [door]
+    assert stub_gateway.failed_polls == 1
+    assert len(stub_gateway.submissions) == 1
+    assert result.output == "partial findings"
+    assert not infra(result)
+
+
 def test_a_status_outside_the_retry_set_is_not_retried(stub_gateway: _StubGatewayServer) -> None:
     """A 500 is a bug at the door and a 400 is this request being wrong;
     re-sending either only repeats it."""
@@ -1524,13 +1596,17 @@ def test_the_fold_ignores_another_task_s_terminal() -> None:
 
 
 def test_the_fold_counts_what_it_cannot_read() -> None:
-    """A malformed entry is skipped and counted rather than failing the fold,
-    the way the bus library's replay skips a poison write."""
+    """A malformed entry is counted rather than failing the fold, the way the
+    bus library's replay skips a poison write. One with no shape at all is
+    dropped; one of a kind this harness does not know is counted and kept,
+    so a newer gateway's entries still reach the transcript while grading
+    reads nothing from them."""
     fold = inject.Fold("task-1")
     for bad in ["not a dict", {"kind": "post"}, {"seq": 1}, entry(2, "unheard-of")]:
         fold.apply(bad)
     assert fold.malformed == 4
-    assert fold.entries == [] or all(e["kind"] != inject.ENTRY_POST for e in fold.entries)
+    assert [e["kind"] for e in fold.entries] == ["unheard-of"]
+    assert fold.posts == []
 
 
 def test_a_chunked_answer_is_reassembled_whole(stub_gateway: _StubGatewayServer) -> None:

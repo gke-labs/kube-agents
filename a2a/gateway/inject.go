@@ -123,12 +123,18 @@ const (
 	// as a steer; the id is what says it is the same message.
 	injectSeenCap = 4096
 
-	// injectSeqFloorCap bounds the memory of where evicted conversations'
-	// sequences stopped (InjectAdapter.seqFloors). A key re-minted after this
-	// many further evictions starts its numbering over, which is the cost of
-	// the bound; a poller that old is a poller whose conversation was evicted
-	// thousands of conversations ago.
-	injectSeqFloorCap = 4096
+	// injectFloorCap bounds the memory of where evicted conversations stopped
+	// (InjectAdapter.floors): their sequence, and the turn they had handed
+	// over that had not ended. A key re-minted after this many further
+	// evictions starts over, which is the cost of the bound; a poller or a
+	// turn that old belongs to a conversation evicted thousands of
+	// conversations ago.
+	injectFloorCap = 4096
+
+	// injectMaxMessageIDRunes bounds a caller-supplied backend message id,
+	// which is the dedupe key and rides into the ingress log; bounded and
+	// checked like the key and the author.
+	injectMaxMessageIDRunes = 256
 
 	// The bearer credential, spelled once. The scheme is compared
 	// case-insensitively (RFC 7235 makes it a case-insensitive token) and
@@ -470,7 +476,7 @@ func (l *injectIDLog) at(prior int) (id string, evicted bool) {
 type injectConversation struct {
 	entries []InjectEntry
 	// nextSeq is monotonic across evictions -- of entries, and of the
-	// conversation itself (InjectAdapter.seqFloors): a reader polling with a
+	// conversation itself (InjectAdapter.floors): a reader polling with a
 	// sequence must never see one it has already consumed, even once the
 	// oldest entries have been dropped or the conversation was evicted and
 	// minted again under it.
@@ -545,13 +551,16 @@ type InjectAdapter struct {
 	// order is the conversation keys in first-seen order, for the eviction
 	// the map cannot do on its own.
 	order []string
-	// seqFloors is where an evicted conversation's sequence stopped, by key,
-	// so a re-mint of the same key continues it: a poller following `after`
-	// across an eviction under its running task would otherwise have the
-	// relay's later posts, renumbered from 1, filtered out as already read.
-	// seqFloorOrder bounds it at injectSeqFloorCap, oldest eviction first.
-	seqFloors     map[string]int
-	seqFloorOrder []string
+	// floors is where an evicted conversation stopped, by key, so a re-mint
+	// of the same key carries on from it: its sequence, or a poller following
+	// `after` across an eviction under its running task would have the
+	// relay's later posts, renumbered from 1, filtered out as already read;
+	// and the turn it had handed over that had not ended, or that turn's end
+	// would count on the new incarnation as a turn it never handed over and
+	// the one-turn-at-a-time guard would admit two messages at once.
+	// floorOrder bounds it at injectFloorCap, oldest eviction first.
+	floors     map[string]injectFloor
+	floorOrder []string
 	// directOf maps an author to the conversation they last spoke on, which
 	// is what OpenDirect answers with. Bounded twice: an entry is dropped
 	// when its conversation is evicted, and directOrder caps the map at
@@ -610,7 +619,7 @@ func NewInjectAdapter(listen, token string, firstEventGrace time.Duration, log *
 		log:             log,
 		conversations:   map[string]*injectConversation{},
 		directOf:        map[string]string{},
-		seqFloors:       map[string]int{},
+		floors:          map[string]injectFloor{},
 		submissions:     map[string]*injectSubmission{},
 		notify:          make(chan struct{}),
 	}, nil
@@ -972,39 +981,53 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 			}
 		}
 		if evicted := a.conversations[oldest]; evicted != nil {
-			a.rememberSeqFloorLocked(oldest, evicted.nextSeq)
+			a.rememberFloorLocked(oldest, injectFloor{
+				nextSeq:     evicted.nextSeq,
+				outstanding: max(0, evicted.handed-evicted.turns),
+			})
 		}
 		delete(a.conversations, oldest)
 	}
 	a.mints++
-	conv := &injectConversation{nextSeq: a.seqFloorLocked(key), terminals: map[string]string{}, gen: a.mints}
+	floor := a.floorLocked(key)
+	conv := &injectConversation{nextSeq: floor.nextSeq, handed: floor.outstanding, terminals: map[string]string{}, gen: a.mints}
 	a.conversations[key] = conv
 	a.order = append(a.order, key)
 	return conv
 }
 
-// rememberSeqFloorLocked records where an evicted conversation's sequence
-// stopped, bounded at injectSeqFloorCap by eviction order. Caller holds a.mu.
-func (a *InjectAdapter) rememberSeqFloorLocked(key string, next int) {
-	if _, ok := a.seqFloors[key]; !ok {
-		a.seqFloorOrder = append(a.seqFloorOrder, key)
+// injectFloor is where an evicted conversation stopped: the sequence its next
+// entry would have carried, and the turns it had handed to the gateway that
+// had not ended (at most one, by the claim's guard). A re-mint of the key
+// starts from both.
+type injectFloor struct {
+	nextSeq     int
+	outstanding int
+}
+
+// rememberFloorLocked records where an evicted conversation stopped, bounded
+// at injectFloorCap by eviction order. Caller holds a.mu.
+func (a *InjectAdapter) rememberFloorLocked(key string, floor injectFloor) {
+	if _, ok := a.floors[key]; !ok {
+		a.floorOrder = append(a.floorOrder, key)
 	}
-	a.seqFloors[key] = next
-	for len(a.seqFloorOrder) > injectSeqFloorCap {
-		delete(a.seqFloors, a.seqFloorOrder[0])
-		a.seqFloorOrder = a.seqFloorOrder[1:]
+	a.floors[key] = floor
+	for len(a.floorOrder) > injectFloorCap {
+		delete(a.floors, a.floorOrder[0])
+		a.floorOrder = a.floorOrder[1:]
 	}
 }
 
-// seqFloorLocked is the sequence a conversation minted under key starts at:
-// where its evicted predecessor stopped, or 1. The floor is left in place
-// rather than consumed, so the bound above stays by eviction order; the next
-// eviction of the key overwrites it. Caller holds a.mu.
-func (a *InjectAdapter) seqFloorLocked(key string) int {
-	if next, ok := a.seqFloors[key]; ok {
-		return next
+// floorLocked is where a conversation minted under key starts: where its
+// evicted predecessor stopped, or at sequence 1 with nothing handed over. The
+// floor is left in place rather than consumed, so the bound above stays by
+// eviction order; the next eviction of the key overwrites it. Caller holds
+// a.mu.
+func (a *InjectAdapter) floorLocked(key string) injectFloor {
+	if floor, ok := a.floors[key]; ok {
+		return floor
 	}
-	return 1
+	return injectFloor{nextSeq: 1}
 }
 
 // appendLocked stamps and stores one entry, then wakes every waiting reader.
@@ -1231,11 +1254,15 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		injectError(w, http.StatusBadRequest, "author is required; it is resolved through the principal map")
 		return
 	}
-	if err := injectAuthorWellFormed(req.Author); err != nil {
+	if err := injectFieldWellFormed("author", req.Author, injectMaxAuthorRunes); err != nil {
 		injectError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Text == "" {
+	if err := injectFieldWellFormed("messageId", req.MessageID, injectMaxMessageIDRunes); err != nil {
+		injectError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Text) == "" {
 		injectError(w, http.StatusBadRequest, "text is required")
 		return
 	}
@@ -1405,7 +1432,11 @@ func (a *InjectAdapter) handleCancel(w http.ResponseWriter, r *http.Request, key
 			"author is required: a cancel is verified like any other message on the conversation")
 		return
 	}
-	if err := injectAuthorWellFormed(req.Author); err != nil {
+	if err := injectFieldWellFormed("author", req.Author, injectMaxAuthorRunes); err != nil {
+		injectError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := injectFieldWellFormed("messageId", req.MessageID, injectMaxMessageIDRunes); err != nil {
 		injectError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1824,17 +1855,19 @@ func injectConversationKey(raw string) (string, error) {
 	return key, nil
 }
 
-// injectAuthorWellFormed bounds the author a request names, for the reasons
-// injectConversationKey bounds the key: it rides into the drop notice, the
-// ingress log and directOf. Blankness is the caller's check, because the two
-// routes say different things about why an author is required.
-func injectAuthorWellFormed(author string) error {
-	if len([]rune(author)) > injectMaxAuthorRunes {
-		return fmt.Errorf("author is longer than %d runes", injectMaxAuthorRunes)
+// injectFieldWellFormed bounds a caller-supplied string the way
+// injectConversationKey bounds the key, for the same reasons: the author and
+// the message id ride into the drop notice, the ingress log and the door's
+// own memory (directOf, the dedupe set). Blankness is the caller's check,
+// because each route says its own thing about why a field is required, and
+// an absent message id is minted rather than refused.
+func injectFieldWellFormed(field, value string, maxRunes int) error {
+	if len([]rune(value)) > maxRunes {
+		return fmt.Errorf("%s is longer than %d runes", field, maxRunes)
 	}
-	for _, r := range author {
+	for _, r := range value {
 		if unicode.IsControl(r) {
-			return fmt.Errorf("author contains a control character")
+			return fmt.Errorf("%s contains a control character", field)
 		}
 	}
 	return nil

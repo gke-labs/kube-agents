@@ -752,6 +752,10 @@ func TestInjectRefusesMalformedRequests(t *testing.T) {
 		{"author too long", fmt.Sprintf(`{"conversation":"c","author":%q,"text":"hi"}`,
 			strings.Repeat("a", injectMaxAuthorRunes+1)), http.StatusBadRequest},
 		{"author with a newline", `{"conversation":"c","author":"10\n01","text":"hi"}`, http.StatusBadRequest},
+		{"blank text", `{"conversation":"c","author":"1001","text":"   "}`, http.StatusBadRequest},
+		{"message id with a newline", `{"conversation":"c","author":"1001","text":"hi","messageId":"m\n1"}`, http.StatusBadRequest},
+		{"message id too long", fmt.Sprintf(`{"conversation":"c","author":"1001","text":"hi","messageId":%q}`,
+			strings.Repeat("m", injectMaxMessageIDRunes+1)), http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, err := r.do(t, http.MethodPost, r.base+injectPath, []byte(tc.body), injectTestToken)
@@ -2963,6 +2967,48 @@ func TestInjectAClaimWithLessThanATurnLeftIsRefusedNotHandedOver(t *testing.T) {
 	// The same message with a whole bound left is handed over at once.
 	if _, ok := door.claimTurn(ctx, key, time.Now().Add(injectSubmitWait)); !ok {
 		t.Fatal("a claim with a whole bound left behind an ended turn must be handed over")
+	}
+}
+
+// TestInjectAReMintedConversationKeepsItsOutstandingTurn: the one-turn-at-a-
+// time guard has to survive an eviction under a running turn the way the
+// sequence does. Re-minted with nothing handed over, the old turn's end would
+// count on the new incarnation as a turn it never handed, and two overlapping
+// messages would both be handed over, the second answered with the first's
+// task and routed as a steer onto it.
+func TestInjectAReMintedConversationKeepsItsOutstandingTurn(t *testing.T) {
+	f := startFakeDoor(t, func(InboundMessage) {})
+	const key = injectKeyPrefix + "evicted-mid-turn"
+	ctx := context.Background()
+	if _, ok := f.door.claimTurn(ctx, key, time.Now().Add(injectSubmitWait)); !ok {
+		t.Fatal("the first claim on a quiet conversation must succeed")
+	}
+	f.evictEverything(t, "evicted-mid-turn")
+	// The old turn ends after the eviction; its end is what re-mints the key.
+	f.door.TurnFinished(key)
+	if _, ok := f.door.claimTurn(ctx, key, time.Now().Add(injectSubmitWait)); !ok {
+		t.Fatal("a claim behind an ended turn must be handed over")
+	}
+	// A second message while that turn runs must wait for it, not be handed
+	// over beside it.
+	second := make(chan bool, 1)
+	go func() {
+		_, ok := f.door.claimTurn(ctx, key, time.Now().Add(injectSubmitWait))
+		second <- ok
+	}()
+	select {
+	case ok := <-second:
+		t.Fatalf("a second message was handed over (%v) while the first's turn was still running: the guard did not survive the eviction", ok)
+	case <-time.After(4 * injectPollInterval):
+	}
+	f.door.TurnFinished(key)
+	select {
+	case ok := <-second:
+		if !ok {
+			t.Fatal("the second message was refused once the first turn ended")
+		}
+	case <-time.After(injectSubmitWait / 4):
+		t.Fatal("the second claim did not return once the first turn ended")
 	}
 }
 
