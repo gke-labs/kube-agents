@@ -554,6 +554,39 @@ class ListProfilesTest(unittest.TestCase):
         self.patcher.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_nonexistent_directory_returns_empty(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.assertEqual(cap.list_profiles(), [])
+
+    def test_filters_reserved_and_files(self):
+        (self.tmp / "default").mkdir()
+        (self.tmp / "platform").mkdir()
+        (self.tmp / "not-a-dir.txt").touch()
+        (self.tmp / "cluster-beta").mkdir()
+        (self.tmp / "cluster-alpha").mkdir()
+
+        self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
+
+    def test_cmd_list_prints_sorted(self):
+        (self.tmp / "cluster-zeta").mkdir()
+        (self.tmp / "cluster-beta").mkdir()
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            cap.cmd_list(mock.MagicMock())
+        self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
+
+
+class ListReadyProfilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-ready-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
     def _scaffold(self, name: str, user_md: bool = True, identity: bool = True):
         p = self.tmp / name
         p.mkdir(parents=True, exist_ok=True)
@@ -566,54 +599,18 @@ class ListProfilesTest(unittest.TestCase):
             )
         return p
 
-    def test_nonexistent_directory_returns_empty(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-        self.assertEqual(cap.list_profiles(), [])
-
-    def test_filters_reserved_and_files(self):
-        (self.tmp / "default").mkdir()
-        (self.tmp / "platform").mkdir()
-        (self.tmp / "not-a-dir.txt").touch()
-        self._scaffold("cluster-beta")
-        self._scaffold("cluster-alpha")
-
-        self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
-
-    def test_incomplete_profiles_excluded_by_default(self):
+    def test_ready_profiles_filters_incomplete_scaffolds_and_missing_kubeconfig(self):
         self._scaffold("cluster-ready")
         self._scaffold("cluster-no-user", user_md=False, identity=True)
         self._scaffold("cluster-no-identity", user_md=True, identity=False)
+        self._scaffold("not-a-cluster-prefix", user_md=True, identity=True)
+        self._scaffold("cluster-missing-kubeconfig", user_md=True, identity=True)
 
-        self.assertEqual(cap.list_profiles(), ["cluster-ready"])
-        self.assertEqual(
-            cap.list_profiles(include_incomplete=True),
-            ["cluster-no-identity", "cluster-no-user", "cluster-ready"],
-        )
+        def mock_kubeconfig_landed(path: Path) -> bool:
+            return "missing-kubeconfig" not in str(path)
 
-    def test_cmd_list_prints_sorted(self):
-        self._scaffold("cluster-zeta")
-        self._scaffold("cluster-beta")
-        self._scaffold("cluster-halfbuilt", user_md=False)
-
-        out = io.StringIO()
-        with mock.patch("sys.stdout", out):
-            cap.cmd_list(mock.MagicMock(all=False))
-        self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
-
-        out_all = io.StringIO()
-        with mock.patch("sys.stdout", out_all):
-            cap.cmd_list(mock.MagicMock(all=True))
-        self.assertEqual(out_all.getvalue(), "cluster-beta\ncluster-halfbuilt\ncluster-zeta\n")
-
-    def test_list_parser_all_flag(self):
-        parser = cap.build_parser()
-        args_default = parser.parse_args(["list"])
-        self.assertEqual(args_default.command, "list")
-        self.assertFalse(args_default.all)
-
-        args_all = parser.parse_args(["list", "--all"])
-        self.assertEqual(args_all.command, "list")
-        self.assertTrue(args_all.all)
+        with mock.patch.object(cap, "kubeconfig_landed", side_effect=mock_kubeconfig_landed):
+            self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
 
 
 

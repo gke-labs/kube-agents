@@ -1175,8 +1175,8 @@ def list_cluster_profiles() -> str:
     Returns the newline-separated list of active, fully scaffolded Cluster Agent
     Hermes profile names (excluding default and platform profiles).
     """
-    from cluster_agent_profile import list_profiles
-    profiles = list_profiles()
+    from cluster_agent_profile import list_ready_profiles
+    profiles = list_ready_profiles()
     return "\n".join(profiles)
 
 

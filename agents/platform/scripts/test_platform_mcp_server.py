@@ -1318,8 +1318,8 @@ class TestFindingsTransport(unittest.TestCase):
 
 
 class TestClusterProfileTools(unittest.TestCase):
-    @patch("cluster_agent_profile.list_profiles")
-    def test_list_cluster_profiles_calls_list_profiles(self, mock_list):
+    @patch("cluster_agent_profile.list_ready_profiles")
+    def test_list_cluster_profiles_calls_list_ready_profiles(self, mock_list):
         mock_list.return_value = ["cluster-a", "cluster-b"]
         result = platform_mcp_server.list_cluster_profiles()
         mock_list.assert_called_once_with()
@@ -1338,6 +1338,7 @@ class TestClusterProfileTools(unittest.TestCase):
             (cluster_dir / "config.yaml").write_text(
                 "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n", encoding="utf-8"
             )
+            (cluster_dir / "kubeconfig.yaml").write_text("apiVersion: v1\n", encoding="utf-8")
 
             import cluster_agent_profile as cap
 

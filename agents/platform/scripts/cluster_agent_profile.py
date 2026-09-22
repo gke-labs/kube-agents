@@ -503,33 +503,36 @@ def delete_profile(name: str) -> None:
         shutil.rmtree(home, ignore_errors=True)
 
 
-def list_profiles(include_incomplete: bool = False) -> list[str]:
-    """Return sorted names of managed Cluster Agent profiles.
-
-    By default (include_incomplete=False), returns only fully scaffolded profiles:
-    profiles whose directory name starts with 'cluster-', not in RESERVED_PROFILES,
-    carrying a valid 'USER.md' identity file, and having readable cluster_identity
-    in config.yaml.
-
-    When include_incomplete=True, returns all directories under PROFILES_BASE
-    excluding RESERVED_PROFILES, allowing reconciliation to detect and repair
-    incomplete scaffolds.
-    """
+def list_profiles() -> list[str]:
+    """Return sorted names of managed Cluster Agent profiles (excludes reserved profiles)."""
     if not PROFILES_BASE.is_dir():
         return []
-    if include_incomplete:
-        return sorted(
-            p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
-        )
+    return sorted(
+        p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
+    )
+
+
+def list_ready_profiles() -> list[str]:
+    """Return sorted names of active, fully scaffolded Cluster Agent profiles.
+
+    Filters profiles to ensure they:
+    - Start with 'cluster-' prefix and are not in RESERVED_PROFILES
+    - Have a stamped 'USER.md' identity file
+    - Have a valid, readable cluster_identity in config.yaml
+    - Have a landed kubeconfig (checked via kubeconfig_landed)
+    """
     valid = []
-    for p in PROFILES_BASE.iterdir():
-        if not p.is_dir() or p.name in RESERVED_PROFILES or not p.name.startswith(CLUSTER_PROFILE_PREFIX):
+    for name in list_profiles():
+        if not name.startswith(CLUSTER_PROFILE_PREFIX):
             continue
-        if not (p / IDENTITY_FILE).is_file():
+        home = profile_home(name)
+        if not (home / IDENTITY_FILE).is_file():
             continue
-        if read_cluster_identity(p) is None:
+        if read_cluster_identity(home) is None:
             continue
-        valid.append(p.name)
+        if not kubeconfig_landed(home / "kubeconfig.yaml"):
+            continue
+        valid.append(name)
     return sorted(valid)
 
 
@@ -539,9 +542,8 @@ def cmd_delete(args: argparse.Namespace) -> None:
     print(name)
 
 
-def cmd_list(args: argparse.Namespace) -> None:
-    include_incomplete = getattr(args, "all", False)
-    for name in list_profiles(include_incomplete=include_incomplete):
+def cmd_list(_args: argparse.Namespace) -> None:
+    for name in list_profiles():
         print(name)
 
 
@@ -571,12 +573,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--cluster", required=True)
         sp.add_argument("--location", required=True)
 
-    list_parser = sub.add_parser("list", help="List existing cluster profiles")
-    list_parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
-    )
+    sub.add_parser("list", help="List existing cluster profiles")
     return parser
 
 

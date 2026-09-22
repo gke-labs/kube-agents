@@ -266,7 +266,7 @@ def reconcile(dry_run: bool = False) -> dict:
     # caller that needs the difference.
     report["create_pass_ran"] = False
 
-    profiles = list_profiles(include_incomplete=True)
+    profiles = list_profiles()
     identities = {name: read_cluster_identity(profile_home(name)) for name in profiles}
     existing_keys = set()
     for name, identity in identities.items():
