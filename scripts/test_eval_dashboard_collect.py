@@ -1141,7 +1141,9 @@ class TestNightlySource(_MergeBase):
         self.assertTrue(cases["reliability-pdb-probe"]["nightly_active"], "TASKS is in the nightly too")
         self.assertFalse(cases["obtainability-planted-pdb"]["active"])
         self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "a nightly-cases.txt entry")
-        self.assertFalse(cases["compliance-rbac-overgrant"]["nightly_active"] and not cases["compliance-rbac-overgrant"]["active"])
+        # Nightly-only since 2026-09-22 (#1023): the presubmit runs the blocking roster only.
+        self.assertFalse(cases["compliance-rbac-overgrant"]["active"])
+        self.assertTrue(cases["compliance-rbac-overgrant"]["nightly_active"], "a held-out case is a nightly case")
 
     def test_head_sha_falls_back_to_the_started_commit_for_a_periodic(self):
         """Prow writes `revision: main` in a periodic's finished.json and the
@@ -1188,16 +1190,20 @@ class TestRepoDerivedFacts(unittest.TestCase):
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
         self.assertEqual(cov["domains_total"], 11)
-        # Empty since 2026-09-22: incident-triage-oom-event-probe, the non-tofu
-        # probe, took a presubmit seat (#1023), closing the gap open since the
-        # tofu case moved to the nightly tier on 2026-09-03 (#1202).
-        self.assertEqual(cov["uncovered"], [])
+        # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
+        # probe, took a roster seat, closing the gap open since the tofu case
+        # moved to the nightly tier on 2026-09-03 (#1202); the same day the
+        # presubmit became the blocking roster only, and the never-admitted
+        # compliance-rbac-overgrant canary took fleet-audits' coverage with it
+        # to the nightly (#1876).
+        self.assertEqual(cov["uncovered"], ["fleet-audits"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
         active = collect.active_task_names()
         self.assertIn("reliability-pdb-probe", active)
-        self.assertIn("compliance-rbac-overgrant", active)
+        self.assertIn("pdb-remediation-pr", active)
+        self.assertNotIn("compliance-rbac-overgrant", active)  # nightly only since 2026-09-22
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 

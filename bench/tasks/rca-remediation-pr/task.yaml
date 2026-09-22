@@ -1,5 +1,12 @@
-# ACTIVE — uncommented in hack/ci-eval-pr.sh TASKS on 2026-08-27, taking
-# `remediation` off the coverage allowlist in docs/designs/domains.yaml.
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22.
+# Uncommented in hack/ci-eval-pr.sh TASKS on 2026-08-27, taking
+# `remediation` off the coverage allowlist in docs/designs/domains.yaml
+# (pdb-remediation-pr holds that coverage now); demoted from the blocking
+# roster on 2026-09-02 (#1189) and, when the presubmit became the blocking
+# roster only (#1023), moved to the nightly with the other held-out cases
+# (434/681 graded presubmit repetitions 2026-09-15 to 09-22; since #1780 it
+# is graded by pull_request_opened, and nothing sweeps the *-infra
+# repositories between runs, #1755 item 2). Re-admission bar: #1189's.
 # Parked 2026-08-26→27 because its cost and signal were unmeasured (the
 # 2026-08-26 run's 85-minute deadline expired before it ever started); the
 # activating pull request's own smoke run is the clean measured run it was
@@ -57,8 +64,8 @@
 # Isolation class: read-only on the cluster; unbounded write to the eval
 # GitOps repo. Presubmit-eligible on the same terms as the audit scenarios
 # (throwaway repo, token scoped to it), with the accumulation above accepted
-# rather than mitigated. Eligible tier: presubmit, and active there since
-# 2026-08-25.
+# rather than mitigated. Eligible tier: presubmit once re-admitted; active
+# there 2026-08-27 to 2026-09-22, nightly since.
 id: rca-remediation-pr
 name: RCA lands its fix as a pull request, never on the cluster
 prompt: >-

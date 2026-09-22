@@ -293,8 +293,12 @@ RECOVERY_GREEN_RUNS = 3
 # broken and /retest does not help.
 #
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
-# concluded run of at least SLOW_MIN_TASKS cases (the presubmit runs 20; a
-# run Prow cut short at its ceiling recorded fewer and is not one) -- all of
+# concluded run of at least SLOW_MIN_TASKS cases (the presubmit runs 13
+# since 2026-09-22, when it became the blocking roster only, #1023, and ran
+# 18-20 before; a run Prow cut short at its ceiling recorded fewer and is
+# not one; the floor was 15 until the roster shrank under it, which would
+# have made every run since a partial one and the rule silent, and it sits
+# one demotion below the roster on purpose) -- all of
 # them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
 # of the full runs of the trailing SLOW_BASELINE before them, given at least
 # SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue
@@ -307,7 +311,7 @@ RECOVERY_GREEN_RUNS = 3
 # hovering at the bar is one episode rather than a note every tick.
 SLOW_RUNS = 5
 SLOW_WINDOW = timedelta(hours=6)
-SLOW_MIN_TASKS = 15
+SLOW_MIN_TASKS = 12
 SLOW_BASELINE = timedelta(days=7)
 SLOW_BASELINE_MIN_RUNS = 20
 SLOW_FACTOR = 1.2

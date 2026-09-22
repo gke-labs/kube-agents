@@ -762,11 +762,12 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # how a pool project still needing bench/tf/fleet applied was found BEFORE
 # these tasks started gating PRs rather than after. Most of the active
 # tasks below read the seeded fleet -- the six domain probes, the
-# fleet-audits canary, the cluster-debugging family, the incident-triage
-# probe over the same crashloop, and the remediation cases that propose
-# fixes for those fixtures -- so those warnings have consumers. It costs one
-# clusters.list, one get-credentials per seeded cluster, and one namespace
-# read per probe -- seconds, against a job measured in tens of minutes.
+# cluster-debugging cases, the incident-triage probe over the same
+# crashloop, the remediation case that proposes a fix for those fixtures,
+# and in the nightly the full audits -- so those warnings have consumers.
+# It costs one clusters.list, one get-credentials per seeded cluster, and
+# one namespace read per probe -- seconds, against a job measured in tens
+# of minutes.
 #
 # The `||` catches a REPOSITORY bug only: a missing or malformed
 # bench/tf/fleet/fixtures.json, or an unusable output directory. Every
@@ -1283,7 +1284,10 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # seat on that record; measured cost, presubmit redundancy or grading
 # something outside the core journeys keep a case there for good. The file's
 # header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=6 (#1491), and that is the copy to keep current.
+# at EVAL_TASK_PARALLELISM=6 (#1491; oss-test-infra#2707, open, moves it to
+# 8), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# presubmit file is the blocking roster and nothing else, so this file is
+# also where every held-out case lives, with its hold-out reason.
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -1448,6 +1452,29 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # round-3 tail measured (2118s); only a repetition at the nightly maximum
 # (2808s) could outlast that tail and make it the last unit, by minutes.
 # Still no Prow deadline change.
+#
+# Later on 2026-09-22 the presubmit became the BLOCKING ROSTER ONLY (#1023,
+# the eval crew's call): the seven held-out cases it had been running
+# without letting them block -- security-overgrant-remediation-proposal,
+# #1049's three obtainability variations, rca-remediation-pr, the
+# compliance-rbac-overgrant canary and cluster-agent-healthy-workload-no-
+# finding -- moved to nightly-cases.txt with their hold-out reasons, and the
+# arithmetic above is for a matrix that no longer runs here. THIRTEEN tasks,
+# 39 units, against the same 360m deadline. What left: ~21 units at
+# 178-1002s median a repetition (the canary's 1002s and p90 2074s the
+# largest), roughly 7200-9000s of lane time, ~30-38min of wall clock at four
+# lanes -- and, more to the point, the critical path. Over the 385
+# presubmit runs of 09-04 to 09-15 the last unit to finish was
+# obtainability-healthy-namespace-silence or obtainability-fleet-exposure-
+# sweep in 81% of them (200-hinted, so launched at the tail of round 3);
+# both are gone, so the tail is now one of the nine 200-hinted units still
+# here, launched after pdb-remediation-pr (1250), incident-triage (700),
+# capacity (540) and consistency (300) in each round, or pdb-remediation-pr
+# itself on a repetition that runs to its 2700s delegation ceiling. The
+# span the 14 green presubmits of 09-19 to 09-21 measured (6073-10940s)
+# priced sixty units; the first runs of the thirteen-case matrix measure
+# the new one, and until they have, this note is the projection rather than
+# the record. Still no Prow deadline change: the matrix shrank.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
@@ -1645,6 +1672,11 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
+    # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
+    # presubmit before that. The canary measured 1002s median, 2074s p90,
+    # over 903 presubmit repetitions 2026-09-04 to 09-15; the hint stays at
+    # the 700 it carried as a presubmit case until the nightly record says
+    # otherwise.
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     # Presubmit since 2026-09-22 (#1023), nightly-only before that. Measured
     # 980-1929s across build 2099539376672346112's three repetitions (267-559s

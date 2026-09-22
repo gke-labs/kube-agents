@@ -71,8 +71,9 @@ every pull request in the repo until it is fixed. §4.2 confirms this is live ra
 hypothetical — it is what kept the audit scenarios commented out in `TASKS` in
 `hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks returned `status: "error"` without
 an `issues: read` credential the Prow job supplied. That was rung 2 working, not misfiring; the job
-mounts one now. The canary `compliance-rbac-overgrant` runs on every presubmit, and the other audit
-scenarios run in the nightly tier only (`hack/eval/nightly-cases.txt`), kept
+mounts one now. The canary `compliance-rbac-overgrant` ran on every presubmit until 2026-09-22,
+when the presubmit became the blocking roster only (#1023) and the never-admitted canary joined the
+other audit scenarios in the nightly tier (`hack/eval/nightly-cases.txt`), where those had been kept
 out of the presubmit on cost. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.

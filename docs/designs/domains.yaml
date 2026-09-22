@@ -27,10 +27,12 @@
 # So in presubmit each audit domain is covered by a PROBE -- a targeted
 # question about that domain's planted defect, answered from observed
 # evidence and graded on the reply -- while the audit-SOP machinery itself
-# (dispatch, delegation, token minter, ledger write) is exercised end to end
-# by exactly one audit kept as a canary, under the `fleet-audits` domain.
-# The full audit scenarios run in the nightly tier (hack/eval/nightly-cases.txt);
-# only an entry in hack/eval/presubmit-cases.txt counts as coverage.
+# (dispatch, delegation, token minter, ledger write) was exercised end to end
+# by exactly one audit kept as a canary, under the `fleet-audits` domain,
+# until 2026-09-22, when the presubmit became the blocking roster only and
+# the never-admitted canary moved to the nightly with the other full audits
+# (hack/eval/nightly-cases.txt); only an entry in
+# hack/eval/presubmit-cases.txt counts as coverage.
 
 domains:
   - slug: chat-and-routing
@@ -73,21 +75,31 @@ domains:
     # card". Opening it is the remediation domain's journey, one row above.
     journey: A warning event is triaged to a root cause and remediation options a human authorizes, never a cluster write
 
-# Known-uncovered. Empty, which is Phase 2's exit criterion. The two kanban
-# probes cover chat-and-routing; cluster-debugging came off first among the
-# Phase 2 domains, in #939. Reliability, capacity, security, upgrades,
-# consistency and cost are covered by the six domain probes, and fleet-audits
-# by the compliance-audit canary -- see the header above for why probes rather
-# than six full audits. incident-triage came off last, in #1045, once
-# bench/tf/prebuilt/autoops-incident gave autoops-warning-event-triage an
-# incident to triage; note that gpu-stress-test-diagnosis never covered it,
-# being a chat-prompted post-incident RCA rather than event-fired triage.
+# Known-uncovered. One entry; empty is Phase 2's exit criterion. The two
+# kanban probes cover chat-and-routing; cluster-debugging came off first
+# among the Phase 2 domains, in #939. Reliability, capacity, security,
+# upgrades, consistency and cost are covered by the six domain probes --
+# see the header above for why probes rather than six full audits.
+# incident-triage came off in #1045, once bench/tf/prebuilt/autoops-incident
+# gave autoops-warning-event-triage an incident to triage (note that
+# gpu-stress-test-diagnosis never covered it, being a chat-prompted
+# post-incident RCA rather than event-fired triage), went back on when that
+# case moved to the nightly (2026-09-03), and came off again on 2026-09-22
+# when incident-triage-oom-event-probe took a roster seat (#1023).
 #
 # An entry goes back on here only alongside a scenario that stopped running.
 allowlist:
-  # Empty since 2026-09-22 (#1023): incident-triage-oom-event-probe, the
-  # non-tofu incident-triage probe, moved into hack/eval/presubmit-cases.txt
-  # and onto the blocking roster. The entry sat here from 2026-09-03, when
-  # the domain's only case (autoops-warning-event-triage, tofu-provisioned,
-  # the wall-clock floor of the presubmit) moved to the nightly tier (#1202
-  # trim addendum, #1218).
+  # fleet-audits, since 2026-09-22 (#1023): the presubmit runs the blocking
+  # roster only, and the domain's one presubmit case, the
+  # compliance-rbac-overgrant canary, was never admitted (demoted 2026-09-02
+  # on #1171), so it moved to hack/eval/nightly-cases.txt with the other
+  # full audits. The SOP machinery it exercised end to end -- dispatch,
+  # delegation, token minter, ledger write -- now runs on every pull request
+  # only as far as the reliability and security probes reach, and the
+  # on-demand path a human would use to run a stream is itself unreachable
+  # from the sandbox (#1876). Delete this entry when a fleet-audits case is
+  # admitted on its nightly record (#1171's bar for the canary, or
+  # ai-security-planted-model-audit's), or when the coverage contract
+  # formally recognizes the nightly tier (#1175). incident-triage sat here
+  # from 2026-09-03 to 2026-09-22 for the same shape of reason.
+  - fleet-audits

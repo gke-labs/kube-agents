@@ -8,6 +8,14 @@
 # roster is a subset of the presubmit by construction. The eval dashboard
 # (scripts/eval_dashboard) reads the same file for its "blocking" pill.
 #
+# Since 2026-09-22 (#1023, the eval crew's call) the subset is the whole:
+# presubmit-cases.txt lists these cases and no others, because the presubmit
+# runs the blocking roster only and a held-out case is a nightly case
+# (nightly-cases.txt carries each with its hold-out reason). The script
+# still checks only the subset; the equality is policy, and
+# scripts/test_eval_rosters.py pins it. An admission edits both files at
+# once; a demotion moves the line from both to the nightly file.
+#
 # A case named here arms rung 4 -- three failed repetitions red the job --
 # and, while the evidence store holds nothing for it at the current version
 # key, leaves rung 6 quiet. Under the default EVAL_ADMISSION_MODE=roster this

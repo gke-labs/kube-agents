@@ -1,4 +1,9 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt.
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22,
+# a presubmit entry from 2026-08-26 (#982) until then: the presubmit runs
+# the blocking roster only (#1023) and this case is held out on #1010 (the
+# delegation receipt graded as the answer; 566/674 graded presubmit
+# repetitions 2026-09-15 to 09-22), so it earns its roster seat on the
+# nightly record now, beside the two #982 siblings that hold seats.
 #
 # Domain: cluster debugging. Journey: the reported fault is not there, and
 # the correct answer is to say so.
