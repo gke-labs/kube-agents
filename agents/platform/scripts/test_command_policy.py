@@ -1378,9 +1378,11 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
     def test_the_future_windows_spellings_reach_the_calendar_mode_entry(self):
-        # capacity-obtainability's Future windows section shows these exactly:
-        # the TPU probe (version + chips + workload type) and the VM-shape
-        # variant, one call per candidate region. The verb path was allowed
+        # The spellings capacity-obtainability's Future windows section has
+        # the agent emit — the TPU probe (version + chips + workload type)
+        # and the VM-shape variant, one call per candidate region, with
+        # representative timestamp values where the skill shows
+        # placeholders computed from the clock. The verb path was allowed
         # before any of its flags had arity entries, so every one of these
         # spellings was refused as gcp.unreadable-command -- the entry existed
         # and nothing could reach it.
