@@ -87,7 +87,7 @@ NIGHTLY_AT_SPLIT = [
 # Registered in the nightly file after the split, in file order, each by the
 # pull request that authored the case (a new case lands in the nightly first).
 ADDED_AFTER_THE_SPLIT = [
-    "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625
+    "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625; promoted 2026-09-22
     "ai-security-planted-model-audit",  # #1023's fleet-audits second case, PR #1103
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
 ]
@@ -112,12 +112,15 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
     # 2026-09-22 (#1023): 12/12 on the four graded nights 09-16 to 09-20.
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
+    # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
+    ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves NIGHTLY_AT_SPLIT
 # below, since the nightly runs both files and lists no case twice.
 PROMOTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "rca-remediation-pr"),  # 2026-09-22 (#1023)
+    ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
 ]
 
 

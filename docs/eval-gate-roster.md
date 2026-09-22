@@ -64,7 +64,7 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Twelve of the nineteen presubmit cases are admitted (recount the entries of
+Thirteen of the twenty presubmit cases are admitted (recount the entries of
 `hack/eval/presubmit-cases.txt` and `blocking-roster.txt` rather than trusting this
 sentence — an earlier copy of it miscounted twice): the ones whose recent record shows
 failures only on their own regressions or on infra classes the harness already excludes
@@ -166,6 +166,23 @@ Admitted on the record since the split:
   take a presubmit seat straight from the nightly under the 2026-09-15 rule, and its
   presubmit record starts with this edit; a collapse on an unrelated pull request in its
   first days is the thing to watch, and the demotion lever below is the answer.
+- **incident-triage-oom-event-probe**, 2026-09-22
+  ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), the incident-triage
+  domain's presubmit-eligible probe
+  ([#1625](https://github.com/gke-labs/kube-agents/pull/1625)), moved from
+  `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
+  the record the nightly built: 10/12 on the four graded nights 2026-09-16 to 09-20 (2/3, 3/3,
+  2/3, 3/3; 529–2808 s a repetition at the nightly's parallelism 6), after 3/3 in its measured
+  presubmit run (build 2099969322708373504, 737/599/1357 s). Both misses are platform bugs the
+  case surfaced, not the case: on the first night the worker blocked on
+  `cluster_agent_profile.py` in the sandbox
+  ([#1840](https://github.com/gke-labs/kube-agents/issues/1840)); on the fourth the delegation
+  acknowledgement was delivered as the final answer
+  ([#1874](https://github.com/gke-labs/kube-agents/issues/1874), filed 2026-09-22, the
+  [#1254](https://github.com/gke-labs/kube-agents/issues/1254)/[#1010](https://github.com/gke-labs/kube-agents/issues/1010)
+  shape). Its seat is what emptied the `docs/designs/domains.yaml` allowlist, so every domain
+  has a blocking case again. Same watch as the case above: a collapse on an unrelated pull
+  request in its first days, and the demotion lever below.
 
 ## How far the roster's promise reaches
 

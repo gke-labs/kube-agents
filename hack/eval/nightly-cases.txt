@@ -49,9 +49,10 @@
 # two tofu cases (ai-security-planted-model-audit ~73min at its 1450s hint,
 # autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
 # the infra lock with the two incumbents). Forty-one cases, ~893-913min
-# serial. 2026-09-22 moved pdb-remediation-pr from this file to the
-# presubmit one (#1023): the nightly runs both files, so it still runs the
-# same forty-one cases at the same price. The
+# serial. 2026-09-22 moved pdb-remediation-pr and
+# incident-triage-oom-event-probe from this file to the presubmit one
+# (#1023): the nightly runs both files, so it still runs the same forty-one
+# cases at the same price. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
@@ -134,19 +135,11 @@
 # presubmit case twice.
 ./tasks/chat-routing-board-read/task.yaml
 
-# #1023's incident-triage second case, nightly from the start (2026-09-15):
-# the presubmit-eligible probe the domains.yaml allowlist entry asks for. The
-# prompt is the watcher's warning payload in the _triage_task_body shape,
-# pointed at the seeded fleet's payments-api crashloop (role
-# crashloop-workload) -- deployer: noop, no infra lock, no watcher or card
-# wait, unlike autoops-warning-event-triage above. It grades the delivery
-# contract (`What to do` plus an option letter or `To authorize:`) that
-# #1101 measured the agent failing and that no presubmit case grades.
-# Measured GREEN 3/3 in the authoring pull request's presubmit (build
-# 2099969322708373504, through a temporary presubmit seat reverted before
-# merge): 737s/599s/1357s a repetition, so it is priced at 700 in
-# unit_cost_hint, not the 200s default.
-./tasks/incident-triage-oom-event-probe/task.yaml
+# #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
+# here from 2026-09-15 until 2026-09-22, when it moved to presubmit-cases.txt
+# on the record it built here (10/12 on the four graded nights 09-16 to
+# 09-20); that file carries the record, and this file never lists a
+# presubmit case twice.
 
 # #1023's fleet-audits and incident-triage second cases (#1103), nightly
 # from the start (2026-09-15; written into this file on 2026-09-21, when the

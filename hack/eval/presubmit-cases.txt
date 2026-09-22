@@ -149,6 +149,22 @@
 ./tasks/cluster-agent-crashloop-evidence-chain/task.yaml
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
 
+# The incident-triage domain's presubmit-eligible probe (#1023, authored in
+# #1625), moved in from nightly-cases.txt on 2026-09-22 on the record it
+# built there: 10/12 on the four graded nights 2026-09-16 to 09-20 (2/3,
+# 3/3, 2/3, 3/3; builds 2100374258805903360, 2100736652539334656,
+# 2101461441721667584, 2101823831382429696), 529-2808s a repetition at the
+# nightly's parallelism 6, after 3/3 in its measured presubmit run (build
+# 2099969322708373504, 737s/599s/1357s). Both misses are platform bugs the
+# case surfaced, not the case: night one, rep 3, the worker blocked on
+# cluster_agent_profile.py in the sandbox (#1840); night four, rep 2, the
+# delegation acknowledgement was delivered as the final answer (#1874, the
+# #1254/#1010 shape). deployer: noop over the seeded crashloop the four
+# cluster-debugging cases above share; no infra lock, no watcher, no card
+# wait. Priced at 700s in unit_cost_hint. This line is what emptied the
+# docs/designs/domains.yaml allowlist.
+./tasks/incident-triage-oom-event-probe/task.yaml
+
 # agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
 # (~100-300s), not a cluster. Re-admitted to the blocking roster after the
 # 2026-08-27 redesign (a real SRE question graded on kanban_create plus

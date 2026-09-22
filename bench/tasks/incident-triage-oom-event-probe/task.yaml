@@ -1,9 +1,17 @@
-# NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt, not the
-# presubmit file, since 2026-09-15 (#1023: every domain at least two
-# cases). A new case lands in the nightly first (#1620, decided 2026-09-15
-# on #1546 and #1564): the record it builds there is what a later roster
-# edit cites (#1568), and the presubmit seat stays with the probes.
-# Measured before the move in the authoring pull request's presubmit
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt and on the blocking
+# roster since 2026-09-22 (#1023), moved in from hack/eval/nightly-cases.txt
+# on the record it built there: 10/12 on the four graded nights 2026-09-16
+# to 09-20 (2/3, 3/3, 2/3, 3/3; builds 2100374258805903360,
+# 2100736652539334656, 2101461441721667584, 2101823831382429696),
+# 529s-2808s a repetition at the nightly's parallelism 6. Both misses are
+# platform bugs the case surfaced, not the case: night one, rep 3, the
+# worker blocked on cluster_agent_profile.py in the sandbox (#1840); night
+# four, rep 2, the delegation acknowledgement was delivered as the final
+# answer (#1874, filed 2026-09-22; the #1254/#1010 shape). Nightly-only
+# from 2026-09-15 until then (#1023: every domain at least two cases; a
+# new case lands in the nightly first, #1620, decided 2026-09-15 on #1546
+# and #1564, and the record it builds there is what the roster edit cites,
+# #1568). Measured before that in the authoring pull request's presubmit
 # (PR #1625, through a temporary presubmit seat reverted before merge):
 # build 2099969322708373504, project kube-agents-evals-18, GREEN 3/3 at
 # rung 7, every check passing in every repetition; 737s/599s/1357s wall
@@ -65,12 +73,12 @@
 # one planted defect serving two domains is the sharing the remediation
 # case already does.
 #
-# PATH TO BLOCKING. Moving this line to hack/eval/presubmit-cases.txt must
-# also delete `incident-triage` from the allowlist in docs/designs/domains.yaml,
-# or
-# scripts/test_domain_coverage.py fails, and update the uncovered list that
-# scripts/test_eval_dashboard_collect.py (test_coverage_matches_domains_yaml)
-# pins to exactly that domain; a nightly-cases.txt entry changes neither.
+# BLOCKING SINCE 2026-09-22. Moving this line to hack/eval/presubmit-cases.txt
+# deleted `incident-triage` from the allowlist in docs/designs/domains.yaml
+# (scripts/test_domain_coverage.py fails on a covered domain still listed)
+# and emptied the uncovered list that scripts/test_eval_dashboard_collect.py
+# (test_coverage_matches_domains_yaml) pins; a nightly-cases.txt entry
+# changed neither.
 #
 # Expected cost bracket: measured 737s/599s/1357s a repetition on build
 # 2099969322708373504 (agent latency 631s/494s/1258s), above the

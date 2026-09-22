@@ -1188,10 +1188,10 @@ class TestRepoDerivedFacts(unittest.TestCase):
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
         self.assertEqual(cov["domains_total"], 11)
-        # incident-triage's presubmit coverage moved to the nightly tier on
-        # 2026-09-03 (tofu wall clock; #1202); the allowlist carries it until
-        # a non-tofu probe activates or the contract recognizes the tier.
-        self.assertEqual(cov["uncovered"], ["incident-triage"])
+        # Empty since 2026-09-22: incident-triage-oom-event-probe, the non-tofu
+        # probe, took a presubmit seat (#1023), closing the gap open since the
+        # tofu case moved to the nightly tier on 2026-09-03 (#1202).
+        self.assertEqual(cov["uncovered"], [])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):

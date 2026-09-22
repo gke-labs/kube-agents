@@ -760,10 +760,11 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # still parked outside the matrix, and that was the point: the warnings it
 # prints per project ("carries no clusters labelled environment=seeded") are
 # how a pool project still needing bench/tf/fleet applied was found BEFORE
-# these tasks started gating PRs rather than after. Eleven of the active
+# these tasks started gating PRs rather than after. Twelve of the active
 # tasks below read the seeded fleet (six domain probes, the fleet-audits
-# canary, cluster-agent-crashloop-debug and the three cluster-debugging
-# cases beside it), so those warnings have consumers. It costs one
+# canary, cluster-agent-crashloop-debug, the three cluster-debugging cases
+# beside it and the incident-triage probe over the same crashloop), so
+# those warnings have consumers. It costs one
 # clusters.list, one get-credentials per seeded cluster, and one namespace
 # read per probe -- seconds, against a job measured in tens of minutes.
 #
@@ -1438,6 +1439,16 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # obtainability probes launched at the tail of round 3. No Prow deadline
 # change rides with this activation.
 #
+# The same edit moved incident-triage-oom-event-probe in as the twentieth
+# case: 737/599/1357s a repetition in its one presubmit run, 529-2808s on the
+# four graded nights, so three repetitions add ~1800-4100s of lane time
+# (~8-17min of wall clock at four lanes; up to ~35min if it runs at its
+# nightly maximum). Hinted at 700 it launches right behind pdb-remediation-pr
+# in each round, and its presubmit band ends well inside the shortest
+# round-3 tail measured (2118s); only a repetition at the nightly maximum
+# (2808s) could outlast that tail and make it the last unit, by minutes.
+# Still no Prow deadline change.
+#
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
 # pull request. It is not a legitimate default: at 1 the collapse rung
@@ -1654,9 +1665,12 @@ unit_cost_hint() {
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
-    # Nightly-only since 2026-09-15. Median of its first three measured
-    # repetitions (737/599/1357s, build 2099969322708373504); the 200s
-    # default under-packs it by 3x.
+    # Presubmit since 2026-09-22 (#1023), nightly-only from 2026-09-15 before
+    # that. Median of its three measured presubmit repetitions (737/599/1357s,
+    # build 2099969322708373504); the 200s default under-packs it by 3x. The
+    # four graded nights ran 529-2808s a repetition at parallelism 6 beside
+    # the tofu cases; the hint stays at the presubmit measurement until the
+    # presubmit record says otherwise.
     incident-triage-oom-event-probe) echo 700 ;;
     *) echo 200 ;;
   esac

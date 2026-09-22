@@ -85,13 +85,9 @@ domains:
 #
 # An entry goes back on here only alongside a scenario that stopped running.
 allowlist:
-  # incident-triage's presubmit coverage moved to the nightly tier on
-  # 2026-09-03: its only case (autoops-warning-event-triage) is
-  # tofu-provisioned — the wall-clock floor of the presubmit (#1202 trim
-  # addendum). Delete this entry when
-  # a non-tofu incident-triage probe activates in presubmit, or when the
-  # coverage contract formally recognizes the nightly tier (#1175). That
-  # probe is incident-triage-oom-event-probe (#1023), in
-  # hack/eval/nightly-cases.txt since 2026-09-15; moving its line to the
-  # presubmit file is what deletes this entry.
-  - incident-triage
+  # Empty since 2026-09-22 (#1023): incident-triage-oom-event-probe, the
+  # non-tofu incident-triage probe, moved into hack/eval/presubmit-cases.txt
+  # and onto the blocking roster. The entry sat here from 2026-09-03, when
+  # the domain's only case (autoops-warning-event-triage, tofu-provisioned,
+  # the wall-clock floor of the presubmit) moved to the nightly tier (#1202
+  # trim addendum, #1218).
