@@ -176,6 +176,7 @@ class FakeBoard:
         self.db_path = db_path
         self.calls = []
         self.cards = {}
+        self.by_key = {}
         self.filed = 0
         self.fail_next_create = False
         self.fail_show = False
@@ -198,8 +199,13 @@ class FakeBoard:
                 self.fail_next_create = False
                 raise RuntimeError("board locked")
             opts = {argv[i]: argv[i + 1] for i in range(1, len(argv) - 1) if argv[i].startswith("--") and argv[i] != "--json"}
+            key = opts.get("--idempotency-key")
+            if key in self.by_key and self.by_key[key] in self.cards:
+                existing = self.by_key[key]
+                return json.dumps({"id": existing, "status": self.cards[existing]["status"]})
             self.filed += 1
             tid = f"t_{self.filed:08x}"
+            self.by_key[key] = tid
             self.cards[tid] = {"status": "ready", "assignee": opts.get("--assignee"), "title": argv[-1], "body": opts.get("--body", ""), "key": opts.get("--idempotency-key"), "comments": []}
             conn = sqlite3.connect(self.db_path)
             conn.execute("INSERT INTO tasks (id, title, body, assignee, status, created_at) VALUES (?, ?, ?, ?, 'ready', 1)", (tid, argv[-1], opts.get("--body", ""), opts.get("--assignee")))
@@ -484,6 +490,47 @@ class Cards(Base):
         self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
         self.assertEqual(len(self.subs(tid)), 1)
 
+    def test_a_stall_that_comes_back_after_its_card_was_completed_gets_a_new_card(self):
+        # The board answers a repeated key with the finished card; the key must
+        # not repeat across episodes, however unchanged the object's spec is.
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        first = next(iter(self.board.cards))
+        self.run_tick({"c": {"checkout": []}})
+        self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.board.cards[first]["status"], "done")
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(self.noticed(lines)), 1)
+        self.assertEqual(len(self.board.cards), 2)
+        self.assertNotIn(f"card `{first}`", lines[0])
+        self.assertEqual(self.ledger()[stall_watch.GENERATIONS_KEY][f"c@{LOCATION}/checkout"], 1)
+
+    def test_a_card_the_agent_completed_early_is_not_reused_for_a_peer_that_appears_later(self):
+        # Two objects from one apply, different thresholds: the Deployment's
+        # card is done within the half hour, the Gateway shows up next tick.
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        first = next(iter(self.board.cards))
+        self.board.cards[first]["status"] = "done"
+        gateway = dict(GATEWAY_CONDITION_ROW, namespace="checkout")
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, gateway]}})
+        self.assertEqual(len(self.noticed(lines)), 1)
+        self.assertEqual(len(self.board.cards), 2)
+        self.assertEqual(next(reversed(self.board.cards.values()))["status"], "ready")
+
+    def test_a_finished_card_handed_back_for_a_repeated_key_is_not_adopted(self):
+        # Defence in depth: even if the key repeats, a terminal card is never
+        # recorded as the episode's card.
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        first = next(iter(self.board.cards))
+        self.board.cards[first]["status"] = "done"
+        self.board.by_key = {k: v for k, v in self.board.by_key.items()}
+        # Pretend the generation counter was lost with the ledger.
+        state = self.ledger(); state[stall_watch.EPISODES_KEY] = {}; state[stall_watch.GENERATIONS_KEY] = {}; state["stalls"] = {}
+        self.state.write_text(json.dumps(state))
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(self.noticed(lines)), 1)
+        self.assertNotIn(f"card `{first}`", lines[0])
+        self.assertEqual(len(self.board.cards), 2)
+
     def test_the_idempotency_key_is_stable_across_a_retry_however_long_the_sweeps_take(self):
         # A real stall's age grows with the clock; the fake reports it relative
         # to a fixed start, and the two ticks run 1,700 s apart with different
@@ -498,10 +545,10 @@ class Cards(Base):
             first = shlex.split(self.board.calls[0])
             clock["now"] = start + 2700
             self.run_tick({"c": {"checkout": rows_at(clock["now"])}})
-            second = shlex.split(self.board.calls[-1])
+            second = shlex.split([c for c in self.board.calls if c.startswith("create ")][-1])
         key = lambda argv: argv[argv.index("--idempotency-key") + 1]
         self.assertEqual(key(first), key(second))
-        self.assertTrue(key(first).endswith(f"-{start // stall_watch.EPISODE_ID_RESOLUTION_SECONDS}"))
+        self.assertTrue(key(first).endswith(f"-{start // stall_watch.EPISODE_ID_RESOLUTION_SECONDS}-g0"), key(first))
 
     def test_a_card_the_agent_already_completed_is_not_completed_again_on_clear(self):
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})

@@ -248,12 +248,9 @@ SKILL_NAME = "gke-stall-detection"
 TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
 #: The board is whatever Hermes' own kanban_db_path() resolves (HERMES_KANBAN_DB,
 #: then kanban/current), falling back to the agent home's kanban.db, the same
-#: file kanban_board_health.board_path names; the notifier only sees cards with
-#: a kanban_notify_subs row, and a cron child
-#: has no session identity for kanban_create to copy, so the row is written
-#: here from the home channels the tick spawner restores into the environment
-#: (`<PLATFORM>_HOME_CHANNEL`; `CHAT_HOME_CHANNEL` is the relay's own label and
-#: names no channel).
+#: file kanban_board_health.board_path names. The notifier only sees cards with
+#: a kanban_notify_subs row, and a cron child has no session identity for
+#: kanban_create to copy, so the row is written here.
 BOARD_DB_NAME = "kanban.db"
 #: The home channels come from the agent home's config.yaml,
 #: `platforms.<p>.home_channel.chat_id`, the field the tick spawner reads for
@@ -283,6 +280,12 @@ RUNNING_CARD_STATUS = "running"
 #: reuses it however long the rest of the sweep took. A repeating-warnings
 #: row's age is an event span, not a start, and does not take part.
 EPISODE_ID_RESOLUTION_SECONDS = 600
+#: The board answers a repeated idempotency key with the existing card, a
+#: finished one included, so a key also carries the scope's episode
+#: generation: it advances whenever an episode ends, and a stall that comes
+#: back after its card was completed gets a new card, while a retry inside one
+#: episode still gets the card it lost the id of.
+GENERATIONS_KEY = "generations"
 #: Plurals kubectl forms with -es or -ies, so a skipped `ingresses` holds
 #: Ingress rows and `networkpolicies` holds NetworkPolicy rows.
 PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
@@ -531,7 +534,7 @@ def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | No
 
 
 def empty_state() -> dict:
-    return {"version": STATE_SCHEMA_VERSION, "stalls": {}, "unreadable": {}, EPISODES_KEY: {}, "sweep_error": None, "updated_at": None, CURSOR_KEY: None}
+    return {"version": STATE_SCHEMA_VERSION, "stalls": {}, "unreadable": {}, EPISODES_KEY: {}, GENERATIONS_KEY: {}, "sweep_error": None, "updated_at": None, CURSOR_KEY: None}
 
 
 def load_state(path: Path) -> dict:
@@ -1048,16 +1051,24 @@ def episode_id(rows: list[dict], now_epoch: int) -> int:
     return start // EPISODE_ID_RESOLUTION_SECONDS
 
 
-def episode_gone(episodes: dict, scope: str, task_id: str) -> bool:
+def end_episode(state: dict, scope: str) -> dict:
+    """Drop the scope's episode and advance its generation, so the next card
+    for the scope carries a key the board has not seen."""
+    generations = state.setdefault(GENERATIONS_KEY, {})
+    generations[scope] = int(generations.get(scope) or 0) + 1
+    return state[EPISODES_KEY].pop(scope)
+
+
+def episode_gone(state: dict, scope: str, task_id: str) -> bool:
     """A card the board no longer has, or one it could not describe for
     MAX_UNKNOWN_CARD_TICKS ticks running, ends its episode; otherwise the
     unknown is counted and the caller retries next tick."""
-    episode = episodes[scope]
+    episode = state[EPISODES_KEY][scope]
     exists = card_exists(task_id)
     episode["unknown"] = 0 if exists else int(episode.get("unknown") or 0) + 1
     if exists is False or episode["unknown"] >= MAX_UNKNOWN_CARD_TICKS:
         sys.stderr.write(f"stall_watch: card {task_id} for {scope} is gone from the board; its episode ends\n")
-        episodes.pop(scope)
+        end_episode(state, scope)
         return True
     return False
 
@@ -1089,7 +1100,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         if episode:
             status = card_status(episode["card"])
-            if status is None and not episode_gone(episodes, scope, episode["card"]):
+            if status is None and not episode_gone(state, scope, episode["card"]):
                 # The rows stay ledgered; the comment waits for a board that answers.
                 episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(rows)))
                 continue
@@ -1099,14 +1110,25 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 comment_pending(episode, namespace)
                 continue
             if status is not None:
-                episodes.pop(scope)
+                end_episode(state, scope)
         assignee = assignee_for(sweep.project, name, location)
+        generation = int(state.setdefault(GENERATIONS_KEY, {}).get(scope) or 0)
         task_id = open_card(
             card_title(name, namespace, rows),
             card_body(sweep.project, name, location, namespace, rows, now, assignee),
             assignee,
-            f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-{episode_id(rows, int(time.time()))}",
+            f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-{episode_id(rows, int(time.time()))}-g{generation}",
         )
+        if task_id and (card_status(task_id) or "") in TERMINAL_CARD_STATUSES:
+            # The board handed back a finished card for a key it had seen; move
+            # the generation on and file once more.
+            state[GENERATIONS_KEY][scope] = generation + 1
+            task_id = open_card(
+                card_title(name, namespace, rows),
+                card_body(sweep.project, name, location, namespace, rows, now, assignee),
+                assignee,
+                f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-{episode_id(rows, int(time.time()))}-g{generation + 1}",
+            )
         if not task_id:
             # No card yet, so nothing to comment on: the rows leave the ledger
             # and the next tick sees the objects as new and tries the board again.
@@ -1138,7 +1160,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         status = card_status(episode["card"])
         if status is None:
-            episode_gone(episodes, scope, episode["card"])
+            episode_gone(state, scope, episode["card"])
             continue
         if status not in TERMINAL_CARD_STATUSES:
             if not episode.get("cleared_at"):
@@ -1150,7 +1172,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 continue
             if not complete_card(episode["card"], f"Stall cleared at {now}: {cleared}. Closed by the stall watch."):
                 continue
-        episodes.pop(scope)
+        end_episode(state, scope)
         lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}; card `{episode['card']}` closed")
     return lines
 
