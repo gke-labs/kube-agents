@@ -922,6 +922,9 @@ the job due for the next `profile-cron-tick` instead of re-enacting the audit in
 fielded the request. That run takes the same execute → save → deliver → mark path as a scheduled
 one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
 the session that triggered it says only that the job is queued and leaves the report to the run.
+The sandbox shell cannot reach `hermes` ([#1876](https://github.com/gke-labs/kube-agents/issues/1876)),
+so as an interim a request naming exactly one stream runs it in that session through
+`audit_report.py start … finish` with its coverage gaps declared, and reports the ledger URL itself.
 
 On a scheduled run there is no channel on the other side of that verdict today, and the mechanism
 says so: a scheduled audit is a cron run on the Platform Agent's own roster

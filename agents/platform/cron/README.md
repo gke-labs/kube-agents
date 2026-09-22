@@ -347,7 +347,10 @@ rule outlives the memory of why:
   one turn budget and produced five hand-typed empty findings documents and a
   fleet-wide all-clear, having issued no `kubectl` at all. That is why the
   Platform Agent marks the job due for the next tick instead of running the SOP
-  itself.
+  itself. One interim exception since 2026-09-22 (#1876): the sandbox shell
+  cannot reach `hermes`, so a request naming exactly one stream runs that
+  stream through `audit_report.py start … finish` in the session, with every
+  check it did not run declared as a coverage gap; several streams still queue.
 - **Overlap is held per job, not per profile.** Holding the profile lock across
   execution — the upstream default — meant a fleet audit blocked every dispatch
   for its whole run; three `github-issue-resolver` firings were measured 418s,

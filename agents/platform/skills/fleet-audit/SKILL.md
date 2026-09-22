@@ -70,26 +70,37 @@ behaves identically on every runtime and always runs in a fresh process.
 
 **Your shell cannot reach that command, and there is no substitute yet.** It runs on the gateway pod,
 where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod, which has neither, so
-`command not found` there is the split working as designed rather than a broken install. When you hit
-it, say the on-demand trigger is unavailable and that the stream will run on its 06:20 schedule. That
-does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself —
-see the next paragraph. The gap is a deliberate deferral of the shell-sandbox design, not an
-oversight.
+`command not found` there is the split working as designed rather than a broken install
+([#1876](https://github.com/gke-labs/kube-agents/issues/1876) tracks the missing on-demand path). It
+does not license `cronjob(action='run')`. What you do instead depends on how many streams the request
+names:
 
-**Do not run the audit yourself in the session that received the request.** A triggered run gets its
-own process and its own turn budget. A session that improvises the audit instead has neither — and
-when the request is "run them all", it has one turn budget for work the schedule spreads across
-every stream and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker
-asked to run all five streams that existed then issued zero `kubectl` commands, hand-typed five
-empty findings documents, and published a fleet-wide all-clear.
+- **Exactly one stream:** run that stream's SOP here, in this session, through the two-command
+  lifecycle below — `audit_report.py start`, the sweep, `audit_report.py finish` — and report every
+  check you did not run as a coverage gap: a cluster you could not read goes in `scope.skipped`, a
+  check that could have run on a cluster and did not goes in that cluster's `limitations`, so `finish`
+  reports the run `partial` and names each gap. Never skip a check silently: a document that omits
+  the checks it never ran reads exactly like a complete one, and the roster check exists to catch
+  that. This is the interim until the trigger has a path from here (#1876).
+- **More than one stream:** say the on-demand trigger is unavailable and that each stream will run
+  on its 06:20 schedule. Do not improvise several streams in one turn — see the next paragraph.
+
+**Do not run more than one stream in the session that received the request.** A triggered run gets
+its own process and its own turn budget. A session that improvises several audits instead has one
+turn budget for work the schedule spreads across every stream and two days. That is not a
+hypothetical failure mode: on 2026-08-03 a single worker asked to run all five streams that existed
+then issued zero `kubectl` commands, hand-typed five empty findings documents, and published a
+fleet-wide all-clear. One stream, run through `start` and `finish` with its gaps declared, is the
+whole of what this session may take on.
 
 The scheduler holds a per-job lock for the length of a run, so a stream already in flight is not
 started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
 is running and what each attempt did.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
-stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
-own `deliver` setting; repeating them here sends the same content twice.
+stream: for a stream you queued, that it is queued for the next tick; for the one stream you ran
+here, the ledger URL `finish` returned and whether the run was `partial`. A triggered run's report
+arrives through its own `deliver` setting; repeating it here sends the same content twice.
 
 ## The two-command lifecycle
 

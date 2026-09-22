@@ -11726,11 +11726,38 @@ class TestDispatchAndHandover(unittest.TestCase):
         own process; `cronjob(action='run')` falls back to executing it inside
         the calling session — which is the one turn budget five audits used to
         share — wherever the runtime cannot take a detached result.
+
+        The sandbox shell has no `hermes` (#913), so until the trigger has a
+        path from there (#1876) the bullet carries one interim: a request that
+        names exactly one job runs it here through `start … finish` with every
+        unrun check declared as a coverage gap; more than one still queues.
         """
         bullet = self.bullet("trigger the schedule, do not re-enact it")
         self.assertIn("hermes cron run", bullet)
         self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
         self.assertIn("cronjob(action='run')", bullet)
+        self.assertIn("exactly one job", bullet)
+        self.assertIn("audit_report.py start", bullet)
+        self.assertIn("coverage gap", bullet)
+        self.assertIn("more than one job", bullet)
+
+    def test_the_skill_allows_one_stream_in_session_with_its_gaps_declared(self):
+        """The skill's own copy of the interim (#1876), same substance.
+
+        The worker that answered "queued" to "run the audit now" was obeying
+        this section verbatim. It now says: one named stream runs here through
+        the two-command lifecycle with its coverage gaps declared, so `finish`
+        reports `partial` rather than a silent skip; several streams never do,
+        for the 2026-08-03 reason.
+        """
+        text = self.read("skills/fleet-audit/SKILL.md")
+        section = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("Exactly one stream", section)
+        self.assertIn("audit_report.py finish", section)
+        self.assertIn("coverage gap", section)
+        self.assertIn("More than one stream", section)
+        self.assertIn("2026-08-03", section)
+        self.assertIn("cronjob(action='run')", section)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
