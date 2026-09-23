@@ -1752,6 +1752,11 @@ unit_cost_hint() {
     # The two tofu incumbents, nightly-only since #1218: ~20 and ~15 min a
     # repetition on the infra lock.
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
+    # The third tofu case, nightly-only from the start (#1827). Unmeasured:
+    # priced with the two above it because it is the same shape -- infra lock,
+    # a plant that blocks on a card appearing, then an agent turn that waits on
+    # that card finishing. A wrong hint costs packing, not correctness.
+    gitops-drift-out-of-band-triage) echo 900 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the

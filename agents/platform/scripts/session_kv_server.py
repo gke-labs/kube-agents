@@ -1681,7 +1681,10 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     keys on to decide which completions earn an `incidents` row — which is what
     makes the offer to reply `apply` honourable. Those literals are load-bearing
     in both bodies for the same reasons; read that docstring before rewording
-    either.
+    either. This body has its own third reader as well —
+    bench/tasks/gitops-drift-out-of-band-triage/task.yaml's delivery objective
+    keys on the same literals — and bench/tests/test_triage_delivery_contract.py
+    holds this template against both that case and the notifier gate.
 
     What is not shared is the question. An event says Kubernetes is unhappy and
     asks for a root cause. This says a person or a tool changed a live object
