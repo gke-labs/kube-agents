@@ -1980,6 +1980,18 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
                 f"App {LEDGER_APP_ID} has no installation {LEDGER_INSTALLATION_ID} (404). It was "
                 "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
             )
+        if exc.code == 422:
+            # The body asked for a permission the installation does not hold.
+            # hack/ci-eval-pr.sh's preflight mint sends the same body and exits
+            # on this answer, so every run on every pool project would stop.
+            wanted = ", ".join(f"{k}: {v}" for k, v in LEDGER_READ_PERMISSIONS.items())
+            return None, "failed", (
+                f"GitHub refused to mint {wanted} for App {LEDGER_APP_ID}'s installation "
+                f"{LEDGER_INSTALLATION_ID} (422): the installation no longer holds one of them. "
+                "hack/ci-eval-pr.sh's preflight mint asks for exactly these and stops the run on "
+                "this answer, so ledger grading is broken pool-wide until an organisation owner "
+                "restores the permission (or accepts a pending permission change) on the installation"
+            )
         return None, "unverified", (
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of minting a token"
         )
@@ -2084,8 +2096,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
         if exc.code == 403:
             return CheckResult(name, False, "Ledger issues not readable", details=[
                 f"App {LEDGER_APP_ID} reaches {repo_slug} but is refused its issues "
-                f"(403 {exc.reason}). Its installation needs `issues: read`, which is a pool-wide "
-                f"permission rather than anything about {project_id}; accept it and re-run"
+                f"(403 {exc.reason}). The token was just minted with `issues: read`, so this is "
+                "not a missing permission: the installation is suspended, or an organisation "
+                "IP allow list or SAML setting blocks App tokens from here. Pool-wide rather than "
+                f"anything about {project_id}; clear it and re-run"
             ])
         if exc.code == 404:
             return CheckResult(name, False, "Ledger issues not readable", details=[

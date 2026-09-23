@@ -1918,6 +1918,19 @@ class LedgerTokenMintTest(unittest.TestCase):
                 self.assertEqual("ghs_minted", token)
                 self.assertEqual("ok", status)
 
+    def test_a_refused_permission_fails_because_the_eval_preflight_would(self):
+        # The pinned body makes 422 possible: the installation no longer holds
+        # one of the three reads. hack/ci-eval-pr.sh sends the same body at
+        # preflight and exits on this answer, so it is a pool-wide failure,
+        # not an "unknown" to re-run later.
+        token, status, message = self._mint(urlopen=self._http_error(422, "Unprocessable Entity"))
+        self.assertIsNone(token)
+        self.assertEqual("failed", status)
+        self.assertIn("422", message)
+        for permission in checker.LEDGER_READ_PERMISSIONS:
+            self.assertIn(permission, message)
+        self.assertIn("preflight", message)
+
     def test_a_server_error_is_unverified_not_failed(self):
         _, status, _ = self._mint(urlopen=self._http_error(503, "Service Unavailable"))
         self.assertEqual("unverified", status)
@@ -1980,10 +1993,13 @@ class LedgerReadCredentialTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("404", " ".join(result.details))
 
-    def test_repo_reachable_without_issues_read_fails(self):
+    def test_repo_reachable_but_refused_fails_and_does_not_blame_a_permission(self):
+        # The mint pinned `issues: read`, so a 403 on the read is not the grant.
         result = self._check(self._http_error(403, "Forbidden"))
         self.assertFalse(result.passed)
-        self.assertIn("issues: read", " ".join(result.details))
+        details = " ".join(result.details)
+        self.assertIn("issues: read", details)
+        self.assertIn("not a missing permission", details)
 
     def test_rate_limited_403_is_unverified_not_failed(self):
         result = self._check(self._http_error(403, "rate limit exceeded", {"x-ratelimit-remaining": "0"}))
