@@ -1,0 +1,126 @@
+# NIGHTLY-TIER, registered on landing in hack/eval/nightly-cases.txt: the
+# default home for a new case (that file's header says why), and a full
+# audit besides -- the same shape and cost band as consistency-drift-outlier,
+# which is why the consistency domain's presubmit seat stays with
+# consistency-authorized-networks-probe.
+#
+# The check this case grades is `no-environment-label`, SOP §4.14: the one
+# check in the drift stream that fires outside a cohort. The stream's other
+# nineteen checks are majority votes, so a cluster with too few peers is
+# compared on nothing -- and an unlabelled cluster has no peers by
+# construction, because §2.3 keys the eight configurable facets on
+# (environment) and the eleven node-level ones on (mode, environment) and
+# merges `unknown` into no named cohort under either. The collector
+# (skills/fleet-audit/scripts/fleet_drift.py) turns that permanent coverage
+# gap into a finding naming the label to set.
+#
+# Planted state: none of its own. The seeded fleet labels seeded-a/-b/-c
+# `environment = seeded` (bench/tf/fleet/main.tf) so that they cohort alone,
+# and the install's own host cluster carries no environment label. The
+# collector fires §4.14 for the unlabelled host beside the three labelled
+# peers -- mode is not part of that key, so what makes the host uncompared is
+# the missing label alone; the fixture role below is the one this fleet
+# carries for the drift stream, and the two sibling objectives bind the run
+# to it the way consistency-drift-outlier does.
+#
+# Two dependencies on pool hygiene, neither of them this case's to fix:
+#   -- Fewer than three unlabelled STANDARD clusters older than 24h may exist
+#      in the project, the host included. §4.14 fires where either of §2.3's
+#      cohorts is short, and for the Standard host the binding one is
+#      (standard, unknown): two stale eval-pr* Standard clusters (a crashed
+#      run's, not swept) that age past the collector's 24h exclusion take it
+#      to the floor of 3, the host is then compared on all nineteen and §4.14
+#      abstains -- the check reads as ran-and-clean, and this case reds on a
+#      fleet the agent audited correctly. Unlabelled AUTOPILOT clusters do not
+#      bind: they raise the cluster-level `unknown` cohort past the floor, but
+#      the node-level one they are counted in is (autopilot, unknown), and
+#      §4.14 still fires on the Standard host's own short cohort.
+#   -- The finding recommends `environment=seeded`, the one value that
+#      reaches the floor. Nobody may APPLY it to the host: bench/tf/fleet
+#      reserves that value for the trio, and a fourth voter changes the
+#      authorized-networks arithmetic consistency-drift-outlier depends on.
+#      The audit only files the finding; the remediation is prose in the
+#      ledger, never a pull request, because nothing in the eval GitOps
+#      repository declares the host cluster.
+#
+# Eval-driven development (.agents/rules/eval_driven_development.md): red on
+# main, where the slug is not on the roster and no SOP section defines it, so
+# no finding can carry it; green once the collector and §4.14 land.
+#
+# Isolation class: cluster-read-only, GitOps-repo write -- the same as every
+# fleet-audit stream (audit_report.py start clones the workspace, finish
+# rewrites the ledger issue). Pinned per eval project to a throwaway GitOps
+# repository; see bench/tasks/DRAFTS.md, A1.
+id: consistency-no-environment-label
+name: Drift audit files the unlabelled cluster its cohorts cannot see
+prompt: >-
+  Run the fleet consistency drift audit, following the
+  fleet-consistency-drift SOP.
+expected_output: >-
+  The ledger issue carries a no-environment-label finding against the
+  cluster that carries no environment label, naming the label value its
+  Standard peers hold, alongside the authorized-networks finding against the
+  outlier cluster. The closing response is the SOP's one line, carrying the
+  ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: consistency
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# The seeded-fleet defects this scenario asserts on, named by ROLE rather than
+# by cluster; roles are defined in bench/tf/fleet/fixtures.json and the rule
+# is docs/designs/bench-fleet-catalog.md. The unlabelled host cluster is not
+# a fixture: it is the install, and every eval project has one.
+fixtures:
+  - drift-outlier
+
+verification_spec:
+  # Graded against the LEDGER, not the chat reply: the SOP mandates a one-line
+  # closing response that restates nothing, so a report_contains check would
+  # fail a conformant run. scope: finding_ids throughout, for the reason
+  # consistency-drift-outlier's spec gives at length: the hidden delta block
+  # carries the ids audit_report.py derived, "<check>.<cluster>.<namespace>.
+  # <object>", so a slug appears there if and only if a finding was FILED
+  # under it, and the rendered body's evidence table -- which restates every
+  # roster slug on every run -- cannot satisfy it.
+  - name: a-no-environment-label-finding-was-filed
+    role: objective
+    # assert, not converge: the ledger is written once, at `finish`.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
+      # The check slug leads every id and `_shorten_id` never trims it.
+      required_phrases: ["no-environment-label"]
+  - name: a-finding-was-filed-against-the-outlier
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
+      required_phrases: ["seeded-c"]
+      # "seeded-c" is a substring of the seeded-capacity namespace the stockout
+      # fixture plants on this same fleet, and an id's namespace segment would
+      # carry it verbatim; a drift id has an "_" namespace segment, so a
+      # seeded-capacity id means a finding against the wrong object.
+      forbidden_phrases: ["seeded-capacity"]
+  - name: an-authorized-networks-finding-was-filed
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
+      required_phrases: ["authorized-networks"]
+  # No deterministic mutation safeguard, documented: the planted state is a
+  # GKE label and a GKE control-plane facet, not a cluster object, so there
+  # is no resource for resource_property to assert on, and tool_called is
+  # blind to a delegated worker's calls. The fleet's scheduled reconcile owns
+  # the fixture's integrity.

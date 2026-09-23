@@ -49,8 +49,8 @@ only — anything that renames, removes or re-types a field bumps
   ],
   "coverage": {
     "domains_total": 11,
-    "domains_covered": 10,
-    "uncovered": ["incident-triage"]
+    "domains_covered": 9,
+    "uncovered": ["fleet-audits", "remediation"]
   }
 }
 ```
@@ -140,7 +140,16 @@ the same layout and is collected from the moment it starts running.
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
-      tokens this collector has never seen) → `fail`.
+      tokens this collector has never seen) → `fail`. An `infra` rep whose
+      `reason` leads with `KUBE_AGENTS_DELEGATION_CEILING` is a
+      **delegation-ceiling** rep: the harness's wait for the delegated worker
+      ran out with the card still running and nothing delivered. The readers
+      (`classify.py`, `health.py`) count it apart from the storm reps — it is
+      not lost to 429s — and outside every pass-rate denominator; `classify.py`
+      classes a case whose ungraded reps are all of this kind
+      `delegation-ceiling`. The run page, the PR view and the PR comment's
+      result cell count it in a case's total and name it apart; the Cases
+      page's per-run counts (`render.rep_counts`) still fold it into `infra`.
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
@@ -259,7 +268,8 @@ side.
   entry in `hack/eval/presubmit-cases.txt` **or** `hack/eval/nightly-cases.txt`
   — the nightly matrix is the presubmit's superset (`EVAL_TIER=nightly`
   appends the second file). `active` implies `nightly_active`; the Cases page's "nightly
-  only" status is `nightly_active and not active`.
+  only" status is `nightly_active and not active` with no demotion date on record for the
+  case (a dated one reads `demoted`).
 - `runs_on_record` — total task appearances across presubmit runs, `infra`
   included (it is history).
 - `pass_rate` — `passes / (passes + fails)`. **`infra` results are excluded
@@ -382,8 +392,11 @@ what the renderer does with them.
   `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
   `reason` is free-form log text (renderers must escape it). `infra` reps
   are excluded from every pass-fraction denominator, exactly like `infra`
-  task results. When `reps` is absent the task's single `result` stands in
-  for one rep.
+  task results; an `infra` rep whose `reason` leads with
+  `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
+  (`storm_reps`, `health.json`'s `infra_reps`) and reported under
+  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `result` stands in for one rep.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
   its verdict and is reported as truncated. Absent means unknown.
@@ -613,9 +626,10 @@ pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** las
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
-`setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
+`setup_death`, `storm_reps`, `ceiling_reps`, `do`, `cases[]` (`{case, outcome, cls,
 also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
-nightly_failed_recent}`) and `health_at` (the verdict in force when it
+nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
+`health_at` (the verdict in force when it
 finished, from history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
@@ -628,9 +642,13 @@ when none did — evidence about `main`, shown beside the case, never a tag.
 `cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
 demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
-(active, off the roster), `demoted` (held out, with `demoted_on` read from the hold-out
-entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`),
-`nightly_only`, or `retired` (in neither matrix on this checkout); an
+(active, off the roster — since 2026-09-22 the presubmit runs the roster only, so this is
+reachable only on a checkout whose presubmit file lists a case the roster does not),
+`demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
+entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
+2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`
+(in the nightly file only, no demotion date on record), or `retired` (in neither matrix on
+this checkout); an
 unreadable roster reads every active case as `blocking`, over-reporting
 rather than hiding. `rates` is `{presubmit: [[pass, fail], [pass, fail]],
 nightly: [...]}` over graded reps for each of `rate_windows_days` (7 and
@@ -776,7 +794,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -786,7 +804,10 @@ and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
 a run-page banner of its own, and otherwise show the generic degraded
-headline. `issue` (`{number, url}`) may carry `condition`, the one it was
+headline. For `delegation_ceiling` (15+ repetitions across 3+ PRs in 2 hours
+ended at the harness's delegation wait with the worker still running, #1874)
+the `incident` also carries `reps`, and the pages give it the storm's 2-hour
+lead, a Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
 filed for. `fixture_drift` (the hourly seeded-fleet scan found a fixture
 role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
@@ -906,6 +927,25 @@ It is the fixture for `releases[]`, and it keeps both banners the driver
 prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top
 and `ci-eval-rc.sh`'s `RELEASE CANDIDATE EVAL` at the end. A substring match
 opens the parse on the first one, so the decoy stays in the fixture.
+
+`testdata_nightly/` holds the nightly of 2026-09-21 (`ci-kube-agents-eval-nightly`,
+the periodic, so no `pull` key and `revision: main`), the second night the
+480m deadline ended with every unit finished and nothing graded (#1491).
+`started.json` / `finished.json` are verbatim and every driver line is real —
+the lease, the fan-out start, the launch and `finished` markers, the
+entrypoint's timeout and grace-period lines, the profile table. The four
+grading blocks are **spliced in**: the real night printed none, because the
+grading ran after the fan-out's `wait` and the deadline arrived first. They
+are real `bench-gate case` output from the night before
+(build 2101461441721667584) for four cases that also ran this night, placed at
+each case's repetition-3 `finished` line the way `hack/ci-eval-pr.sh` prints them
+since it grades per case, three of them after the SIGTERM, inside the grace
+period; the `recorded` lines are restamped to this build. The
+`Eval ended before its verdict` line is the EXIT trap's cut-off report:
+
+| build               | why it is here                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 2102186223282950144 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
 
 `testdata_health/data.json.gz` is a **real** published `data.json` reduced by
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by

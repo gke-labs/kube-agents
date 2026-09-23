@@ -644,6 +644,60 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   return 0
 }
 
+# ─── The cut-off report ──────────────────────────────────────────────────────
+# A Prow deadline (the nightly's 480m, the presubmit's 360m) arrives as
+# SIGTERM, which the trap below turns into an exit before the suite step ever
+# runs. The nights of 2026-09-18 and 09-21 (builds 2101099042170736640 and
+# 2102186223282950144) had finished 105 and 122 units when it arrived and
+# left no case JSON, no baseline line and no verdict table, because all three
+# were downstream of the fan-out's `wait`; the dashboard counted each night
+# 0/0/0/0 (#1491). The grading is per case now (finish_case, in the fan-out),
+# so on exit every case whose last repetition finished already has its
+# case-<name>.json, its `Task <name> Result:` block in this log and, on a main
+# run, its baseline line; this tables those cases.
+#
+# What it writes is NOT the run's verdict and must not read as one.
+# `bench-gate suite --partial` banners the markdown and marks the JSON, and the
+# line printed here carries neither "Succeeded" nor "Failed" between the anchors
+# scripts/eval_dashboard/collect.py matches, so `eval_verdict` stays null and
+# nightly.py keeps calling the night truncated -- now with the graded cases
+# counted instead of nothing. Skipped when the run reached its own suite step
+# (EVAL_SUITE_REACHED), when it died before the fan-out existed, and when no
+# case had every repetition graded; never fatal, and its stdout is the
+# markdown already in eval-verdict.md, so only its warnings reach the log.
+report_partial_verdict() {
+  [ -z "${EVAL_SUITE_REACHED:-}" ] || return 0
+  [ -n "${STATE_DIR:-}" ] && [ -d "${STATE_DIR}" ] && [ -n "${ARTIFACT_DIR:-}" ] || return 0
+  local name total=0 graded=0 recorded=0 partial_args=()
+  for name in ${TASK_NAMES[@]+"${TASK_NAMES[@]}"}; do
+    total=$((total + 1))
+    if [ -f "${STATE_DIR}/${name}.graded" ] && [ -f "${ARTIFACT_DIR}/case-${name}.json" ]; then
+      graded=$((graded + 1))
+      partial_args+=(--case-result "${ARTIFACT_DIR}/case-${name}.json")
+    fi
+  done
+  if [ "${graded}" -eq 0 ]; then
+    echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Eval ended before its verdict with no case fully graded (${total} in the matrix); nothing partial to table ==="
+    return 0
+  fi
+  if [ -n "${EVAL_RECORDED_MANIFEST:-}" ] && [ -f "${EVAL_RECORDED_MANIFEST}" ]; then
+    recorded="$(grep -c . "${EVAL_RECORDED_MANIFEST}" 2>/dev/null || true)"
+    recorded="${recorded:-0}"
+  fi
+  local note="this run ended before its verdict (a deadline, or an error after the fan-out began); ${graded} of ${total} cases had every repetition graded by then"
+  local suite_status=0
+  (cd "${BENCH_DIR}" && uv run bench-gate suite \
+    "${partial_args[@]}" \
+    --partial "${note}" \
+    --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
+    --json-out "${ARTIFACT_DIR}/eval-verdict.json") >/dev/null || suite_status=$?
+  # 1 (the covered cases are red) and 2 (not evaluated) are returned after the
+  # table is written; only a table that never landed is worth a warning.
+  [ -f "${ARTIFACT_DIR}/eval-verdict.md" ] || \
+    echo "WARNING: the partial verdict table could not be written (bench-gate suite --partial exited ${suite_status}); the graded cases are still in this log and in case-*.json."
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Eval ended before its verdict: ${graded} of ${total} cases graded, ${recorded} recorded to the baseline store; partial table in ${ARTIFACT_DIR}/eval-verdict.md ==="
+}
+
 # Print the profile on every exit — success, gate failure, or a set -e death —
 # then hand the original exit code to the artifact dumper ci-env.sh provides.
 #
@@ -651,6 +705,12 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 # baseline store the gate compares against is built from PASSING runs on main,
 # and those are exactly the records the old failure-only trap threw away. It
 # cannot precede the `$?` capture, so it sits immediately after it.
+# report_partial_verdict comes next, ahead of everything slow: on a deadline
+# kill the grace period is five minutes and the partial table is what a
+# cut-off night keeps (#1491). collect_gateway_log follows for the same reason
+# collect_bench_results runs on green: a green nightly whose repetitions ran to
+# the delegation ceiling used to leave no gateway log to say whether the worker
+# was starved by 429s or a stuck dispatcher.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -668,6 +728,8 @@ profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
   collect_bench_results
+  report_partial_verdict
+  collect_gateway_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -689,7 +751,12 @@ profile_and_dump_on_exit() {
 trap profile_and_dump_on_exit EXIT
 # A Prow deadline delivers SIGTERM, which does not run the EXIT trap on its
 # own; converting it to an exit is what lets the artifact collection above
-# fire on a deadline kill.
+# fire on a deadline kill. The fan-out's background units are not killed by
+# it: they run on until Prow's grace period (5m on the nightly) ends, and the
+# entrypoint waits for them because they hold this job's stdout -- on the
+# night of 2026-09-21 six units finished up to three minutes after the trap
+# had run. A unit that completes its case in that window grades it itself
+# (finish_case), so its block lands in this log after the cut-off line.
 trap 'exit 143' TERM INT
 
 # ─── Boskos lease heartbeat for the eval's own lifetime ──────────────────────
@@ -760,12 +827,15 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # still parked outside the matrix, and that was the point: the warnings it
 # prints per project ("carries no clusters labelled environment=seeded") are
 # how a pool project still needing bench/tf/fleet applied was found BEFORE
-# these tasks started gating PRs rather than after. Eleven of the active
-# tasks below read the seeded fleet (six domain probes, the fleet-audits
-# canary, cluster-agent-crashloop-debug and the three cluster-debugging
-# cases beside it), so those warnings have consumers. It costs one
-# clusters.list, one get-credentials per seeded cluster, and one namespace
-# read per probe -- seconds, against a job measured in tens of minutes.
+# these tasks started gating PRs rather than after. Most of the active
+# tasks below read the seeded fleet -- the six domain probes, the
+# cluster-debugging cases, the incident-triage probe over the same
+# crashloop, the reliability variation that proposes a fix for the same
+# plant, and in the nightly the full audits and the two remediation
+# writers -- so those warnings have consumers.
+# It costs one clusters.list, one get-credentials per seeded cluster, and
+# one namespace read per probe -- seconds, against a job measured in tens
+# of minutes.
 #
 # The `||` catches a REPOSITORY bug only: a missing or malformed
 # bench/tf/fleet/fixtures.json, or an unusable output directory. Every
@@ -1282,7 +1352,10 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # seat on that record; measured cost, presubmit redundancy or grading
 # something outside the core journeys keep a case there for good. The file's
 # header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=6 (#1491), and that is the copy to keep current.
+# at EVAL_TASK_PARALLELISM=6 (#1491; oss-test-infra#2707, open, moves it to
+# 8), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# presubmit file is the blocking roster and nothing else, so this file is
+# also where every held-out case lives, with its hold-out reason.
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -1421,6 +1494,47 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # The expensive term is instead compliance-rbac-overgrant at 2042s for three
 # repetitions (681s each), which is 24% of the whole task budget on its own.
 #
+# 2026-09-22: incident-triage-oom-event-probe moved in from the nightly
+# (#1023), the nineteenth case, measured rather than projected. Under the
+# fan-out at parallelism 4 the serial arithmetic above no longer prices the
+# job: the 14 green presubmits of 09-19 to 09-21 ran the fan-out in
+# 6073-10940s (median 8147s) against the 360m deadline, with ~15min of build
+# and deploy outside it. This case cost 737/599/1357s a repetition in its
+# one presubmit run and 529-2808s on the four graded nights, so three
+# repetitions add ~1800-4100s of lane time (~8-17min of wall clock at four
+# lanes; up to ~35min if it runs at its nightly maximum). Hinted at 700, the
+# presubmit's largest, it launches first in each repetition round, and its
+# presubmit band ends well inside the shortest round-3 tail measured (first
+# rep-3 launch to the fan-out's end: 2118-5849s in those 14 runs); only a
+# repetition at the nightly maximum (2808s) could outlast that tail and make
+# it the last unit, by minutes. No Prow deadline change rides with this
+# activation. (The same pull request first moved pdb-remediation-pr in
+# beside it, hinted at 1250, and withdrew that before merge: its record was
+# graded by the check #1780 replaced; nightly-cases.txt carries the note.)
+#
+# Later on 2026-09-22 the presubmit became the BLOCKING ROSTER ONLY (#1023,
+# the eval crew's call): the seven held-out cases it had been running
+# without letting them block -- security-overgrant-remediation-proposal,
+# #1049's three obtainability variations, rca-remediation-pr, the
+# compliance-rbac-overgrant canary and cluster-agent-healthy-workload-no-
+# finding -- moved to nightly-cases.txt with their hold-out reasons, and the
+# arithmetic above is for a matrix that no longer runs here. TWELVE tasks,
+# 36 units, against the same 360m deadline. What left: ~21 units at
+# 178-1002s median a repetition (the canary's 1002s and p90 2074s the
+# largest), roughly 7200-9000s of lane time, ~30-38min of wall clock at four
+# lanes -- and, more to the point, the critical path. Over the 385
+# presubmit runs of 09-04 to 09-15 the last unit to finish was
+# obtainability-healthy-namespace-silence or obtainability-fleet-exposure-
+# sweep in 81% of them (200-hinted, so launched at the tail of round 3);
+# both are gone, so the tail is now one of the nine 200-hinted units still
+# here, launched after incident-triage (700), capacity (540) and
+# consistency (300) in each round, or the incident probe itself on a
+# repetition at its nightly maximum. The span the 14 green presubmits of
+# 09-19 to 09-21 measured (6073-10940s) priced the eighteen-case matrix's
+# fifty-four units; the first runs of the twelve-case matrix measure the
+# new one, and until they have, this note is the projection rather than the
+# record. Still no Prow deadline change: the matrix shrank.
+#
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
 # pull request. It is not a legitimate default: at 1 the collapse rung
@@ -1521,9 +1635,10 @@ esac
 # list in the file, the prose there. hack/OWNERS puts the file under the
 # eval-crew alias (#1546).
 #
-# Demoting a flaky case is a one-line same-day edit: delete its name from
-# the file, referencing the issue that names its re-admission condition
-# and citing what the record says about it.
+# Demoting a flaky case is a same-day edit: delete its name from that file
+# and its line from presubmit-cases.txt, add the line to nightly-cases.txt
+# with the issue that names its re-admission condition as the # line above
+# it, and cite what the record says about it.
 #
 # A name that is not a presubmit case stops the job here: a misspelled entry
 # would otherwise arm nothing and look like a working roster, and a nightly
@@ -1587,6 +1702,33 @@ ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
 mkdir -p "${ARTIFACT_DIR}"
 CASE_RESULTS=()
 
+# Whether this run appends to the baseline store, decided once here and read
+# by record_case inside the fan-out and by the record step after it. The three
+# conditions -- a main-branch job type, no PULL_NUMBER, no release candidate --
+# and why each one is there are explained at that step ("Baseline collection",
+# below the fan-out).
+case "${JOB_TYPE:-}" in
+  postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
+  *) EVAL_IS_MAIN_RUN="false" ;;
+esac
+if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+# The commit each line is stamped with. A postsubmit carries it as
+# PULL_BASE_SHA; a periodic carries neither that nor PULL_PULL_SHA (Prow's
+# EnvForSpec returns before setting them for JOB_TYPE=periodic), so
+# `bench-gate record`'s own default would leave the nightly's evidence
+# unattributed. extra_refs has checked out main's head, so HEAD is the
+# commit the run measured.
+EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)}"
+# What this run has appended so far: one line per case and version key,
+# written by `bench-gate record --recorded-manifest` after each append and read
+# back by every later call, so a case recorded when it was graded is skipped by
+# the record step after the fan-out and nothing is appended twice. An
+# artifact, so a night's record is reviewable beside its verdict, and what the
+# cut-off line counts as "recorded".
+EVAL_RECORDED_MANIFEST="${ARTIFACT_DIR}/baseline-recorded.jsonl"
+
 # ─── Parallel fan-out ─────────────────────────────────────────────────────────
 # The schedulable unit is one (task, repetition): every invocation is an
 # independent agent conversation, and the agent span is ~98% of its wall clock
@@ -1616,10 +1758,20 @@ unit_cost_hint() {
     # nightly 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
+    consistency-no-environment-label) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
+    # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
+    # presubmit before that. The canary measured 1002s median, 2074s p90,
+    # over 903 presubmit repetitions 2026-09-04 to 09-15; the hint stays at
+    # the 700 it carried as a presubmit case until the nightly record says
+    # otherwise.
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
-    # Nightly-only. Measured 980-1929s across build 2099539376672346112's
-    # three repetitions (267-559s in August); median of the September run.
+    # Nightly-only. The 2026-09-22 promotion (#1023) was withdrawn before
+    # merge: its record was graded by the check #1780 replaced. Measured
+    # 980-1929s across build 2099539376672346112's three repetitions (267-559s
+    # in August); median of the September run, kept although the four graded
+    # nights of 09-16 to 09-20 ran 420-1153s, until the nightly record under
+    # pull_request_opened says otherwise.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
@@ -1634,9 +1786,12 @@ unit_cost_hint() {
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
-    # Nightly-only since 2026-09-15. Median of its first three measured
-    # repetitions (737/599/1357s, build 2099969322708373504); the 200s
-    # default under-packs it by 3x.
+    # Presubmit since 2026-09-22 (#1023), nightly-only from 2026-09-15 before
+    # that. Median of its three measured presubmit repetitions (737/599/1357s,
+    # build 2099969322708373504); the 200s default under-packs it by 3x. The
+    # four graded nights ran 529-2808s a repetition at parallelism 6 beside
+    # the tofu cases; the hint stays at the presubmit measurement until the
+    # presubmit record says otherwise.
     incident-triage-oom-event-probe) echo 700 ;;
     *) echo 200 ;;
   esac
@@ -1645,7 +1800,7 @@ unit_cost_hint() {
 # The harness's delegation ceiling for one unit, in seconds: how long
 # devops-bench keeps polling the Platform Agent for a delegated worker before
 # it grades whatever the parent has said so far. Every unit inherits the
-# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the six
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the seven
 # full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
 # a ledger write, one closing line -- get 3000s.
 #
@@ -1678,6 +1833,7 @@ unit_delegation_timeout() {
   case "$1" in
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
+    consistency-no-environment-label) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
@@ -1759,6 +1915,108 @@ lock_acquire() { # <dir> [deadline-seconds]
 }
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 
+# ─── Per-case grading and recording, inside the fan-out ─────────────────────
+# A case is graded the moment its last repetition finishes, by the unit that
+# finished it, not in one serial pass after the fan-out. Two reasons, both from
+# the nightly (#1491):
+#   - the serial pass ran off the critical path's end: 2217s over 41 cases on
+#     the night of 2026-09-20 (one store read per `bench-gate case`), all of
+#     it after the last unit and all of it inside the 480m budget. In the
+#     lanes it overlaps units that are still running.
+#   - a Prow deadline kills the fan-out before that pass. The nights of
+#     2026-09-18 and 09-21 finished 105 and 122 units and recorded nothing,
+#     because the case JSON, the baseline line and the verdict table were all
+#     downstream of `wait`. Graded per case, everything a finished case
+#     produces exists before the deadline can arrive, and the EXIT trap's
+#     report_partial_verdict tables it.
+# grade_case is the same grading the loop after the fan-out runs, and that loop
+# still runs it for any case the fan-out did not finish: a repetition that gave
+# up on its lock wrote no state, so its case never reaches the count in
+# run_one_unit and is graded after the fan-out with that repetition MISSING,
+# exactly as before. The `.graded` sentinel beside the state files is what
+# tells the two apart, there and in the trap.
+grade_case() { # <task-path> <task-name>
+  local task="$1" name="$2" rep run_dir start_ms end_ms rep_result
+  local result_args=()
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${name} (${task}) x${EVAL_REPETITIONS} <<<"
+  # One --result per repetition, positionally. A repetition that produced no
+  # run directory contributes the literal MISSING, so the gate can tell "died
+  # before writing anything" from "wrote an unusable record". The harness log
+  # is kept for every repetition, green ones included: a green record is the
+  # raw material for the baseline store.
+  for rep in $(seq 1 "${EVAL_REPETITIONS}"); do
+    run_dir="$(cat "${STATE_DIR}/${name}.rep${rep}.dir" 2>/dev/null || true)"
+    start_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.start" 2>/dev/null || echo 0)"
+    end_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.end" 2>/dev/null || echo 0)"
+    rep_result=""
+    [ -n "${run_dir}" ] && rep_result="${run_dir}/results.json"
+    analyze_eval_phases "/tmp/eval_${name}_rep${rep}.log" "${start_ms}" "${end_ms}" "${name} rep ${rep}" "${rep_result}"
+    if [ -n "${run_dir}" ]; then
+      result_args+=(--result "${run_dir}")
+      cp "${run_dir}/results.json" "results_${name}_rep${rep}.json" 2>/dev/null || true
+    else
+      result_args+=(--result MISSING)
+    fi
+  done
+  # The verdict. bench-gate exits 0 for ANY verdict it could reach, including a
+  # blocking one; it exits 2 only when it could not grade at all, which must
+  # stop the job -- and does, when the loop after the fan-out calls this under
+  # errexit. Inside the fan-out (finish_case) the same 2 leaves the case for
+  # that loop, which reaches the same 2 and stops the job there.
+  (cd "${BENCH_DIR}" && uv run bench-gate case \
+    --task "${task}" \
+    "${result_args[@]}" \
+    --json-out "${ARTIFACT_DIR}/case-${name}.json")
+}
+
+# One case's baseline line, under the same three conditions as the record step
+# after the fan-out (EVAL_IS_MAIN_RUN, decided above it) and never fatal: an
+# append that fails here is retried by that step, which passes the same
+# manifest and so appends only what is not in it yet.
+record_case() { # <task-name>
+  if [ "${EVAL_IS_MAIN_RUN}" != "true" ] || [ -n "${PULL_NUMBER:-}" ]; then
+    return 0
+  fi
+  (cd "${BENCH_DIR}" && uv run bench-gate record \
+    --case-result "${ARTIFACT_DIR}/case-${1}.json" \
+    ${EVAL_RECORD_COMMIT:+--commit "${EVAL_RECORD_COMMIT}"} \
+    --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl" \
+    --recorded-manifest "${EVAL_RECORDED_MANIFEST}") || \
+    echo "WARNING: recording ${1}'s baseline evidence failed; the record step after the fan-out retries it."
+}
+
+# Grade one finished case and, on a main run, record it. One case at a time:
+# `bench-gate case` reads the whole store (up to sixteen gcloud processes for a
+# GCS store), and six lanes finishing together would run six of those at once;
+# serialized, the load is the old loop's, just earlier. The lock keeps two
+# gradings apart; it is not what keeps one case's block contiguous in the job
+# log, since the launcher's `>>>` and the other lanes' `<<<` lines never take
+# it. That is the single `cat` below: a block under PIPE_BUF (4096 bytes; the
+# fixtures measure 448-1524) reaches the stdout pipe in one write. It matters
+# because scripts/eval_dashboard/collect.py attaches `rep N:` lines to the
+# `Task <name> Result:` line above them and closes the block at the next
+# `>>>`/`===`/`---` header, so a launch marker landing inside a block would
+# orphan the rest of it -- keep the block small. A lock whose holder died is a
+# throttle failure, not a reason to skip the grading. The sentinel is written only on a
+# grading that produced its JSON; anything else is left for the loop after the
+# fan-out, and says so.
+finish_case() { # <task-path> <task-name>
+  local task="$1" name="$2" status=0
+  # Its own `local`: the words of one `local` are expanded before any of
+  # them is assigned, so `${name}` on the same line as `name="$2"` is unbound.
+  local block="${STATE_DIR}/${name}.grading"
+  lock_acquire "${STATE_DIR}/lock-grade" 1800 || true
+  if grade_case "${task}" "${name}" > "${block}" 2>&1; then
+    : > "${STATE_DIR}/${name}.graded"
+    record_case "${name}" >> "${block}" 2>&1 || true
+  else
+    status=$?
+    echo "WARNING: grading ${name} inside the fan-out failed (status ${status}); it is graded again after the fan-out." >> "${block}"
+  fi
+  cat "${block}"
+  lock_release "${STATE_DIR}/lock-grade"
+}
+
 run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq>
   local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6"
   local log="/tmp/eval_${name}_rep${rep}.log"
@@ -1818,19 +2076,33 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
-  [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
-  lock_release "${STATE_DIR}/lock-task-${name}"
   # `|| true`: a run that never printed a `results:` line must still write
   # its state files and reach the artifact copy -- it is exactly the crashed
   # run someone will need the log for.
   dir="$(grep -oE 'results: [^ ]*/results\.json' "${log}" | tail -1 | sed -e 's/^results: //' -e 's|/results\.json$||' || true)"
+  # Written while this unit still holds the task lock, and counted under it:
+  # repetitions of one task write their state files serially, so exactly one
+  # of them -- the last to finish -- sees the count reach EVAL_REPETITIONS,
+  # and that one grades the case (finish_case, once the locks are released).
+  # A repetition that gave up on its lock returned above without a state
+  # file, so its case never reaches the count and is graded after the
+  # fan-out instead, that repetition MISSING.
   printf '%s\n' "${start}" > "${STATE_DIR}/${name}.rep${rep}.start"
   printf '%s\n' "${end}" > "${STATE_DIR}/${name}.rep${rep}.end"
   printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir"
+  local finished_reps=0 state
+  for state in "${STATE_DIR}/${name}".rep*.end; do
+    [ -e "${state}" ] && finished_reps=$((finished_reps + 1))
+  done
+  [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  lock_release "${STATE_DIR}/lock-task-${name}"
   # Copied here, not in the grading pass: a Prow deadline that kills the
   # fan-out must still leave every completed unit's log in the artifacts.
   cp "${log}" "${ARTIFACT_DIR}/eval_${name}_rep${rep}.log" 2>/dev/null || true
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] finished ${name} rep ${rep} in $(((end - start) / 1000))s"
+  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    finish_case "${task}" "${name}"
+  fi
 }
 
 # Rep-ascending FIRST, cost-descending within a rep: repetitions of one task
@@ -1867,43 +2139,21 @@ EOF_UNIT_QUEUE
 wait
 
 # ─── Per-case verdicts, in the order TASKS declares ───────────────────────────
+# Most cases were graded inside the fan-out by the unit that finished them
+# (finish_case); this pass grades the rest -- a case with a repetition that
+# gave up on its lock, or whose in-lane grading failed -- and collects every
+# case's JSON, in TASKS order, for the suite.
 profile_begin "per-repetition breakdowns + case verdicts"
 i=0
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="${TASK_NAMES[i]}"
   i=$((i + 1))
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${TASK_NAME} (${TASK}) x${EVAL_REPETITIONS} <<<"
-
-  # One --result per repetition, positionally. A repetition that produced no
-  # run directory contributes the literal MISSING, so the gate can tell "died
-  # before writing anything" from "wrote an unusable record". The harness log
-  # is kept for every repetition, green ones included: a green record is the
-  # raw material for the baseline store.
-  RESULT_ARGS=()
-  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    EVAL_LOG="/tmp/eval_${TASK_NAME}_rep${REP}.log"
-    NEW_RUN_DIR="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.dir" 2>/dev/null || true)"
-    RUN_START_MS="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.start" 2>/dev/null || echo 0)"
-    RUN_END_MS="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.end" 2>/dev/null || echo 0)"
-    REP_RESULT=""
-    [ -n "${NEW_RUN_DIR}" ] && REP_RESULT="${NEW_RUN_DIR}/results.json"
-    analyze_eval_phases "${EVAL_LOG}" "${RUN_START_MS}" "${RUN_END_MS}" "${TASK_NAME} rep ${REP}" "${REP_RESULT}"
-    if [ -n "${NEW_RUN_DIR}" ]; then
-      RESULT_ARGS+=(--result "${NEW_RUN_DIR}")
-      cp "${NEW_RUN_DIR}/results.json" "results_${TASK_NAME}_rep${REP}.json" 2>/dev/null || true
-    else
-      RESULT_ARGS+=(--result MISSING)
-    fi
-  done
-
-  # The verdict. bench-gate exits 0 for ANY verdict it could reach, including a
-  # blocking one; it exits 2 only when it could not grade at all, which must
-  # stop the job.
   CASE_JSON="${ARTIFACT_DIR}/case-${TASK_NAME}.json"
-  (cd "${BENCH_DIR}" && uv run bench-gate case \
-    --task "${TASK}" \
-    "${RESULT_ARGS[@]}" \
-    --json-out "${CASE_JSON}")
+  if [ -f "${STATE_DIR}/${TASK_NAME}.graded" ] && [ -f "${CASE_JSON}" ]; then
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${TASK_NAME}: graded inside the fan-out when its last repetition finished; its block is above <<<"
+  else
+    grade_case "${TASK}" "${TASK_NAME}"
+  fi
   CASE_RESULTS+=(--case-result "${CASE_JSON}")
 done
 
@@ -1949,27 +2199,21 @@ profile_begin "record + final gate"
 # build a sample came from, so an RC record and a main record are the same
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
-case "${JOB_TYPE:-}" in
-  postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
-  *) EVAL_IS_MAIN_RUN="false" ;;
-esac
-if [ -n "${RC_COMMIT_SHA:-}" ]; then
-  EVAL_IS_MAIN_RUN="false"
-fi
+#
+# The decision itself (EVAL_IS_MAIN_RUN) and the commit stamp are taken above
+# the fan-out, because record_case appends each case's line inside it as soon
+# as the case is graded. This pass covers what the fan-out did not record --
+# a case graded in the loop above, or an append that failed in the lane -- and
+# passes the same manifest, so a case already recorded is skipped, not
+# appended twice.
 if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
-  # The commit each line is stamped with. A postsubmit carries it as
-  # PULL_BASE_SHA; a periodic carries neither that nor PULL_PULL_SHA (Prow's
-  # EnvForSpec returns before setting them for JOB_TYPE=periodic), so
-  # `bench-gate record`'s own default would leave the nightly's evidence
-  # unattributed. extra_refs has checked out main's head, so HEAD is the
-  # commit the run measured.
-  EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)}"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
   (cd "${BENCH_DIR}" && uv run bench-gate record \
     "${CASE_RESULTS[@]}" \
     ${EVAL_RECORD_COMMIT:+--commit "${EVAL_RECORD_COMMIT}"} \
-    --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
+    --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl" \
+    --recorded-manifest "${EVAL_RECORDED_MANIFEST}") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 elif [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
@@ -2030,6 +2274,9 @@ announce_suite_verdict() {
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 SUITE_STATUS=0
+# From here the run writes its own verdict; the EXIT trap's cut-off report
+# (report_partial_verdict) must not overwrite it with a partial one.
+EVAL_SUITE_REACHED=1
 (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \

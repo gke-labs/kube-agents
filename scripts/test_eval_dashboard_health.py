@@ -75,6 +75,20 @@ EMPTY_RECORD = "the record is not evidence of a real agent run: the trajectory i
 NEVER_RAN = "the record shows no agent ever ran: the trajectory is empty and tokens.total is 0"
 RETRIES = "the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): "
 GRADED_FAIL = "VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent"
+# The scorer's delegation-ceiling marker, read out of its source: this test
+# does not import the bench package, and the literal must not drift.
+SCORER = pathlib.Path(__file__).resolve().parent.parent / "bench" / "kube_agents_bench" / "scoring.py"
+
+
+def _scorer_ceiling_marker() -> str:
+    for line in SCORER.read_text(encoding="utf-8").splitlines():
+        if line.startswith("DELEGATION_CEILING_MARKER = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"DELEGATION_CEILING_MARKER not found in {SCORER}")
+
+
+SCORER_CEILING_MARKER = _scorer_ceiling_marker()
+CEILING = f"{SCORER_CEILING_MARKER}: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +100,7 @@ REP_LETTER = {
     "f": {"result": "fail", "reason": GRADED_FAIL},
     "i": {"result": "infra", "reason": RETRIES},
     "e": {"result": "fail", "reason": EMPTY_RECORD},
+    "c": {"result": "infra", "reason": CEILING},
 }
 
 
@@ -128,8 +143,10 @@ def green_tasks():
 
 
 def full_tasks():
-    """Eighteen passing cases: a full run in rule 7's sense (SLOW_MIN_TASKS)."""
-    return [task(f"case-{k}", "ppp") for k in range(18)]
+    """A full run in rule 7's sense: eighteen passing cases (the presubmit's
+    size when these fixtures were cut), or one above the floor read from the
+    presubmit file once the roster grows past that."""
+    return [task(f"case-{k}", "ppp") for k in range(max(18, health.SLOW_MIN_TASKS + 1))]
 
 
 def broken_tasks(cases):
@@ -171,6 +188,20 @@ class RepKinds(unittest.TestCase):
         self.assertTrue(health.Task({"name": "x", "result": "fail"}).collapsed)
         self.assertEqual(health.Task({"name": "x", "result": "infra"}).storms, 1)
         self.assertFalse(health.Task({"name": "x", "result": "pass"}).collapsed)
+
+    def test_the_ceiling_marker_is_the_scorers(self):
+        self.assertEqual(health.DELEGATION_CEILING_MARKER, SCORER_CEILING_MARKER)
+
+    def test_a_ceiling_rep_is_its_own_kind_whatever_the_verdict_token(self):
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": CEILING}), "ceiling")
+        self.assertEqual(health.rep_kind({"result": "fail", "reason": CEILING}), "ceiling")
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": RETRIES}), "storm")
+
+    def test_ceiling_reps_are_neither_graded_nor_storms(self):
+        t = health.Task(task("x", "ccc"))
+        self.assertEqual((t.passes, t.fails, t.storms, t.ceilings, t.graded), (0, 0, 0, 3, 0))
+        self.assertFalse(t.collapsed, "nothing graded, nothing collapsed")
+        self.assertTrue(health.Task(task("x", "ffc")).collapsed, "a ceiling rep never softens a collapse")
 
 
 # --------------------------------------------------------------------------- #
@@ -325,6 +356,82 @@ class Storm(unittest.TestCase):
         # Three clean greens on new PRs after the storm: GREEN.
         doc["runs"] += [run(200 + i, 20 + i, later - timedelta(minutes=30 - 5 * i), result="SUCCESS", tasks=broken_tasks(set())) for i in range(3)]
         self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
+
+
+# --------------------------------------------------------------------------- #
+# Rule 2b: delegation ceiling
+# --------------------------------------------------------------------------- #
+
+
+class DelegationCeiling(unittest.TestCase):
+    """Rule 2 shape over ceiling reps (#1874, #1879): a fleet-wide worker
+    stall is named here instead of reading GREEN while every PR says
+    NOT EVALUATED."""
+
+    def wave(self, prs, reps_per_run, spread_minutes=20, letter="c", nightly=False):
+        runs = []
+        for i, pr in enumerate(prs):
+            tasks = [task(f"case-{k}", letter * 3) for k in range(reps_per_run // 3)]
+            tasks += [task(name, "ppp") for name in sorted(ADMITTED)]
+            doc = run(100 + i, pr, T0 - timedelta(minutes=spread_minutes * i), result="SUCCESS", tasks=tasks)
+            runs.append(dict(doc, tier="nightly", pr=None) if nightly else doc)
+        return data(*runs)
+
+    def test_fifteen_ceiling_reps_across_three_prs_degrade_under_their_own_name(self):
+        result = assess(self.wave([1, 2, 3], 6), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "delegation_ceiling"))
+        self.assertRegex(result["cause"], r"^delegation ceiling: 18 repetitions on 3 PRs ended with the worker still running \d\d:\d\d–\d\d:\d\d UTC$")
+        self.assertIn("delegation ceiling: 18 reps across 3 PRs ended with the worker still running", result["evidence"][0])
+        self.assertEqual((result["incident"]["reps"], result["incident"]["runs"], sorted(result["incident"]["prs"])), (18, 3, [1, 2, 3]))
+        self.assertEqual(result["failing_cases"], [], "a ceiling wave is no collapse")
+        self.assertFalse(any("quota storm" in line for line in result["evidence"]), "and no storm")
+
+    def test_the_thresholds_and_window_are_the_storms(self):
+        self.assertEqual((health.CEILING_MIN_REPS, health.CEILING_MIN_PRS, health.CEILING_WINDOW), (health.STORM_MIN_REPS, health.STORM_MIN_PRS, health.STORM_WINDOW))
+        self.assertEqual(health.CEILING_RUN_SIGNATURE_REPS, health.STORM_RUN_SIGNATURE_REPS)
+        self.assertEqual(assess(self.wave([1, 2, 3], 3), T0)["state"], "GREEN", "9 reps")
+        self.assertEqual(assess(self.wave([1, 2, 2], 6), T0)["state"], "GREEN", "2 PRs")
+        self.assertEqual(assess(self.wave([1, 2, 3, 4, 5], 3), T0)["state"], "DEGRADED", "15 reps on 5 PRs")
+        self.assertEqual(assess(self.wave([1, 2, 3], 6, spread_minutes=65), T0)["state"], "GREEN", "outside the 2h window")
+
+    def test_nightly_ceiling_reps_do_not_count(self):
+        self.assertEqual(assess(self.wave([None, None, None], 6, nightly=True), T0)["state"], "GREEN")
+
+    def test_the_storm_outranks_it_and_keeps_it_as_evidence(self):
+        doc = self.wave([1, 2, 3], 6)
+        stormy = [task(f"s-{k}", "eee") for k in range(2)] + [task(name, "ppp") for name in sorted(ADMITTED)]
+        doc["runs"] += [run(200 + i, 10 + i, T0 - timedelta(minutes=5 * i), result="SUCCESS", tasks=stormy) for i in range(3)]
+        result = assess(doc, T0)
+        self.assertEqual(result["condition"], "storm")
+        self.assertTrue(any(line.startswith("delegation ceiling: 18 reps") for line in result["evidence"]), result["evidence"])
+
+    def test_advice_points_at_the_gateway_log(self):
+        result = adjudicate(self.wave([1, 2, 3], 6), T0)
+        self.assertEqual(result["advice"], health.ADVICE_CEILING)
+        self.assertIn("#1879", result["advice"])
+        self.assertIn("NOT EVALUATED", result["advice"])
+
+    def test_the_wave_runs_themselves_do_not_count_as_its_recovery(self):
+        doc = self.wave([1, 2, 3], 6)
+        prev = adjudicate(doc, T0)
+        self.assertEqual(prev["state"], "DEGRADED")
+        later = T0 + timedelta(hours=2, minutes=1)
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["condition"], held["recovering"]), ("DEGRADED", "delegation_ceiling", True), held)
+        doc["runs"] += [run(200 + i, 20 + i, later - timedelta(minutes=30 - 5 * i), result="SUCCESS", tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
+
+    def test_a_green_run_with_five_ceiling_reps_still_carries_the_wave(self):
+        doc = self.wave([1, 2, 3], 6)
+        prev = adjudicate(doc, T0)
+        later = T0 + timedelta(hours=2, minutes=1)
+        held = adjudicate(doc, later, prev)
+        doc["runs"] += [
+            run(200 + i, 20 + i, later - timedelta(minutes=30 - 5 * i), result="SUCCESS",
+                tasks=broken_tasks(set()) + ([task("slow", "ccccc")] if i == 1 else []))
+            for i in range(3)
+        ]
+        self.assertEqual((adjudicate(doc, later, held)["state"], adjudicate(doc, later, held)["recovering"]), ("DEGRADED", True))
 
 
 # --------------------------------------------------------------------------- #
@@ -723,6 +830,21 @@ class Metrics(unittest.TestCase):
         doc = data(run(1, 1, T0 - timedelta(hours=1), result="SUCCESS", tasks=tasks))
         self.assertEqual(adjudicate(doc, T0)["metrics"]["infra_rep_rate"], round(5 / 9, 3))
 
+    def test_ceiling_reps_are_counted_apart_from_the_storms(self):
+        """Fifteen ceiling reps across three PRs are rule 2b's condition, not
+        rule 2's: the storm count and rate stay at zero and the digest
+        carries them under their own key."""
+        runs = [
+            run(k, 100 + k, T0 - timedelta(minutes=10 * k), result="SUCCESS",
+                tasks=green_tasks() + [task("slow", "ccc"), task("slower", "cc")])
+            for k in range(1, 4)
+        ]
+        result = adjudicate(data(*runs), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "delegation_ceiling"))
+        self.assertEqual(result["metrics"]["infra_reps"], 0)
+        self.assertEqual(result["metrics"]["ceiling_reps"], 15)
+        self.assertEqual(result["metrics"]["infra_rep_rate"], 0.0)
+
 
 # --------------------------------------------------------------------------- #
 # Rule 7: slow gate
@@ -777,15 +899,33 @@ class SlowGate(unittest.TestCase):
         # is waiting on them.
         self.assertIsNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=6)), T0)["slow"])
         self.assertIsNotNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=5)), T0)["slow"])
-        # Ten cases is a run Prow cut short, not a full run, and an aborted
-        # run concluded nothing: the newest five full runs are then the
-        # baseline's own, at the typical length.
-        short = [task(f"case-{k}", "ppp") for k in range(10)]
+        # A run one case under the floor is a run Prow cut short, not a full
+        # run (the floor follows the presubmit file, one below its count), and
+        # an aborted run concluded nothing: the newest five full runs are then
+        # the baseline's own, at the typical length.
+        short = [task(f"case-{k}", "ppp") for k in range(health.SLOW_MIN_TASKS - 1)]
         self.assertIsNone(adjudicate(self.week([200] * 5, tasks=short), T0)["slow"])
         doc = self.week([200] * 5)
         for aborted in doc["runs"][-5:]:
             aborted["result"] = "ABORTED"
         self.assertIsNone(adjudicate(doc, T0)["slow"])
+
+    def test_the_floor_sits_one_demotion_below_the_live_presubmit(self):
+        # Since 2026-09-22 the presubmit runs the blocking roster only (twelve
+        # cases, #1023) and the floor is read from the presubmit file rather
+        # than pinned: a full-roster run is a full run, one demotion away it
+        # still is, and two demotions away (the ten-case run Prow cut short
+        # above, today) is not. A literal floor of 15 would never see a full
+        # run and the rule would go silent; a literal of any size would need
+        # an edit here on every admission or demotion.
+        n = len(health.eval_rosters.presubmit_cases())
+        self.assertGreaterEqual(n, 3)
+        full = [task(f"case-{k}", "ppp") for k in range(n)]
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=full), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=full[: n - 1]), T0)["slow"])
+        self.assertIsNone(adjudicate(self.week([200] * 5, tasks=full[: n - 2]), T0)["slow"])
+        self.assertEqual(health.SLOW_MIN_TASKS, n - 1, "one demotion below the live presubmit roster, on purpose")
+        self.assertEqual(health._slow_min_tasks(), n - 1)
 
     def test_an_episode_holds_until_the_median_is_under_1_1x_and_keeps_its_start(self):
         first = adjudicate(self.week([180] * 5), T0)

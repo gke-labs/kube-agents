@@ -134,7 +134,11 @@ readonly RESOLVE_SCRIPT="resolve-rc-target.sh"
 # only meaning 2 has. So the driver also reads `outcome` from the verdict
 # JSON bench-gate writes beside the markdown, as ci-eval-pr.sh itself does
 # before announcing the verdict. Any other non-zero status, and a 2 the JSON
-# does not confirm, is a red.
+# does not confirm, is a red. Nor does a partial JSON confirm it: a run that
+# ends after its fan-out began and before its own suite step (a deadline, a
+# `bench-gate case` that could not grade) leaves the EXIT trap's cut-off table
+# in the same two files, marked `partial: true`, and its `outcome` is the
+# graded subset's, not the run's.
 readonly EVAL_NOT_EVALUATED_STATUS=2
 readonly EVAL_NOT_EVALUATED_OUTCOME="not_evaluated"
 readonly RC_VERDICT_JSON_FILE="eval-verdict.json"
@@ -145,7 +149,7 @@ readonly RC_VERDICT_JSON_FILE="eval-verdict.json"
 main() {
   local script_dir repo_root rc_commit_sha rc_tag original_ref
   local artifacts_dir summary_path verdict_path deck_url
-  local deploy_status eval_status verdict
+  local deploy_status eval_status eval_partial verdict
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   repo_root="$(cd "${script_dir}/.." && pwd)"
@@ -277,15 +281,21 @@ main() {
   # the one reading that matters, because the whole lane exists to answer
   # "is this candidate worse than main".
   eval_status=0
+  eval_partial=0
   if [ "${deploy_status}" -ne 0 ]; then
     verdict="NOT RUN"
     echo "ERROR: deploying ${rc_tag} (${rc_commit_sha:0:7}) failed with status ${deploy_status}, so the candidate was never evaluated. This is not a verdict on the candidate." >&2
   else
     echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Evaluating release candidate ${rc_commit_sha:0:7} (tier: ${RC_EVAL_TIER}) ==="
     "${script_dir}/${EVAL_SCRIPT}" || eval_status=$?
+    if [ -n "${artifacts_dir}" ] && [ -f "${artifacts_dir}/${RC_VERDICT_JSON_FILE}" ] && \
+      python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("partial") else 1)' \
+        "${artifacts_dir}/${RC_VERDICT_JSON_FILE}" 2>/dev/null; then
+      eval_partial=1
+    fi
     if [ "${eval_status}" -eq 0 ]; then
       verdict="GREEN"
-    elif [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ] && [ -n "${artifacts_dir}" ] && \
+    elif [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ] && [ "${eval_partial}" -eq 0 ] && [ -n "${artifacts_dir}" ] && \
       python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("outcome") == sys.argv[2] else 1)' \
         "${artifacts_dir}/${RC_VERDICT_JSON_FILE}" "${EVAL_NOT_EVALUATED_OUTCOME}" 2>/dev/null; then
       # The same reading as the failed deploy above, one step later: the eval
@@ -293,7 +303,8 @@ main() {
       # no judgement on the candidate. RED would send someone to look for a
       # regression in a build this run never measured. Only with the JSON's
       # word for it (see EVAL_NOT_EVALUATED_STATUS): a 2 without it, or a run
-      # outside Prow with no ARTIFACTS to find the JSON in, stays a RED.
+      # outside Prow with no ARTIFACTS to find the JSON in, stays a RED; so
+      # does a 2 whose JSON is the EXIT trap's partial table.
       verdict="NOT RUN"
       echo "NOTE: evaluating ${rc_tag} (${rc_commit_sha:0:7}) could not certify a verdict (status ${eval_status}): an admitted case lost every repetition to infrastructure. This is not a verdict on the candidate; rerun when the environment is healthy." >&2
     else
@@ -347,7 +358,11 @@ main() {
         echo "the environment is healthy."
         echo
       fi
-      if [ -f "${verdict_path}" ]; then
+      if [ -f "${verdict_path}" ] && [ "${eval_partial}" -eq 1 ]; then
+        echo "The run did not reach its verdict step. The cases graded before it"
+        echo "ended are tabled in \`${RC_VERDICT_FILE}\` alongside this file, under"
+        echo "a PARTIAL banner; the build log above is where it stopped."
+      elif [ -f "${verdict_path}" ]; then
         echo "Per-case detail is in \`${RC_VERDICT_FILE}\` alongside this file."
       elif [ "${deploy_status}" -ne 0 ]; then
         echo "The candidate was never evaluated: deploying it failed with"

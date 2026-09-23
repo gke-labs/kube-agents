@@ -46,7 +46,11 @@ Environment:
     AGENT_DELEGATION_TIMEOUT: Total seconds to wait for delegated work across
         all status turns (default ``1800``). ``0`` disables waiting, restoring
         the single-turn behaviour.
-    AGENT_DELEGATION_POLL_INTERVAL: Seconds between status turns (default ``30``).
+    AGENT_DELEGATION_POLL_INTERVAL: Seconds between board reads while delegated
+        work is awaited (default ``30``). Each read is a ``kubectl exec``
+        against the agent's kanban store; a status turn through the model is
+        made only when a read shows a card settled, or when the board cannot
+        be read at all.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
     AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
@@ -136,7 +140,7 @@ from devops_bench.agents import AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import transcript, worker_trajectory
+from kube_agents_bench import board, transcript, worker_trajectory
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -230,6 +234,16 @@ _RUN_ID_HEX_WIDTH = 12
 # so a deadline of grace plus margin would grade every queued unit of a
 # parallel run as a timeout.
 _INJECT_DEFAULT_TIMEOUT = "1800"
+# Leads the deadline error when the delegation wait ran out and no awaited
+# card had delivered anything: the graded output is then the front door's
+# acknowledgement alone, which is no answer to grade for or against the agent
+# under test. ``scoring.py`` matches this string and classifies the repetition
+# as its own infrastructure class, apart from the transport marker above (the
+# agent was reached and its worker was still running). A ceiling hit after a
+# partial delivery -- a fan-out with some cards finished -- carries no marker
+# and grades as before. Duplicated in ``scoring.py`` for the same reason as
+# the marker above; ``test_scoring.py`` asserts the two strings agree.
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
@@ -581,9 +595,13 @@ def _canonical_session_tokens(
 
 
 # A card in one of these has stopped moving on its own: done and archived are
-# finished, and blocked needs a human. The other hermes statuses (triage, todo,
-# ready, running) still have a worker or the dispatcher behind them.
-_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
+# finished, blocked needs a human, and failed and cancelled are hermes' own
+# terminal failures (agents/platform/scripts/kanban_workspace_gc.py names the
+# same set). The other hermes statuses (triage, todo, ready, running) still
+# have a worker or the dispatcher behind them. A failed card left out of this
+# set would run the wait to its ceiling and grade as the harness's, not the
+# worker's.
+_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
 
 # ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
 # can file a card can always read one back.
@@ -1768,14 +1786,16 @@ class KubeAgentsHarness(AgentHarness):
         trajectory afterwards, in :meth:`_settle`, read from their session
         stores rather than from any turn.)
 
-        The harness cannot read the board itself (in-cluster SQLite, with only
-        ``/v1/responses`` and ``/api/sessions`` exposed), so it asks the agent
-        to. ``turn`` issues one status turn -- on the api transport a re-POST
-        of the same stateful ``conversation`` so the agent keeps its context,
-        on the inject transport a further message on the same conversation --
-        and returns the parsed reply with its session id; ``reset`` respawns
-        the transport's tunnel between failed turns. Cards filed *during* a
-        status turn join the wait.
+        Each poll first reads the cards' statuses off the board itself
+        (:mod:`kube_agents_bench.board`, one ``kubectl exec`` and no model
+        turn). Only when a card has stopped moving -- or the board cannot be
+        read -- does the harness ask the agent. ``turn`` issues that status
+        turn -- on the api transport a re-POST of the same stateful
+        ``conversation`` so the agent keeps its context and can carry the
+        card's result back, on the inject transport a further message on the
+        same conversation -- and returns the parsed reply with its session
+        id; ``reset`` respawns the transport's tunnel between failed turns.
+        Cards filed *during* a status turn join the wait.
 
         A turn that fails in transport is retried up to
         :data:`_MAX_TRANSPORT_FAILURES` times running -- through a fresh
@@ -1820,6 +1840,12 @@ class KubeAgentsHarness(AgentHarness):
         silent = 0
         transport_failures = 0
         timed_out = True
+        # The freshest status seen for each card, from whichever source read
+        # it last -- the board or a status turn -- for the deadline report.
+        # ``statuses`` stays the agent's own readings, which are what settle a
+        # card: a board reading never retires a card from ``outstanding``,
+        # because only a status turn can carry the card's result back.
+        latest: dict[str, str] = dict(statuses)
         while outstanding:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1832,6 +1858,31 @@ class KubeAgentsHarness(AgentHarness):
             # Clamp the request to what is left, or a turn issued just before
             # the deadline could block for a further AGENT_HTTP_TIMEOUT and
             # overrun the total budget by that much.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            # Ask the board before asking the agent. A status turn replays the
+            # whole conversation through the model, so a card that runs for
+            # 45 minutes used to cost ~90 turns and millions of input tokens
+            # against the quota the worker under test shares. The board read
+            # is one kubectl exec and no tokens; the turn is spent only once
+            # the board says a card has stopped moving, since that is the one
+            # turn that can bring its result into the conversation. A read
+            # that fails, or does not know every outstanding card, decides
+            # nothing: the turn is made exactly as before, so the silent-turn
+            # ceiling still ends a wait on a card the agent cannot see.
+            on_board = board.read_statuses(_agent_shell, outstanding, _EXEC_TIMEOUT)
+            if on_board is not None:
+                latest.update(on_board)
+                if all(t in on_board for t in outstanding) and not any(
+                    on_board[t] in _TERMINAL_STATUSES for t in outstanding
+                ):
+                    continue
+
+            # The board read took its own time off the budget (up to
+            # _EXEC_TIMEOUT); clamp again so the turn cannot overrun the
+            # deadline by that much.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -1901,6 +1952,7 @@ class KubeAgentsHarness(AgentHarness):
             # reading the board pass as one still answering, and would mark
             # every turn after the first terminal card as settled.
             fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
+            latest.update(fresh_reported)
             _fold_status_turn(
                 result,
                 status_turn,
@@ -1936,11 +1988,18 @@ class KubeAgentsHarness(AgentHarness):
         # the budget is untouched, and claiming it ran out would misreport why
         # the run stopped.
         if outstanding and timed_out:
-            result.errors.append(
+            report = (
                 "delegated tasks did not finish within "
                 f"{delegation_timeout:.0f}s: "
-                + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
+                + ", ".join(f"{t} ({latest.get(t, 'unknown')})" for t in outstanding)
             )
+            # With nothing delivered the record holds the acknowledgement
+            # alone; the marker routes it to its own class in the scorer
+            # rather than a graded failure of the agent under test. A partial
+            # delivery keeps the plain report and grades on what arrived.
+            if not delivered_results(observed, awaited):
+                report = f"{DELEGATION_CEILING_MARKER}: {report}"
+            result.errors.append(report)
         self._settle(result, observed, awaited)
         return session_id
 

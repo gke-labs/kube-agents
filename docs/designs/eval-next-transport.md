@@ -47,14 +47,17 @@ endpoint from outside the cluster. It is also identical in both modes, because t
 renders the bus beside the agent and leaves the agent's HTTP server as it was.
 
 The reply it grades is the Responses payload. When the agent delegates by filing a kanban card,
-the harness re-prompts the same conversation every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30
-by default) with an instruction to call `kanban_show` on the outstanding ids, until every card
-reads done, blocked or archived or `AGENT_DELEGATION_TIMEOUT` elapses (1800 s by default, 2700 s
-in the presubmit, 3000 s for its six full-audit units). The delivered card results are appended
-to the answer, and the worker's report and terminal commands are read back with `kubectl exec` from
+the harness reads the outstanding cards' statuses off the agent's kanban store with `kubectl exec`
+every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30 by default), and re-prompts the same
+conversation with an instruction to call `kanban_show` only once a card reads done, archived,
+blocked, failed or cancelled (or when the store cannot be read or does not know a card), until
+every card has settled or
+`AGENT_DELEGATION_TIMEOUT` elapses (1800 s by default, 2700 s in the presubmit, 3000 s for its
+six full-audit units). The delivered card results are appended to the answer, and the worker's
+report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted. A customer sees the card result relayed to their thread; they never see the files, and
-the poll turns are model calls the customer never made.
+deleted. A customer sees the card result relayed to their thread; they never see the files, the
+store reads, or the collecting turn, which is a model call the customer never made.
 
 The consequence, measured: the presubmit matrix ran under `mode: next` with the A2A gateway in
 `ErrImagePull`, the auth callout in `ImagePullBackOff` and the provisioning Job in `Error`, and
@@ -436,10 +439,11 @@ project, because a Chat app configuration is per GCP project.
 
 ## Completion signals
 
-Today's wait costs one model turn per poll interval, notices completion only at a poll boundary,
-and slows down exactly when the agent is rate-limited, because the status question is itself a
-model call the agent has to answer. A delegated case that waits ten minutes spends about twenty
-turns asking.
+Today's wait costs one `kubectl exec` against the kanban store per poll interval and one model
+turn per card that settles (plus a turn whenever the store cannot be read or does not know a
+card), notices completion only at a poll boundary, and still needs that collecting turn, which
+slows down exactly when the agent is rate-limited. A delegated case that waits ten minutes spends
+about twenty store reads and one turn.
 
 On the bus a task has a lifecycle the requester can watch: `status-update` events, a `result`
 artifact, one terminal event with `final: true`, and `cancel` as a real envelope rather than a
@@ -462,11 +466,12 @@ ended and the card was filed, not that the work is done.
 
 Stage 1 handles that in three parts. The transport awaits the terminal of a named task id,
 "await the terminal of task X" rather than "await the task I submitted", for everything the
-executor does itself, which is most cases and removes the poll turns. For a terminal whose result
+executor does itself, which is most cases and removes the store reads and the collecting turn. For a terminal whose result
 names card ids, the case runner waits for the cards one hop further in, with the time cost above
 moved with it. Today's wait cannot be re-entered as it is: it is a method of the api transport
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
-`kanban_show` payloads in the trajectory, and gives up after three turns that report nothing, and
+the kanban store or from `kanban_show` payloads in the trajectory, and gives up after three status
+turns that report nothing, and
 on this path the trajectory holds no tool calls, only the lifecycle entries of step 4. Stage 1
 writes the wait again for the inject path: card ids and statuses read from the `result` text, the
 status question sent as a new turn on the same conversation key with its own backend message

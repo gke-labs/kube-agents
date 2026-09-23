@@ -25,7 +25,7 @@ import tempfile
 import unittest
 import unittest.mock
 import urllib.parse
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import render
 
@@ -50,6 +50,17 @@ SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
 SETUP_DEATH_BUILD = "2097273589702070272"
 SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
+
+
+# The scorer's marker-led reason for a delegation-ceiling repetition (#1874);
+# test_eval_dashboard_classify.py pins the literal against the scorer.
+CEILING_REASON = "KUBE_AGENTS_DELEGATION_CEILING: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
+
+
+def health_module_advice():
+    from eval_dashboard import health as health_module
+
+    return health_module.ADVICE_CEILING
 
 
 def health_doc(state="OUTAGE", **overrides):
@@ -501,6 +512,25 @@ class RenderedFilesTest(unittest.TestCase):
         self.assertNotRegex(script, r"prLink\([^)]*\)\s*\.replace", "prLink's anchor is markup, never stripped back to text")
 
 
+# The blocking roster as the split left it (test_eval_rosters.ROSTER_AT_SPLIT).
+# BrowserTest renders the fixture week against THIS roster, not the live
+# hack/eval/blocking-roster.txt: the run page counts gate cases from the
+# roster, so every admission since (#1023 admitted two on 2026-09-22) would
+# otherwise move the "10 gate cases" the expectations below pin.
+ROSTER_AT_SPLIT = frozenset({
+    "reliability-pdb-probe",
+    "security-overgrant-probe",
+    "upgrades-lagging-master-probe",
+    "consistency-authorized-networks-probe",
+    "cost-idle-pool-probe",
+    "obtainability-remediation-proposal",
+    "cluster-agent-crashloop-debug",
+    "cluster-agent-crashloop-misleading-symptom",
+    "cluster-agent-crashloop-evidence-chain",
+    "agent-kanban-smoke",
+})
+
+
 @unittest.skipUnless(chrome(), "headless Chrome not found")
 class BrowserTest(unittest.TestCase):
     """The pages as a browser renders them. Data: the real fixture week with
@@ -510,6 +540,8 @@ class BrowserTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        cls.roster_patch = unittest.mock.patch.object(render.classify, "admitted_cases", return_value=ROSTER_AT_SPLIT)
+        cls.roster_patch.start()
         data = load_fixture()
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "active": True} for n in CRASHLOOP_TRIO]
@@ -529,11 +561,79 @@ class BrowserTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.roster_patch.stop()
         cls.tmp.cleanup()
 
     def render_state(self, health, sub="s"):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
+
+    def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
+        """Ceiling reps sit under their own key in `reps` (#1874). The card's
+        totals must include them, or a three-rep case reads "all 0 reps lost
+        before grading" beside its delegation-ceiling tag."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        task["reps"] = [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (1, 2, 3)]
+        mixed = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[1])
+        mixed["reps"] = [{"n": 1, "result": "pass", "reason": None}, {"n": 2, "result": "pass", "reason": None}, {"n": 3, "result": "infra", "reason": CEILING_REASON}]
+        mixed["result"] = "pass"
+        out = render_to(pathlib.Path(self.tmp.name) / "ceiling", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps hit the delegation ceiling with the worker still running", page)
+        self.assertIn('class="tag storm">delegation ceiling<', page)
+        self.assertIn(f"<span>{CRASHLOOP_TRIO[1]}</span>", page, "two passes and a ceiling rep is a pass, listed by name")
+        self.assertNotIn("all 0 reps", page)
+        self.assertNotIn("0 reps lost", page)
+
+    def test_a_delegation_ceiling_wave_has_its_own_brief_and_banner(self):
+        health = health_doc(
+            "DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[],
+            cause="delegation ceiling: 18 repetitions on 3 PRs ended with the worker still running 12:00–14:00 UTC",
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(),
+            incident={"prs": [1, 2, 3], "runs": 3, "reps": 18, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
+        )
+        out = render_to(pathlib.Path(self.tmp.name) / "ceiling-brief", self.data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("DEGRADED · since Tue 8:00 AM ET", app)
+        self.assertIn("Workers aren't finishing: repetitions are ending at the harness's delegation wait", app)
+        self.assertIn("Why we think it's the workers, not the PRs", app)
+        self.assertIn("ended at the harness's delegation wait with the worker still running, across 0 PRs", app, "the fixture week has no ceiling reps; the fact still counts")
+        self.assertIn("#1879", app)
+        self.assertNotIn("quota storm", app.lower().replace("no shared break, storm", ""))
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("Workers not finishing", run_page)
+        self.assertIn("those runs read not evaluated, not red", run_page)
+
+    def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
+        """A run whose every case ended at the ceiling passed nothing, so its row
+        cannot read "all gate cases passed"; and the storm brief's totals count
+        those repetitions among the ones that ran, as the run page does."""
+        data = copy.deepcopy(self.data)
+        run = max((r for r in data["runs"] if r.get("pr") is not None and r.get("tasks")), key=lambda r: r["finished"])
+        for task in run["tasks"]:
+            task["result"] = "infra"
+            task["reps"] = [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (1, 2, 3)]
+        finished = datetime.fromisoformat(run["finished"].replace("Z", "+00:00"))
+        since = (finished - timedelta(hours=1)).isoformat()
+        incident = {"prs": [1, 2, 3], "runs": 3, "window_start": since, "window_end": finished.isoformat()}
+        ceiling = health_doc("DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[], since=since,
+                             advice=health_module_advice(), incident=dict(incident, reps=18))
+        app = dom_text(render_to(pathlib.Path(self.tmp.name) / "ceiling-rows", data, health=ceiling) / "index.html")
+        row = re.search(rf'<a class="runrow[^"]*" href="run.html#build={run["build_id"]}">.*?</a>', app)
+        self.assertIsNotNone(row, "the run is listed in the wave's window")
+        self.assertIn("nothing graded", row.group(0))
+        self.assertIn(f"{3 * len(run['tasks'])} reps at the delegation ceiling", row.group(0))
+        self.assertNotIn("all gate cases passed", row.group(0))
+        storm = health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[], since=since, incident=incident)
+        before = dom_text(render_to(pathlib.Path(self.tmp.name) / "storm-before", self.data, health=storm) / "index.html")
+        after = dom_text(render_to(pathlib.Path(self.tmp.name) / "storm-after", data, health=storm) / "index.html")
+        total = lambda page: int(re.search(r"of (\d+) repetitions</b> came back with no agent run", page).group(1))
+        # The reps were graded before and ceiling hits after; either way they
+        # ran, so the total is the same (the old sum dropped every one of them).
+        self.assertEqual(total(after), total(before), "ceiling reps are repetitions that ran")
 
     def test_outage_brief(self):
         app = dom_text(self.index)
@@ -1104,6 +1204,10 @@ class CasesAndGridPagesTest(unittest.TestCase):
                              "finished": "2026-08-20T11:00:00+00:00", "result": "FAILURE", "duration_s": 3600,
                              "tasks": [{"name": "old-failure-case", "result": "fail", "reps": [{"n": 1, "result": "fail", "reason": "check ancient: required phrases absent"}]}]})
         data["cases"].append({"name": "old-failure-case", "domain": "cost", "active": True})
+        # A case demoted under the 2026-09-22 protocol: off both presubmit
+        # files, in the nightly one, dated on the roster page. It is a
+        # held-out row with the demoted pill, not a "nightly only" one.
+        data["cases"].append({"name": "demoted-nightly-case", "domain": "cost", "active": False, "nightly_active": True})
         history = history_lines(
             dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
             dict(health_doc(since="2026-09-07T14:00:00+00:00"), tick="2026-09-07T14:00:00+00:00"),
@@ -1113,7 +1217,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         )
         admitted = frozenset(CRASHLOOP_TRIO[:2])
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=admitted), \
-                unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02"}), \
+                unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02", "demoted-nightly-case": "2026-09-02"}), \
                 unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
             cls.out = render_to(cls.tmp.name, data, health=health_doc(), history=history)
         cls.cases_page = cls.out / "cases.html"
@@ -1130,7 +1234,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('id="case-cluster-agent-crashloop-debug"', app)
         self.assertIn('<span class="st blocking">blocking</span>', app)
         self.assertIn('<span class="st demoted">demoted 09-02</span>', app)
-        self.assertIn("held out · 2 cases", app)
+        self.assertIn("held out · 3 cases", app, "the active demoted case, the active held-out one and the nightly demoted one")
+        self.assertEqual(app.count("demoted 09-02"), 2, "the nightly demoted case carries the dated pill too")
         self.assertIn("not in any matrix · 1 case", app)
         self.assertNotIn('id="case-retired-probe"', app, "retired cases are folded until asked for")
         self.assertIn('class="rate ', app)
@@ -1156,7 +1261,9 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('<span class="st blocking">blocking</span>', blocking)
         held = dom_text(self.cases_page, query="show=held")
         self.assertIn("demoted 09-02", held)
+        self.assertIn('id="case-demoted-nightly-case"', held, "a case demoted to the nightly is a held-out row")
         self.assertNotIn('class="st blocking"', held)
+        self.assertNotIn('id="case-demoted-nightly-case"', blocking)
         highlighted = dom_text(self.cases_page, fragment="#cluster-agent-crashloop-evidence-chain")
         self.assertIn('<tr id="case-cluster-agent-crashloop-evidence-chain" class="main hl">', highlighted)
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
