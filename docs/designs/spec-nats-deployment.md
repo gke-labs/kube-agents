@@ -490,6 +490,17 @@ Layout:
   so for as long as a port-forward runs, any page the operator's browser visits could
   otherwise drive this surface.
 
+- **The console surface (added 9/23).** One `console` user for the web console: the `web`
+  read surface exactly, plus publish on `chat.console.*.in` (the gateway's console adapter's
+  inbound subject, spec-chatops-gateway.md), subscribe on `chat.console.*.out`, and
+  `STREAM.INFO` on the three `KV_*` streams. The KV grant is sizes and counts for the
+  console's capacity tiles; the `$KV` data plane and every consumer verb on `KV_*` stay off,
+  so the bucket contents do not follow the size grant in. The gateway user gains the
+  matching pair (subscribe `.in`, publish `.out`). The console subjects are core NATS, so
+  the provision Job is untouched and an existing install picks the door up on operator
+  upgrade. Same posture as `web` and stated in the same places: static, published to a
+  browser by design, port-forward only.
+
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the
