@@ -105,6 +105,17 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
    The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential broker before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container in the `platform-agent-credential-proxy` pod rather than the relay reporting the error.
 
+5. **Talk to the agent.**
+
+   With Google Chat or Slack enabled, DM the app. Both are opt-in and off by default, so an install that enabled neither talks to the agent over `kubectl exec` instead — the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes, with your cluster, region, project and namespace already filled in:
+
+   ```bash
+   gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
+   kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes -p platform
+   ```
+
+   Drop `--dns-endpoint` on a cluster that publishes no externally reachable DNS endpoint, where `gcloud` rejects it. `-p platform` reaches the Platform Agent directly; a bare `hermes` reaches the Planning Agent front door, which is where a chat message would have landed. [ChatOps](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled) covers the difference and what a chat-less install does not exercise.
+
 </Steps>
 
 ## What just happened
