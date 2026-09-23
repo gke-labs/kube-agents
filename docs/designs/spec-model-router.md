@@ -237,6 +237,19 @@ list, create and info grants for the `provision` principal on it, publish and su
 NATS deployment spec's bucket list (which becomes four buckets), and a row in the payload
 spec's verified-identity table beside `$KV.session-state.>`.
 
+**The window outlives the stream, on purpose.** A 168h window is more than double the
+TASKS stream's retention window at its 72h dev default. The gateway spec's content rule
+bounds a copy of task content to a shorter horizon than the stream copy it duplicates
+([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "The rule covers identifiers, not
+content"). That rule is about a duplicate. The window is not one. It is the chat
+conversation's own record, the user's turns in the room that produced them, and the
+stream copy is not what justifies it existing. The audience is not widened either, since
+nobody but the gateway principal is granted the `conversation` bucket. The window never
+renders agent `event:` output. So the primary chat context is exempt from the horizon
+condition, deliberately and not by oversight (decided 9/23). It is not free: a
+conversation stays rehydratable from the window for longer than its tasks stay readable
+from the stream.
+
 ### Sizing
 
 | measured                                 | value                                                 |
@@ -297,7 +310,13 @@ routing call. A two-second budget is aspirational, reported against rather than 
 | ------------------------ | ----------------------------------------------- | ---------------------------------------------------------------------- |
 | `router.model`           | the `model-router` alias, at `gemini-3.5-flash` | an alias, so a swap is a LiteLLM config change, not a redeploy         |
 | `router.reasoningEffort` | unset, which is the endpoint default: on        | `none` is a supported choice, below the plain bar                      |
-| `router.timeout`         | see the fallback rule                           | on expiry the matcher answers; a slow model degrades, it does not hang |
+| `router.timeout`         | 30s                                             | on expiry the matcher answers; a slow model degrades, it does not hang |
+
+The 30s timeout is a hang guard for a wedged call or a dropped connection, not a latency
+target, so it sits well above the measured ~4.4 s rather than near it. The two-second
+budget above is reported against rather than gated on. Seven times the measured call
+leaves room for an occasional lagging turn. Much longer than that and a wedge leaves the
+user watching a dead chat window.
 
 Reasoning on is the default because one decision in forty is not uniformly cheap: a
 misrouted mutating ask is a wrong production change, not a retype. `none` is a choice an
@@ -423,6 +442,10 @@ Steps 1 to 3 are ordinary Go with no dependency on the `model-router` alias.
   size cap, since neither can be changed on an install afterward.
 - Whether a group room gets a shorter default window than a DM.
 - The subject the gateway's decisions are published on, under the two constraints above.
+- Whether a room can override requester-only cancel (a room owner, an allowlist, an
+  explicit override phrase), and what a cancel does against a task with no recorded
+  requester, which is anything in flight at rollout. Originator-only for now. The
+  chat permissions model is what settles both.
 
 ## Why not ADK
 

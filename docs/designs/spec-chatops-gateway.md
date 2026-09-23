@@ -39,9 +39,12 @@ discussed for group chats slots in beside the gateway later as a veto - it can b
 reroute a message, and it never widens anything.
 
 **Amended 2026-09-22.** The seam this paragraph reserves is filled by the model router,
-designed in [`spec-model-router.md`](spec-model-router.md). The property this section
-protects is unchanged: the gateway process hosts no context window of its own, and the
-router picks a destination and never holds an authority or publishes.
+designed in [`spec-model-router.md`](spec-model-router.md). That supersedes the "no
+prompt" clause above: there is one model call in this path now, once per turn. What the
+section protects survives it. The gateway process still hosts no context window of its
+own, and the router call beside it is stateless - one turn, no tools, a window scoped to
+one conversation. The gateway holds the only bus credential, mints every id and the
+`authority` block, and is the only publisher. A router decision is a proposal.
 
 ## What a session is
 
@@ -416,6 +419,13 @@ on the copy, not a property of it. The horizon holds only where a terminal event
 guaranteed, so the ends Session lifecycle names as having none are cases where this
 justification does not hold on its own, and the `ask` TTL and first-event grace named
 there are what carry it.
+
+**Amended 2026-09-23.** The horizon condition above applies to a duplicate of content
+that already rides the stream. The conversation window in
+[`spec-model-router.md`](spec-model-router.md) is exempt from it. That window is the
+chat conversation's own record rather than a copy of a task, and its audience is the
+gateway principal alone. So it is allowed to outlive the tasks it discusses. The cost is
+that a conversation stays rehydratable after the stream copy of its tasks has expired.
 
 - `requester.principal` is the pseudonymized identity in _our_ trust domain; the gateway
   resolves it to the RBAC string at the boundary that needs one. `subject` is the sender
