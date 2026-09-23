@@ -177,17 +177,21 @@ repetition's), and `worker_commands` (regular expressions over the terminal comm
 the delegated workers ran, read from each card's worker log before the harness
 purges it).
 
-Two limits are worth knowing before choosing one. `tool_called` sees the delegating
-turn's calls only — a delegated worker's calls never reach the trajectory — so it can
-assert what the router did and nothing about what a worker did to a cluster. A mutation
-safeguard built on it is blind to the calls it fears; use `resource_property` for those.
+Two limits are worth knowing before choosing one. `tool_called` counts the delegating
+turn's calls only — the harness appends the delegated workers' calls to the trajectory
+tagged with the profile that made them, and the verifier skips every tagged entry — so
+it can assert what the router did and nothing about what a worker did to a cluster. A
+mutation safeguard built on it is blind to the calls it fears; use `resource_property`
+for those.
 And `report_contains` defaults to `scope: final`, the answer the user receives. `full`
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears
 in quoted material. `worker_commands` is the complement of the `tool_called` limit: it is
 the one check that sees the route a worker took, but only its terminal commands, never
 its MCP tool calls, and only for cards the run delegated — a router that answered without
-delegating leaves it nothing to read, which is `status: "error"`, not a pass.
+delegating leaves it nothing to read, which is `status: "error"`, not a pass. The record
+itself does carry the workers' MCP tool calls, as the tagged trajectory entries above; no
+deterministic check reads them, and the judged metrics receive them as the execution trace.
 
 All seven fail closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below

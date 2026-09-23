@@ -309,6 +309,12 @@ collector-manifest design says what the manifest holds): `--manifest-file` names
 collector wrote and `--no-collector-manifest` publishes without one, reporting the reason as a
 coverage gap. An SOP that mentions neither runs `finish` without them, exactly as before.
 
+A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
+and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
+and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
+`--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
+says how to read its manifest and what is still yours to write.
+
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
@@ -346,7 +352,11 @@ the message names and re-run; never delete the finding that tripped it. What rea
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
-empty path, or `--no-collector-manifest` was given a blank reason. Exit 1 is fatal and means
+empty path, or `--no-collector-manifest` was given a blank reason. A manifest that finished before
+this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
+scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
+there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
+against nothing. Re-run the collector. Exit 1 is fatal and means
 something else broke.
 
 ### Partial coverage

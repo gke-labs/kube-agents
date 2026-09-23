@@ -1395,8 +1395,10 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		}
 	}
 
-	// key -> the content it must hold.
-	expected := make(map[string]string, len(allBareRepos)+len(contextBareRepos))
+	// key -> the content it must hold. No capacity hint: both lengths come from
+	// ConfigMap JSON, and CodeQL (go/allocation-size-overflow) flags their sum
+	// as an allocation size that untrusted input could overflow.
+	expected := make(map[string]string)
 	writeContent := renderRepoPolicy(baseTemplate, allBareRepos)
 	for _, bareRepo := range allBareRepos {
 		expected[bareRepo+minterPolicyKeySuffix] = writeContent

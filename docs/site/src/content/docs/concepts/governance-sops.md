@@ -39,7 +39,7 @@ Findings are reported in **resource units — GiB, vCPU, node and object counts 
 
 ### `fleet_consistency_drift_sop.md`
 
-Fleet consistency drift, weekly. For each configuration facet — release channel, Workload Identity, Shielded Nodes, logging and monitoring config, network policy, node auto-provisioning, Binary Authorization, required labels — it computes what the majority of _comparable_ clusters do and reports the outliers.
+Fleet consistency drift, weekly. For each configuration facet — release channel, Shielded Nodes, logging and monitoring config, network policy, node auto-provisioning, Binary Authorization, label keys — it computes what the majority of _comparable_ clusters do and reports the outliers, and it reports a cluster whose missing environment label keeps it out of every comparison.
 
 The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where the retired `blueprint_sync_sop.md` and `standardization_validator_sop.md` are not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
 

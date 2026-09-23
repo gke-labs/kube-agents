@@ -7,7 +7,9 @@ GKE NotFound. Missing identity, transient errors, and reserved profiles are neve
 deleted.
 """
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,15 +37,28 @@ def _home_factory(root: Path, incomplete=frozenset()):
     kubeconfig is written here too, for ``_local_kubeconfig_landed`` to find --
     on a real install it is on the sandbox's volume, not this one.
     """
+    made: set[str] = set()
+
     def factory(name: str) -> Path:
         home = root / name
-        home.mkdir(parents=True, exist_ok=True)
-        if name not in incomplete:
-            for artifact in (*rec.SCAFFOLD_ARTIFACTS, rec.KUBECONFIG_ARTIFACT):
-                (home / artifact).touch()
+        # Created once: a home the test's delete stub removed stays removed, so the
+        # script's "is it still on disk" checks see what production would.
+        if name not in made:
+            made.add(name)
+            home.mkdir(parents=True, exist_ok=True)
+            if name not in incomplete:
+                for artifact in (*rec.SCAFFOLD_ARTIFACTS, rec.KUBECONFIG_ARTIFACT):
+                    (home / artifact).touch()
         return home
 
     return factory
+
+
+def _listing(clusters):
+    """What `_list_project` returns for a stubbed cluster list: the list and its outcome."""
+    if clusters is None:
+        return None, rec.OUTCOME_UNREACHABLE
+    return clusters, rec.OUTCOME_OK
 
 
 def _local_kubeconfig_landed(path: Path) -> bool:
@@ -69,6 +84,12 @@ class HomesMixin(unittest.TestCase):
         landed = mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed)
         landed.start()
         self.addCleanup(landed.stop)
+        # The scope snapshot is written beside the profiles; keep it in the temp dir, and
+        # start every test from no declared scope.
+        env = mock.patch.dict(os.environ, {"HERMES_HOME": self._tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
 
 
 class ReconcileTest(HomesMixin):
@@ -80,9 +101,9 @@ class ReconcileTest(HomesMixin):
         Returns (report, list_of_deleted_names).
         """
         deleted: list[str] = []
-        # _project() -> None disables the CREATE direction, isolating the prune behavior
+        # _project_source() -> None disables the CREATE direction, isolating the prune behavior
         # under test (and avoiding any real metadata/gcloud calls).
-        with mock.patch.object(rec, "_project", return_value=None), \
+        with mock.patch.object(rec, "_project_source", return_value=(None, True)), \
              mock.patch.object(rec, "list_profiles", return_value=profiles), \
              mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity", side_effect=lambda home: identities[home.name]), \
@@ -141,12 +162,12 @@ class CreateDirectionTest(HomesMixin):
         # metadata server; it is now managed like any other, because the triage session for
         # an event on it is created on its own profile and there would otherwise be none.
         created: list = []
-        with mock.patch.object(rec, "_project", return_value="p"), \
-             mock.patch.object(rec, "_all_clusters", return_value=[
+        with mock.patch.object(rec, "_project_source", return_value=("p", True)), \
+             mock.patch.object(rec, "_list_project", return_value=_listing([
                  ("p", "alpha", "us-central1"),   # no profile -> CREATE
                  ("p", "beta", "us-central1"),    # already has a profile -> skip
                  ("p", "mgmt", "us-central1"),    # the management cluster -> CREATE too
-             ]), \
+             ])), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
              mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity",
@@ -164,9 +185,9 @@ class CreateDirectionTest(HomesMixin):
         # RECONCILE_EXCLUDE is now the only opt-out, so it has to prune as well as skip:
         # adding a name after the fact must remove the profile, not leave it orphaned.
         deleted: list[str] = []
-        with mock.patch.object(rec, "_project", return_value="p"), \
+        with mock.patch.object(rec, "_project_source", return_value=("p", True)), \
              mock.patch.object(rec, "EXTRA_EXCLUDE", {"skipme"}), \
-             mock.patch.object(rec, "_all_clusters", return_value=[("p", "skipme", "us-central1")]), \
+             mock.patch.object(rec, "_list_project", return_value=_listing([("p", "skipme", "us-central1")])), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-skipme"]), \
              mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity",
@@ -180,10 +201,10 @@ class CreateDirectionTest(HomesMixin):
 
     def test_extra_exclude_names_skipped(self):
         created: list = []
-        with mock.patch.object(rec, "_project", return_value="p"), \
+        with mock.patch.object(rec, "_project_source", return_value=("p", True)), \
              mock.patch.object(rec, "EXTRA_EXCLUDE", {"skipme"}), \
-             mock.patch.object(rec, "_all_clusters", return_value=[
-                 ("p", "keep", "us-central1"), ("p", "skipme", "us-central1")]), \
+             mock.patch.object(rec, "_list_project", return_value=_listing([
+                 ("p", "keep", "us-central1"), ("p", "skipme", "us-central1")])), \
              mock.patch.object(rec, "list_profiles", return_value=[]), \
              mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity", return_value=None), \
@@ -207,8 +228,8 @@ class IncompleteScaffoldTest(HomesMixin):
     def _reconcile(self, incomplete):
         created: list = []
         with mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed), \
-             mock.patch.object(rec, "_project", return_value="p"), \
-             mock.patch.object(rec, "_all_clusters", return_value=[("p", "beta", "us-central1")]), \
+             mock.patch.object(rec, "_project_source", return_value=("p", True)), \
+             mock.patch.object(rec, "_list_project", return_value=_listing([("p", "beta", "us-central1")])), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
              mock.patch.object(rec, "profile_home",
                                side_effect=_home_factory(self.homes, incomplete=incomplete)), \
@@ -278,7 +299,7 @@ class AllClustersTest(unittest.TestCase):
         done = subprocess.CompletedProcess([], 0, stdout="a us-central1\nb europe-west1\n")
         with mock.patch.object(rec.subprocess, "run", return_value=done):
             self.assertEqual(
-                rec._all_clusters("p"),
+                rec._list_project("p")[0],
                 [("p", "a", "us-central1"), ("p", "b", "europe-west1")],
             )
 
@@ -290,14 +311,14 @@ class AllClustersTest(unittest.TestCase):
         )
         with mock.patch.object(rec.subprocess, "run", side_effect=err), \
              mock.patch.object(rec, "log") as logged:
-            self.assertIsNone(rec._all_clusters("p"))
+            self.assertIsNone(rec._list_project("p")[0])
         self.assertIn("Reauthentication required", " ".join(str(c) for c in logged.call_args_list))
 
     def test_uses_check_true_so_nonzero_exit_cannot_pass_silently(self):
         seen = {}
         with mock.patch.object(rec.subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess([], 0, stdout="")
-            rec._all_clusters("p")
+            rec._list_project("p")[0]
             seen = run.call_args.kwargs
         self.assertTrue(seen.get("check"), "gcloud list must run with check=True")
 
@@ -305,7 +326,7 @@ class AllClustersTest(unittest.TestCase):
         with mock.patch.object(rec.subprocess, "run",
                                side_effect=subprocess.TimeoutExpired(["gcloud"], 120)), \
              mock.patch.object(rec, "log") as logged:
-            self.assertIsNone(rec._all_clusters("p"))
+            self.assertIsNone(rec._list_project("p")[0])
         self.assertTrue(logged.called)
 
 
@@ -319,9 +340,11 @@ class CreatePassSignalTest(unittest.TestCase):
     """
 
     def _reconcile(self, clusters):
-        with mock.patch.object(rec, "list_profiles", return_value=[]), \
-             mock.patch.object(rec, "_project", return_value="p"), \
-             mock.patch.object(rec, "_all_clusters", return_value=clusters), \
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {"HERMES_HOME": tmp}), \
+             mock.patch.object(rec, "list_profiles", return_value=[]), \
+             mock.patch.object(rec, "_project_source", return_value=("p", True)), \
+             mock.patch.object(rec, "_list_project", return_value=_listing(clusters)), \
              mock.patch.object(rec, "log"):
             return rec.reconcile(dry_run=True)
 
@@ -333,7 +356,7 @@ class CreatePassSignalTest(unittest.TestCase):
 
     def test_an_unresolvable_project_does_not(self):
         with mock.patch.object(rec, "list_profiles", return_value=[]), \
-             mock.patch.object(rec, "_project", return_value=None), \
+             mock.patch.object(rec, "_project_source", return_value=(None, True)), \
              mock.patch.object(rec, "log"):
             self.assertFalse(rec.reconcile(dry_run=True)["create_pass_ran"])
 
@@ -353,9 +376,12 @@ class CreatePassSignalTest(unittest.TestCase):
             self.assertIsNone(rec.main())
 
     def test_a_failed_create_is_recorded_rather_than_only_logged(self):
-        with mock.patch.object(rec, "list_profiles", return_value=[]), \
-             mock.patch.object(rec, "_project", return_value="p"), \
-             mock.patch.object(rec, "_all_clusters", return_value=[("p", "alpha", "us-central1")]), \
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}), \
+             mock.patch.object(rec, "list_profiles", return_value=[]), \
+             mock.patch.object(rec, "_project_source", return_value=("p", True)), \
+             mock.patch.object(rec, "_list_project", return_value=_listing([("p", "alpha", "us-central1")])), \
              mock.patch.object(rec, "create_profile", side_effect=SystemExit("no credentials")), \
              mock.patch.object(rec, "log"):
             report = rec.reconcile(dry_run=False)
@@ -660,6 +686,731 @@ class FormatNotificationTest(unittest.TestCase):
         self.assertIn("cluster-a", msg)
         self.assertIn("cluster-b", msg)
         self.assertIn("cluster-c", msg)  # unverified profiles surfaced too
+
+
+class ScopeTest(HomesMixin):
+    """spec.scope, phase 1: explicit projects, exclusions, outcomes, the prune rules, the snapshot."""
+
+    MGMT = "mgmt-proj"
+
+    def _write_scope(self, scope: dict | None):
+        if scope is None:
+            return
+        path = Path(self._tmp.name) / "scope.json"
+        # The operator writes `present` on every render; a test that passes a dict without
+        # it is declaring a block, as the operator would for a CR that carries one.
+        if isinstance(scope, dict) and rec.SCOPE_PRESENT_KEY not in scope:
+            scope = {rec.SCOPE_PRESENT_KEY: True, **scope}
+        path.write_text(json.dumps(scope), encoding="utf-8")
+        os.environ[rec.SCOPE_FILE_ENV] = str(path)
+
+    def _write_previous(self, projects: list[dict]):
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(
+            json.dumps({"projects": projects}), encoding="utf-8")
+
+    def _snapshot(self) -> dict:
+        return json.loads((Path(self._tmp.name) / rec.SNAPSHOT_FILE).read_text(encoding="utf-8"))
+
+    def _run(self, scope, listings, profiles=None, identities=None, exists=True,
+             management=MGMT, extra_exclude=frozenset(), delete_removes=True, dry_run=False,
+             authoritative=True):
+        """listings: project -> (clusters list | None, outcome) or a list (ok); or a callable
+        used as the lister itself.
+
+        delete_removes: whether the stubbed delete also removes the profile home,
+        as the real one does; False models a delete that failed.
+        """
+        self._write_scope(scope)
+        profiles = profiles or []
+        identities = identities or {}
+        created: list = []
+        deleted: list = []
+
+        def delete(name):
+            deleted.append(name)
+            if delete_removes:
+                shutil.rmtree(self.homes / name, ignore_errors=True)
+
+        def list_project(project, timeout=None):
+            value = listings.get(project, ([], rec.OUTCOME_OK))
+            return value if isinstance(value, tuple) else (value, rec.OUTCOME_OK)
+
+        with mock.patch.object(rec, "_project_source", return_value=(management, authoritative)), \
+             mock.patch.object(rec, "EXTRA_EXCLUDE", set(extra_exclude)), \
+             mock.patch.object(rec, "_list_project", side_effect=listings if callable(listings) else list_project), \
+             mock.patch.object(rec, "list_profiles", return_value=list(profiles)), \
+             mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
+             mock.patch.object(rec, "read_cluster_identity",
+                               side_effect=lambda home: identities.get(home.name)), \
+             mock.patch.object(rec, "_cluster_exists", return_value=exists), \
+             mock.patch.object(rec, "delete_profile", side_effect=delete), \
+             mock.patch.object(rec, "create_profile",
+                               side_effect=lambda pr, c, l: created.append((pr, c, l)) or f"cluster-{c}"):
+            report = rec.reconcile(dry_run=dry_run)
+        return report, created, deleted
+
+    def test_no_scope_file_is_the_management_project_alone(self):
+        report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "a", "us-central1")],
+                                              "other": [("other", "x", "us-central1")]})
+        self.assertEqual(created, [(self.MGMT, "a", "us-central1")])
+        snap = self._snapshot()
+        self.assertEqual([p["id"] for p in snap["projects"]], [self.MGMT])
+        self.assertEqual(snap["resolver"], rec.RESOLVER_EXPLICIT)
+        self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
+
+    def test_explicit_projects_are_listed_after_the_management_project_in_sorted_order(self):
+        scope = {"projects": ["zeta", "alpha"]}
+        report, created, _ = self._run(scope, {
+            self.MGMT: [(self.MGMT, "m", "us-central1")],
+            "alpha": [("alpha", "a", "us-central1")],
+            "zeta": [("zeta", "z", "europe-west1")],
+        })
+        self.assertEqual(created, [(self.MGMT, "m", "us-central1"), ("alpha", "a", "us-central1"),
+                                   ("zeta", "z", "europe-west1")])
+        snap = self._snapshot()
+        # Listed in fill order (management first), written sorted by ID.
+        self.assertEqual([(p["id"], p["via"], p["outcome"], p["clusters"]) for p in snap["projects"]],
+                         [("alpha", ["explicit"], "ok", 1), (self.MGMT, ["management"], "ok", 1),
+                          ("zeta", ["explicit"], "ok", 1)])
+        self.assertTrue(report["create_pass_ran"])
+
+    def test_exclude_projects_takes_ids_and_globs_and_never_the_management_project(self):
+        scope = {"projects": ["team-sandbox", "team-prod", "legacy"],
+                 "exclude": {"projects": ["*-sandbox", "legacy", "mgmt-*"]}}
+        report, created, _ = self._run(scope, {
+            self.MGMT: [(self.MGMT, "m", "us-central1")],
+            "team-prod": [("team-prod", "p", "us-central1")],
+            "team-sandbox": [("team-sandbox", "s", "us-central1")],
+            "legacy": [("legacy", "l", "us-central1")],
+        })
+        self.assertEqual(created, [(self.MGMT, "m", "us-central1"), ("team-prod", "p", "us-central1")])
+        snap = self._snapshot()
+        self.assertEqual([p["id"] for p in snap["projects"]], sorted([self.MGMT, "team-prod"]))
+        self.assertEqual(snap["ignoredExcludes"], [{"project": self.MGMT, "pattern": "mgmt-*"}])
+
+    def test_exclude_clusters_by_triple_skips_create_and_prunes_the_existing_profile(self):
+        scope = {"projects": ["other"],
+                 "exclude": {"clusters": [{"projectId": "other", "location": "us-central1", "clusterName": "scratch"},
+                                          {"projectId": self.MGMT, "location": "us-central1", "clusterName": "old"}]}}
+        report, created, deleted = self._run(
+            scope,
+            {self.MGMT: [(self.MGMT, "old", "us-central1")],
+             "other": [("other", "scratch", "us-central1"), ("other", "keep", "us-central1")]},
+            profiles=["cluster-old"],
+            identities={"cluster-old": _identity(self.MGMT, "old")},
+        )
+        self.assertEqual(created, [("other", "keep", "us-central1")])
+        self.assertEqual(deleted, ["cluster-old"])
+        self.assertEqual(report["pruned"], ["cluster-old"])
+
+    def test_a_denied_project_keeps_its_profiles_and_is_reported(self):
+        scope = {"projects": ["locked"]}
+        report, created, deleted = self._run(
+            scope,
+            {self.MGMT: [], "locked": (None, rec.OUTCOME_DENIED)},
+            profiles=["cluster-l"], identities={"cluster-l": _identity("locked", "l")},
+        )
+        self.assertEqual(created, [])
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["projects"], {self.MGMT: "ok", "locked": "denied"})
+        self.assertEqual(report["kept"], ["cluster-l"])
+        self.assertTrue(report["create_pass_ran"])  # the management project listed fine
+        snap = self._snapshot()
+        locked = next(p for p in snap["projects"] if p["id"] == "locked")
+        self.assertEqual((locked["outcome"], locked["clusters"]), ("denied", None))
+        self.assertIn("`locked` (denied)", rec._format_notification(report))
+
+    def test_list_failures_are_classified(self):
+        self.assertEqual(rec._classify_list_failure("ResponseError: code=403, message=Permission denied"),
+                         rec.OUTCOME_DENIED)
+        self.assertEqual(rec._classify_list_failure("Kubernetes Engine API has not been used in project x"),
+                         rec.OUTCOME_API_DISABLED)
+        self.assertEqual(rec._classify_list_failure("SERVICE_DISABLED"), rec.OUTCOME_API_DISABLED)
+        self.assertEqual(rec._classify_list_failure("Unable to connect"), rec.OUTCOME_UNREACHABLE)
+
+    def test_a_project_dropped_from_the_scope_is_pruned_only_under_all_three_conditions_and_two_runs(self):
+        gone_profile = {"cluster-g": _identity("gone", "g")}
+        # (1) absent from the resolved set, (2) lookups clean, (3) in the previous snapshot -> retiring
+        # on the first clean run, pruned on the next.
+        self._write_previous([{"id": "gone", "state": rec.STATE_IN_SCOPE}])
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-g"], identities=gone_profile)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["retiring"], ["gone"])
+        retiring = next(p for p in self._snapshot()["projects"] if p["id"] == "gone")
+        self.assertEqual((retiring["state"], retiring["clusters"]), (rec.STATE_RETIRING, 1))
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-g"], identities=gone_profile)
+        self.assertEqual(deleted, ["cluster-g"])
+        self.assertEqual([p for p in self._snapshot()["projects"] if p["id"] == "gone"], [])
+
+    def test_a_profile_the_scope_never_produced_is_kept_and_listed_unmanaged(self):
+        # Condition (3) fails: no previous snapshot names the project.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-h"], identities={"cluster-h": _identity("hand", "h")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["unmanaged"], ["cluster-h"])
+        self.assertEqual(report["kept"], ["cluster-h"])
+        self.assertEqual(self._snapshot()["unmanaged"],
+                         [{"profile": "cluster-h", "project": "hand", "reason": "never in scope"}])
+
+    def test_an_unreachable_lookup_blocks_the_scope_prune(self):
+        # Condition (2) fails: one listed project was unreachable, so absence proves nothing,
+        # and a project already retiring is not pruned.
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+        report, _, deleted = self._run({"projects": ["flaky"]},
+                                       {self.MGMT: [], "flaky": (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["unmanaged"], ["cluster-g"])
+        self.assertEqual(self._snapshot()["unmanaged"][0]["reason"], "retiring; waiting for a clean run")
+        self.assertEqual(report["retiring"], ["gone"])
+
+    def test_a_management_project_that_cannot_list_its_own_clusters_is_not_a_clean_run(self):
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: (None, rec.OUTCOME_DENIED)},
+                                       profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
+        self.assertEqual((deleted, report["retiring"]), ([], ["gone"]))
+
+    def test_a_changed_management_project_that_cannot_be_listed_retires_nothing(self):
+        # RECONCILE_PROJECT set to a project the agent cannot read: two such ticks must not
+        # read as the real management project confirmed gone.
+        mgmt_profiles = {"cluster-m1": _identity(self.MGMT, "m1")}
+        self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                  profiles=["cluster-m1"], identities=mgmt_profiles)
+        for _ in range(2):
+            report, _, deleted = self._run({"projects": []}, {"typo": (None, rec.OUTCOME_DENIED)}, management="typo",
+                                           profiles=["cluster-m1"], identities=mgmt_profiles)
+            self.assertEqual((deleted, report["retiring"]), ([], []))
+            self.assertEqual(report["unmanaged"], ["cluster-m1"])
+            rows = {p["id"]: p["state"] for p in self._snapshot()["projects"]}
+            self.assertEqual(rows[self.MGMT], rec.STATE_IN_SCOPE)
+        # The typo fixed: the management project lists again, nothing lost.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                                       profiles=["cluster-m1"], identities=mgmt_profiles)
+        self.assertEqual((deleted, report["kept"]), ([], ["cluster-m1"]))
+
+    def test_a_retiring_project_stays_while_a_profile_of_unknown_identity_is_on_the_volume(self):
+        # The last snapshot attributed cluster-g to gone; this tick its identity is unreadable.
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "gone", "state": rec.STATE_RETIRING}], "profiles": {"cluster-g": "gone"}}),
+            encoding="utf-8")
+        # Two unreadable ticks in a row: the attribution is carried forward, not lost.
+        for _ in range(2):
+            report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                           profiles=["cluster-g"], identities={"cluster-g": None})
+            self.assertEqual((deleted, report["skipped_no_identity"], report["retiring"]), ([], ["cluster-g"], ["gone"]))
+            self.assertEqual(self._snapshot()["profiles"], {"cluster-g": "gone"})
+        # Identity readable again on the next clean run: pruned, not "never in scope".
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
+        self.assertEqual(deleted, ["cluster-g"])
+
+    def test_a_project_dropped_while_its_only_profile_is_unreadable_still_retires(self):
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "p", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}], "profiles": {"cluster-p": "p"}}),
+            encoding="utf-8")
+        # The drop tick is clean but cluster-p's identity cannot be read: retiring by attribution.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p"], identities={"cluster-p": None})
+        self.assertEqual((deleted, report["retiring"]), ([], ["p"]))
+        rows = {q["id"]: (q["state"], q["clusters"]) for q in self._snapshot()["projects"]}
+        self.assertEqual(rows["p"], (rec.STATE_RETIRING, 1))
+        # Readable again on the next clean run: pruned, as the two-run rule promises.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-p"], identities={"cluster-p": _identity("p", "p1")})
+        self.assertEqual(deleted, ["cluster-p"])
+
+    def test_a_project_dropped_while_its_only_profile_is_unreadable_on_an_unclean_tick_is_carried(self):
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "p", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}], "profiles": {"cluster-p": "p"}}),
+            encoding="utf-8")
+        report, _, deleted = self._run({"projects": ["flaky"]}, {self.MGMT: [], "flaky": (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=["cluster-p"], identities={"cluster-p": None})
+        self.assertEqual((deleted, report["retiring"]), ([], []))
+        rows = {q["id"]: q["state"] for q in self._snapshot()["projects"]}
+        self.assertEqual(rows["p"], rec.STATE_IN_SCOPE)
+
+    def test_a_changed_management_projects_unreadable_profile_retires_on_the_change_tick(self):
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}],
+             "profiles": {"cluster-m1": self.MGMT}}), encoding="utf-8")
+        report, _, deleted = self._run({"projects": []}, {"new": []}, management="new",
+                                       profiles=["cluster-m1"], identities={"cluster-m1": None})
+        self.assertEqual((deleted, report["retiring"]), ([], [self.MGMT]))
+        rows = {q["id"]: q["state"] for q in self._snapshot()["projects"]}
+        self.assertEqual(rows[self.MGMT], rec.STATE_RETIRING)
+
+    def test_a_pruned_profile_whose_home_survives_a_failed_delete_stays_attributed(self):
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")},
+                                       delete_removes=False)
+        self.assertEqual((deleted, report["retiring"]), (["cluster-g"], ["gone"]))
+        self.assertEqual(self._snapshot()["profiles"], {"cluster-g": "gone"})
+
+    def test_an_unreadable_declaration_keeps_the_last_declarations_exclusions(self):
+        # Rollback to an operator without the field: the file is gone, but the cluster the
+        # operator excluded must not be re-onboarded, and the snapshot keeps naming that
+        # declaration so the next unreadable tick reads the same exclusions.
+        declared = {"projects": ["p2"], "exclude": {"projects": ["*-scratch"], "clusters": [
+            {"projectId": self.MGMT, "location": "us-central1", "clusterName": "kept-out"}]}}
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared}),
+            encoding="utf-8")
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        for _ in range(2):
+            report, created, deleted = self._run(None, {self.MGMT: [(self.MGMT, "kept-out", "us-central1"), (self.MGMT, "m1", "us-central1")]})
+            self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
+            self.assertEqual(deleted, [])
+            self.assertEqual(self._snapshot()["declared"], declared)
+            self.assertEqual([p["id"] for p in self._snapshot()["projects"]], [self.MGMT])
+
+    def test_a_declaration_with_scalar_fields_is_read_as_absent_fields(self):
+        # A hand-edited file or snapshot must not abort the run or come apart into characters.
+        for parsed in ({"projects": 5}, {"projects": "abc"}, {"exclude": {"clusters": 7}}, {"exclude": {"projects": True}}, {"exclude": 3}):
+            self.assertEqual(rec._normalize_scope(parsed), rec._empty_scope(), parsed)
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": {"projects": 5}}),
+            encoding="utf-8")
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "m1", "us-central1")]})
+        self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
+        self._write_scope({"projects": "abc", "exclude": {"clusters": 7}})
+        report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "m1", "us-central1")]})
+        self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
+
+    def test_a_cr_without_a_scope_block_retires_nothing_and_keeps_the_last_exclusions(self):
+        # The operator renders present=false when the CR has no scope block, which is what a
+        # write through an older webhook leaves behind: the previously explicit project is
+        # carried in scope, its profiles kept, and the last declaration's exclusions still hold.
+        declared = {"projects": ["p2"], "exclude": {"projects": [], "clusters": [
+            {"projectId": self.MGMT, "location": "us-central1", "clusterName": "kept-out"}]}}
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                          {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}],
+             "declared": declared, "profiles": {"cluster-p2": "p2"}}), encoding="utf-8")
+        ids = {"cluster-p2": _identity("p2", "x")}
+        for _ in range(3):
+            report, created, deleted = self._run({rec.SCOPE_PRESENT_KEY: False, "projects": [], "exclude": {"projects": [], "clusters": []}},
+                                                 {self.MGMT: [(self.MGMT, "kept-out", "us-central1")]},
+                                                 profiles=["cluster-p2"], identities=ids)
+            self.assertEqual((created, deleted, report["retiring"]), ([], [], []))
+            rows = {p["id"]: p["state"] for p in self._snapshot()["projects"]}
+            self.assertEqual(rows["p2"], rec.STATE_IN_SCOPE)
+            self.assertEqual(self._snapshot()["declared"], declared)
+            self.assertEqual(self._snapshot()["unmanaged"][0]["reason"], "no scope block declared this run; carried forward")
+        # A present block with an empty projects list is the declaration that drops p2.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p2"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), ([], ["p2"]))
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p2"], identities=ids)
+        self.assertEqual(deleted, ["cluster-p2"])
+
+    def test_a_cr_without_a_scope_block_still_has_clean_runs_for_what_an_earlier_block_marked(self):
+        # A project an earlier present block marked retiring, and a management project that changes
+        # identity, are still pruned on a no-block install: the mark came from a real declaration and
+        # the identity change from the metadata server, neither from the absence of the block.
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                          {"id": "gone", "via": [], "state": rec.STATE_RETIRING}],
+             "declared": {"projects": [], "exclude": {"projects": [], "clusters": []}}}), encoding="utf-8")
+        absent = {rec.SCOPE_PRESENT_KEY: False, "projects": [], "exclude": {"projects": [], "clusters": []}}
+        ids = {"cluster-g": _identity("gone", "g"), "cluster-m1": _identity(self.MGMT, "m1")}
+        report, _, deleted = self._run(absent, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                                       profiles=["cluster-g", "cluster-m1"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), (["cluster-g"], []))
+        # The management project changes (metadata names another): retiring on the change tick,
+        # pruned on the next clean run, block or no block.
+        report, _, deleted = self._run(absent, {"new-mgmt": []}, management="new-mgmt",
+                                       profiles=["cluster-m1"], identities={"cluster-m1": _identity(self.MGMT, "m1")})
+        self.assertEqual((deleted, report["retiring"]), ([], [self.MGMT]))
+        report, _, deleted = self._run(absent, {"new-mgmt": []}, management="new-mgmt",
+                                       profiles=["cluster-m1"], identities={"cluster-m1": _identity(self.MGMT, "m1")})
+        self.assertEqual(deleted, ["cluster-m1"])
+
+    def test_an_empty_reconcile_project_reads_as_unset(self):
+        # The operator pins RECONCILE_PROJECT empty; the empty value must not become the project.
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": ""}), \
+             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
+            self.assertEqual(rec._project_source(), ("from-metadata", True))
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "override"}), \
+             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
+            self.assertEqual(rec._project_source(), ("override", True))
+
+    def test_an_unreadable_declaration_with_no_previous_snapshot_excludes_nothing(self):
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "m1", "us-central1")]})
+        self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
+        self.assertEqual(self._snapshot()["declared"], rec._empty_scope())
+
+    def test_projects_are_listed_concurrently_and_created_in_the_fixed_order(self):
+        import threading, time
+        delay = 0.4
+        seen: list[str] = []
+        lock = threading.Lock()
+
+        def slow_list(project, timeout=None):
+            with lock:
+                seen.append(project)
+            time.sleep(delay)
+            return [(project, "c", "us-central1")], rec.OUTCOME_OK
+        start = time.monotonic()
+        report, created, _ = self._run({"projects": ["b", "a", "c"]}, slow_list)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, delay * 4 * 0.7, f"listings ran sequentially ({elapsed:.2f}s)")
+        self.assertEqual(sorted(seen), ["a", "b", "c", self.MGMT])
+        self.assertEqual([c[0] for c in created], [self.MGMT, "a", "b", "c"])
+
+    def test_an_unmanaged_profile_whose_cluster_is_gone_is_pruned_and_not_listed_as_unmanaged(self):
+        # exists=False on a profile the scope never produced: the orphan prune removes it, and a
+        # pruned profile must not be advertised in the snapshot's unmanaged list.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-h"],
+                                       identities={"cluster-h": _identity("hand", "h")}, exists=False)
+        self.assertEqual((deleted, report["pruned"], report["unmanaged"]), (["cluster-h"], ["cluster-h"], []))
+        self.assertEqual(self._snapshot()["unmanaged"], [])
+        # Inconclusive lookups keep it and list it, as before.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-h2"],
+                                       identities={"cluster-h2": _identity("hand", "h2")}, exists=None)
+        self.assertEqual((deleted, report["skipped_error"], report["unmanaged"]), ([], ["cluster-h2"], ["cluster-h2"]))
+        self.assertEqual([u["profile"] for u in self._snapshot()["unmanaged"]], ["cluster-h2"])
+
+    def test_the_management_project_is_listed_first_and_alone(self):
+        import threading, time
+        delay = 0.2
+        spans: dict[str, tuple[float, float]] = {}
+        lock = threading.Lock()
+
+        def lister(project, timeout=None):
+            start = time.monotonic(); time.sleep(delay); end = time.monotonic()
+            with lock:
+                spans[project] = (start, end)
+            return [], rec.OUTCOME_OK
+        self._run({"projects": ["a", "b"]}, lister)
+        self.assertEqual(sorted(spans), ["a", "b", self.MGMT])
+        self.assertLessEqual(spans[self.MGMT][1], min(spans["a"][0], spans["b"][0]))
+
+    def test_a_listing_still_running_at_the_budget_reads_unreachable_and_the_run_goes_on(self):
+        import time
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+
+        import threading
+        cuts: dict[str, float] = {}
+
+        def lister(project, timeout=None):
+            cuts[project] = timeout
+            if project == "slow":
+                # Honours the timeout the way gcloud's would: sleeps no longer than it.
+                time.sleep(min(1.5, timeout if timeout is not None else 1.5))
+            return [], rec.OUTCOME_OK
+        baseline = threading.active_count()
+        start = time.monotonic()
+        with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
+            report, _, deleted = self._run({"projects": ["slow", "quick"]}, lister,
+                                           profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
+        self.assertLess(time.monotonic() - start, 1.2)
+        self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK, "quick": rec.OUTCOME_OK, "slow": rec.OUTCOME_UNREACHABLE})
+        # Unreachable switches the scope prune off; the snapshot is still written.
+        self.assertEqual((deleted, report["retiring"]), ([], ["gone"]))
+        self.assertEqual({p["id"]: p["outcome"] for p in self._snapshot()["projects"]}["slow"], rec.OUTCOME_UNREACHABLE)
+        # The worker's own timeout was cut to the budget left, so no thread outlives the run
+        # by more than the grace: the interpreter joins the pool's threads at exit.
+        self.assertLessEqual(cuts["slow"], 1.0)
+        time.sleep(1.2)
+        self.assertEqual(threading.active_count(), baseline)
+
+    def test_an_unrelated_profile_of_unknown_identity_does_not_keep_a_project_retiring(self):
+        # gone's last profile goes this tick; a hand-made directory with no identity, never
+        # attributed to gone, must not pin gone in the snapshot, or a cluster onboarded there
+        # by hand later would be pruned instead of kept as never in scope.
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "gone", "state": rec.STATE_RETIRING}], "profiles": {"cluster-g": "gone"}}),
+            encoding="utf-8")
+        ids = {"cluster-g": _identity("gone", "g"), "hand-made": None}
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-g", "hand-made"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), (["cluster-g"], []))
+        self.assertEqual([p["id"] for p in self._snapshot()["projects"]], [self.MGMT])
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-g2", "hand-made"],
+                                       identities={"cluster-g2": _identity("gone", "g2"), "hand-made": None})
+        self.assertEqual((deleted, report["unmanaged"]), ([], ["cluster-g2"]))
+        self.assertEqual(self._snapshot()["unmanaged"][0]["reason"], "never in scope")
+
+    def test_the_snapshot_attributes_every_readable_profile_to_its_project(self):
+        report, _, _ = self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                                 profiles=["cluster-m1", "cluster-h"],
+                                 identities={"cluster-m1": _identity(self.MGMT, "m1"), "cluster-h": _identity("hand", "h")})
+        self.assertEqual(self._snapshot()["profiles"], {"cluster-h": "hand", "cluster-m1": self.MGMT})
+
+    def test_a_retiring_project_stays_in_the_snapshot_until_its_profiles_are_gone(self):
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+        # The delete fails this tick: the home survives, so the project stays retiring and the
+        # next run tries again rather than reading the survivor as never in scope.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")},
+                                       delete_removes=False)
+        self.assertEqual(deleted, ["cluster-g"])
+        self.assertIn("gone", report["retiring"])
+        self.assertEqual([(p["id"], p["clusters"]) for p in self._snapshot()["projects"] if p["state"] == rec.STATE_RETIRING], [("gone", 1)])
+
+    def test_explicit_projects_past_the_cap_read_over_cap_and_are_not_listed(self):
+        scope = {"projects": ["b", "c", "a"]}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
+            report, created, _ = self._run(scope, {
+                self.MGMT: [], "a": [("a", "x", "us-central1")], "b": [("b", "y", "us-central1")],
+                "c": [("c", "z", "us-central1")],
+            })
+        self.assertEqual(created, [("a", "x", "us-central1"), ("b", "y", "us-central1")])
+        self.assertEqual(report["projects"], {self.MGMT: "ok", "a": "ok", "b": "ok", "c": rec.OUTCOME_OVER_CAP})
+
+    def test_reconcile_exclude_still_works_beside_a_scope(self):
+        scope = {"projects": ["other"]}
+        report, created, _ = self._run(scope, {self.MGMT: [], "other": [("other", "skipme", "us-central1"),
+                                                                        ("other", "keep", "us-central1")]},
+                                       extra_exclude={"skipme"})
+        self.assertEqual(created, [("other", "keep", "us-central1")])
+
+    def test_an_unreadable_scope_file_falls_back_to_the_management_project(self):
+        path = Path(self._tmp.name) / "scope.json"
+        path.write_text("{not json", encoding="utf-8")
+        os.environ[rec.SCOPE_FILE_ENV] = str(path)
+        report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "m", "us-central1")],
+                                              "other": [("other", "o", "us-central1")]})
+        self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
+
+    def test_an_unresolved_management_project_switches_the_scope_prune_off(self):
+        # The previous snapshot always names the management project, so a tick that
+        # cannot resolve it would otherwise read every management profile as dropped.
+        self._write_previous([{"id": self.MGMT, "state": rec.STATE_IN_SCOPE}])
+        report, _, deleted = self._run({"projects": []}, {}, management=None,
+                                       profiles=["cluster-m1", "cluster-m2"],
+                                       identities={"cluster-m1": _identity(self.MGMT, "m1"),
+                                                   "cluster-m2": _identity(self.MGMT, "m2")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["unmanaged"]), ["cluster-m1", "cluster-m2"])
+        self.assertEqual(report["kept"], ["cluster-m1", "cluster-m2"])
+
+    def test_a_corrupt_scope_file_switches_the_scope_prune_off(self):
+        self._write_previous([{"id": "other", "state": rec.STATE_IN_SCOPE}])
+        path = Path(self._tmp.name) / "scope.json"
+        path.write_text("[1, 2]", encoding="utf-8")   # valid JSON, not a declaration
+        os.environ[rec.SCOPE_FILE_ENV] = str(path)
+        report, created, deleted = self._run(None, {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                             profiles=["cluster-o"], identities={"cluster-o": _identity("other", "o")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(created, [(self.MGMT, "m", "us-central1")])  # the management project still reconciles
+        self.assertEqual(report["unmanaged"], ["cluster-o"])
+
+    def test_an_empty_declaration_from_the_operator_is_a_declaration(self):
+        # The operator renders {"present": true, "projects": [], "exclude": {...}} for a CR
+        # whose scope block is present but empty; that is a declaration, and a project
+        # dropped from it retires (an absent block, present=false, is the case that does not).
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+        report, _, deleted = self._run({"projects": [], "exclude": {"projects": [], "clusters": []}},
+                                       {self.MGMT: []}, profiles=["cluster-g"],
+                                       identities={"cluster-g": _identity("gone", "g")})
+        self.assertEqual(deleted, ["cluster-g"])
+
+    def test_a_missing_scope_file_is_not_a_declaration(self):
+        # Variable set, file absent: the render did not reach the pod (a rollback, a
+        # ConfigMap mid-resync). Create still runs; the scope prune does not.
+        self._write_previous([{"id": "gone", "state": rec.STATE_IN_SCOPE}])
+        os.environ[rec.SCOPE_FILE_ENV] = str(Path(self._tmp.name) / "absent.json")
+        report, created, deleted = self._run(None, {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                             profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
+        self.assertTrue(report["create_pass_ran"])
+        # Nothing dropped it, so it is carried forward in scope, not written as retiring.
+        carried = next(p for p in self._snapshot()["projects"] if p["id"] == "gone")
+        self.assertEqual((carried["state"], carried["outcome"]), (rec.STATE_IN_SCOPE, rec.OUTCOME_UNREACHABLE))
+        self.assertEqual(report["retiring"], [])
+
+    def test_a_project_dropped_on_an_unclean_tick_is_carried_and_takes_two_clean_runs(self):
+        self._write_previous([{"id": "gone", "state": rec.STATE_IN_SCOPE}])
+        gone = {"cluster-g": _identity("gone", "g")}
+        # Tick 1: a flaky lookup; the drop is not judged, the project is carried forward.
+        report, _, deleted = self._run({"projects": ["flaky"]},
+                                       {self.MGMT: [], "flaky": (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=["cluster-g"], identities=gone)
+        self.assertEqual((deleted, report["retiring"]), ([], []))
+        rows = {p["id"]: p["state"] for p in self._snapshot()["projects"]}
+        self.assertEqual(rows["gone"], rec.STATE_IN_SCOPE)
+        # Tick 2: the first clean run marks it retiring.
+        report, _, deleted = self._run({"projects": ["flaky"]}, {self.MGMT: [], "flaky": []},
+                                       profiles=["cluster-g"], identities=gone)
+        self.assertEqual((deleted, report["retiring"]), ([], ["gone"]))
+        # Tick 3: unclean again; still retiring, not pruned, count not restarted.
+        report, _, deleted = self._run({"projects": ["flaky"]},
+                                       {self.MGMT: [], "flaky": (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=["cluster-g"], identities=gone)
+        self.assertEqual((deleted, report["retiring"]), ([], ["gone"]))
+        # Tick 4: the next clean run prunes.
+        report, _, deleted = self._run({"projects": ["flaky"]}, {self.MGMT: [], "flaky": []},
+                                       profiles=["cluster-g"], identities=gone)
+        self.assertEqual(deleted, ["cluster-g"])
+
+    def test_a_malformed_previous_snapshot_does_not_abort_the_run(self):
+        for body in ("[1, 2]", '{"projects": null}', '{"projects": [1, "x", {"id": "z"}]}'):
+            (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(body, encoding="utf-8")
+            report, created, deleted = self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                                 profiles=["cluster-h"], identities={"cluster-h": _identity("hand", "h")})
+            self.assertEqual(created, [(self.MGMT, "m", "us-central1")], body)
+            self.assertEqual(deleted, [], body)
+            self.assertTrue(report["create_pass_ran"], body)
+
+    def test_an_unresolved_management_project_leaves_the_roster_unreconciled_even_with_a_scope(self):
+        report, created, _ = self._run({"projects": ["other"]}, {"other": [("other", "o", "us-central1")]},
+                                       management=None)
+        self.assertEqual(created, [("other", "o", "us-central1")])
+        self.assertFalse(report["create_pass_ran"])
+
+    def test_only_the_management_projects_own_listing_reconciles_the_roster(self):
+        report, created, _ = self._run({"projects": ["other"]},
+                                       {self.MGMT: (None, rec.OUTCOME_UNREACHABLE), "other": [("other", "o", "us-central1")]})
+        self.assertEqual(created, [("other", "o", "us-central1")])
+        self.assertFalse(report["create_pass_ran"])
+
+    def test_a_changed_management_project_keeps_the_old_ones_profiles(self):
+        # RECONCILE_PROJECT removed or re-pointed, or the metadata server naming another project
+        # (a fallback answer that disagrees is the unresolved case, tested below): the old
+        # management project reads as dropped, and nothing in the declaration changed.
+        self._write_previous([{"id": "old-mgmt", "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-x"], identities={"cluster-x": _identity("old-mgmt", "x")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["unmanaged"], ["cluster-x"])
+        self.assertEqual(self._snapshot()["unmanaged"][0]["reason"],
+                         "was the management project until this run; retiring, pruned on the next clean run")
+        self.assertEqual([p["id"] for p in self._snapshot()["projects"] if p["state"] == rec.STATE_RETIRING], ["old-mgmt"])
+        # The next clean run prunes it like any dropped project, unless it is named in the scope.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-x"], identities={"cluster-x": _identity("old-mgmt", "x")})
+        self.assertEqual(deleted, ["cluster-x"])
+        self.assertEqual(report["retiring"], [])
+
+    def test_a_fallback_answer_that_disagrees_with_the_previous_run_is_treated_as_unresolved(self):
+        # Metadata timed out and the broker's gcloud config named another project: two such
+        # ticks in a row must not retire and then prune the real management project's profiles.
+        mgmt_profiles = {"cluster-m1": _identity(self.MGMT, "m1")}
+        self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                  profiles=["cluster-m1"], identities=mgmt_profiles)
+        for _ in range(2):
+            report, created, deleted = self._run({"projects": []}, {"other-proj": []}, management="other-proj",
+                                                 profiles=["cluster-m1"], identities=mgmt_profiles, authoritative=False)
+            self.assertEqual((deleted, created), ([], []))
+            self.assertEqual(report["retiring"], [])
+            self.assertFalse(report["create_pass_ran"])
+            rows = {p["id"]: (p["via"], p["outcome"]) for p in self._snapshot()["projects"]}
+            self.assertEqual(rows, {self.MGMT: ([rec.VIA_MANAGEMENT], rec.OUTCOME_UNREACHABLE)})
+        # Metadata is back: the management project lists again and nothing was lost.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                                       profiles=["cluster-m1"], identities=mgmt_profiles)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-m1"])
+
+    def test_a_fallback_answer_on_the_first_run_is_the_management_project(self):
+        # No previous snapshot: nothing to disagree with, so the fallback answer stands.
+        report, created, _ = self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                                       authoritative=False)
+        self.assertTrue(report["create_pass_ran"])
+        self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
+
+    def test_a_retiring_project_re_declared_before_the_second_run_returns_to_scope(self):
+        self._write_previous([{"id": "p", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-p": _identity("p", "p1")}
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), ([], ["p"]))
+        report, _, deleted = self._run({"projects": ["p"]}, {self.MGMT: [], "p": [("p", "p1", "us-central1")]},
+                                       profiles=["cluster-p"], identities=ids)
+        self.assertEqual((deleted, report["retiring"], report["unmanaged"]), ([], [], []))
+        rows = {q["id"]: (q["state"], q["via"]) for q in self._snapshot()["projects"]}
+        self.assertEqual(rows["p"], (rec.STATE_IN_SCOPE, [rec.VIA_EXPLICIT]))
+        # Dropped again: the count starts over, retiring rather than pruned.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), ([], ["p"]))
+
+    def test_a_glob_newly_matching_an_explicit_project_retires_it_over_two_runs(self):
+        ids = {"cluster-s": _identity("team-scratch", "s1")}
+        self._run({"projects": ["team-scratch"]}, {self.MGMT: [], "team-scratch": [("team-scratch", "s1", "us-central1")]},
+                  profiles=["cluster-s"], identities=ids)
+        scope = {"projects": ["team-scratch"], "exclude": {"projects": ["*-scratch"]}}
+        report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=["cluster-s"], identities=ids)
+        self.assertEqual((deleted, report["retiring"], report["unmanaged"]), ([], ["team-scratch"], ["cluster-s"]))
+        report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=["cluster-s"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), (["cluster-s"], []))
+
+    def test_a_changed_management_project_named_in_the_scope_stays_managed(self):
+        self._write_previous([{"id": "old-mgmt", "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, _, deleted = self._run({"projects": ["old-mgmt"]}, {self.MGMT: [], "old-mgmt": []},
+                                       profiles=["cluster-x"], identities={"cluster-x": _identity("old-mgmt", "x")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["unmanaged"], [])
+        self.assertEqual(report["retiring"], [])
+
+    def test_a_retiring_project_stays_retiring_on_a_tick_that_could_not_read_the_declaration(self):
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+        self._write_scope("{not json")
+        report, _, deleted = self._run(None, {self.MGMT: []},
+                                       profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["retiring"], ["gone"])
+        rows = [(p["id"], p["state"]) for p in self._snapshot()["projects"] if p["id"] == "gone"]
+        self.assertEqual(rows, [("gone", rec.STATE_RETIRING)])
+        # The next clean run prunes: the unreadable tick did not restart the count.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
+                                       profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
+        self.assertEqual(deleted, ["cluster-g"])
+
+    def test_dry_run_deletes_nothing_and_writes_no_snapshot(self):
+        self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
+        before = (self.homes / rec.SNAPSHOT_FILE).read_bytes()
+        report, created, deleted = self._run(
+            {"projects": [], "exclude": {"clusters": [{"projectId": self.MGMT, "location": "us-central1", "clusterName": "x"}]}},
+            {self.MGMT: [(self.MGMT, "new", "us-central1"), (self.MGMT, "x", "us-central1")]},
+            profiles=["cluster-g", "cluster-x"],
+            identities={"cluster-g": _identity("gone", "g"), "cluster-x": _identity(self.MGMT, "x")},
+            dry_run=True)
+        self.assertEqual((deleted, created), ([], []))
+        self.assertEqual(sorted(report["pruned"]), ["cluster-g", "cluster-x"])
+        self.assertEqual(report["created"], ["new/us-central1"])
+        self.assertEqual(report["retiring"], ["gone"])
+        self.assertEqual((self.homes / rec.SNAPSHOT_FILE).read_bytes(), before)
+
+    def test_an_unresolved_tick_keeps_naming_the_management_project_so_the_next_tick_cannot_prune_it(self):
+        mgmt_profiles = {"cluster-m1": _identity(self.MGMT, "m1")}
+        # Tick 1: normal.
+        self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                  profiles=["cluster-m1"], identities=mgmt_profiles)
+        # Tick 2: the management project cannot be resolved.
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        report, _, deleted = self._run({"projects": []}, {}, management=None,
+                                       profiles=["cluster-m1"], identities=mgmt_profiles)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["retiring"], [])
+        carried = next(p for p in self._snapshot()["projects"] if p["id"] == self.MGMT)
+        self.assertEqual((carried["via"], carried["outcome"], carried["state"]),
+                         (["management"], rec.OUTCOME_UNREACHABLE, rec.STATE_IN_SCOPE))
+        # Tick 3: resolved again; nothing was dropped, nothing is pruned.
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                                       profiles=["cluster-m1"], identities=mgmt_profiles)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-m1"])
+        # Tick 3': resolved to a different project instead; the old one is kept, not pruned.
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        report, _, deleted = self._run({"projects": []}, {"other-mgmt": []}, management="other-mgmt",
+                                       profiles=["cluster-m1"], identities=mgmt_profiles)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["unmanaged"], ["cluster-m1"])
+
+    def test_a_carried_forward_management_project_that_is_also_explicit_is_listed_once(self):
+        self._write_previous([{"id": "p1", "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, created, _ = self._run({"projects": ["p1"]}, {"p1": [("p1", "c", "us-central1")]}, management=None)
+        rows = [p for p in self._snapshot()["projects"] if p["id"] == "p1"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["via"], ["explicit", "management"])
+        self.assertEqual(rows[0]["outcome"], rec.OUTCOME_OK)
+        self.assertEqual(created, [("p1", "c", "us-central1")])
+        self.assertEqual(report["projects"], {"p1": rec.OUTCOME_OK})
 
 
 if __name__ == "__main__":

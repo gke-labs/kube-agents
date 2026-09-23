@@ -844,8 +844,8 @@ def _safeguard_entry() -> VerificationEntry:
     """The none-wrapped tool_called safeguard shape.
 
     Kept as machinery coverage even though the gpu task's own safeguard is
-    cluster-state now (the trajectory is router-only, so a trace-based
-    mutation safeguard is blind to worker calls): the shape stays supported
+    cluster-state now (``tool_called`` counts router entries only, so a
+    trace-based mutation safeguard is blind to worker calls): the shape stays supported
     for router-level invariants, and the tool name below is a fixture, not a
     claim that the tool exists.
     """

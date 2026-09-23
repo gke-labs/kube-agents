@@ -884,6 +884,43 @@ class JsonOutput(unittest.TestCase):
         self.assertEqual([], payload["cause_text"])
 
 
+class XmlText(unittest.TestCase):
+    """`_xml_text` drops exactly what XML 1.0's Char production excludes.
+
+    The class is written in escapes, so the check runs over every code point
+    rather than a sample: one wrong digit at a boundary moves a plane in or out
+    and no captured fixture carries a character that would notice.
+    """
+
+    # XML 1.0 section 2.2, Char ::= #x9 | #xA | #xD | [#x20-#xD7FF]
+    #                              | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+    CHAR_RANGES = ((0x9, 0x9), (0xA, 0xA), (0xD, 0xD), (0x20, 0xD7FF),
+                   (0xE000, 0xFFFD), (0x10000, 0x10FFFF))
+
+    def test_every_code_point_lands_on_the_side_the_production_puts_it(self):
+        everything = "".join(map(chr, range(sys.maxunicode + 1)))
+        expected = "".join(
+            chr(cp) for low, high in self.CHAR_RANGES for cp in range(low, high + 1)
+        )
+        actual = pp._xml_text(everything)
+        if actual != expected:
+            wrong = sorted(set(map(ord, actual)) ^ set(map(ord, expected)))
+            self.fail("on the wrong side of the Char production: "
+                      + ", ".join(f"U+{cp:04X}" for cp in wrong[:20]))
+
+    def test_the_boundaries_by_name(self):
+        """The edges of each range and a character from each plane, readable
+        without decoding the sweep above."""
+        kept = "\t\n\r A\ud7ff\ue000\ufffd\U00010000\U0001F600\U0010FFFF"
+        dropped = "\x00\x01\x08\x0b\x0c\x1f\ud800\udfff\ufffe\uffff"
+        self.assertEqual(kept, pp._xml_text(kept + dropped))
+        self.assertEqual(kept, pp._xml_text(dropped + kept))
+
+    def test_none_and_empty_are_empty(self):
+        self.assertEqual("", pp._xml_text(None))
+        self.assertEqual("", pp._xml_text(""))
+
+
 class JunitOutput(unittest.TestCase):
     """The --junit file is what the TestGrid tab reads, so it is an interface.
 

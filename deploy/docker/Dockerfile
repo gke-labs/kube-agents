@@ -1367,6 +1367,16 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
+# The two files that name the speaking profile to the shell sandbox on every
+# connection Hermes' backend opens: the ssh client drop-in, and the wrapper that
+# puts the variable it sends into the client's environment. Each says what it
+# does and why it is baked here rather than written at start. Staged in one COPY
+# and installed by the RUN below, which is one layer rather than two against
+# the budget at the top; the same arrangement the patch appliers use.
+COPY deploy/docker/ssh_config.d/10-sandbox-profile-home.conf \
+     deploy/docker/ssh-wrapper.sh \
+     /tmp/sandbox-profile-home/
+
 # Remove the build-only clone dependency after all plugin installation is done.
 #
 # The loop is what step 2 above defers to. git is native up to the purge on the
@@ -1374,6 +1384,19 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
 # left with #737 — so a hit is a step someone added rather than a leftover. This
 # catches a real binary only; the symlink case is the `platform` stage's guard,
 # which runs last and so sees everything both stages wrote.
+#
+# Then the two files staged above go to their places -- the drop-in, root-owned
+# 0644, into the directory the base image's /etc/ssh/ssh_config includes; the
+# wrapper to /usr/local/bin/ssh, which PATH reaches before /usr/bin -- and four
+# checks follow, in this layer rather than one of their own. `command -v` proves
+# the wrapper is what `ssh` resolves to and that the client it execs is there.
+# `ssh -G` parses the config for a host and prints what it resolved, so the
+# first -G line fails when the base image's ssh_config stops including the
+# directory, when the drop-in no longer parses on the image's OpenSSH, or when
+# the host pattern misses the operator's naming; the second fails when the
+# pattern widens to a host that is not a sandbox. None of them can prove the
+# server accepts the variable or that a multiplexed session carries the
+# caller's value; sections 4e and 4f of the sandbox smoke test do that.
 RUN apt-get purge -y git && apt-get autoremove -y && \
 	rm -rf /var/lib/apt/lists/* && \
 	for binary in gcloud kubectl gh git helm k9s yq; do \
@@ -1381,7 +1404,14 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 			echo "unexpected cluster CLI in the agent image: ${binary}" >&2; \
 			exit 1; \
 		fi; \
-	done
+	done && \
+	install -m 0644 /tmp/sandbox-profile-home/10-sandbox-profile-home.conf /etc/ssh/ssh_config.d/ && \
+	install -m 0755 /tmp/sandbox-profile-home/ssh-wrapper.sh /usr/local/bin/ssh && \
+	rm -rf /tmp/sandbox-profile-home && \
+	[ "$(command -v ssh)" = /usr/local/bin/ssh ] && [ -x /usr/bin/ssh ] && \
+	ssh -G agent@probe-shell-0.probe-shell.probe.svc.cluster.local \
+		| grep -qx 'sendenv HERMES_PROFILE_HOME' && \
+	! ssh -G agent@probe.example.invalid | grep -q '^sendenv HERMES_PROFILE_HOME'
 
 # 5.7. Precompile the Python tree to bytecode.
 #

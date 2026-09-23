@@ -1200,7 +1200,11 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     object_name = payload.get("name") or ""
     message = payload.get("message") or ""
     cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
-    gcp_project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GCP_PROJECT") or ""
+    # The watcher stamps the cluster's own project on the event; with a scope declared
+    # (docs/designs/multi-project-scope.md) that is not always the project this pod runs
+    # in, and a console link into the wrong project is worse than none.
+    gcp_project = (payload.get("project") or os.environ.get("GCP_PROJECT_ID")
+                   or os.environ.get("GCP_PROJECT") or "")
     workloads_project_query = f"?project={gcp_project}" if gcp_project else ""
     logs_project_query = f";project={gcp_project}" if gcp_project else ""
 

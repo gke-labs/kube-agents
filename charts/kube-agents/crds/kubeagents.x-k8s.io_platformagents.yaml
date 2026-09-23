@@ -9946,6 +9946,86 @@ spec:
                         - endpoint
                       type: object
                   type: object
+                scope:
+                  description: |-
+                    Scope declares which GCP projects, beyond the one the agent runs in, the
+                    Cluster Agent reconcile enumerates for GKE clusters, and which projects and
+                    clusters it leaves unmanaged. Absent, the reconcile lists the management project
+                    alone, keeps the last declaration's exclusions and retires nothing; an empty
+                    projects list in a present block drops the projects an earlier block declared.
+                    The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
+                    this is its phase 1, explicit projects only.
+                  properties:
+                    exclude:
+                      description: |-
+                        Exclude subtracts projects and clusters after every selector has
+                        contributed.
+                      properties:
+                        clusters:
+                          description: |-
+                            Clusters names single clusters by the full triple, because cluster names
+                            are unique only within a project and location. This replaces the
+                            RECONCILE_EXCLUDE environment variable, which matched bare names across
+                            every project.
+                          items:
+                            description: ScopeClusterRef identifies one GKE cluster.
+                            properties:
+                              clusterName:
+                                description: ClusterName is the GKE cluster's name.
+                                maxLength: 63
+                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                type: string
+                              location:
+                                description: Location is the cluster's region or zone.
+                                maxLength: 63
+                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                type: string
+                              projectId:
+                                description:
+                                  ProjectID is the project the cluster lives
+                                  in.
+                                maxLength: 63
+                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                type: string
+                            required:
+                              - clusterName
+                              - location
+                              - projectId
+                            type: object
+                          maxItems: 100
+                          type: array
+                          x-kubernetes-list-map-keys:
+                            - projectId
+                            - location
+                            - clusterName
+                          x-kubernetes-list-type: map
+                        projects:
+                          description: |-
+                            Projects are project IDs or shell-style globs (`*-sandbox`) matched against
+                            each resolved project ID. A match on the management project is ignored and
+                            recorded in the scope snapshot, never applied.
+                          items:
+                            pattern: ^[a-z0-9*?\[\]!-]{1,63}$
+                            type: string
+                          maxItems: 100
+                          type: array
+                          x-kubernetes-list-type: set
+                      type: object
+                    projects:
+                      description: |-
+                        Projects lists GCP project IDs whose GKE clusters get Cluster Agent
+                        profiles, in addition to the management project. The agent's service
+                        account needs the read roles in each, granted by hand until the install's
+                        Terraform gains a scope input; a project it cannot list is reported with
+                        the reason (denied, api-disabled, unreachable) and its existing profiles
+                        are kept.
+                      items:
+                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
+                        type: string
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-type: set
+                  type: object
                 security:
                   description:
                     Security configures RBAC, Pod Security, and Workload
@@ -10304,7 +10384,9 @@ spec:
                             git wrappers, which go through the broker;
                           - the metadata lookup in cluster_agent_reconcile.py, which finds that
                             script's project id. It fails soft after a five-second timeout and
-                            falls back to a broker gcloud call; set RECONCILE_PROJECT to skip it.
+                            falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
+                            pinned empty in the managed .env (a project other than the pod's belongs in
+                            spec.scope.projects, the management project still has to resolve).
 
                         Those would not be accidental casualties. A headless browser with
                         unrestricted egress is the exfiltration path, so the capabilities this

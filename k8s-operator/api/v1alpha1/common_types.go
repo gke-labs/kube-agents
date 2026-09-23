@@ -1093,7 +1093,9 @@ type SecuritySpec struct {
 	//     git wrappers, which go through the broker;
 	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
 	//     script's project id. It fails soft after a five-second timeout and
-	//     falls back to a broker gcloud call; set RECONCILE_PROJECT to skip it.
+	//     falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
+	//     pinned empty in the managed .env (a project other than the pod's belongs in
+	//     spec.scope.projects, the management project still has to resolve).
 	//
 	// Those would not be accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this

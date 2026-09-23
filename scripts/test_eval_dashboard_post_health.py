@@ -320,6 +320,32 @@ class Shapes(RunHarness):
             f"{URL}#since=2026-09-05T13:00:00Z&view=gate",
         )
 
+    def test_a_delegation_ceiling_wave_is_posted_under_its_own_name(self):
+        doc = health(
+            "DEGRADED", "delegation ceiling: 18 repetitions on 3 PRs ended with the worker still running 17:15–18:25 UTC",
+            since="2026-09-03T18:30:00+00:00", condition="delegation_ceiling", prs=(1182, 1167, 1188), runs=3,
+            window=("2026-09-03T17:15:00+00:00", "2026-09-03T18:25:00+00:00"),
+        )
+        doc["incident"]["reps"] = 18
+        self.tick(doc, T0)
+        self.assertEqual(
+            self.opener.texts[0],
+            "🟡 *Smoke gate: flaky* — 18 repetitions on 3 PRs ended with the worker still running 1:15 PM–2:25 PM ET; nothing was graded"
+            " and nothing counts against a case. Those runs read NOT EVALUATED, not red; retest once workers are finishing again."
+            " The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).\n"
+            f"{URL}#since=2026-09-03T18:30:00Z&view=gate",
+        )
+        self.tick(health(), T0.replace(hour=15, minute=30))
+        self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 21h (workers were not finishing).")
+
+    def test_the_digest_carries_the_ceiling_count_on_a_day_that_had_one(self):
+        doc = health()
+        doc["metrics"]["ceiling_reps"] = 13
+        self.tick(doc, self.at(DIGEST_UTC, 5))
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(lines[1], "⏳ 13 repetitions ended at the delegation ceiling with the worker still running; not counted as infra or against any case.")
+        self.assertIn("5 infra", lines[0], "the headline's infra count is the storm's, unchanged")
+
     def test_recovery(self):
         self.tick(outage(cases=TRIO, since="2026-09-07T14:00:00+00:00", issues=["#1269"]), T0.replace(day=7, hour=14))
         self.tick(health(since="2026-09-08T01:00:00+00:00"), T0.replace(day=8, hour=1))

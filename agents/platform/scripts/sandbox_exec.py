@@ -30,8 +30,10 @@ It does not build the ssh subprocess environment from `os.environ`. The agent
 pod holds `API_SERVER_KEY` and `SESSION_KV_API_KEY`, and `_run_env()` in
 `agent_common_server.py` — the helper most of these call sites used to pass —
 is `{**os.environ, "HOME": "/tmp"}`. Nothing crosses today, because the
-sandbox's `sshd_config` sets `PermitUserEnvironment no` and `AcceptEnv LANG
-LC_*`, but that is the remote end declining what this end should not offer.
+sandbox's `sshd_config` sets `PermitUserEnvironment no` and accepts only `LANG`
+and `LC_*` — plus `HERMES_PROFILE_HOME` for the `agent` account alone, which
+this module never is — but that is the remote end declining what this end
+should not offer.
 Variables the remote command genuinely needs go through `remote_env`, which
 renders them into the command line rather than into the client's environment.
 

@@ -1429,5 +1429,3 @@ func TestBuildLiteLLMNetworkPolicy_CollectorNamespaceAnnotation(t *testing.T) {
 		}
 	}
 }
-
-

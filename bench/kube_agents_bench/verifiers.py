@@ -205,15 +205,17 @@ class ReportContainsVerifier(BaseVerifier):
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
 
-    THE TRAJECTORY IS THE ROUTER'S, NOT THE FLEET'S. By this harness's
-    design, ``result.trajectory`` holds only the delegating turn's calls:
-    poll-turn calls are the harness's own bookkeeping and are kept out
-    (``_fold_status_turn``), and a delegated worker's calls never reach it
-    at all. This verifier can therefore assert what the ROUTER did
-    (``kanban_create`` is the router's own call) and nothing about what a
-    worker did on a cluster — a mutation safeguard built on it would be
-    blind to the very calls it fears. Use a cluster-state check
-    (``resource_property``) for those.
+    THE COUNT IS THE ROUTER'S, NOT THE FLEET'S. By this harness's
+    design, this verifier counts only the delegating turn's calls: poll-turn
+    calls are the harness's own bookkeeping and are kept out of the
+    trajectory (``_fold_status_turn``), and the delegated workers' calls,
+    which the harness appends after settlement tagged with the ``agent``
+    that made them (``worker_trajectory``), are skipped here so the count
+    keeps meaning what it always has. This verifier can therefore assert
+    what the ROUTER did (``kanban_create`` is the router's own call) and
+    nothing about what a worker did on a cluster — a mutation safeguard
+    built on it would be blind to the very calls it fears. Use a
+    cluster-state check (``resource_property``) for those.
 
     Passes when at least ``minimum_calls`` matching calls were made. Wrapped
     in a ``none`` compound, it is the safeguard shape "this tool was never
@@ -247,6 +249,7 @@ class ToolCalledVerifier(BaseVerifier):
             entry
             for entry in snap.trajectory
             if isinstance(entry, dict)
+            and not entry.get("agent")
             and entry.get("name") in wanted
             and not (self.require_success and entry.get("status") == "error")
         ]
@@ -396,7 +399,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     """Pattern checks against the terminal commands the delegated workers ran.
 
     The one check that sees the ROUTE a worker took rather than the answer it
-    gave. ``tool_called`` cannot: a worker's calls never reach the trajectory.
+    gave. ``tool_called`` cannot: it skips the worker entries the harness
+    appends to the trajectory, by design (see its docstring).
     The harness reads each delegated card's worker log before purging it and
     stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
     this verifier matches Python regular expressions against those strings,
@@ -598,8 +602,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     prints ``"issue": null`` until a ledger exists (only ``finish`` ever calls
     ``gh issue create``), the audit's ``.lease`` marker on disk records the
     repo and the audit id but no issue number, and the audit runs in a
-    delegated worker whose tool calls never reach ``snap.trajectory``. What
-    does cross back is ``finish``'s ``issue_url``, which the SOP requires
+    delegated worker whose calls reach ``snap.trajectory`` only as clipped,
+    tagged entries that no verifier reads for content. What does cross back
+    is ``finish``'s ``issue_url``, which the SOP requires
     every non-silent report to carry in full — and an on-demand run, which is
     what an eval task is, is never silent. The URL is treated as a POINTER and
     never as evidence: everything asserted below comes from what GitHub
