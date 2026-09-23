@@ -189,7 +189,13 @@
           "path": "nodePools[?(@.name=='no-surge-pool')].upgradeSettings.maxUnavailable",
           "op": "any_eq",
           "value": 1,
-          "why": "the defect itself, as far as clusters describe exposes it: the pool upgrades by taking its only node away. Raising maxSurge back to 1 heals the fixture while every probe still passes, which is what this assertion exists to catch. maxSurge = 0 is the other half and is deliberately not asserted yet -- whether the API emits the zero or omits it is unconfirmed against a live apply, and an assertion guessed wrong leaves the role permanently drifted"
+          "why": "half of the defect, as clusters describe exposes it: the pool upgrades by taking its only node away. Raising maxSurge back to 1 heals the fixture while every probe still passes, which is what this and the next assertion exist to catch"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='no-surge-pool')].upgradeSettings.maxSurge",
+          "op": "absent",
+          "why": "the other half. The API omits maxSurge when it is 0 (confirmed against a live apply: the pool's upgradeSettings carry maxUnavailable and strategy only), so its presence at any value means someone gave the pool surge capacity and the fixture is healed"
         }
       ]
     },
