@@ -566,16 +566,47 @@ def refresh_git_credentials(
             timeout=CLI_SETUP_TIMEOUT_SECONDS,
             env=env,
         )
-        subprocess.run(
-            ["gh", "auth", "setup-git"],
-            check=True,
+        # Stop rewriting the config on every refresh. The helper `gh auth setup-git`
+        # installs is static (!.../gh auth git-credential) and carries nothing token-specific.
+        # Skipping the call when credential.https://github.com.helper already has it
+        # removes the steady-state write, eliminating the .gitconfig lock collision window.
+        configured_helper = subprocess.run(
+            [
+                "git",
+                "config",
+                "--global",
+                "--get-all",
+                "credential.https://github.com.helper",
+            ],
             capture_output=True,
+            text=True,
             timeout=CLI_SETUP_TIMEOUT_SECONDS,
             env=env,
         )
+        if (
+            configured_helper.returncode != 0
+            or "gh auth git-credential" not in (configured_helper.stdout or "")
+        ):
+            subprocess.run(
+                ["gh", "auth", "setup-git"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=CLI_SETUP_TIMEOUT_SECONDS,
+                env=env,
+            )
         log(
             f"GitHub authentication successfully configured for repository: {repository}"
         )
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "")
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        detail = detail.strip()
+        detail_msg = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"Failed to configure GitHub auth in gh CLI: {e}{detail_msg}"
+        ) from e
     except Exception as e:
         raise RuntimeError(f"Failed to configure GitHub auth in gh CLI: {e}") from e
 

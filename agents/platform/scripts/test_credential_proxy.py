@@ -2870,6 +2870,129 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 executor.refresh_forge_credential("gitlab", "gke-agentic/infra")
         self.assertIn("gitlab", str(raised.exception))
 
+    def test_serializes_concurrent_refreshes_and_coalesces_second_caller(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+
+        def slow_execute(argv, cwd=None):
+            calls.append(list(argv))
+            started_event.set()
+            time.sleep(0.05)
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=50,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = slow_execute
+        results = []
+
+        def worker():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results.append("ok")
+            except Exception as e:
+                results.append(e)
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        self.assertEqual(results, ["ok", "ok"])
+        # Only one helper execution occurred because the second caller coalesced.
+        self.assertEqual(len(calls), 1)
+
+    def test_coalesces_subsequent_refresh_within_coalesce_window(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            # Immediate second call for the same repo (differing only in casing/spaces)
+            executor.refresh_forge_credential("github", " GKE-AGENTIC/INFRA ")
+
+        self.assertEqual(len(calls), 1)
+
+    def test_distinct_repositories_both_run(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            executor.refresh_forge_credential("github", "gke-agentic/repo-b")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_refresh_does_not_coalesce_next_attempt(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def fail_then_succeed(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="transient error",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = fail_then_succeed
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            with self.assertRaises(RuntimeError):
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+            # Second attempt must run and succeed, not coalesce the failure
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+
+        self.assertEqual(len(calls), 2)
+
 
 class ForgeRefreshRouteTest(unittest.TestCase):
     """What `POST /v1/forge/refresh` answers, and what it declines to say."""
