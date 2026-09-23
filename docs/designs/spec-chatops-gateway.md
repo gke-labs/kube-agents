@@ -160,6 +160,14 @@ by construction. Three interceptors run on each turn, ahead of the routing above
 - **Delegate.** A prefix, not a phrase, and recognized only when no live task
   serializes the conversation; its own section below.
 
+**Amended 2026-09-23.** The **Stop** bullet above describes what ships today: a stop
+from anyone in the room cancels the task. It becomes requester-only. A stop from
+someone other than the requester gets a notice, not a cancel. That change is designed
+in [`spec-model-router.md`](spec-model-router.md), under "What the router may never do",
+which owns the rule and the reasoning for it. None of it is implemented yet. The router
+spec carries the gateway half as build step 3, so until that lands the bullet above is
+what the code does.
+
 Two routes exist, and the terms recur below: a conversation is **fixed-routed** when
 its tasks address the standing executor configured at deploy time (the platform front
 door), and **session-routed** when they address the conversation's own spawned worker.

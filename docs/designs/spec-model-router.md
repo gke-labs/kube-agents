@@ -459,6 +459,10 @@ Steps 1 to 3 are ordinary Go with no dependency on the `model-router` alias.
   explicit override phrase), and what a cancel does against a task with no recorded
   requester, which is anything in flight at rollout. Originator-only for now. The
   chat permissions model is what settles both.
+- Whether the gateway should constrain `ask` at all, since a captured router can keep a
+  legitimate addressee and rewrite what is being asked for (Injection: blast radius
+  above). And whether the decision audit record has to land earlier than build step 5,
+  which is the only place a rewrite becomes visible. Unconstrained for now.
 
 ## Why not ADK
 
