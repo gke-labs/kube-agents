@@ -187,6 +187,12 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
             body["deduplicated"] = True
         if self.server.accepted_at is None:
             self.server.accepted_at = time.monotonic()
+        if attempts <= self.server.dropped_replies:
+            # Accepted and started, and the reply lost: the socket closes
+            # before a status line, as a dying port-forward's does.
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
         self._respond(200, body)
 
     def do_GET(self) -> None:
@@ -287,6 +293,10 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # bounds how many leading POSTs do (-1: all of them).
     submit_status: int | None = None
     submit_failures: int = -1
+    # How many leading POSTs the stub accepts -- recorded, the task started
+    # -- and then drops the connection on before the status line, which is
+    # a tunnel dying between the door's accept and its reply.
+    dropped_replies: int = 0
     # Non-None makes GETs answer with that status: every GET when
     # poll_failures is -1, otherwise the first poll_failures GETs that
     # arrive poll_fail_after_seconds or more after the first accepted POST,
@@ -747,6 +757,48 @@ def test_a_transport_that_dies_after_the_accept_still_cancels_the_task(
     assert len(stub_gateway.submissions) == 1
     assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
     assert "was published" in result.errors[0]
+
+
+def test_a_task_whose_accept_reply_was_lost_is_still_cancelled_by_name(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """The door accepts the POST and the tunnel dies before the reply, on
+    every attempt the retry set allows, so this side never learns the task
+    id -- and the task is running all the same, because the door finishes a
+    claimed turn whether or not its client is there. The abandon reads the
+    conversation once, takes the active task's id off the probe, and cancels
+    by name, rather than leaving a task it never heard of on the bridge."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)
+    stub_gateway.dropped_replies = harness._MAX_TRANSPORT_FAILURES
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert infra(result)
+    assert len(stub_gateway.submissions) == harness._MAX_TRANSPORT_FAILURES
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
+    assert f"a cancel naming task {stub_gateway.task_id} was published" in result.errors[0]
+
+
+def test_a_lost_accept_reply_whose_recovery_read_also_fails_says_so(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """The same loss, and the read that would recover the id fails too: the
+    record says no id is known and that a started task was left running,
+    rather than the bare exchange failure, and no unnamed cancel is sent."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id)
+    stub_gateway.dropped_replies = harness._MAX_TRANSPORT_FAILURES
+    # Every read after the first accept fails -- the retries' preflights and
+    # the recovery read alike, which is a door gone dark -- while the
+    # preflight before the first POST, which precedes the accept, succeeds.
+    stub_gateway.poll_status = 500
+    stub_gateway.poll_failures = 2 * harness._MAX_TRANSPORT_FAILURES
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert infra(result)
+    assert not stub_gateway.cancels, "a cancel was sent with no task id to name"
+    assert "no task id is known for it" in result.errors[0]
+    assert "left running" in result.errors[0]
 
 
 def test_a_task_inside_the_grace_is_still_waited_for(stub_gateway: _StubGatewayServer) -> None:

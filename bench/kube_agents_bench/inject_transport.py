@@ -968,6 +968,11 @@ class InjectTask:
         # answered), so a caller's record can say what was sent rather than
         # what was attempted.
         self.cancel_sent = False
+        # Whether a POST has been sent that nothing answered: set across the
+        # request in submit, so a reply that never arrives leaves it set.
+        # recover_task_id reads only then; a door that answered, with a task
+        # or a refusal, has nothing to recover.
+        self.unanswered_post = False
 
     def preflight(self) -> Probe:
         """Read the conversation before anything is started.
@@ -1021,9 +1026,11 @@ class InjectTask:
         }
         if self.message_id:
             payload["messageId"] = self.message_id
+        self.unanswered_post = True
         body = _request(
             self.base_url + INJECT_PATH, SUBMIT_TIMEOUT_SECONDS, self.token, payload
         )
+        self.unanswered_post = False
         grace = body.get("firstEventGraceSeconds")
         if isinstance(grace, (int, float)) and grace > 0:
             self.first_event_grace = float(grace)
@@ -1054,6 +1061,38 @@ class InjectTask:
                 self.refusal or "no refusal code",
                 self.note,
             )
+        return self.task_id
+
+    def recover_task_id(self) -> str:
+        """The conversation's active task id from one read, or ``""``.
+
+        For an exchange whose POST was answered by nobody: the door runs a
+        claimed turn on a context the client's disconnect does not cancel,
+        so a task can have started that this side never learned the id of,
+        and a cancel has to name it. The read route's probe names the
+        record's active task. Best effort over the transport that has just
+        failed; a read that fails or finds no active task recovers nothing,
+        and says so in the log. Nothing is read unless a POST went
+        unanswered: a door that refused the submission, or was never sent
+        one, started nothing this side does not know about.
+        """
+        if self.task_id:
+            return self.task_id
+        if not self.unanswered_post:
+            return ""
+        try:
+            body = self._poll("", 0, 0)
+        except InjectUnavailable as exc:
+            _log.warning(
+                "inject: could not read %s to recover a task id: %s", self.conversation, exc
+            )
+            return ""
+        probe = Probe.from_body(body)
+        if probe is None or not probe.active or not probe.task_id:
+            _log.info("inject: no active task on %s to recover an id from", self.conversation)
+            return ""
+        _log.info("inject: recovered task %s on %s from the read", probe.task_id, self.conversation)
+        self.task_id = probe.task_id
         return self.task_id
 
     def await_terminal(self, task_id: str, *, deadline: float) -> Exchange:

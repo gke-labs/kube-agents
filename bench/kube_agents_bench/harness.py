@@ -1451,17 +1451,29 @@ class KubeAgentsHarness(AgentHarness):
             behind it in the same run queue. Best effort, on the transport
             that has just failed: it may fail too, and the run is
             infrastructure either way.
+
+            The id may be unknown: a POST the door accepted whose reply
+            never arrived leaves the task running with this side holding no
+            id for it (the door finishes a claimed turn whether or not its
+            client is still there), and the retries that would have been
+            answered with the id by the dedupe have failed too. One read of
+            the conversation recovers it when the transport allows.
             """
-            if not task.task_id:
-                return ""
-            task.cancel(task.task_id, settle=0)
+            task_id = task.task_id or task.recover_task_id()
+            if not task_id:
+                return (
+                    "; no task id is known for it: the POST's reply never arrived and a read "
+                    "of the conversation recovered none (see the log), so a task the POST "
+                    "started, if any, was left running"
+                )
+            task.cancel(task_id, settle=0)
             if task.cancel_sent:
                 return (
-                    f"; a cancel naming task {task.task_id} was published, so it does not hold a "
+                    f"; a cancel naming task {task_id} was published, so it does not hold a "
                     "bridge slot for the rest of its budget"
                 )
             return (
-                f"; task {task.task_id} was left running: the cancel could not be sent over the "
+                f"; task {task_id} was left running: the cancel could not be sent over the "
                 "same failed transport (see the log)"
             )
 

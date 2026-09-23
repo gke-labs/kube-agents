@@ -17,10 +17,9 @@ import (
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
-// slot instead of holding it forever. For an inbound message the clock
-// starts before the wait for the conversation's session lock, so the
-// bound is on the turn as a whole and not on the work after the lock; see
-// handleInbound for what depends on that.
+// slot instead of holding it forever. Where the clock starts relative to
+// the wait for the conversation's session lock depends on who is waiting
+// for the answer; handleInbound says which and why.
 const turnTimeout = 60 * time.Second
 
 // relayDurable is the event relay's durable consumer name; see
@@ -348,23 +347,64 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
 
-	// The turn's clock starts here, before the wait for the conversation's
-	// session lock inside runTurn. The relay, the reap and the sweep each
-	// hold that lock for up to a turn of their own, and a clock started
-	// after the lock would let a turn run for a lock-hold plus turnTimeout.
-	// The inject door depends on the whole turn fitting inside turnTimeout:
-	// it hands a message over only with that much of its submit bound left
+	backend, principal, ok := g.verifySender(msg)
+	if !ok {
+		return
+	}
+
+	// Where the turn's clock starts depends on who is waiting for the
+	// answer. The relay, the reap and the sweep each hold the conversation's
+	// session lock, the relay for as long as its chat posts take (a Post or
+	// Edit to a slow chat API is not bound by the relay's own context), so
+	// a turn can queue behind the lock for a minute or more.
+	//
+	// A door turn's caller is a program waiting on a bound: the door hands
+	// a message over only with a whole turnTimeout of its submit bound left
 	// and reads a bound that expires with the turn unfinished as "nothing
 	// started", which has to be true (InjectAdapter.claimTurn, awaitTurn).
+	// So its clock starts before the lock wait, and a turn whose clock ran
+	// out waiting does nothing. The door's own conversations are relayed
+	// into memory, so on them the lock is held for the bus calls alone.
+	//
+	// A chat turn's caller is a person, for whom a late answer beats none:
+	// the lock first, then a whole turn, as before the door existed.
+	if backend == injectBackend {
+		ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
+		defer cancel()
+		g.runTurn(ctx, msg, backend, principal)
+		return
+	}
+	l := g.lockSession(msg.Conversation)
+	l.Lock()
+	defer l.Unlock()
 	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
 	defer cancel()
-	g.runTurn(ctx, msg)
+	g.routeTurn(ctx, msg, backend, principal)
 }
 
-// runTurn is the body of handleInbound under the turn's context: verify,
-// lock the session, route. Split from handleInbound so a test can hand it
-// a context of its own and hold the lock against it.
-func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage) {
+// runTurn is a door turn under a clock already running: take the session
+// lock, and route only if the clock has not run out in the wait. Split
+// from handleInbound so a test can hand it a context of its own and hold
+// the lock against it.
+func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage, backend, principal string) {
+	l := g.lockSession(msg.Conversation)
+	l.Lock()
+	defer l.Unlock()
+	if err := ctx.Err(); err != nil {
+		// The whole turn went on waiting for the lock. Every call below
+		// would fail on the expired context anyway; said once, and plainly,
+		// rather than as a session lookup failure.
+		g.log.Warn("turn skipped: the conversation's session lock was held for the whole turn",
+			"conversation", msg.Conversation, "messageId", msg.MessageID, "err", err)
+		return
+	}
+	g.routeTurn(ctx, msg, backend, principal)
+}
+
+// verifySender resolves the sender to a principal, or drops the message and
+// says so. Returns the backend the message came through, the principal, and
+// whether the turn goes on.
+func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, ok bool) {
 	// Verify against the backend's identity mechanism — the mapping table
 	// on Discord, the Google-asserted email gated by the allowlist on gchat
 	// — and drop the message if we can't (gateway design, turns-and-tasks
@@ -373,8 +413,8 @@ func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage) {
 	// backend-asserted id — their own identity, in their own conversation,
 	// which is what the admin needs to add and is not an oracle over
 	// anything the sender does not already see.
-	backend := g.backendFor(msg)
-	principal := g.resolvePrincipal(backend, msg.AuthorID)
+	backend = g.backendFor(msg)
+	principal = g.resolvePrincipal(backend, msg.AuthorID)
 	if principal == "" {
 		g.log.Warn("dropping message from unverified sender",
 			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
@@ -401,21 +441,15 @@ func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage) {
 		// between the signal and the post would hand its caller a reply with
 		// the notice missing from the transcript.
 		g.observeMessageDropped(msg.Conversation, msg.AuthorID)
-		return
+		return "", "", false
 	}
+	return backend, principal, true
+}
 
-	l := g.lockSession(msg.Conversation)
-	l.Lock()
-	defer l.Unlock()
-	if err := ctx.Err(); err != nil {
-		// The whole turn went on waiting for the lock. Every call below
-		// would fail on the expired context anyway; said once, and plainly,
-		// rather than as a session lookup failure.
-		g.log.Warn("turn skipped: the conversation's session lock was held for the whole turn",
-			"conversation", msg.Conversation, "messageId", msg.MessageID, "err", err)
-		return
-	}
-
+// routeTurn is the turn proper: resolve the session, heal a stale task, and
+// route the message. The caller holds the conversation's session lock and
+// owns the context's clock.
+func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, principal string) {
 	rec, err := g.reg.Get(ctx, msg.Conversation)
 	if err != nil {
 		g.log.Error("session lookup failed", "conversation", msg.Conversation, "err", err)

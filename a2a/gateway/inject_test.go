@@ -2077,12 +2077,26 @@ func TestInjectRelayAndReadRouteAgreeOnWhoseTerminalItIs(t *testing.T) {
 // and then began its own turnTimeout would outlive the door's bound and
 // start a task after the door had told its caller it did not. So the clock
 // runs through the lock wait, and a turn whose clock ran out while it waited
-// does nothing once it has the lock. Driven through runTurn with a short
-// context so the test does not wait a real turnTimeout; the relay standing
-// in for the lock-holder is the test itself.
+// does nothing once it has the lock. A chat turn keeps the other order
+// (the lock, then a whole turn), because its caller is a person for whom a
+// late answer beats none; handleInbound chooses by backend. Driven through
+// runTurn with a short context so the test does not wait a real
+// turnTimeout; the relay standing in for the lock-holder is the test itself.
 func TestInjectTheTurnClockStartsBeforeTheSessionLock(t *testing.T) {
 	r := startInjectRig(t)
 	key := injectKeyPrefix + "held-lock"
+	msg := InboundMessage{
+		Conversation: key,
+		Kind:         injectConversationKind,
+		AuthorID:     injectTestAuthor,
+		MessageID:    "held-lock-1",
+		Text:         "how is the fleet?",
+		Backend:      injectBackend,
+	}
+	backend, principal, ok := r.g.verifySender(msg)
+	if !ok || backend != injectBackend || principal != injectTestPrincipal {
+		t.Fatalf("verifySender = (%q, %q, %v), want the door's author resolved", backend, principal, ok)
+	}
 	l := r.g.lockSession(key)
 	l.Lock()
 
@@ -2091,14 +2105,7 @@ func TestInjectTheTurnClockStartsBeforeTheSessionLock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		r.g.runTurn(ctx, InboundMessage{
-			Conversation: key,
-			Kind:         injectConversationKind,
-			AuthorID:     injectTestAuthor,
-			MessageID:    "held-lock-1",
-			Text:         "how is the fleet?",
-			Backend:      injectBackend,
-		})
+		r.g.runTurn(ctx, msg, backend, principal)
 	}()
 	<-ctx.Done()
 	select {
