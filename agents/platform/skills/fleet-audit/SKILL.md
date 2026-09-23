@@ -46,20 +46,21 @@ watchdog — **not** a prettified form of the audit id:
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
 
-## Running an audit stream on demand
+## Running a stream on demand
 
 An audit request arrives in one of two distinct forms, and the execution path depends on your session context:
 
 ### 1. In a delegated kanban task or worker session: Run the audit directly
 
-When you are delegated a kanban card to run an audit (e.g. *"Run the security and RBAC posture audit, following the compliance-audit SOP"*, or *"Run the compliance-audit stream now"*):
+When you are delegated a kanban card to run an audit (e.g. *"Run the security and RBAC posture audit, following the compliance-audit SOP"*):
 
 - **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit.
-- **Execute the audit following its SOP (`governance/<stream>_sop.md`) directly.** Use the two-command lifecycle below:
+- **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
   1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
   2. Enumerate clusters and run the checks per the SOP.
   3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** The user or parent agent explicitly delegated this task to be executed now.
+- **Alignment with `AGENTS.md`:** `AGENTS.md` ("Never do the audit in the session that received the request. Each card gets its own session and its own turn budget") explicitly protects against improvising multiple audits in an interactive front-door chat session. When invoked on a delegated kanban card (`work kanban task <id>`), you are the dedicated worker session with its own turn budget; execute the audit directly.
 - **A card whose result is "queued for later" must NEVER be marked `done` (#1876):** If an audit cannot be run in this session due to missing credentials or infrastructure failure, call `kanban_block` (or ask for input); **never** call `kanban_complete` claiming `done` when zero findings or ledger were produced.
 
 ### 2. In the interactive front-door chat: Triggering the cron schedule
@@ -1144,8 +1145,8 @@ be a day stale until a run can read it; report the gap as you would any other pa
   protection above back off: the run stops being `partial`, the ledger closes, and a fleet nobody
   looked at publishes as clean. The commands are published verbatim, so a padded entry is not a
   private shortcut — it is a false statement in a public issue, with your run's name on it.
-- **Never run the audit inline when asked to run the cron job.** Dispatch it; see
-  [Running a stream on demand](#running-a-stream-on-demand).
+- **Never run the audit inline when asked to trigger the cron job in interactive chat.** Dispatch it; see
+  [Running a stream on demand](#running-a-stream-on-demand). When delegated a kanban card or worker task to execute an audit per SOP, run the audit directly using the two-command lifecycle.
 - **Never call `start`, `finish`, or `remediate` for a stream you dispatched.** The run owns its
   stream's lifecycle end to end and has already published by the time the call returns to you. A
   second `finish` reads a findings document the run's own `start` consumed, so it publishes whatever
