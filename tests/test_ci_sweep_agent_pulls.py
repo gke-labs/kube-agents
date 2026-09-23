@@ -38,6 +38,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import subprocess
 import unittest
 import urllib.error
 from unittest import mock
@@ -146,6 +147,7 @@ class _Boskos:
         self.acquired = []
         self.released = []
         self.resets = []
+        self.order = []
 
     def __call__(self, request, timeout=None):
         if self.error is not None:
@@ -153,6 +155,7 @@ class _Boskos:
         url = request.full_url
         query = dict(part.split("=", 1) for part in url.split("?", 1)[1].split("&"))
         action = url.split("?", 1)[0].rsplit("/", 1)[1]
+        self.order.append(action)
         if action == "acquire":
             assert query == {
                 "type": sweeper.BOSKOS_RESOURCE_TYPE,
@@ -193,13 +196,16 @@ class _Cluster:
 class _Gcloud:
     """A stand-in for `gcloud kms asymmetric-sign` that writes a signature."""
 
-    def __init__(self, returncode=0, signature=b"signature"):
+    def __init__(self, returncode=0, signature=b"signature", raise_on_project=None):
         self.returncode = returncode
         self.signature = signature
+        self.raise_on_project = raise_on_project
         self.argv = []
 
     def __call__(self, argv, **kwargs):
         self.argv.append(list(argv))
+        if self.raise_on_project and any(a == "--project=%s" % self.raise_on_project for a in argv):
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 60))
         if self.returncode == 0:
             target = [a for a in argv if a.startswith("--signature-file=")][0].split("=", 1)[1]
             pathlib.Path(target).write_bytes(self.signature)
@@ -479,6 +485,17 @@ class PoolTest(unittest.TestCase):
         self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
         self.assertEqual(closed, {})
 
+    def test_a_hung_signing_call_is_that_projects_failure_and_the_rest_are_swept(self):
+        # gcloud past its timeout raises TimeoutExpired, a SubprocessError and not
+        # an OSError; before this arm it unwound the whole walk after one project.
+        gcloud = _Gcloud(raise_on_project="kube-agents-evals-7")
+        (closed, failures, _), boskos, _ = run_pool(
+            ["kube-agents-evals-7", "kube-agents-evals-8"], _GitHub(pulls=[]), gcloud=gcloud
+        )
+        self.assertEqual(list(failures), ["kube-agents-evals-7"])
+        self.assertEqual(closed, {"kube-agents-evals-8": 0})
+        self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
     def test_a_project_is_released_when_github_is_unreachable(self):
         def unreachable(request, timeout=None):
             raise OSError("connection reset")
@@ -513,6 +530,7 @@ class PoolTest(unittest.TestCase):
             boskos.resets,
             [{"type": sweeper.BOSKOS_RESOURCE_TYPE, "state": "cleaning", "dest": "free", "expire": sweeper.BOSKOS_STRANDED_AFTER}],
         )
+        self.assertEqual(boskos.order[0], "reset", "the reset must precede the first acquire")
 
     def test_a_reset_that_fails_does_not_stop_the_sweep(self):
         boskos = _Boskos(["kube-agents-evals-7"], reset_error=_http_error(500, BOSKOS))
@@ -546,10 +564,14 @@ class ExitCodeTest(unittest.TestCase):
 
     def _main(self, argv, github=None, boskos=None, gcloud=None):
         cluster = _Cluster(github or _GitHub(), boskos or _Boskos(["kube-agents-evals-7"]))
+        # The handler main() installs is process-wide; patched so the unittest
+        # runner keeps its own SIGTERM behaviour after this class.
         with mock.patch.object(sweeper.urllib.request, "urlopen", cluster), mock.patch.object(
             sweeper.subprocess, "run", gcloud or _Gcloud()
-        ):
-            return sweeper.main(argv + ["--ci-deploy-script", str(_CI_DEPLOY)])
+        ), mock.patch.object(sweeper.signal, "signal") as installed:
+            rc = sweeper.main(argv + ["--ci-deploy-script", str(_CI_DEPLOY)])
+        installed.assert_called_once_with(sweeper.signal.SIGTERM, sweeper._terminate)
+        return rc
 
     def test_a_clean_pool_sweep_exits_zero(self):
         argv = ["--pool", "--boskos-server", BOSKOS, "--boskos-owner", OWNER]

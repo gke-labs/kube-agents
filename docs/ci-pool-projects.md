@@ -277,6 +277,8 @@ The key is a Kubernetes Secret on the Prow build cluster. Its name, entry and na
 
 `selected` stays, for the same reason as 5.3: the organisation holds repositories that are not pool infrastructure, and the list is what keeps a bench run's credential off them. Widening it to `all` would pass every check here — the read the check makes still succeeds — so the mint response's `repository_selection` is checked directly and `all` fails the project.
 
+Skipping this step fails nothing visible until a lease. `kube-agents-evals-6` was registered with its repository outside the then-credential's scope, and the first run to lease it filed its ledger issue correctly and then 404'd reading it back — a red on an unrelated pull request ([#994](https://github.com/gke-labs/kube-agents/issues/994)). Section 7's `Ledger Read Credential` check is what catches it beforehand.
+
 ### 5.5 The pull-request sweep
 
 A remediation scenario opens a pull request in the leased project's GitOps repository and nothing closes it, so the next lease inherits it (#1755). The `pull_request_opened` check grades the head commit, so an inherited pull request no longer passes as the run's work; what is left is hygiene, and a repetition reproducing the same fix refused "nothing to commit" by the leftover branch.
@@ -286,8 +288,6 @@ A remediation scenario opens a pull request in the leased project's GitOps repos
 What onboarding owes it is one grant, made by `scripts/provision_ci_pool_project.sh`: `roles/cloudkms.signerVerifier` for `eval-pull-sweeper@kube-agents-prow` on the project's `github-token-minter-key`. Nothing on the project, nothing on the App. The presubmit's runner is deliberately not on that key: a presubmit runs the pull request's code, and a signer there would hand every change under test a pool-wide write.
 
 Branches are left: deleting a ref needs `contents: write`, which the sweep's mint does not ask for.
-
-Skipping this step fails nothing visible until a lease. `kube-agents-evals-6` was registered with its repository outside the then-credential's scope, and the first run to lease it filed its ledger issue correctly and then 404'd reading it back — a red on an unrelated pull request ([#994](https://github.com/gke-labs/kube-agents/issues/994)). Section 7's `Ledger Read Credential` check is what catches it beforehand.
 
 ## 6. The seeded dirty fleet
 

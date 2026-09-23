@@ -1913,7 +1913,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     installation.
 
     The token is narrowed to LEDGER_GRADING_PERMISSIONS: this check reads one
-    repository's issues, and has no business holding the write the App also has.
+    repository's issues, and asks for exactly that whatever the App is granted.
     """
 
     def _b64(raw: bytes) -> bytes:

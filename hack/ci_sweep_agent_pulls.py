@@ -471,7 +471,13 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
             print("sweeping %s (%s)" % (name, repo))
             try:
                 closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner)
-            except (SweepError, urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
+            except (
+                SweepError,
+                urllib.error.HTTPError,
+                OSError,
+                http.client.HTTPException,
+                subprocess.SubprocessError,
+            ) as exc:
                 print("  %s: %s" % (name, exc), file=sys.stderr)
                 failures[name] = str(exc)
         finally:
@@ -549,7 +555,7 @@ def main(argv=None):
     except urllib.error.HTTPError as exc:
         print("ERROR: HTTP %d (%s) from %s" % (exc.code, exc.reason, exc.url), file=sys.stderr)
         return 1
-    except (OSError, http.client.HTTPException) as exc:
+    except (OSError, http.client.HTTPException, subprocess.SubprocessError) as exc:
         print("ERROR: could not reach a service (%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)
         return 1
 

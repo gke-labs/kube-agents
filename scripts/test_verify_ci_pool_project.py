@@ -1920,9 +1920,9 @@ class LedgerTokenMintTest(unittest.TestCase):
         self.assertNotIn("not-a-key", message)
 
     def test_the_token_asks_for_issues_read_and_nothing_more(self):
-        # The App can also write pull requests, for the teardown's sweep. This
-        # check reads one repository's issues; a mint that named no permissions
-        # would hand a pool-wide write to a read-only probe.
+        # This check reads one repository's issues; a mint that named no
+        # permissions would hand whatever the installation holds, now or
+        # later, to a read-only probe.
         seen = {}
 
         def urlopen(request, *a, **kw):

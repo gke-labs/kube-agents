@@ -2,10 +2,9 @@
 # ==============================================================================
 # Prow CI Teardown Pipeline Script
 # ==============================================================================
-# Cleans up what a PR run leaves in the leased project: its Kubernetes objects
-# on the target GKE cluster, and the agent's pull requests in the project's
-# GitOps repository. Preserves static cluster & GCP IAM setup for fast re-use
-# across PR runs.
+# Cleans up what a PR run leaves on the leased project's GKE cluster. Preserves
+# static cluster & GCP IAM setup for fast re-use across PR runs. The agent's
+# pull requests are swept elsewhere; see below.
 #
 # One `helm uninstall` (the release owns every Kubernetes object ci-deploy.sh
 # created) plus a CRD delete, since the chart leaves CRDs behind by Helm's own

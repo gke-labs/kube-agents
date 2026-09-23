@@ -265,10 +265,11 @@ class LedgerMintScopeTest(unittest.TestCase):
         self.assertIn('data=json.dumps({"permissions": GRADING_PERMISSIONS}).encode()', body)
 
     def test_the_sweep_is_the_only_writer(self):
-        # The other caller of this App. Its own narrowing is pinned in
-        # tests/test_ci_sweep_agent_pulls.py; what matters here is that the two
-        # asks are different, so a copy-paste that hands the grader write shows
-        # up as a failure rather than as a passing suite.
+        # The pool sweep signs as the agent's App, not this one, and its own
+        # narrowing is pinned in tests/test_ci_sweep_agent_pulls.py; what
+        # matters here is that the two asks are different, so a copy-paste that
+        # hands the grader write shows up as a failure rather than as a passing
+        # suite.
         sweeper = (_REPO_ROOT / "hack" / "ci_sweep_agent_pulls.py").read_text(encoding="utf-8")
         self.assertIn('TOKEN_PERMISSIONS = {"pull_requests": "write"}', sweeper)
         grading = _extract(r"^GRADING_PERMISSIONS = \{[^}]*\}$", "GRADING_PERMISSIONS")
