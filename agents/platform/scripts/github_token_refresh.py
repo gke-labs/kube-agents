@@ -599,10 +599,7 @@ def refresh_git_credentials(
             f"GitHub authentication successfully configured for repository: {repository}"
         )
     except subprocess.CalledProcessError as e:
-        detail = (e.stderr or e.stdout or "")
-        if isinstance(detail, bytes):
-            detail = detail.decode("utf-8", errors="replace")
-        detail = detail.strip()
+        detail = (e.stderr or e.stdout or "").strip()
         detail_msg = f": {detail}" if detail else ""
         raise RuntimeError(
             f"Failed to configure GitHub auth in gh CLI: {e}{detail_msg}"

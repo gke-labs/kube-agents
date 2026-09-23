@@ -425,8 +425,11 @@ def required_roles(path: str) -> tuple[str, ...]:
 MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 
 # A successful forge credential refresh satisfies subsequent refresh requests
-# for the same provider and repository arriving within this window, avoiding
+# for the same provider and organization arriving within this window, avoiding
 # redundant token mints when concurrent cron jobs wake on the same tick.
+# Because the forge CLI shares a single token slot per provider (e.g. github.com),
+# a refresh for a different organization immediately replaces the active credential
+# and invalidates the previous organization's coalesce window.
 FORGE_REFRESH_COALESCE_SECONDS = 30.0
 
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
@@ -3229,7 +3232,7 @@ class CommandExecutor:
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
-        self._last_forge_refresh: dict[tuple[str, str], float] = {}
+        self._last_forge_refresh: dict[str, tuple[str, float]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)
@@ -3658,7 +3661,7 @@ class CommandExecutor:
         return self._forge_refresh_lock
 
     @property
-    def _refresh_cache(self) -> dict[tuple[str, str], float]:
+    def _refresh_cache(self) -> dict[str, tuple[str, float]]:
         if getattr(self, "_last_forge_refresh", None) is None:
             self._last_forge_refresh = {}
         return self._last_forge_refresh
@@ -3679,14 +3682,17 @@ class CommandExecutor:
         helper = self._forge_helper(provider)
         if not repository_is_managed(repository):
             raise PermissionError(f"{repository} is not a repository this install manages")
-        key = (provider, repository.strip().lower())
+        clean_repo = repository.strip().lower()
+        org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
         with self._refresh_lock:
             now = time.monotonic()
-            last_refresh = self._refresh_cache.get(key, 0.0)
-            if now - last_refresh < FORGE_REFRESH_COALESCE_SECONDS:
-                return
+            current = self._refresh_cache.get(provider)
+            if current is not None:
+                cached_org, last_refresh = current
+                if cached_org == org and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
+                    return
             self._run_forge_helper(provider, helper, [repository], "credential refresh")
-            self._refresh_cache[key] = time.monotonic()
+            self._refresh_cache[provider] = (org, time.monotonic())
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:

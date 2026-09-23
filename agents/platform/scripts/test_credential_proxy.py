@@ -2936,7 +2936,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
-    def test_distinct_repositories_both_run(self):
+    def test_distinct_repositories_in_same_org_coalesce(self):
         executor = credential_proxy.CommandExecutor.__new__(
             credential_proxy.CommandExecutor
         )
@@ -2954,9 +2954,58 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         )
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
             executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            # Same organization shares the pod-wide token slot, so second repo coalesces
             executor.refresh_forge_credential("github", "gke-agentic/repo-b")
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
+
+    def test_distinct_organizations_both_run_and_invalidate_coalesce(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+            # Different organization replaces the pod-wide slot and must run
+            executor.refresh_forge_credential("github", "org-beta/repo-b")
+            # Requesting org-alpha again must run because org-beta replaced the slot
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+
+        self.assertEqual(len(calls), 3)
+
+    def test_cold_start_does_not_coalesce_at_monotonic_zero(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        # Simulate cold node start where time.monotonic() < 30s
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", return_value=5.0):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+
+        self.assertEqual(len(calls), 1)
 
     def test_failed_refresh_does_not_coalesce_next_attempt(self):
         executor = credential_proxy.CommandExecutor.__new__(
