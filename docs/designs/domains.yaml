@@ -75,7 +75,7 @@ domains:
     # card". Opening it is the remediation domain's journey, one row above.
     journey: A warning event is triaged to a root cause and remediation options a human authorizes, never a cluster write
 
-# Known-uncovered. One entry; empty is Phase 2's exit criterion. The two
+# Known-uncovered. Two entries; empty is Phase 2's exit criterion. The two
 # kanban probes cover chat-and-routing; cluster-debugging came off first
 # among the Phase 2 domains, in #939. Reliability, capacity, security,
 # upgrades, consistency and cost are covered by the six domain probes --
@@ -103,3 +103,15 @@ allowlist:
   # formally recognizes the nightly tier (#1175). incident-triage sat here
   # from 2026-09-03 to 2026-09-22 for the same shape of reason.
   - fleet-audits
+  # remediation, since 2026-09-22 (#1023): the same decision, and neither of
+  # the domain's two writers holds a seat. rca-remediation-pr was demoted
+  # 2026-09-02 (#1189) and moved to hack/eval/nightly-cases.txt with the
+  # other held-out cases that day; the promotion of pdb-remediation-pr
+  # proposed the same day was withdrawn before merge, because the record it
+  # cited (12/12 on the four graded nights 2026-09-16 to 09-20) was graded
+  # by report_contains, which #1780 (merged 2026-09-21) replaced with
+  # pull_request_opened, and no graded run of the case under the new check
+  # exists yet. Delete this entry when a remediation case is admitted on a
+  # nightly record built under pull_request_opened (#1189's bar for rca,
+  # docs/eval-gate-roster.md's entry for pdb).
+  - remediation

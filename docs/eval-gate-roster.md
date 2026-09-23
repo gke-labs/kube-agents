@@ -29,7 +29,7 @@ partial window for it (`collecting`), that evidence feeds both. A case not named
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` and
-`blocking-roster.txt` hold the same thirteen cases, a held-out case is a nightly case, and
+`blocking-roster.txt` hold the same twelve cases, a held-out case is a nightly case, and
 `scripts/test_eval_rosters.py` pins the equality. Before that date the presubmit also ran
 held-out cases that reported without blocking; the seven it was running moved to
 `hack/eval/nightly-cases.txt` that day, each with its hold-out reason beside its line.
@@ -69,7 +69,7 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-All thirteen presubmit cases are admitted, because the presubmit file is the roster
+All twelve presubmit cases are admitted, because the presubmit file is the roster
 (recount the entries of `hack/eval/presubmit-cases.txt` and `blocking-roster.txt` rather than
 trusting this sentence — an earlier copy of it miscounted twice). The bar a case clears to
 get there: its recent record shows failures only on its own regressions or on infra classes
@@ -112,7 +112,9 @@ filed issue naming the exit condition:
   (merged 2026-09-21) it is graded by `pull_request_opened`, which rejects a pull request last
   written before the run started, and nothing sweeps the `*-infra` repositories between runs
   ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
-  2026-09-22. Enters when #1189's re-admission bar holds.
+  2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain has
+  no presubmit case, so `remediation` joined `fleet-audits` on the allowlist. Enters when
+  #1189's re-admission bar holds.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -121,6 +123,25 @@ Its original hold-out rationale stands —
 [#1101](https://github.com/gke-labs/kube-agents/issues/1101): 0/5 graded repetitions on
 record. It enters the roster when the lettered-options bar is settled and it has a clean
 record.
+
+**pdb-remediation-pr** ([#1079](https://github.com/gke-labs/kube-agents/pull/1079)), the
+remediation domain's second writer, has never held a presubmit seat either. Its record —
+12/12 on the four graded nights 2026-09-16 to 09-20 (420–1153 s a repetition), after 11/15
+across #1079's five presubmit runs (the misses traced to
+[#1097](https://github.com/gke-labs/kube-agents/issues/1097) and
+[#1590](https://github.com/gke-labs/kube-agents/issues/1590)) — is what a 2026-09-22
+promotion cited, and the promotion was withdrawn before it merged: every repetition of that
+record was graded by `report_contains`, which
+[#1780](https://github.com/gke-labs/kube-agents/pull/1780) (merged 2026-09-21) replaced with
+`pull_request_opened`, a check that rejects a pull request last written before the run
+started; nothing sweeps the `*-infra` repositories between runs
+([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2), so a correct but
+byte-identical resubmission grades as a miss, the shape rca-remediation-pr showed on #1780's
+own head (0/3 on a leftover); and no graded run under the new check exists (the 09-22 nightly
+died at the Prow deadline before grading). A seat on that record would have armed rung 4 on
+a grader the record never saw. It enters when the nightly record under `pull_request_opened`
+clears the bar above, or when #1755 item 2 lands and the record is re-read; until then the
+remediation domain sits on the `docs/designs/domains.yaml` allowlist beside fleet-audits.
 
 Every case that is not in the presubmit runs in the nightly, since 2026-09-15 including
 the nine that used to wait commented out in the script (the reasons each cannot take a
@@ -172,23 +193,6 @@ Admitted on the record since the split:
   planted-pool name and the ceiling, 10 only the ceiling, 1 only the pool. The residual is
   mostly the platform's shape, not the case's own regression; the roster's operative metric
   is the collapse, and there were none in 196 runs.
-- **pdb-remediation-pr**, 2026-09-22
-  ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), the remediation domain's
-  second case ([#1079](https://github.com/gke-labs/kube-agents/pull/1079)), moved from
-  `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
-  the record the nightly built: 12/12 on the four graded nights 2026-09-16 to 09-20
-  (420–1153 s a repetition), after 11/15 across its five presubmit runs on #1079 (3/3, 2/3,
-  1/3, 3/3, 2/3; the misses #1079 traced to
-  [#1097](https://github.com/gke-labs/kube-agents/issues/1097) and
-  [#1590](https://github.com/gke-labs/kube-agents/issues/1590)). It is the first case to
-  take a presubmit seat straight from the nightly under the 2026-09-15 rule, and its
-  presubmit record starts with this edit; a collapse on an unrelated pull request in its
-  first days is the thing to watch, and the demotion lever below is the answer. One caveat
-  the eval crew accepted with the seat: every repetition of that record was graded by
-  `report_contains`, and since [#1780](https://github.com/gke-labs/kube-agents/pull/1780)
-  (merged 2026-09-21) the case is graded by `pull_request_opened`, which rejects a pull request
-  last written before the run started; the first presubmit runs under the new grader are the
-  record to read.
 - **incident-triage-oom-event-probe**, 2026-09-22
   ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), the incident-triage
   domain's presubmit-eligible probe
@@ -205,8 +209,9 @@ Admitted on the record since the split:
   [#1254](https://github.com/gke-labs/kube-agents/issues/1254)/[#1010](https://github.com/gke-labs/kube-agents/issues/1010)
   shape). Its seat took incident-triage off the `docs/designs/domains.yaml` allowlist; the
   same day's decision that the presubmit runs the roster only put `fleet-audits` on it (the
-  compliance canary above). Same watch as the case above: a collapse on an unrelated pull
-  request in its first days, and the demotion lever below.
+  compliance canary above) and, with pdb-remediation-pr's promotion withdrawn, `remediation`
+  too. Same watch as the case above: a collapse on an unrelated pull request in its first
+  days, and the demotion lever below.
 
 ## How far the roster's promise reaches
 

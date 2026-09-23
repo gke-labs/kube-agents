@@ -42,10 +42,15 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Thirteen cases, thirty-nine units at the script's EVAL_REPETITIONS
-# of 3: six domain probes, one reliability prompt variation, the admitted
-# one of the remediation domain's two writers, three cluster-debugging
-# cases, the incident-triage probe and the kanban smoke. The 2026-08-26
+# BUDGET. Twelve cases, thirty-six units at the script's EVAL_REPETITIONS
+# of 3: six domain probes, one reliability prompt variation, three
+# cluster-debugging cases, the incident-triage probe and the kanban smoke.
+# Neither of the remediation domain's two writers holds a seat --
+# rca-remediation-pr was demoted 2026-09-02 (#1189), and the 2026-09-22
+# promotion of pdb-remediation-pr was withdrawn before merge because its
+# record was graded by the check #1780 replaced (nightly-cases.txt has the
+# note) -- so remediation sits on the docs/designs/domains.yaml allowlist
+# beside fleet-audits. The 2026-08-26
 # smoke run (build 2092638061140643840, kube-agents-evals-3) measured what
 # six full audits cost: obtainability-planted-pdb PASSED in 962s and
 # compliance-rbac-overgrant in 606s, the three that failed did so on
@@ -83,21 +88,6 @@
 # since 2026-09-22 #1049's three (pdb-semantics, fleet-exposure-sweep,
 # healthy-namespace-silence) -- run in the nightly.
 ./tasks/obtainability-remediation-proposal/task.yaml
-
-# pdb-remediation-pr -- the remediation domain's second case (#1079), moved
-# in from nightly-cases.txt on 2026-09-22 (#1023) on the record it built
-# there: 12/12 on the four graded nights 2026-09-16 to 09-20 (420-1153s a
-# repetition), after 11/15 in #1079's own presubmit runs (the misses it
-# traced to #1097 and #1590). The one case here that WRITES --
-# rca-remediation-pr, the remediation domain's other writer, is a nightly
-# case since 2026-09-22 -- a PodDisruptionBudget the fixture lacks, filed as
-# a pull request through submit-suggestion. Priced at 1250s in
-# unit_cost_hint, its presubmit-measured median, so it launches first in
-# each repetition round; the rep-3 round's tail ran 2118-5849s after that
-# launch in the 14 green presubmits of 09-19 to 09-21, above its longest
-# measured repetition (1929s), so it does not set the job's length -- the
-# comment above EVAL_REPETITIONS in the script carries the arithmetic.
-./tasks/pdb-remediation-pr/task.yaml
 
 # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
 # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it

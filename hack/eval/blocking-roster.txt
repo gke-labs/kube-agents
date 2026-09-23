@@ -44,7 +44,6 @@ upgrades-lagging-master-probe
 consistency-authorized-networks-probe
 cost-idle-pool-probe
 obtainability-remediation-proposal
-pdb-remediation-pr
 cluster-agent-crashloop-debug
 cluster-agent-crashloop-misleading-symptom
 cluster-agent-crashloop-evidence-chain

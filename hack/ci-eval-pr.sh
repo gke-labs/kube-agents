@@ -763,8 +763,9 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # these tasks started gating PRs rather than after. Most of the active
 # tasks below read the seeded fleet -- the six domain probes, the
 # cluster-debugging cases, the incident-triage probe over the same
-# crashloop, the remediation case that proposes a fix for those fixtures,
-# and in the nightly the full audits -- so those warnings have consumers.
+# crashloop, the reliability variation that proposes a fix for the same
+# plant, and in the nightly the full audits and the two remediation
+# writers -- so those warnings have consumers.
 # It costs one clusters.list, one get-credentials per seeded cluster, and
 # one namespace read per probe -- seconds, against a job measured in tens
 # of minutes.
@@ -1426,32 +1427,23 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # The expensive term is instead compliance-rbac-overgrant at 2042s for three
 # repetitions (681s each), which is 24% of the whole task budget on its own.
 #
-# 2026-09-22: pdb-remediation-pr moved in from the nightly (#1023), the
-# nineteenth case, measured rather than projected. Under the fan-out at
-# parallelism 4 the serial arithmetic above no longer prices the job: the 14
-# green presubmits of 09-19 to 09-21 ran the fan-out in 6073-10940s (median
-# 8147s) against the 360m deadline, with ~15min of build and deploy outside
-# it. This case costs 980-1929s a repetition in presubmit (420-1153s on the
-# four graded nights), so three repetitions add ~3750-5800s of lane time,
-# ~16-24min of wall clock at four lanes when the lanes are full. Only a
-# repetition that ran to the 2700s delegation ceiling plus grading could
-# make it the last unit; on the record it does not: its 1250s hint is the
-# presubmit's largest, so it launches first in each repetition round, and
-# the round-3 tail (first rep-3 launch to the fan-out's end) ran
-# 2118-5849s in those 14 runs, longer at its shortest than 1929s,
-# its longest measured repetition. The last unit stays one of the
-# obtainability probes launched at the tail of round 3. No Prow deadline
-# change rides with this activation.
-#
-# The same edit moved incident-triage-oom-event-probe in as the twentieth
-# case: 737/599/1357s a repetition in its one presubmit run, 529-2808s on the
-# four graded nights, so three repetitions add ~1800-4100s of lane time
-# (~8-17min of wall clock at four lanes; up to ~35min if it runs at its
-# nightly maximum). Hinted at 700 it launches right behind pdb-remediation-pr
-# in each round, and its presubmit band ends well inside the shortest
-# round-3 tail measured (2118s); only a repetition at the nightly maximum
-# (2808s) could outlast that tail and make it the last unit, by minutes.
-# Still no Prow deadline change.
+# 2026-09-22: incident-triage-oom-event-probe moved in from the nightly
+# (#1023), the nineteenth case, measured rather than projected. Under the
+# fan-out at parallelism 4 the serial arithmetic above no longer prices the
+# job: the 14 green presubmits of 09-19 to 09-21 ran the fan-out in
+# 6073-10940s (median 8147s) against the 360m deadline, with ~15min of build
+# and deploy outside it. This case cost 737/599/1357s a repetition in its
+# one presubmit run and 529-2808s on the four graded nights, so three
+# repetitions add ~1800-4100s of lane time (~8-17min of wall clock at four
+# lanes; up to ~35min if it runs at its nightly maximum). Hinted at 700, the
+# presubmit's largest, it launches first in each repetition round, and its
+# presubmit band ends well inside the shortest round-3 tail measured (first
+# rep-3 launch to the fan-out's end: 2118-5849s in those 14 runs); only a
+# repetition at the nightly maximum (2808s) could outlast that tail and make
+# it the last unit, by minutes. No Prow deadline change rides with this
+# activation. (The same pull request first moved pdb-remediation-pr in
+# beside it, hinted at 1250, and withdrew that before merge: its record was
+# graded by the check #1780 replaced; nightly-cases.txt carries the note.)
 #
 # Later on 2026-09-22 the presubmit became the BLOCKING ROSTER ONLY (#1023,
 # the eval crew's call): the seven held-out cases it had been running
@@ -1459,8 +1451,8 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # #1049's three obtainability variations, rca-remediation-pr, the
 # compliance-rbac-overgrant canary and cluster-agent-healthy-workload-no-
 # finding -- moved to nightly-cases.txt with their hold-out reasons, and the
-# arithmetic above is for a matrix that no longer runs here. THIRTEEN tasks,
-# 39 units, against the same 360m deadline. What left: ~21 units at
+# arithmetic above is for a matrix that no longer runs here. TWELVE tasks,
+# 36 units, against the same 360m deadline. What left: ~21 units at
 # 178-1002s median a repetition (the canary's 1002s and p90 2074s the
 # largest), roughly 7200-9000s of lane time, ~30-38min of wall clock at four
 # lanes -- and, more to the point, the critical path. Over the 385
@@ -1468,13 +1460,13 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # obtainability-healthy-namespace-silence or obtainability-fleet-exposure-
 # sweep in 81% of them (200-hinted, so launched at the tail of round 3);
 # both are gone, so the tail is now one of the nine 200-hinted units still
-# here, launched after pdb-remediation-pr (1250), incident-triage (700),
-# capacity (540) and consistency (300) in each round, or pdb-remediation-pr
-# itself on a repetition that runs to its 2700s delegation ceiling. The
-# span the 14 green presubmits of 09-19 to 09-21 measured (6073-10940s)
-# priced sixty units; the first runs of the thirteen-case matrix measure
-# the new one, and until they have, this note is the projection rather than
-# the record. Still no Prow deadline change: the matrix shrank.
+# here, launched after incident-triage (700), capacity (540) and
+# consistency (300) in each round, or the incident probe itself on a
+# repetition at its nightly maximum. The span the 14 green presubmits of
+# 09-19 to 09-21 measured (6073-10940s) priced the eighteen-case matrix's
+# fifty-four units; the first runs of the twelve-case matrix measure the
+# new one, and until they have, this note is the projection rather than the
+# record. Still no Prow deadline change: the matrix shrank.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a

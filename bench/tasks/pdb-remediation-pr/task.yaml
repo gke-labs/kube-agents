@@ -1,12 +1,14 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt and on the blocking
-# roster since 2026-09-22 (#1023), moved in from hack/eval/nightly-cases.txt
-# on the record it built there: 12/12 on the four graded nights 2026-09-16
-# to 09-20, 420-1153s a repetition. Nightly-only from 2026-09-15 until then,
-# under #1568 (roster by default, the nightly record informs the edit);
-# measured before that move at 11/15 across #1079's five presubmit runs
-# (the misses #1079 traced to #1097 and #1590), 980-1929s a repetition on
-# 2026-09-14. The
-# paragraph below is the original activation note, kept for the
+# NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt, not the
+# presubmit file, since 2026-09-15: the nightly record informs the roster edit that
+# would admit it (#1568: roster by default, record verdicts reported), and
+# the presubmit seat stays with the domain's probe. Measured before the move: 7/9 across three presubmit builds; misses are #1097 and #1590, 980-1929s a repetition on 2026-09-14.
+# In the nightly: 12/12 on the four graded nights 2026-09-16 to 09-20
+# (420-1153s a repetition). A 2026-09-22 promotion on that record (#1023)
+# was withdrawn before merge: every one of those repetitions was graded by
+# report_contains, which #1780 (merged 2026-09-21) replaced with
+# pull_request_opened, and no graded run under the new check exists yet;
+# the seat waits on that record (docs/eval-gate-roster.md has the entry).
+# The paragraph below is the original activation note, kept for the
 # measurements it cites.
 #
 # Written as: lands as an uncommented hack/ci-eval-pr.sh TASKS entry with
@@ -44,15 +46,13 @@
 # submit-suggestion has no dedupe and nothing ever closes its PRs (the
 # accounting is in rca-remediation-pr's header; this case doubles that
 # accumulation, accepted on the same terms: the *-infra repos are throwaway
-# fixtures nobody reads). Eligible tier: presubmit (since 2026-09-22; the
-# nightly runs it too, as it runs every presubmit case).
+# fixtures nobody reads). Eligible tier: nightly, under the merged
+# fan-out.
 #
-# Expected cost bracket: measured 980-1929s a repetition in #1079's presubmit
-# runs (2026-09-14) and 420-1153s on the four graded nights of 09-16 to
-# 09-20; the 1250s unit_cost_hint sits between them. Bounded below by
+# Expected cost bracket: unmeasured. Bounded below by
 # obtainability-remediation-proposal (124-130s measured — same fixture,
-# proposal in the reply, no PR) and under a full audit's 600-1300s only on
-# a good night.
+# proposal in the reply, no PR) and expected well under a full audit's
+# 600-1300s; the authoring PR's draft-phase presubmit is the measurement.
 id: pdb-remediation-pr
 name: Missing disruption budget lands as a pull request, never on the cluster
 # The prompt names the workload and namespace but no cluster: fixtures.json

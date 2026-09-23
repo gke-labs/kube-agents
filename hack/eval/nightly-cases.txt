@@ -57,10 +57,9 @@
 # two tofu cases (ai-security-planted-model-audit ~73min at its 1450s hint,
 # autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
 # the infra lock with the two incumbents). Forty-one cases, ~893-913min
-# serial. 2026-09-22 moved pdb-remediation-pr and
-# incident-triage-oom-event-probe from this file to the presubmit one
-# (#1023): the nightly runs both files, so it still runs the same forty-one
-# cases at the same price. The
+# serial. 2026-09-22 moved incident-triage-oom-event-probe from this file
+# to the presubmit one (#1023): the nightly runs both files, so it still
+# runs the same forty-one cases at the same price. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
@@ -153,18 +152,33 @@
 # skill, so it grades the silence side only and earns its record here.
 ./tasks/cluster-agent-stalled-controller-healthy-silence/task.yaml
 
-# #1023's chat-and-routing second case (#1079), nightly from the start
-# (2026-09-15) rather than presubmit: the presubmit seats stay with the
-# probes, and the record the nightly builds here is what a later
-# blocking-roster edit cites (#1568). Measured in the authoring pull
-# request's presubmit runs before the move: 9/9 across builds
-# 2094517532634386432, 2094843196214349824 and 2099539376672346112 (11-94s
-# agent latency; the default 200s hint fits). Its sibling from the same pull
-# request, pdb-remediation-pr, earned its presubmit seat here -- 12/12 on the
-# four graded nights 2026-09-16 to 09-20 -- and moved to presubmit-cases.txt
-# on 2026-09-22 (#1023); the line lives there now, this file never lists a
-# presubmit case twice.
+# #1023's remediation and chat-and-routing second cases (#1079), nightly
+# from the start (2026-09-15) rather than presubmit: the presubmit seats stay
+# with the probes, and the record the nightly builds here is what a later
+# blocking-roster edit cites (#1568). Both measured in the authoring pull
+# request's presubmit runs before the move:
+#   -- chat-routing-board-read: 9/9 across builds 2094517532634386432,
+#      2094843196214349824 and 2099539376672346112 (11-94s agent latency;
+#      the default 200s hint fits).
+#   -- pdb-remediation-pr: 7/9 across the same builds; the two misses are
+#      #1097 (delegation slot) and #1590 (submit-suggestion in the sandbox).
+#      980-1929s a repetition on 2026-09-14; priced at 1250s in
+#      unit_cost_hint. Here it went 12/12 on the four graded nights
+#      2026-09-16 to 09-20 (420-1153s a repetition), and the 2026-09-22
+#      promotion that cited that record (#1023) was withdrawn before merge:
+#      every one of those repetitions was graded by report_contains, which
+#      #1780 (merged 2026-09-21) replaced with pull_request_opened -- a check
+#      that rejects a pull request last written before the run started,
+#      while nothing sweeps the *-infra repositories between runs (#1755
+#      item 2), so a correct but byte-identical resubmission grades as a
+#      miss -- and no graded run under the new check exists yet (the 09-22
+#      nightly died at the Prow deadline before grading). With
+#      rca-remediation-pr below also nightly, the remediation domain has no
+#      presubmit case and sits on the docs/designs/domains.yaml allowlist;
+#      the seat waits on the record this file builds under
+#      pull_request_opened.
 ./tasks/chat-routing-board-read/task.yaml
+./tasks/pdb-remediation-pr/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
 # here from 2026-09-15 until 2026-09-22, when it moved to presubmit-cases.txt

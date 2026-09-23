@@ -1195,15 +1195,18 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # moved to the nightly tier on 2026-09-03 (#1202); the same day the
         # presubmit became the blocking roster only, and the never-admitted
         # compliance-rbac-overgrant canary took fleet-audits' coverage with it
-        # to the nightly (#1876).
-        self.assertEqual(cov["uncovered"], ["fleet-audits"])
+        # to the nightly (#1876), and remediation's coverage left with it:
+        # rca-remediation-pr is held out and pdb-remediation-pr's promotion
+        # was withdrawn until it has a record under its #1780 grader.
+        self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
         active = collect.active_task_names()
         self.assertIn("reliability-pdb-probe", active)
-        self.assertIn("pdb-remediation-pr", active)
+        self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertNotIn("compliance-rbac-overgrant", active)  # nightly only since 2026-09-22
+        self.assertNotIn("pdb-remediation-pr", active)  # nightly only; its 2026-09-22 promotion was withdrawn
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 

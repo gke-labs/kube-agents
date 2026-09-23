@@ -183,7 +183,7 @@ latency (#1586). The wall clock is therefore a note beside the state, never a
 state, and only beside a GREEN one: inside a storm or an outage the long runs
 are the incident's symptom, and the incident's advice stands alone.
 `health.json`'s `slow` is set, while the state is GREEN, when the median wall
-clock of the last 5 full runs — a concluded run of 12+ cases, all five
+clock of the last 5 full runs — a concluded run of 11+ cases, all five
 finished in the last 6 hours — is at least 1.2× the median of the trailing 7
 days' full runs (at least 20 of them), and stays set until that median is back
 under 1.1×. Wall clock is a run's finish minus its start, the digest's

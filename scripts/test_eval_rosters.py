@@ -82,7 +82,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",
+    "pdb-remediation-pr",  # still here: its 2026-09-22 promotion was withdrawn, the record predates its #1780 grader
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here --
@@ -115,8 +115,6 @@ MOVED_TO_NIGHTLY = [
 ADMITTED_AFTER_THE_SPLIT = [
     # 2026-09-22 (#1023): 529/570 graded presubmit repetitions since #1626, no collapse.
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
-    # 2026-09-22 (#1023): 12/12 on the four graded nights 09-16 to 09-20.
-    ("pdb-remediation-pr", "obtainability-remediation-proposal"),
     # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
 ]
@@ -124,7 +122,6 @@ ADMITTED_AFTER_THE_SPLIT = [
 # (case, the presubmit line it follows); the same case leaves NIGHTLY_AT_SPLIT
 # below, since the nightly runs both files and lists no case twice.
 PROMOTED_AFTER_THE_SPLIT = [
-    ("pdb-remediation-pr", "rca-remediation-pr"),  # 2026-09-22 (#1023)
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22

@@ -49,8 +49,8 @@ only — anything that renames, removes or re-types a field bumps
   ],
   "coverage": {
     "domains_total": 11,
-    "domains_covered": 10,
-    "uncovered": ["fleet-audits"]
+    "domains_covered": 9,
+    "uncovered": ["fleet-audits", "remediation"]
   }
 }
 ```
