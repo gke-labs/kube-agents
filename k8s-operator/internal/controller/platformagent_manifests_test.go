@@ -5902,9 +5902,9 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 
 	// Issue #1880: bound kanban stale running timeout to 30m (1800s) to prevent
 	// wedged workers from occupying dispatch slots until the 4h upstream default.
-	if got["dispatch_stale_timeout_seconds"] != kanbanDispatchStaleTimeoutSeconds {
-		t.Errorf("dispatch_stale_timeout_seconds = %v, want %d to bound kanban worker reclaim to 30m (#1880)",
-			got["dispatch_stale_timeout_seconds"], kanbanDispatchStaleTimeoutSeconds)
+	if got["dispatch_stale_timeout_seconds"] != 1800 {
+		t.Errorf("dispatch_stale_timeout_seconds = %v, want 1800 to bound kanban worker reclaim to 30m (#1880)",
+			got["dispatch_stale_timeout_seconds"])
 	}
 
 	// The CR field is the reason equality with the image is not enough on its own: it is

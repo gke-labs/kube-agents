@@ -1237,7 +1237,8 @@ check(
     has_stale_cfg,
 )
 
-# F2. dispatch_once reclaims running cards that exceed stale_timeout_seconds.
+# F2. dispatch_once reclaims running cards that exceed stale_timeout_seconds
+# when no heartbeat is present, while preserving active heartbeating cards.
 conn = fresh()
 stale_card = new_card(conn, "Wedged worker card")
 K.recompute_ready(conn)
@@ -1257,6 +1258,22 @@ if has_runs:
         "UPDATE task_runs SET started_at = ? WHERE task_id = ?",
         (old_time, stale_card),
     )
+
+# Control card: running for 30m+ (started_at backdated by 1805s) but actively
+# heartbeating (recent last_heartbeat_at). It must NOT be reclaimed.
+heartbeating_card = new_card(conn, "Healthy heartbeating worker card")
+K.recompute_ready(conn)
+K.claim_task(conn, heartbeating_card)
+recent_heartbeat = int(time.time() - 60)
+conn.execute(
+    "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? WHERE id = ?",
+    (old_time, recent_heartbeat, heartbeating_card),
+)
+if has_runs:
+    conn.execute(
+        "UPDATE task_runs SET started_at = ? WHERE task_id = ?",
+        (old_time, heartbeating_card),
+    )
 conn.commit()
 
 # With upstream default (14400s / 4h), an 1805s old card is NOT stale.
@@ -1266,11 +1283,17 @@ check(
     stale_card not in res_4h.stale and K.get_task(conn, stale_card).status == "running",
 )
 
-# With 1800s (30m) bound, dispatch_once reclaims the card to ready.
+# With 1800s (30m) bound, dispatch_once reclaims the wedged card to ready,
+# while the healthy heartbeating card survives untouched in running.
 res_30m = KD.dispatch_once(conn, stale_timeout_seconds=1800)
 check(
-    "F3. 1800s stale timeout reclaims 30m-old card and frees slot",
+    "F3. 1800s stale timeout reclaims 30m-old wedged card and frees slot",
     stale_card in res_30m.stale and K.get_task(conn, stale_card).status == "ready",
+)
+check(
+    "F4. control: 30m-old heartbeating card survives 1800s stale timeout sweep",
+    heartbeating_card not in res_30m.stale
+    and K.get_task(conn, heartbeating_card).status == "running",
 )
 
 conn.close()
