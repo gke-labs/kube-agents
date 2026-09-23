@@ -4410,9 +4410,16 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	ctx := context.Background()
 
 	env := a2aGatewayEnv(t, cl, agent)
+	// Loopback, not every interface: the port-forward the eval runner uses
+	// is served from inside the pod's network namespace, and a bind on every
+	// interface would hand the pod network a listener the fence alone
+	// withholds.
 	listen := env[a2aInjectListenEnvVar]
-	if listen.Value != fmt.Sprintf(":%d", a2aInjectPort) {
-		t.Errorf("%s = %q, want every interface on the inject port", a2aInjectListenEnvVar, listen.Value)
+	if listen.Value != fmt.Sprintf("%s:%d", a2aInjectListenHost, a2aInjectPort) {
+		t.Errorf("%s = %q, want the pod's loopback on the inject port", a2aInjectListenEnvVar, listen.Value)
+	}
+	if strings.HasPrefix(listen.Value, ":") {
+		t.Errorf("%s = %q binds every interface", a2aInjectListenEnvVar, listen.Value)
 	}
 	// The map the gateway reads has to be the one the operator rendered; the
 	// default path is the hand-made Discord map, which carries no eval

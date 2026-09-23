@@ -24,20 +24,23 @@ import (
 // same idea as the Discord test backend in spec-chatops-gateway.md, with the
 // eval as the consumer rather than a human.
 //
-// DEV AND EVAL ONLY. Four things confine it, and the first is the only one
+// DEV AND EVAL ONLY. Five things confine it, and the first is the only one
 // inside this file.
 //
 // Every request carries a bearer token (A2A_INJECT_TOKEN, which the operator
 // renders into a Secret under its eval flag and the gateway refuses to arm
-// the door without). The other three are the operator's: the door renders
-// only under that flag, its Service is a ClusterIP, and while it is armed a
+// the door without). The other four are the operator's: the door renders
+// only under that flag, it listens on the gateway pod's loopback rather than
+// every interface, its Service is a ClusterIP that exists to give `kubectl
+// port-forward` a name and routes nothing, and while it is armed a
 // NetworkPolicy fences the gateway pod against every pod on the cluster
 // network.
 //
-// The token is not belt-and-braces over that fence, it is the control, and
-// the fence is the secondary. The eval runner reaches the Service through
-// `kubectl port-forward`, which enters from the node and is not pod-network
-// traffic -- so the fence never governs the door's own caller. Without a
+// The token is not belt-and-braces over the bind and the fence, it is the
+// control, and those are the secondary. The eval runner reaches the door
+// through `kubectl port-forward`, which the kubelet serves from inside the
+// pod's network namespace and is not pod-network traffic -- so neither the
+// loopback bind nor the fence governs the door's own caller. Without a
 // token, the population that can drive the platform persona with the
 // install's cluster and GitHub credentials would be everyone holding
 // pods/portforward in the namespace, rather than the holders of the agent's
@@ -595,9 +598,10 @@ type InjectAdapter struct {
 	listener net.Listener
 }
 
-// NewInjectAdapter builds the door for a listen address (host:port, or :port
-// for every interface), the bearer token every request must carry, and the
-// gateway's first-event grace to report to callers.
+// NewInjectAdapter builds the door for a listen address (host:port; the
+// operator renders the pod's loopback, a test binds an ephemeral loopback
+// port), the bearer token every request must carry, and the gateway's
+// first-event grace to report to callers.
 //
 // The token is required here as well as in FromEnv, because this constructor
 // is also what a test and an embedder reach: a door that could be built

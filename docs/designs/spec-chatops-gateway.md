@@ -694,13 +694,14 @@ the map decides _which_ principal an author id stands for, and what admitted the
 door's token rather than Discord's authenticated websocket or Chat's IAM-locked topic. A consumer
 that treated the three alike is what this value exists to stop.
 
-**Posture: a dev and eval door.** Four things confine it.
+**Posture: a dev and eval door.** Five things confine it.
 
 1. **Every request carries a bearer token.** The operator renders it into a Secret beside the
    door and the gateway refuses to arm the door without one; there is no unauthenticated mode.
-   This is the control, not a second layer over the fence below: the fence governs pod-network
-   traffic, and the eval runner arrives through `kubectl port-forward`, which enters from the
-   node and is exempt. Without the token the population that can drive the platform persona -
+   This is the control, not a second layer over the bind and the fence below: those govern
+   pod-network traffic, and the eval runner arrives through `kubectl port-forward`, which the
+   kubelet serves from inside the pod's network namespace and is exempt from both. Without the
+   token the population that can drive the platform persona -
    with the install's cluster and GitHub credentials, past the allowed-users gate - would be
    everyone holding `pods/portforward` in the namespace rather than the holders of the key the
    door stands in for.
@@ -715,12 +716,20 @@ that treated the three alike is what this value exists to stop.
    and the conformance suite (`tests/conformance/test_A_authority.py`) asserts that every render
    site consults the flag, that the flag is an operator environment variable and not a CRD
    field, and that the door's principal lookup cannot reach a cloud identity.
-3. **Its Service is a ClusterIP.** Not a NodePort, not a LoadBalancer.
-4. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
-   network**: ingress with no rules. This is what keeps every other pod from reaching a listener
-   it would otherwise only need a token to use. Its honest edge is the exemption above seen from
-   the other side: a `hostNetwork` pod on the gateway's node reaches the listener the way the
-   port-forward does, and the token is what that pod would still lack.
+3. **It listens on the gateway pod's loopback**, `127.0.0.1:8099`, not every interface. A pod
+   dialling the inject port is refused before any policy is consulted; the port-forward still
+   reaches it because the kubelet dials from inside the pod's network namespace. This is the
+   posture the agent's dashboard already has, and it is what keeps every other pod from
+   reaching a listener it would otherwise only need a token to use.
+4. **Its Service is a ClusterIP.** Not a NodePort, not a LoadBalancer, and it routes nothing:
+   it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
+   port.
+5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
+   network**: ingress with no rules. It is a second control over the edge the bind already
+   closes, kept so that a reader of the rendered objects sees the intent and so that a later
+   change to the bind address does not open the pod network by itself. Its honest edge is the
+   exemption above seen from the other side: a `hostNetwork` pod on the gateway's node reaches
+   the listener the way the port-forward does, and the token is what that pod would still lack.
 
 **What it also settles.** The gateway refuses to start without a backend, which makes it
 crash-loop on any install with neither a Discord token nor a Chat relay - so a `mode: next`

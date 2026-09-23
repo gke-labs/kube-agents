@@ -153,9 +153,10 @@ the presubmit exports nothing new until it chooses to. The exchange:
    `shows_a_run`, held together by a test. The inject transport brings the scorer rule; the
    diagnostic transport reuses it.
 
-The adapter binds to localhost or a ClusterIP Service. A NetworkPolicy edge fences it from every
-in-cluster pod but the eval runner's path; it does not govern the port-forward the harness uses,
-which enters from the node, so the fence is not what keeps the door shut. What keeps it shut is a
+The adapter binds the gateway pod's loopback, with a ClusterIP Service that gives the harness's
+port-forward a name and routes nothing. A NetworkPolicy edge fences it from every in-cluster pod
+as a second control; neither governs the port-forward the harness uses, which the kubelet serves
+from inside the pod's network namespace, so they are not what keeps the door shut. What keeps it shut is a
 bearer token the operator renders into a Secret beside the adapter's env, under the eval flag
 only, which the harness reads the way the presubmit reads `API_SERVER_KEY` today. The door it
 replaces admits key holders, and this one admits the same population rather than everyone

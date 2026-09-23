@@ -182,16 +182,22 @@ const (
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
 
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
-	// select the backend, and a2aInjectPort is the port it listens on. The
-	// listen address is every interface rather than loopback: a Service has
-	// to reach it, and a pod-local loopback bind would be reachable only
-	// from inside the gateway container. What withholds it from the pod
-	// network is buildA2AGatewayNetworkPolicy, not the bind address.
+	// select the backend; a2aInjectListenHost and a2aInjectPort are the
+	// address it listens on. The host is the pod's loopback, not every
+	// interface: the door's only caller is the eval runner's `kubectl
+	// port-forward`, which the kubelet serves from inside the pod's network
+	// namespace, so loopback reaches it and nothing on the pod network does
+	// -- another pod dialling the inject Service gets connection refused,
+	// whatever the NetworkPolicy says. That is the same posture as the
+	// dashboard (dashboardPort in platformagent_manifests.go), and it is
+	// what withholds the listener from the cluster; buildA2AGatewayNetworkPolicy
+	// stays as a second control over the same edge.
 	//
 	// Untyped on purpose, like a2aNATSClientPort: the container port wants
 	// an int32, the fence wants an intstr, and the listen address wants a
 	// string.
 	a2aInjectListenEnvVar = "A2A_INJECT_LISTEN"
+	a2aInjectListenHost   = "127.0.0.1"
 	a2aInjectPort         = 8099
 
 	// The one identity the inject door admits, and the principal it stands
@@ -2214,20 +2220,24 @@ func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 	}
 }
 
-// buildA2AInjectService is how the eval runner reaches the inject backend:
-// a ClusterIP, which is what `kubectl port-forward svc/...` resolves.
+// buildA2AInjectService is how the eval runner names the inject backend:
+// a ClusterIP, which is what `kubectl port-forward svc/...` resolves to a
+// pod and a port. It routes nothing: the door binds the pod's loopback
+// (a2aInjectListenHost), so a connection to the ClusterIP from another pod
+// is refused, the same way the agent's dashboard Service is published for
+// port-forward name resolution over a loopback listener.
 //
 // ClusterIP and not a LoadBalancer or a NodePort. The access control is the
 // bearer token the door demands on every request (a2a/gateway/inject.go,
-// rendered from the Secret this file mints); the ClusterIP and the fence
-// below are the secondary layer, narrowing who can even present one. A
-// ClusterIP is unreachable from outside the cluster, the fence denies every
-// pod, and the eval runner's port-forward enters through the kubelet on the
-// node path -- neither pod-network traffic (so the fence does not govern it)
-// nor routable from off-cluster (so it needs an authenticated Kubernetes API
-// session first). Without the token, that API session would be the whole
-// authentication, and the population holding pods/portforward here is wider
-// than the population holding the agent's key the door stands in for.
+// rendered from the Secret this file mints); the loopback bind and the fence
+// below are the secondary layer, narrowing who can even present one. The
+// eval runner's port-forward enters through the kubelet inside the pod's
+// network namespace -- neither pod-network traffic (so neither the bind nor
+// the fence governs it) nor routable from off-cluster (so it needs an
+// authenticated Kubernetes API session first). Without the token, that API
+// session would be the whole authentication, and the population holding
+// pods/portforward here is wider than the population holding the agent's
+// key the door stands in for.
 func buildA2AInjectService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
@@ -2351,16 +2361,17 @@ func randomA2AInjectToken() (string, error) {
 // reaching the gateway at all, and the inject port must not become the one
 // that does.
 //
-// This fence is the second control, not the first. It does not govern the
-// door's own caller: the eval runner reaches the Service through `kubectl
-// port-forward`, which enters from the node and is exempt from NetworkPolicy
-// under Dataplane V2 (the same path the NATS monitor and websocket ports rely
-// on; buildA2ANATSNetworkPolicy says so at length), and the exemption is
-// host-local rather than port-forward-shaped, so a hostNetwork pod on the
-// gateway's node reaches the listener by the same route. What answers both is
-// the bearer token (ensureA2AInjectTokenSecret) -- this fence is what keeps
-// every OTHER pod from reaching a listener it would otherwise only need a
-// token to use.
+// This fence is a second control over an edge the bind address already
+// closes, not the first. The door listens on the pod's loopback
+// (a2aInjectListenHost), so a pod dialling the inject port is refused before
+// any policy is consulted; the fence is belt-and-braces for the day the bind
+// address changes, and it is what a reader of the rendered objects sees. It
+// does not govern the door's own caller: the eval runner reaches the Service
+// through `kubectl port-forward`, which the kubelet serves from inside the
+// pod's network namespace and is exempt from NetworkPolicy under Dataplane
+// V2 (the same path the NATS monitor and websocket ports rely on;
+// buildA2ANATSNetworkPolicy says so at length). What answers that caller is
+// the bearer token (ensureA2AInjectTokenSecret).
 //
 // Rendered only with the backend, deliberately. A deny-all-ingress fence on
 // the gateway is a good idea whatever the backend, but rendering one on every
@@ -2407,7 +2418,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var injectVolumes []corev1.Volume
 	if a2aInjectBackendEnabled() {
 		injectEnv = []corev1.EnvVar{
-			{Name: a2aInjectListenEnvVar, Value: fmt.Sprintf(":%d", a2aInjectPort)},
+			{Name: a2aInjectListenEnvVar, Value: fmt.Sprintf("%s:%d", a2aInjectListenHost, a2aInjectPort)},
 			// The door's own map, beside the chat one rather than over it:
 			// the door may be armed next to a real backend, and repointing
 			// A2A_PRINCIPAL_MAP would take that backend's identities away.

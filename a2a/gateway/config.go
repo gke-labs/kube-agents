@@ -373,10 +373,11 @@ func FromEnv() (*Config, error) {
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
-	// exempt from the NetworkPolicy in front of it. There is deliberately no
-	// opt-out — see Config.InjectToken.
+	// served from inside the pod, past both the loopback bind and the
+	// NetworkPolicy in front of it. There is deliberately no opt-out — see
+	// Config.InjectToken.
 	if cfg.InjectListen != "" && cfg.InjectToken == "" {
-		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, and the NetworkPolicy in front of it does not govern the port-forward path its caller uses")
+		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, because neither its loopback bind nor the NetworkPolicy in front of it governs the port-forward path its caller uses")
 	}
 	// Only when the spawn path is armed: a gateway that spawns nothing has
 	// no session identity to name, and demanding one would break every
