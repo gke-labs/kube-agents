@@ -63,6 +63,7 @@ Environment:
 from __future__ import annotations
 
 import atexit
+import fcntl
 import http.client
 import json
 import logging
@@ -136,6 +137,8 @@ _HERMES_BIN_FALLBACK = "/opt/hermes/.venv/bin/hermes"
 # What ``hermes kanban archive <id>`` prints on success; a failure goes to
 # stderr with exit 1, which ``_agent_shell`` returns as an empty string.
 _ARCHIVED_PREFIX = "Archived "
+# How much of an unexpected archive reply the warning quotes.
+_LOG_EXCERPT_CHARS = 200
 # One terminal command per line in a card's worker log, as hermes renders it:
 # ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
 # are stripped; the command is kept verbatim otherwise.
@@ -651,7 +654,7 @@ _STAT_FORMAT = "%Y %s"
 _STAT_UNKNOWN = "-"
 # One row per stalled card, appended: every repetition in a build shares one
 # ARTIFACTS directory, so a file written whole would keep only the last stall.
-# The header is written once, by whichever repetition creates the file.
+# The header is written once, by whichever repetition finds the file empty.
 _WORKER_LOG_INDEX = "index.txt"
 _WORKER_LOG_INDEX_HEADER = "card\tmtime_epoch\tsize_bytes\tstate"
 
@@ -799,16 +802,20 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog] | None, stalled: Sequence[str]
     try:
         target.mkdir(parents=True, exist_ok=True)
         index = target / _WORKER_LOG_INDEX
-        # Exclusive create for the header, append for the rows: repetitions
-        # run in parallel, and the pair leaves no window for two of them to
-        # both write the header or for either to lose the other's rows.
-        try:
-            with index.open("x", encoding="utf-8") as fh:
-                fh.write(_WORKER_LOG_INDEX_HEADER + "\n")
-        except FileExistsError:
-            pass
+        # One append-mode open under an exclusive flock. Repetitions run in
+        # parallel, and a header written through a separate exclusive-create
+        # handle sat at offset 0 until close, where it could overwrite the
+        # first row another repetition had appended meanwhile. O_APPEND puts
+        # every write at the end, and the lock makes header-then-rows one step.
         with index.open("a", encoding="utf-8") as fh:
-            fh.write("\n".join(rows) + "\n")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                if os.fstat(fh.fileno()).st_size == 0:
+                    fh.write(_WORKER_LOG_INDEX_HEADER + "\n")
+                fh.write("\n".join(rows) + "\n")
+                fh.flush()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         for tid in stalled:
             log = found.get(tid)
             if log is not None:
@@ -848,7 +855,7 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
             _log.warning(
                 "could not archive stalled card %s; its worker may still hold a dispatcher slot (%s)",
                 tid,
-                out[:200] or "no output",
+                out[:_LOG_EXCERPT_CHARS] or "no output",
             )
 
 

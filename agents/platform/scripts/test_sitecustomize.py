@@ -275,7 +275,7 @@ class FinderMustNotImportTest(unittest.TestCase):
         (self.root / "gateway_helper.py").write_text("VALUE = 1\n")
         script = textwrap.dedent(
             f"""
-            import importlib, importlib.util, sys, threading, time, types
+            import importlib, importlib.util, sys, threading, types
             sys.path.insert(0, {str(self.root)!r})
             spec = importlib.util.spec_from_file_location(
                 "_sc", {str(SCRIPTS_DIR / "sitecustomize.py")!r}
@@ -284,12 +284,21 @@ class FinderMustNotImportTest(unittest.TestCase):
             spec.loader.exec_module(sc)
             sys.meta_path[:] = [f for f in sys.meta_path if type(f).__name__ != "PatchOnImport"]
             ctl = types.ModuleType("_deadlock_ctl")
-            ctl.started, ctl.go = threading.Event(), threading.Event()
+            ctl.started, ctl.go, ctl.in_finder = threading.Event(), threading.Event(), threading.Event()
             sys.modules["_deadlock_ctl"] = ctl
+
+            # Signals the moment thread B is inside the hook, so A is released
+            # only then: the race is forced, not left to a sleep.
+            class Signalling(sc.PatchOnImport):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == sc.TRIGGER_MODULE:
+                        ctl.in_finder.set()
+                    return super().find_spec(fullname, path, target)
+
             patch = types.ModuleType("fake_patch")
             patch.install = lambda: None
             sys.modules["fake_patch"] = patch
-            sys.meta_path.insert(0, sc.PatchOnImport(["fake_patch"]))
+            sys.meta_path.insert(0, Signalling(["fake_patch"]))
             a = threading.Thread(target=lambda: importlib.import_module("gateway"), daemon=True)
             b = threading.Thread(
                 target=lambda: importlib.import_module("gateway.platform_registry"), daemon=True
@@ -297,7 +306,7 @@ class FinderMustNotImportTest(unittest.TestCase):
             a.start()
             assert ctl.started.wait(10)
             b.start()
-            time.sleep(0.5)
+            assert ctl.in_finder.wait(10), "thread B never reached the hook"
             ctl.go.set()
             a.join(5)
             b.join(5)
