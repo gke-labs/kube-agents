@@ -36,7 +36,7 @@
 slots:
   - slot: a
     suffix: a
-    carries: The four seeded workload namespaces and the two defect node pools
+    carries: The five seeded workload namespaces and the two defect node pools
   - slot: b
     suffix: b
     carries: The held-back control plane, and no workloads
@@ -55,6 +55,17 @@ fixtures:
       Cluster-scoped ClusterRoleBinding granting cluster-admin to the default
       ServiceAccount in seeded-security. Cluster-scoped deliberately: the
       compliance SOP reads clusterrolebindings only.
+
+  - role: stalled-controller
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/inventory-api
+    namespace: seeded-stall
+    defect: >-
+      One Deployment whose container reads a ConfigMap that does not exist
+      through envFrom. Its pods sit in CreateContainerConfigError and the
+      Deployment never progresses, with no crash and no restart.
 
   - role: no-pdb-workload
     slot: a

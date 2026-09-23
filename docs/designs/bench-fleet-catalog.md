@@ -90,24 +90,25 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
+Nine fixtures: eight across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
+five seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
+`seeded-capacity` and `seeded-stall`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
 only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
 outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
 from voting on the baseline.
 
-| Role                 | Slot    | Day | What is planted                                                                       |
-| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+| Role                 | Slot    | Day | What is planted                                                                                    |
+| -------------------- | ------- | --- | -------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA              |
+| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                        |
+| `stalled-controller` | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded |
+| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop              |
+| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                              |
+| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                |
+| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                   |
+| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                                         |
+| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                               |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
