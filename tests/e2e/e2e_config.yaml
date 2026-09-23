@@ -111,7 +111,7 @@ suites:
   # 6. Full Nightly E2E Matrix Environment
   # ----------------------------------------------------------------------------
   # Every nightly test file in one unit, for a hand-dispatched "run the lot".
-  # nightly-pipeline.yml does NOT run it as a single suite: it gates the staging
+  # staging-promotion-pipeline.yml does NOT run it as a single suite: it gates the staging
   # promotion on `rc` — the subset with a green run on a real cluster behind it —
   # and runs `gchat`, `agent-plugin` and `stockout-full` alongside as optional
   # coverage. Those three cover the files this suite adds on top of `rc`, so the

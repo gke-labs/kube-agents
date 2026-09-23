@@ -1,6 +1,6 @@
-"""Unit tests for scripts/release/dispatch_nightly_pipeline.sh and its skip counterpart.
+"""Unit tests for scripts/release/dispatch_promotion_pipeline.sh and its skip counterpart.
 
-nightly-scheduler.yml is now the scheduled trigger that starts the nightly
+staging-promotion-scheduler.yml is now the scheduled trigger that starts the staging
 promotion pipeline, so a dispatch that fails quietly means no candidate is tested
 for staging promotion until somebody notices. These pin the annotation that says so,
 the arguments that decide which candidate tag gets tested, and the refusal to run on
@@ -15,15 +15,15 @@ import unittest
 from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_DISPATCH_SCRIPT = _REPO_ROOT / "scripts" / "release" / "dispatch_nightly_pipeline.sh"
-_SKIP_SCRIPT = _REPO_ROOT / "scripts" / "release" / "record_nightly_scheduler_skip.sh"
+_DISPATCH_SCRIPT = _REPO_ROOT / "scripts" / "release" / "dispatch_promotion_pipeline.sh"
+_SKIP_SCRIPT = _REPO_ROOT / "scripts" / "release" / "record_promotion_scheduler_skip.sh"
 
 _COMMIT = "1234567890abcdef1234567890abcdef12345678"
 _RC_TAG = "rc_20260830_120000_1234567_validated"
 _CALLS_LOG = "gh_calls.log"
 
 
-class DispatchNightlyPipelineTest(unittest.TestCase):
+class DispatchPromotionPipelineTest(unittest.TestCase):
     def _run(self, gh_exit=0, overrides=None, omit=()):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -65,7 +65,7 @@ exit {gh_exit}
     def test_dispatches_the_pipeline_with_the_resolved_candidate(self):
         proc, recorded, _ = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("workflow run nightly-pipeline.yml", recorded)
+        self.assertIn("workflow run staging-promotion-pipeline.yml", recorded)
         self.assertIn(f"rc_tag={_RC_TAG}", recorded)
 
     def test_dispatches_against_the_ref_the_scheduler_ran_on(self):
@@ -75,16 +75,16 @@ exit {gh_exit}
 
     def test_records_the_dispatch_in_the_job_summary(self):
         _, _, summary = self._run()
-        self.assertIn("### Nightly pipeline dispatched", summary)
+        self.assertIn("### Promotion pipeline dispatched", summary)
         self.assertIn(f"| Commit | `{_COMMIT}` |", summary)
         self.assertIn(f"| Candidate tag | `{_RC_TAG}` |", summary)
 
     def test_a_failed_dispatch_is_an_error_annotation_not_a_bare_exit(self):
-        """This failure means no nightly candidate is being tested; it must say so."""
+        """This failure means no candidate is being tested; it must say so."""
         proc, _, summary = self._run(gh_exit=1)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("::error title=Nightly pipeline dispatch failed", proc.stderr)
-        self.assertIn("No nightly candidate is being tested", proc.stderr)
+        self.assertIn("::error title=Promotion pipeline dispatch failed", proc.stderr)
+        self.assertIn("No promotion candidate is being tested", proc.stderr)
         self.assertNotIn("dispatched", summary)
 
     def test_missing_commit_sha_aborts_before_calling_gh(self):
@@ -137,17 +137,17 @@ exit {gh_exit}
         self.assertIn("gh CLI is required", proc.stderr)
 
     def test_dispatches_with_overridden_workflow_file(self):
-        proc, recorded, _ = self._run(overrides={"WORKFLOW_FILE": "custom-nightly.yml"})
+        proc, recorded, _ = self._run(overrides={"WORKFLOW_FILE": "custom-promotion.yml"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("workflow run custom-nightly.yml", recorded)
+        self.assertIn("workflow run custom-promotion.yml", recorded)
 
     def test_runs_outside_actions_without_step_summary_file(self):
         proc, recorded, _ = self._run(omit=("GITHUB_STEP_SUMMARY",))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("workflow run nightly-pipeline.yml", recorded)
+        self.assertIn("workflow run staging-promotion-pipeline.yml", recorded)
 
 
-class RecordNightlySchedulerSkipTest(unittest.TestCase):
+class RecordPromotionSchedulerSkipTest(unittest.TestCase):
     def _run(self, with_summary_file=True, overrides=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -172,7 +172,7 @@ class RecordNightlySchedulerSkipTest(unittest.TestCase):
         """A quiet tick leaves no pipeline run, so this text is the only trace."""
         proc, summary = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("### No nightly promotion required", summary)
+        self.assertIn("### No staging promotion required", summary)
         self.assertIn(f"`{_RC_TAG}`", summary)
         self.assertIn(f"`{_COMMIT}`", summary)
         self.assertIn("says nothing about the last pipeline run's result", summary)
@@ -181,21 +181,21 @@ class RecordNightlySchedulerSkipTest(unittest.TestCase):
         reason = "Commit is already promoted as 'staging_20260830_120000_1234567'."
         proc, summary = self._run(overrides={"SKIP_REASON": reason})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("### No nightly promotion required", summary)
+        self.assertIn("### No staging promotion required", summary)
         self.assertIn(reason, summary)
         self.assertIn("says nothing about the last pipeline run's result", summary)
 
     def test_renders_fallback_when_no_tag_or_reason_provided(self):
         proc, summary = self._run(overrides={"RC_TAG": "", "COMMIT_SHA": "", "SKIP_REASON": ""})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("### No nightly promotion required", summary)
+        self.assertIn("### No staging promotion required", summary)
         self.assertIn("No eligible validated candidate exists to promote", summary)
         self.assertIn("says nothing about the last pipeline run's result", summary)
 
     def test_runs_outside_actions_without_a_summary_file(self):
         proc, _ = self._run(with_summary_file=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("### No nightly promotion required", proc.stdout)
+        self.assertIn("### No staging promotion required", proc.stdout)
 
 
 if __name__ == "__main__":

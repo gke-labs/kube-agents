@@ -928,6 +928,25 @@ prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top
 and `ci-eval-rc.sh`'s `RELEASE CANDIDATE EVAL` at the end. A substring match
 opens the parse on the first one, so the decoy stays in the fixture.
 
+`testdata_nightly/` holds the nightly of 2026-09-21 (`ci-kube-agents-eval-nightly`,
+the periodic, so no `pull` key and `revision: main`), the second night the
+480m deadline ended with every unit finished and nothing graded (#1491).
+`started.json` / `finished.json` are verbatim and every driver line is real —
+the lease, the fan-out start, the launch and `finished` markers, the
+entrypoint's timeout and grace-period lines, the profile table. The four
+grading blocks are **spliced in**: the real night printed none, because the
+grading ran after the fan-out's `wait` and the deadline arrived first. They
+are real `bench-gate case` output from the night before
+(build 2101461441721667584) for four cases that also ran this night, placed at
+each case's repetition-3 `finished` line the way `hack/ci-eval-pr.sh` prints them
+since it grades per case, three of them after the SIGTERM, inside the grace
+period; the `recorded` lines are restamped to this build. The
+`Eval ended before its verdict` line is the EXIT trap's cut-off report:
+
+| build               | why it is here                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 2102186223282950144 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
+
 `testdata_health/data.json.gz` is a **real** published `data.json` reduced by
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by
 suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of

@@ -720,6 +720,17 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
             "An absolute rule tripped or the log was cut short; the build log has the reason, the case list does not." + held_note,
             VERDICT_RED,
         )
+    if not failed and str(run.get("result") or "").upper() == RUN_ABORTED:
+        # Since the fan-out grades each case as it finishes, a run a newer
+        # push superseded carries the blocks of the cases graded before Prow
+        # stopped it. They are real; "all n passed" is not, since the rest
+        # never got their turn.
+        return (
+            "Aborted before it finished.",
+            f"Usually a newer push superseded this run; {_plural(n, 'gate case')} had been graded by then, and the next run carries the verdict."
+            + held_note,
+            VERDICT_INFRA,
+        )
     if not failed:
         partial = [c for c in gate if c["outcome"] == OUTCOME_PARTIAL]
         lede = (
