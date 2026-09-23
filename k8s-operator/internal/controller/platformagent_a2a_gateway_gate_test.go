@@ -1,19 +1,20 @@
 package controller
 
-// BusCredentialsReady, from the side that reads it.
+// The A2A gateway creation gate, from the side that waits on it.
 //
-// The condition reports that the auth callout is serving the identity map that
-// every bus principal authenticates against. Until A6 nothing consumed it: the
-// CRD reference said so in as many words, and a claim with no reader is a claim
-// nobody notices going wrong. What reads it now is the gateway render, and only
-// its CREATE - a gateway that already exists keeps reconciling through a
-// callout outage, because withholding its updates would freeze its image and
-// env at whatever the outage interrupted, and because the sessions it already
-// spawned hang off its Deployment UID.
+// The gate withholds the gateway Deployment's CREATE until one auth callout
+// replica is both ready and on the current pod template
+// (a2aCalloutCanServeANewGateway) - a gateway that already exists keeps
+// reconciling through a callout outage, because withholding its updates would
+// freeze its image and env at whatever the outage interrupted, and because the
+// sessions it already spawned hang off its Deployment UID. The gate used to
+// read BusCredentialsReady, whose all-replicas rule held a first gateway for as
+// long as a second callout pod could not schedule; it now computes its own
+// answer from the callout Deployment, and the two deliberately answer different
+// questions. These tests pin both the release and the cases it must not admit.
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,7 @@ func reportCalloutServing(t *testing.T, ctx context.Context, cl client.Client, a
 	if dep.Spec.Replicas != nil {
 		replicas = *dep.Spec.Replicas
 	}
+	dep.Status.ObservedGeneration = dep.Generation
 	dep.Status.Replicas = replicas
 	dep.Status.ReadyReplicas = replicas
 	dep.Status.UpdatedReplicas = replicas
@@ -55,11 +57,34 @@ func reportCalloutServing(t *testing.T, ctx context.Context, cl client.Client, a
 	}
 }
 
-// letTheGatewayThrough is reportCalloutServing plus the two passes the gate
-// costs: syncBusCredentialsReady is deferred, so the reconcile that observes a
-// serving callout is the one that publishes the condition, and the NEXT one is
-// the first to read it True. Tests that are about something other than the gate
-// call this to get past it.
+// reportCalloutStatus puts the callout Deployment into an arbitrary counted
+// state, with the Deployment controller reported as having seen the current
+// spec, so the gate's answer is about the counts and nothing else. The tests
+// below use it for the states a real callout passes through that
+// reportCalloutServing does not model: a second pod Pending, a wedged roll, a
+// reap window.
+func reportCalloutStatus(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent, replicas, ready, updated int32) {
+	t.Helper()
+	dep := &appsv1.Deployment{}
+	key := types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, dep); err != nil {
+		t.Fatalf("get callout Deployment: %v", err)
+	}
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = replicas
+	dep.Status.ReadyReplicas = ready
+	dep.Status.UpdatedReplicas = updated
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatalf("update callout status: %v", err)
+	}
+}
+
+// letTheGatewayThrough is reportCalloutServing plus two passes. The gate reads
+// the callout Deployment itself, so the first pass after the status lands is
+// the one that creates the gateway; the second is the settled pass, where the
+// deferred BusCredentialsReady write has landed and the phase has been computed
+// with the gateway in the namespace, which is the state tests that are about
+// something other than the gate want to read from.
 func letTheGatewayThrough(t *testing.T, ctx context.Context, cl client.Client, r *PlatformAgentReconciler, req ctrl.Request, agent *agentv1alpha1.PlatformAgent) {
 	t.Helper()
 	reportCalloutServing(t, ctx, cl, agent)
@@ -70,22 +95,21 @@ func letTheGatewayThrough(t *testing.T, ctx context.Context, cl client.Client, r
 	}
 }
 
-// busCredentialsAreReady sets BusCredentialsReady True on the in-memory CR,
-// which is the one thing the gateway gate reads. It is for tests that drive
-// reconcileA2A directly instead of going through Reconcile: syncBusCredentialsReady
-// runs on the way out of Reconcile, so on that path no pass ever publishes the
-// condition, the gate holds forever, and the gateway Deployment is never
-// created. An assertion about a gateway that was never created passes on
-// absence, which is the failure mode this helper exists to keep out of the
-// suite -- so call it, and then assert the Deployment is there before
-// asserting anything else about it.
-func busCredentialsAreReady(agent *agentv1alpha1.PlatformAgent) {
-	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
-		Type:    busCredentialsReadyCondition,
-		Status:  metav1.ConditionTrue,
-		Reason:  busCredsReasonServing,
-		Message: "the auth callout is serving identity map <test>",
-	})
+// theCalloutIsServing renders the A2A stack once and reports its callout
+// Deployment serving, which is the one thing the gateway gate reads. It is for
+// tests that drive reconcileA2A directly instead of going through Reconcile:
+// the fake client runs no Deployment controller, so on that path the callout
+// the first pass renders never reports a replica, the gate holds forever, and
+// the gateway Deployment is never created. An assertion about a gateway that
+// was never created passes on absence, which is the failure mode this helper
+// exists to keep out of the suite -- so call it, and then assert the Deployment
+// is there before asserting anything else about it.
+func theCalloutIsServing(t *testing.T, ctx context.Context, cl client.Client, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatalf("render the A2A stack so the callout exists to report on: %v", err)
+	}
+	reportCalloutServing(t, ctx, cl, agent)
 }
 
 // completeTheProvisionJob reports the A2A provision Job complete, which is what
@@ -174,7 +198,7 @@ func TestTheGatewayIsWithheldUntilTheCalloutServes(t *testing.T) {
 
 	gwKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); !errors.IsNotFound(err) {
-		t.Fatalf("gateway rendered while BusCredentialsReady is False (err=%v); it would dispatch onto a bus that refuses every session's connect", err)
+		t.Fatalf("gateway rendered while no callout replica serves (err=%v); it would dispatch onto a bus that refuses every session's connect", err)
 	}
 
 	// Everything the callout needs in order to become ready is already
@@ -253,10 +277,12 @@ func TestARunningGatewayKeepsReconcilingThroughACalloutOutage(t *testing.T) {
 	if err := cl.Status().Update(ctx, dep); err != nil {
 		t.Fatalf("update callout status: %v", err)
 	}
-	// Two passes to land it, for the same deferred-write reason as
-	// letTheGatewayThrough: the condition is published on the way out. The
-	// spec change below must arrive when the gate is genuinely reading False,
-	// or this test passes on staleness rather than on the rule it is about.
+	// Two passes to land it. The gate reads the Deployment, so it sees the
+	// outage on the first; the condition is published on the way out, and
+	// the second pass is what makes it readable below. The spec change must
+	// arrive when the gate is genuinely reading an outage, or this test passes
+	// on staleness rather than on the rule it is about, and the condition is
+	// the independent witness that the outage landed on the cluster.
 	for i := 0; i < 2; i++ {
 		if _, err := r.Reconcile(ctx, req); err != nil {
 			t.Fatalf("Reconcile %d after the callout went unready: %v", i+1, err)
@@ -300,35 +326,26 @@ func TestARunningGatewayKeepsReconcilingThroughACalloutOutage(t *testing.T) {
 	}
 }
 
-// What the gate costs a new install whose callout is only partly up, pinned
-// because Risk & Rollout states it in prose and prose does not go red.
+// The release: one replica ready on the current template is enough for a new
+// gateway, and BusCredentialsReady is not consulted.
 //
-// The gate passes on BusCredentialsReady alone, and that condition is True only
-// when every replica of the callout Deployment is ready AND on the current pod
-// template. The Deployment is rendered at two. But the callout's replicas join
-// a NATS queue group (a2a/authcallout/service.go, AuthQueueGroup) precisely so
-// that exactly one of them answers each authorization request, so ONE ready
-// replica already mints credentials for every session. The condition's
-// all-replicas rule was written for a different question -- "is the callout as
-// a whole serving the map this render names", where a half-rolled Deployment
-// genuinely is not -- and the gate imports it wholesale.
+// The callout's replicas join a NATS queue group (a2a/authcallout/service.go,
+// AuthQueueGroup) precisely so that exactly one of them answers each
+// authorization request, so ONE ready replica already mints credentials for
+// every session. The condition's all-replicas rule was written for a different
+// question -- "is the callout as a whole serving the map this render names",
+// where a half-rolled Deployment genuinely is not -- and the gate used to
+// import it wholesale, which held a NEW install's gateway for as long as a
+// second replica could not schedule (node pressure, a namespace quota, an image
+// pull that fails on one node), on a bus that would have authenticated every
+// one of its sessions.
 //
-// So a second replica that cannot schedule (node pressure, a namespace quota,
-// an image pull that fails on one node) or a roll that wedges holds a NEW
-// install's gateway for as long as that lasts, on a bus that would have
-// authenticated every one of its sessions. Before the gate the install got a
-// gateway and working sessions. The hold is not silent -- BusCredentialsReady
-// is False on the CR and its message carries the 1-of-2 -- but nothing ties it
-// to the gateway's absence: the hold writes no condition of its own, and the
-// phase is decided from the agent gateway, shell sandbox and credential broker,
-// so the CR reads Ready with no A2A gateway in the namespace.
-//
-// This is a characterisation test, and it is written to fail in both
-// directions. Loosening the gate to one ready replica breaks the "withheld"
-// assertion; making the hold observable on the CR breaks the phase assertion.
-// Either of those is a real decision, and when it is taken this test and the
-// Risk & Rollout paragraph move together, which is the point of pinning it.
-func TestAPartlyReadyCalloutStillWithholdsANewGateway(t *testing.T) {
+// This is the shape a Pending second pod has in Deployment status: both pods
+// created on the current template (Updated=2, Replicas=2), one of them ready.
+// The condition is asserted False in the same breath, because the two now
+// disagree on purpose and a test that only checked the gateway would pass just
+// as well on a loosened condition, which is not the change.
+func TestAPartlyReadyCalloutLetsANewGatewayThrough(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent,
 		readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
@@ -356,20 +373,14 @@ func TestAPartlyReadyCalloutStillWithholdsANewGateway(t *testing.T) {
 		t.Fatalf("the callout renders at %d replicas; this test is about the gap between one replica serving and every replica ready, and at one there is no gap", rendered)
 	}
 
-	// One of them up, on the current template, and the Deployment controller
-	// has seen the current spec. The only thing short of serving is the
-	// second pod.
-	dep.Status.ObservedGeneration = dep.Generation
-	dep.Status.Replicas = rendered
-	dep.Status.ReadyReplicas = 1
-	dep.Status.UpdatedReplicas = 1
-	if err := cl.Status().Update(ctx, dep); err != nil {
-		t.Fatalf("update callout status: %v", err)
-	}
+	// Every pod on the current template, one of them ready: the second is
+	// Pending. The only thing short of the condition's bar is that pod.
+	reportCalloutStatus(t, ctx, cl, agent, rendered, 1, rendered)
 
-	// Two passes for the deferred condition write, the same reason
-	// letTheGatewayThrough takes two, and the Job kept complete across them so
-	// the requeue below is the gate's arm and not provisioning's.
+	// Two passes: the first is the one the gate decides on, and the second
+	// lands the deferred condition write so it can be read beside the
+	// gateway. The Job is kept complete across them so neither pass is
+	// provisioning's.
 	for i := 0; i < 2; i++ {
 		completeTheProvisionJob(t, ctx, cl, agent)
 		if _, err := r.Reconcile(ctx, req); err != nil {
@@ -377,33 +388,135 @@ func TestAPartlyReadyCalloutStillWithholdsANewGateway(t *testing.T) {
 		}
 	}
 
+	gwKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); err != nil {
+		t.Errorf("the A2A gateway is withheld (err=%v) with one of %d callout replicas ready on the current template; one serving replica answers every authorization through the queue group, and the gate is meant to pass on it", err, rendered)
+	}
+
+	// The condition still says what it says: every replica, and there is not
+	// every replica. That the gateway exists beside it is the design.
 	fresh := &agentv1alpha1.PlatformAgent{}
 	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
 		t.Fatalf("get agent: %v", err)
 	}
 	cond := meta.FindStatusCondition(fresh.Status.Conditions, busCredentialsReadyCondition)
 	if cond == nil || cond.Status != metav1.ConditionFalse {
-		t.Fatalf("BusCredentialsReady = %+v at one of two replicas ready, want False; the rest of this test would prove nothing", cond)
+		t.Errorf("BusCredentialsReady = %+v at one of %d replicas ready, want False; the gate's release must not have come from loosening the condition, which is a claim about the callout as a whole", cond, rendered)
+	}
+}
+
+// The case the release must not admit, and the reason a plain "one ready
+// replica" rule was never taken.
+//
+// Under MaxUnavailable 0 a roll wedged on a pod too old to parse the rendered
+// identity map keeps both old pods ready and serving the previous map while
+// the new pod never becomes ready: Ready=2, Updated=1, Replicas=3. A rule that
+// read ReadyReplicas alone would let a first gateway through against a callout
+// no replica of which accepted the current map, and the sessions it spawned
+// would be authorized against the map before it. The lower bound reads
+// 2 + 1 - 3 = 0 here, and the gateway stays withheld with the requeue that
+// converges it once the roll unwedges.
+func TestAWedgedCalloutRollStillWithholdsANewGateway(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	reportCalloutStatus(t, ctx, cl, agent, 3, 2, 1)
+
+	completeTheProvisionJob(t, ctx, cl, agent)
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile on the wedged roll: %v", err)
 	}
 
 	gwKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); !errors.IsNotFound(err) {
-		t.Errorf("the A2A gateway exists (err=%v) with one of two callout replicas ready; if the gate was deliberately loosened to one ready replica, the Risk & Rollout paragraph about what a partly-ready callout costs a new install has to change with it", err)
+		t.Errorf("the A2A gateway exists (err=%v) on a callout at Ready=2, Updated=1, Replicas=3; both ready replicas are on the previous template, so a gateway created now spawns sessions authorized against the previous identity map", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Errorf("a gateway held on a wedged roll requeued after %s, want 30s", res.RequeueAfter)
+	}
+}
+
+// The rule's one error direction, through Reconcile: a terminated pod still
+// counted in Status.Replicas makes one ready updated replica read 1 + 1 - 2 = 0,
+// so the gate holds for that pass, and passes as soon as the count drops. The
+// false negative costs a held pass and a requeue, never a wrong gateway.
+func TestAReapWindowHoldsTheGatewayForOnePass(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	gwKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+
+	// One replica ready and updated, one terminating pod still counted.
+	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 1)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile in the reap window: %v", err)
+	}
+	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Fatalf("the A2A gateway exists (err=%v) at Ready=1, Updated=1, Replicas=2; status cannot tell this apart from one old ready pod beside one new unready one, so the gate has to hold", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Errorf("a gateway held in the reap window requeued after %s, want 30s; the requeue is what turns the false negative into a delay", res.RequeueAfter)
 	}
 
-	// The half that used to be silent. The three workloads the phase was computed
-	// from are all up, so before readSplitWorkloads counted the A2A gateway an
-	// operator watching `kubectl get platformagent` saw a healthy install with no
-	// dispatcher -- Ready: True sitting directly beside the False condition read
-	// above it. The hold is unchanged; what the phase says about it is not.
-	if fresh.Status.Phase != "Provisioning" {
-		t.Errorf("phase = %q with the A2A gateway withheld, want %q; if the gateway was deliberately taken back out of Ready, the Risk & Rollout paragraph about what a partly-ready callout costs a new install has to change with it", fresh.Status.Phase, "Provisioning")
+	// The terminated pod is reaped: the count drops, and nothing else changes.
+	reportCalloutStatus(t, ctx, cl, agent, 1, 1, 1)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the reap: %v", err)
 	}
-	ready := meta.FindStatusCondition(fresh.Status.Conditions, "Ready")
-	if ready == nil {
-		t.Fatalf("no Ready condition, so there is nothing for an operator to read")
+	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); err != nil {
+		t.Errorf("the A2A gateway is still withheld (err=%v) at Ready=1, Updated=1, Replicas=1; the one replica is both ready and current, and the hold was meant to last one pass", err)
 	}
-	if !strings.Contains(ready.Message, a2aGatewayName(agent)) {
-		t.Errorf("the Ready message is %q; it has to name %s, because naming the object is the whole difference between a phase that says converging and a phase that says which describe to run", ready.Message, a2aGatewayName(agent))
+}
+
+// The predicate on its own, over the Deployment states the tests above drive
+// through Reconcile and the ones they do not.
+func TestACalloutCanServeANewGatewayFromOneReadyUpdatedReplica(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		generation, observed     int64
+		replicas, ready, updated int32
+		want                     bool
+	}{
+		{name: "fully serving", generation: 1, observed: 1, replicas: 2, ready: 2, updated: 2, want: true},
+		{name: "second replica Pending", generation: 1, observed: 1, replicas: 2, ready: 1, updated: 2, want: true},
+		{name: "wedged roll under MaxUnavailable 0", generation: 1, observed: 1, replicas: 3, ready: 2, updated: 1, want: false},
+		{name: "healthy roll, surge pod ready", generation: 1, observed: 1, replicas: 3, ready: 3, updated: 1, want: true},
+		{name: "reap window, terminated pod still counted", generation: 1, observed: 1, replicas: 2, ready: 1, updated: 1, want: false},
+		{name: "reap window closed", generation: 1, observed: 1, replicas: 1, ready: 1, updated: 1, want: true},
+		{name: "one ready, none on the current template", generation: 1, observed: 1, replicas: 1, ready: 1, updated: 0, want: false},
+		{name: "outage, both pods present", generation: 1, observed: 1, replicas: 2, ready: 0, updated: 0, want: false},
+		{name: "no status yet", generation: 0, observed: 0, replicas: 0, ready: 0, updated: 0, want: false},
+		{name: "spec change not yet observed", generation: 2, observed: 1, replicas: 2, ready: 2, updated: 2, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: tc.generation},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: tc.observed,
+					Replicas:           tc.replicas,
+					ReadyReplicas:      tc.ready,
+					UpdatedReplicas:    tc.updated,
+				},
+			}
+			if got := a2aCalloutCanServeANewGateway(dep); got != tc.want {
+				t.Errorf("a2aCalloutCanServeANewGateway(gen %d observed %d, replicas %d ready %d updated %d) = %v, want %v",
+					tc.generation, tc.observed, tc.replicas, tc.ready, tc.updated, got, tc.want)
+			}
+		})
 	}
 }

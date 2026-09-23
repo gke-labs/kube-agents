@@ -769,11 +769,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// invisible without a requeue.
 	//
 	// gatewayHeld shares the requeue rather than getting its own: the gateway
-	// is waiting on BusCredentialsReady, which this reconcile writes on its
-	// way out, so the pass that finally sees it true has to be a pass that
-	// happens. The callout Deployment is owned and its readiness does trigger
-	// one, but a gate that only converges because something else is watched
-	// is a gate with a hidden dependency.
+	// is waiting on a callout replica that is both ready and on the current
+	// spec (a2aCalloutCanServeANewGateway), and the pass that finally sees one
+	// has to be a pass that happens. The callout Deployment is owned and its
+	// status changes do trigger one, but a gate that only converges because
+	// something else is watched is a gate with a hidden dependency -- and the
+	// predicate's one false negative, a terminated pod still counted, clears
+	// on a status change the requeue does not need to wait for.
 	if a2aNext && (!a2aState.done || a2aState.gatewayHeld) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -2559,9 +2561,11 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 	// install without one cannot serve an A2A request at all, and nothing about the
 	// agent gateway's own readiness says so. It is also the one workload here that
 	// the operator withholds ON PURPOSE -- a2aGatewayWaitsForCallout holds the first
-	// creation while the auth callout is short of serving -- and until that hold is
-	// counted, the CR reports Ready: True beside a BusCredentialsReady of False and
-	// the two contradict each other. The hold stays; it stops being silent.
+	// creation until one auth callout replica is ready on the current spec -- and
+	// until that hold is counted, the CR reports Ready: True with no dispatcher in
+	// the namespace. The hold stays; it stops being silent. BusCredentialsReady is
+	// not the signal for it: that condition asks for every replica, so it reads
+	// False through holds the gate has already released.
 	//
 	// a2aStackRendering, not a2aAgentSurface: this has to be the same predicate as
 	// whatever creates the Deployment. On version skew the A2A objects are frozen

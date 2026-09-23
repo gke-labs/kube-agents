@@ -586,26 +586,38 @@ informer that has not yet seen the Deployment gone - answers "already there" and
 be re-created while the condition is false, which is the single thing the gate exists to
 prevent. A stale NotFound costs one held pass and a requeue.
 
-**Amended 9/17: the hold is on the phase now.** The condition the gate reads is a claim
-about the callout as a whole - every replica ready and on the current spec - and that is
-strictly more than a new gateway needs, because the callout replicas form a queue group
-and one of them serving answers every authorization request. A callout stuck at one of
-two ready therefore withholds a _first_ gateway creation for as long as it stays there,
-which on a cluster with no headroom for the second pod is indefinite. The strict rule is
-kept on purpose: `ReadyReplicas` and `UpdatedReplicas` are independent counts, so "at
-least one ready" cannot tell one ready replica on the current template from two ready
-replicas on the previous one, and letting a gateway through against a callout that never
-accepted the current identity map is a worse failure than delaying one. What changes is
-that the delay stopped being invisible. Under `mode: next` the A2A gateway is one of the
-workloads `Ready` is computed from (`readSplitWorkloads`), so an install held at the gate
-reads `Provisioning` with a message naming the Deployment, beside the
-`BusCredentialsReady` that says why - rather than a `Ready: True` sitting above a `False`
-condition and contradicting it. A safe one-replica rule does exist, and is a follow-up
-rather than part of this design: `ReadyReplicas + UpdatedReplicas - Replicas` is a lower
-bound on the pods that are both ready and on the current template, so testing it against
-one can never read true when none is, and its only error direction is a false negative
-while terminated pods are still counted - which costs exactly the held pass and requeue
-that stale-false already costs.
+**Amended 9/17: the hold is on the phase now, and the gate asks for one serving
+replica.** The condition is a claim about the callout as a whole - every replica ready
+and on the current spec - and that is strictly more than a new gateway needs, because
+the callout replicas form a queue group and one of them serving answers every
+authorization request. A gate that read the condition therefore withheld a _first_
+gateway creation on a callout stuck at one of two ready for as long as it stayed there,
+which on a cluster with no headroom for the second pod is indefinite. The condition keeps
+its strict rule, because it answers "is the callout as a whole serving map V" and the
+operator reading it relies on that. The gate no longer reads it. It computes its own
+answer from the callout Deployment's status (`a2aCalloutCanServeANewGateway`), and it is
+not "at least one ready": `ReadyReplicas` and `UpdatedReplicas` are independent counts,
+so that rule cannot tell one ready replica on the current template from two ready
+replicas on the previous one, and under `maxUnavailable: 0` a roll wedged on a pod too
+old to parse the rendered identity map sits at exactly `Ready=2, Updated=1, Replicas=3`.
+The rule is `ObservedGeneration >= Generation` and
+`ReadyReplicas + UpdatedReplicas - Replicas >= 1`: an inclusion-exclusion lower bound on
+the pods that are both ready and on the current template, so it can never read true when
+none is. It admits the second replica Pending (`1 + 2 - 2 = 1`) and rejects the wedged
+roll (`2 + 1 - 3 = 0`). Its only error direction is a false negative while a terminated
+pod is still counted in `Status.Replicas` (`1 + 1 - 2 = 0`), which costs exactly the held
+pass and requeue that the gate already pays, and the callout Deployment is owned, so the
+status change that closes the window triggers the pass that clears it. The two signals
+now disagree on purpose, and only in the safe direction: the gate never passes on a
+callout the condition's `False` describes as having no current-template replica serving,
+and a gateway let through beside a `False` condition has a serving replica to mint
+against. The stale-true paragraph above no longer applies to the gate, which reads the
+Deployment from the informer rather than a condition written a pass earlier; the live
+read for "already there" is unchanged. The delay also stopped being invisible. Under
+`mode: next` the A2A gateway is one of the workloads `Ready` is computed from
+(`readSplitWorkloads`), so an install held at the gate reads `Provisioning` with a
+message naming the Deployment - rather than a `Ready: True` sitting above an absent
+dispatcher.
 
 **Amended 9/8.** The condition asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
