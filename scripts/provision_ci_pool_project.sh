@@ -30,6 +30,10 @@ APP_ID="4675512"
 # different one here would only mis-address the warning in step 1.4.
 LEDGER_APP_ID="4739812"
 LEDGER_INSTALLATION_ID="157029058"
+# The identity the pool's pull-request sweep runs as (hack/ci_sweep_agent_pulls.py,
+# a Prow periodic on main). Step 4 grants it signer on this project's copy of
+# the App key, which is the whole reach it has here.
+PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
@@ -557,13 +561,11 @@ elif [ "${SKIP_PEM_IMPORT:-false}" != "true" ]; then
   echo "You MUST run 'minty tools import-pk' to enable version 1 before setting EVAL_GITHUB_APP_ID in Prow."
 fi
 
-# The pool's pull-request sweep (hack/ci_sweep_agent_pulls.py) signs the same
-# App's JWT with this project's copy of the key, from a Prow periodic that runs
-# only main under its own identity. Signer on the key, and nothing on the
-# project: that is the whole reach the sweep has here. The presubmit's runner
-# is not granted it; it does hold project IAM admin for the deploy, so this
-# is where the line is drawn, not a fence GitHub enforces.
-PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+# The sweep signs the same App's JWT with this project's copy of the key. The
+# presubmit's runner is not granted it; it does hold project IAM admin for the
+# deploy, so this is where the line is drawn, not a fence GitHub enforces. On
+# a project already registered, run this one command by hand rather than the
+# script (docs/ci-pool-projects.md, sections 5.5 and 8).
 echo "Granting the pull-request sweeper signer rights on github-token-minter-key..."
 gcloud kms keys add-iam-policy-binding github-token-minter-key \
   --project="${PROJECT_ID}" --location="${REGION}" \

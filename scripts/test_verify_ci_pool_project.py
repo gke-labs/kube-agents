@@ -1400,7 +1400,7 @@ class TokenMinterTest(unittest.TestCase):
         )
 
     def _key_policy(self, members=None):
-        members = [f"serviceAccount:{self._GSA}"] if members is None else members
+        members = [f"serviceAccount:{self._GSA}", checker.PULL_SWEEP_MEMBER] if members is None else members
         return json.dumps({"bindings": [{"role": "roles/cloudkms.signerVerifier", "members": members}]})
 
     def _gsa_policy(self, member=None):
@@ -1503,6 +1503,19 @@ class TokenMinterTest(unittest.TestCase):
         result = self._run(key_policy=_ok(self._key_policy(members=[])))
         self.assertFalse(result.passed)
         self.assertTrue(any("signerVerifier" in d for d in result.details), result.details)
+
+    def test_missing_pull_sweep_signer_fails_and_names_the_one_off_grant(self):
+        # A project registered before the sweep existed has the minter's grant
+        # and not the sweeper's. Re-running the provisioning script is the
+        # wrong repair on a registered project, so the detail carries the
+        # single gcloud command that adds the binding.
+        result = self._run(key_policy=_ok(self._key_policy(members=[f"serviceAccount:{self._GSA}"])))
+        self.assertFalse(result.passed)
+        sweep = [d for d in result.details if "pull-request sweep" in d]
+        self.assertEqual(len(sweep), 1, result.details)
+        self.assertIn("gcloud kms keys add-iam-policy-binding github-token-minter-key", sweep[0])
+        self.assertIn(f"--member={checker.PULL_SWEEP_MEMBER}", sweep[0])
+        self.assertFalse(any(self._GSA in d and "lacks" in d for d in result.details), result.details)
 
     def test_missing_minter_gsa_fails(self):
         result = self._run(gsa_policy=_fail("NOT_FOUND"))

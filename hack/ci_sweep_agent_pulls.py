@@ -62,13 +62,12 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 JWT_LIFETIME_SECONDS = 540
 JWT_BACKDATE_SECONDS = 60
 
-# The App this signs as is the one the agent submits with, so the author to
-# look for is its own bot. hack/ci-deploy.sh hands the same App to the agent as
-# EVAL_GITHUB_APP_ID; a test pins the slug to that script. Written out rather
-# than read from GET /app so a sweep that cannot mint still reports a name.
+# The App this signs as is the one the agent submits with (hack/ci-deploy.sh
+# hands it over as EVAL_GITHUB_APP_ID; a test pins the id to the provisioning
+# script), so the author to close for is its own bot: the slug GET /app
+# returns under the same JWT, plus this suffix. Read rather than written out,
+# so a renamed App is followed instead of silently matching nothing.
 BOT_LOGIN_SUFFIX = "[bot]"
-AGENT_APP_SLUG = "kube-agents-evals-token-minter"
-AGENT_BOT_LOGIN = AGENT_APP_SLUG + BOT_LOGIN_SUFFIX
 DEFAULT_APP_ID = "4675512"
 
 # The only permission this asks for. The installation carries contents and
@@ -281,22 +280,26 @@ def is_agent_pull_request(pull, repo, bot_login):
 
 
 def scoped_token(app_id, project, repo, runner=subprocess.run):
-    """A token for this repository alone, signed with this project's key.
+    """(token, bot login): a token for this repository alone, and who the App is.
 
     The installation is resolved from the repository rather than passed in: one
     App serves the whole pool, and a hardcoded id is a silent 404 on every
     repository but one. The token is narrowed twice -- to this one repository,
     and to TOKEN_PERMISSIONS -- so the sweep never holds the reach the App has.
+    The author to close for comes from the same credential: GET /app under the
+    JWT names the App's slug, and its pull requests are authored by that plus
+    BOT_LOGIN_SUFFIX.
     """
     bearer = "Bearer " + app_jwt(app_id, project, runner)
     try:
+        slug = _field(api("GET", "/app", bearer), "slug", "the App lookup", repo)
         installation = _field(api("GET", "/repos/%s/installation" % repo, bearer), "id", "the installation lookup", repo)
     except urllib.error.HTTPError as exc:
         # 401: the key in this project's KMS is not App app_id's. 404: the App
         # is not installed on this repository, an onboarding gap rather than a
         # fault here.
         raise SweepError(
-            "GitHub answered HTTP %d (%s) locating App %s's installation on %s"
+            "GitHub answered HTTP %d (%s) locating App %s and its installation on %s"
             % (exc.code, exc.reason, app_id, repo)
         )
     try:
@@ -318,7 +321,7 @@ def scoped_token(app_id, project, repo, runner=subprocess.run):
             "GitHub answered HTTP %d (%s) minting for App %s on %s"
             % (exc.code, exc.reason, app_id, repo)
         )
-    return _field(minted, "token", "the token mint", repo)
+    return _field(minted, "token", "the token mint", repo), slug + BOT_LOGIN_SUFFIX
 
 
 def _field(payload, key, what, repo):
@@ -328,12 +331,12 @@ def _field(payload, key, what, repo):
     return payload[key]
 
 
-def close_agent_pulls(repo, authorization, dry_run=False):
-    """Close every open pull request the agent owns. Returns (closed, unclosed)."""
+def close_agent_pulls(repo, authorization, bot_login, dry_run=False):
+    """Close every open pull request `bot_login` owns. Returns (closed, unclosed)."""
     closed = 0
     unclosed = []
     for pull in open_pulls(repo, authorization):
-        if not is_agent_pull_request(pull, repo, AGENT_BOT_LOGIN):
+        if not is_agent_pull_request(pull, repo, bot_login):
             continue
         number = pull["number"]
         print("  #%s (%s)" % (number, pull["head"]["ref"]))
@@ -361,11 +364,11 @@ def close_agent_pulls(repo, authorization, dry_run=False):
 
 def sweep_repo(project, repo, app_id, dry_run=False, runner=subprocess.run):
     """Close the agent's leftovers in one project's repository; returns the count."""
-    authorization = "token " + scoped_token(app_id, project, repo, runner)
-    closed, unclosed = close_agent_pulls(repo, authorization, dry_run=dry_run)
+    token, bot_login = scoped_token(app_id, project, repo, runner)
+    closed, unclosed = close_agent_pulls(repo, "token " + token, bot_login, dry_run=dry_run)
     print(
         "%s %d pull request(s) by %s in %s"
-        % ("would close" if dry_run else "closed", closed, AGENT_BOT_LOGIN, repo)
+        % ("would close" if dry_run else "closed", closed, bot_login, repo)
     )
     if unclosed:
         raise SweepError(

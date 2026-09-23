@@ -285,7 +285,16 @@ A remediation scenario opens a pull request in the leased project's GitOps repos
 
 `hack/ci_sweep_agent_pulls.py --pool` closes them from the Prow periodic `ci-kube-agents-pull-sweep` in `oss-test-infra`, which runs `main` only, every ten minutes, as the service account `eval-pull-sweeper` on the build cluster (Workload Identity to `eval-pull-sweeper@kube-agents-prow`). It takes each project Boskos hands out as `free`, holds it in `cleaning` for the seconds the sweep takes, signs the minter App's JWT with that project's KMS key, mints a token narrowed to that repository and `pull_requests: write`, closes the pull requests that pass all three of `forge.py`'s ownership conditions, and releases the project. A leased project is never offered, so never touched. A run arriving mid-sweep waits those seconds at its own acquire.
 
-What onboarding owes it is one grant, made by `scripts/provision_ci_pool_project.sh`: `roles/cloudkms.signerVerifier` for `eval-pull-sweeper@kube-agents-prow` on the project's `github-token-minter-key`. Nothing on the project, nothing on the App. The presubmit's runner is not granted it: a presubmit runs the pull request's code, and a signer there would hand every change under test a pool-wide write. That runner does hold project IAM admin for the deploy, so the line is policy and the verifier, not a fence GitHub enforces.
+What onboarding owes it is one grant: `roles/cloudkms.signerVerifier` for `eval-pull-sweeper@kube-agents-prow` on the project's `github-token-minter-key`. Nothing on the project, nothing on the App. `scripts/provision_ci_pool_project.sh` makes it for a new project. A project registered before the sweep existed does not have it, and the script must not be re-run there (section 8), so add the binding by hand:
+
+```bash
+gcloud kms keys add-iam-policy-binding github-token-minter-key \
+  --keyring=github-token-minter-keyring --location=us-central1 --project="${PROJECT_ID}" \
+  --member=serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com \
+  --role=roles/cloudkms.signerVerifier
+```
+
+`scripts/verify_ci_pool_project.py` fails a project whose key lacks it and prints that command. Until it is run, every sweep of that project fails at signing and the periodic exits 1 naming it; the presubmit is not affected. The presubmit's runner is not granted it: a presubmit runs the pull request's code, and a signer there would hand every change under test a pool-wide write. That runner does hold project IAM admin for the deploy, so the line is policy and the verifier, not a fence GitHub enforces.
 
 Branches are left: deleting a ref needs `contents: write`, which the sweep's mint does not ask for.
 

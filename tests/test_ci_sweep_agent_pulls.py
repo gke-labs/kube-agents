@@ -58,10 +58,11 @@ REPO = "gke-agentic/kube-agents-evals-7-infra"
 APP_ID = "4675512"
 BOSKOS = "http://boskos.test"
 OWNER = "ci-kube-agents-pull-sweep-1"
-# The agent's author login. The sweep signs as the same App now, so its own
-# bot is the one to match; OTHER_BOT is another App's, whose pull requests it
-# must leave alone.
-BOT = "kube-agents-evals-token-minter[bot]"
+# The agent's author login. The sweep signs as the same App, so its own bot --
+# the slug GET /app answers plus "[bot]" -- is the one to match; OTHER_BOT is
+# another App's, whose pull requests it must leave alone.
+BOT_SLUG = "kube-agents-evals-token-minter"
+BOT = BOT_SLUG + "[bot]"
 OTHER_BOT = "kube-agents-evals-ledger-reader[bot]"
 MAPPING = {
     "kube-agents-evals-7": REPO,
@@ -94,10 +95,12 @@ class _GitHub:
     `pulls` is one list served for every repository, or a dict by repository.
     """
 
-    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None):
+    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG):
         self.calls = []
         self.pulls = pulls if pulls is not None else []
         self.mint_error = mint_error
+        # What GET /app answers for the App the JWT names.
+        self.slug = slug
         # {"<METHOD> <path prefix>": raw bytes} answered verbatim with a 200:
         # an intermediary's HTML page, an empty object, a null.
         self.odd_bodies = odd_bodies or {}
@@ -119,6 +122,8 @@ class _GitHub:
         for prefix, raw in self.odd_bodies.items():
             if key.startswith(prefix):
                 return io.BytesIO(raw)
+        if key == "GET /app":
+            return io.BytesIO(json.dumps({"id": int(APP_ID), "slug": self.slug}).encode())
         if key.startswith("GET /repos/") and key.endswith("/installation"):
             return io.BytesIO(json.dumps({"id": 157029058}).encode())
         if key.startswith("POST /app/installations/"):
@@ -288,15 +293,29 @@ class AgentAuthorTest(unittest.TestCase):
         self.assertEqual(run_repo(github), 0)
         self.assertEqual(github.keys("PATCH "), [])
 
-    def test_the_login_and_app_id_are_the_ones_the_agent_submits_with(self):
-        # Three constants in files that do not read each other: the slug the
-        # deploy hands the agent, the App id the provisioning script installs,
-        # and the pair written here because a sweep that cannot mint must still
-        # name what it looked for.
-        self.assertIn(sweeper.AGENT_APP_SLUG, _CI_DEPLOY.read_text(encoding="utf-8"))
-        # Anchored to the line: `LEDGER_APP_ID="..."` in the same file must not satisfy it.
+    def test_the_app_id_is_the_one_the_agent_submits_with(self):
+        # Two constants in files that do not read each other: the App id the
+        # provisioning script installs, and the default here. Anchored to the
+        # line: `LEDGER_APP_ID="..."` in the same file must not satisfy it.
         self.assertRegex(_PROVISION.read_text(encoding="utf-8"), r'(?m)^APP_ID="%s"$' % sweeper.DEFAULT_APP_ID)
-        self.assertEqual(sweeper.AGENT_BOT_LOGIN, sweeper.AGENT_APP_SLUG + "[bot]")
+
+    def test_the_author_is_whoever_the_credential_is(self):
+        # The login is read from GET /app under the sweep's own JWT, not
+        # written down: an App renamed in GitHub's settings changes its bot
+        # login, and a pinned name would then match nothing and report a
+        # clean sweep.
+        github = _GitHub(slug="renamed-minter", pulls=[agent_pull(number=1, author="renamed-minter[bot]"), agent_pull(number=2, author=BOT)])
+        self.assertEqual(run_repo(github), 1)
+        self.assertEqual(github.keys("PATCH "), ["PATCH /repos/%s/pulls/1" % REPO])
+
+    def test_an_app_lookup_without_a_slug_stops_before_anything_is_read(self):
+        for raw in (b"{}", b"null", b'{"id": 4675512, "slug": ""}'):
+            with self.subTest(raw=raw):
+                github = _GitHub(pulls=[agent_pull()], odd_bodies={"GET /app": raw})
+                with self.assertRaises(sweeper.SweepError) as caught:
+                    run_repo(github)
+                self.assertIn("slug", str(caught.exception))
+                self.assertEqual([k for k in github.keys("") if k != "GET /app"], [])
 
 
 class SigningKeyTest(unittest.TestCase):

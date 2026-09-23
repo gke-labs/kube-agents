@@ -210,6 +210,15 @@ PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gse
 # holding no role there at all (gke-labs/kube-agents#1491).
 NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 
+# The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
+# ci-kube-agents-pull-sweep on main) signs the agent's App through each
+# project's copy of the key, so it needs signer on that key and nothing on the
+# project. A project without the grant fails every ten-minute sweep from the
+# first, so the check names the one command that adds it -- the provisioning
+# script must not be re-run on a registered project (docs/ci-pool-projects.md
+# section 8).
+PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
 # as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
 # project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
@@ -2409,6 +2418,14 @@ def check_token_minter(
             if f"serviceAccount:{minter_gsa}" not in signers:
                 passed = False
                 details.append(f"{minter_gsa} lacks roles/cloudkms.signerVerifier on {key}; it cannot sign a JWT")
+            if PULL_SWEEP_MEMBER not in signers:
+                passed = False
+                details.append(
+                    f"{PULL_SWEEP_MEMBER} lacks roles/cloudkms.signerVerifier on {key}; the pull-request "
+                    "sweep cannot sign here. Grant it without re-running the provisioning script: "
+                    f"gcloud kms keys add-iam-policy-binding {key} --keyring={keyring} --location={location} "
+                    f"--project={project_id} --member={PULL_SWEEP_MEMBER} --role=roles/cloudkms.signerVerifier"
+                )
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing KMS key IAM policy: {exc}")
