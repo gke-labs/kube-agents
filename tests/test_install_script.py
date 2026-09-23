@@ -40,6 +40,7 @@ from tests.testing.release import (
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALL_SH = _REPO_ROOT / "install.sh"
+_PRINT_NO_CHAT_SH = _REPO_ROOT / "scripts" / "installer" / "print_instructions_no_chat.sh"
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 
 # install.sh sources the shared helpers from the acquired workspace partway
@@ -6685,6 +6686,144 @@ class InstallerHelpersDetachFromTheTerminalTest(PtyChildTestMixin, unittest.Test
                 os.replace(staging, result_path)
             finally:
                 os._exit(0)
+
+
+class NoChatTerminalAccessTest(unittest.TestCase):
+    """The installer names a way in when no chat platform is chosen.
+
+    Both chat platforms default off, so this is the common install, and nothing
+    else in a run tells the operator how to reach the agent.
+
+    These read install.sh rather than running it: the code is inside main(),
+    which the KUBE_AGENTS_SOURCE_ONLY harness cannot drive.
+    """
+
+    _FUNCTION = "  _prompt_no_chat_enabled() {"
+    _SIBLINGS = ("  _prompt_google_chat_settings() {", "  _prompt_slack_settings() {")
+    _HEADING = "--- [Talking to the Agent from a Terminal] ---"
+    _GET_CREDENTIALS = "gcloud container clusters get-credentials ${cluster_name}"
+    _EXEC = "kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT}"
+    _FLAG_RESOLUTION = 'gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id"'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = _INSTALL_SH.read_text()
+
+    def test_the_none_arm_delegates_to_the_function(self):
+        """Arm 4 handles the no-chat case, and delegates rather than inlining."""
+        self.assertIn(self._FUNCTION, self.source)
+        self.assertRegex(self.source, r"\n    4\)\n      _prompt_no_chat_enabled\n      ;;")
+
+    def test_the_completion_banner_prints_it_too(self):
+        """Chat and Slack instruct at the end of the run, and so does this.
+
+        By then the chat step is a Terraform plan away. Arm 4 alone would leave
+        the feature looking present while nobody sees it, so the second call is
+        pinned separately from the first.
+        """
+        banner = self.source.index("print_instructions_slack.sh")
+        self.assertLess(
+            banner,
+            self.source.rindex("_prompt_no_chat_enabled"),
+            "the no-chat block must also print beside the two chat printers",
+        )
+        self.assertIn('if [ "$chat_choice" = "4" ]; then', self.source)
+
+    def test_it_is_defined_beside_the_arms_it_is_a_sibling_of(self):
+        for sibling in self._SIBLINGS:
+            self.assertIn(sibling, self.source)
+        self.assertLess(
+            max(self.source.index(s) for s in self._SIBLINGS),
+            self.source.index(self._FUNCTION),
+            "the four chat outcomes are read together, so keep their handlers together",
+        )
+
+    def test_nothing_reconstructs_the_no_chat_case_from_the_toggles(self):
+        """The case statement decided it; a second derivation could disagree.
+
+        Re-testing the toggles later has to be revisited for every platform
+        added, and when it is not, an install with working chat is told it has
+        none.
+        """
+        self.assertNotIn("any_chat_enabled", self.source)
+
+    def test_it_prints_both_commands(self):
+        body = self._function_body()
+        self.assertIn(self._HEADING, body)
+        self.assertIn(self._GET_CREDENTIALS, body)
+        self.assertIn(self._EXEC, body)
+
+    def test_the_exec_names_the_container_and_the_profile(self):
+        # Without -c, kubectl picks the first of the pod's three containers.
+        # Without -p, the session is the Planning Agent, not the Platform Agent.
+        body = self._function_body()
+        self.assertIn("-c ${PLATFORM_AGENT_CONTAINER}", body)
+        self.assertIn("hermes -p ${PLATFORM_AGENT_HERMES_PROFILE}", body)
+
+    def test_the_namespace_is_the_one_the_install_uses(self):
+        # A literal kubeagents-system would print a command that fails on the
+        # installs that passed --agent-namespace.
+        self.assertIn(
+            "-n ${NAMESPACE:-$DEFAULT_NAMESPACE}",
+            self._function_body(),
+        )
+
+    def test_the_dns_endpoint_flag_is_the_resolved_one(self):
+        # gcloud rejects --dns-endpoint on clusters without an external DNS
+        # endpoint, so the printed flag has to be the resolved one -- which
+        # means gke_dns_endpoint_flag has to run first.
+        body = self._function_body()
+        printed = body.index(self._GET_CREDENTIALS)
+        self.assertIn("${GKE_DNS_ENDPOINT_FLAG:+ ${GKE_DNS_ENDPOINT_FLAG}}", body)
+        self.assertLess(
+            body.index(self._FLAG_RESOLUTION),
+            printed,
+            "the command reads GKE_DNS_ENDPOINT_FLAG, so it must be resolved above it",
+        )
+        self.assertNotIn(
+            " --dns-endpoint",
+            body[printed : printed + 400],
+            "the printed flag must be the resolved one",
+        )
+
+    def test_it_says_how_to_add_a_chat_platform_later(self):
+        body = self._function_body()
+        self.assertIn("--enable-google-chat", body)
+        self.assertIn("--enable-slack", body)
+
+    def _function_body(self):
+        """The function's text alone.
+
+        Some of these strings also appear in the completion banner, so matching
+        against the whole file would pass on a body that had lost the line.
+        """
+        start = self.source.index(self._FUNCTION)
+        return self.source[start : self.source.index("\n  }\n", start)]
+
+
+class BannerColourVariablesAreDefinedTest(unittest.TestCase):
+    """Every C_* install.sh interpolates is one install.sh itself defines.
+
+    install.sh does not source scripts/installer/common.sh, which declares a
+    wider palette (C_WHITE among it). Under `set -Eeuo pipefail` naming one of
+    those is not a cosmetic slip: the unset variable aborts the run at the line
+    that reads it, and most of this palette is used in the completion banner --
+    so the failure lands after a successful apply, on the last thing an
+    operator sees.
+    """
+
+    def test_no_undefined_colour_is_interpolated(self):
+        source = _INSTALL_SH.read_text()
+        used = set(re.findall(r"\$\{(C_[A-Z_]+)\}", source))
+        used |= set(re.findall(r"\$(C_[A-Z_]+)\b", source))
+        defined = set(re.findall(r"\b(C_[A-Z_]+)=", source))
+        self.assertEqual(
+            sorted(used - defined),
+            [],
+            "install.sh interpolates colour variables it does not define; "
+            "they come from scripts/installer/common.sh, which it does not source",
+        )
+
 
 
 if __name__ == "__main__":

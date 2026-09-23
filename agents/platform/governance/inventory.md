@@ -68,7 +68,7 @@ under two minutes each, every one of them with no `metadata` at all, and the fle
 followed named zero problems on a fleet that had them.
 
 **Do not create, repair, or delete a Cluster Agent profile.** Profile lifecycle belongs to
-`cluster_agent_reconcile.py`, which holds the `RECONCILE_EXCLUDE` opt-out and the create/prune
+`cluster_agent_reconcile.py`, which holds the scope and its exclusions and the create/prune
 rules; a profile you create by hand is one the next reconcile run may immediately prune, and you
 will loop. A cluster the roster does not cover is yours to audit in Step 4 — or, if you cannot
 reach it, a row in the report saying so.

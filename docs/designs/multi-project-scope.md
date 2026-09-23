@@ -1,7 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; not implemented.** Nothing below ships today. The Platform Agent
-> discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 1's IAM bindings, installer path and `platform_mcp_server.py` change, and steps 2 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -97,8 +96,8 @@ boundary.
 ## 3. The scope model
 
 A new block on `PlatformAgent`, `spec.scope`, declares an opt-in set. The name is provisional; there
-is no `spec.fleet` or similar today; the top-level spec has `harness`, `integration`, `mode`,
-`deployment`, `security`, `telemetry`, and `networkPolicy`.
+is no `spec.fleet` or similar today; the top-level spec has `harness`, `integration`, `mode`, `deployment`, `security`, `telemetry`,
+`networkPolicy`, and now `scope`.
 
 ```yaml
 spec:

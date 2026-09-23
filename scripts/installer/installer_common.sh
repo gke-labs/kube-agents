@@ -62,6 +62,15 @@ readonly KUBE_AGENTS_HELM_RELEASE="kube-agents"
 # shellcheck disable=SC2034  # read by install.sh and upgrade.sh
 readonly KUBE_AGENTS_OPERATOR_DEPLOYMENT="kube-agents-controller-manager"
 readonly PLATFORM_AGENT_DEPLOYMENT="platform-agent-gateway"
+# The Hermes container in that Deployment's pod. The pod runs three and sets no
+# default-container annotation, so `kubectl exec` without -c lands on whichever
+# is first.
+# shellcheck disable=SC2034  # read by install.sh
+readonly PLATFORM_AGENT_CONTAINER="platform-agent"
+# The Hermes profile the Platform Agent answers on. A bare `hermes` reaches the
+# `default` profile instead -- the Planning Agent front door.
+# shellcheck disable=SC2034  # read by install.sh
+readonly PLATFORM_AGENT_HERMES_PROFILE="platform"
 readonly PLATFORM_AGENT_SECRET="platform-agent-secrets"
 # The chart's LiteLLM Deployment, and the objects the operator composes from
 # the PlatformAgent's name (platform-agent, which the composition leaves at
