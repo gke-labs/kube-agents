@@ -242,6 +242,9 @@ AUDITS: dict[str, AuditSpec] = {
             "label-keys",
             "image-type",
             "database-encryption",
+            # §4.14, the one check that runs outside a cohort. Last because
+            # the roster is the SOP's `####` heading order.
+            "no-environment-label",
         ),
         # §3 step 6's split-cluster guard: a cluster that is an outlier on six
         # or more facets is a different kind of cluster, not a drifting one, so
@@ -435,7 +438,18 @@ DELTA_RE = re.compile(
 # ids move, but the stamp is per-document and cannot say which — and the cost
 # of bumping is one run of withheld `resolved`, against announcing a
 # re-spelled finding as fixed.
-ID_SCHEME = 2
+#
+# 3: the fleet-consistency-drift collector qualifies every cluster name as
+# `<project>/<location>/<name>`, and the `cluster` segment is the second of
+# the four `derive_finding_id` joins — so every finding that stream already
+# carries is spelled differently from its first run on the new procedure.
+# `derive_finding_id` itself did not change, which is precisely why the stamp
+# rather than the function's shape is what this guards: the ids move because
+# their input moved. The bump is global because the stamp is, so every other
+# stream pays one run of withheld `resolved` for a rename in this one; a
+# per-stream stamp would be the alternative, and it is a bigger change than
+# the single run it would save.
+ID_SCHEME = 3
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
@@ -677,6 +691,16 @@ DECLARED_INTENT_UNSEARCHED_KEY = "declared_intent_unsearched"
 REFUSED_REF_KEY = "refused_ref"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
+# When `start` opened this run. The collector manifest is the one input
+# `finish` takes from outside the run and the one `start` cannot scrub: its
+# path lives in the SOP's text rather than in code, so `start` does not know
+# what to unlink. A run whose worker never launched the collector therefore
+# finds last week's manifest at the same fixed path and publishes against it.
+# Comparing the manifest's `finished_at` with this is what makes that loud.
+RUN_RECORD_STARTED_KEY = "started_at"
+# The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
+# two stamps compare without either side guessing at the other's shape.
+RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 FRONTMATTER_DELIMITER = "---"
 # U+FEFF: what an editor that writes a UTF-8 byte-order mark puts before the
 # first `---`. `str.strip()` does not remove it (it is not whitespace), so it
@@ -772,6 +796,9 @@ TARGET_KINDS = frozenset({TARGET_KIND_CLUSTER, TARGET_KIND_PROJECT, TARGET_KIND_
 # `checks_run`; every other outcome leaves the cluster to the manual fallback —
 # except `out-of-scope`, the collector saying the target is not this audit's,
 # which is neither cross-checked nor owed by the document.
+# The collector's wall-clock stop. Carried, not read, everywhere except the
+# staleness guard in `load_manifest`.
+MANIFEST_FINISHED_KEY = "finished_at"
 MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
 # How much of a collector's `error` a refusal quotes back.
@@ -2589,6 +2616,37 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+def manifest_predates_run(manifest: dict, audit_id: str) -> tuple[str, str] | None:
+    """`(finished_at, started_at)` when this manifest was written before the run opened.
+
+    `--manifest-file` is the one input `finish` takes from outside the run, and
+    the collectors write it to a fixed path the SOP names in prose rather than
+    one the harness derives from the audit id — so `start` cannot scrub it the
+    way it scrubs the findings file. A run whose worker skipped the collector,
+    or whose collector died before writing, therefore finds last week's
+    manifest sitting at that path and cross-checks against it: a corroboration
+    that vouches for a fleet as it stood a week ago, which is worse than none,
+    because the run publishes with the manifest's authority behind it.
+
+    Both stamps unknown-by-default: a run record from a `start` older than
+    `RUN_RECORD_STARTED_KEY`, or a manifest from a collector that writes no
+    `finished_at`, reads as "cannot tell" and lets the manifest through. That
+    is `parse_gh_timestamp`'s rule — a missing timestamp is evidence about the
+    writer, never about the past — and it is what keeps this from failing every
+    run that straddles the upgrade.
+    """
+    record = read_run_record(audit_id)
+    if not isinstance(record, dict):
+        return None
+    started_raw = record.get(RUN_RECORD_STARTED_KEY)
+    finished_raw = manifest.get(MANIFEST_FINISHED_KEY)
+    started = parse_gh_timestamp(started_raw)
+    finished = parse_gh_timestamp(finished_raw)
+    if started is None or finished is None or finished >= started:
+        return None
+    return str(finished_raw), str(started_raw)
+
+
 def load_manifest(path: str, audit_id: str | None = None) -> dict:
     """The collector manifest at `path`, or a ValidationError naming why not.
 
@@ -2600,6 +2658,10 @@ def load_manifest(path: str, audit_id: str | None = None) -> dict:
     functions below, because a malformed cluster entry is the collector's
     defect and should degrade to "this cluster is not cross-checked" rather
     than fail the run the document is otherwise entitled to.
+
+    The one check that is not about the envelope's shape is staleness:
+    `manifest_predates_run` refuses a manifest the collector finished before
+    this run's `start` wrote its record.
     """
     manifest_path = Path(path)
     if not manifest_path.is_file():
@@ -2620,6 +2682,16 @@ def load_manifest(path: str, audit_id: str | None = None) -> dict:
             f"not {audit_id!r}; a manifest cross-checks the document against its own "
             "stream's roster and corroborates nothing about another's."
         )
+    if audit_id:
+        stale = manifest_predates_run(manifest, audit_id)
+        if stale:
+            finished, started = stale
+            raise ValidationError(
+                f"--manifest-file: {path} finished at {finished}, before this run started "
+                f"at {started}; it is a previous run's collection and corroborates nothing "
+                "about the fleet as it stands. Re-run the collector, or pass "
+                "--no-collector-manifest to publish without one and take the coverage gap."
+            )
     return manifest
 
 
@@ -8762,6 +8834,10 @@ def write_run_record(
     `start` read completely, as `owner/name@sha` — and `sources` says where
     in each it looked. `finish` folds the first into the document; the second
     is the record of the bound that was applied.
+
+    The stamp under `RUN_RECORD_STARTED_KEY` is what `load_manifest` compares a
+    collector manifest's `finished_at` against, so this is also the moment the
+    run becomes able to tell its own collection from the last one's.
     """
     path = run_record_path_for(audit_id)
     Path(path).write_text(
@@ -8772,6 +8848,7 @@ def write_run_record(
                 "context_repos": list(context),
                 RUN_RECORD_SEARCHED_KEY: list(searched or []),
                 RUN_RECORD_SOURCES_KEY: list(sources or []),
+                RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
             }
         ),
         encoding="utf-8",
@@ -8837,9 +8914,14 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
         return None
     searched = data.get(RUN_RECORD_SEARCHED_KEY)
     sources = data.get(RUN_RECORD_SOURCES_KEY)
+    started = data.get(RUN_RECORD_STARTED_KEY)
     return {
         "repo": recorded,
         "context_repos": [str(slug) for slug in context],
+        # Empty on a record an older `start` wrote. `manifest_predates_run` is
+        # the only reader and treats that as "cannot tell when this run
+        # opened", never as "the manifest is current".
+        RUN_RECORD_STARTED_KEY: started if isinstance(started, str) else "",
         # Absent on a record an older `start` wrote, which is a run that
         # searched nothing on the harness's behalf.
         RUN_RECORD_SEARCHED_KEY: (
