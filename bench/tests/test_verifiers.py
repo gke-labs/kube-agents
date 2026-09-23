@@ -1979,6 +1979,20 @@ def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, githu
     assert "pull_requests: read" in res.reason
 
 
+def test_pulls_denied_when_read_for_the_file_count_is_an_error_naming_the_permission(token, github):
+    """The issues endpoint resolved the pull request, so the check is past
+    every fail arm when it reads `/pulls/{n}` for the file count. A denial
+    there is the credential's, not the run's: error, naming the permission,
+    rather than a fall-back to the stamps that would pass a token unable to
+    see what was pushed."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (403, {"message": "Resource not accessible"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert "pull_requests: read" in res.reason and "pulls endpoint" in res.reason
+
+
 def test_an_expired_token_is_diagnosed_as_the_token_not_the_permission(token, github):
     """401 is the credential, 403 is its scopes. Reading a one-hour
     installation token that ran out as a missing permission sends the reader to
