@@ -60,7 +60,7 @@ const PAGE = {
   // lookback (shared break 6 h, storm, setup deaths and lost pods 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000 },
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -575,6 +575,34 @@ function stormFacts(inc, inWindow) {
   ];
 }
 
+// The delegation-ceiling brief's facts (#1874): the storm's shape over
+// ceiling reps. `ceiling_reps` on the run doc anchors the incident's first run.
+function ceilingFacts(inc, inWindow) {
+  let reps = 0, ceiling = 0;
+  const prs = new Set();
+  const projects = new Set();
+  for (const run of inWindow) {
+    let mine = 0;
+    for (const c of run.cases || []) { reps += repTotal(c.reps); ceiling += c.reps.ceiling || 0; mine += c.reps.ceiling || 0; }
+    if (mine) { if (run.pr != null) prs.add(run.pr); if (run.project) projects.add(run.project); }
+  }
+  const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
+  const passed = graded.filter((c) => c.outcome === "passed" || c.outcome === "partial").length;
+  const collapsed = new Map();
+  for (const run of inWindow) for (const c of gateFailures(run)) collapsed.set(c, (collapsed.get(c) || new Set()).add(run.pr));
+  const widest = Math.max(0, ...[...collapsed.values()].map((s) => s.size));
+  return [
+    fact(true, `<b>${ceiling} of ${reps} repetitions</b> ended at the harness's delegation wait with the worker still running, across ${plural(prs.size, "PR")}; none of them was graded or counted against a case.`),
+    fact(graded.length > 0, graded.length
+      ? `When a worker did finish it mostly passed: ${passed} of ${graded.length} graded gate cases.`
+      : "Nothing was graded in this window at all."),
+    fact(projects.size > 1, `Spread over ${plural(projects.size, "project")}, so not one bad cluster.`),
+    fact(widest < 3, widest < 3
+      ? `No single case fails everywhere: the widest shared failure is on ${plural(widest, "PR")}.`
+      : `One case also fails on ${plural(widest, "PR")}; a shared break may be underneath.`),
+  ];
+}
+
 function setupFacts(inc, inWindow) {
   const deaths = inWindow.filter((r) => r.setup_death);
   const prs = new Set(deaths.map((r) => r.pr).filter((p) => p != null));
@@ -660,6 +688,12 @@ function briefHeadline(inc, inWindow) {
       lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The leased project failed at clone or deploy, so the agent was never started.`,
     };
   }
+  if (inc.condition === "delegation_ceiling") {
+    return {
+      head: inc.past ? "Workers did not finish: repetitions ended at the harness's delegation wait" : "Workers aren't finishing: repetitions are ending at the harness's delegation wait",
+      lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The front door delegated and the card was still running when the eval stopped waiting, so nothing was graded; those runs read not evaluated, not red. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).`,
+    };
+  }
   return { head: inc.past ? "A past gate incident" : "The gate is degraded", lede: esc(inc.cause || "") };
 }
 
@@ -683,6 +717,7 @@ function whyTitle(inc) {
   if (isBreak(inc)) return "Why we think it's the environment, not a PR";
   if (inc.condition === "storm") return "Why we think it's a quota storm";
   if (inc.condition === "setup_deaths") return "Why we think it's the setup, not the PRs";
+  if (inc.condition === "delegation_ceiling") return "Why we think it's the workers, not the PRs";
   return "What the data shows";
 }
 
@@ -691,7 +726,7 @@ function agentSawHtml(inc, inWindow) {
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (inc.condition === "storm" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -714,7 +749,7 @@ function agentSawHtml(inc, inWindow) {
 
 function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
-  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : (r.storm_reps || 0) > 0));
+  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
   if (firstRedMs == null) {
     // Same anchor as mergesFact: without it there is no "before" to show.
@@ -737,6 +772,7 @@ function beingDoneHtml(inc) {
     const retest = stormRetestMs(inc);
     lines.push(`<p>Wait it out${retest != null ? `: retest after ${esc(et(retest))}` : ""}. The API quota is fixed, so fewer runs at once is the only lever; a retest inside the storm loses repetitions the same way.</p>`);
   } else if (inc.condition === "setup_deaths" && !inc.past) lines.push(`<p>Check the leased pool projects before spending another run: a stuck Helm release or a failing image pull is the usual cause. Retest once the deaths stop.</p>`);
+  else if (inc.condition === "delegation_ceiling" && !inc.past) lines.push(`<p>Retest once workers are finishing again. Read <code>platform-agent-gateway.log</code> in a run's artifacts for <code>kanban dispatcher stuck</code> and <code>RESOURCE_EXHAUSTED</code> lines: a stalled dispatcher is #1879, starved workers are the quota.</p>`);
   if (inc.past) lines.push(`<p class="mut">This incident is over${inc.untilMs != null ? `; the gate was reported healthy again at ${esc(et(inc.untilMs))}` : ""}.</p>`);
   if (inc.stale) lines.push(`<p class="stale">The data behind this state stopped refreshing; the state is as old as the data.</p>`);
   if (!lines.length) return "";
@@ -800,7 +836,7 @@ function lastIncidentHtml() {
   const past = historyIncidents().map(incidentFromHistory).filter((inc) => inc.sinceMs != null).sort((a, b) => b.sinceMs - a.sinceMs);
   if (!past.length) return brief.history ? `<p class="mut">No incident on record yet.</p>` : `<p class="mut">No incident history is published yet, so only the current state is shown.</p>`;
   const inc = past[0];
-  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : "a degraded gate";
+  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : "a degraded gate";
   return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a> <a href="${esc(trendHref(inc.cases, inc.sinceMs, inc.untilMs))}">The record on main around the night it started →</a></p>`;
 }
 
@@ -894,7 +930,7 @@ function briefHtml(link) {
       beingDoneHtml(inc) + footHtml();
   }
   const { head, lede } = briefHeadline(inc, inWindow);
-  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : [];
+  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
   const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}${inc.stale ? " · STALE" : ""}`;
   let recoveringLine = "";
   if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far. A retest is reasonable.</div>`;
@@ -932,6 +968,7 @@ function bannerHtml(run) {
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "delegation_ceiling") text = `<b>Workers not finishing ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: repetitions end at the harness's delegation wait with the card still running; those runs read not evaluated, not red. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
   return `<div class="banner ${PAGE.states[state] || "hs-past"}">${pillHtml(state, h.recovering ? "RECOVERING" : h.state)}<span>${text}</span></div>`;
@@ -946,10 +983,28 @@ function tagFor(c) {
   return '<span class="tag unclear">unexplained</span>';
 }
 
+// A case's repetitions by kind. `ceiling` is the repetitions the harness
+// stopped watching at its delegation wait with the worker still running
+// (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
+// the total or a three-rep case would read "all 0 reps lost".
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0); }
+function lostText(reps) {
+  const parts = [];
+  if (reps.infra) parts.push(`${reps.infra} lost`);
+  if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  return parts.length ? ` (${parts.join(", ")})` : "";
+}
+function ungradedText(reps) {
+  const total = plural(repTotal(reps), "rep");
+  if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
+  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling`;
+  return `all ${total} lost before grading`;
+}
+
 function caseCard(run, c) {
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
-  const total = reps.pass + reps.fail + reps.infra;
-  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${reps.infra ? ` (${reps.infra} lost)` : ""}` : c.outcome === "infra" ? `all ${plural(total, "rep")} lost before grading` : `${reps.pass} of ${total} reps passed`;
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const total = repTotal(reps);
+  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : `${reps.pass} of ${total} reps passed${lostText(reps)}`;
   const rate = c.pass_rate_30d != null ? ` · this case passed ${pct(c.pass_rate_30d)} of the time over the last 30 days on PRs` : "";
   // The nightly's record beside the gate's: the newest night within two
   // days of this run, when one graded the case. Evidence about main, never
@@ -1218,7 +1273,7 @@ function gridMarkers(win, cols) {
       seen.push({ t, cls });
       markers.push({ t, cls, label, title: `${et(t)} · ${label}` });
     };
-    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : "degraded");
+    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : "degraded");
     for (const inc of historyIncidents().map(incidentFromHistory)) {
       add(inc.sinceMs, "incident", `${inc.state.toLowerCase()}: ${what(inc)}`);
       add(inc.untilMs, "recovered", "healthy again");
@@ -1331,9 +1386,9 @@ function detailHtml() {
   const run = runs().find((r) => String(r.build) === sel.build);
   const c = run ? (run.cases || []).find((x) => x.case === sel.case) : null;
   if (!run || !c) return "";
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
-  const total = reps.pass + reps.fail + reps.infra;
-  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${reps.infra ? ` (${reps.infra} lost)` : ""}` : c.outcome === "infra" ? `all ${plural(total, "rep")} lost before grading` : c.outcome === "partial" ? `${reps.fail} of ${total} reps failed` : `passed all ${plural(reps.pass, "rep")}`;
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const total = repTotal(reps);
+  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : c.outcome === "partial" ? `${reps.fail} of ${total} reps failed${lostText(reps)}` : `passed all ${plural(reps.pass, "rep")}${lostText(reps)}`;
   const others = (run.cases || []).filter((x) => x.case !== c.case && x.outcome === "passed").length;
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
   const length = startMs != null && finishMs != null ? ` · ${minutesText(finishMs - startMs)} run` : "";

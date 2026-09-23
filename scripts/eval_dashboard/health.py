@@ -85,6 +85,9 @@ STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
 LOST_PODS = "lost_pods"
 FIXTURE_DRIFT = "fixture_drift"
+# A ceiling wave: enough repetitions across enough pull requests ended at the
+# harness's delegation wait with the worker still running (rule 2b, #1874).
+DELEGATION_CEILING = "delegation_ceiling"
 # The conditions whose evidence is not a full run -- a count of runs that
 # never became one, or the fleet scan's verdict; rule 6's entry check takes
 # the evidence itself as currency.
@@ -109,9 +112,9 @@ REP_STORM = "storm"
 # before anything was delivered. The scorer grades it `infra` under a reason
 # that leads with this marker (bench/kube_agents_bench/scoring.py, #1874).
 # Not a storm rep: the agent ran and nothing was lost to 429s, so it stays out
-# of rule 2's count and of every pass-rate denominator.
-# test_eval_dashboard_health.py reads the literal out of the scorer so the two
-# cannot drift.
+# of rule 2's count and of every pass-rate denominator; rule 2b below counts
+# it on its own. test_eval_dashboard_health.py reads the literal out of the
+# scorer so the two cannot drift.
 REP_CEILING = "ceiling"
 DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
@@ -188,6 +191,34 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # "inside the storm" for recovery purposes (rule 6): one or two infra reps
 # in a run are background noise on any day and must not hold GREEN off.
 STORM_RUN_SIGNATURE_REPS = 5
+
+# --- Rule 2b: delegation ceiling -> DEGRADED (#1874, #1879) -------------------
+# Incident: the platform agent's kanban dispatcher stalls under load ("ready
+# queue non-empty ... 0 workers spawned", 23 warnings on the 2026-09-21
+# nightly, #1879), or workers run past the harness's wait. Every repetition
+# that reaches AGENT_DELEGATION_TIMEOUT with nothing delivered is a `ceiling`
+# rep (REP_CEILING above): not graded and not a storm rep, so on its own it
+# is neither a collapse for rule 1 nor a count for rule 2, and the suite
+# reports the run NOT EVALUATED. Without this rule a fleet-wide stall read
+# GREEN here while every pull request was told to rerun: visible on each
+# run, named nowhere.
+#
+# The rule is rule 2's shape over ceiling reps, same thresholds and window:
+# CEILING_MIN_REPS across CEILING_MIN_PRS distinct pull requests among the
+# runs that finished inside CEILING_WINDOW. Three PRs because one project's
+# worker can be slow on one PR's task without saying anything about the
+# fleet; fifteen reps because one or two per run is a slow worker on a slow
+# day, while five per run three times over is the 2026-09-19 nightly's shape
+# (13 of 116) spread across presubmits. Ranked below the storm on purpose: a
+# 429-starved worker hits the same wait, so when both fire the quota is the
+# cause and the ceiling wave is evidence beside it.
+CEILING_WINDOW = STORM_WINDOW
+CEILING_MIN_REPS = STORM_MIN_REPS
+CEILING_MIN_PRS = STORM_MIN_PRS
+# A finished run carrying at least this many ceiling repetitions is still
+# inside the wave for recovery purposes (rule 6), as STORM_RUN_SIGNATURE_REPS
+# is for a storm.
+CEILING_RUN_SIGNATURE_REPS = STORM_RUN_SIGNATURE_REPS
 
 # --- Rule 3: setup deaths -> DEGRADED (#1172, #1176) -------------------------
 # Incident: a stuck Helm release record left by ci-teardown poisoned pool
@@ -380,6 +411,7 @@ CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
 CAUSE_FIXTURE_DRIFT = "seeded fixture drift: {roles} out of designed state on {projects} pool project(s)"
+CAUSE_CEILING = "delegation ceiling: {reps} repetitions on {prs} PRs ended with the worker still running {start}–{end} UTC"
 ADVICE_OUTAGE = "Don't retest yet; the failing cases share a cause. Tracking: {tracking}"
 ADVICE_OUTAGE_NO_ISSUE = "no issue filed yet — file one with the presubmit-gate label"
 ADVICE_STORM = "Retest after {when} UTC; runs started inside the storm lose repetitions to 429s."
@@ -396,6 +428,10 @@ UNKNOWN_NODE = "(name unknown)"
 ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
     " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
+)
+ADVICE_CEILING = (
+    "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."
+    " platform-agent-gateway.log in a run's artifacts says whether the dispatcher stalled (#1879) or 429s starved the workers."
 )
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
@@ -762,6 +798,33 @@ def storm(full_runs, now: datetime) -> dict:
         "end": end,
         "evidence": evidence if fires else [],
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
+        "runs": len(hit),
+    }
+
+
+def delegation_ceiling(full_runs, now: datetime) -> dict:
+    """Rule 2b. Returns {fires, reps, prs, start, end, evidence, signature_runs, runs}."""
+    window = _in_window(full_runs, now, CEILING_WINDOW)
+    hit = [run for run in window if run.ceiling_reps > 0]
+    reps = sum(run.ceiling_reps for run in hit)
+    prs = _prs(hit)
+    fires = reps >= CEILING_MIN_REPS and len(prs) >= CEILING_MIN_PRS
+    start = min((run.finished for run in hit), default=None)
+    end = max((run.finished for run in hit), default=None)
+    evidence = []
+    if hit:
+        evidence.append(
+            f"delegation ceiling: {reps} reps across {len(prs)} PRs ended with the worker still running"
+            f" in runs finishing {hhmm(start)}–{hhmm(end)} UTC; nothing graded, nothing counted against a case"
+        )
+    return {
+        "fires": fires,
+        "reps": reps,
+        "prs": prs,
+        "start": start,
+        "end": end,
+        "evidence": evidence if fires else [],
+        "signature_runs": {run.build_id for run in hit if run.ceiling_reps >= CEILING_RUN_SIGNATURE_REPS},
         "runs": len(hit),
     }
 
@@ -1407,6 +1470,8 @@ def advice_for(
     if condition == STORM:
         when = hhmm(storm_end + STORM_COOLDOWN) if storm_end else "the storm ends"
         return ADVICE_STORM.format(when=when)
+    if condition == DELEGATION_CEILING:
+        return ADVICE_CEILING
     if condition == LOST_PODS:
         incident = incident or {}
         return ADVICE_LOST_PODS.format(
@@ -1435,6 +1500,7 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
     r2 = storm(full_runs, now)
+    r2b = delegation_ceiling(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
     r3c = fixture_drift(fixture_state_doc, now)
@@ -1448,6 +1514,9 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     elif r2["fires"]:
         state, condition = DEGRADED, STORM
         cause = CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"]))
+    elif r2b["fires"]:
+        state, condition = DEGRADED, DELEGATION_CEILING
+        cause = CAUSE_CEILING.format(reps=r2b["reps"], prs=len(r2b["prs"]), start=hhmm(r2b["start"]), end=hhmm(r2b["end"]))
     elif r3["fires"]:
         state, condition = DEGRADED, SETUP_DEATHS
         cause = CAUSE_SETUP.format(count=len(r3["deaths"]), prs=_pr_list(r3["prs"]))
@@ -1457,7 +1526,7 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     else:
         state, condition, cause = GREEN, None, ""
 
-    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
+    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
     if r1["fires"] and r2["fires"]:
         # Both true at once on 2026-09-02: the break is the state, the
         # storm is context the reader still needs.
@@ -1471,6 +1540,8 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         signature = r1["signature_runs"]
     elif condition == STORM:
         signature = {run.build_id for run in full_runs if run.storm_reps > 0}
+    elif condition == DELEGATION_CEILING:
+        signature = {run.build_id for run in full_runs if run.ceiling_reps > 0}
     else:
         signature = set()
     current = condition in COUNTED_CONDITIONS or any(run.build_id in signature for run in recent)
@@ -1482,6 +1553,10 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
         incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
+    elif condition == DELEGATION_CEILING:
+        # `reps` beside the storm's keys: the message says how many
+        # repetitions ended at the wait, not only how many runs held one.
+        incident = {"prs": r2b["prs"], "runs": r2b["runs"], "reps": r2b["reps"], "window_start": iso(r2b["start"]), "window_end": iso(r2b["end"])}
     elif condition == SETUP_DEATHS:
         incident = {"prs": r3["prs"], "runs": len(r3["deaths"]), "window_start": None, "window_end": None}
     elif condition == LOST_PODS:
@@ -1530,8 +1605,9 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     distinct pull requests, all finished after the incident began, and none
     carries the signature of the condition being left -- a collapse of one
     of its cases for a shared break, STORM_RUN_SIGNATURE_REPS storm
-    repetitions for a storm, a setup death after it for setup deaths, a lost
-    pod after it for lost pods. Judged from the runs themselves rather than
+    repetitions for a storm, CEILING_RUN_SIGNATURE_REPS ceiling repetitions
+    for a delegation-ceiling wave, a setup death after it for setup deaths,
+    a lost pod after it for lost pods. Judged from the runs themselves rather than
     from the rule's window, so the runs that constituted the incident never
     count as its recovery once the window has rolled past them."""
     recent = full_runs[-RECOVERY_GREEN_RUNS:]
@@ -1550,6 +1626,7 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     carries = {
         SHARED_BREAK: lambda run: bool(run.collapsed_cases() & cases & roster.at(run.started or run.finished)),
         STORM: lambda run: run.storm_reps >= STORM_RUN_SIGNATURE_REPS,
+        DELEGATION_CEILING: lambda run: run.ceiling_reps >= CEILING_RUN_SIGNATURE_REPS,
         SETUP_DEATHS: lambda run: last_setup_death is not None and run.finished <= last_setup_death,
         LOST_PODS: lambda run: last_lost_pod is not None and run.finished <= last_lost_pod,
     }.get(condition, lambda run: False)

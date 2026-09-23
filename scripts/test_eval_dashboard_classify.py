@@ -131,6 +131,16 @@ class RepAndOutcomeTest(unittest.TestCase):
     def test_a_ceiling_rep_is_its_own_kind_not_a_storm(self):
         self.assertEqual(classify.rep_kind({"result": "infra", "reason": CEILING}), "ceiling")
         self.assertEqual(classify.rep_kind({"result": "fail", "reason": CEILING}), "ceiling", "the marker decides, whatever the verdict token")
+
+    def test_a_runs_ceiling_reps_are_counted_beside_its_storm_reps(self):
+        """The run doc carries both counts; the Brief anchors a ceiling
+        incident's first run on `ceiling_reps` as it anchors a storm's on
+        `storm_reps`."""
+        reps = [{"n": 1, "result": "infra", "reason": CEILING}, {"n": 2, "result": "infra", "reason": CEILING}, {"n": 3, "result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE: transport"}]
+        run = {"build_id": "1", "pr": 1, "tasks": [{"name": "a", "result": "infra", "reps": reps}]}
+        self.assertEqual((classify.storm_reps(run), classify.ceiling_reps(run)), (1, 2))
+        verdict = classify.classify_run(run, [run])
+        self.assertEqual((verdict["storm_reps"], verdict["ceiling_reps"]), (1, 2))
         self.assertEqual(classify.rep_kind({"result": "infra", "reason": NEVER_RAN}), "storm")
 
     def test_ceiling_reps_are_ungraded_and_outside_the_storm_count(self):

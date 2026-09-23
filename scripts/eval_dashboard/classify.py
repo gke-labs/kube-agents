@@ -15,7 +15,7 @@ interface::
                    "pass_rate_30d", "reason", "excerpt", "rep_n", "do",
                    "admitted", "reps"}],
         "matches_incident": bool,
-        # run-level detail: "setup_death", "storm_reps", "cls", "do"
+        # run-level detail: "setup_death", "storm_reps", "ceiling_reps", "cls", "do"
     }
 
 The first line of keys is the contract other callers rely on; the rest is
@@ -297,7 +297,7 @@ _RUN_CACHE: dict[int, tuple[dict, dict]] = {}
 
 
 def _run_facts(run: dict) -> dict:
-    """{outcomes: {case: outcome}, collapsed: set, storm: int} for a run."""
+    """{outcomes: {case: outcome}, collapsed: set, storm: int, ceiling: int} for a run."""
     key = id(run)
     hit = _RUN_CACHE.get(key)
     if hit is not None and hit[0] is run:
@@ -305,18 +305,21 @@ def _run_facts(run: dict) -> dict:
     outcomes = {}
     counts_by_case = {}
     storm = 0
+    ceiling = 0
     for task in run_tasks(run):
         counts = rep_counts(task)
         name = str(task.get("name"))
         counts_by_case[name] = counts
         outcomes[name] = outcome_of(counts)
         storm += counts["infra"]
+        ceiling += counts["ceiling"]
     started = parse_iso(run.get("started"))
     facts = {
         "outcomes": outcomes,
         "counts": counts_by_case,
         "collapsed": {c for c, o in outcomes.items() if o == OUTCOME_FAILED},
         "storm": storm,
+        "ceiling": ceiling,
         "started": started,
         "finished": parse_iso(run.get("finished")) or started,
     }
@@ -333,6 +336,12 @@ def collapsed_cases(run: dict) -> set[str]:
 
 def storm_reps(run: dict) -> int:
     return _run_facts(run)["storm"]
+
+
+def ceiling_reps(run: dict) -> int:
+    """Repetitions the harness stopped watching at its delegation ceiling
+    (#1874); apart from `storm_reps`, never inside it."""
+    return _run_facts(run)["ceiling"]
 
 
 def run_length(run: dict) -> timedelta | None:
@@ -851,4 +860,5 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         cls=None,
         do="",
         storm_reps=storm_reps(run),
+        ceiling_reps=ceiling_reps(run),
     )

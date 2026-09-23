@@ -52,6 +52,17 @@ SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
 
 
+# The scorer's marker-led reason for a delegation-ceiling repetition (#1874);
+# test_eval_dashboard_classify.py pins the literal against the scorer.
+CEILING_REASON = "KUBE_AGENTS_DELEGATION_CEILING: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
+
+
+def health_module_advice():
+    from eval_dashboard import health as health_module
+
+    return health_module.ADVICE_CEILING
+
+
 def health_doc(state="OUTAGE", **overrides):
     doc = {
         "schema_version": 1, "state": state,
@@ -534,6 +545,45 @@ class BrowserTest(unittest.TestCase):
     def render_state(self, health, sub="s"):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
+
+    def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
+        """Ceiling reps sit under their own key in `reps` (#1874). The card's
+        totals must include them, or a three-rep case reads "all 0 reps lost
+        before grading" beside its delegation-ceiling tag."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        task["reps"] = [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (1, 2, 3)]
+        mixed = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[1])
+        mixed["reps"] = [{"n": 1, "result": "pass", "reason": None}, {"n": 2, "result": "pass", "reason": None}, {"n": 3, "result": "infra", "reason": CEILING_REASON}]
+        mixed["result"] = "pass"
+        out = render_to(pathlib.Path(self.tmp.name) / "ceiling", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps hit the delegation ceiling with the worker still running", page)
+        self.assertIn('class="tag storm">delegation ceiling<', page)
+        self.assertIn(f"<span>{CRASHLOOP_TRIO[1]}</span>", page, "two passes and a ceiling rep is a pass, listed by name")
+        self.assertNotIn("all 0 reps", page)
+        self.assertNotIn("0 reps lost", page)
+
+    def test_a_delegation_ceiling_wave_has_its_own_brief_and_banner(self):
+        health = health_doc(
+            "DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[],
+            cause="delegation ceiling: 18 repetitions on 3 PRs ended with the worker still running 12:00–14:00 UTC",
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(),
+            incident={"prs": [1, 2, 3], "runs": 3, "reps": 18, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
+        )
+        out = render_to(pathlib.Path(self.tmp.name) / "ceiling-brief", self.data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("DEGRADED · since Tue 8:00 AM ET", app)
+        self.assertIn("Workers aren't finishing: repetitions are ending at the harness's delegation wait", app)
+        self.assertIn("Why we think it's the workers, not the PRs", app)
+        self.assertIn("ended at the harness's delegation wait with the worker still running, across 0 PRs", app, "the fixture week has no ceiling reps; the fact still counts")
+        self.assertIn("#1879", app)
+        self.assertNotIn("quota storm", app.lower().replace("no shared break, storm", ""))
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("Workers not finishing", run_page)
+        self.assertIn("those runs read not evaluated, not red", run_page)
 
     def test_outage_brief(self):
         app = dom_text(self.index)

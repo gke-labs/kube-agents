@@ -357,6 +357,82 @@ class Storm(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Rule 2b: delegation ceiling
+# --------------------------------------------------------------------------- #
+
+
+class DelegationCeiling(unittest.TestCase):
+    """Rule 2 shape over ceiling reps (#1874, #1879): a fleet-wide worker
+    stall is named here instead of reading GREEN while every PR says
+    NOT EVALUATED."""
+
+    def wave(self, prs, reps_per_run, spread_minutes=20, letter="c", nightly=False):
+        runs = []
+        for i, pr in enumerate(prs):
+            tasks = [task(f"case-{k}", letter * 3) for k in range(reps_per_run // 3)]
+            tasks += [task(name, "ppp") for name in sorted(ADMITTED)]
+            doc = run(100 + i, pr, T0 - timedelta(minutes=spread_minutes * i), result="SUCCESS", tasks=tasks)
+            runs.append(dict(doc, tier="nightly", pr=None) if nightly else doc)
+        return data(*runs)
+
+    def test_fifteen_ceiling_reps_across_three_prs_degrade_under_their_own_name(self):
+        result = assess(self.wave([1, 2, 3], 6), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "delegation_ceiling"))
+        self.assertRegex(result["cause"], r"^delegation ceiling: 18 repetitions on 3 PRs ended with the worker still running \d\d:\d\d–\d\d:\d\d UTC$")
+        self.assertIn("delegation ceiling: 18 reps across 3 PRs ended with the worker still running", result["evidence"][0])
+        self.assertEqual((result["incident"]["reps"], result["incident"]["runs"], sorted(result["incident"]["prs"])), (18, 3, [1, 2, 3]))
+        self.assertEqual(result["failing_cases"], [], "a ceiling wave is no collapse")
+        self.assertFalse(any("quota storm" in line for line in result["evidence"]), "and no storm")
+
+    def test_the_thresholds_and_window_are_the_storms(self):
+        self.assertEqual((health.CEILING_MIN_REPS, health.CEILING_MIN_PRS, health.CEILING_WINDOW), (health.STORM_MIN_REPS, health.STORM_MIN_PRS, health.STORM_WINDOW))
+        self.assertEqual(health.CEILING_RUN_SIGNATURE_REPS, health.STORM_RUN_SIGNATURE_REPS)
+        self.assertEqual(assess(self.wave([1, 2, 3], 3), T0)["state"], "GREEN", "9 reps")
+        self.assertEqual(assess(self.wave([1, 2, 2], 6), T0)["state"], "GREEN", "2 PRs")
+        self.assertEqual(assess(self.wave([1, 2, 3, 4, 5], 3), T0)["state"], "DEGRADED", "15 reps on 5 PRs")
+        self.assertEqual(assess(self.wave([1, 2, 3], 6, spread_minutes=65), T0)["state"], "GREEN", "outside the 2h window")
+
+    def test_nightly_ceiling_reps_do_not_count(self):
+        self.assertEqual(assess(self.wave([None, None, None], 6, nightly=True), T0)["state"], "GREEN")
+
+    def test_the_storm_outranks_it_and_keeps_it_as_evidence(self):
+        doc = self.wave([1, 2, 3], 6)
+        stormy = [task(f"s-{k}", "eee") for k in range(2)] + [task(name, "ppp") for name in sorted(ADMITTED)]
+        doc["runs"] += [run(200 + i, 10 + i, T0 - timedelta(minutes=5 * i), result="SUCCESS", tasks=stormy) for i in range(3)]
+        result = assess(doc, T0)
+        self.assertEqual(result["condition"], "storm")
+        self.assertTrue(any(line.startswith("delegation ceiling: 18 reps") for line in result["evidence"]), result["evidence"])
+
+    def test_advice_points_at_the_gateway_log(self):
+        result = adjudicate(self.wave([1, 2, 3], 6), T0)
+        self.assertEqual(result["advice"], health.ADVICE_CEILING)
+        self.assertIn("#1879", result["advice"])
+        self.assertIn("NOT EVALUATED", result["advice"])
+
+    def test_the_wave_runs_themselves_do_not_count_as_its_recovery(self):
+        doc = self.wave([1, 2, 3], 6)
+        prev = adjudicate(doc, T0)
+        self.assertEqual(prev["state"], "DEGRADED")
+        later = T0 + timedelta(hours=2, minutes=1)
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["condition"], held["recovering"]), ("DEGRADED", "delegation_ceiling", True), held)
+        doc["runs"] += [run(200 + i, 20 + i, later - timedelta(minutes=30 - 5 * i), result="SUCCESS", tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
+
+    def test_a_green_run_with_five_ceiling_reps_still_carries_the_wave(self):
+        doc = self.wave([1, 2, 3], 6)
+        prev = adjudicate(doc, T0)
+        later = T0 + timedelta(hours=2, minutes=1)
+        held = adjudicate(doc, later, prev)
+        doc["runs"] += [
+            run(200 + i, 20 + i, later - timedelta(minutes=30 - 5 * i), result="SUCCESS",
+                tasks=broken_tasks(set()) + ([task("slow", "ccccc")] if i == 1 else []))
+            for i in range(3)
+        ]
+        self.assertEqual((adjudicate(doc, later, held)["state"], adjudicate(doc, later, held)["recovering"]), ("DEGRADED", True))
+
+
+# --------------------------------------------------------------------------- #
 # Rule 3: setup deaths
 # --------------------------------------------------------------------------- #
 
@@ -753,16 +829,16 @@ class Metrics(unittest.TestCase):
         self.assertEqual(adjudicate(doc, T0)["metrics"]["infra_rep_rate"], round(5 / 9, 3))
 
     def test_ceiling_reps_are_counted_apart_from_the_storms(self):
-        """Fifteen ceiling reps across three PRs would be a storm if they were
-        storm reps (rule 2); they are not, so the gate stays GREEN and the
-        digest carries them under their own key."""
+        """Fifteen ceiling reps across three PRs are rule 2b's condition, not
+        rule 2's: the storm count and rate stay at zero and the digest
+        carries them under their own key."""
         runs = [
             run(k, 100 + k, T0 - timedelta(minutes=10 * k), result="SUCCESS",
                 tasks=green_tasks() + [task("slow", "ccc"), task("slower", "cc")])
             for k in range(1, 4)
         ]
         result = adjudicate(data(*runs), T0)
-        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "delegation_ceiling"))
         self.assertEqual(result["metrics"]["infra_reps"], 0)
         self.assertEqual(result["metrics"]["ceiling_reps"], 15)
         self.assertEqual(result["metrics"]["infra_rep_rate"], 0.0)
