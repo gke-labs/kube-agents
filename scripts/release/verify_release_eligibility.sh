@@ -175,8 +175,8 @@ if [ -z "${VALIDATED_TAGS}" ]; then
   echo "❌ BLOCKED: Commit ${RC_CANDIDATE_COMMIT} has NOT been promoted to staging!" >&2
   echo "   No tag matching 'staging_<ts>_<sha>' points to this commit." >&2
   echo "   To release this version:" >&2
-  echo "     1. Wait for the nightly pipeline to run the full E2E matrix and promote this commit." >&2
-  echo "     2. Or run the '.github/workflows/staging-promotion-pipeline.yml' workflow manually on its candidate." >&2
+  echo "  1. Wait for the staging promotion pipeline to run the full E2E matrix and promote this commit." >&2
+  echo "  2. Or run the '.github/workflows/staging-promotion-pipeline.yml' workflow manually on its candidate." >&2
   echo "     3. For emergency CVE hotfixes, run with skip_staging_validation=true and an explicit reason." >&2
   exit 1
 fi
