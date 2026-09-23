@@ -2079,10 +2079,6 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ToleratedProbesClearErrTrapTest(unittest.TestCase):
     """The library's tolerated probes clear the inherited ERR trap inside their $(...).
 
@@ -2116,3 +2112,6 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
                 self.assertEqual(source.count(guarded), count, f"{path.name}: {guarded!r}")
                 self.assertNotIn(unguarded, source, f"{path.name}: a probe lost its `trap - ERR`")
 
+
+if __name__ == "__main__":
+    unittest.main()

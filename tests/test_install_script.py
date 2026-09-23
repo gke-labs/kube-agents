@@ -5288,15 +5288,20 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         """
         lib = self._tmp_path / "helper_lib.sh"
         lib.write_text("library_probe() {\n  false\n}\n")
+        # Same file the other write_json_report tests read, removed first so
+        # the assertions below read this run's report and not the one the
+        # previous test left behind.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
         proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
 
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertNotIn("NOT_REACHED", proc.stdout)
         self.assertIn(f"Error encountered at {lib}:", proc.stderr)
         self.assertIn(" in library_probe (exit code 1): false", proc.stderr)
-        # The report the handler wrote on the way out. Same file the other
-        # write_json_report tests read.
-        report = json.loads(pathlib.Path("/tmp/kube-agents-install-report.json").read_text())
+        # The report the handler wrote on the way out.
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
         self.assertEqual(report["status"], "FAILED")
         for absent in ("message", "line", "line_no", "command", "function", "source_file"):
             self.assertNotIn(absent, report)
@@ -5367,6 +5372,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         hand the caller a clean exit. The parent's trap then fires at the
         assignment and prints the one banner.
         """
+        # Same file the other write_json_report tests read, removed first so
+        # the report assertion reads this run's and not the previous test's.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
         proc = self._run_func(
             'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
             'x="$(probe)"\n'
@@ -5376,7 +5385,8 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertNotIn("NOT_REACHED", proc.stdout)
         self.assertEqual(proc.stderr.count("Error encountered"), 1, proc.stderr)
         self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
-        report = json.loads(pathlib.Path("/tmp/kube-agents-install-report.json").read_text())
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
         self.assertEqual(report["status"], "FAILED")
 
     def test_each_front_door_handler_exits_a_subshell_silently(self):

@@ -257,8 +257,41 @@ echo "NOT_REACHED x=[$x]"
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertNotIn("NOT_REACHED", proc.stdout)
         self.assertEqual(proc.stderr.count("Teardown error encountered"), 1, proc.stderr)
-        self.assertIn("exit code 1", proc.stderr)
+        # A `bash -c` body has no file for bash to name its frames after, so
+        # the banner falls back to the script's name; the assignment in the
+        # parent is the command it names.
+        self.assertIn(" at uninstall.sh:", proc.stderr)
+        self.assertIn(' in main (exit code 1): x="$(', proc.stderr)
         self.assertNotIn("exit code 3", proc.stderr)
+
+    def test_a_failure_inside_a_sourced_helper_names_its_file_and_function(self):
+        # $LINENO counts from the top of whichever file the failing command
+        # sat in, so a bare line number sent the reader to an unrelated line
+        # of uninstall.sh (#1798). The banner names the helper and the
+        # function it failed in.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            lib = pathlib.Path(tmp) / "helper_lib.sh"
+            lib.write_text("helper_probe() {\n  false\n}\n")
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"
+source "{lib}"
+helper_probe
+echo "NOT_REACHED"
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertNotIn("NOT_REACHED", proc.stdout)
+            self.assertEqual(proc.stderr.count("Teardown error encountered"), 1, proc.stderr)
+            self.assertIn(f"Teardown error encountered at {lib}:", proc.stderr)
+            self.assertIn(" in helper_probe (exit code 1): false", proc.stderr)
 
     def _scratch_repo(self, tmp):
         """A minimal kube-agents tree for whole-script runs.
