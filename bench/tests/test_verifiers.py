@@ -1847,6 +1847,23 @@ def test_a_pull_request_that_changes_no_files_is_a_fail(token, github):
     assert "changes no files" in res.reason
 
 
+def test_a_transport_failure_dating_the_head_commit_is_unresolved_not_a_crash(token, github):
+    """The commits read sits after the stamp checks, so a reset there used to
+    escape `verify()` as a traceback instead of joining `unresolved` the way
+    the same fault on the first read does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+
+    def boom():
+        raise OSError("connection reset")
+
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = boom
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success
+    assert "could not reach the GitHub API" in res.reason and "connection reset" in res.reason
+
+
 def test_a_head_commit_the_api_will_not_date_does_not_fail_the_run(token, github):
     """An observation the API would not give is not evidence the run pushed
     nothing. The commits page is missing here, so the check falls back to the

@@ -516,8 +516,9 @@ first, because a pull request is an issue to that API and `issues: read` is what
 carries; `/pulls/{n}` is tried when that is denied or absent, and read anyway for the file count
 and commit total, which the issues payload does not carry. Both want `pull_requests: read`, which
 `hack/ci-eval-pr.sh` asks for at mint. The check errors only on a fault
-of ours: a 401, which is the token having expired rather than a permission, and a denial from both
-endpoints, which names `pull_requests: read` as the permission to add. Everything else is graded.
+of ours: a 401, which is the token having expired rather than a permission; a denial from both
+endpoints, or from `/pulls/{n}` when it is read for the file count, which names `pull_requests: read`
+as the permission to add; and an API it could not reach. Everything else is graded.
 A 403 from one endpoint proves the repository is reachable, so the other's 404 is the number's own;
 404 from both is either the number or a repository this credential cannot see, and nothing in the
 API separates them. Both fail. Erroring instead would red the eval job for every open pull request

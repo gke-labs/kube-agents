@@ -1213,9 +1213,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # What the stamp above cannot say: whether the run pushed a fix or
             # only wrote to a pull request. `updated_at` moves on a comment and
             # on a label. The head commit moves on neither.
-            changed, pushed, unevaluable = self._head_push(
-                owner, repo, number, payload, token, budget
-            )
+            try:
+                changed, pushed, unevaluable = self._head_push(
+                    owner, repo, number, payload, token, budget
+                )
+            except OSError as exc:
+                unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                continue
             if unevaluable:
                 unresolved.append(unevaluable)
                 continue
