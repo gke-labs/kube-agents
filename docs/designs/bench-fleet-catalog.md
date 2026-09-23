@@ -90,7 +90,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eleven fixtures: ten across the three cluster slots and one project-scoped. Most in-cluster
+Twelve fixtures: eleven across the three cluster slots and one project-scoped. Most in-cluster
 fixtures are on slot `a`, across the four seeded namespaces `seeded-debug`,
 `seeded-reliability`, `seeded-security` and `seeded-capacity`, plus both defect node pools.
 Slot `c` carries a GKE-level defect only and no workloads at all: it is the configuration
