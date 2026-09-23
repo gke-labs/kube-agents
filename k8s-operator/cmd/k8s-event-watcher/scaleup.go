@@ -15,6 +15,7 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -53,6 +54,14 @@ const (
 	// defaultScaleUpEntries caps the memo per cluster. The same bound as
 	// pullClassMemo: pending pods are a small fraction of a cluster's pods,
 	// and a cluster churning through them must not grow the map without limit.
+	// A full memo gives up expired marks first and then the oldest mark in
+	// the namespace holding the most (boundedEntries.evictee), so the cap is
+	// shared by the cluster's namespaces but a burst of marks in one of them
+	// displaces its own before another's. A TriggeredScaleUp older than the
+	// hold plus the staleness check decides nothing any more (filter.go), so
+	// oldest-first within a namespace spends those before a mark that is
+	// still holding a pod; the bound that costs a live mark is more marks
+	// still inside the hold than the cap, in one namespace.
 	defaultScaleUpEntries = 4096
 	// scaleUpMemoKeySep joins a pod's namespace and UID into the memo's key.
 	// A UID is a UUID and carries no slash, so the join is unambiguous.
@@ -142,6 +151,15 @@ type scaleUpMark struct {
 // reaches only a pod in the namespace it was written in, which is the reach
 // the reporter check (scaleUpReporter) already assumes.
 //
+// The namespace is also what a full memo evicts by: the cap is one per
+// cluster, and evicting the oldest mark in the cluster regardless of namespace
+// would let the same principal, writing marks under the autoscaler's reporter
+// against invented UIDs in its own namespace, push every other namespace's
+// marks out of the memo — not a hold or a release but a forget, which sends a
+// kube-system pod mid-scale-up to the count backstop. The memo instead evicts
+// from the namespace holding the most marks, so a namespace loses a mark only
+// to one holding at least as many, and the flooding namespace loses its own.
+//
 // Latest is by event time, not arrival order, so a replayed older mark cannot
 // overwrite a newer one. A later TriggeredScaleUp supersedes a NotTriggerScaleUp
 // (the autoscaler changed its mind, a node group was resized) and the reverse
@@ -161,7 +179,9 @@ func newScaleUpMemo(ttl time.Duration, max int) *scaleUpMemo {
 	if max <= 0 {
 		max = defaultScaleUpEntries
 	}
-	return &scaleUpMemo{entries: newBoundedEntries[scaleUpVerdict](ttl, max)}
+	entries := newBoundedEntries[scaleUpVerdict](ttl, max)
+	entries.groupOf = scaleUpMemoNamespace
+	return &scaleUpMemo{entries: entries}
 }
 
 func (m *scaleUpMemo) clock() time.Time {
@@ -179,6 +199,13 @@ func scaleUpMemoKey(namespace, uid string) string {
 		return ""
 	}
 	return namespace + scaleUpMemoKeySep + uid
+}
+
+// scaleUpMemoNamespace is the namespace half of a key scaleUpMemoKey built;
+// it is the group a full memo evicts within.
+func scaleUpMemoNamespace(key string) string {
+	namespace, _, _ := strings.Cut(key, scaleUpMemoKeySep)
+	return namespace
 }
 
 // Record remembers verdict for the pod uid in namespace as of at, unless a

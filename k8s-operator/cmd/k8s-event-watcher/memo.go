@@ -26,6 +26,12 @@ type boundedEntries[V any] struct {
 	entries map[string]memoEntry[V]
 	ttl     time.Duration
 	max     int
+	// groupOf names the group a key belongs to, when set. A full map then
+	// evicts the oldest entry of the group holding the most entries rather
+	// than the oldest entry overall, so a burst of keys in one group
+	// displaces that group's own entries before another's; nil groups
+	// nothing, and the oldest entry in the map goes.
+	groupOf func(key string) string
 }
 
 type memoEntry[V any] struct {
@@ -62,8 +68,8 @@ func (b *boundedEntries[V]) store(uid string, value V, at, now time.Time) {
 }
 
 // evictIfFull drops expired entries first, and only if that frees nothing
-// evicts the oldest — the same bounded-scan approach dedupCache uses, on a map
-// an order of magnitude smaller.
+// evicts one live entry (evictee) — the same bounded-scan approach dedupCache
+// uses, on a map an order of magnitude smaller.
 func (b *boundedEntries[V]) evictIfFull(now time.Time) {
 	if len(b.entries) < b.max {
 		return
@@ -76,15 +82,49 @@ func (b *boundedEntries[V]) evictIfFull(now time.Time) {
 	if len(b.entries) < b.max {
 		return
 	}
-	var oldestUID string
-	var oldest time.Time
-	first := true
-	for uid, e := range b.entries {
-		if first || e.at.Before(oldest) {
-			oldestUID, oldest, first = uid, e.at, false
+	delete(b.entries, b.evictee())
+}
+
+// evictee picks the live entry a full map gives up: the oldest in the map
+// when keys are not grouped, otherwise the oldest in the group holding the
+// most entries. Between groups of equal size the one whose oldest entry is
+// older gives it up, and between those the lower group name, so the choice
+// does not depend on map order. A group can therefore lose an entry only to
+// a group holding at least as many, which is what keeps a burst of keys in
+// one group, forged or real, from emptying another's share.
+func (b *boundedEntries[V]) evictee() string {
+	type groupOldest struct {
+		key   string
+		at    time.Time
+		count int
+	}
+	groups := make(map[string]*groupOldest)
+	for key, e := range b.entries {
+		var group string
+		if b.groupOf != nil {
+			group = b.groupOf(key)
+		}
+		g, ok := groups[group]
+		if !ok {
+			groups[group] = &groupOldest{key: key, at: e.at, count: 1}
+			continue
+		}
+		g.count++
+		if e.at.Before(g.at) || (e.at.Equal(g.at) && key < g.key) {
+			g.key, g.at = key, e.at
 		}
 	}
-	delete(b.entries, oldestUID)
+	var chosenName string
+	var chosen *groupOldest
+	for name, g := range groups {
+		if chosen == nil ||
+			g.count > chosen.count ||
+			(g.count == chosen.count && g.at.Before(chosen.at)) ||
+			(g.count == chosen.count && g.at.Equal(chosen.at) && name < chosenName) {
+			chosenName, chosen = name, g
+		}
+	}
+	return chosen.key
 }
 
 func (b *boundedEntries[V]) len() int {

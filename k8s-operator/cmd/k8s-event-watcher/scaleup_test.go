@@ -15,6 +15,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -125,6 +126,73 @@ func TestScaleUpMemoIsBounded(t *testing.T) {
 	// The newest survives the eviction of the oldest.
 	if got := m.Lookup("default", string(rune('a'+19))); got.Verdict != scaleUpTriggered {
 		t.Errorf("newest entry was evicted: %+v", got)
+	}
+}
+
+// TestScaleUpMemoEvictsFromTheNamespaceHoldingTheMost: the cap is one per
+// cluster, so a burst of marks in one namespace must give up that namespace's
+// own marks and not another's. kube-system's two marks are the oldest in the
+// memo and survive a tenant writing five times the cap.
+func TestScaleUpMemoEvictsFromTheNamespaceHoldingTheMost(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newScaleUpMemo(time.Hour, 8)
+	m.now = func() time.Time { return now }
+
+	m.Record("kube-system", "ks-1", scaleUpTriggered, now)
+	now = now.Add(time.Second)
+	m.Record("kube-system", "ks-2", scaleUpDeclined, now)
+	for i := 0; i < 40; i++ {
+		now = now.Add(time.Second)
+		m.Record("tenant-a", fmt.Sprintf("forged-%02d", i), scaleUpTriggered, now)
+	}
+	if got := m.Len(); got > 8 {
+		t.Errorf("memo holds %d entries; want <= 8", got)
+	}
+	if got := m.Lookup("kube-system", "ks-1"); got.Verdict != scaleUpTriggered {
+		t.Errorf("kube-system's oldest mark was evicted by tenant-a's burst: %+v", got)
+	}
+	if got := m.Lookup("kube-system", "ks-2"); got.Verdict != scaleUpDeclined {
+		t.Errorf("kube-system's second mark was evicted by tenant-a's burst: %+v", got)
+	}
+	if got := m.Lookup("tenant-a", "forged-39"); got.Verdict != scaleUpTriggered {
+		t.Errorf("tenant-a's newest mark was not kept: %+v", got)
+	}
+	if got := m.Lookup("tenant-a", "forged-00"); got.Verdict != scaleUpNone {
+		t.Errorf("tenant-a's oldest mark survived its own burst: %+v", got)
+	}
+}
+
+// TestScaleUpMemoEvictionTieGoesToTheOlderNamespace: between namespaces
+// holding the same number of marks, the one whose oldest mark is older gives
+// it up, and a third namespace's first mark displaces neither of the other's
+// newer ones.
+func TestScaleUpMemoEvictionTieGoesToTheOlderNamespace(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newScaleUpMemo(time.Hour, 4)
+	m.now = func() time.Time { return now }
+
+	// The clock advances with the stamps: a stamp ahead of the memo's clock
+	// is read as now, which would collapse the four onto one instant.
+	for _, mark := range []struct{ ns, uid string }{
+		{"ns-a", "a-old"}, {"ns-b", "b-old"}, {"ns-a", "a-new"}, {"ns-b", "b-new"}, {"ns-c", "c-1"},
+	} {
+		now = now.Add(time.Second)
+		m.Record(mark.ns, mark.uid, scaleUpTriggered, now)
+	}
+
+	if got := m.Len(); got != 4 {
+		t.Errorf("memo holds %d entries; want 4", got)
+	}
+	if got := m.Lookup("ns-a", "a-old"); got.Verdict != scaleUpNone {
+		t.Errorf("the older of the two equal namespaces kept its oldest mark: %+v", got)
+	}
+	for ns, uid := range map[string]string{"ns-a": "a-new", "ns-b": "b-old", "ns-c": "c-1"} {
+		if got := m.Lookup(ns, uid); got.Verdict == scaleUpNone {
+			t.Errorf("%s/%s was evicted; want kept", ns, uid)
+		}
+	}
+	if got := m.Lookup("ns-b", "b-new"); got.Verdict != scaleUpTriggered {
+		t.Errorf("ns-b/b-new was evicted; want kept: %+v", got)
 	}
 }
 
