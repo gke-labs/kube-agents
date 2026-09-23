@@ -57,11 +57,15 @@ const (
 	// A full memo gives up expired marks first and then the oldest mark in
 	// the namespace holding the most (boundedEntries.evictee), so the cap is
 	// shared by the cluster's namespaces but a burst of marks in one of them
-	// displaces its own before another's. A TriggeredScaleUp older than the
-	// hold plus the staleness check decides nothing any more (filter.go), so
+	// displaces its own before another's. A namespace therefore loses a mark
+	// once the memo is full and no other namespace holds more: against one
+	// namespace flooding the memo its share is about half the cap, against k
+	// of them about cap/(k+1). A TriggeredScaleUp older than the hold plus
+	// the staleness check decides nothing any more (filter.go), so
 	// oldest-first within a namespace spends those before a mark that is
-	// still holding a pod; the bound that costs a live mark is more marks
-	// still inside the hold than the cap, in one namespace.
+	// still holding a pod; what costs a live mark is a namespace holding its
+	// share with every mark still inside the hold, and such a pod falls to
+	// the count backstop.
 	defaultScaleUpEntries = 4096
 	// scaleUpMemoKeySep joins a pod's namespace and UID into the memo's key.
 	// A UID is a UUID and carries no slash, so the join is unambiguous.

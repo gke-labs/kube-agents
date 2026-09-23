@@ -162,6 +162,69 @@ func TestScaleUpMemoEvictsFromTheNamespaceHoldingTheMost(t *testing.T) {
 	}
 }
 
+// TestScaleUpMemoEvictionShareAgainstOneFloodingNamespace: a namespace loses
+// a mark once the memo is full and no other namespace holds more, not once it
+// holds more than the cap. At cap 8, kube-system's five marks are the most in
+// the memo when tenant-a's fourth write fills it, so that write costs
+// kube-system its oldest; the tie that follows goes to kube-system again as
+// the older namespace; from then on tenant-a holds the most and spends only
+// its own, and kube-system keeps three however long the flood runs.
+func TestScaleUpMemoEvictionShareAgainstOneFloodingNamespace(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newScaleUpMemo(time.Hour, 8)
+	m.now = func() time.Time { return now }
+
+	for i := 1; i <= 5; i++ {
+		now = now.Add(time.Second)
+		m.Record("kube-system", fmt.Sprintf("ks-%d", i), scaleUpTriggered, now)
+	}
+	for i := 0; i < 3; i++ {
+		now = now.Add(time.Second)
+		m.Record("tenant-a", fmt.Sprintf("forged-%02d", i), scaleUpTriggered, now)
+	}
+	if got := m.Len(); got != 8 {
+		t.Fatalf("memo holds %d entries before the crossing; want 8", got)
+	}
+	if got := m.Lookup("kube-system", "ks-1"); got.Verdict != scaleUpTriggered {
+		t.Fatalf("kube-system's oldest mark was evicted before the memo was full: %+v", got)
+	}
+
+	// The fourth write fills the memo with kube-system holding the most.
+	now = now.Add(time.Second)
+	m.Record("tenant-a", "forged-03", scaleUpTriggered, now)
+	if got := m.Lookup("kube-system", "ks-1"); got.Verdict != scaleUpNone {
+		t.Errorf("kube-system held the most and kept its oldest mark: %+v", got)
+	}
+	if got := m.Lookup("kube-system", "ks-2"); got.Verdict != scaleUpTriggered {
+		t.Errorf("kube-system lost more than its oldest mark on one write: %+v", got)
+	}
+
+	for i := 4; i < 40; i++ {
+		now = now.Add(time.Second)
+		m.Record("tenant-a", fmt.Sprintf("forged-%02d", i), scaleUpTriggered, now)
+	}
+	if got := m.Len(); got != 8 {
+		t.Errorf("memo holds %d entries after the flood; want 8", got)
+	}
+	if got := m.Lookup("kube-system", "ks-2"); got.Verdict != scaleUpNone {
+		t.Errorf("kube-system kept its second mark through the tie: %+v", got)
+	}
+	for i := 3; i <= 5; i++ {
+		if got := m.Lookup("kube-system", fmt.Sprintf("ks-%d", i)); got.Verdict != scaleUpTriggered {
+			t.Errorf("kube-system/ks-%d was evicted; want its share of three kept: %+v", i, got)
+		}
+	}
+	if got := m.Lookup("tenant-a", "forged-39"); got.Verdict != scaleUpTriggered {
+		t.Errorf("tenant-a's newest mark was not kept: %+v", got)
+	}
+	if got := m.Lookup("tenant-a", "forged-35"); got.Verdict != scaleUpTriggered {
+		t.Errorf("tenant-a's share was cut below five: %+v", got)
+	}
+	if got := m.Lookup("tenant-a", "forged-34"); got.Verdict != scaleUpNone {
+		t.Errorf("tenant-a kept more than its share: %+v", got)
+	}
+}
+
 // TestScaleUpMemoEvictionTieGoesToTheOlderNamespace: between namespaces
 // holding the same number of marks, the one whose oldest mark is older gives
 // it up, and a third namespace's first mark displaces neither of the other's
