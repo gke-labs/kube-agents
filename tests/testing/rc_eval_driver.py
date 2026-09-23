@@ -34,9 +34,11 @@ EXPECTED_DECK_URL = (
 # guard to let it through; the real marker is the variable ci-deploy.sh reads.
 DEPLOY_RC_MARKER = "RC_COMMIT_SHA"
 
-# The tier switch's variable. The driver exports it and greps the candidate for
-# it; nothing on main reads it yet.
-EVAL_TIER_MARKER = "EVAL_TIER"
+# The matrix the driver exports to the candidate's ci-eval-pr.sh. `presubmit`
+# and not `nightly` because step 5 of nightly-pipeline.yml stops waiting for
+# the verdict at 330 minutes and the full catalog does not finish in that;
+# hack/ci-eval-rc.sh's RC_EVAL_TIER block has the measurements.
+EXPECTED_RC_EVAL_TIER = "presubmit"
 
 # bench-gate's per-case roll-up, which the real hack/ci-eval-pr.sh writes with
 # --markdown-out. RC_VERDICT_FILE in hack/ci-eval-rc.sh is the other half of the
@@ -164,9 +166,10 @@ class RcEvalDriverFixture:
             )
         (hack / "ci-deploy.sh").write_text(deploy_stub, encoding="utf-8")
 
-        # The tier note keys off the string EVAL_TIER appearing in the
-        # candidate's ci-eval-pr.sh, so the stub for a candidate that predates
-        # the tier must not mention it anywhere — including in its trace lines.
+        # `eval_supports_tier=False` models a candidate cut before #1175, whose
+        # ci-eval-pr.sh has no tier switch to read. The stub must not mention
+        # EVAL_TIER anywhere — including in its trace lines — or it is not that
+        # candidate.
         # bench-gate's roll-up artifact, written before the exit so that a
         # non-zero eval still leaves it behind: that ordering is what makes the
         # file mean "a catalog was graded" rather than "the eval succeeded".

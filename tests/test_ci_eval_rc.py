@@ -31,8 +31,8 @@ import unittest
 
 from tests.testing.rc_eval_driver import (
     DEPLOY_RC_MARKER as _DEPLOY_RC_MARKER,
-    EVAL_TIER_MARKER as _EVAL_TIER_MARKER,
     EXPECTED_DECK_URL as _EXPECTED_DECK_URL,
+    EXPECTED_RC_EVAL_TIER as _EXPECTED_RC_EVAL_TIER,
     RC_TAG as _RC_TAG,
     RcEvalDriverFixture,
 )
@@ -107,10 +107,12 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         trace = self.trace.read_text(encoding="utf-8")
         self.assertEqual(trace.count(f"RC_COMMIT_SHA={candidate}"), 2, trace)
-        # `nightly`, not a value of this lane's own: #1175's switch exits 1 on
-        # anything it does not know, so inventing `rc` here would break the day
-        # the two land together.
-        self.assertEqual(trace.count("TIER=nightly"), 2, trace)
+        # One of #1175's two values and not a name of this lane's own: its
+        # switch exits 1 on anything it does not know, and it exits 1 after the
+        # pool lease rather than before it.
+        self.assertEqual(
+            trace.count(f"TIER={_EXPECTED_RC_EVAL_TIER}"), 2, trace
+        )
 
     def test_survives_a_candidate_whose_tree_lacks_the_driver(self):
         """The checkout deletes the running script; the run must finish anyway.
@@ -154,17 +156,20 @@ class RcEvalDriverTestCase(unittest.TestCase):
             self.steps(), ["resolve"], "the refusal must land before deploying"
         )
 
-    def test_notes_but_allows_a_candidate_without_the_tier_switch(self):
-        """A smaller matrix than intended is a note; it is not a wrong verdict.
+    def test_grades_a_candidate_that_predates_the_tier_switch_without_a_note(self):
+        """The two agree on the matrix, so there is nothing left to warn about.
 
-        This is the ordinary case, not a legacy one: the tier switch is not on
-        main, so every candidate reaches here until it lands.
+        A candidate cut before #1175 has no switch to read and falls back to
+        the presubmit matrix, which is what RC_EVAL_TIER exports anyway. The
+        driver used to print a note here saying the run measured something
+        narrower than the lane intended; that stopped being true when the lane
+        settled on the presubmit matrix, and a note nobody can act on is how
+        the comment this change removed survived nineteen days.
         """
         root, _ = self.build_repo(eval_supports_tier=False)
         result = self.run_driver(root)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("carries no EVAL_TIER switch", result.stdout)
-        self.assertIn("presubmit matrix", result.stdout)
+        self.assertNotIn("carries no EVAL_TIER switch", result.stdout)
         self.assertEqual(self.steps(), ["resolve", "deploy", "eval"])
 
     def test_finishes_the_run_after_its_own_file_is_emptied_mid_step(self):
@@ -198,33 +203,36 @@ class RcEvalDriverTestCase(unittest.TestCase):
         deploy = (_REPO_ROOT / "hack" / "ci-deploy.sh").read_text(encoding="utf-8")
         self.assertIn(_DEPLOY_RC_MARKER, deploy)
 
-    def test_the_tier_marker_is_a_string_the_real_ci_eval_pr_reads(self):
-        """The driver's export and the candidate's switch must be one string.
+    def test_the_exported_tier_is_the_presubmit_matrix(self):
+        """The lane grades 54 units, not 126, and the clock is why.
 
-        The half that can be checked today is the driver's: it greps the
-        candidate for the same name it exports, so a rename on one side alone
-        makes the grep vacuous. The candidate's half waits on #1175, which is
-        what adds the switch to hack/ci-eval-pr.sh.
+        Step 5 of nightly-pipeline.yml withdraws the nomination if no verdict
+        has arrived in 330 minutes, and it cannot wait longer: a GitHub-hosted
+        job is killed at 360. The nightly tier does not finish in that window —
+        ci-kube-agents-eval-nightly grades the same matrix and took 357 and 401
+        minutes on the two runs that finished in the week to 2026-09-23.
 
-        A skip rather than @unittest.expectedFailure, deliberately. An
-        expected failure that starts passing is an unexpectedSuccess, which
-        unittest counts as a failure and exits 1 — so #1175 landing would have
-        reddened main's Python suite, with the failure naming this file rather
-        than the change that caused it.
+        This pins the value rather than only checking the evaluator accepts it,
+        because `nightly` is also accepted. It was `nightly` from #1230 until
+        the wall-clock measurements on #1842, and the comment that made that
+        look harmless said #1175's switch was not on main — 29 minutes after it
+        was. A silent flip back reds here rather than on the next deploy that
+        does not happen.
         """
         driver = _CI_EVAL_RC.read_text(encoding="utf-8")
         self.assertIn(
-            _EVAL_TIER_MARKER,
+            f'readonly RC_EVAL_TIER="{_EXPECTED_RC_EVAL_TIER}"',
             driver,
-            "the driver must export the marker it greps the candidate for",
+            "widening the tier needs the verdict to arrive somewhere that is "
+            "not a GitHub-hosted job holding a connection open for it",
         )
         evaluator = (_REPO_ROOT / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")
-        if _EVAL_TIER_MARKER not in evaluator:
-            self.skipTest(
-                f"{_EVAL_TIER_MARKER} is not on main yet (#1175), so the "
-                "driver's export is inert and its note fires on every "
-                "candidate — the case above covers that state"
-            )
+        self.assertIn(
+            f"  {_EXPECTED_RC_EVAL_TIER})",
+            evaluator,
+            "ci-eval-pr.sh's tier case must accept what the driver exports, or "
+            "the run exits 1 after taking a pool project",
+        )
 
     # ─── Reporting ──────────────────────────────────────────────────────────
 

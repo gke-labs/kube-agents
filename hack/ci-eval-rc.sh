@@ -7,9 +7,9 @@
 # whether the candidate reaches the staging cluster. Step 5 of
 # staging-promotion-pipeline.yml polls this run's artifacts and pushes the staging_ tag
 # staging-deploy.yml triggers on only when the summary below says GREEN. How
-# wide that evaluation is depends on a tier switch that has not landed yet --
-# see RC_EVAL_TIER below, which is the one place in this file describing
-# something the repository does not have.
+# wide that evaluation is, RC_EVAL_TIER below decides: the presubmit matrix,
+# and deliberately not the full catalog, because the step that waits for this
+# verdict gives up before the full catalog finishes.
 #
 # The word in the summary is the verdict, not this script's exit status, and the
 # three-way split is why. An exit status has two values and this lane has three
@@ -78,20 +78,36 @@
 
 set -euo pipefail
 
-# The tier exported to ci-eval-pr.sh. NOTHING READS IT TODAY: the switch that
-# would is #1175's and is not on main, so `grep EVAL_TIER` finds only this file.
-# Every run therefore measures the presubmit matrix, and the NOTE below prints
-# for every candidate rather than only for old ones. That is a smaller run than
-# the lane intends, not a wrong one, which is why it is a note and not a
-# failure. The export is here so the lane widens to the full catalog on the day
-# that switch merges, with no edit to this file.
+# The tier exported to ci-eval-pr.sh, and so which matrix this lane grades:
+# `presubmit` is the 18-case merge-blocking set, `nightly` appends the 24
+# nightly-only cases for 42. At three repetitions, 54 units against 126.
 #
-# `nightly` and not a value of this lane's own, because #1175's switch rejects
-# anything it does not know: a value invented here would exit 1 the day the two
-# land together. What distinguishes this run from the main-branch nightly is
-# RC_COMMIT_SHA, which ci-eval-pr.sh already reads as the third condition on
-# the baseline store, so the tier does not have to carry that meaning too.
-readonly RC_EVAL_TIER="nightly"
+# It is the smaller one because of the clock, not because the other cases are
+# unwanted. Step 5 of nightly-pipeline.yml waits 330 minutes for this verdict
+# and then withdraws the nomination, and that 330 is the last of three
+# ceilings: a GitHub-hosted job is killed at 360, so the waiting job is capped
+# at 345 to leave itself room to write a summary. The nightly tier does not fit
+# under it. ci-kube-agents-eval-nightly grades the same 126 units on the same
+# pool, and in the week to 2026-09-23 its two runs that finished took 357 and
+# 401 minutes while four were killed at its own 480-minute deadline. The rate
+# those two imply puts 54 units near 175 minutes, which would leave the poller
+# room for a slow night -- an estimate, not a measurement: no run of this lane
+# has graded the presubmit matrix since #1620, so the first one to do so is
+# what confirms the headroom.
+#
+# This read `nightly` from #1230 until now, under a comment saying #1175's
+# switch was not on main so nothing read the export. That was true when it was
+# written and false when it merged: #1175 landed 12:18 on 2026-09-05 and #1230
+# 12:47, twenty-nine minutes later. The lane therefore graded the full catalog
+# from its first run, unintentionally, and the timeout in oss-test-infra was
+# sized for the matrix the comment described. #1620 grew the nightly roster at
+# 00:07 on 2026-09-16; every run of this lane from that morning on was killed
+# at its deadline. #1842 holds the measurements.
+#
+# Widening this back to `nightly` needs the verdict to arrive somewhere that is
+# not a GitHub-hosted job holding a connection open for it. Until then the full
+# catalog runs in the nightly periodic, where nothing is waiting on the clock.
+readonly RC_EVAL_TIER="presubmit"
 
 # Written by resolve-rc-target.sh through RC_TARGET_OUTPUT: the tag and commit
 # in key=value form, for anything downstream that needs to know what was
@@ -120,16 +136,10 @@ readonly PROW_DECK_BUILD_BASE="https://oss.gprow.dev/view/gs/kube-agents-prow/lo
 # leased project and measure something that was never published.
 readonly DEPLOY_RC_MARKER="RC_COMMIT_SHA"
 
-# The same question asked of the candidate's ci-eval-pr.sh, with a softer
-# answer: absent, the tier switch is not there to read and the run measures
-# the presubmit matrix. Absent is the norm until #1175 lands, so expect this
-# one to fire on every candidate for now.
-readonly EVAL_TIER_MARKER="EVAL_TIER"
-
 # The siblings this script drives. Named because each name is a contract with
-# hack/ -- the marker greps above read the same files the invocations below
-# run, and a rename that moved one and not the other would leave this grepping
-# a file nobody was about to execute.
+# hack/ -- the marker grep above reads the same file one of the invocations
+# below runs, and a rename that moved one and not the other would leave it
+# grepping a file nobody was about to execute.
 readonly DEPLOY_SCRIPT="ci-deploy.sh"
 readonly EVAL_SCRIPT="ci-eval-pr.sh"
 readonly RESOLVE_SCRIPT="resolve-rc-target.sh"
@@ -261,9 +271,10 @@ main() {
     echo "       Measure a candidate cut after that path landed, or pin one with RC_TAG." >&2
     exit 1
   fi
-  if ! grep -q "${EVAL_TIER_MARKER}" "${script_dir}/${EVAL_SCRIPT}"; then
-    echo "NOTE: ${rc_tag} carries no ${EVAL_TIER_MARKER} switch, so this run measures the presubmit matrix rather than the full ${RC_EVAL_TIER} catalog. Expected until that switch lands; the verdict is valid for the cases it ran."
-  fi
+  # No equivalent guard on the candidate's ci-eval-pr.sh: a candidate cut
+  # before #1175 has no tier switch to read, and the matrix it falls back to is
+  # the presubmit one this lane exports anyway. The two agree, so there is
+  # nothing to warn about. Widening RC_EVAL_TIER would bring the check back.
 
   # ─── Steps 3 and 4: deploy the candidate, then grade it ───────────────────
   # RC_COMMIT_SHA is what puts ci-deploy.sh on the published-image path and
