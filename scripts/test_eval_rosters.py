@@ -120,8 +120,9 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
-# (case, the presubmit line it follows); the same case leaves NIGHTLY_AT_SPLIT
-# below, since the nightly runs both files and lists no case twice.
+# (case, the presubmit line it follows); the same case leaves the nightly
+# expectation (NIGHTLY_AT_SPLIT or ADDED_AFTER_THE_SPLIT, whichever registered
+# it), since the nightly runs both files and lists no case twice.
 PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
 ]

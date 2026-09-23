@@ -81,7 +81,8 @@
 # "gateway" running registry.k8s.io/pause:3.9, with no PodDisruptionBudget in
 # the namespace. Its defect is declarative; at runtime it is healthy, which
 # is the property this case uses. Isolation class: read-only. Eligible tier:
-# presubmit.
+# nightly since 2026-09-22 (held out on #1010; a presubmit case from
+# 2026-08-26 until the presubmit became the blocking roster only).
 #
 # Fixture sharing to coordinate on: obtainability-planted-pdb reads the same
 # role and asserts the same two facts — replicas still 2, still no PDB in

@@ -143,8 +143,10 @@ def green_tasks():
 
 
 def full_tasks():
-    """Eighteen passing cases: a full run in rule 7's sense (SLOW_MIN_TASKS)."""
-    return [task(f"case-{k}", "ppp") for k in range(18)]
+    """A full run in rule 7's sense: eighteen passing cases (the presubmit's
+    size when these fixtures were cut), or one above the floor read from the
+    presubmit file once the roster grows past that."""
+    return [task(f"case-{k}", "ppp") for k in range(max(18, health.SLOW_MIN_TASKS + 1))]
 
 
 def broken_tasks(cases):

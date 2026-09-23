@@ -515,7 +515,7 @@ class RenderedFilesTest(unittest.TestCase):
 # The blocking roster as the split left it (test_eval_rosters.ROSTER_AT_SPLIT).
 # BrowserTest renders the fixture week against THIS roster, not the live
 # hack/eval/blocking-roster.txt: the run page counts gate cases from the
-# roster, so every admission since (#1023 admitted the eleventh) would
+# roster, so every admission since (#1023 admitted two on 2026-09-22) would
 # otherwise move the "10 gate cases" the expectations below pin.
 ROSTER_AT_SPLIT = frozenset({
     "reliability-pdb-probe",

@@ -221,6 +221,18 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
+Since 2026-09-22 those rungs reach only the cases the presubmit runs, which are the roster's
+twelve, and that narrows what a pull request can be redded for. The two held-out cases that
+used to exercise the GitHub-write path on every pull request — `rca-remediation-pr`
+(submit-suggestion opening a pull request) and the `compliance-rbac-overgrant` canary (the
+minted token, the cloned `*-infra` workspace, the ledger write) — are nightly cases now, so
+no presubmit case writes to GitHub at all: a change that breaks submit-suggestion, the token
+minter, the ledger write or the `pull_request_opened` / `ledger_issue_contains` verifiers reds
+nothing on the pull request that introduces it and is first seen by the next nightly that
+finishes grading. The eval crew took that trade with the policy; the way to close it is a
+GitHub-write probe cheap enough to earn a roster seat on its nightly record, and until one
+exists a pull request that touches that path should say what it ran by hand.
+
 ## Demoting a flaky case
 
 If an admitted case reds a pull request its diff cannot explain on a graded failure,
