@@ -27,9 +27,17 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import collect
+from eval_dashboard import collect, nightly, tiers
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata"
+
+# The nightly of 2026-09-21 (#1491), the second night the Prow deadline ended
+# with every unit finished and nothing graded. Its driver lines and Prow
+# metadata are real; the four grading blocks are what hack/ci-eval-pr.sh
+# prints since it grades each case inside the fan-out, spliced in at the
+# repetition-3 `finished` lines (SCHEMA.md, Fixtures).
+NIGHTLY_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly"
+BUILD_NIGHTLY_CUT = "2102186223282950144"
 
 # Real multi-repetition builds (see SCHEMA.md's fixtures table): the grading
 # blocks the single-rep-era fixtures above predate.
@@ -133,6 +141,76 @@ class TestFixtureParsing(unittest.TestCase):
             [run["build_id"] for run in data["runs"]],
             [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL],
         )
+
+
+class TestTruncatedNightlyFixture(unittest.TestCase):
+    """A deadline-cut night keeps the cases it graded (#1491).
+
+    Until 2026-09-22 the grading, the record and the verdict table were all
+    downstream of the fan-out's `wait`, so a night the 480m deadline ended
+    left a log with 122 `finished` lines and no `Task ... Result:` line, and
+    the Nightly report counted it 0/0/0/0. With the grading per case, the
+    blocks are in the log the moment each case's last repetition finishes --
+    three of them here after the SIGTERM, inside the grace period -- and the
+    EXIT trap prints a cut-off line that is deliberately not a verdict line,
+    so the night still reads as truncated, now with its graded cases counted.
+    """
+
+    def run_record(self) -> dict:
+        build_dir = NIGHTLY_TESTDATA / BUILD_NIGHTLY_CUT
+        return collect.build_run(
+            BUILD_NIGHTLY_CUT, collect._dir_reader(build_dir),
+            tier=tiers.TIER_NIGHTLY, job=nightly.DEFAULT_NIGHTLY_JOB,
+        )
+
+    def test_the_graded_cases_survive_the_deadline(self):
+        run = self.run_record()
+        self.assertEqual(run["result"], "FAILURE", "Prow records a deadline as FAILURE, not ABORTED")
+        self.assertIsNone(run["eval_verdict"], "the cut-off line is not a verdict line")
+        self.assertEqual(run["duration_s"], 1790064220 - 1790035235, "no verdict line: finished - started")
+        self.assertEqual((run["pr"], run["head_sha"], run["project"]), (None, "fefbf06", "kube-agents-evals-27"))
+        self.assertEqual(
+            [(t["name"], t["result"], [r["result"] for r in t["reps"]]) for t in run["tasks"]],
+            [
+                ("rca-remediation-pr", "pass", ["infra", "pass", "pass"]),
+                ("security-overgrant-remediation-proposal", "pass", ["pass", "pass", "pass"]),
+                ("obtainability-pdb-semantics", "pass", ["pass", "pass", "pass"]),
+                ("cost-idle-pool-probe", "fail", ["pass", "pass", "fail"]),
+            ],
+        )
+
+    def test_blocks_survive_the_lines_other_lanes_print_around_them(self):
+        """A heartbeat line inside the first block, launch markers and the
+        SIGTERM tail between blocks: none of it detaches a rep line from
+        its case, and the three blocks printed after the cut-off line --
+        cases whose last repetition finished in the grace period -- parse
+        like the one before it."""
+        log = (NIGHTLY_TESTDATA / BUILD_NIGHTLY_CUT / "build-log.txt").read_text()
+        cut = log.index("Eval ended before its verdict")
+        self.assertIn('heartbeat sent for resource "kube-agents-evals-27"', log[log.index("Task rca-remediation-pr Result:"):cut])
+        self.assertIn("Process did not finish before 8h0m0s timeout", log[:cut])
+        self.assertEqual(log[cut:].count("Result: ["), 3)
+        run = self.run_record()
+        self.assertTrue(all(len(t["reps"]) == 3 for t in run["tasks"]))
+        self.assertEqual(run["tasks"][0]["reps"][0]["result"], "infra")
+        self.assertIn("exhausted its retries", run["tasks"][0]["reps"][0]["reason"])
+
+    def test_the_night_is_truncated_with_its_counts(self):
+        run = self.run_record()
+        names = [t["name"] for t in run["tasks"]]
+        data = {
+            "cases": [{"name": n, "domain": "x", "active": True, "nightly_active": True} for n in [*names, "agent-kanban-smoke"]],
+            "runs": [run],
+        }
+        night = nightly.night_document(run, data, None)
+        self.assertTrue(night["truncated"])
+        self.assertFalse(night["complete"])
+        self.assertEqual(night["counts"], {"expected": 5, "recorded": 4, "passed": 3, "partial": 1, "failed": 0, "infra": 0, "missing": 1})
+        self.assertEqual(night["missing"], ["agent-kanban-smoke"])
+        at = datetime(2026, 9, 22, 13, 0, tzinfo=timezone.utc)  # 9 AM ET that morning
+        line = nightly.digest_line(data, at)
+        self.assertIn("truncated after 8h 03m", line)
+        self.assertIn("4 of 5 cases recorded", line)
 
 
 class TestCaseDerivation(unittest.TestCase):
@@ -1141,7 +1219,9 @@ class TestNightlySource(_MergeBase):
         self.assertTrue(cases["reliability-pdb-probe"]["nightly_active"], "TASKS is in the nightly too")
         self.assertFalse(cases["obtainability-planted-pdb"]["active"])
         self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "a nightly-cases.txt entry")
-        self.assertFalse(cases["compliance-rbac-overgrant"]["nightly_active"] and not cases["compliance-rbac-overgrant"]["active"])
+        # Nightly-only since 2026-09-22 (#1023): the presubmit runs the blocking roster only.
+        self.assertFalse(cases["compliance-rbac-overgrant"]["active"])
+        self.assertTrue(cases["compliance-rbac-overgrant"]["nightly_active"], "a held-out case is a nightly case")
 
     def test_head_sha_falls_back_to_the_started_commit_for_a_periodic(self):
         """Prow writes `revision: main` in a periodic's finished.json and the
@@ -1188,16 +1268,23 @@ class TestRepoDerivedFacts(unittest.TestCase):
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
         self.assertEqual(cov["domains_total"], 11)
-        # incident-triage's presubmit coverage moved to the nightly tier on
-        # 2026-09-03 (tofu wall clock; #1202); the allowlist carries it until
-        # a non-tofu probe activates or the contract recognizes the tier.
-        self.assertEqual(cov["uncovered"], ["incident-triage"])
+        # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
+        # probe, took a roster seat, closing the gap open since the tofu case
+        # moved to the nightly tier on 2026-09-03 (#1202); the same day the
+        # presubmit became the blocking roster only, and the demoted (2026-09-02,
+        # #1171) compliance-rbac-overgrant canary took fleet-audits' coverage with it
+        # to the nightly (#1876), and remediation's coverage left with it:
+        # rca-remediation-pr is held out and pdb-remediation-pr's promotion
+        # was withdrawn until it has a record under its #1780 grader.
+        self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
         active = collect.active_task_names()
         self.assertIn("reliability-pdb-probe", active)
-        self.assertIn("compliance-rbac-overgrant", active)
+        self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
+        self.assertNotIn("compliance-rbac-overgrant", active)  # nightly only since 2026-09-22
+        self.assertNotIn("pdb-remediation-pr", active)  # nightly only; its 2026-09-22 promotion was withdrawn
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 

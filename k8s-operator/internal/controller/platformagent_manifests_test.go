@@ -5909,6 +5909,13 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 			"from %s:\n  overlay: %v\n  image:   %v", path, got, image.Kanban)
 	}
 
+	// Issue #1880: bound kanban stale running timeout to 30m (1800s) to prevent
+	// wedged workers from occupying dispatch slots until the 4h upstream default.
+	if got["dispatch_stale_timeout_seconds"] != 1800 {
+		t.Errorf("dispatch_stale_timeout_seconds = %v, want 1800 to bound kanban worker reclaim to 30m (#1880)",
+			got["dispatch_stale_timeout_seconds"])
+	}
+
 	// The CR field is the reason equality with the image is not enough on its own: it is
 	// documented as "board-wide cap on concurrent kanban workers", and reaching only a
 	// profile the gateway is not homed at is the same as not reaching anything.

@@ -143,8 +143,10 @@ def green_tasks():
 
 
 def full_tasks():
-    """Eighteen passing cases: a full run in rule 7's sense (SLOW_MIN_TASKS)."""
-    return [task(f"case-{k}", "ppp") for k in range(18)]
+    """A full run in rule 7's sense: eighteen passing cases (the presubmit's
+    size when these fixtures were cut), or one above the floor read from the
+    presubmit file once the roster grows past that."""
+    return [task(f"case-{k}", "ppp") for k in range(max(18, health.SLOW_MIN_TASKS + 1))]
 
 
 def broken_tasks(cases):
@@ -897,15 +899,33 @@ class SlowGate(unittest.TestCase):
         # is waiting on them.
         self.assertIsNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=6)), T0)["slow"])
         self.assertIsNotNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=5)), T0)["slow"])
-        # Ten cases is a run Prow cut short, not a full run, and an aborted
-        # run concluded nothing: the newest five full runs are then the
-        # baseline's own, at the typical length.
-        short = [task(f"case-{k}", "ppp") for k in range(10)]
+        # A run one case under the floor is a run Prow cut short, not a full
+        # run (the floor follows the presubmit file, one below its count), and
+        # an aborted run concluded nothing: the newest five full runs are then
+        # the baseline's own, at the typical length.
+        short = [task(f"case-{k}", "ppp") for k in range(health.SLOW_MIN_TASKS - 1)]
         self.assertIsNone(adjudicate(self.week([200] * 5, tasks=short), T0)["slow"])
         doc = self.week([200] * 5)
         for aborted in doc["runs"][-5:]:
             aborted["result"] = "ABORTED"
         self.assertIsNone(adjudicate(doc, T0)["slow"])
+
+    def test_the_floor_sits_one_demotion_below_the_live_presubmit(self):
+        # Since 2026-09-22 the presubmit runs the blocking roster only (twelve
+        # cases, #1023) and the floor is read from the presubmit file rather
+        # than pinned: a full-roster run is a full run, one demotion away it
+        # still is, and two demotions away (the ten-case run Prow cut short
+        # above, today) is not. A literal floor of 15 would never see a full
+        # run and the rule would go silent; a literal of any size would need
+        # an edit here on every admission or demotion.
+        n = len(health.eval_rosters.presubmit_cases())
+        self.assertGreaterEqual(n, 3)
+        full = [task(f"case-{k}", "ppp") for k in range(n)]
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=full), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=full[: n - 1]), T0)["slow"])
+        self.assertIsNone(adjudicate(self.week([200] * 5, tasks=full[: n - 2]), T0)["slow"])
+        self.assertEqual(health.SLOW_MIN_TASKS, n - 1, "one demotion below the live presubmit roster, on purpose")
+        self.assertEqual(health._slow_min_tasks(), n - 1)
 
     def test_an_episode_holds_until_the_median_is_under_1_1x_and_keeps_its_start(self):
         first = adjudicate(self.week([180] * 5), T0)

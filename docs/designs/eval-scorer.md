@@ -71,8 +71,9 @@ every pull request in the repo until it is fixed. §4.2 confirms this is live ra
 hypothetical — it is what kept the audit scenarios commented out in `TASKS` in
 `hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks returned `status: "error"` without
 an `issues: read` credential the Prow job supplied. That was rung 2 working, not misfiring; the job
-mounts one now. The canary `compliance-rbac-overgrant` runs on every presubmit, and the other audit
-scenarios run in the nightly tier only (`hack/eval/nightly-cases.txt`), kept
+mounts one now. The canary `compliance-rbac-overgrant` ran on every presubmit until 2026-09-22,
+when the presubmit became the blocking roster only (#1023) and the never-admitted canary joined the
+other audit scenarios in the nightly tier (`hack/eval/nightly-cases.txt`), where those had been kept
 out of the presubmit on cost. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
@@ -911,6 +912,21 @@ re-applies its OpenTofu GPU stack on **every** repetition, so the cost per repet
 of agent time the fixtures show. Confirm all three on the first three nights' measured wall clock and
 record the result on #1491; the dashboard's Nightly report carries each night's wall clock and
 whether the deadline cut it short.
+
+**A night the deadline cuts still records what it finished.** The nights of 2026-09-18 and
+2026-09-21 (builds 2101099042170736640 and 2102186223282950144) had finished 105 and 122 units when
+SIGTERM arrived and left nothing: the per-case grading, the `record` call and the verdict table were
+all downstream of the fan-out's `wait`, and the grading pass alone took 37 minutes on a full night.
+Since 2026-09-22 `hack/ci-eval-pr.sh` grades and records each case inside the fan-out, by the unit
+that finishes its last repetition (`finish_case`), so a finished case's `Task` block, its
+`case-<name>.json` and its baseline line exist before the deadline can arrive; a case with a
+repetition still running, or one that gave up on its lock, is not recorded until the loop after the
+fan-out, as before. `bench-gate record --recorded-manifest` (the `baseline-recorded.jsonl` artifact)
+keeps that pass from appending a case twice, and the EXIT trap's `report_partial_verdict` tables the
+graded cases into `eval-verdict.md` under a PARTIAL banner and prints a cut-off line that is
+deliberately not a verdict line, so the Nightly report counts the cases and still calls the night
+truncated. The presubmit grades per case too and gets the same table on a deadline kill; its store
+stays read-only, as `PULL_NUMBER` and the viewer-only identity already guarantee.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is
 not an open question: it has to be a dedicated one, or the read/write split cannot be expressed at

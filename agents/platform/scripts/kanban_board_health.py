@@ -76,10 +76,11 @@ Deliberately NOT checked:
   survives them, so a log or OTel alert on that line is the right vehicle and
   belongs to observability. Do not add a query for this.
 - *stale ``running`` cards.* ``detect_stale_running`` already reclaims them:
-  ``kanban.dispatch_stale_timeout_seconds`` resolves to 14400 from
-  ``hermes_cli/config_defaults.py`` (not from any file in this repo), and
-  ``release_stale_claims`` reclaims expired claims unconditionally. Alerting on
-  a state the harness is about to self-heal is how an alert gets muted.
+  ``kanban.dispatch_stale_timeout_seconds`` is configured to 1800 (30m) in
+  the chat profile and operator manifests (#1880, bounding stale running workers
+  from upstream's 14400s / 4h default), and ``release_stale_claims`` reclaims
+  expired claims unconditionally. Alerting on a state the harness is about to
+  self-heal is how an alert gets muted.
 - *cards stranded in ``ready``, stuck in ``blocked``, or failing repeatedly.*
   All three are strictly worse restatements of ``_rule_stranded_in_ready``,
   ``_rule_stuck_in_blocked`` and ``_rule_repeated_failures``, which are

@@ -1,10 +1,10 @@
-"""Unit tests for scripts/release/record_nightly_candidate_summary.sh.
+"""Unit tests for scripts/release/record_promotion_candidate_summary.sh.
 
-Step 1 of the nightly pipeline has two skips that mean different things, and
+Step 1 of the staging promotion pipeline has two skips that mean different things, and
 this summary is where a reader tells them apart: SKIP_PIPELINE means no
 candidate and no run, SKIP_PROMOTION means the matrix runs but a pass pushes
 nothing because the commit is already tagged for staging. Rendering one as the
-other would report a night that did nothing as a night that tested something.
+other would report a run that did nothing as a run that tested something.
 """
 
 import pathlib
@@ -15,14 +15,14 @@ import unittest
 from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_SCRIPT = _REPO_ROOT / "scripts" / "release" / "record_nightly_candidate_summary.sh"
+_SCRIPT = _REPO_ROOT / "scripts" / "release" / "record_promotion_candidate_summary.sh"
 
 _COMMIT = "1234567890abcdef1234567890abcdef12345678"
 _RC_TAG = "rc_20260830_120000_1234567_validated"
 _STAGING_TAG = "staging_20260830_120000_1234567"
 
 
-class RecordNightlyCandidateSummaryTest(unittest.TestCase):
+class RecordPromotionCandidateSummaryTest(unittest.TestCase):
     def _run(self, overrides=None, with_summary_file=True):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -121,13 +121,13 @@ class RecordNightlyCandidateSummaryTest(unittest.TestCase):
             cwd=tmp.name,
         )
         self.assertIn("### An earlier step", summary.read_text())
-        self.assertIn("### Nightly candidate", summary.read_text())
+        self.assertIn("### Promotion candidate", summary.read_text())
 
     def test_runs_outside_actions_without_a_summary_file(self):
         """No GITHUB_STEP_SUMMARY: print instead of failing on an unset path."""
         proc, _ = self._run(with_summary_file=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("### Nightly candidate", proc.stdout)
+        self.assertIn("### Promotion candidate", proc.stdout)
 
     def test_unset_inputs_do_not_abort(self):
         """Actions defines an `env:` key even when its expression is empty."""

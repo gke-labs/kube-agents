@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Records a quiet daily tick in the nightly scheduler's job summary.
+# Records a quiet daily tick in the staging promotion scheduler's job summary.
 #
-# The whole point of nightly-scheduler.yml is that a tick with nothing to promote
+# The whole point of staging-promotion-scheduler.yml is that a tick with nothing to promote
 # leaves no pipeline run behind to be mistaken for a passing one. That makes this
 # summary the only trace such a tick leaves, so it says explicitly that a green
 # scheduler here reports nothing about the last pipeline run's result.
@@ -12,7 +12,7 @@ RC_TAG="${RC_TAG:-}"
 SKIP_REASON="${SKIP_REASON:-}"
 
 render_summary() {
-  echo "### No nightly promotion required"
+  echo "### No staging promotion required"
   echo ""
   if [ -n "${SKIP_REASON}" ]; then
     echo "${SKIP_REASON}"

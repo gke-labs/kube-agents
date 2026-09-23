@@ -434,6 +434,33 @@ If you enabled Google Chat or Slack during the install, perform the following re
   ./scripts/installer/print_instructions_slack.sh
   ```
 
+#### Step 6: Talk to the Agent With No Chat Platform
+
+Both chat integrations are opt-in and off by default, so an install that enabled neither reaches
+the agent over `kubectl exec`. `install.sh` prints these two commands when you choose "None" at the
+chat prompt and again when it finishes, with the cluster, region, project and namespace already
+filled in:
+
+```bash
+gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
+kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes -p platform
+```
+
+- `--dns-endpoint` applies only to a cluster that publishes an externally reachable DNS endpoint;
+  `gcloud` rejects the flag on one that does not, so drop it there. The installer decides per
+  cluster ([`scripts/installer/gke_dns_endpoint.sh`](scripts/installer/gke_dns_endpoint.sh)).
+- `-c platform-agent` selects the Hermes container; the gateway pod runs three, so omitting it
+  works but makes `kubectl` warn about which one it picked.
+- `-p platform` reaches the Platform Agent directly. A bare `hermes` reaches the Planning Agent
+  front door, which is where a chat message would have landed. See the site's
+  [ChatOps](docs/site/src/content/docs/concepts/chatops.md) for the difference and for what a
+  chat-less install does not exercise.
+- `kubectl port-forward` is not an alternative here: the agent runs sandboxed under gVisor by
+  default and the forward cannot see into the sandbox. `kubectl exec` enters it.
+
+To add a chat platform later, re-run the installer with `--enable-google-chat` or `--enable-slack`
+and follow Step 5.
+
 ---
 
 ## The Shell Sandbox
