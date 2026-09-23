@@ -55,7 +55,11 @@ at any duration, with a NodeNotReady pod event or no build log at all
 ``do``. A conflicted merge (``is_merge_conflict``, #1608) is the same shape
 again and is neither: it is the branch's own, so it is ``red`` and the
 ``do`` is a rebase rather than a retest. None of the three has cases to
-classify.
+classify. ``deadline-kill`` (``is_deadline_kill``, #1894) is the fourth
+run-level class -- a FAILURE with no eval verdict that ran to the job's
+timeout -- and the one that may carry cases: the harness records each case
+as it finishes (#1875), so the cases graded before Prow stopped the run are
+classified and shown, under the kill's headline and ``do``.
 
 ``runs`` may carry the nightly periodic's runs beside the presubmit's
 (SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
@@ -217,7 +221,7 @@ DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the p
 DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
-DO_DEADLINE_KILL = "Nothing yet. Prow killed the run at its deadline before anything was graded; retest once the brief says runs are finishing again."
+DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
 DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
@@ -394,6 +398,22 @@ def is_deadline_kill(run: dict) -> bool:
         and not is_merge_conflict(run)
         and length is not None
         and length >= PROW_JOB_TIMEOUT - DEADLINE_KILL_MARGIN
+    )
+
+
+def _deadline_verdict(base: dict, condition: str | None, cases: list[dict]) -> dict:
+    graded = f"{len(cases)} case(s) finished before that; the rest were never graded." if cases else "Nothing was graded."
+    return dict(
+        base,
+        headline=f"Prow killed this run at its {int(PROW_JOB_TIMEOUT.total_seconds() // 60)}-minute deadline.",
+        lede=f"The run outlived the job's timeout before the eval reached a verdict. {graded}"
+        + ("" if condition != CONDITION_DEADLINE_KILL else " Other PRs are being killed the same way right now."),
+        verdict=VERDICT_INFRA,
+        setup_death=False,
+        cls=CLS_DEADLINE,
+        do=DO_DEADLINE_KILL,
+        cases=cases,
+        matches_incident=condition == CONDITION_DEADLINE_KILL,
     )
 
 
@@ -828,17 +848,7 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
                 matches_incident=condition == CONDITION_LOST_PODS,
             )
         if is_deadline_kill(run):
-            return dict(
-                base,
-                headline=f"Prow killed this run at its {int(PROW_JOB_TIMEOUT.total_seconds() // 60)}-minute deadline.",
-                lede="Nothing was graded: the run outlived the job's timeout before the eval reached a verdict."
-                + ("" if condition != CONDITION_DEADLINE_KILL else " Other PRs are being killed the same way right now."),
-                verdict=VERDICT_INFRA,
-                setup_death=False,
-                cls=CLS_DEADLINE,
-                do=DO_DEADLINE_KILL,
-                matches_incident=condition == CONDITION_DEADLINE_KILL,
-            )
+            return _deadline_verdict(base, condition, [])
         if is_merge_conflict(run):
             return dict(
                 base,
@@ -888,6 +898,11 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     run_ceiling = ceiling_reps(run) >= STORM_RUN_SIGNATURE_REPS
     cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
     cases = [c for c in cases if c["outcome"] is not None]
+    if is_deadline_kill(run):
+        # #1875: the cases that finished before Prow stopped it are recorded,
+        # the verdict never was. The kill is the run's class; the cases stay
+        # on the page for what they are worth.
+        return dict(_deadline_verdict(base, condition, cases), storm_reps=storm_reps(run), ceiling_reps=ceiling_reps(run))
 
     failed_names = {c["case"] for c in cases if c["outcome"] == OUTCOME_FAILED and c["admitted"]}
     if condition == CONDITION_SHARED_BREAK:

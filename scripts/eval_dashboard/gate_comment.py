@@ -25,14 +25,23 @@ truncated log, and says so. The nightly periodic's runs share data.json
 (`tier: nightly`, no pull request) and are dropped before anything is
 counted, so a green night never reads as another PR's pass (tiers.py).
 
-One zero-task run does get a comment: a lost pod -- the build node went
-away under the job (health.py rule 3b, #1478). Twelve authors saw a red
-with no log and no explanation on 2026-09-11; the comment is one line
-saying the node died, nothing was graded, and to /retest, with the same
-marker, edit-in-place and per-build dedupe as the red comment:
+Two runs without a graded repetition do get a comment. A lost pod -- the
+build node went away under the job (health.py rule 3b, #1478): twelve
+authors saw a red with no log and no explanation on 2026-09-11, so the
+comment is one line saying the node died, nothing was graded, and to
+/retest, with the same marker, edit-in-place and per-build dedupe as the
+red comment:
 
     ### ⚪ Smoke gate: run lost
     > The Prow build node running this job went away at 10:19 AM ET (...).
+
+And a deadline kill -- Prow ended the run at the job timeout with no
+verdict (rule 3d, #1894), tasks or not: one line saying when, and -- while
+health.json's condition is deadline_kill -- that the gate is down and the
+red is not the author's diff:
+
+    ### ⚪ Smoke gate: run killed at the deadline
+    > Prow killed this run at its 360-minute deadline at 10:19 AM ET; ...
 
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
@@ -152,12 +161,18 @@ FOOTER_LOST = "Ran {minutes} min before the node went away · [build log]({url})
 # no verdict. While health.json's condition is deadline_kill, the gate is down
 # and the box says so in the author's terms.
 HEADING_DEADLINE = "### ⚪ Smoke gate: run killed at the deadline"
-BOX_DEADLINE = "Prow killed this run at its {minutes}-minute deadline at {when}; nothing was graded and nothing about your change is implied."
+BOX_DEADLINE = "Prow killed this run at its {minutes}-minute deadline at {when}; no verdict was reached."
 BOX_DEADLINE_DOWN = (
     " **The gate is down: {runs} runs on {prs} PRs have been killed at the deadline since {since}; your run's failure is not your diff.**"
     " Don't retest yet; `/retest` once #kube-agents-ci-health says the gate is healthy again."
 )
-BOX_DEADLINE_QUIET = " `/retest` once runs are finishing again; the build log shows how far the units got."
+# No deadline outage is declared, so the kill may be the branch's: a change
+# that hangs the eval or the harness ends the same way (health.py, "one PR
+# looping to the deadline is that PR's problem").
+BOX_DEADLINE_QUIET = (
+    " No gate outage is declared, so this may be the branch: a change that hangs the eval ends this way too."
+    " The build log shows how far the units got; `/retest` if other PRs' runs are finishing and yours has no reason not to."
+)
 FOOTER_DEADLINE = "Ran {minutes} min to the deadline · [build log]({url})"
 CONDITION_LOST_PODS = health.LOST_PODS
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"

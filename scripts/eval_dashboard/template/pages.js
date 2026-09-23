@@ -57,8 +57,8 @@ const PAGE = {
   // The adjudicator's STORM_COOLDOWN: retest this long after the last storm-hit run.
   stormCooldownMs: 30 * 60 * 1000,
   // An incident's window opens this long before its `since`: the rule's own
-  // lookback (shared break 6 h; storm, delegation ceiling, setup deaths and
-  // lost pods 2 h), so
+  // lookback (shared break 6 h; storm, delegation ceiling, setup deaths,
+  // lost pods and deadline kills 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
   incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000, deadline_kill: 2 * 3600 * 1000 },
@@ -715,6 +715,11 @@ function briefHeadline(inc, inWindow) {
   return { head: inc.past ? "A past gate incident" : "The gate is degraded", lede: esc(inc.cause || "") };
 }
 
+// The bar out of a deadline-kill outage is a verdict either way (health.py
+// `recovered`): a red that graded proves the gate grades again.
+function verdictRecovery(inc) { return inc.condition === "deadline_kill"; }
+function recoveryBarText(inc) { return verdictRecovery(inc) ? "runs with a verdict" : "clean runs"; }
+
 function recoveryProgress(inc) {
   // No start on record: nothing is "after" the incident, so no run counts.
   if (inc.sinceMs == null) return 0;
@@ -722,7 +727,7 @@ function recoveryProgress(inc) {
   const prs = new Set();
   let count = 0;
   for (const run of later) {
-    if (!isGreen(run) || run.matches_incident) break;
+    if (verdictRecovery(inc) ? run.cls === "deadline-kill" : (!isGreen(run) || run.matches_incident)) break;
     if (run.pr != null && prs.has(run.pr)) continue;
     prs.add(run.pr);
     count += 1;
@@ -755,7 +760,7 @@ function agentSawHtml(inc, inWindow) {
   if (inc.condition === "deadline_kill") {
     const killed = [...inWindow].reverse().find((r) => r.cls === "deadline-kill");
     const url = killed ? buildUrl(killed) : null;
-    return `<p>No verdict was reached. The build log is the evidence${url ? `: <a href="${esc(url)}">${esc(prText(killed.pr))} at ${esc(et(runFinish(killed)))}</a>` : ""}; its units end at the delegation ceiling.</p>`;
+    return `<p>No verdict was reached. The build log is the evidence${url ? `: <a href="${esc(url)}">${esc(prText(killed.pr))} at ${esc(et(runFinish(killed)))}</a>` : ""}; it shows how far the units got (on 2026-09-22 every unit ended at the delegation ceiling, #1880).</p>`;
   }
   if (inc.condition === "setup_deaths") {
     const death = [...inWindow].reverse().find((r) => r.setup_death);
@@ -789,8 +794,8 @@ function changedBeforeHtml(inc, inWindow) {
 
 function beingDoneHtml(inc) {
   const lines = [];
-  if (inc.tracking.length) lines.push(`<p>Tracking ${inc.tracking.map(issueLink).join(", ")}. The gate comes back on its own once the fix lands: the bot reports healthy after ${PAGE.recoveryGreenRuns} clean runs on different PRs.</p>`);
-  if (inc.recovering) lines.push(`<p><b>The condition has cleared.</b> A retest is reasonable now; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far.</p>`);
+  if (inc.tracking.length) lines.push(`<p>Tracking ${inc.tracking.map(issueLink).join(", ")}. The gate comes back on its own once the fix lands: the bot reports healthy after ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on different PRs.</p>`);
+  if (inc.recovering) lines.push(`<p><b>The condition has cleared.</b> A retest is reasonable now; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on distinct PRs so far.</p>`);
   else if (isBreak(inc) && !inc.tracking.length && !inc.past) lines.push(`<p>No issue is filed yet. File one with the <code>presubmit-gate</code> label and link this page. Demoting the case in <code>hack/eval/blocking-roster.txt</code> unblocks merges while the fixture is fixed; re-admit it afterwards.</p>`);
   else if (inc.condition === "storm" && !inc.past) {
     const retest = stormRetestMs(inc);
@@ -863,7 +868,7 @@ function lastIncidentHtml() {
   const past = historyIncidents().map(incidentFromHistory).filter((inc) => inc.sinceMs != null).sort((a, b) => b.sinceMs - a.sinceMs);
   if (!past.length) return brief.history ? `<p class="mut">No incident on record yet.</p>` : `<p class="mut">No incident history is published yet, so only the current state is shown.</p>`;
   const inc = past[0];
-  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : "a degraded gate";
+  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : inc.condition === "deadline_kill" ? "runs killed at the job deadline" : "a degraded gate";
   return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a> <a href="${esc(trendHref(inc.cases, inc.sinceMs, inc.untilMs))}">The record on main around the night it started →</a></p>`;
 }
 
@@ -948,7 +953,7 @@ function briefHtml(link) {
       nightlyBriefHtml() + releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
-  if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death)) {
+  if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death || r.cls === "deadline-kill")) {
     // Nothing on record for the window (older than brief.json's run_days, or
     // the link points at a time with no runs): say so instead of counting zeros.
     const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}`;
@@ -960,7 +965,7 @@ function briefHtml(link) {
   const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "deadline_kill" ? deadlineFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
   const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}${inc.stale ? " · STALE" : ""}`;
   let recoveringLine = "";
-  if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far. A retest is reasonable.</div>`;
+  if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on distinct PRs so far. A retest is reasonable.</div>`;
   return `<div class="sec head">${pillHtml(inc.recovering ? "DEGRADED" : inc.state, pillText)}<h1>${head}</h1><div class="lede">${lede}</div>${recoveringLine}</div>` +
     (facts.length ? `<div class="sec" id="gate"><h2>${esc(whyTitle(inc))}</h2>${factsHtml(facts)}</div>` : "") +
     `<div class="sec"><h2>What the agent saw</h2>${agentSawHtml(inc, inWindow)}</div>` +
@@ -1061,7 +1066,8 @@ function runDoHtml(text) {
 
 function whatToDoHtml(run) {
   const items = [];
-  if (!measured(run) && run.do) items.push(runDoHtml(run.do));
+  // A deadline kill keeps its `do` whether or not cases finished before it.
+  if ((!measured(run) || run.cls === "deadline-kill") && run.do) items.push(runDoHtml(run.do));
   else if (run.setup_death || (!measured(run) && run.verdict === "infra")) items.push("<li><b>Retest.</b> Nothing ran, so nothing here is about your change.</li>");
   else if (!measured(run) && run.verdict === "green") items.push("<li><b>Nothing.</b> The gate revalidated this branch's earlier green run.</li>");
   else if (!measured(run)) items.push("<li><b>Read the build log.</b> The failure is before the eval loop; a broken image build or deploy on this branch looks like this.</li>");
@@ -1301,7 +1307,7 @@ function gridMarkers(win, cols) {
       seen.push({ t, cls });
       markers.push({ t, cls, label, title: `${et(t)} · ${label}` });
     };
-    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : "degraded");
+    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : inc.condition === "deadline_kill" ? "deadline kills" : "degraded");
     for (const inc of historyIncidents().map(incidentFromHistory)) {
       add(inc.sinceMs, "incident", `${inc.state.toLowerCase()}: ${what(inc)}`);
       add(inc.untilMs, "recovered", "healthy again");

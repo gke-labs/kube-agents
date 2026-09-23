@@ -351,9 +351,13 @@ class DeadlineKillComment(Harness):
         self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
         body = self.gh.bodies()[0]
         self.assertIn("### ⚪ Smoke gate: run killed at the deadline", body)
-        self.assertIn("> Prow killed this run at its 360-minute deadline at 10:55 AM ET; nothing was graded and nothing about your change is implied. `/retest` once runs are finishing again", body)
+        # No outage is declared, so the comment does not clear the branch: a
+        # change that hangs the eval ends the same way (health.py, one PR
+        # looping to the deadline is that PR's problem).
+        self.assertIn("> Prow killed this run at its 360-minute deadline at 10:55 AM ET; no verdict was reached. No gate outage is declared, so this may be the branch", body)
         self.assertIn("Ran 363 min to the deadline", body)
         self.assertNotIn("gate is down", body)
+        self.assertNotIn("not your diff", body)
 
     def test_during_the_outage_it_says_the_gate_is_down_and_not_to_retest(self):
         mine = killed(100, 1300, NOW - timedelta(minutes=5))
@@ -362,6 +366,7 @@ class DeadlineKillComment(Harness):
         self.assertIn("**The gate is down: 3 runs on 3 PRs have been killed at the deadline since Tue 10:05 AM ET; your run's failure is not your diff.**", body)
         self.assertIn("Don't retest yet", body)
         self.assertIn("[Incident brief →]", body)
+        self.assertNotIn("may be the branch", body)
 
     def test_a_long_red_with_a_verdict_is_not_a_kill(self):
         # Ran just as long, but graded: the ordinary red comment, not this one.

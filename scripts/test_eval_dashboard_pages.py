@@ -623,15 +623,30 @@ class BrowserTest(unittest.TestCase):
             "pod_phase": "Failed", "pod_last_event": None, "merge_conflict": False, "tasks": [],
         }
         data["runs"].append(killed)
+        # #1875: a killed run that recorded a case before Prow stopped it.
+        partial = dict(killed, build_id="2097282860221206600", pr=2, finished="2026-09-08T13:59:00+00:00", tasks=[copy.deepcopy(next(r for r in data["runs"] if r.get("tasks"))["tasks"][0])])
+        data["runs"].append(partial)
         out = render_to(pathlib.Path(self.tmp.name) / "deadline-brief", data, health=health)
         app = dom_text(out / "index.html")
         self.assertIn("OUTAGE · since Tue 8:00 AM ET", app)
         self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
         self.assertIn("Why we think it's the gate, not the PRs", app)
-        self.assertIn("ran to the job deadline and ended with no verdict", app)
+        # Both kills count, the one with cases too (the Brief reads the run-level cls).
+        self.assertIn("<b>2 runs</b> on 2 PRs ran to the job deadline and ended with no verdict", app)
         run_page = dom_text(out / "run.html", query="build=2097282860221206599")
         self.assertIn("Prow killed this run at its 360-minute deadline", run_page)
         self.assertIn("Runs killed at the deadline", run_page)
+        partial_page = dom_text(out / "run.html", query="build=2097282860221206600")
+        self.assertIn("Prow killed this run at its 360-minute deadline", partial_page)
+        self.assertIn("Retest once the brief says runs are finishing again", partial_page)
+        # The run-level item, not the copied case's own "Do:" line.
+        self.assertNotIn("<li><b>Fix the PR.</b>", partial_page)
+        # A lead window holding only zero-task kills is not an empty window.
+        only = dict(data, runs=[killed, dict(killed, build_id="2097282860221206601", pr=2, finished="2026-09-08T13:30:00+00:00"), dict(killed, build_id="2097282860221206602", finished="2026-09-08T13:00:00+00:00")])
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-brief-only", only, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
+        self.assertNotIn("No runs on record for this window", app)
 
     def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
         """A run whose every case ended at the ceiling passed nothing, so its row

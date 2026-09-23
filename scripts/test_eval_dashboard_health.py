@@ -600,6 +600,19 @@ class DeadlineKills(unittest.TestCase):
         self.assertEqual(result["metrics"]["infra_reds"], 3)
         self.assertEqual(result["metrics"]["pr_caused_reds"], 0)
 
+    def test_a_document_without_the_field_is_unknown_and_never_a_kill(self):
+        # SCHEMA.md: a record written before `eval_verdict` existed has no
+        # key. That is unknown, not "no verdict" -- the fixtures cut before
+        # the field, and any data.json from before it, must stay quiet.
+        raw = kill(1, 1, T0)
+        del raw["eval_verdict"]
+        self.assertFalse(health.Run(raw).deadline_kill)
+        self.assertTrue(health.Run(dict(raw, tasks=[task("agent-kanban-smoke", "ppp")])).has_verdict)
+
+    def test_recovering_advice_names_the_bar_the_condition_is_left_on(self):
+        self.assertIn("3 consecutive runs with a verdict on distinct PRs", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
+        self.assertIn("3 consecutive green runs on distinct PRs", health.advice_for("DEGRADED", "shared_break", [], None, {}, recovering=True))
+
     def test_deadline_advice(self):
         advice = adjudicate(self.kills([1, 1, 2]), T0)["advice"]
         self.assertIn("killed at the 360-minute deadline", advice)

@@ -27,9 +27,18 @@ lease those projects. So:
     and no OPEN issue labelled `presubmit-gate` already names every drifted role
     -> create one addressed to the fleet owner, and say "Tracking #NNN"
 
+The fourth shape (#1894): runs Prow killed at the job deadline with no
+verdict, 3+ on 2+ pull requests in 2 hours, so nothing is graded and nobody
+can pass. So:
+
+    the condition becomes `deadline_kill`
+    and no OPEN issue labelled `presubmit-gate` has "deadline" and "smoke" in its TITLE
+    -> create one for whoever owns the gate, and say "Tracking #NNN"
+
 The dedupe is against people: a human who filed first, with the case names
-(or the node names, or the role names) in the title or body, wins and the bot
-adopts their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
+(or the node names, or the role names) in the title or body -- or, for the
+deadline kills, those two words in the title -- wins and the bot adopts
+their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
 close it"). The bot never closes an issue -- a green gate is not proof the
 fixture is fixed, only that three runs passed, and the node events are still
 worth reading after the pool has healed itself.
@@ -59,8 +68,11 @@ CONDITION_DEADLINE_KILL = "deadline_kill"
 DEADLINE_MINUTES = 360
 # health.py RECOVERY_GREEN_RUNS, the bar the body quotes.
 RECOVERY_RUNS = 3
-# What an open issue must name to be adopted as the deadline-kill tracker.
-DEADLINE_KILL_NAMES = ("deadline", "pull-kube-agents-smoke-test")
+# What an open issue's TITLE must carry to be adopted as the deadline-kill
+# tracker. Title only: every bot-filed body names the job and quotes the
+# evidence block, which mentions deadline kills whenever one sits in the
+# window, so a body match would adopt a shared-break issue.
+DEADLINE_KILL_NAMES = ("deadline", "smoke")
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -118,7 +130,7 @@ The smoke gate (`{job}`) is in OUTAGE: since {since} ({since_iso}), {runs} runs 
 
 **Advice for authors:** don't retest until the Chat space reports the gate healthy; a run started now ends the same way.
 
-**For whoever picks this up:** each killed run's `build-log.txt` shows every unit reaching the delegation ceiling; the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. Recovery is reported after {recovery} runs with a verdict, green or red, on distinct PRs.
+**For whoever picks this up:** each killed run's `build-log.txt` shows how far its units got (on 2026-09-22 every unit reached the delegation ceiling, #1880); the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. Recovery is reported after {recovery} runs with a verdict, green or red, on distinct PRs.
 
 Incident brief: {brief}
 
@@ -305,15 +317,16 @@ class Tracker:
     def __init__(self, gh):
         self.gh = gh
 
-    def existing(self, names: list[str]) -> dict | None:
+    def existing(self, names: list[str], title_only: bool = False) -> dict | None:
         """An open `presubmit-gate` issue whose title or body names every
         one of `names` (the failing cases, or the lost nodes) -- a human got
-        there first."""
+        there first. `title_only` for names too common in bot-filed bodies."""
         issues = self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
         for issue in issues or []:
             if not isinstance(issue, dict) or issue.get("pull_request"):
                 continue
-            if names_all(f"{issue.get('title', '')}\n{issue.get('body', '')}", names):
+            text = issue.get("title", "") if title_only else f"{issue.get('title', '')}\n{issue.get('body', '')}"
+            if names_all(text, names):
                 return as_issue(issue)
         return None
 
@@ -359,9 +372,9 @@ class Tracker:
         return created
 
     def _ensure_deadline_kill(self, health: dict, since_text: str, window_text: str, brief_link: str) -> dict | None:
-        found = self.existing(list(DEADLINE_KILL_NAMES))
+        found = self.existing(list(DEADLINE_KILL_NAMES), title_only=True)
         if found:
-            log(f"tracking issue: adopting open #{found['number']} (names the deadline kills)")
+            log(f"tracking issue: adopting open #{found['number']} (its title names the deadline kills)")
             return dict(found, condition=CONDITION_DEADLINE_KILL)
         payload = {
             "title": render_deadline_kill_title(health, since_text),

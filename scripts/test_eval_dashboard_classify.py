@@ -426,6 +426,24 @@ class StormAndSetupTest(unittest.TestCase):
         short = dict(target, duration_s=344 * 60)
         self.assertEqual(classify_run(short, [short])["headline"], "The run failed before any case ran 344 minutes in.")
 
+    def test_a_deadline_kill_that_recorded_cases_is_still_the_kill(self):
+        # #1875: the cases graded before Prow stopped the run are shown, but
+        # the run's class, verdict and `do` are the kill's -- the same reading
+        # health.py counts and the gate comment gives it.
+        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[task(n, "ppp") for n in sorted(ADMITTED)[:2]])
+        target.update({"eval_verdict": None, "has_build_log": True, "pod_last_event": None, "merge_conflict": False})
+        verdict = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": []})
+        self.assertEqual((verdict["verdict"], verdict["cls"], verdict["do"]), ("infra", classify.CLS_DEADLINE, classify.DO_DEADLINE_KILL))
+        self.assertEqual(verdict["headline"], "Prow killed this run at its 360-minute deadline.")
+        self.assertIn("2 case(s) finished before that; the rest were never graded.", verdict["lede"])
+        self.assertTrue(verdict["matches_incident"])
+        self.assertEqual([c["outcome"] for c in verdict["cases"]], ["passed", "passed"])
+
+    def test_the_deadline_constants_are_healths(self):
+        from eval_dashboard import health
+
+        self.assertEqual((classify.PROW_JOB_TIMEOUT, classify.DEADLINE_KILL_MARGIN), (health.PROW_JOB_TIMEOUT, health.DEADLINE_KILL_MARGIN))
+
     def test_an_aborted_run_is_not_a_verdict(self):
         verdict = classify_run(run(1, 913, T0, minutes=8, result="ABORTED"), [])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))

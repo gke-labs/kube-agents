@@ -47,8 +47,10 @@ the cluster owner, unless an open `presubmit-gate` issue already names the
 lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
 designed state on two consecutive hourly scans or on three pool projects at
 once, #1550) files one for the fleet owner the same way, unless an open
-`presubmit-gate` issue already names the drifted roles. It never closes an
-issue. A GitHub failure is a warning: the message goes out with "no issue
+`presubmit-gate` issue already names the drifted roles. A new `deadline_kill`
+OUTAGE (runs killed at the job timeout with no verdict, #1894) files one for
+whoever owns the gate, unless an open `presubmit-gate` issue's title already
+names the deadline kills. It never closes an issue. A GitHub failure is a warning: the message goes out with "no issue
 yet" and the next change asks again.
 
 Delivery is the Google Chat REST API with the job's service account acting
@@ -680,7 +682,7 @@ def figure(value) -> str:
 def slow_text(slow: dict) -> str:
     """The numbers behind a slow gate, in minutes, as one clause: "the last
     5 full runs took 152–213 min (median 183) against a 7-day typical of
-    151 min (p90 198); 2 reps lost to 429s"."""
+    151 min (p90 198); 2 reps lost to 429s or empty records"."""
     # health.py's storm_reps: 429s and empty records alike (rep_kind), so the
     # note names both rather than calling an empty record a 429.
     lost = f"{slow['infra_reps']} reps lost to 429s or empty records" if slow.get("infra_reps") else "no reps lost"
@@ -1132,7 +1134,7 @@ def run(
     if tracker is not None and wants_issue:
         incident = health.get("incident") or {}
         since = parse_iso(health.get("since"))
-        if condition == CONDITION_LOST_PODS:
+        if condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
             start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
             issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True))
         else:

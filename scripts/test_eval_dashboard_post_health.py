@@ -1794,7 +1794,38 @@ class DeadlineKillMessages(RunHarness):
         self.assertTrue(body["title"].startswith("Smoke gate outage: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict since"), body["title"])
         self.assertIn("ran to Prow's 360-minute deadline and were killed with no eval verdict", body["body"])
         self.assertIn("#1826, #1838, #1877", body["body"])
+        # The span of the kills, not the incident's start twice over.
+        self.assertIn("**Window:** 3:40 PM–4:00 PM ET (2026-09-22T19:40:00+00:00 – 2026-09-22T20:00:00+00:00).", body["body"])
         self.assertIn("presubmit-gate", body["labels"])
+
+    def test_a_humans_issue_titled_for_the_deadline_kills_is_adopted(self):
+        human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": ""}
+        gh = FakeGh(open_issues=[human])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [], "nothing filed")
+        self.assertIn("Tracking #1894.", self.opener.texts[0])
+
+    def test_a_break_issue_whose_body_quotes_the_kills_is_not_adopted(self):
+        # Every bot-filed body names the job and quotes the evidence block,
+        # which mentions deadline kills whenever one sits in the window; only
+        # the title decides, or a shared-break issue becomes the tracker.
+        bot = {
+            "number": 1793,
+            "html_url": "https://github.com/gke-labs/kube-agents/issues/1793",
+            "title": "Smoke gate outage: 2 cases failing on every PR since Fri 9:00 AM ET",
+            "body": "The smoke gate (`pull-kube-agents-smoke-test`) is in OUTAGE.\n- deadline kills: 1 runs on 1 PRs killed at the 360-minute deadline with no verdict 12:40–12:40 UTC (#1)",
+        }
+        gh = FakeGh(open_issues=[bot])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        self.assertNotIn("#1793", self.opener.texts[0])
+
+    def test_the_copied_constants_are_healths(self):
+        from eval_dashboard import gate_issue, health
+
+        self.assertEqual(post_health.DEADLINE_MINUTES, int(health.PROW_JOB_TIMEOUT.total_seconds() // 60))
+        self.assertEqual(gate_issue.DEADLINE_MINUTES, post_health.DEADLINE_MINUTES)
+        self.assertEqual(gate_issue.RECOVERY_RUNS, health.RECOVERY_GREEN_RUNS)
 
     def test_the_recovery_names_the_kills(self):
         self.assertEqual(post_health.short_cause({"condition": "deadline_kill"}), "runs were being killed at the deadline")

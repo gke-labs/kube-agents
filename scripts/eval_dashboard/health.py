@@ -6,9 +6,11 @@ same mechanical procedure: open the dashboard, find the reds of the last few
 hours, ask whether the same cases failed on unrelated pull requests (a shared
 fixture broke -- #1278), whether the repetitions were lost to 429s and empty
 records rather than graded (a quota storm -- #1225, #1097), whether runs
-died before any task ran (setup failures), or whether the build cluster lost
-the node the pod was on (lost pods -- #1478). Nobody derives that from a
-heatmap at 8am, so this turns the procedure into a job.
+died before any task ran (setup failures), whether the build cluster lost
+the node the pod was on (lost pods -- #1478), or whether Prow killed the
+runs at the job deadline with nothing graded (deadline kills -- #1894).
+Nobody derives that from a heatmap at 8am, so this turns the procedure into
+a job.
 
 It is a pure function: data.json (schema v1, SCHEMA.md) plus the previously
 written health.json in -- and, when the hourly seeded-fleet scan has
@@ -90,9 +92,9 @@ FIXTURE_DRIFT = "fixture_drift"
 DELEGATION_CEILING = "delegation_ceiling"
 # Rule 3d (#1894): runs Prow killed at the job deadline with no verdict.
 DEADLINE_KILL = "deadline_kill"
-# The conditions whose evidence is not a full run -- a count of runs that
-# never became one, or the fleet scan's verdict; rule 6's entry check takes
-# the evidence itself as currency.
+# The conditions whose evidence is a count rather than a full run's
+# signature -- runs that never became one, runs Prow killed, or the fleet
+# scan's verdict; rule 6's entry check takes the count itself as currency.
 COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT, DEADLINE_KILL)
 
 # Prow's job verdicts (SCHEMA.md: runs[].result). ABORTED is a superseded
@@ -488,8 +490,11 @@ ADVICE_DEADLINE_KILL = (
 )
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
-    " after {count} consecutive green runs on distinct PRs."
+    " after {count} consecutive {bar} on distinct PRs."
 )
+RECOVERY_BAR_GREEN = "green runs"
+# Leaving a deadline-kill outage: a verdict either way proves the gate grades.
+RECOVERY_BAR_VERDICT = "runs with a verdict"
 ADVICE_STALE = "data.json last refreshed {generated_at} ({age} ago); the dashboard refresh is stalled and this state is that old."
 ADVICE_GREEN = ""
 
@@ -598,7 +603,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "eval_verdict", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -622,8 +627,10 @@ class Run:
         # recorded the field must keep reading the way it did.
         self.merge_conflict = run.get("merge_conflict") if isinstance(run.get("merge_conflict"), bool) else None
         # The eval loop's own verdict (SCHEMA.md, optional): None when the
-        # run never reached one, which a deadline kill never does.
+        # run never reached one, which a deadline kill never does. A document
+        # without the key is unknown, not "no verdict": it never makes a kill.
         self.eval_verdict = run.get("eval_verdict") if isinstance(run.get("eval_verdict"), str) else None
+        self.eval_verdict_recorded = "eval_verdict" in run
 
     @property
     def full(self) -> bool:
@@ -675,6 +682,7 @@ class Run:
         """Rule 3d's unit: Prow's deadline ended it, not the eval."""
         return (
             self.result == RUN_FAILURE
+            and self.eval_verdict_recorded
             and self.eval_verdict is None
             and not self.lost_pod
             and self.merge_conflict is not True
@@ -1139,7 +1147,7 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
         "red_runs": reds,
         # The digest's split of the reds: the pull request's own, and
         # everything else (shared breaks, storms, empty records, setup
-        # deaths, lost pods) as "infra".
+        # deaths, lost pods, deadline kills) as "infra".
         "pr_caused_reds": own,
         "infra_reds": reds - own + deaths + lost + kills_not_counted,
         "green_rate": round(len(green) / len(concluded), 3) if concluded else None,
@@ -1553,6 +1561,11 @@ def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
     return issues
 
 
+def recovery_bar(condition: str | None) -> str:
+    """What `recovered` counts on the way out of `condition`, in words."""
+    return RECOVERY_BAR_VERDICT if condition == DEADLINE_KILL else RECOVERY_BAR_GREEN
+
+
 def advice_for(
     state: str,
     condition: str | None,
@@ -1570,7 +1583,7 @@ def advice_for(
     if state == GREEN:
         return ADVICE_GREEN
     if recovering:
-        return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS)
+        return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS, bar=recovery_bar(condition))
     if condition == SHARED_BREAK:
         issues = all_tracking(cases, notes, issue)
         return ADVICE_OUTAGE.format(tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE)
@@ -1650,8 +1663,8 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         evidence.append(CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"])) + " overlaps the break")
 
     # Currency for rule 6's entry check: whether one of the newest full runs
-    # carries the firing condition's signature. Setup deaths and lost pods
-    # are not full runs; their count is their currency.
+    # carries the firing condition's signature. Setup deaths, lost pods and
+    # deadline kills are counted, not signed; their count is their currency.
     recent = full_runs[-TRANSITION_MIN_RUNS:]
     if condition == SHARED_BREAK:
         signature = r1["signature_runs"]
@@ -1885,9 +1898,8 @@ def adjudicate(
         issue = next((match for match in (issue_for(candidate, decided["condition"]) for candidate in candidates) if match), None)
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
-        bar = "runs with a verdict" if decided["condition"] == DEADLINE_KILL else "green runs"
         evidence.append(
-            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive {bar}"
+            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive {recovery_bar(decided['condition'])}"
             " on distinct PRs before reporting GREEN"
         )
     elif decided["state"] != assessed["state"] and SEVERITY[assessed["state"]] > SEVERITY[decided["state"]]:

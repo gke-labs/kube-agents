@@ -845,6 +845,10 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
         "lede": verdict.get("lede", ""),
         "matches_incident": verdict["matches_incident"],
         "setup_death": verdict.get("setup_death", False),
+        # The run-level class (a setup death or lost pod, a deadline kill, a
+        # conflicted merge), which the Brief's deadline facts and recovery
+        # count read; null for a run whose classes are per case.
+        "cls": verdict.get("cls"),
         "storm_reps": verdict.get("storm_reps", 0),
         "ceiling_reps": verdict.get("ceiling_reps", 0),
         "do": verdict.get("do", ""),
