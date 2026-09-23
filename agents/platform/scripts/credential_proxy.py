@@ -55,13 +55,44 @@ LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
-# Context name environment variable pinning the host cluster (#1799).
+# The cluster this broker runs on, as the operator names it in the pod spec. A
+# request that names no cluster resolves to this rather than to whatever the
+# base kubeconfig currently points at.
 HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
 
-# Default execution and request timeouts for kubectl (#1799).
+# Bounds on a one-shot kubectl read. kubectl's own client default is 300s, so a
+# control plane that is down, private or firewalled parks a broker worker for
+# five minutes; `_kubectl_runs_long` decides what counts as one-shot.
 DEFAULT_KUBECTL_TIMEOUT_SECONDS = 60
 DEFAULT_KUBECTL_REQUEST_TIMEOUT = "30s"
 ENV_KUBECTL_TIMEOUT_SECONDS = "CREDENTIAL_PROXY_KUBECTL_TIMEOUT_SECONDS"
+
+# kubectl invocations meant to outlast a one-shot read: no injected
+# `--request-timeout`, and the broker-wide deadline. `command_policy` refuses
+# most of these a layer earlier, but this decides a deadline rather than an
+# authorisation, so the list is the wider one. Exempting a verb that did not
+# need it only forgoes a bound; missing one breaks a command the shipped skills
+# tell the agent to run (`logs -f`, `rollout status`, `wait`).
+KUBECTL_LONG_RUNNING_VERBS = (
+    "attach",
+    "debug",
+    "delete",
+    "exec",
+    "port-forward",
+    "proxy",
+    "rollout",
+    "wait",
+)
+# `--follow` streams until the caller stops reading. Only meaningful on `logs`:
+# `-f` is `--filename` everywhere else, so it is matched against the verb rather
+# than against the whole argv.
+KUBECTL_FOLLOW_VERB = "logs"
+KUBECTL_FOLLOW_FLAGS = ("-f", "--follow")
+# `get`/`describe` with a watch flag stream too.
+KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
+# A caller who named their own bound has already answered the question; honour
+# it rather than overriding it with a shorter one.
+KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -1942,6 +1973,33 @@ def _is_get_credentials(argv: list[str]) -> bool:
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
 
 
+def _kubectl_runs_long(argv: list[str]) -> bool:
+    """Is this a kubectl that is meant to block, rather than a one-shot read?
+
+    Read off the verb -- the first argument that is not a flag, since global
+    flags may precede it -- plus the flags that make an otherwise-bounded verb
+    stream.
+    """
+    verb = ""
+    for arg in argv[1:]:
+        if not arg.startswith("-"):
+            verb = arg
+            break
+    if verb in KUBECTL_LONG_RUNNING_VERBS:
+        return True
+    if verb == KUBECTL_FOLLOW_VERB and any(
+        arg in KUBECTL_FOLLOW_FLAGS for arg in argv[1:]
+    ):
+        return True
+    if any(arg in KUBECTL_WATCH_FLAGS for arg in argv[1:]):
+        return True
+    return any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_TIMEOUT_FLAGS
+    )
+
+
 # Identity stamped on commits the proxy makes on the agent's behalf. `git commit`
 # exits 128 — "Please tell me who you are" — with no identity configured, and the
 # commit runs here rather than in the agent container, so a .gitconfig over there
@@ -3326,6 +3384,10 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # Read here rather than forwarded into `self.environment`: this decides
+        # which kubeconfig a request resolves to, and a subprocess has no
+        # business reading it or overriding it.
+        self.host_context = os.environ.get(HOST_CONTEXT_ENV, "").strip()
         # Applied per invocation in `_execute`, and only to git, rather than
         # written once to ~/.gitconfig: the identity then stays scoped to the
         # proxied commands that need it and leaves no ambient state in the
@@ -3443,17 +3505,18 @@ class CommandExecutor:
         # the pool existed -- regenerated on the ambient identity, never
         # selected on.
         scoped = executable == "kubectl"
-        if executable == "kubectl":
-            has_request_timeout = any(
-                arg == "--request-timeout" or arg.startswith("--request-timeout=")
-                for arg in command
-            )
-            if not has_request_timeout:
-                command = [
-                    command[0],
-                    f"--request-timeout={DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
-                    *command[1:],
-                ]
+        # Bound the one-shot read; a command meant to block keeps kubectl's own
+        # default. Decided here rather than in `_execute` because the argv
+        # arrives there carrying the flag this branch just injected, and reading
+        # it back would conclude the caller had asked for it.
+        kubectl_deadline: int | None = None
+        if executable == "kubectl" and not _kubectl_runs_long(command):
+            kubectl_deadline = self.kubectl_timeout_seconds
+            command = [
+                command[0],
+                f"--request-timeout={DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+                *command[1:],
+            ]
         command, flag_kubeconfig = self._reroute_kubeconfig_flags(command, scoped=scoped)
         if flag_kubeconfig is not None:
             # The flag beats the environment, because that is the precedence
@@ -3496,12 +3559,6 @@ class CommandExecutor:
             # taking roles/container.viewer off that identity is not a tidy-up
             # alongside this work but the half of it that covers this door.
             kubeconfig_path = self._default_kubeconfig()
-        elif executable == "kubectl" and HOST_CONTEXT_ENV in self.environment:
-            # When the caller names no cluster, resolve against the host cluster
-            # context pinned in the environment rather than whatever was last fetched (#1799).
-            kubeconfig_path = self._resolve_kubeconfig(
-                self.environment[HOST_CONTEXT_ENV], scoped=scoped
-            )
         else:
             kubeconfig_path = None
         return self._execute(
@@ -3509,6 +3566,7 @@ class CommandExecutor:
             stdin=stdin,
             cwd=cwd,
             kubeconfig_path=kubeconfig_path,
+            timeout_seconds=kubectl_deadline,
         )
 
     def execute_internal(
@@ -3960,18 +4018,21 @@ class CommandExecutor:
         return scoped
 
     def _ambient_target(self) -> ClusterTarget | None:
-        """The cluster the sidecar's own kubeconfig points at, if any.
+        """The cluster a request that names none resolves to.
 
-        This is the file `bootstrap` asked gcloud to write, so reading it is not
-        the same act as reading one the agent handed over — nothing here is
-        caller-controlled. It matters because `KUBECONFIG` is set in the base
-        environment: a `kubectl` request that names no kubeconfig at all still
-        reaches a cluster, and if the pool did not cover that path it would be
-        the one door left open onto the ambient credential.
+        `KUBECONFIG` is set in the base environment, so a `kubectl` naming no
+        kubeconfig at all still reaches a cluster, and if the pool did not cover
+        this path it would be the one door left open onto the ambient
+        credential.
+
+        The operator names the host cluster in the environment and that wins: it
+        is fixed for the life of the pod, while the kubeconfig's
+        `current-context` is whatever last wrote the file. The file is the
+        fallback, for a broker started outside the operator -- reading it is
+        safe because `bootstrap` wrote it, not the agent.
         """
-        host_context = self.environment.get(HOST_CONTEXT_ENV)
-        if host_context:
-            target = parse_gke_context(host_context.strip())
+        if self.host_context:
+            target = parse_gke_context(self.host_context)
             if target is not None:
                 return target
         try:
@@ -4132,8 +4193,10 @@ class CommandExecutor:
         Returned rather than written: the destination is a path in the agent's
         pod, which this process cannot see and must not be handed a route into.
         """
-        # Always execute into an isolated scratch file so the broker's own
-        # base config (watcher.config) is never mutated (#1799).
+        # Always execute into an isolated scratch file: left to itself gcloud
+        # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
+        # config, moving the `current-context` that every later context-less
+        # kubectl resolves against.
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch)
@@ -4162,6 +4225,7 @@ class CommandExecutor:
         kubeconfig_path: Path | None = None,
         containment_root: Path | None = None,
         extra_config: tuple[tuple[str, str], ...] = (),
+        timeout_seconds: int | None = None,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -4174,6 +4238,9 @@ class CommandExecutor:
         caller. `execute_workspace_git` passes the broker-owned content
         workspace root instead — the two roots are proven disjoint at startup,
         so widening the check here cannot widen the other path.
+
+        `timeout_seconds` overrides the broker-wide deadline for this one
+        command; `execute` passes the shorter kubectl bound through it.
         """
         started = time.monotonic()
         timed_out = False
@@ -4224,9 +4291,7 @@ class CommandExecutor:
             start_new_session=True,
         )
         effective_timeout = (
-            self.kubectl_timeout_seconds
-            if argv and Path(argv[0]).name == "kubectl"
-            else self.timeout_seconds
+            timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         )
         try:
             stdout_bytes, stderr_bytes = process.communicate(

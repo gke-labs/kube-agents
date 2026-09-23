@@ -723,16 +723,23 @@ Consequences:
   `SIGSEGV` on a deeply nested document, where the Python loader raises a
   catchable error. The input is chosen by the sandbox, so this is a
   denial-of-service boundary rather than a performance choice.
-- A `kubectl` command that specifies neither `--context` nor a `--kubeconfig`/`KUBECONFIG`
-  runs against the host cluster context (`KUBE_CONTEXT_NAME`). It does not follow whichever
-  cluster was most recently selected by `get-credentials`.
-- `gcloud container clusters get-credentials` writes into an isolated scratch kubeconfig rather
-  than mutating the broker's primary configuration (`watcher.config`). This keeps commands without
-  an explicit target on the host cluster and prevents one task's credentials from redirecting
-  another.
-- Proxied `kubectl` executions inject `--request-timeout=30s` when no request timeout is
-  provided and enforce a 60-second command deadline. An unreachable cluster fails fast rather than
-  holding the broker worker for `kubectl`'s 300-second default client timeout.
+- `gcloud container clusters get-credentials` runs against an isolated scratch
+  kubeconfig, and the result is filed under the context it names. It never writes
+  the broker's own base kubeconfig. That base file is where a `kubectl` naming no
+  kubeconfig resolves, and `bootstrap` sets its `current-context` — and its
+  default namespace — to the host cluster once at startup. Leaving it alone is
+  what keeps a context-less `kubectl` on the host cluster instead of following
+  whichever cluster was fetched last. Selecting a different cluster is done by
+  pointing `KUBECONFIG` at a per-target file, which is the pin the broker reads;
+  a bare `--context` is passed through to `kubectl` and will not find a context
+  the file it was handed does not contain.
+- Proxied `kubectl` reads get `--request-timeout=30s` and a 60-second deadline,
+  so an unreachable control plane fails in seconds rather than holding a broker
+  worker for `kubectl`'s 300-second client default. Commands that are meant to
+  block are exempt and keep that default: `wait`, `rollout`, `delete`, the
+  interactive verbs (`exec`, `attach`, `debug`, `port-forward`, `proxy`),
+  `logs --follow`, anything watching with `-w`, and any command whose caller
+  supplied its own `--timeout` or `--request-timeout`.
 
 ### Cloud API reads
 

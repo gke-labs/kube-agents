@@ -210,10 +210,23 @@ class ApplySubstitutionsTest(unittest.TestCase):
         text = self._read(d)
         self.assertNotIn(sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET, text)
         self.assertIn(sync.GKE_BASICS_NEW_CREDENTIALS_SNIPPET, text)
-        self.assertIn("KUBECONFIG=", text)
+        self._assert_credentials_snippet_pins_the_target(text)
         # Second call must be a no-op (replacement already present).
         self.assertFalse(sync.apply_substitutions(str(d), "gke-basics"))
         self.assertEqual(text.count(sync.GKE_BASICS_NEW_CREDENTIALS_SNIPPET), 1)
+
+    def _assert_credentials_snippet_pins_the_target(self, text):
+        # The two ways this snippet has been wrong. A `KUBECONFIG=` prefixed onto the
+        # `gcloud` line alone is unset again by the time the agent runs `kubectl`, which then
+        # reads the host cluster; and a file named for the cluster alone collides across
+        # projects and locations, so a `get-credentials` for one re-points every reader of the
+        # other. agents/platform/AGENTS.md ("Cluster Credentials") is the canonical form, and
+        # the name is the one _thread_kubeconfig_path builds.
+        self.assertIn("export KUBECONFIG=", text)
+        self.assertIn(
+            ".kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml", text
+        )
+        self.assertNotIn("kubeconfig_CLUSTER_NAME.yaml", text)
 
     def test_repo_basics_skill_carries_credentials_substitution(self):
         repo_root = Path(__file__).resolve().parent.parent
@@ -222,6 +235,7 @@ class ApplySubstitutionsTest(unittest.TestCase):
         for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-basics"]:
             self.assertNotIn(target, content)
             self.assertEqual(content.count(replacement), 1, replacement)
+        self._assert_credentials_snippet_pins_the_target(content)
 
 
 if __name__ == "__main__":

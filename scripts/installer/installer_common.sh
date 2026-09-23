@@ -48,9 +48,6 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
-# Request timeout for kubectl probes against live clusters in the installer.
-readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
-
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
 readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
@@ -1577,8 +1574,7 @@ write_tfvars_from_state() {
       # just destroyed black-holes TCP instead of refusing, and eight keys
       # times a hung connect stalls the install for minutes.
       secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --context "$expected_ctx" \
-        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+        --request-timeout=10s \
         -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
       if [ -n "$secret_val" ]; then
         export "${secret_key}=${secret_val}"
@@ -1633,8 +1629,7 @@ write_tfvars_from_state() {
     local cert_expected_ctx
     cert_expected_ctx="$(gke_context_name)"
     if [ "$(kubectl config current-context 2>/dev/null || true)" = "$cert_expected_ctx" ] &&
-      kubectl get deployment cert-manager -n cert-manager --context "$cert_expected_ctx" \
-        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" >/dev/null 2>&1; then
+      kubectl get deployment cert-manager -n cert-manager >/dev/null 2>&1; then
       # The Deployment alone cannot say whose it is. On a retry after an
       # apply that died past the cert-manager release, and on every
       # upgrade.sh regeneration of an existing-cluster install, the

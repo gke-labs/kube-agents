@@ -1886,12 +1886,6 @@ wait_for_rollout() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
-  local context="${4:-}"
-
-  local ctx_flag=()
-  if [ -n "$context" ]; then
-    ctx_flag=(--context "$context")
-  fi
 
   local started=$SECONDS
   local log_file=""
@@ -1899,7 +1893,7 @@ wait_for_rollout() {
 
   local rc=0
   run_with_spinner "$deployment" "$log_file" \
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" || rc=$?
 
   # Published for the caller's failure message. How long the wait actually ran is
   # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
@@ -1932,15 +1926,9 @@ wait_for_deployment_object() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
-  local context="${4:-}"
-
-  local ctx_flag=()
-  if [ -n "$context" ]; then
-    ctx_flag=(--context "$context")
-  fi
 
   local deadline=$((SECONDS + timeout_secs))
-  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
+  while ! kubectl get deployment "$deployment" -n "$namespace" >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       return 1
     fi
@@ -5163,13 +5151,13 @@ main() {
     print_info "Failed to switch kubectl context to '${expected_ctx}'. Refusing to run health checks on the wrong cluster."
     exit 1
   fi
-  if ! kubectl get ns "$namespace" --context "$expected_ctx" >/dev/null 2>&1; then
+  if ! kubectl get ns "$namespace" >/dev/null 2>&1; then
     print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
-    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS" "$expected_ctx"; then
+    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS"; then
       print_error "Expected deployment '$deployment' was not created within ${DEPLOYMENT_APPEAR_TIMEOUT_SECS}s."
       # platform-agent-gateway is the agent, and the sandbox is the one thing
       # that stops the operator writing it while leaving everything else
@@ -5177,7 +5165,7 @@ main() {
       # CR rather than in any of the logs an operator would reach for first.
       if [ "$deployment" = "$PLATFORM_AGENT_DEPLOYMENT" ] && [ "$enable_gvisor" = "true" ]; then
         print_info "The agent asks for the ${C_BOLD}gvisor${C_RESET} RuntimeClass; the operator will not create its Deployment until that RuntimeClass exists."
-        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} --context ${expected_ctx} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
+        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
         print_info "Re-run with ${C_BOLD}--enable-gvisor=false${C_RESET} to run the agent on the standard container runtime instead."
       fi
       exit 1
@@ -5186,7 +5174,7 @@ main() {
     # so a couple of minutes is normal. Running past the budget means "still
     # coming up", not "broken": say so and keep the summary below, which carries
     # the chat links and port-forward command.
-    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS" "$expected_ctx"; then
+    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS"; then
       slow_rollouts+=("$deployment")
       print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."
     fi

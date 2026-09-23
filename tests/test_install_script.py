@@ -1823,15 +1823,49 @@ run_menu_system "."
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC=1", proc.stdout)
 
-    def test_wait_for_deployment_object_passes_context(self):
-        """Context argument must be forwarded as --context to kubectl."""
-        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
-        proc = self._run_with_kubectl_stub(
-            'rc=0; wait_for_deployment_object dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
-            stub,
+    # main() is not callable from here -- reaching step 13 means provisioning a
+    # cluster -- so its context gate is lifted out of the source and run in a
+    # function of its own. The anchors are checked in _context_gate_body, so a
+    # rewrite of the step fails loudly rather than leaving the two tests below
+    # asserting against an empty string.
+    _CONTEXT_GATE_START = '  local expected_ctx\n  expected_ctx="$(gke_context_name)"'
+    _CONTEXT_GATE_END = "    exit 1\n  fi\n"
+
+    def _context_gate_body(self):
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index(self._CONTEXT_GATE_END, start) + len(self._CONTEXT_GATE_END)
+        gate = source[start:end]
+        self.assertIn("kubectl config current-context", gate)
+        return (
+            _SOURCE_INSTALLER_COMMON
+            + '\nPROJECT_ID="a-project"; REGION="a-region"; CLUSTER_NAME="a-cluster"\n'
+            + "context_gate() {\n"
+            + gate
+            + "}\n"
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("RC=0", proc.stdout)
+
+    def test_the_health_check_refuses_a_kubectl_pointed_elsewhere(self):
+        """Step 13 reads whatever context is current, so a get-credentials that
+        did not take must end the run rather than grade another cluster."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_another-project_another-region_another-cluster"',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("REACHED_HEALTH_CHECKS", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("gke_another-project_another-region_another-cluster", combined)
+        self.assertIn("gke_a-project_a-region_a-cluster", combined)
+
+    def test_the_health_check_continues_on_the_expected_context(self):
+        """The other half: the gate has to let the matching context through."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_a-project_a-region_a-cluster"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("REACHED_HEALTH_CHECKS", proc.stdout)
 
     def test_print_generate_only_handoff_renders_required_commands(self):
         """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""

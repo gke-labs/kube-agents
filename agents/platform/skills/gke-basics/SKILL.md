@@ -52,10 +52,11 @@ Managed Kubernetes platform on Google Cloud. Defaults to Autopilot mode unless S
    - Resource requests equal limits automatically. Omit `limits` to allow Autopilot to set defaults matching `requests`.
 
 4. **Cluster Credentials:**
-   - Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials, and isolate credentials to a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` to preserve ambient cluster context:
+   - Always explicitly specify the cluster's location (`--region` for regional clusters, `--zone` for zonal, or `--location` for either) when fetching credentials, and `export` a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` first, so the pin survives to every `kubectl` that follows and concurrent reads of different clusters do not race on one `current-context`:
      ```bash
-     KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_CLUSTER_NAME.yaml" \
-       gcloud container clusters get-credentials CLUSTER_NAME --region=REGION --quiet
+     PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request
+     export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
+     gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
      ```
 
 ## Reference Directory
