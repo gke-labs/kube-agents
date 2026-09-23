@@ -76,14 +76,20 @@ The roster is also reconciled automatically. An hourly, deterministic `no_agent`
 (`cluster-agent-reconcile`) runs `scripts/cluster_agent_reconcile.py`, which drives the roster in
 both directions:
 
-- **Create** — every cluster in the project gets a profile, including the management cluster
-  kube-agents itself runs on. The only exceptions are names listed in `RECONCILE_EXCLUDE`. If the
-  pod cannot resolve the project, the create direction is skipped for that run rather than guessed
-  at. The management cluster is included because its own workloads fail like any other cluster's,
+- **Create** — every cluster in every project in scope gets a profile, including the management
+  cluster kube-agents itself runs on. The scope is the management project alone unless the
+  `PlatformAgent` declares `spec.scope`; the only exceptions are clusters named in
+  `spec.scope.exclude.clusters` or, for one more release, bare names in `RECONCILE_EXCLUDE`. A
+  project the pod cannot list is recorded with its outcome in `fleet_scope.json` at the root of the data volume (`/opt/data`, beside `profiles/`; the reconcile's own `HERMES_HOME`, not a profile's) (written by every run except `--dry-run`) and
+  skipped for that run rather than guessed at. The management cluster is included because its own workloads fail like any other cluster's,
   and the agent that triages a Kubernetes event is the one scoped to the cluster that raised it.
 - **Prune** — a profile is deleted when its GKE cluster is definitively gone (a `NotFound` from
-  `gcloud container clusters describe`), or when it belongs to an excluded cluster, which must not
-  carry a profile even though that cluster exists. This closes the loop when a cluster is deleted
+  `gcloud container clusters describe`), when it belongs to an excluded cluster, which must not
+  carry a profile even though that cluster exists, or when its project has left the scope, over two clean runs: a clean run (no project unreachable, the management project resolved, listed its own
+  clusters and unchanged since the last run, the scope file readable) that finds a previously in-scope project absent marks it `retiring` in
+  `fleet_scope.json`; the next clean run prunes its profiles. A profile whose project the scope never produced, or whose prune waits for that second run, is
+  kept and listed as `unmanaged`; one whose identity could not be read is kept and appears under the report's
+  `skipped_no_identity`, and under the snapshot's `profiles` once an earlier run has read its identity. This closes the loop when a cluster is deleted
   out-of-band, so its profile is never left orphaned pointing at a dead kubeconfig.
 
 A create that fails is recorded rather than only logged: the cluster goes into a `create_failed`
@@ -91,8 +97,8 @@ bucket. Both places that bucket surfaces are narrower than it looks. The chat su
 failures only on a run that also created or pruned something — a run whose sole outcome is a failed
 create posts nothing, because a permanent cause repeats every minute while the bootstrap gate is
 ticking. A failed create is only one of the things `--require-create-pass` reports. Under that flag the run
-exits `3` when the CREATE direction never ran (the project would not resolve, or listing the
-clusters failed), when `reconcile()` raised, or when it ran and every create failed with no fully
+exits `3` when the CREATE direction never ran (the management project would not resolve, or
+its clusters could not be listed), when `reconcile()` raised, or when it ran and every create failed with no fully
 scaffolded profile already on the roster — and `4` when another reconcile holds the lock. One
 failure alongside a success exits 0 and costs the sweep one `gaps` row. Without the flag every one
 of those exits 0, because a cron producer must. That flag's caller is the bootstrap scan gate,

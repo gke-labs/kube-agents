@@ -1,0 +1,6 @@
+{{/*
+Preflight ResourceQuota validation (#749).
+Runs at chart render time before resources are created. If any namespace ResourceQuota
+lacks room for the release footprint, the render fails with a diagnostic and patch command.
+*/}}
+{{- include "kube-agents.quotaPreflight" . }}

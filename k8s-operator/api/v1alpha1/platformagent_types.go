@@ -39,6 +39,78 @@ type PlatformAgentSpec struct {
 	// +kubebuilder:validation:Enum=today;next
 	// +optional
 	Mode *string `json:"mode,omitempty"`
+
+	// Scope declares which GCP projects, beyond the one the agent runs in, the
+	// Cluster Agent reconcile enumerates for GKE clusters, and which projects and
+	// clusters it leaves unmanaged. Absent, the reconcile lists the management project
+	// alone, keeps the last declaration's exclusions and retires nothing; an empty
+	// projects list in a present block drops the projects an earlier block declared.
+	// The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
+	// this is its phase 1, explicit projects only.
+	// +optional
+	Scope *ScopeSpec `json:"scope,omitempty"`
+}
+
+// ScopeSpec is the opt-in set of projects the Cluster Agent reconcile manages.
+type ScopeSpec struct {
+	// Projects lists GCP project IDs whose GKE clusters get Cluster Agent
+	// profiles, in addition to the management project. The agent's service
+	// account needs the read roles in each, granted by hand until the install's
+	// Terraform gains a scope input; a project it cannot list is reported with
+	// the reason (denied, api-disabled, unreachable) and its existing profiles
+	// are kept.
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`
+	// +listType=set
+	// +optional
+	Projects []string `json:"projects,omitempty"`
+
+	// Exclude subtracts projects and clusters after every selector has
+	// contributed.
+	// +optional
+	Exclude *ScopeExcludeSpec `json:"exclude,omitempty"`
+}
+
+// ScopeExcludeSpec names what the scope must never manage.
+type ScopeExcludeSpec struct {
+	// Projects are project IDs or shell-style globs (`*-sandbox`) matched against
+	// each resolved project ID. A match on the management project is ignored and
+	// recorded in the scope snapshot, never applied.
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9*?\[\]!-]{1,63}$`
+	// +listType=set
+	// +optional
+	Projects []string `json:"projects,omitempty"`
+
+	// Clusters names single clusters by the full triple, because cluster names
+	// are unique only within a project and location. This replaces the
+	// RECONCILE_EXCLUDE environment variable, which matched bare names across
+	// every project.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
+	// +optional
+	Clusters []ScopeClusterRef `json:"clusters,omitempty"`
+}
+
+// ScopeClusterRef identifies one GKE cluster.
+type ScopeClusterRef struct {
+	// ProjectID is the project the cluster lives in.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ProjectID string `json:"projectId"`
+
+	// Location is the cluster's region or zone.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	Location string `json:"location"`
+
+	// ClusterName is the GKE cluster's name.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ClusterName string `json:"clusterName"`
 }
 
 // PlatformAgentIntegrationSpec extends common IntegrationSpec with platform-specific connections.

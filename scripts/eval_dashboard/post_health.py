@@ -110,6 +110,7 @@ OUTAGE = "OUTAGE"
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
+CONDITION_DELEGATION_CEILING = "delegation_ceiling"
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"
@@ -611,6 +612,13 @@ def cause_sentence(health: dict) -> str:
         return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
     if condition == CONDITION_FIXTURE_DRIFT:
         return fixture_drift_sentence(health, since)
+    if condition == CONDITION_DELEGATION_CEILING:
+        start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        window = clock_range(start, end) if start and end else f"since {since}"
+        return (
+            f"{incident.get('reps', 0)} repetitions on {prs} PRs ended with the worker still running {window};"
+            " nothing was graded and nothing counts against a case."
+        )
     return health.get("cause") or "no single cause"
 
 
@@ -625,6 +633,11 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
         end = parse_iso((health.get("incident") or {}).get("window_end"))
         when = f"after {clock(end + STORM_COOLDOWN)}" if end else "once the storm has passed"
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours went red, retest {when}."]
+    elif condition == CONDITION_DELEGATION_CEILING:
+        lines = [
+            f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Those runs read NOT EVALUATED, not red; retest once workers are"
+            " finishing again. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879)."
+        ]
     elif condition == CONDITION_LOST_PODS:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
@@ -867,6 +880,8 @@ def short_cause(prev: dict) -> str:
         return "the build cluster lost nodes"
     if condition == CONDITION_FIXTURE_DRIFT:
         return "seeded fixtures had drifted"
+    if condition == CONDITION_DELEGATION_CEILING:
+        return "workers were not finishing"
     return prev.get("cause") or "unknown cause"
 
 
@@ -952,6 +967,15 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
     if health.get("slow"):
         lines.append(f"🐢 Slow since {clock(parse_iso(health['slow'].get('since')))}: {slow_text(health['slow'])}.")
+    ceiling = metrics.get("ceiling_reps") or 0
+    if ceiling:
+        # Apart from the headline's infra count on purpose: these repetitions
+        # were neither lost to 429s nor graded (#1874). Only on a day that
+        # had one; a zero line every morning would be read past.
+        lines.append(
+            f"⏳ {ceiling} repetitions ended at the delegation ceiling with the worker still running;"
+            " not counted as infra or against any case."
+        )
     if health.get("pool"):
         lines.append(pool_digest_line(health["pool"]))
     if data is not None:

@@ -119,6 +119,20 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
+			// A spec.scope block. Diff this against platformagent-tagged.yaml and the
+			// whole of what phase 1 of docs/designs/multi-project-scope.md renders is
+			// one ConfigMap key, scope.json, sorted regardless of declaration order;
+			// the optional volume, its mount and KUBEAGENTS_SCOPE_FILE are in every
+			// expected output because they do not depend on the field being set.
+			name:         "PlatformAgentScope",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-scope.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scope.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
 			// The above-one-replica shape. This is the only fixture that
 			// renders the leader Role's pods get/patch rule, and it is here
 			// because that rule is the agent identity's one write grant --

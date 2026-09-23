@@ -109,6 +109,16 @@ jobs:
           go-version-file: k8s-operator/go.mod
           cache-dependency-path: k8s-operator/go.sum
 
+      # Same reason as Go above: chart-rendering suites in tests/
+      # (test_quota_preflight.py, test_values_schema.py, test_helm_plugins.py,
+      # test_litellm_redaction.py, and others) are decorated `skipUnless(helm)`,
+      # so without a helm binary on the runner they skip silently while the job
+      # reports green.
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+
       # Read from requirements-test.txt rather than spelled out here, so this
       # job and `make test-python-deps` cannot drift into disagreeing about
       # what the suite needs. The reasoning for each entry is in that file.
