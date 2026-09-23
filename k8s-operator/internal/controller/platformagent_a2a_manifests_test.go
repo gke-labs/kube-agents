@@ -3947,7 +3947,11 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 	// JetStream, KV, inboxes, and the console chat door. A first token
 	// outside them is a grant nothing here can read, and a wildcard there
 	// (">", "*.API.>", "*.>") covers all six at once, which no literal
-	// spelling check would see.
+	// spelling check would see. Admitting "chat" here does not itself hold a
+	// chat.* grant to any row -- neither this function nor the table below it
+	// tracks the two console subjects at all -- so
+	// TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader is what refuses
+	// one on a principal other than console or gateway.
 	namespaces := []string{"a2a", "agents", "$JS", "$KV", "_INBOX", "chat"}
 	ownInbox := inboxPrefix + user + ".>"
 	reached := map[string]map[string]bool{}
@@ -4321,6 +4325,45 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 						t.Errorf("%s publish %q covers topic %s without naming it; topic publishes are exact", user, g, topic)
 					}
 				}
+			}
+		}
+	}
+}
+
+// TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader is the property the
+// console identity's security claim rests on (consoleIdentity's own comment):
+// the gateway takes a frame on chat.console.*.in as coming from nats:console
+// with no mapping table in between, because only console can publish there --
+// and console takes a notice on chat.console.*.out as coming from the
+// gateway for the same reason. Admitting "chat" as a recognized namespace in
+// rule 2 above stopped refusing any chat.* grant on any principal by
+// spelling alone, so this is what holds the two subjects to their one
+// intended writer and one intended reader: every principal's publish and
+// subscribe lists are matched, wildcard-aware (subjectMatches, the same
+// helper the topics check above uses), against one concrete subject per
+// door. A future chat.> or chat.console.> grant on any other principal --
+// bridge, seed, the callout-issued agent or provision, even a widened web --
+// trips here.
+func TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
+	const (
+		consoleInbound  = "chat.console.tok.in"
+		consoleOutbound = "chat.console.tok.out"
+	)
+	for _, id := range a2aIdentities(a2aTestAgent()) {
+		for _, g := range id.publish {
+			if subjectMatches(g, consoleInbound) && id.user != "console" {
+				t.Errorf("%s publish %q reaches %s; only console may publish the console door's inbound subject", id.user, g, consoleInbound)
+			}
+			if subjectMatches(g, consoleOutbound) && id.user != "gateway" {
+				t.Errorf("%s publish %q reaches %s; only gateway may publish the console door's outbound subject", id.user, g, consoleOutbound)
+			}
+		}
+		for _, g := range id.subscribe {
+			if subjectMatches(g, consoleInbound) && id.user != "gateway" {
+				t.Errorf("%s subscribe %q reaches %s; only gateway may hear the console door's inbound subject", id.user, g, consoleInbound)
+			}
+			if subjectMatches(g, consoleOutbound) && id.user != "console" {
+				t.Errorf("%s subscribe %q reaches %s; only console may hear the console door's outbound subject", id.user, g, consoleOutbound)
 			}
 		}
 	}

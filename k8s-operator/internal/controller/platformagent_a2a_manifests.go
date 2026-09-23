@@ -1093,13 +1093,14 @@ authorization {
     # task. Do not read this list as the session path.
     #
     # A name is here for one of three reasons, and each identity's own comment
-    # above says which. It can hold no projected token at all — the browser
-    # read user, the $SYS login held by a person, the seed tooling that is
-    # applied rather than run. Or it is a sidecar, which a ServiceAccount
-    # token cannot name apart from the container beside it — the bridge, whose
-    # own comment above says what a callout entry there would merge. Or it
-    # could move and has not: gateway, which is the remaining migration. The
-    # first two reasons are permanent; only the third is a migration.
+    # above says which. It can hold no projected token at all — the browser's
+    # two credentials, web and console, the $SYS login held by a person, the
+    # seed tooling that is applied rather than run. Or it is a sidecar, which
+    # a ServiceAccount token cannot name apart from the container beside it —
+    # the bridge, whose own comment above says what a callout entry there
+    # would merge. Or it could move and has not: gateway, which is the
+    # remaining migration. The first two reasons are permanent; only the
+    # third is a migration.
     auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
   }
 }
