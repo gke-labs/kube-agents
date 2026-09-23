@@ -32,6 +32,9 @@ What it will not do:
   fixed marker (`RESET_MARKER`) that the `ledger_issue_contains` check reads
   back, so a report that still cites a retired ledger is graded as a stale
   pointer to the harness's close, not as a run that closed its own ledger.
+  The check binds the marker to the close time, so a comment whose close
+  then failed (the ledger stays open) cannot lend the harness's name to a
+  close somebody else makes later.
 
 The token arrives in the environment (`LEDGER_RESET_TOKEN`), never on argv
 where `ps` would show it. `--dry-run` lists what would close and writes

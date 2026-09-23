@@ -1097,12 +1097,14 @@ def _ledger_closed_at(closed_at: str, state_reason: str = "not_planned") -> dict
     return {**_issue(stale), "state": "closed", "state_reason": state_reason, "closed_at": closed_at}
 
 
-def _reset_comment() -> dict:
+def _reset_comment(created_at: str) -> dict:
+    # What hack/ci_reset_audit_ledgers.py posts, seconds before it closes.
     return {
+        "created_at": created_at,
         "body": (
             f"{verifiers.LEDGER_RESET_MARKER}\nClosed by kube-agents eval build 1 before "
             "repetition of the compliance-audit stream: the eval harness's ledger reset ..."
-        )
+        ),
     }
 
 
@@ -1113,7 +1115,10 @@ def test_a_ledger_the_harness_reset_before_the_run_is_named_as_the_resets_close(
     not say it did. Still a fail: nothing was published to the ledger named."""
     _stash_report()
     github.routes[_api()] = (200, _ledger_closed_at(_RESET_CLOSE))
-    github.routes[_RESET_COMMENTS] = (200, [{"body": "looks fine to me"}, _reset_comment()])
+    github.routes[_RESET_COMMENTS] = (
+        200,
+        [{"body": "looks fine to me", "created_at": "2026-08-21T08:10:00Z"}, _reset_comment("2026-08-21T08:59:37Z")],
+    )
     res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
     assert res.status == "fail" and not res.success
     assert "by the eval harness's ledger reset, before this run started" in res.reason
@@ -1156,11 +1161,32 @@ def test_a_ledger_the_lease_time_reset_closed_long_before_the_run_is_still_the_r
     # citing that ledger gets the same sentence, not "a previous run's".
     _stash_report()
     github.routes[_api()] = (200, _ledger_closed_at("2026-08-21T07:30:00Z"))
-    github.routes[_api() + "/comments?per_page=100&since=2026-08-21T06:30:00Z"] = (200, [_reset_comment()])
+    github.routes[_api() + "/comments?per_page=100&since=2026-08-21T06:30:00Z"] = (
+        200,
+        [_reset_comment("2026-08-21T07:29:58Z")],
+    )
     res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
     assert res.status == "fail"
     assert "eval harness's ledger reset" in res.reason
     assert "previous run's ledger, so this run published nothing" not in res.reason
+
+
+def test_a_marker_left_by_a_reset_whose_close_failed_does_not_name_a_later_false_clean(token, github):
+    """The reset comments first and closes second. When the close fails the
+    marker stays on an OPEN ledger; a worker that then closes it as clean did
+    the closing, and the marker from twenty minutes earlier must not say
+    otherwise. Only a marker within max_clock_skew_sec of closed_at counts."""
+    _stash_report()
+    github.routes[_api()] = (200, _ledger_closed_at("2026-08-21T09:20:00Z", "completed"))
+    github.routes[_api() + "/comments?per_page=100&since=2026-08-21T08:20:00Z"] = (
+        200,
+        [_reset_comment("2026-08-21T08:59:37Z"), {"body": "0 findings, closing", "created_at": "2026-08-21T09:19:58Z"}],
+    )
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "false clean" in res.reason
+    assert "eval harness's ledger reset" not in res.reason
+    assert res.raw["reset_by_harness"] is False
 
 
 def test_a_ledger_closed_before_this_run_is_still_a_previous_runs(token, github):

@@ -1102,8 +1102,10 @@ ledger_reset_token() { # <owner/repo>
 }
 
 # The audit id a case grades its ledger under: the `audit:` key of its
-# ledger_issue_contains checks in task.yaml (the seven audit cases each carry
-# one, all distinct). Empty for a case that writes no ledger.
+# ledger_issue_contains checks in task.yaml (each of the eight audit cases
+# carries one; two consistency cases share fleet-consistency-drift, and the
+# reset is per stream, so both retire that one ledger). Empty for a case that
+# writes no ledger.
 ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac

@@ -299,10 +299,12 @@ LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 # ledger a report still cites is read for it, so the harness's own close is
 # named as such rather than blamed on the run.
 LEDGER_RESET_MARKER = "<!-- kube-agents-eval-ledger-reset -->"
-# How far back from a ledger's closed_at that comment is looked for. The
-# reset posts it and closes seconds later; an hour is generous and keeps the
-# read to one page.
+# How far back from a ledger's closed_at that comment is asked for, and the
+# page it is asked for on. The reset posts the comment and closes seconds
+# later; an hour is generous and keeps the read to one page.
 _RESET_COMMENT_LOOKBACK = timedelta(hours=1)
+_GITHUB_PAGE_SIZE = 100
+_GITHUB_SINCE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # github.com only, and issues only: `/pull/<n>` is a remediation pull request,
 # which every audit report also links and which is not the ledger.
@@ -687,11 +689,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     (``hack/ci_reset_audit_ledgers.py``), seconds before devops-bench starts
     the run, so that ``closed_at`` falls inside the same window a false clean
     would. A worker that cites the retired ledger instead of the fresh one it
-    should have opened did not close it: when a closed ledger's comments carry
-    ``LEDGER_RESET_MARKER``, the reason says the harness reset it before this
-    run started. Still a fail, since the run published nothing to the ledger
-    it named; only the sentence changes, whichever side of ``started_at``
-    the close fell on.
+    should have opened did not close it: when a closed ledger carries a
+    ``LEDGER_RESET_MARKER`` comment posted within ``max_clock_skew_sec`` of
+    its ``closed_at``, the reason says the harness reset it before this run
+    started. Bound to the close on purpose: the reset comments first and
+    closes second, so a reset whose close failed leaves the marker on an OPEN
+    ledger, and a worker's genuine false clean on it later must not inherit
+    the harness's name from a comment that is minutes or hours older than the
+    close. Still a fail, since the run published nothing to the ledger it
+    named; only the sentence changes, whichever side of ``started_at`` the
+    close fell on.
     """
 
     type: Literal["ledger_issue_contains"]
@@ -721,34 +728,43 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # even back-to-back tasks in one presubmit never share a ledger.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
-    @staticmethod
     def _closed_by_the_reset(
-        api_url: str, closed_at: datetime, token: str, budget: float
+        self, api_url: str, closed_at: datetime, token: str, budget: float
     ) -> bool | None:
-        """Whether a closed ledger's comments carry the harness's reset marker.
+        """Whether the harness's reset marker was posted alongside this close.
 
         ``True`` or ``False`` when the comments were read; ``None`` when they
         could not be (a transport fault or a non-200), which the caller
         reports instead of treating it as either answer. Only comments from
-        the hour before the close are asked for: the reset posts its comment
-        and closes seconds later, and the bound keeps the read to one page.
+        the hour before the close are asked for, and only a marker comment
+        created within ``max_clock_skew_sec`` of ``closed_at`` counts: the
+        reset posts its comment and closes seconds later, so a marker that is
+        older than that belongs to a reset whose close failed, not to this
+        close.
         """
-        since = (closed_at.astimezone(timezone.utc) - _RESET_COMMENT_LOOKBACK).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        closed_at = closed_at.astimezone(timezone.utc)
+        since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
         try:
             status_code, payload = _http_get_json(
-                f"{api_url}/comments?per_page=100&since={since}", token, budget
+                f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}",
+                token,
+                budget,
             )
         except OSError:
             return None
         if status_code != 200 or not isinstance(payload, list):
             return None
-        return any(
-            isinstance(comment, dict)
-            and LEDGER_RESET_MARKER in str(comment.get("body") or "")
-            for comment in payload
-        )
+        for comment in payload:
+            if not isinstance(comment, dict):
+                continue
+            if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
+                continue
+            created_at = _parse_github_time(comment.get("created_at"))
+            if created_at is None:
+                continue
+            if abs((closed_at - created_at).total_seconds()) <= self.max_clock_skew_sec:
+                return True
+        return False
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
