@@ -451,7 +451,7 @@ def boskos_reset_stranded(server):
                 "expire": BOSKOS_STRANDED_AFTER,
             },
         )
-    except (urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
+    except (SweepError, urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
         print("could not reset stranded projects: %s" % exc, file=sys.stderr)
         return []
     names = sorted(stranded or {})

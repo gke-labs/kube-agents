@@ -1979,6 +1979,29 @@ def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, githu
     assert "pull_requests: read" in res.reason
 
 
+def test_an_expired_token_on_the_file_count_read_is_the_token_not_the_permission(token, github):
+    """The first read answered 200 and the token ran out before the second: the
+    reason names the mint, as `_resolve`'s 401 arm does, not a permission."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (401, {"message": "Bad credentials"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "not valid" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_5xx_or_a_redirect_on_the_file_count_read_is_githubs_not_a_permission(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    for status in (502, 301):
+        github.routes[_pr_api("pulls")] = (status, None)
+        res = _pr_check().verify(5.0)
+        assert res.status == "error", status
+        assert f"unexpected GitHub response {status}" in res.reason
+        assert "pull_requests: read" not in res.reason
+
+
 def test_pulls_denied_when_read_for_the_file_count_is_an_error_naming_the_permission(token, github):
     """The issues endpoint resolved the pull request, so the check is past
     every fail arm when it reads `/pulls/{n}` for the file count. A denial

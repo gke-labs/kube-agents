@@ -188,11 +188,12 @@ if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/d
   echo "   and add the same pair to _EXPECTED_MAPPING in tests/test_ci_gitops_repo.py." >&2
   if [ "${ALLOW_UNMAPPED}" != "true" ]; then
     echo "   Refusing to provision: an unmapped project fails every lease at" >&2
-    echo "   gitops_repo_for_project()'s refusal, and the pull-request sweep skips it." >&2
+    echo "   gitops_repo_for_project()'s refusal, Step 5's verification would fail anyway," >&2
+    echo "   and the pull-request sweep skips an unmapped project." >&2
     echo "   Land the mapping first, or re-run with --allow-unmapped." >&2
     exit 1
   fi
-  echo "   --allow-unmapped set: continuing. The pull-request sweep will skip this project."
+  echo "   --allow-unmapped set: continuing. Step 5 will still report this as a failure, and the pull-request sweep will skip this project."
 else
   echo "✓ Mapped to ${GITOPS_REPO} in hack/ci-deploy.sh"
 fi

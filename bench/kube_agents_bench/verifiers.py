@@ -1069,15 +1069,32 @@ class PullRequestOpenedVerifier(BaseVerifier):
         payload = resolved
         if "changed_files" not in payload:
             status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            # The same three readings `_resolve` gives this endpoint: 401 is
+            # the token, 403 is the permission, anything else is GitHub's.
+            if status == 401:
+                return (
+                    None,
+                    None,
+                    f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
+                    f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                    "an installation token expires an hour after it is minted — so "
+                    "this check could not be evaluated",
+                )
+            if status == 403:
+                return (
+                    None,
+                    None,
+                    f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
+                    f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                    "`pull_requests: read` to grade what a run pushed, so this "
+                    "check could not be evaluated",
+                )
             if status != 200 or not isinstance(payload, dict):
                 return (
                     None,
                     None,
-                    f"GitHub answered {status} for {owner}/{repo}#{number} on "
-                    f"the pulls endpoint; the token behind "
-                    f"{LEDGER_TOKEN_ENV_VARS[0]} needs `pull_requests: read` to "
-                    "grade what a run pushed, so this check could not be "
-                    "evaluated",
+                    f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
+                    "on the pulls endpoint; this check could not be evaluated",
                 )
         changed = payload.get("changed_files")
         changed = changed if isinstance(changed, int) else None

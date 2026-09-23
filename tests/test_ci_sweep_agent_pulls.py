@@ -145,11 +145,13 @@ class _GitHub:
 class _Boskos:
     """A stand-in for the Boskos server: hands out `free` in order, then 404."""
 
-    def __init__(self, free=(), error=None, stranded=(), reset_error=None, release_errors=None):
+    def __init__(self, free=(), error=None, stranded=(), reset_error=None, release_errors=None, reset_raw=None):
         self.free = list(free)
         self.error = error
         self.stranded = list(stranded)
         self.reset_error = reset_error
+        # A verbatim reset body (an intermediary's page) instead of JSON.
+        self.reset_raw = reset_raw
         # Keyed by project name: one release can fail while the rest succeed.
         self.release_errors = release_errors or {}
         self.acquired = []
@@ -187,6 +189,8 @@ class _Boskos:
             self.resets.append(query)
             if self.reset_error is not None:
                 raise self.reset_error
+            if self.reset_raw is not None:
+                return io.BytesIO(self.reset_raw)
             return io.BytesIO(json.dumps({name: "an-earlier-sweep" for name in self.stranded}).encode())
         raise AssertionError("unexpected Boskos call %s" % url)
 
@@ -290,7 +294,8 @@ class AgentAuthorTest(unittest.TestCase):
         # and the pair written here because a sweep that cannot mint must still
         # name what it looked for.
         self.assertIn(sweeper.AGENT_APP_SLUG, _CI_DEPLOY.read_text(encoding="utf-8"))
-        self.assertIn('APP_ID="%s"' % sweeper.DEFAULT_APP_ID, _PROVISION.read_text(encoding="utf-8"))
+        # Anchored to the line: `LEDGER_APP_ID="..."` in the same file must not satisfy it.
+        self.assertRegex(_PROVISION.read_text(encoding="utf-8"), r'(?m)^APP_ID="%s"$' % sweeper.DEFAULT_APP_ID)
         self.assertEqual(sweeper.AGENT_BOT_LOGIN, sweeper.AGENT_APP_SLUG + "[bot]")
 
 
@@ -599,11 +604,14 @@ class PoolTest(unittest.TestCase):
         self.assertEqual(boskos.order[0], "reset", "the reset must precede the first acquire")
 
     def test_a_reset_that_fails_does_not_stop_the_sweep(self):
-        boskos = _Boskos(["kube-agents-evals-7"], reset_error=_http_error(500, BOSKOS))
-        github = _GitHub(pulls=[agent_pull()])
-        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github, boskos)):
-            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
-        self.assertEqual((closed, failures), ({"kube-agents-evals-7": 1}, {}))
+        # A 500, and a 200 whose body is not JSON: both are reported and the
+        # sweep goes on to acquire.
+        for boskos in (_Boskos(["kube-agents-evals-7"], reset_error=_http_error(500, BOSKOS)), _Boskos(["kube-agents-evals-7"], reset_raw=b"<html>busy</html>")):
+            with self.subTest(reset=boskos.reset_error or boskos.reset_raw):
+                github = _GitHub(pulls=[agent_pull()])
+                with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github, boskos)):
+                    closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+                self.assertEqual((closed, failures), ({"kube-agents-evals-7": 1}, {}))
 
     def test_a_termination_mid_sweep_releases_the_held_project(self):
         # Prow's SIGTERM, delivered while a repository is being read: the
