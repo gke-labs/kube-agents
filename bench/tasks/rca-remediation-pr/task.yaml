@@ -54,11 +54,12 @@
 # Every run leaves a pull request behind. Nothing in the skill closes it --
 # submit-suggestion gets no dedupe, unlike fleet-audit's `remediate`, which
 # keys the branch on the touched files and closes the PR when the finding
-# stops reproducing. What bounds the accumulation is hack/ci-teardown.sh,
-# which closes the agent bot's open PRs on the leased project's *-infra repo
-# at job start and again at job end. So a job inherits none and leaves none,
-# but its own reps accumulate within it, and that is why this scenario asserts
-# on the PR URL its own run produced rather than on repo state.
+# stops reproducing. What bounds the accumulation is the pool sweep
+# (hack/ci_sweep_agent_pulls.py --pool, a Prow periodic), which closes the
+# agent bot's open PRs on each free project's *-infra repo between leases. A
+# job usually inherits none, its own reps accumulate within it, and the
+# head-commit check keeps an inherited one out of grading -- which is why this
+# scenario asserts on the PR URL its own run produced rather than on repo state.
 #
 # Isolation class: read-only on the cluster; unbounded write to the eval
 # GitOps repo. Presubmit-eligible on the same terms as the audit scenarios

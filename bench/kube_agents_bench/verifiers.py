@@ -948,9 +948,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     WHY THIS EXISTS. The remediation cases used to grade on a
     ``report_contains`` over ``["github.com/", "/pull/"]``, which asks only
     that the reply hold a URL-shaped string. Nothing is fetched, so an invented
-    link passes; and the teardown sweep runs per job rather than between reps,
-    so a pull request an earlier rep of the same job opened is still there and
-    still linkable. Repeats of a case were being graded against a pile of their
+    link passes; and the pool sweep runs between leases rather than between
+    reps, so a pull request an earlier rep of the same job opened is still there
+    and still linkable. Repeats of a case were being graded against a pile of their
     own earlier output (#1755).
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub

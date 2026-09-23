@@ -910,10 +910,9 @@ export BENCH_TF_ROOT="./tf"
 #
 # EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
 # instead, once per fan-out unit, because a token lasts an hour and units launch
-# across the whole run. It is read-only because the mint asks for
-# GRADING_PERMISSIONS, not because the App is -- the App stopped being read-only
-# when hack/ci-teardown.sh needed pull_requests: write to close the agent's
-# leftovers (#1755). Unset: the mounted PAT stands. A mint that
+# across the whole run. The mint asks for GRADING_PERMISSIONS rather than
+# inheriting the installation whole, so what the grader holds is what it reads
+# whatever the App is granted. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
 # repetition inside the fan-out; it never falls back to the PAT, which would
 # let a smoke test pass while proving nothing about the credential it was added
@@ -964,11 +963,9 @@ key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
 app_id = os.environ["EVAL_LEDGER_APP_ID"]
 installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
 
-# Asked for rather than inherited. The App also holds pull_requests: write, so
-# hack/ci-teardown.sh can close the agent's leftover pull requests (#1755) --
-# and the token the verifiers grade with must not carry it. A token can request
-# any subset of what the installation has, so the read-only property the
-# grading path relies on is restored here instead of at the App.
+# Asked for rather than inherited. A token can request any subset of what the
+# installation has, so the token the verifiers grade with carries exactly the
+# two reads it makes, whatever the App is granted later.
 GRADING_PERMISSIONS = {"issues": "read", "pull_requests": "read"}
 
 

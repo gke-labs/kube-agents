@@ -21,10 +21,9 @@ visible from a run where GitHub answers. What has to hold:
 The functions are extracted from the script and executed with the network half
 stubbed out, so these assertions are against the code that ships.
 
-The scope half is newer and has nothing to do with the retry. The App stopped
-being read-only when the teardown's pull-request sweep needed it (#1755), so
-the read-only property the verifiers rely on now comes from what this mint asks
-for. LedgerMintScopeTest is what keeps it.
+The scope half is newer and has nothing to do with the retry. The read-only
+property the verifiers rely on comes from what this mint asks for, not from
+what the App happens to be granted. LedgerMintScopeTest is what keeps it.
 """
 
 import ast
@@ -242,15 +241,12 @@ class LedgerMintContractTest(unittest.TestCase):
 
 
 class LedgerMintScopeTest(unittest.TestCase):
-    """The App is no longer read-only; the token it mints here still is.
+    """The token minted here asks for the two reads grading makes, and no more.
 
-    App 4739812 gained `pull_requests: write` so hack/ci-teardown.sh can close
-    the agent's leftover pull requests (#1755). The verifiers grade with the
-    same App's key, and nothing about grading needs write. A mint may ask for
-    any subset of what the installation holds, so the separation lives at the
-    mint now instead of at the App: drop the body and the token inherits the
-    installation whole, and the credential that judges a run can change what it
-    judges.
+    A mint may ask for any subset of what the installation holds, so the
+    read-only property lives at the mint rather than at the App: drop the body
+    and the token inherits the installation whole, and the credential that
+    judges a run holds whatever the App is granted later.
     """
 
     def test_the_grading_token_asks_for_read_and_nothing_more(self):

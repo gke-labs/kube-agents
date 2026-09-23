@@ -15,11 +15,12 @@
 # for `helm uninstall` to act on, and Helm then refuses to adopt them on the
 # project's next lease (#1006). Step 4 names the kinds the label cannot reach.
 #
-# Two steps are conditional. The CRD delete runs when a release record outlives
+# One step is conditional. The CRD delete runs when a release record outlives
 # Step 1, which needs its CRDs or the next lease can neither uninstall nor
-# upgrade over it (#1172). The pull-request sweep runs when an App key is
-# mounted and the project maps to a GitOps repository; without it the next
-# lease inherits a pull request this one opened (#1755).
+# upgrade over it (#1172). The agent's leftover pull requests are not this
+# script's to close: that takes a write credential, and a presubmit runs the
+# pull request's own code, so the sweep runs from a periodic that executes only
+# main (hack/ci_sweep_agent_pulls.py, #1755).
 # ==============================================================================
 
 set -uo pipefail
@@ -69,27 +70,6 @@ readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
 # heartbeat below arms itself with no wrapper change. If the convention ever
 # changes, beats 401 — one loud daemon line, harmless to the teardown.
 readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
-
-# Step 5's credential. The agent opens a pull request in the leased project's
-# GitOps repo and nothing closed it, so the next lease met its predecessor's:
-# create_pull_request treats "already exists" as success and hands back the old
-# URL (#1755).
-#
-# The App is the ledger reader, already installed on every pool repository with
-# its key already mounted, so the sweep adds no onboarding step. It holds
-# pull_requests: write for this and nothing else, and ci_sweep_agent_pulls.py
-# narrows the minted token further, to one repository. Keep this default equal
-# to EVAL_LEDGER_APP_ID's in hack/ci-eval-pr.sh; a test pins the pair.
-readonly SWEEP_APP_ID="${EVAL_LEDGER_APP_ID:-4739812}"
-readonly SWEEP_APP_KEY_FILE="${EVAL_LEDGER_APP_KEY_FILE:-}"
-# Where Step 5 reads the project-to-repository mapping. It keeps its one home in
-# ci-deploy.sh: a dozen documents, scripts/verify_ci_pool_project.py and the
-# dashboard's fixture_state.py all read it out of that file, and the verifier
-# reads it out of gke-labs/main as well, where a moved function would report
-# every project unmapped. Lifting the function by its own text is what
-# scripts/provision_ci_pool_project.sh already does; sourcing ci-deploy.sh would
-# run a deploy. Relative because the script cd's to the repository root.
-readonly CI_DEPLOY_SCRIPT="${CI_DEPLOY_SCRIPT:-hack/ci-deploy.sh}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
@@ -364,51 +344,6 @@ SWEEP_NAMESPACED_KINDS=(
   persistentvolumeclaims
 )
 sweep_kinds "Namespaced sweep" "${NAMESPACE}" "${SWEEP_NAMESPACED_KINDS[@]}"
-
-STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Closing the agent's leftover pull requests ==="
-# The one step that touches GitHub rather than the cluster, and the reason it
-# lives in teardown rather than in a scheduled job: the Prow wrapper runs this
-# script at job start too, so a lease begins against a clean repository even
-# when the run before it was hard-killed. A sweep on a timer could not promise
-# that.
-#
-# Last on purpose. It needs neither the cluster nor anything the steps above
-# leave behind, and putting it after them keeps a GitHub outage from delaying
-# the deletes that free the project for its next lease.
-#
-# Skips, loudly and successfully, when the key is not mounted or the project
-# maps to no repository -- a laptop run of this script must not need a GitHub
-# credential. Branches are left: deleting a ref needs contents: write, which
-# this credential deliberately lacks. Both submit paths continue a leftover
-# branch rather than overwrite it, so one still costs a repetition that
-# reproduces the same fix -- see the module docstring in
-# hack/ci_sweep_agent_pulls.py for what that case does and does not break.
-#
-# EVAL_GITOPS_REPO first, the same order ci-deploy.sh resolves in. Prow refuses
-# the override outright, so there it is always the mapping -- but on a laptop
-# the deploy wrote to the override, and resolving by PROJECT_ID here would
-# point a sweep at the pool repository that project maps to instead.
-SWEEP_PULLS_STATUS=0
-GITOPS_REPO="${EVAL_GITOPS_REPO:-}"
-if [ "${GITOPS_REPO}" = "none" ]; then
-  GITOPS_REPO=""
-elif [ -z "${GITOPS_REPO}" ] && [ -r "${CI_DEPLOY_SCRIPT}" ]; then
-  eval "$(awk '/^gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY_SCRIPT}")"
-  GITOPS_REPO="$(gitops_repo_for_project "${PROJECT_ID:-}")" || GITOPS_REPO=""
-fi
-if [ -z "${SWEEP_APP_KEY_FILE}" ]; then
-  SWEEP_PULLS_RESULT="skipped, no App key mounted"
-elif [ -z "${GITOPS_REPO}" ]; then
-  SWEEP_PULLS_RESULT="skipped, ${PROJECT_ID:-no project} maps to no GitOps repo"
-elif python3 "${SCRIPT_DIR}/ci_sweep_agent_pulls.py" \
-  --repo "${GITOPS_REPO}" --app-id "${SWEEP_APP_ID}" --key-file "${SWEEP_APP_KEY_FILE}"; then
-  SWEEP_PULLS_RESULT="${GITOPS_REPO}"
-else
-  SWEEP_PULLS_RESULT="failed on ${GITOPS_REPO}"
-  SWEEP_PULLS_STATUS=1
-fi
-finish_step "Agent pull-request sweep (${SWEEP_PULLS_RESULT})" "${SWEEP_PULLS_STATUS}"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if [ "${FAILED_STEPS}" -eq 0 ]; then

@@ -188,11 +188,11 @@ if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/d
   echo "   and add the same pair to _EXPECTED_MAPPING in tests/test_ci_gitops_repo.py." >&2
   if [ "${ALLOW_UNMAPPED}" != "true" ]; then
     echo "   Refusing to provision: an unmapped project fails every lease at" >&2
-    echo "   gitops_repo_for_project()'s refusal, and Step 5 would fail anyway." >&2
+    echo "   gitops_repo_for_project()'s refusal, and the pull-request sweep skips it." >&2
     echo "   Land the mapping first, or re-run with --allow-unmapped." >&2
     exit 1
   fi
-  echo "   --allow-unmapped set: continuing. Step 5 will still report this as a failure."
+  echo "   --allow-unmapped set: continuing. The pull-request sweep will skip this project."
 else
   echo "✓ Mapped to ${GITOPS_REPO} in hack/ci-deploy.sh"
 fi
@@ -556,6 +556,20 @@ elif [ "${SKIP_PEM_IMPORT:-false}" != "true" ]; then
   echo "Cloud KMS key 'github-token-minter-key' is in PENDING_IMPORT state."
   echo "You MUST run 'minty tools import-pk' to enable version 1 before setting EVAL_GITHUB_APP_ID in Prow."
 fi
+
+# The pool's pull-request sweep (hack/ci_sweep_agent_pulls.py) signs the same
+# App's JWT with this project's copy of the key, from a Prow periodic that runs
+# only main under its own identity. Signer on the key, and nothing on the
+# project: that is the whole reach the sweep has here, and the presubmit's
+# runner is deliberately not on this list.
+PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+echo "Granting the pull-request sweeper signer rights on github-token-minter-key..."
+gcloud kms keys add-iam-policy-binding github-token-minter-key \
+  --project="${PROJECT_ID}" --location="${REGION}" \
+  --keyring="github-token-minter-keyring" \
+  --member="${PULL_SWEEP_SA}" \
+  --role=roles/cloudkms.signerVerifier \
+  --quiet >/dev/null
 
 # ─── Step 5: Automated Pre-Flight Verification ────────────────────────────────
 echo -e "\n==> [Step 5/5] Running Pre-Flight Verification..."

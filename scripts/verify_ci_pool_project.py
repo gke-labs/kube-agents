@@ -124,9 +124,8 @@ GITHUB_INSTALLATION_TOKEN_URL = (
 )
 
 # All this check does with the token is read one repository's issues, so that is
-# all it asks for. The App can write pull requests -- hack/ci-teardown.sh closes
-# the agent's leftovers with it -- and a token that inherited the installation
-# whole would carry that reach into a read-only probe.
+# all it asks for. A token that inherited the installation whole would carry
+# every permission the App is ever granted into a read-only probe.
 LEDGER_GRADING_PERMISSIONS = {"issues": "read"}
 
 # Its private key, read from the cluster rather than the operator's disk: a

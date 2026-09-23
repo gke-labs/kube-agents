@@ -504,8 +504,9 @@ one used and edits the pull request already open on it. The stamp cannot decide 
 moves on a comment as readily as on a push — so the check also reads the head commit, and fails a
 pull request that changes no files or whose head commit predates the run. That is what makes
 repetitions inside one lease gradable: rep 2 pushing onto rep 1's branch moves the head commit,
-rep 2 quoting rep 1's URL does not. `hack/ci-teardown.sh` closes the agent's leftovers at the
-start of a lease and again at the end, so nothing survives from the lease before.
+rep 2 quoting rep 1's URL does not. A Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run
+from `main` only) closes the agent's leftovers in free pool projects every ten minutes, so a lease
+rarely inherits one; when it does, the head-commit check is what keeps it from grading.
 A pull request closed without being merged is rejected: closing moves `updated_at` too, and
 what the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
 match across every pool project that breaks loudly if the organisation ever moves.
