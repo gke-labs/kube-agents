@@ -1067,9 +1067,11 @@ Mutation(
         "mode: next gateway rather than only under the operator's flag. The "
         "door has no customer-facing purpose and maps a principal out of a "
         "request body, so an install that never asked for it must not carry "
-        "it -- and the operator's own render tests pass a flag in, so they "
-        "assert what happens when it is set rather than that anything "
-        "consults it",
+        "it. The operator's own flag-off render test "
+        "(TestA2AInjectBackendIsOffWithoutTheFlag) would catch it too, but it "
+        "is a Go test this harness does not run; the conformance test is the "
+        "one that has to notice, from the source, that the render consults "
+        "the flag",
     ),
     Mutation(
         "A3-inject-flag-fails-open",

@@ -1475,6 +1475,9 @@ func TestInjectReadRouteReportsTheExecutorsState(t *testing.T) {
 	if waiting.Detached {
 		t.Fatal("a task nothing cancelled reads as detached")
 	}
+	if waiting.ReachedWorking {
+		t.Fatal("a stream with no events reads as having reached working")
+	}
 
 	origin := r.awaitTask(t, "platform")
 	exec := r.execFor(t, origin, "platform")
@@ -1485,6 +1488,9 @@ func TestInjectReadRouteReportsTheExecutorsState(t *testing.T) {
 	waitFor(t, "the read route to see the executor's submitted event", func() bool {
 		return r.probe(t, reply.Conversation, reply.TaskID).Probe.ExecutorState == string(lib.StateSubmitted)
 	})
+	if queued := r.probe(t, reply.Conversation, reply.TaskID).Probe; queued.ReachedWorking {
+		t.Fatalf("queued probe = %+v, want reachedWorking false at submitted", queued)
+	}
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		t.Fatal(err)
 	}
@@ -1494,6 +1500,9 @@ func TestInjectReadRouteReportsTheExecutorsState(t *testing.T) {
 	running := r.probe(t, reply.Conversation, reply.TaskID).Probe
 	if running.Final || !running.Active {
 		t.Fatalf("running probe = %+v, want active and not final", running)
+	}
+	if !running.ReachedWorking {
+		t.Fatalf("running probe = %+v, want reachedWorking", running)
 	}
 	if running.LastPost == nil || running.LastPost.Kind != InjectEntryPost {
 		t.Fatalf("running probe carries no last post: %+v", running)
@@ -2285,6 +2294,35 @@ func TestInjectAnswersARetriedPostWithTheSameRefusal(t *testing.T) {
 	}
 }
 
+// TestInjectReadRouteRemembersWorkingBehindALaterState: the read reports the
+// stream's latest state, and two events can land between a caller's reads --
+// working, then input-required. A caller deciding "a model ran" from the
+// states it saw would file a run that happened as one that never started, so
+// the read also says whether working was ever on the stream.
+func TestInjectReadRouteRemembersWorkingBehindALaterState(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-parked-after-working", injectTestAuthor, "take your time")
+	r.awaitRecordedTask(t, reply.Conversation)
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	for _, state := range []lib.TaskState{lib.StateSubmitted, lib.StateWorking, lib.StateInputRequired} {
+		if err := exec.PublishStatus(ctx, state, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "the read route to see the executor parked", func() bool {
+		return r.probe(t, reply.Conversation, reply.TaskID).Probe.ExecutorState == string(lib.StateInputRequired)
+	})
+	parked := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !parked.ReachedWorking {
+		t.Fatalf("parked probe = %+v, want reachedWorking behind the later state", parked)
+	}
+	if parked.Final || !parked.Active {
+		t.Fatalf("parked probe = %+v, want active and not final", parked)
+	}
+}
+
 // TestInjectRefusesASecondDropWithoutWaitingForTheBound: the gateway tells an
 // unverifiable sender once per sender, so the second message from that author
 // posts nothing at all. A door watching only the transcript would hold that
@@ -2298,6 +2336,14 @@ func TestInjectRefusesASecondDropWithoutWaitingForTheBound(t *testing.T) {
 		t.Fatalf("first drop = %+v, want the unverified-author refusal", first)
 	}
 	entriesBefore := r.adapter.counts(first.Conversation).entries
+	// The memory is per backend and author: the same id arriving through a
+	// chat backend is another sender and owed its own notice.
+	r.g.mu.Lock()
+	notified := r.g.droppedNotices[droppedNoticeKey(injectBackend, injectTestUnknownAuthor)]
+	r.g.mu.Unlock()
+	if !notified {
+		t.Fatalf("the first drop is not remembered under the door's key")
+	}
 
 	started := time.Now()
 	second := r.inject(t, "case-twice-unmapped", injectTestUnknownAuthor, "let me in again")

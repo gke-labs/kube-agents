@@ -407,6 +407,10 @@ type probeReport struct {
 	// ExecutorState is "" when the stream holds no event for the task.
 	ExecutorState string `json:"executorState,omitempty"`
 	Final         bool   `json:"final,omitempty"`
+	// ReachedWorking is whether the stream ever showed working, whatever
+	// executorState shows now; the states a caller saw across its reads
+	// can skip one, and this is the one that says a model ran.
+	ReachedWorking bool `json:"reachedWorking,omitempty"`
 	// The fold's terminal, when Final: whose word it is ("executor" for a
 	// terminal on the task's events subject, "supervisor" for one on the
 	// supervisor subject), the result artifact's text, and the terminal's status
@@ -1795,15 +1799,16 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
 	defer cancel()
 	state, err := a.probe(ctx, key)
 	report := &probeReport{
-		Backend:       state.Backend,
-		InjectOnly:    state.InjectOnly,
-		GraceSeconds:  int(state.Grace / time.Second),
-		Active:        state.Active,
-		TaskID:        state.TaskID,
-		AgeSeconds:    int(state.Age / time.Second),
-		Detached:      state.Detached,
-		ExecutorState: string(state.ExecutorState),
-		Final:         state.Final,
+		Backend:        state.Backend,
+		InjectOnly:     state.InjectOnly,
+		GraceSeconds:   int(state.Grace / time.Second),
+		Active:         state.Active,
+		TaskID:         state.TaskID,
+		AgeSeconds:     int(state.Age / time.Second),
+		Detached:       state.Detached,
+		ExecutorState:  string(state.ExecutorState),
+		Final:          state.Final,
+		ReachedWorking: state.ReachedWorking,
 		// Bounded like an entry: a result is an agent's report and rides
 		// the same in-memory transcript budget.
 		TerminalSource: string(state.TerminalSource),

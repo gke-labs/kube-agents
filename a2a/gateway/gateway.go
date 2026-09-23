@@ -38,7 +38,9 @@ const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event s
 const (
 	// droppedNoticesCap bounds the once-per-sender drop-notice memory; one
 	// entry per unverified sender, evicted wholesale rather than leaked.
+	// droppedNoticeKeySep joins the backend and the author in its key.
 	droppedNoticesCap     = 4096
+	droppedNoticeKeySep   = "/"
 	taskIDHexWidth        = 8
 	messageIDHexWidth     = 8
 	contextIDHexWidth     = 12
@@ -401,6 +403,12 @@ func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage, backend, prin
 	g.routeTurn(ctx, msg, backend, principal)
 }
 
+// droppedNoticeKey is the once-per-sender memory's key: the backend the
+// message came through and the author's id, case-folded.
+func droppedNoticeKey(backend, authorID string) string {
+	return backend + droppedNoticeKeySep + strings.ToLower(authorID)
+}
+
 // verifySender resolves the sender to a principal, or drops the message and
 // says so. Returns the backend the message came through, the principal, and
 // whether the turn goes on.
@@ -418,10 +426,14 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 	if principal == "" {
 		g.log.Warn("dropping message from unverified sender",
 			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
-		// Keyed case-folded (an asserted address that varies in case is one
-		// person) and bounded the way the adapters bound their own maps:
-		// wholesale eviction at the cap, which at worst repeats a notice.
-		key := strings.ToLower(msg.AuthorID)
+		// Keyed by backend and case-folded author: one gateway has two
+		// ingresses (a chat backend and the inject door), and the same id
+		// on the two is not the same sender, so a notice on one must not
+		// silence the other. Case-folded because an asserted address that
+		// varies in case is one person. Bounded the way the adapters bound
+		// their own maps: wholesale eviction at the cap, which at worst
+		// repeats a notice.
+		key := droppedNoticeKey(backend, msg.AuthorID)
 		g.mu.Lock()
 		if len(g.droppedNotices) >= droppedNoticesCap {
 			g.droppedNotices = map[string]bool{}
@@ -811,6 +823,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 	case terr == nil:
 		state.ExecutorState = task.State
 		state.Final = task.Final
+		state.ReachedWorking = slices.Contains(task.StatusHistory, lib.StateWorking)
 		if task.Final {
 			// The fold's terminal, with whose word it is: the events
 			// subject is the executor's, the supervisor subject the

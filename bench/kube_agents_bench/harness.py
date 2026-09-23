@@ -1461,6 +1461,10 @@ class KubeAgentsHarness(AgentHarness):
             """
             task_id = task.task_id or task.recover_task_id()
             if not task_id:
+                if not task.unanswered_post:
+                    # Refused, or never sent: every POST was answered without
+                    # a task, or none went out. Nothing is running.
+                    return "; no task was started, so nothing is left running"
                 return (
                     "; no task id is known for it: the POST's reply never arrived and a read "
                     "of the conversation recovered none (see the log), so a task the POST "
@@ -1489,7 +1493,11 @@ class KubeAgentsHarness(AgentHarness):
             even where the gateway's own heal has released the record on
             this very turn. It never changes the classification. The settle
             read after it contributes one thing, and only to the graded
-            timeout: the executor's terminal, with its reason. The
+            timeout: how the task ended after the cancel -- the terminal,
+            whose word it is and its reason -- for the record, never for the
+            verdict (the supervisor completing a requester's stop for a
+            worker that exited without its own terminal is still the
+            timeout). The
             deliverable stays what the task produced inside its budget --
             the cancel acknowledgement the gateway posts after it is not the
             agent's answer -- and anything else the settle says (a transient
@@ -1624,14 +1632,20 @@ class KubeAgentsHarness(AgentHarness):
                 "executor took the task and did not run it"
             )
 
-        if exchange.fold.gateway_declared:
+        if exchange.fold.gateway_declared and not timed_out:
             # The gateway declared this terminal rather than an executor:
             # about a task it could not put on the bus, or -- on the read's
             # fold -- the supervisor's word about an executor that died or
             # never ran. Same state on the wire as an executor's failure and
             # the opposite meaning: grading it would score an outage as the
             # agent answering badly. Which of the two it was is worth saying,
-            # because they name different broken things.
+            # because they name different broken things. Not on the graded
+            # timeout: there the terminal came from the settle after this
+            # harness's own cancel, and a supervisor's `canceled` completing
+            # that stop (the worker exited without its own terminal) is how
+            # the task ended, not a relabelling of what the deadline read
+            # classified -- the same exclusion the reason-based check below
+            # makes.
             reason = exchange.fold.terminal_reason or "no reason given"
             if exchange.fold.terminal_source == inject.TERMINAL_SOURCE_SUPERVISOR:
                 whose = "the supervisor ended it, so its executor died or never ran"

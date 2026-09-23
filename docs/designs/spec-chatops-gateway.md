@@ -587,7 +587,10 @@ not be silent about it.
   conversation's session record and of the active task's stream, which mutates nothing - no
   heal, no lock, no post, no publish, no write. It returns the record's active task with its
   `submittedAt`, age and `detached` flag, the highest executor state the stream shows (none,
-  `submitted`, `working`, or a terminal, with `final`) and, when the stream is terminal, the
+  `submitted`, `working`, or a terminal, with `final`), whether `working` was ever on the stream
+  (`reachedWorking`, read off the fold's history, because two events can land between a
+  caller's reads and the latest state alone would hide the one that says a model ran) and, when
+  the stream is terminal, the
   fold of it: whose word the terminal is (`terminalSource`, the executor's for a terminal on the
   task's events subject and the supervisor's for one on its supervisor subject - distinct from
   the gateway's own source, which says it could not publish the task at all), the result

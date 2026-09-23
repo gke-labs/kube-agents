@@ -269,6 +269,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # transcript carries this task's terminal, and never before a POST.
     probe_active: bool | None = None
     probe_final: bool = False
+    # Whether the probe says the stream reached working behind whatever
+    # state it shows now (the gateway's reachedWorking).
+    probe_reached_working: bool = False
     probe_detached: bool = False
     probe_age_seconds: int = 0
     # The fold's terminal on the read, when probe_final: whose word it is,
@@ -359,6 +362,8 @@ class _StubGatewayServer(ThreadingHTTPServer):
                     "final": self.probe_final,
                 }
             )
+            if self.probe_reached_working:
+                report["reachedWorking"] = True
             if self.probe_final:
                 report["terminalSource"] = self.probe_terminal_source
                 report["result"] = self.probe_result
@@ -981,6 +986,10 @@ def test_each_refusal_says_which_thing_is_broken(
     assert result.output == ""
     assert len(stub_gateway.submissions) == 1
     assert not stub_gateway.cancels
+    # The door answered without a task, so nothing was left running and the
+    # record must not say the POST went unanswered.
+    assert "was left running" not in result.errors[0]
+    assert "nothing is left running" in result.errors[0]
 
 
 # --------------------------------------------------------------------------
@@ -1048,10 +1057,15 @@ def test_a_transport_failure_after_the_accept_rejoins_the_same_wait(
     assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
     failed_at = max(i for i, p in enumerate(stub_gateway.polls) if p["failed"])
     # The read below indexes back past the two failures to the last poll
-    # that succeeded; a first GET that landed after the failure instant
-    # would leave nothing there and the index would wrap to the settle read.
-    assert failed_at >= 2, f"the failures came before any successful poll: {stub_gateway.polls}"
+    # that succeeded. That poll has to be one of the task's own: the
+    # preflight read never fails (the stub fails GETs only after the accept)
+    # and asks for no wait, so a first task poll that landed after the
+    # failure instant would put the preflight there and fail the clock
+    # comparison below for the wrong reason.
     before = stub_gateway.polls[failed_at - 2]
+    assert before["task"] == stub_gateway.task_id, (
+        f"the poll before the failures is not the task's: {stub_gateway.polls}"
+    )
     resumed = stub_gateway.polls[failed_at + 1]
     # Replayed from the start, so the deliverable posted before the drop is
     # in the fold again.
@@ -1215,6 +1229,31 @@ def test_a_parked_task_at_the_deadline_is_infrastructure(
     assert result.output == ""
     assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
     assert stub_gateway.calls.index("probe") < stub_gateway.calls.index("cancel")
+
+
+def test_a_working_state_skipped_between_reads_is_still_a_graded_timeout(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read shows the stream's latest state, and working then
+    input-required can land between two reads. The gateway says working was
+    there (reachedWorking), so the task that ran and was then parked is the
+    graded timeout, with working on the lifecycle before the parked state,
+    rather than infrastructure with its output discarded."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    # Every poll already sees the parked state: working came and went
+    # between the POST and the first read, and only the flag says so.
+    stub_gateway.executor_states = ["input-required"]
+    stub_gateway.probe_reached_working = True
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert not infra(result)
+    assert result.output == "partial findings"
+    assert any("did not reach a terminal state" in e for e in result.errors)
+    assert "was parked" not in result.errors[0]
+    assert result.metadata["executor_states"] == ["working", "input-required"]
+    assert [c["taskId"] for c in stub_gateway.cancels] == [stub_gateway.task_id]
 
 
 def test_a_task_parked_then_working_at_the_deadline_is_a_graded_timeout(
@@ -1412,6 +1451,36 @@ def test_a_confirmed_cancel_keeps_the_deadline_on_record(
     assert any("did not reach a terminal state" in e for e in result.errors)
     assert any("ended canceled" in e for e in result.errors)
     assert not infra(result)
+    assert status_entries(result)[-1] == ("canceled", True)
+
+
+def test_a_supervisor_terminal_in_the_settle_keeps_the_graded_timeout(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deadline read said working: the graded timeout. The cancel goes,
+    and inside the settle the relay posts a terminal the gateway attributed
+    to the supervisor -- the worker exited without its own terminal and the
+    supervisor completed the requester's stop. That is how the task ended
+    after our own cancel, on the record with its source; it is not the
+    supervisor's word about an executor that never ran, and it must not turn
+    the graded timeout into infrastructure with the output discarded."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.on_cancel = [
+        entry(5, inject.ENTRY_POST, text="🛑 cancel sent", messageId="inj-5"),
+        entry(6, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="canceled",
+              source=inject.TERMINAL_SOURCE_SUPERVISOR,
+              reason="reason: canceled-by-request - the worker exited without its terminal"),
+    ]
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert not infra(result)
+    assert result.output == "partial findings"
+    assert any("did not reach a terminal state" in e for e in result.errors)
+    assert any("ended canceled" in e for e in result.errors)
+    assert result.metadata["terminal_state"] == "canceled"
+    assert result.metadata["terminal_source"] == inject.TERMINAL_SOURCE_SUPERVISOR
     assert status_entries(result)[-1] == ("canceled", True)
 
 

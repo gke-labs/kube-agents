@@ -649,7 +649,11 @@ class Fold:
         nobody ran, whether it sat at ``submitted`` or was parked at
         ``input-required`` or ``auth-required`` first. The rule is
         :func:`shows_a_run`, the one the scorer's liveness rung applies, so a
-        deadline fold graded here is one the rung will grade too.
+        deadline fold graded here is one the rung will grade too. The states
+        are what the reads showed, plus ``working`` when the gateway reports
+        the stream reached it behind a later state (:attr:`Probe.reached_working`),
+        so a task that worked and was then parked between two reads is the
+        graded timeout it was.
         """
         return self.final or any(shows_a_run(state, False) for state in self.executor_states)
 
@@ -759,6 +763,12 @@ class Probe:
     detached: bool = False
     executor_state: str = ""
     final: bool = False
+    # Whether the stream ever showed ``working``, whatever ``executor_state``
+    # shows now. The gateway reads it off the fold's history: two events can
+    # land between two reads (working, then input-required), and the latest
+    # state alone would hide the one that says a model ran. A door too old
+    # to report it leaves it ``False``.
+    reached_working: bool = False
     # The fold's terminal, when ``final``: whose word it is (``executor`` or
     # ``supervisor``, the two the session record carries), the result
     # artifact's text and the terminal's status message, as the read route
@@ -792,6 +802,7 @@ class Probe:
             detached=bool(raw.get("detached")),
             executor_state=str(raw.get("executorState") or ""),
             final=bool(raw.get("final")),
+            reached_working=bool(raw.get("reachedWorking")),
             terminal_source=str(raw.get("terminalSource") or ""),
             result=str(raw.get("result") or ""),
             reason=str(raw.get("reason") or ""),
@@ -1165,6 +1176,13 @@ class InjectTask:
         if probe.grace_seconds > 0:
             self.first_event_grace = probe.grace_seconds
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
+            if probe.reached_working:
+                # The read shows the latest state; ``working`` may have come
+                # and gone between two reads, and it is the state that
+                # decides parked from the graded timeout. The gateway says
+                # whether it was ever there; it goes on the lifecycle before
+                # the state the stream shows now (a repeat is dropped).
+                fold.note_executor_state(STATE_WORKING)
             fold.note_executor_state(probe.executor_state)
 
     def _absorb(self, fold: Fold, body: dict[str, Any], after: int) -> tuple[int, bool]:

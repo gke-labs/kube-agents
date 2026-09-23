@@ -288,6 +288,12 @@ type ConversationState struct {
 	// terminal. Final is whether that event was final.
 	ExecutorState lib.TaskState
 	Final         bool
+	// ReachedWorking is whether the stream ever showed `working`, whatever
+	// ExecutorState shows now. Two events can land between a caller's
+	// reads -- working, then input-required -- and a caller deciding "a
+	// model ran" from the states it saw would file a run that happened as
+	// one that never started. Read off the fold's history, not its head.
+	ReachedWorking bool
 	// The terminal, when Final -- the fold of the task's stream, which is
 	// what a caller has when the record still holds a task whose relay
 	// already acked its terminal (a restart or a failed record write between
