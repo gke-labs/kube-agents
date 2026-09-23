@@ -53,6 +53,22 @@ func run() int {
 	return 0
 }
 
+// buildAdapters wraps the configured chat backend and the console adapter in
+// one mux. The console runs whenever the gateway runs: its identity renders
+// under mode next like the rest of the bus, and a render that predates it
+// surfaces as a logged refusal on the console subscription, not a boot
+// failure (spec-chatops-gateway.md, "The console adapter").
+func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
+	console, err := gateway.NewConsoleAdapter(cfg.NATSURL, natsOpts, log)
+	if err != nil {
+		return nil, err
+	}
+	return gateway.NewMultiAdapter(cfg.Backend(), map[string]gateway.Adapter{
+		cfg.Backend(): primary,
+		"console":     console,
+	})
+}
+
 // realMain is the gateway from configuration to shutdown. Every failure is
 // logged where it is found and then returned; realMain itself logs nothing
 // about the exit, and run maps every error to the same exit code.
@@ -96,6 +112,12 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	if err != nil {
 		log.Error("adapter", "backend", cfg.Backend(), "err", err)
+		return err
+	}
+
+	adapter, err = buildAdapters(cfg, adapter, natsOpts, log)
+	if err != nil {
+		log.Error("console adapter", "err", err)
 		return err
 	}
 

@@ -7,9 +7,17 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+
+	"github.com/gke-labs/kube-agents/a2a/gateway"
 )
+
+// startTestServerReadyTimeout bounds how long a test waits for the embedded
+// nats-server to accept connections before failing loudly instead of hanging.
+const startTestServerReadyTimeout = 10 * time.Second
 
 // unreachableNATSURL is a loopback port nothing listens on. lib.Connect
 // dials once with no retry-on-failed-connect, so a refused port fails the
@@ -102,5 +110,76 @@ func TestRunExitsNonZeroOnConfigError(t *testing.T) {
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
 	if got := run(); got != exitFailure {
 		t.Errorf("run() = %d, want %d", got, exitFailure)
+	}
+}
+
+// startTestServer starts an embedded, no-auth nats-server on a random port
+// for buildAdapters tests that need a real bus but no gateway config.
+func startTestServer(t *testing.T) *natsserver.Server {
+	t.Helper()
+	opts := &natsserver.Options{
+		Host:     "127.0.0.1",
+		Port:     -1,
+		NoLog:    true,
+		NoSigs:   true,
+		StoreDir: t.TempDir(),
+	}
+	s, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(startTestServerReadyTimeout) {
+		t.Fatal("nats-server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	return s
+}
+
+// fakePrimary is a gateway.Adapter stand-in for buildAdapters tests: it
+// proves the primary backend is still reachable through the mux without
+// standing up a real Discord or Google Chat adapter.
+type fakePrimary struct{}
+
+func newFakePrimary() *fakePrimary { return &fakePrimary{} }
+
+func (f *fakePrimary) Run(ctx context.Context, handler func(gateway.InboundMessage)) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakePrimary) Post(conversation, text string) (string, error) {
+	return "1", nil
+}
+
+func (f *fakePrimary) Edit(conversation, messageID, text string) error {
+	return nil
+}
+
+func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
+	return nil, true, nil
+}
+
+func (f *fakePrimary) OpenDirect(userID string) (string, error) {
+	return "", nil
+}
+
+// TestBuildAdaptersIncludesTheConsole proves buildAdapters wires both the
+// configured chat backend and the console adapter behind one mux: a post to
+// either backend's prefix must reach it (spec-chatops-gateway.md, "The
+// console adapter").
+func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
+	s := startTestServer(t)
+	cfg := &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x"}
+	primary := newFakePrimary()
+	m, err := buildAdapters(cfg, primary, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Post("console:tab-1", "hi"); err != nil {
+		t.Errorf("console not wired: %v", err)
+	}
+	if _, err := m.Post("discord:g/c", "hi"); err != nil {
+		t.Errorf("primary not wired: %v", err)
 	}
 }
