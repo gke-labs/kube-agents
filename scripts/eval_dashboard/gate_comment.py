@@ -148,6 +148,17 @@ BOX_LOST_EVENT = " — part of a build-cluster event: {runs} runs on {prs} PRs"
 BOX_LOST_SOME = " — one of {runs} runs on {prs} PRs that lost their build node"
 LINK_DETAILS = "[Details →]({url})"
 FOOTER_LOST = "Ran {minutes} min before the node went away · [build log]({url})"
+# The deadline-kill comment (#1894): Prow ended the run at the job timeout with
+# no verdict. While health.json's condition is deadline_kill, the gate is down
+# and the box says so in the author's terms.
+HEADING_DEADLINE = "### ⚪ Smoke gate: run killed at the deadline"
+BOX_DEADLINE = "Prow killed this run at its {minutes}-minute deadline at {when}; nothing was graded and nothing about your change is implied."
+BOX_DEADLINE_DOWN = (
+    " **The gate is down: {runs} runs on {prs} PRs have been killed at the deadline since {since}; your run's failure is not your diff.**"
+    " Don't retest yet; `/retest` once #kube-agents-ci-health says the gate is healthy again."
+)
+BOX_DEADLINE_QUIET = " `/retest` once runs are finishing again; the build log shows how far the units got."
+FOOTER_DEADLINE = "Ran {minutes} min to the deadline · [build log]({url})"
 CONDITION_LOST_PODS = health.LOST_PODS
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
 TABLE_ROW = "| `{case}`{note} | {result} | {also} |"
@@ -221,7 +232,7 @@ def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
     newest: dict = {}
     for raw in data.get("runs") or []:
         run = health.Run(raw)
-        if run.pr is None or not run.finished or not (since < run.finished <= now) or not (is_red(run) or run.lost_pod):
+        if run.pr is None or not run.finished or not (since < run.finished <= now) or not (is_red(run) or run.lost_pod or run.deadline_kill):
             continue
         current = newest.get(run.pr)
         if current is None or run.finished > health.Run(current).finished:
@@ -375,6 +386,34 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_deadline_comment(run: health.Run, health_doc: dict) -> str:
+    """The deadline-kill comment: when Prow killed it, that nothing was graded,
+    and -- while the health condition is `deadline_kill` -- that the gate is
+    down and the red is not the author's."""
+    incident = health_doc.get("incident") or {}
+    down = health_doc.get("condition") == health.DEADLINE_KILL and health_doc.get("state") != health.GREEN
+    tail = (
+        BOX_DEADLINE_DOWN.format(runs=incident.get("runs", 0), prs=len(incident.get("prs") or []), since=post_health.clock(post_health.parse_iso(health_doc.get("since")), weekday=True))
+        if down
+        else BOX_DEADLINE_QUIET
+    )
+    links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
+    if down:
+        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+    box = BOX_DEADLINE.format(minutes=int(health.PROW_JOB_TIMEOUT.total_seconds() // 60), when=post_health.clock(run.finished)) + tail
+    wall = run.wall_clock
+    minutes = int(wall.total_seconds() // 60) if wall else "?"
+    lines = [
+        MARKER,
+        HEADING_DEADLINE,
+        "",
+        f"> {box} {' · '.join(links)}",
+        "",
+        FOOTER_DEADLINE.format(minutes=minutes, url=BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)),
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def render_lost_comment(run: health.Run, health_doc: dict) -> str:
     """The lost-pod comment: the node and the time, and -- while the health
     condition is `lost_pods` -- that it is part of a build-cluster event."""
@@ -465,6 +504,8 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
             continue  # never twice for the same build (nor after giving up on it)
         if run.lost_pod:
             body = render_lost_comment(run, health_doc)
+        elif run.deadline_kill:
+            body = render_deadline_comment(run, health_doc)
         else:
             admitted = roster.at(run.started or run.finished)
             verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)

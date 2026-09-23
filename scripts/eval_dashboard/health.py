@@ -88,10 +88,12 @@ FIXTURE_DRIFT = "fixture_drift"
 # A ceiling wave: enough repetitions across enough pull requests ended at the
 # harness's delegation wait with the worker still running (rule 2b, #1874).
 DELEGATION_CEILING = "delegation_ceiling"
+# Rule 3d (#1894): runs Prow killed at the job deadline with no verdict.
+DEADLINE_KILL = "deadline_kill"
 # The conditions whose evidence is not a full run -- a count of runs that
 # never became one, or the fleet scan's verdict; rule 6's entry check takes
 # the evidence itself as currency.
-COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT)
+COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT, DEADLINE_KILL)
 
 # Prow's job verdicts (SCHEMA.md: runs[].result). ABORTED is a superseded
 # push, not a statement about the gate, and is counted nowhere below except
@@ -262,6 +264,33 @@ LOST_POD_SPAN = timedelta(minutes=30)
 LOST_POD_MIN = 3
 LOST_POD_EVENT_MIN = 8
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
+
+# --- Rule 3d: deadline kills -> OUTAGE (#1894) -------------------------------
+# Incident: from 2026-09-22 17:00Z to 2026-09-23 10:00Z seventeen presubmit
+# runs were killed at Prow's 360m deadline with every unit at the delegation
+# ceiling (#1880) and nothing graded, and the bot stayed GREEN: a deadline
+# death after a successful deploy matched no rule.
+#
+# The rule: a run is a deadline kill when it concluded FAILURE with no eval
+# verdict, is neither a lost pod nor a conflicted merge, and lasted at least
+# PROW_JOB_TIMEOUT minus DEADLINE_KILL_MARGIN. Not "no tasks": since #1875 the
+# harness records cases as they finish, so a killed run may carry graded
+# tasks and still no verdict. DEADLINE_KILL_MIN of them finishing inside
+# DEADLINE_KILL_WINDOW on DEADLINE_KILL_MIN_PRS distinct pull requests is an
+# OUTAGE -- the gate can pass nobody -- ranked below a shared break, which
+# names cases, and above every DEGRADED condition. Recovery is
+# RECOVERY_GREEN_RUNS runs WITH A VERDICT, green or red, on distinct pull
+# requests after the last kill: a red that graded proves the gate grades.
+#
+# The timeout is the job's decoration_config.timeout in oss-test-infra
+# (prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml); data.json
+# does not carry it. The margin covers the 362-365 minutes Prow records for
+# a killed run without reaching a long green.
+PROW_JOB_TIMEOUT = timedelta(minutes=360)
+DEADLINE_KILL_MARGIN = timedelta(minutes=15)
+DEADLINE_KILL_WINDOW = timedelta(hours=2)
+DEADLINE_KILL_MIN = 3
+DEADLINE_KILL_MIN_PRS = 2
 # The lost-pod advice names the loss on the reader's clock, the way
 # post_health.py writes every time a person reads (docs/ci-health.md, Times);
 # zone and label are fixed together there and mirrored here rather than
@@ -431,6 +460,7 @@ CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
 CAUSE_FIXTURE_DRIFT = "seeded fixture drift: {roles} out of designed state on {projects} pool project(s)"
 CAUSE_CEILING = "delegation ceiling: {reps} repetitions on {prs} PRs ended with the worker still running {start}–{end} UTC"
+CAUSE_DEADLINE_KILL = "deadline kills: {count} runs on {prs} PRs killed at the {minutes}-minute deadline with no verdict {start}–{end} UTC"
 ADVICE_OUTAGE = "Don't retest yet; the failing cases share a cause. Tracking: {tracking}"
 ADVICE_OUTAGE_NO_ISSUE = "no issue filed yet — file one with the presubmit-gate label"
 ADVICE_STORM = "Retest after {when} UTC; runs started inside the storm lose repetitions to 429s."
@@ -452,6 +482,10 @@ ADVICE_CEILING = (
     "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."
     " platform-agent-gateway.log in a run's artifacts says whether the dispatcher stalled (#1879) or 429s starved the workers."
 )
+ADVICE_DEADLINE_KILL = (
+    "Don't retest; runs are being killed at the {minutes}-minute deadline before anything is graded,"
+    " so nothing can pass. Tracking: {tracking}"
+)
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
     " after {count} consecutive green runs on distinct PRs."
@@ -469,9 +503,10 @@ GZIP_SUFFIX = ".gz"
 # every phrase STORM_REASON_RE matches sits inside the first 96 characters
 # of the harness's phrasings, and the dashboard keeps 300.
 TRIM_REASON_CHARS = 96
-# The optional "how the build ended" run fields (SCHEMA.md) the trimmer
-# carries when the source has them; absent stays absent.
-ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict")
+# The optional run fields (SCHEMA.md) the trimmer carries when the source has
+# them; absent stays absent: how the build ended, and the eval's own verdict,
+# which is what tells a deadline kill from a long red.
+ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict", "eval_verdict")
 
 UTC = timezone.utc
 
@@ -563,7 +598,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "eval_verdict", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -586,6 +621,9 @@ class Run:
         # Unknown stays a setup death: a document written before the collector
         # recorded the field must keep reading the way it did.
         self.merge_conflict = run.get("merge_conflict") if isinstance(run.get("merge_conflict"), bool) else None
+        # The eval loop's own verdict (SCHEMA.md, optional): None when the
+        # run never reached one, which a deadline kill never does.
+        self.eval_verdict = run.get("eval_verdict") if isinstance(run.get("eval_verdict"), str) else None
 
     @property
     def full(self) -> bool:
@@ -631,6 +669,27 @@ class Run:
             and self.duration is not None
             and self.duration < SETUP_DEATH_MAX_DURATION
         )
+
+    @property
+    def deadline_kill(self) -> bool:
+        """Rule 3d's unit: Prow's deadline ended it, not the eval."""
+        return (
+            self.result == RUN_FAILURE
+            and self.eval_verdict is None
+            and not self.lost_pod
+            and self.merge_conflict is not True
+            and self.duration is not None
+            and self.duration >= PROW_JOB_TIMEOUT - DEADLINE_KILL_MARGIN
+        )
+
+    @property
+    def has_verdict(self) -> bool:
+        """Reached a verdict: the eval's own, or -- for a document written
+        before `eval_verdict` existed -- a concluded full run that was not
+        killed."""
+        if self.eval_verdict is not None:
+            return True
+        return self.full and self.result in (RUN_SUCCESS, RUN_FAILURE) and not self.deadline_kill
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
@@ -863,6 +922,31 @@ def setup_deaths(runs, now: datetime) -> dict:
     return {"fires": fires, "deaths": deaths, "prs": prs, "evidence": evidence}
 
 
+def deadline_kills(runs, now: datetime) -> dict:
+    """Rule 3d. Returns {fires, killed, prs, start, end, evidence}."""
+    killed = [run for run in _in_window(runs, now, DEADLINE_KILL_WINDOW) if run.deadline_kill]
+    prs = _prs(killed)
+    start = min((run.finished for run in killed), default=None)
+    end = max((run.finished for run in killed), default=None)
+    evidence = []
+    if killed:
+        evidence.append(_deadline_cause(killed, prs, start, end) + f" ({_pr_list(prs)})")
+    return {
+        "fires": len(killed) >= DEADLINE_KILL_MIN and len(prs) >= DEADLINE_KILL_MIN_PRS,
+        "killed": killed,
+        "prs": prs,
+        "start": start,
+        "end": end,
+        "evidence": evidence,
+    }
+
+
+def _deadline_cause(killed, prs, start, end) -> str:
+    return CAUSE_DEADLINE_KILL.format(
+        count=len(killed), prs=len(prs), minutes=int(PROW_JOB_TIMEOUT.total_seconds() // 60), start=hhmm(start), end=hhmm(end)
+    )
+
+
 def node_counts(runs) -> dict[str, int]:
     """{node: lost pods on it}, by name; runs with no recorded node skipped."""
     counts: dict[str, int] = {}
@@ -1044,6 +1128,9 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     own = pr_caused_reds(full, roster)
     deaths = sum(1 for run in window if run.setup_death)
     lost = sum(1 for run in window if run.lost_pod)
+    kills = [run for run in window if run.deadline_kill]
+    # A killed run that recorded cases (#1875) is already among the full reds.
+    kills_not_counted = sum(1 for run in kills if not run.full)
     out = {
         "window_hours": int(METRICS_WINDOW.total_seconds() // 3600),
         "full_runs": len(full),
@@ -1054,11 +1141,12 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
         # everything else (shared breaks, storms, empty records, setup
         # deaths, lost pods) as "infra".
         "pr_caused_reds": own,
-        "infra_reds": reds - own + deaths + lost,
+        "infra_reds": reds - own + deaths + lost + kills_not_counted,
         "green_rate": round(len(green) / len(concluded), 3) if concluded else None,
         "aborted_runs": sum(1 for run in window if run.result not in (RUN_SUCCESS, RUN_FAILURE)),
         "setup_deaths": deaths,
         "lost_pods": lost,
+        "deadline_kills": len(kills),
         "infra_rep_rate": round(storm_reps / reps, 3) if reps else None,
         "infra_reps": storm_reps,
         # Apart from the storm's count: repetitions the harness stopped
@@ -1486,6 +1574,12 @@ def advice_for(
     if condition == SHARED_BREAK:
         issues = all_tracking(cases, notes, issue)
         return ADVICE_OUTAGE.format(tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE)
+    if condition == DEADLINE_KILL:
+        issues = all_tracking(cases, notes, issue)
+        return ADVICE_DEADLINE_KILL.format(
+            minutes=int(PROW_JOB_TIMEOUT.total_seconds() // 60),
+            tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE,
+        )
     if condition == STORM:
         when = hhmm(storm_end + STORM_COOLDOWN) if storm_end else "the storm ends"
         return ADVICE_STORM.format(when=when)
@@ -1523,10 +1617,14 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
     r3c = fixture_drift(fixture_state_doc, now)
+    r3d = deadline_kills(visible, now)
 
     if r1["fires"]:
         state, condition = OUTAGE, SHARED_BREAK
         cause = CAUSE_SHARED_BREAK.format(cases=", ".join(r1["cases"]))
+    elif r3d["fires"]:
+        state, condition = OUTAGE, DEADLINE_KILL
+        cause = _deadline_cause(r3d["killed"], r3d["prs"], r3d["start"], r3d["end"])
     elif r3b["fires"]:
         state, condition = DEGRADED, LOST_PODS
         cause = CAUSE_LOST_PODS.format(count=len(r3b["lost"]), prs=len(r3b["prs"]), start=hhmm(r3b["start"]), end=hhmm(r3b["end"]))
@@ -1545,7 +1643,7 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     else:
         state, condition, cause = GREEN, None, ""
 
-    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
+    evidence = r1["evidence"] + r3d["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
     if r1["fires"] and r2["fires"]:
         # Both true at once on 2026-09-02: the break is the state, the
         # storm is context the reader still needs.
@@ -1578,6 +1676,8 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         incident = {"prs": r2b["prs"], "runs": r2b["runs"], "reps": r2b["reps"], "window_start": iso(r2b["start"]), "window_end": iso(r2b["end"])}
     elif condition == SETUP_DEATHS:
         incident = {"prs": r3["prs"], "runs": len(r3["deaths"]), "window_start": None, "window_end": None}
+    elif condition == DEADLINE_KILL:
+        incident = {"prs": r3d["prs"], "runs": len(r3d["killed"]), "window_start": iso(r3d["start"]), "window_end": iso(r3d["end"])}
     elif condition == LOST_PODS:
         incident = {
             "prs": r3b["prs"],
@@ -1614,12 +1714,13 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
         "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
+        "last_deadline_kill": max((run.finished for run in visible if run.deadline_kill), default=None),
         "roster": roster,
         "fixture": r3c,
     }
 
 
-def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None) -> bool:
+def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None, last_deadline_kill: datetime | None = None) -> bool:
     """Rule 6's exit: the last RECOVERY_GREEN_RUNS full runs are green, on
     distinct pull requests, all finished after the incident began, and none
     carries the signature of the condition being left -- a collapse of one
@@ -1629,6 +1730,15 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     a lost pod after it for lost pods. Judged from the runs themselves rather than
     from the rule's window, so the runs that constituted the incident never
     count as its recovery once the window has rolled past them."""
+    if prev.get("condition") == DEADLINE_KILL:
+        # A verdict either way is the proof: the gate is grading again. Green
+        # alone would hold the outage through a stretch of honest reds.
+        recent = [run for run in full_runs if run.has_verdict][-RECOVERY_GREEN_RUNS:]
+        if len(recent) < RECOVERY_GREEN_RUNS:
+            return False
+        if any(run.finished <= since or (last_deadline_kill is not None and run.finished <= last_deadline_kill) for run in recent):
+            return False
+        return len(_prs(recent)) >= RECOVERY_GREEN_RUNS
     recent = full_runs[-RECOVERY_GREEN_RUNS:]
     if len(recent) < RECOVERY_GREEN_RUNS:
         return False
@@ -1718,7 +1828,7 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
         if fixture_drift_hold(assessed["fixture"], prev.get("incident")) is None:
             return _keep(GREEN, None, "", [], now, recovering=False)
         return _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
-    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"]):
+    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"], assessed.get("last_deadline_kill")):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
 
@@ -1775,8 +1885,9 @@ def adjudicate(
         issue = next((match for match in (issue_for(candidate, decided["condition"]) for candidate in candidates) if match), None)
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
+        bar = "runs with a verdict" if decided["condition"] == DEADLINE_KILL else "green runs"
         evidence.append(
-            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive green runs"
+            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive {bar}"
             " on distinct PRs before reporting GREEN"
         )
     elif decided["state"] != assessed["state"] and SEVERITY[assessed["state"]] > SEVERITY[decided["state"]]:
@@ -1964,8 +2075,8 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
 
     Runs that finished in [start, end); per run build_id, pr, started,
     finished, result, duration_s and tasks, plus how the build ended
-    (has_build_log, the pod_* trio, merge_conflict) when the source recorded
-    it; per task
+    (has_build_log, the pod_* trio, merge_conflict) and eval_verdict when the
+    source recorded them; per task
     name, result and reps; per rep result and the first TRIM_REASON_CHARS of
     the reason (null for passing reps, as the collector writes them).
     """

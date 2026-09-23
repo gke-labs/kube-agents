@@ -37,6 +37,7 @@ ROSTER_HISTORY = TESTDATA / "roster-history.json"
 # 2026-09-11, the build-cluster node loss (#1478), and BOOTSTRAP_ADMITTED as
 # hack/ci-eval-pr.sh had it that day.
 LOST_FIXTURE = TESTDATA / "lost-pods-2026-09-11.json.gz"
+DEADLINE_FIXTURE = TESTDATA / "deadline-kills-2026-09-22.json.gz"
 # The week ending 2026-09-14 18:20Z: every run green, every run long (#1586).
 SLOW_FIXTURE = TESTDATA / "slow-gate-2026-09-14.json.gz"
 ROSTER_0911 = [
@@ -500,6 +501,116 @@ class SetupDeaths(unittest.TestCase):
     def test_a_lowercase_prow_verdict_still_counts(self):
         # Prow wrote `failure` on six zero-task runs on 2026-09-05.
         self.assertEqual(assess(self.deaths([1, 1, 2], result="failure"), T0)["state"], "DEGRADED")
+
+
+# --------------------------------------------------------------------------- #
+# Rule 3d: deadline kills
+# --------------------------------------------------------------------------- #
+
+
+def kill(build_id, pr, finished, minutes=363, **fields):
+    """A run Prow killed at its deadline, as the collector records it: a FAILURE
+    with no verdict that lasted the job's whole timeout. 2026-09-22/23's 17."""
+    raw = run(build_id, pr, finished, minutes=minutes, result="FAILURE")
+    raw.update({"eval_verdict": None, "has_build_log": True, "pod_phase": "Failed", "pod_last_event": None, "merge_conflict": False})
+    raw.update(fields)
+    return raw
+
+
+def graded(build_id, pr, finished, verdict="GREEN", minutes=120):
+    """A run that reached a verdict, green or red."""
+    tasks = broken_tasks(set()) if verdict == "GREEN" else broken_tasks({"agent-kanban-smoke"})
+    return dict(run(build_id, pr, finished, minutes=minutes, tasks=tasks), eval_verdict=verdict)
+
+
+class DeadlineKills(unittest.TestCase):
+    def kills(self, prs, spread_minutes=10, **fields):
+        return data(*(kill(100 + i, pr, T0 - timedelta(minutes=spread_minutes * i), **fields) for i, pr in enumerate(prs)))
+
+    def test_the_predicate_reads_the_verdict_and_the_clock(self):
+        self.assertTrue(health.Run(kill(1, 1, T0)).deadline_kill)
+        self.assertTrue(health.Run(kill(2, 2, T0, minutes=345)).deadline_kill, "the margin under the 360m timeout")
+        self.assertFalse(health.Run(kill(3, 3, T0, minutes=344)).deadline_kill)
+        self.assertFalse(health.Run(kill(4, 4, T0, eval_verdict="RED")).deadline_kill, "a long run that graded is a red, not a kill")
+        self.assertFalse(health.Run(kill(5, 5, T0, result="SUCCESS")).deadline_kill)
+        self.assertFalse(health.Run(kill(6, 6, T0, result="ABORTED")).deadline_kill)
+        self.assertFalse(health.Run(kill(7, 7, T0, has_build_log=False, pod_last_event="NodeNotReady")).deadline_kill, "a lost pod is a lost pod")
+        self.assertFalse(health.Run(kill(8, 8, T0, merge_conflict=True)).deadline_kill)
+        # #1875: the harness records cases as they finish, so a killed run may
+        # carry graded tasks and still no verdict. Still a kill.
+        partial = kill(9, 9, T0, tasks=[task("agent-kanban-smoke", "ppp")])
+        self.assertTrue(health.Run(partial).deadline_kill)
+        self.assertFalse(health.Run(partial).setup_death)
+
+    def test_three_kills_on_two_prs_are_an_outage(self):
+        result = assess(self.kills([1, 1, 2]), T0)
+        self.assertEqual((result["state"], result["condition"]), ("OUTAGE", "deadline_kill"))
+        self.assertEqual(result["cause"], "deadline kills: 3 runs on 2 PRs killed at the 360-minute deadline with no verdict 23:40–00:00 UTC")
+        self.assertEqual(result["incident"]["prs"], [1, 2])
+        self.assertEqual(result["incident"]["runs"], 3)
+        self.assertIn("deadline kills: 3 runs on 2 PRs killed at the 360-minute deadline with no verdict 23:40–00:00 UTC (#1, #2)", result["evidence"])
+
+    def test_one_pr_looping_to_the_deadline_is_that_prs_problem(self):
+        result = assess(self.kills([1068, 1068, 1068]), T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIn("deadline kills: 3 runs on 1 PRs killed at the 360-minute deadline with no verdict 23:40–00:00 UTC (#1068)", result["evidence"])
+
+    def test_two_kills_or_kills_outside_the_window_do_not_fire(self):
+        self.assertEqual(assess(self.kills([1, 2]), T0)["state"], "GREEN")
+        self.assertEqual(assess(self.kills([1, 2, 3], spread_minutes=70), T0)["state"], "GREEN", "0, 70 and 140 minutes ago: only two inside 2h")
+
+    def test_kills_outrank_lost_pods_and_a_break_outranks_kills(self):
+        doc = self.kills([1, 1, 2])
+        doc["runs"] += [lost(200 + i, 20 + i, T0 - timedelta(minutes=5 * i)) for i in range(3)]
+        self.assertEqual(assess(doc, T0)["condition"], "deadline_kill")
+        doc["runs"] += [run(300 + i, 30 + i, T0 - timedelta(minutes=3 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(3)]
+        self.assertEqual(assess(doc, T0)["condition"], "shared_break")
+
+    def test_recovery_needs_three_verdicts_on_distinct_prs_after_the_last_kill(self):
+        doc = self.kills([1, 1, 2])
+        prev = adjudicate(doc, T0)
+        self.assertEqual(prev["state"], "OUTAGE")
+        later = T0 + timedelta(hours=3)  # the kills have rolled out of the window
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["recovering"]), ("OUTAGE", True))
+        self.assertIn("waiting for 3 consecutive runs with a verdict on distinct PRs", held["evidence"][-1])
+        # A red with a verdict counts: the gate is grading again.
+        doc["runs"] += [graded(400, 40, later - timedelta(minutes=30), "RED"), graded(401, 41, later - timedelta(minutes=20), "GREEN")]
+        self.assertEqual(adjudicate(doc, later, held)["state"], "OUTAGE")
+        # A third on a PR already counted: held -- the last three must be
+        # three PRs. Two more on new PRs: GREEN.
+        doc["runs"].append(graded(402, 41, later - timedelta(minutes=10), "GREEN"))
+        self.assertEqual(adjudicate(doc, later, held)["state"], "OUTAGE")
+        doc["runs"].append(graded(403, 42, later - timedelta(minutes=5), "GREEN"))
+        doc["runs"].append(graded(404, 43, later - timedelta(minutes=2), "RED"))
+        result = adjudicate(doc, later, held)
+        self.assertEqual((result["state"], result["recovering"]), ("GREEN", False))
+
+    def test_verdicts_that_predate_the_last_kill_do_not_recover_it(self):
+        doc = self.kills([1, 1, 2])
+        doc["runs"] += [graded(400 + i, 40 + i, T0 - timedelta(minutes=60 + 5 * i)) for i in range(3)]
+        prev = adjudicate(doc, T0)
+        self.assertEqual(prev["state"], "OUTAGE")
+        later = T0 + timedelta(hours=3)
+        self.assertEqual(adjudicate(doc, later, prev)["state"], "OUTAGE")
+
+    def test_kills_are_counted_on_the_infra_side_of_the_digest(self):
+        result = adjudicate(self.kills([1, 1, 2]), T0)
+        self.assertEqual(result["metrics"]["deadline_kills"], 3)
+        self.assertEqual(result["metrics"]["infra_reds"], 3)
+        self.assertEqual(result["metrics"]["pr_caused_reds"], 0)
+
+    def test_deadline_advice(self):
+        advice = adjudicate(self.kills([1, 1, 2]), T0)["advice"]
+        self.assertIn("killed at the 360-minute deadline", advice)
+        self.assertIn("Don't retest", advice)
+        self.assertIn("no issue filed yet", advice)
+
+    def test_nightly_kills_do_not_count(self):
+        doc = self.kills([1, 1, 2])
+        for entry in doc["runs"]:
+            entry["tier"] = "nightly"
+        self.assertEqual(assess(doc, T0)["state"], "GREEN")
 
 
 # --------------------------------------------------------------------------- #
@@ -1658,6 +1769,56 @@ class Replay(unittest.TestCase):
         # window's moving bounds do not count. Bound the week's entries so
         # the poster's silence is real, not a coincidence of the fixture.
         self.assertLess(len(self.timeline), 60, [e["at"] for e in self.timeline])
+
+
+class DeadlineKillsReplay(unittest.TestCase):
+    """2026-09-22/23 (#1894): the published data.json from 12:00Z on the 22nd
+    to 20:00Z on the 23rd. Thirty-three presubmit runs were killed at Prow's
+    360-minute deadline with no verdict (#1880's dispatch stall under them)
+    and ten reached one; health.py of the day stayed GREEN throughout. The
+    rule fires on the third kill, at 20:00Z on the 22nd, and is still firing
+    at the end of the window because the kills are."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = health.load_json(DEADLINE_FIXTURE)
+        cls.roster = health.Roster.fixed(ADMITTED)
+        cls.every = list(health.replay(cls.data, timedelta(minutes=30), cls.roster, start=day("09-22", 12, 0)))
+        cls.timeline = health.timeline(cls.every)
+
+    def tick(self, when):
+        return next(h for now, h in self.every if now == when)
+
+    def test_the_fixture_is_what_trim_produces(self):
+        trimmed = self.data["trimmed"]
+        again = health.trim(self.data, health.parse_iso(trimmed["from"]), health.parse_iso(trimmed["to"]), trimmed["source"])
+        self.assertEqual(again["runs"], self.data["runs"])
+        runs = [health.Run(r) for r in self.data["runs"]]
+        self.assertEqual(sum(1 for r in runs if r.deadline_kill), 33)
+        self.assertEqual(sum(1 for r in runs if r.has_verdict), 10)
+        self.assertEqual(sum(1 for r in runs if r.lost_pod), 0, "none of the kills reads as a lost pod")
+
+    def test_green_until_the_third_kill_then_outage_under_its_own_name(self):
+        self.assertEqual(at(self.timeline, day("09-22", 19, 30))["state"], "GREEN")
+        entry = at(self.timeline, day("09-22", 20, 0))
+        self.assertEqual((entry["state"], entry["condition"]), ("OUTAGE", "deadline_kill"), entry)
+        self.assertEqual(entry["cause"], "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 18:49–19:49 UTC")
+
+    def test_the_outage_holds_through_the_night_and_is_still_on_at_the_end(self):
+        conditions = {e["condition"] for e in between(self.timeline, day("09-22", 20, 0), day("09-23", 20, 0))}
+        self.assertEqual(conditions, {"deadline_kill"}, "no other condition takes the state from it")
+        states = {e["state"] for e in between(self.timeline, day("09-22", 20, 0), day("09-23", 20, 0))}
+        self.assertEqual(states, {"OUTAGE"})
+        last_now, last = self.every[-1]
+        self.assertEqual((last_now, last["state"], last["condition"]), (day("09-23", 20, 0), "OUTAGE", "deadline_kill"))
+
+    def test_a_lull_in_kills_is_recovering_not_green(self):
+        # 03:25-04:38Z kills, then none until 08:22Z: the rule stops firing,
+        # the bar (three runs with a verdict on distinct PRs) is not met, and
+        # the state is held as recovering rather than dropped to GREEN.
+        tick = self.tick(day("09-23", 6, 0))
+        self.assertEqual((tick["state"], tick["condition"], tick["recovering"]), ("OUTAGE", "deadline_kill", True))
+        self.assertIn("waiting for 3 consecutive runs with a verdict on distinct PRs", " ".join(tick["evidence"]))
 
 
 class LostPodsReplay(unittest.TestCase):

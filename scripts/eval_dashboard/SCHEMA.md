@@ -794,7 +794,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -807,7 +807,10 @@ a run-page banner of its own, and otherwise show the generic degraded
 headline. For `delegation_ceiling` (15+ repetitions across 3+ PRs in 2 hours
 ended at the harness's delegation wait with the worker still running, #1874)
 the `incident` also carries `reps`, and the pages give it the storm's 2-hour
-lead, a Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
+lead, a Brief headline and a run-page banner of its own. `deadline_kill` (3+ runs on 2+ PRs in 2 hours that concluded `FAILURE`
+with `eval_verdict` `null` after running to the job's 360-minute deadline,
+#1894) is an OUTAGE with the storm's incident keys; the pages give it a
+Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
 filed for. `fixture_drift` (the hourly seeded-fleet scan found a fixture
 role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a

@@ -409,6 +409,23 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "red")
         self.assertEqual(verdict["headline"], "The run failed before any case ran 25 minutes in.")
 
+    def test_a_deadline_kill_is_run_level_and_named_as_prows(self):
+        # #1894: a FAILURE with no verdict that ran to the job's timeout is
+        # Prow's kill, not the branch's failure -- and not a setup death.
+        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[])
+        target.update({"eval_verdict": None, "has_build_log": True, "pod_last_event": None, "merge_conflict": False})
+        verdict = classify_run(target, [target])
+        self.assertEqual((verdict["verdict"], verdict["cls"], verdict["do"]), ("infra", classify.CLS_DEADLINE, classify.DO_DEADLINE_KILL))
+        self.assertEqual(verdict["headline"], "Prow killed this run at its 360-minute deadline.")
+        self.assertFalse(verdict["setup_death"])
+        self.assertFalse(verdict["matches_incident"])
+        during = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": []})
+        self.assertTrue(during["matches_incident"])
+        self.assertIn("Other PRs are being killed the same way", during["lede"])
+        # 344 minutes is under the margin: still the branch's own failure.
+        short = dict(target, duration_s=344 * 60)
+        self.assertEqual(classify_run(short, [short])["headline"], "The run failed before any case ran 344 minutes in.")
+
     def test_an_aborted_run_is_not_a_verdict(self):
         verdict = classify_run(run(1, 913, T0, minutes=8, result="ABORTED"), [])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))

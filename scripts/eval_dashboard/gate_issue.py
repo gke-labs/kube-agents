@@ -54,6 +54,13 @@ COMMENTS_PATH = "issues/{number}/comments"
 # (health.py owns the vocabulary).
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
+CONDITION_DEADLINE_KILL = "deadline_kill"
+# The presubmit job's timeout in minutes (health.py PROW_JOB_TIMEOUT owns it).
+DEADLINE_MINUTES = 360
+# health.py RECOVERY_GREEN_RUNS, the bar the body quotes.
+RECOVERY_RUNS = 3
+# What an open issue must name to be adopted as the deadline-kill tracker.
+DEADLINE_KILL_NAMES = ("deadline", "pull-kube-agents-smoke-test")
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -98,6 +105,24 @@ The Prow build cluster (`kube-agents-prow`) lost the node(s) below at {when}; {r
 Incident brief: {brief}
 
 Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it.
+"""
+DEADLINE_KILL_TITLE = "Smoke gate outage: {runs} runs on {prs} PRs killed at the {minutes}-minute deadline with no verdict since {since}"
+DEADLINE_KILL_BODY = """\
+The smoke gate (`{job}`) is in OUTAGE: since {since} ({since_iso}), {runs} runs on {prs} pull requests ran to Prow's {minutes}-minute deadline and were killed with no eval verdict. Nothing is being graded, so no pull request can pass, and a red on an open PR from this window is not that PR's code.
+
+**Window:** {window} ({window_iso}).
+**Affected PRs:** {pr_list}.
+**Evidence:**
+
+{evidence}
+
+**Advice for authors:** don't retest until the Chat space reports the gate healthy; a run started now ends the same way.
+
+**For whoever picks this up:** each killed run's `build-log.txt` shows every unit reaching the delegation ceiling; the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. Recovery is reported after {recovery} runs with a verdict, green or red, on distinct PRs.
+
+Incident brief: {brief}
+
+Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue.
 """
 FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
 PROJECT_NOUN = ("project", "projects")
@@ -217,6 +242,31 @@ def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_
     )
 
 
+def render_deadline_kill_title(health: dict, since_text: str) -> str:
+    incident = health.get("incident") or {}
+    return DEADLINE_KILL_TITLE.format(runs=incident.get("runs", 0), prs=len(incident.get("prs") or []), minutes=DEADLINE_MINUTES, since=since_text)
+
+
+def render_deadline_kill_body(health: dict, since_text: str, window_text: str, brief_link: str) -> str:
+    incident = health.get("incident") or {}
+    prs = incident.get("prs") or []
+    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    return DEADLINE_KILL_BODY.format(
+        job=JOB_NAME,
+        since=since_text,
+        since_iso=health.get("since") or "?",
+        runs=incident.get("runs", 0),
+        prs=len(prs),
+        minutes=DEADLINE_MINUTES,
+        window=window_text,
+        window_iso=f"{incident.get('window_start') or '?'} – {incident.get('window_end') or '?'}",
+        pr_list=", ".join(f"#{pr}" for pr in prs) or "none recorded",
+        evidence="\n".join(evidence) or NO_EVIDENCE,
+        recovery=RECOVERY_RUNS,
+        brief=brief_link,
+    )
+
+
 def render_fixture_drift_title(health: dict, since_text: str) -> str:
     incident = health.get("incident") or {}
     roles = list(incident.get("roles") or [])
@@ -277,6 +327,8 @@ class Tracker:
             return self._ensure_lost_pods(health, since_text, window_text or since_text, brief_link)
         if condition == CONDITION_FIXTURE_DRIFT:
             return self._ensure_fixture_drift(health, since_text, brief_link)
+        if condition == CONDITION_DEADLINE_KILL:
+            return self._ensure_deadline_kill(health, since_text, window_text or since_text, brief_link)
         cases = list(health.get("failing_cases") or [])
         if not cases:
             return None
@@ -304,6 +356,21 @@ class Tracker:
         created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_LOST_PODS)
         if created:
             log(f"tracking issue: filed #{created['number']} for the cluster owner")
+        return created
+
+    def _ensure_deadline_kill(self, health: dict, since_text: str, window_text: str, brief_link: str) -> dict | None:
+        found = self.existing(list(DEADLINE_KILL_NAMES))
+        if found:
+            log(f"tracking issue: adopting open #{found['number']} (names the deadline kills)")
+            return dict(found, condition=CONDITION_DEADLINE_KILL)
+        payload = {
+            "title": render_deadline_kill_title(health, since_text),
+            "body": render_deadline_kill_body(health, since_text, window_text, brief_link),
+            "labels": [LABEL],
+        }
+        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_DEADLINE_KILL)
+        if created:
+            log(f"tracking issue: filed #{created['number']} for the gate's deadline kills")
         return created
 
     def _ensure_fixture_drift(self, health: dict, since_text: str, brief_link: str) -> dict | None:

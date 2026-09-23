@@ -111,6 +111,10 @@ CONDITION_LOST_PODS = "lost_pods"
 CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_DEADLINE_KILL = "deadline_kill"
+# The presubmit job's timeout in minutes (health.py PROW_JOB_TIMEOUT owns it;
+# copied so this module imports nothing that reads data.json).
+DEADLINE_MINUTES = 360
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"
@@ -599,6 +603,13 @@ def cause_sentence(health: dict) -> str:
         if incident.get("event"):
             return f"the build cluster lost {nodes_text(incident.get('nodes'))} at {when}; {runs} runs on {prs} PRs died mid-run."
         return f"{runs} runs on {prs} PRs died with their build node at {when}."
+    if condition == CONDITION_DEADLINE_KILL:
+        start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        window = clock_range(start, end) if start and end else f"since {since}"
+        return (
+            f"{incident.get('runs', 0)} runs on {prs} PRs were killed at the {DEADLINE_MINUTES}-minute deadline with no verdict {window};"
+            " nothing is being graded, so the gate cannot pass anyone."
+        )
     if condition == "shared_break":
         return (
             f"{describe_cases(health.get('failing_cases'))} fail on every PR since {since}"
@@ -670,7 +681,9 @@ def slow_text(slow: dict) -> str:
     """The numbers behind a slow gate, in minutes, as one clause: "the last
     5 full runs took 152–213 min (median 183) against a 7-day typical of
     151 min (p90 198); 2 reps lost to 429s"."""
-    lost = f"{slow['infra_reps']} reps lost to 429s" if slow.get("infra_reps") else "no reps lost"
+    # health.py's storm_reps: 429s and empty records alike (rep_kind), so the
+    # note names both rather than calling an empty record a 429.
+    lost = f"{slow['infra_reps']} reps lost to 429s or empty records" if slow.get("infra_reps") else "no reps lost"
     return (
         f"the last {slow.get('runs', 0)} full runs took {minutes_text(slow.get('min_s'))}–{minutes_text(slow.get('max_s'))} min"
         f" (median {minutes_text(slow.get('median_s'))}) against a {slow.get('baseline_days', DEFAULT_SLOW_BASELINE_DAYS)}-day typical"
@@ -882,6 +895,8 @@ def short_cause(prev: dict) -> str:
         return "seeded fixtures had drifted"
     if condition == CONDITION_DELEGATION_CEILING:
         return "workers were not finishing"
+    if condition == CONDITION_DEADLINE_KILL:
+        return "runs were being killed at the deadline"
     return prev.get("cause") or "unknown cause"
 
 

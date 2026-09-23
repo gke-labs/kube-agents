@@ -607,6 +607,32 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Workers not finishing", run_page)
         self.assertIn("those runs read not evaluated, not red", run_page)
 
+    def test_a_deadline_kill_outage_has_its_own_brief_and_banner(self):
+        # #1894: runs Prow killed at the job deadline with no verdict.
+        health = health_doc(
+            "OUTAGE", condition="deadline_kill", failing_cases=[], tracking_issues=[],
+            cause="deadline kills: 3 runs on 2 PRs killed at the 360-minute deadline with no verdict 12:00–14:00 UTC",
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(),
+            incident={"prs": [1, 2], "runs": 3, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
+        )
+        data = json.loads(json.dumps(self.data))
+        killed = {
+            "build_id": "2097282860221206599", "pr": 1, "project": "kube-agents-evals-7", "tier": "presubmit",
+            "started": "2026-09-08T07:55:00+00:00", "finished": "2026-09-08T13:58:00+00:00",
+            "result": "FAILURE", "eval_verdict": None, "duration_s": 21780, "has_build_log": True,
+            "pod_phase": "Failed", "pod_last_event": None, "merge_conflict": False, "tasks": [],
+        }
+        data["runs"].append(killed)
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-brief", data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("OUTAGE · since Tue 8:00 AM ET", app)
+        self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
+        self.assertIn("Why we think it's the gate, not the PRs", app)
+        self.assertIn("ran to the job deadline and ended with no verdict", app)
+        run_page = dom_text(out / "run.html", query="build=2097282860221206599")
+        self.assertIn("Prow killed this run at its 360-minute deadline", run_page)
+        self.assertIn("Runs killed at the deadline", run_page)
+
     def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
         """A run whose every case ended at the ceiling passed nothing, so its row
         cannot read "all gate cases passed"; and the storm brief's totals count

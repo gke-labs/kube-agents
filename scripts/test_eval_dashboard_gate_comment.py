@@ -320,6 +320,57 @@ def lost_pods_health(prs=(926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1
     }
 
 
+def killed(build, pr, finished, minutes=363, **fields):
+    """A run Prow killed at the job deadline: FAILURE, no verdict, no tasks,
+    the collector's usual ended-fields -- 2026-09-22/23's seventeen."""
+    raw = run(build, pr, finished, tasks=[], result="FAILURE", minutes=minutes)
+    raw.update({"eval_verdict": None, "has_build_log": True, "pod_phase": "Failed", "pod_node": "n", "pod_last_event": None, "merge_conflict": False, **fields})
+    return raw
+
+
+def deadline_health(prs=(1826, 1838, 1877)):
+    return {
+        "state": "OUTAGE",
+        "condition": "deadline_kill",
+        "since": "2026-09-08T14:05:52+00:00",  # Tue 10:05 AM EDT
+        "failing_cases": [],
+        "tracking_issues": [],
+        "incident": {"prs": list(prs), "runs": len(prs), "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:50:00+00:00"},
+    }
+
+
+class DeadlineKillComment(Harness):
+    """A run Prow killed at the job deadline gets one short comment (#1894):
+    when, that nothing was graded, and -- while the gate is in the
+    deadline_kill outage -- that the gate is down and the red is not the
+    author's diff."""
+
+    def test_the_shape_without_an_incident(self):
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        body = self.gh.bodies()[0]
+        self.assertIn("### ⚪ Smoke gate: run killed at the deadline", body)
+        self.assertIn("> Prow killed this run at its 360-minute deadline at 10:55 AM ET; nothing was graded and nothing about your change is implied. `/retest` once runs are finishing again", body)
+        self.assertIn("Ran 363 min to the deadline", body)
+        self.assertNotIn("gate is down", body)
+
+    def test_during_the_outage_it_says_the_gate_is_down_and_not_to_retest(self):
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), deadline_health())
+        body = self.gh.bodies()[0]
+        self.assertIn("**The gate is down: 3 runs on 3 PRs have been killed at the deadline since Tue 10:05 AM ET; your run's failure is not your diff.**", body)
+        self.assertIn("Don't retest yet", body)
+        self.assertIn("[Incident brief →]", body)
+
+    def test_a_long_red_with_a_verdict_is_not_a_kill(self):
+        # Ran just as long, but graded: the ordinary red comment, not this one.
+        graded = run(100, 1300, NOW - timedelta(minutes=5), failing=("agent-kanban-smoke",), minutes=363)
+        graded["eval_verdict"] = "RED"
+        self.tick(data(graded, *green_others()), green_health())
+        self.assertNotIn("killed at the deadline", self.gh.bodies()[0])
+
+
 class LostPodComment(Harness):
     """A run whose build node went away gets one short comment (#1478): the
     time and node, that nothing was graded, and /retest -- with the

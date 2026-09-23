@@ -100,6 +100,18 @@ concluded runs (#1278, #1171). Don't retest: the reds share a cause. The message
 names the cases, the pull requests, and the tracking issue when
 `case-notes.yaml` has one.
 
+**OUTAGE** also when runs are being killed at the job deadline (#1894): 3+
+runs on 2+ pull requests among those finishing in the last 2 hours concluded
+`FAILURE` with no eval verdict after running to within 15 minutes of the
+presubmit's 360-minute Prow timeout, and were neither lost pods nor conflicted
+merges. Nothing was graded, so nothing can pass; a killed run that recorded
+some cases before Prow stopped it still counts. The message says how many
+runs on how many pull requests, an issue is filed for whoever owns the gate,
+and recovery is 3 runs with a verdict — green or red — on distinct pull
+requests after the last kill, because a red that graded proves the gate
+grades again. It ranks below a shared break (which names cases) and above
+every DEGRADED condition.
+
 **DEGRADED** — lost pods (the build cluster lost the node under the job:
 3+ runs that concluded `FAILURE` with no tasks and either a `NodeNotReady` pod
 event or no build log at all, finishing within 30 minutes of each other, among
@@ -147,7 +159,7 @@ infra count), the typical run length and the typical wait before a run starts,
 and the delegation-ceiling repetitions on a day that had any. `health.json`'s
 `metrics` keeps the rest — green rate, wall clock p50/p90, `queue_wait_p50_s`
 and whether it was read at all, the infra-rep rate, `setup_deaths`,
-`lost_pods`, `ceiling_reps`.
+`lost_pods`, `deadline_kills`, `ceiling_reps`.
 
 A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
@@ -390,6 +402,14 @@ build-cluster event: N runs on M PRs" (below the 8-run event bar, "one of N
 runs on M PRs that lost their build node") and the incident brief link. Prow's
 build-log page shows the pod's events. Setup deaths and conflicted merges stay
 silent; the build log says which it was.
+
+A run Prow killed at the job deadline with no verdict (#1894) gets the same
+one-line shape under `⚪ Smoke gate: run killed at the deadline`: when it was
+killed, that nothing was graded and nothing about the change is implied, and
+`/retest` once runs are finishing again. While `health.json`'s condition is
+`deadline_kill` the box says instead that the gate is down — "N runs on M PRs
+have been killed at the deadline since ⟨time⟩; your run's failure is not your
+diff" — with the brief link, and asks the author not to retest yet.
 
 The comment starts with a hidden marker (`<!-- smoke-gate-comment -->`); a
 later red on the same pull request edits it in place, and a build already

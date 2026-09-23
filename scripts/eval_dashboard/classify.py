@@ -138,6 +138,11 @@ DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 # Zero tasks, concluded FAILURE, and over inside this long: the run died at
 # clone or deploy before any case ran (the adjudicator's setup-death rule).
 SETUP_DEATH_MAX_DURATION = timedelta(minutes=5)
+# health.py's rule 3d (#1894): a FAILURE with no verdict that lasted the job's
+# timeout was killed by Prow, not by the eval. Copied from health.py, which
+# owns them; the timeout is the presubmit's decoration_config in oss-test-infra.
+PROW_JOB_TIMEOUT = timedelta(minutes=360)
+DEADLINE_KILL_MARGIN = timedelta(minutes=15)
 
 # --- Pass rate ---------------------------------------------------------------
 # The per-case pass rate the PR view quotes is over runs started inside
@@ -171,6 +176,7 @@ CONDITION_STORM = "storm"
 CONDITION_SETUP_DEATHS = "setup_deaths"
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_DEADLINE_KILL = "deadline_kill"
 # The pod event health.py's rule 3b reads (runs[].pod_last_event).
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
 RUN_SUCCESS = "SUCCESS"
@@ -186,6 +192,7 @@ CLS_ONLY_THIS_PR = "only-this-pr"
 CLS_STORM = "storm"
 CLS_CEILING = "delegation-ceiling"
 CLS_SETUP = "setup"
+CLS_DEADLINE = "deadline-kill"
 VERDICT_RED = "red"
 VERDICT_GREEN = "green"
 VERDICT_INFRA = "infra"
@@ -210,6 +217,7 @@ DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the p
 DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
+DO_DEADLINE_KILL = "Nothing yet. Prow killed the run at its deadline before anything was graded; retest once the brief says runs are finishing again."
 DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
@@ -372,6 +380,21 @@ def is_merge_conflict(run: dict) -> bool:
     """A zero-task FAILURE the collector recorded as a clone that could not
     merge the pull request into its base (SCHEMA.md, `merge_conflict`)."""
     return not run_tasks(run) and str(run.get("result") or "").upper() == RUN_FAILURE and run.get("merge_conflict") is True
+
+
+def is_deadline_kill(run: dict) -> bool:
+    """health.py's rule 3d unit: a FAILURE with no eval verdict that ran to
+    the job's deadline. Tasks or not: since #1875 a killed run may carry the
+    cases that finished before Prow stopped it."""
+    length = run_length(run)
+    return (
+        str(run.get("result") or "").upper() == RUN_FAILURE
+        and run.get("eval_verdict") is None
+        and not is_lost_pod(run)
+        and not is_merge_conflict(run)
+        and length is not None
+        and length >= PROW_JOB_TIMEOUT - DEADLINE_KILL_MARGIN
+    )
 
 
 def is_setup_death(run: dict) -> bool:
@@ -803,6 +826,18 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
                 cls=CLS_SETUP,
                 do=DO_LOST_POD,
                 matches_incident=condition == CONDITION_LOST_PODS,
+            )
+        if is_deadline_kill(run):
+            return dict(
+                base,
+                headline=f"Prow killed this run at its {int(PROW_JOB_TIMEOUT.total_seconds() // 60)}-minute deadline.",
+                lede="Nothing was graded: the run outlived the job's timeout before the eval reached a verdict."
+                + ("" if condition != CONDITION_DEADLINE_KILL else " Other PRs are being killed the same way right now."),
+                verdict=VERDICT_INFRA,
+                setup_death=False,
+                cls=CLS_DEADLINE,
+                do=DO_DEADLINE_KILL,
+                matches_incident=condition == CONDITION_DEADLINE_KILL,
             )
         if is_merge_conflict(run):
             return dict(

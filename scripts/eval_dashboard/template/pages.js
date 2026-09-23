@@ -61,7 +61,7 @@ const PAGE = {
   // lost pods 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000 },
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000, deadline_kill: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -620,6 +620,17 @@ function setupFacts(inc, inWindow) {
   ];
 }
 
+function deadlineFacts(inc, inWindow) {
+  const killed = inWindow.filter((r) => r.cls === "deadline-kill");
+  const prs = new Set(killed.map((r) => r.pr).filter((p) => p != null));
+  const graded = inWindow.filter((r) => measured(r) && concluded(r) && r.cls !== "deadline-kill");
+  return [
+    fact(true, `<b>${plural(killed.length, "run")}</b> on ${plural(prs.size, "PR")} ran to the job deadline and ended with no verdict.`),
+    fact(prs.size > 1, prs.size > 1 ? "More than one PR, so not one slow branch." : "Only one PR so far; it may be that branch."),
+    fact(graded.length > 0, graded.length ? `Runs that reached a verdict in the same window: ${graded.length}.` : "No run in this window has reached a verdict."),
+  ];
+}
+
 function mergesFact(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return null;
   const firstRed = inWindow.find((r) => gateFailures(r).some((c) => inc.cases.includes(c)));
@@ -695,6 +706,12 @@ function briefHeadline(inc, inWindow) {
       lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The front door delegated and the card was still running when the eval stopped waiting, so nothing was graded; those runs read not evaluated, not red. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).`,
     };
   }
+  if (inc.condition === "deadline_kill") {
+    return {
+      head: inc.past ? "Runs were killed at the job deadline with nothing graded" : "Runs are being killed at the job deadline with nothing graded",
+      lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. Prow ended each run at the job's timeout before the eval reached a verdict, so no pull request can pass; nothing about those pull requests is implied.`,
+    };
+  }
   return { head: inc.past ? "A past gate incident" : "The gate is degraded", lede: esc(inc.cause || "") };
 }
 
@@ -719,6 +736,7 @@ function whyTitle(inc) {
   if (inc.condition === "storm") return "Why we think it's a quota storm";
   if (inc.condition === "setup_deaths") return "Why we think it's the setup, not the PRs";
   if (inc.condition === "delegation_ceiling") return "Why we think it's the workers, not the PRs";
+  if (inc.condition === "deadline_kill") return "Why we think it's the gate, not the PRs";
   return "What the data shows";
 }
 
@@ -733,6 +751,11 @@ function agentSawHtml(inc, inWindow) {
       }
     }
     if (pick) break;
+  }
+  if (inc.condition === "deadline_kill") {
+    const killed = [...inWindow].reverse().find((r) => r.cls === "deadline-kill");
+    const url = killed ? buildUrl(killed) : null;
+    return `<p>No verdict was reached. The build log is the evidence${url ? `: <a href="${esc(url)}">${esc(prText(killed.pr))} at ${esc(et(runFinish(killed)))}</a>` : ""}; its units end at the delegation ceiling.</p>`;
   }
   if (inc.condition === "setup_deaths") {
     const death = [...inWindow].reverse().find((r) => r.setup_death);
@@ -934,7 +957,7 @@ function briefHtml(link) {
       beingDoneHtml(inc) + footHtml();
   }
   const { head, lede } = briefHeadline(inc, inWindow);
-  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
+  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "deadline_kill" ? deadlineFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
   const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}${inc.stale ? " · STALE" : ""}`;
   let recoveringLine = "";
   if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far. A retest is reasonable.</div>`;
@@ -972,6 +995,7 @@ function bannerHtml(run) {
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "deadline_kill") text = `<b>Runs killed at the deadline ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs reach the job timeout with no verdict, so nothing can pass; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "delegation_ceiling") text = `<b>Workers not finishing ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: repetitions end at the harness's delegation wait with the card still running; those runs read not evaluated, not red. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
