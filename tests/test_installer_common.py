@@ -127,6 +127,7 @@ class InstallerCommonTest(unittest.TestCase):
         kms_versions="",
         sa_describe_stub="exit 1",
         gcloud_stderr=None,
+        get_credentials_stub=None,
     ):
         """Source installer_common.sh with print stubs and run `script`.
 
@@ -149,11 +150,17 @@ class InstallerCommonTest(unittest.TestCase):
             state_file = pathlib.Path(tmp) / "default.tfstate"
             if gcloud_stdout is not None:
                 state_file.write_text(gcloud_stdout)
+            get_cred_case = (
+                f"  *\"clusters get-credentials\"*) {get_credentials_stub} ;;\n"
+                if get_credentials_stub
+                else ""
+            )
             gcloud = bin_dir / "gcloud"
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
                 f"  *\"clusters describe\"*) {describe_stub} ;;\n"
+                f"{get_cred_case}"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
                 f"  *\"service-accounts describe\"*) {sa_describe_stub} ;;\n"
                 "esac\n"
@@ -381,6 +388,40 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("enable_cert_manager        = true", dest.read_text())
+
+    def test_tfvars_adoption_path_resolves_dns_endpoint_flag(self):
+        # When adopting an existing cluster (create_cluster=false), get-credentials
+        # must resolve --dns-endpoint via gke_dns_endpoint_flag so clusters publishing
+        # only a DNS endpoint can be reached.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            cred_log = pathlib.Path(out_dir) / "get_credentials.log"
+            describe_stub = (
+                'case "$*" in\n'
+                '  *controlPlaneEndpointsConfig*) printf "cluster-dns.gke.goog\\tTrue\\n"; exit 0 ;;\n'
+                '  *currentMasterVersion*) printf "1.31.5-gke.1023000\\n"; exit 0 ;;\n'
+                '  *) printf "True\\n"; exit 0 ;;\n'
+                'esac'
+            )
+            get_cred_stub = (
+                'case "$*" in\n'
+                '  *--help*) echo "--dns-endpoint"; exit 0 ;;\n'
+                f'  *) echo "$*" >> "{cred_log}"; exit 0 ;;\n'
+                'esac'
+            )
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub=describe_stub,
+                get_credentials_stub=get_cred_stub,
+                kubectl_script=_CERT_MANAGER_PRESENT_KUBECTL,
+                gcloud_exit=1,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertTrue(cred_log.exists(), "get-credentials was not called")
+            logged_args = cred_log.read_text()
+            self.assertIn("--dns-endpoint", logged_args)
+            self.assertIn("test-cluster", logged_args)
 
     # ── check_service_account_ownership: the 409 a second install hits (#1294) ─
 
@@ -1015,9 +1056,10 @@ class InstallerCommonTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             # Recovery is gated on the current context being this install's
-            # cluster; the stub answers with the expected gke_<p>_<r>_<c> name.
+            # cluster; the stub answers with the expected gke_<p>_<r>_<c> name
+            # and asserts that secret reads explicitly pass --context.
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*) printf "%s" "{recovered_b64}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*--context\\ gke_test-project_us-central1_test-cluster*) printf "%s" "{recovered_b64}" ;;\n'
             "  *) exit 1 ;;\n"
             "esac\n"
         )

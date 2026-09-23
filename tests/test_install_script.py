@@ -1887,6 +1887,14 @@ run_menu_system "."
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REACHED_HEALTH_CHECKS", proc.stdout)
 
+    def test_step_13_namespace_check_passes_context(self):
+        """Step 13's namespace check must forward --context to avoid querying ambient context."""
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index("wait_for_deployment_object", start)
+        body = source[start:end]
+        self.assertIn('kubectl get ns "$namespace" --context "$expected_ctx"', body)
+
     def test_print_generate_only_handoff_renders_required_commands(self):
         """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""
         cmd = f"""
