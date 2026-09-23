@@ -334,8 +334,15 @@ RECOVERY_GREEN_RUNS = 3
 # broken and /retest does not help.
 #
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
-# concluded run of at least SLOW_MIN_TASKS cases (the presubmit runs 18; a
-# run Prow cut short at its ceiling recorded fewer and is not one) -- all of
+# concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
+# presubmit file lists, read from hack/eval/presubmit-cases.txt: 11 for the
+# twelve cases the presubmit runs since 2026-09-22, when it became the
+# blocking roster only, #1023, having run 18-19 before; a run Prow cut short
+# at its ceiling recorded fewer and is not one; the floor was a literal 15
+# until the roster shrank under it, which would have made every run since a
+# partial one and the rule silent, so it follows the file and sits one
+# demotion below the roster on purpose, an admission or a demotion moving
+# it without an edit here) -- all of
 # them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
 # of the full runs of the trailing SLOW_BASELINE before them, given at least
 # SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue
@@ -348,7 +355,19 @@ RECOVERY_GREEN_RUNS = 3
 # hovering at the bar is one episode rather than a note every tick.
 SLOW_RUNS = 5
 SLOW_WINDOW = timedelta(hours=6)
-SLOW_MIN_TASKS = 15
+
+
+def _slow_min_tasks(default: int = 11) -> int:
+    """One fewer than the presubmit file's case count; `default` when the
+    file cannot be read (a checkout without hack/eval/, an old era)."""
+    try:
+        cases = eval_rosters.presubmit_cases()
+    except (OSError, ValueError):
+        return default
+    return max(1, len(cases) - 1) if cases else default
+
+
+SLOW_MIN_TASKS = _slow_min_tasks()
 SLOW_BASELINE = timedelta(days=7)
 SLOW_BASELINE_MIN_RUNS = 20
 SLOW_FACTOR = 1.2

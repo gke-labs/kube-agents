@@ -49,8 +49,8 @@ only — anything that renames, removes or re-types a field bumps
   ],
   "coverage": {
     "domains_total": 11,
-    "domains_covered": 10,
-    "uncovered": ["incident-triage"]
+    "domains_covered": 9,
+    "uncovered": ["fleet-audits", "remediation"]
   }
 }
 ```
@@ -268,7 +268,8 @@ side.
   entry in `hack/eval/presubmit-cases.txt` **or** `hack/eval/nightly-cases.txt`
   — the nightly matrix is the presubmit's superset (`EVAL_TIER=nightly`
   appends the second file). `active` implies `nightly_active`; the Cases page's "nightly
-  only" status is `nightly_active and not active`.
+  only" status is `nightly_active and not active` with no demotion date on record for the
+  case (a dated one reads `demoted`).
 - `runs_on_record` — total task appearances across presubmit runs, `infra`
   included (it is history).
 - `pass_rate` — `passes / (passes + fails)`. **`infra` results are excluded
@@ -641,9 +642,13 @@ when none did — evidence about `main`, shown beside the case, never a tag.
 `cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
 demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
-(active, off the roster), `demoted` (held out, with `demoted_on` read from the hold-out
-entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`),
-`nightly_only`, or `retired` (in neither matrix on this checkout); an
+(active, off the roster — since 2026-09-22 the presubmit runs the roster only, so this is
+reachable only on a checkout whose presubmit file lists a case the roster does not),
+`demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
+entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
+2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`
+(in the nightly file only, no demotion date on record), or `retired` (in neither matrix on
+this checkout); an
 unreadable roster reads every active case as `blocking`, over-reporting
 rather than hiding. `rates` is `{presubmit: [[pass, fail], [pass, fail]],
 nightly: [...]}` over graded reps for each of `rate_windows_days` (7 and
@@ -922,6 +927,25 @@ It is the fixture for `releases[]`, and it keeps both banners the driver
 prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top
 and `ci-eval-rc.sh`'s `RELEASE CANDIDATE EVAL` at the end. A substring match
 opens the parse on the first one, so the decoy stays in the fixture.
+
+`testdata_nightly/` holds the nightly of 2026-09-21 (`ci-kube-agents-eval-nightly`,
+the periodic, so no `pull` key and `revision: main`), the second night the
+480m deadline ended with every unit finished and nothing graded (#1491).
+`started.json` / `finished.json` are verbatim and every driver line is real —
+the lease, the fan-out start, the launch and `finished` markers, the
+entrypoint's timeout and grace-period lines, the profile table. The four
+grading blocks are **spliced in**: the real night printed none, because the
+grading ran after the fan-out's `wait` and the deadline arrived first. They
+are real `bench-gate case` output from the night before
+(build 2101461441721667584) for four cases that also ran this night, placed at
+each case's repetition-3 `finished` line the way `hack/ci-eval-pr.sh` prints them
+since it grades per case, three of them after the SIGTERM, inside the grace
+period; the `recorded` lines are restamped to this build. The
+`Eval ended before its verdict` line is the EXIT trap's cut-off report:
+
+| build               | why it is here                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 2102186223282950144 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
 
 `testdata_health/data.json.gz` is a **real** published `data.json` reduced by
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by

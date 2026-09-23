@@ -1,5 +1,9 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt, one of the three
-# activations that take the reliability domain to five enabled tasks (#1049).
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22,
+# a presubmit entry from 2026-08-31 until then, one of the three activations
+# that took the reliability domain to five enabled tasks (#1049). The
+# presubmit runs the blocking roster only (#1023) and this case was never
+# admitted (491/679 graded presubmit repetitions 2026-09-15 to 09-22), so
+# it earns its roster seat on the nightly record now.
 # Grades what nothing active grades: fleet-wide DISCOVERY. Every active
 # reliability task names checkout-gateway in its prompt; this one does not —
 # the agent has to sweep the seeded namespaces across the clusters it
@@ -18,7 +22,7 @@
 # the fleet's only unprotected multi-replica workload by construction, so
 # the sweep has exactly one right answer.
 # Isolation class: read-only.
-# Eligible tier: presubmit.
+# Eligible tier: presubmit once admitted; nightly since 2026-09-22.
 id: obtainability-fleet-exposure-sweep
 name: Reliability sweep discovers the unbudgeted workload without being told its name
 # Deliberately NOT the located pattern: discovery is the graded behavior, so

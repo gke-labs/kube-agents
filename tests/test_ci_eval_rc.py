@@ -490,6 +490,57 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertNotIn("could not certify", summary)
         self.assertNotIn("rerun when the environment is healthy", summary)
 
+    def test_an_exit_2_whose_verdict_json_is_the_traps_partial_table_is_red(self):
+        """ci-eval-pr.sh's EXIT trap tables the cases graded so far when the
+        run ends after its fan-out began and before its own suite step, in
+        the same two files `bench-gate suite` would have written, with
+        `partial: true` in the JSON. A `bench-gate case` that could not grade
+        in the loop after the fan-out lands there with status 2, and the
+        subset's `outcome` can read `not_evaluated` when one graded case lost
+        every repetition to infrastructure. That is not the run's word for
+        it: the run died on a grading error, and before the trap existed it
+        left no JSON at all and was RED. It stays RED, and the summary says
+        the verdict step was not reached rather than pointing at the table
+        as the run's per-case detail.
+        """
+        root, _ = self.build_repo(
+            eval_exit_code=2,
+            eval_body=(
+                'printf \'{"outcome": "not_evaluated", "partial": true}\' > "${ARTIFACTS}/eval-verdict.json"; '
+                'printf \'# PARTIAL\\n\' > "${ARTIFACTS}/eval-verdict.md"'
+            ),
+        )
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("RED", result.stdout)
+        self.assertNotIn("NOT RUN", result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | RED |", summary)
+        self.assertNotIn("could not certify", summary)
+        self.assertNotIn("rerun when the environment is healthy", summary)
+        self.assertIn("did not reach its verdict step", summary)
+        self.assertIn("under\na PARTIAL banner", summary)
+        self.assertNotIn("Per-case detail is in", summary)
+
+    def test_a_deadline_kill_with_a_partial_table_says_the_verdict_step_was_not_reached(self):
+        """The same table after Prow's deadline (143): RED as before, and the
+        summary must not present the trap's partial table as the run's
+        per-case detail beside that RED.
+        """
+        root, _ = self.build_repo(
+            eval_exit_code=143,
+            eval_body=(
+                'printf \'{"outcome": "green", "partial": true}\' > "${ARTIFACTS}/eval-verdict.json"; '
+                'printf \'# PARTIAL\\n\' > "${ARTIFACTS}/eval-verdict.md"'
+            ),
+        )
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 143, result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | RED |", summary)
+        self.assertIn("did not reach its verdict step", summary)
+        self.assertNotIn("Per-case detail is in", summary)
+
     def test_writes_the_target_and_summary_artifacts(self):
         root, candidate = self.build_repo()
         result = self.run_driver(root)

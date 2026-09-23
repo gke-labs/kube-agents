@@ -1,8 +1,14 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt since 2026-08-25,
-# and since 2026-08-26 THE AUDIT-MACHINERY CANARY: the one full audit scenario
-# kept in the presubmit. It exercises delegation to a worker, the GitHub
-# token minter, the workspace clone and the ledger write end to end, and it
-# is the scenario that proved that chain — measured 606s clean on 2026-08-26 (build
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22;
+# a presubmit entry from 2026-08-25 until then, and from 2026-08-26 THE
+# AUDIT-MACHINERY CANARY: the one full audit scenario the presubmit kept.
+# Demoted from the blocking roster on 2026-09-02 (#1171) and, when the
+# presubmit became the blocking roster only (#1023), moved to the nightly
+# with the other held-out cases (413/677 graded presubmit repetitions
+# 2026-09-15 to 09-22), which put the fleet-audits domain back on the
+# docs/designs/domains.yaml allowlist (#1876). Re-admission bar: #1171's.
+# It exercises SOP dispatch, delegation to a worker, the GitHub token
+# minter, and the ledger write end to end, and it is the
+# scenario that proved that chain — measured 606s clean on 2026-08-26 (build
 # 2092638061140643840, project kube-agents-evals-3), every exact check green.
 # The other audit domains are covered by snappy probes instead (a full audit
 # costs 600-1300s each, which six domains cannot spend in one presubmit); the
@@ -11,19 +17,6 @@
 # covers in presubmit is the machinery, while the planted over-grant itself is
 # probed by security-overgrant-probe. It was held by A1, A4 and A5
 # (bench/tasks/DRAFTS.md); all three are closed.
-#
-# WHAT IT GRADES, stated plainly (#1876). An on-demand, in-session,
-# single-stream run: the prompt asks a worker to run the compliance-audit SOP
-# now, against the one planted defect below, and the worker runs it in the
-# session that took the request through `audit_report.py start ... finish`.
-# That exercises the ledger minter, the GitOps workspace clone, the ledger
-# write and the close guards (#1691). It does NOT exercise the cron dispatch
-# -- the 06:20 tick, `hermes cron run`, the per-job lock, the run's own
-# `deliver` leg -- and never did: the sandbox shell has no `hermes`
-# (docs/designs/agent-shell-sandboxing.md), so from #913 (2026-09-05) until
-# the single-stream allowance in skills/fleet-audit/SKILL.md the skill told
-# the worker to answer "queued" to this very prompt, which is the miss #1876
-# records. No presubmit case grades the scheduled path.
 #
 # A1 and A4 cleared together on 2026-08-25, when
 # GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
@@ -46,10 +39,10 @@
 # Domain: fleet-audits (SOP machinery; the slug is docs/designs/domains.yaml's
 # — this task carried it alone until #1023). The compliance-audit SOP is the
 # vehicle; the ai-security-audit SOP is the same machinery's second stream,
-# and ai-security-planted-model-audit now carries it in presubmit over a
+# and ai-security-planted-model-audit carries it in the nightly over a
 # per-run planted defect (a floating model-image tag and a plaintext
 # registry credential).
-# Journey: an audit SOP asked for on demand runs end to end — delegates to a worker,
+# Journey: a scheduled audit SOP runs end to end — delegates to a worker,
 # sweeps the fleet, and files a ledger issue a human can act on.
 #
 # Planted defect required: a cluster-scoped ClusterRoleBinding named
@@ -66,8 +59,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1, now closed. Eligible tier: presubmit, and active there
-# since 2026-08-25.
+# blocker A1, now closed. Eligible tier: presubmit once re-admitted; active
+# there 2026-08-25 to 2026-09-22, nightly since.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
 # The prompt no longer asks for a summary in the final answer: the SOP's

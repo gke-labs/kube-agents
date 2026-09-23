@@ -1,6 +1,6 @@
-name: "Nightly: Scheduler"
+name: "Staging: Promotion Scheduler"
 
-# Holds the nightly pipeline's cron one level up, so a daily tick with nothing
+# Holds the staging promotion pipeline's cron one level up, so a daily tick with nothing
 # to promote produces no pipeline run at all.
 #
 # The pipeline used to make that decision itself, and a run that skipped every
@@ -20,16 +20,16 @@ on:
   # tick. It takes no inputs: the whole job is "work out whether there is
   # anything to do", and a manual run that overrode that would be testing
   # something else. To force a specific candidate through, dispatch
-  # nightly-pipeline.yml directly — it still accepts rc_tag.
+  # staging-promotion-pipeline.yml directly — it still accepts rc_tag.
   workflow_dispatch:
 
 concurrency:
-  group: nightly-scheduler
+  group: staging-promotion-scheduler
   cancel-in-progress: false
 
 jobs:
   dispatch-if-there-is-work:
-    name: Dispatch the nightly pipeline if a promotion is needed
+    name: Dispatch the staging promotion pipeline if a promotion is needed
     # A fork inherits the cron but none of the credentials. The guard is on the
     # job rather than trusted to cascade, matching every other scheduled
     # workflow here.
@@ -55,7 +55,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # The same script, with the same inputs, that nightly-pipeline.yml runs. That
+      # The same script, with the same inputs, that staging-promotion-pipeline.yml runs. That
       # is the point: the skip decision has one implementation, so the gate that
       # starts the pipeline and the gate inside it cannot drift into disagreeing
       # about what a new candidate is.
@@ -72,16 +72,16 @@ jobs:
           COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
           RC_TAG: ${{ steps.resolve.outputs.rc_tag }}
           SKIP_REASON: ${{ steps.resolve.outputs.skip_reason }}
-        run: ./scripts/release/record_nightly_scheduler_skip.sh
+        run: ./scripts/release/record_promotion_scheduler_skip.sh
 
       # GITHUB_TOKEN rather than the PAT or App token the promotion step needs.
-      # This step is the only thing that starts the nightly pipeline on schedule,
+      # This step is the only thing that starts the staging promotion pipeline on schedule,
       # so whatever it depends on is a single point of failure, and the default token
       # needs no secret to be present and cannot expire.
-      - name: Dispatch the nightly pipeline
+      - name: Dispatch the staging promotion pipeline
         if: steps.resolve.outputs.skip_pipeline != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
           RC_TAG: ${{ steps.resolve.outputs.rc_tag }}
-        run: ./scripts/release/dispatch_nightly_pipeline.sh
+        run: ./scripts/release/dispatch_promotion_pipeline.sh
