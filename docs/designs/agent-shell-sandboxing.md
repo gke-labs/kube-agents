@@ -2186,7 +2186,7 @@ So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
 | Role        | Starts                                               | Runs in                              |
 | ----------- | ---------------------------------------------------- | ------------------------------------ |
 | `broker`    | credential exec broker, Google Chat and Slack relays | the `<agent>-credential-proxy` pod   |
-| `api-proxy` | API authenticator, k8s-event-watcher                 | the gateway pod, as `agent-api-auth` |
+| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector | the gateway pod, as `agent-api-auth` |
 | `combined`  | all of them                                          | nothing, now — the default           |
 
 `combined` is the default, so an image paired with an operator that does not set the

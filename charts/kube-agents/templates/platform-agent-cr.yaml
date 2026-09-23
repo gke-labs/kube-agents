@@ -71,6 +71,20 @@ spec:
     memory:
       {{- . | nindent 6 }}
     {{- end }}
+    {{- $drift := .Values.platformAgent.harness.driftDetector | default dict }}
+    {{- /*
+      Rendered only when an install says something about it, which is why
+      `enabled: null` rather than `false` is the value shipped: the CRD already
+      defaults it off, and a chart that wrote the default would make every
+      install look like one that had considered drift detection and declined.
+    */}}
+    {{- with include "kube-agents.compactFields" (dict
+          "enabled" $drift.enabled
+          "subscription" $drift.subscription
+          "gitopsManagers" $drift.gitopsManagers) }}
+    driftDetector:
+      {{- . | nindent 6 }}
+    {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
     {{- if and .Values.plugins (and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}

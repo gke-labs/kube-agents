@@ -2,14 +2,16 @@
 
 Run: python3 -m unittest discover -s deploy/docker -p 'test_*.py'
 
-Three guarantees are pinned here, all invisible from any single source file:
+Four guarantees are pinned here, all invisible from any single source file:
 
   * the process the entrypoint execs starts inside the shared workspace, so the
     credential-proxy shims are not refused before they run;
   * the vendored Python tree carries a bytecode cache, since the runtime cannot
-    build one; and
+    build one;
   * the event watcher's emergency stop reads the variable the operator writes,
-    and reads it the way the CRD promises.
+    and reads it the way the CRD promises; and
+  * the drift detector's start gate does the same, with the opposite default —
+    and silently, which is why it needs a test more than the watcher does.
 
 The entrypoint assertions run the real script rather than reading it. Every
 step it takes is gated on an absolute image path (/opt/hermes, /opt/defaults)
@@ -314,6 +316,123 @@ class EventWatcherEmergencyStopTest(unittest.TestCase):
             rf'Name:\s*"{self.env_var}"',
             f"the operator never sets {self.env_var}, so the CRD's "
             "eventWatcher.enabled field controls nothing",
+        )
+
+
+class DriftDetectorStartGateTest(unittest.TestCase):
+    """The switch that starts drift detection, and its opposite default.
+
+    The same two-ended contract as the watcher's emergency stop above, and it
+    matters more here rather than less. The watcher announces itself when it is
+    switched off; `start_drift_detector` returns silently, because off is the
+    ordinary state for almost every install. So a rename on either side of the
+    contract leaves the detector permanently off with no log line, no failing
+    Go test — the operator's tests assert the variable is *written*, never that
+    the script reads the same one — and a golden file that still looks right.
+
+    The default is inverted from the watcher's, which is the other thing worth
+    pinning: absent means not started, because the Pub/Sub subscription the
+    detector reads exists only where the drift-pubsub Terraform module was
+    applied.
+    """
+
+    def setUp(self):
+        self.script = START_SERVICES.read_text()
+        # Spelled as the script spells it, and anchored on the `:-false`
+        # default so this cannot silently start tracking the watcher's
+        # `:-true` gate if either function is renamed.
+        match = re.search(
+            r'case "\$\{([A-Za-z_][A-Za-z0-9_]*):-false\}" in', self.script
+        )
+        self.assertIsNotNone(
+            match,
+            "start-services.sh no longer switches on a variable defaulted to "
+            "false; spec.harness.driftDetector.enabled now reaches nothing, or "
+            "has stopped defaulting to off",
+        )
+        self.env_var = match.group(1)
+
+        body = re.search(
+            r"^drift_detector_enabled\(\) \{.*?^\}$",
+            self.script,
+            flags=re.M | re.S,
+        )
+        self.assertIsNotNone(
+            body, "start-services.sh has no drift_detector_enabled function"
+        )
+        self.gate = body.group(0)
+
+    def ask_gate(self, value):
+        """Run the real gate for `value` (None = unset) and return its verdict."""
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if value is not None:
+            env[self.env_var] = value
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"set -euo pipefail\n{self.gate}\n"
+                "if drift_detector_enabled; then echo ENABLED; "
+                "else echo DISABLED; fi",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_an_unset_variable_leaves_the_detector_stopped(self):
+        # The inversion, and the whole reason this gate is not the watcher's.
+        # Every install that has not applied the Terraform module reaches here,
+        # and starting there would give a process retrying a pull that cannot
+        # succeed for the life of the pod.
+        self.assertEqual(self.ask_gate(None), "DISABLED")
+
+    def test_true_starts_it(self):
+        # strconv.FormatBool emits exactly this.
+        self.assertEqual(self.ask_gate("true"), "ENABLED")
+
+    def test_false_leaves_it_stopped(self):
+        for value in ("false", "False", "FALSE"):
+            with self.subTest(value=value):
+                self.assertEqual(self.ask_gate(value), "DISABLED")
+
+    def test_an_unrecognised_value_fails_towards_not_detecting(self):
+        # The opposite asymmetry to the watcher's, for the same reason in
+        # reverse: the detector needs infrastructure the install may not have,
+        # so an ambiguous value must not start it. The empty string is covered
+        # here because `${VAR:-false}` substitutes the default for it, so it can
+        # never reach the `case` patterns at all.
+        self.assertEqual(self.ask_gate("ture"), "DISABLED")
+        self.assertEqual(self.ask_gate(""), "DISABLED")
+
+    def test_the_gate_runs_before_the_detector_is_launched(self):
+        start = self.script.index("start_drift_detector() {")
+        launched = self.script.index("/usr/local/bin/drift-detector", start)
+        gated = self.script.index("drift_detector_enabled || return 0", start)
+        self.assertLess(
+            gated,
+            launched,
+            "start_drift_detector launches the detector before consulting the "
+            f"{self.env_var} gate",
+        )
+
+    def test_the_operator_writes_the_variable_the_script_reads(self):
+        # The half `go test` cannot see. Without this, changing the value of
+        # driftDetectorEnabledEnv in platformagent_manifests.go passes every Go
+        # test and every golden file — they asserted whatever the constant now
+        # says — while switching drift detection off across the fleet.
+        #
+        # Matched as a bare string literal rather than on `Name:`, because this
+        # one is written through a named constant instead of inline the way the
+        # watcher's is.
+        self.assertIn(
+            f'"{self.env_var}"',
+            MANIFESTS_GO.read_text(),
+            f"the operator never names {self.env_var}, so the CRD's "
+            "driftDetector.enabled field controls nothing",
         )
 
 

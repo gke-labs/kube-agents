@@ -16,9 +16,10 @@ why this is a Pub/Sub consumer and not an informer like its sibling
 Ingestion, classification, the `managedFields` join, and the inject: pull, parse, assign a tier,
 forward the records that represent a real human change, enrich each with what the live object says
 owns the fields, and post the result to the core-agent daemon — `session_kv_server.py`, the Session
-KV server, which the sibling event watcher posts to under the same name — as a `gitops-drift` inject. Nothing
-builds this binary into an image and nothing launches it, so reaching that pipeline is something an
-operator does by hand today and no installation detects drift on its own.
+KV server, which the sibling event watcher posts to under the same name — as a `gitops-drift` inject.
+The binary ships in the platform-agent and credential-proxy images and the credential proxy's
+entrypoint launches it, but only where an install has asked for it: see
+[Deployed](#deployed) below.
 
 The inject is off unless `--daemon-url` is set, and off is the default. With it off the detector
 does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
@@ -101,9 +102,48 @@ against the wrong cluster.
 starts it with `--host 127.0.0.1 --port 8699`, so `--daemon-url` has nothing to point at from
 outside the agent Pod's network namespace. For a local run against a real install, forward the port
 first — `kubectl port-forward -n kubeagents-system <agent-pod> 8699:8699`, which only works where the
-install does not sandbox the pod. For a deployed one, the detector has to be a container in that Pod;
-nothing builds or launches it there yet, which is why the flag defaults to empty and the inject is
-off.
+install does not sandbox the pod. A deployed detector does not need the forward because it is
+already inside that namespace, which is what the next section is about.
+
+### Deployed
+
+The detector runs where the daemon is: as a peer process inside the credential-proxy sidecar,
+alongside Envoy, the credential runtime and the event watcher. It is not a container of its own,
+and the reason is the paragraph above — a container of its own would have its own network namespace
+and no route to the daemon.
+
+Three pieces put it there, and each is the same one that puts the event watcher there:
+
+- [`deploy/docker/Dockerfile`](../../../deploy/docker/Dockerfile) builds it in the
+  `watcher-builder` stage and copies it into `agent-base`, so it is in every image derived from
+  that stage — the platform agent and the credential proxy. No new image and no entry in
+  `images.json`.
+- [`deploy/shared/start-services.sh`](../../../deploy/shared/start-services.sh) supervises it,
+  retried in place on the watcher's backoff curve so that a detector that cannot start never takes
+  the credential path down with it.
+- The operator writes the `DRIFT_DETECTOR_*` environment into that sidecar and the entrypoint turns
+  it into the flags above. Two of the six come from `spec.harness.driftDetector`; the project,
+  location and cluster name come from `spec.harness` itself, because this sidecar does not get the
+  `GKE_*` triple the agent container has.
+
+**It is off unless an install asks for it**, which is the one place it differs from the watcher.
+`spec.harness.driftDetector.enabled` defaults to `false`, and the chart's
+`platformAgent.harness.driftDetector.enabled` leaves the field out altogether until it is set. The
+reason is the subscription: it exists only where
+[`terraform/modules/drift-pubsub`](../../../terraform/modules/drift-pubsub/) was applied. The
+subscription is not checked at startup, so a detector started without one does not fail loudly: it
+comes up, retries a pull that will never succeed for the life of the pod, and reports nothing. The
+supervisor never sees an exit and the pod stays Ready, which is why the default has to be off rather
+than merely documented. Apply the module first, then set the field.
+
+Enabling it is necessary and not sufficient: the operator also requires `spec.harness.projectId`,
+`.location` and `.clusterName`, because `--cluster-name` is checked at startup against the cluster
+the pod's credentials actually reach and a disagreement stops the process. A half-filled harness
+leaves the detector off rather than looping.
+
+Two flags reach the CR, `subscription` and `gitopsManagers`; the rest are fixed by where the process
+runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector joins its own cluster
+and every Cluster Agent profile in the project without being asked.
 
 Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
 agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`

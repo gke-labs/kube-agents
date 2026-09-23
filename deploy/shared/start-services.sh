@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Entrypoint for the credential-proxy container.
 #
-# Three peer services live here, not one service with helpers. They share a
+# Four peer services live here, not one service with helpers. They share a
 # container because they all need credentials, and credentials are deliberately
 # kept out of the agent sandbox — not because any of them belongs to another:
 #
 #   credential_proxy.py   executes credentialed CLIs on behalf of the sandbox
 #   envoy                 fronts the credential proxy on loopback
 #   k8s-event-watcher     watches cluster API servers and reports events
+#   drift-detector        reads GKE admin-activity audit records from Pub/Sub
+#                         and reports the ones a person made outside git
 #
 # CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
 # run in the same pod. It is the same variable and the same three values
@@ -25,11 +27,14 @@
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
 # credentialed command, so their exit ends the container and Kubernetes
-# restarts it. The watcher is best-effort observability — losing it must not
-# take the credential path down with it, so it is supervised and restarted in
-# place instead. It is also the only one of the three that can be switched off
-# deliberately: EVENT_WATCHER_ENABLED=false skips it entirely, which is the
-# emergency stop for an event storm. See event_watcher_disabled below.
+# restarts it. The watcher and the drift detector are best-effort observability
+# — losing either must not take the credential path down with it, so each is
+# supervised and restarted in place instead. They are also the two that can be
+# switched off deliberately, in opposite directions: EVENT_WATCHER_ENABLED=false
+# skips the watcher, which is the emergency stop for an event storm, while the
+# detector starts only when DRIFT_DETECTOR_ENABLED says so, because the Pub/Sub
+# subscription it reads exists only where an install asked for it. See
+# event_watcher_disabled and drift_detector_enabled below.
 set -euo pipefail
 
 # The sandbox runs as a different user (see the UID constants in the operator's
@@ -63,6 +68,30 @@ esac
 WATCHER_RETRY_MIN_SECONDS="${WATCHER_RETRY_MIN_SECONDS:-10}"
 WATCHER_RETRY_MAX_SECONDS="${WATCHER_RETRY_MAX_SECONDS:-120}"
 WATCHER_HEALTHY_RUN_SECONDS="${WATCHER_HEALTHY_RUN_SECONDS:-120}"
+
+# Drift detector restart policy, the same shape and the same reasoning as the
+# watcher's above: retried in place, best-effort, never allowed to end the
+# container. The values match deliberately — both processes fail for the same
+# kinds of reason (a credential that is not there yet, an API that is briefly
+# unreachable), and two different backoff curves in one container would be a
+# thing to explain rather than a thing to tune.
+DRIFT_RETRY_MIN_SECONDS="${DRIFT_RETRY_MIN_SECONDS:-10}"
+DRIFT_RETRY_MAX_SECONDS="${DRIFT_RETRY_MAX_SECONDS:-120}"
+DRIFT_HEALTHY_RUN_SECONDS="${DRIFT_HEALTHY_RUN_SECONDS:-120}"
+
+# Consecutive short exits before the detector's failure is stated as a
+# consequence rather than logged as an exit. Three, as for the watcher: one is
+# ordinary during startup, and by the third the cause is not transient.
+DRIFT_SHORT_EXIT_ALERT_COUNT="${DRIFT_SHORT_EXIT_ALERT_COUNT:-3}"
+
+# Where the detector posts its drift injects. Not overridable, unlike the
+# values above: it is the Session KV server on this pod's loopback, which the
+# watcher reaches at the same address, and it is fixed by where the two
+# processes run rather than by anything an operator chooses. Named rather than
+# written into the flag list below because a literal there would be the one
+# piece of this container's internal wiring that is only discoverable by
+# reading a command line.
+readonly DRIFT_DAEMON_URL=http://127.0.0.1:8699
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -132,13 +161,18 @@ PROXY_PYTHON="${PROXY_PYTHON:-/opt/hermes/.venv/bin/python3}"
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
+drift_pid=""
 
 terminate() {
   trap - EXIT INT TERM
-  # The supervisor first, so it does not restart the watcher on the way down.
+  # The supervisors first, so neither restarts its process on the way down.
   if [[ -n "${watcher_pid}" ]]; then
     kill "${watcher_pid}" 2>/dev/null || true
     pkill -P "${watcher_pid}" 2>/dev/null || true
+  fi
+  if [[ -n "${drift_pid}" ]]; then
+    kill "${drift_pid}" 2>/dev/null || true
+    pkill -P "${drift_pid}" 2>/dev/null || true
   fi
   [[ -z "${runtime_pid}" ]] || kill "${runtime_pid}" 2>/dev/null || true
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
@@ -312,17 +346,147 @@ start_event_watcher() {
   watcher_pid=$!
 }
 
+# Whether the drift detector starts, written by the operator from the
+# PlatformAgent's spec.harness.driftDetector.enabled.
+#
+# Unset means NOT started, which is the opposite of event_watcher_disabled
+# above, and the asymmetry is the point rather than an oversight. The watcher
+# needs nothing an install does not already have, so an install that says
+# nothing should keep watching. The detector reads a Pub/Sub subscription that
+# exists only where the drift-pubsub Terraform module was applied, so an
+# install that says nothing has no subscription to read: starting it there
+# gives a process that stays up and retries a failing pull for the life of the
+# pod, filling the pod log without ever being able to work. It does not exit, so
+# the supervisor below never sees it fail and the pod stays Ready throughout.
+#
+# It therefore fails towards not starting, including on a value it does not
+# recognise, where the watcher's equivalent fails towards running. The two
+# mistakes are not symmetric here either: a detector that stays off costs an
+# install what it had before this feature existed, and one that starts without
+# a subscription costs it a permanently failing process.
+drift_detector_enabled() {
+  case "${DRIFT_DETECTOR_ENABLED:-false}" in
+    [Tt][Rr][Uu][Ee] | 1 | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
+    [Ff][Aa][Ll][Ss][Ee] | 0 | [Nn][Oo] | [Oo][Ff][Ff]) return 1 ;;
+    *)
+      echo "start-services: DRIFT_DETECTOR_ENABLED=${DRIFT_DETECTOR_ENABLED:-} is not a recognised boolean; the drift-detector will NOT start and out-of-band changes will not be reported. Use 'true' to enable it." >&2
+      return 1
+      ;;
+  esac
+}
+
+start_drift_detector() {
+  # Silent when off, unlike the watcher's disabled branch, which is loud. Off is
+  # this one's ordinary state — every install that has not applied the
+  # drift-pubsub module lands here — so a line saying so on every pod start
+  # would be noise in the log of an install that is behaving exactly as
+  # intended.
+  drift_detector_enabled || return 0
+
+  # Said once, up front, in terms of what stops working. The detector's own
+  # error for an empty --project names the flag, and the flag's name is not
+  # something an operator of this container set: the operator sets
+  # spec.harness.projectId, and driftDetectorEnabled() in
+  # platformagent_manifests.go only writes DRIFT_DETECTOR_ENABLED=true when that
+  # and the other two harness fields are all present. Reaching here with one
+  # empty therefore means the enable arrived by some route other than the CR —
+  # a hand-edited Deployment during an incident is the realistic one.
+  if [ -z "${DRIFT_DETECTOR_PROJECT_ID:-}" ] ||
+    [ -z "${DRIFT_DETECTOR_CLUSTER_NAME:-}" ] ||
+    [ -z "${DRIFT_DETECTOR_CLUSTER_LOCATION:-}" ]; then
+    echo "start-services: ALERT the drift-detector is enabled but its project, cluster name or cluster location is empty, so it will exit on every start — NO out-of-band changes are being detected. Set spec.harness.projectId, .location and .clusterName on the PlatformAgent." >&2
+  fi
+
+  # The same token the watcher posts with, and the same failure: the detector
+  # refuses to start when the named variable is empty. Warned about separately
+  # from the watcher's copy of this check because the two processes are enabled
+  # independently — an install running the detector with the watcher switched
+  # off would otherwise get no warning at all.
+  if [ -z "${SESSION_KV_API_KEY:-}" ]; then
+    echo "start-services: ALERT SESSION_KV_API_KEY is empty, so drift-detector cannot authenticate to the Session KV server and will exit on every start — NO out-of-band changes are being detected. Add the key to the agent Secret (upgrade.sh backfills it; the chart and the Terraform composition generate it on a fresh install) and restart the pod." >&2
+  fi
+
+  # Built as an array because two of the flags have to be omitted rather than
+  # passed empty, which a single backslash-continued command line cannot do.
+  local detector_args=(
+    --project="${DRIFT_DETECTOR_PROJECT_ID:-}"
+    --in-cluster
+    --cluster-name="${DRIFT_DETECTOR_CLUSTER_NAME:-}"
+    --cluster-location="${DRIFT_DETECTOR_CLUSTER_LOCATION:-}"
+    --profiles-dir="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/profiles"
+    # --daemon-url is what turns the inject on: empty means the detector
+    # classifies, joins and logs, and escalates nothing. The three below travel
+    # together for that reason, and are set here rather than left to the
+    # operator because they describe how processes inside this container reach
+    # each other, exactly as the watcher's equivalents do.
+    --daemon-url="${DRIFT_DAEMON_URL}"
+    --token-env=SESSION_KV_API_KEY
+    --owner=platform
+  )
+
+  # Omitted rather than passed empty. --subscription's own default is the
+  # subscription name the drift-pubsub module creates, so passing "" would not
+  # fall back to it — it would point the detector at a subscription called the
+  # empty string, and the startup check would fail on a name nobody chose.
+  if [[ -n "${DRIFT_DETECTOR_SUBSCRIPTION:-}" ]]; then
+    detector_args+=(--subscription="${DRIFT_DETECTOR_SUBSCRIPTION}")
+  fi
+
+  # --gitops-managers has no default to lose, so this is cosmetic rather than
+  # load-bearing: it keeps "not configured" spelled the same way as it is for
+  # the subscription, and keeps an empty value out of the process table where
+  # it reads like a manager named "".
+  if [[ -n "${DRIFT_DETECTOR_GITOPS_MANAGERS:-}" ]]; then
+    detector_args+=(--gitops-managers="${DRIFT_DETECTOR_GITOPS_MANAGERS}")
+  fi
+
+  (
+    delay="${DRIFT_RETRY_MIN_SECONDS}"
+    consecutive=0
+    while true; do
+      started=$SECONDS
+      /usr/local/bin/drift-detector "${detector_args[@]}" || true
+      ran=$(( SECONDS - started ))
+
+      if [[ "${ran}" -ge "${DRIFT_HEALTHY_RUN_SECONDS}" ]]; then
+        delay="${DRIFT_RETRY_MIN_SECONDS}"
+        consecutive=0
+      else
+        consecutive=$(( consecutive + 1 ))
+      fi
+
+      echo "start-services: drift-detector exited after ${ran}s (consecutive short exits: ${consecutive}); retrying in ${delay}s" >&2
+      if [[ "${consecutive}" -ge "${DRIFT_SHORT_EXIT_ALERT_COUNT}" ]]; then
+        # The same reasoning as the watcher's ALERT above: the container stays
+        # Ready either way, so a detector that can never start is otherwise
+        # indistinguishable from a fleet where nobody has touched a cluster by
+        # hand.
+        echo "start-services: ALERT drift-detector has failed to start ${consecutive} times in a row — NO out-of-band changes are being detected" >&2
+      fi
+
+      sleep "${delay}"
+      delay=$(( delay * 2 ))
+      [[ "${delay}" -le "${DRIFT_RETRY_MAX_SECONDS}" ]] || delay="${DRIFT_RETRY_MAX_SECONDS}"
+    done
+  ) &
+  drift_pid=$!
+}
+
 write_wif_credentials
 start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
   start_envoy
 fi
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]]; then
+  # The same guard as the watcher, and for the same reason: both post to the
+  # Session KV server on this pod's loopback, which the broker pod does not run.
   start_event_watcher
+  start_drift_detector
 fi
 
-# Only the credential-path services are waited on. The watcher is absent from
-# this list deliberately — see the header. envoy_pid is empty in the api-proxy
-# role, and `wait -n` rejects an empty argument, so it is expanded unquoted.
+# Only the credential-path services are waited on. The watcher and the drift
+# detector are absent from this list deliberately — see the header. envoy_pid is
+# empty in the api-proxy role, and `wait -n` rejects an empty argument, so it is
+# expanded unquoted.
 # shellcheck disable=SC2086
 wait -n "${runtime_pid}" ${envoy_pid}

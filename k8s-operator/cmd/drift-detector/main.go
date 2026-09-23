@@ -30,10 +30,12 @@
 // core-agent daemon as a gitops-drift inject, which is where the pipeline the
 // design describes takes over: session, agent, chat, human approval, GitOps PR.
 //
-// The inject is off unless --daemon-url is set, and off is the default. No
-// image builds or launches this binary yet, so reaching that pipeline is
-// something an operator does by hand today. See docs/designs/drift-detection.md
-// for the design.
+// The inject is off unless --daemon-url is set, and off is the default. The
+// agent images carry this binary and the credential proxy's entrypoint starts
+// it, but only where the drift-pubsub Terraform module has been applied and the
+// PlatformAgent sets spec.harness.driftDetector.enabled; absent either, it ships
+// without running. See docs/designs/drift-detection.md for the design and
+// deploy/shared/start-services.sh for the flags it is started with.
 package main
 
 import (

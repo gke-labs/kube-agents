@@ -5469,6 +5469,194 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 	}
 }
 
+// agentWithDriftDetector builds a PlatformAgent whose harness names the drift
+// detector. The harness triple is filled in, because the detector's own gate
+// requires it and a fixture without it would make every "enabled" case look
+// like a disabled one for the wrong reason; the tests that care about a missing
+// triple clear a field themselves.
+func agentWithDriftDetector(drift *agentv1alpha1.DriftDetectorSpec) *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID:     "test-project",
+		Location:      "us-central1",
+		ClusterName:   "test-cluster",
+		DriftDetector: drift,
+	}
+	return a
+}
+
+// The default has to be "not detecting", which is the opposite of the watcher's
+// and for a reason the watcher does not have: the detector reads a Pub/Sub
+// subscription that only exists where the drift-pubsub Terraform module was
+// applied. A resolver that read absence as on would start, on every install
+// without one, a process that never exits and never reports a change: the
+// subscription is not checked at startup and the failing pull is retried for the
+// life of the pod, on a pod that stays Ready throughout.
+func TestDriftDetectorDefaultsOffWhenUnspecified(t *testing.T) {
+	if driftDetectorEnabled(newTestPlatformAgent()) {
+		t.Error("an agent with no harness at all must not run the detector")
+	}
+	if driftDetectorEnabled(agentWithTuning(nil)) {
+		t.Error("a harness that says nothing about the detector must not run it")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{})) {
+		t.Error("a driftDetector block with no enabled key must not run the detector")
+	}
+	if !driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})) {
+		t.Error("enabled: true with a complete harness must run the detector")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})) {
+		t.Error("enabled: false must turn the detector off")
+	}
+}
+
+// Enabling it is necessary and not sufficient. The detector checks the cluster
+// name it is given against the cluster its credentials actually reach and stops
+// on a disagreement, so starting it with a half-filled harness gives a restart
+// loop rather than a degraded detector. The gate is here, in the operator,
+// because that is the layer that can see the whole harness.
+func TestDriftDetectorStaysOffWithoutTheWholeHarnessTriple(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		clear func(*agentv1alpha1.HarnessSpec)
+	}{
+		{"no project", func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" }},
+		{"no location", func(h *agentv1alpha1.HarnessSpec) { h.Location = "" }},
+		{"no cluster name", func(h *agentv1alpha1.HarnessSpec) { h.ClusterName = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			tc.clear(agent.Spec.Harness)
+			if driftDetectorEnabled(agent) {
+				t.Errorf("enabled: true with %s must not start the detector", tc.name)
+			}
+		})
+	}
+}
+
+// The entrypoint reads these six and nothing else carries the configuration into
+// the pod. Written on every reconcile rather than only when the detector is on,
+// for the same reason the watcher's switch is: from outside the container an
+// install that never asked for drift detection and one whose detector cannot
+// start look identical, and the Deployment is where that is answered.
+//
+// The harness triple is repeated under the detector's own names rather than read
+// from GKE_PROJECT_ID and friends, which buildPodTemplateSpec sets on the agent
+// container and not on this sidecar. Asserting the values here is what catches a
+// later change that assumes the two containers share an environment.
+func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{
+		Enabled:        ptr.To(true),
+		Subscription:   "drift-audit-sub",
+		GitopsManagers: "argocd-controller,flux",
+	})
+
+	want := map[string]string{
+		"DRIFT_DETECTOR_ENABLED":          "true",
+		"DRIFT_DETECTOR_PROJECT_ID":       "test-project",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION": "us-central1",
+		"DRIFT_DETECTOR_CLUSTER_NAME":     "test-cluster",
+		"DRIFT_DETECTOR_SUBSCRIPTION":     "drift-audit-sub",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS":  "argocd-controller,flux",
+	}
+
+	got := map[string][]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if _, ours := want[e.Name]; ours {
+			got[e.Name] = append(got[e.Name], e.Value)
+		}
+	}
+	for name, value := range want {
+		if len(got[name]) != 1 {
+			t.Fatalf("want exactly one %s, got %d (%q)", name, len(got[name]), got[name])
+		}
+		if got[name][0] != value {
+			t.Errorf("%s = %q, want %q", name, got[name][0], value)
+		}
+	}
+}
+
+// An unconfigured detector still gets its switch, set to "false" rather than
+// left out, and gets none of its settings. Both halves matter. The switch is
+// there so that a Deployment says whether the detector is meant to be running;
+// the settings are not, because every install that has not applied the
+// drift-pubsub module is in this state, and writing them would repeat the
+// harness triple under five more names on every credential proxy in the fleet
+// for a process that is not started.
+//
+// The CR supplies all six here to make the second half a real assertion rather
+// than an observation about a fixture: the names are reserved in
+// mergeCredentialProxyEnv whether or not the operator writes them, so an entry
+// the operator skips has to be dropped, not passed through.
+func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: "DRIFT_DETECTOR_ENABLED", Value: "true"},
+			{Name: "DRIFT_DETECTOR_PROJECT_ID", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_LOCATION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_NAME", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_SUBSCRIPTION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_GITOPS_MANAGERS", Value: "cr-supplied"},
+		},
+	}
+
+	var switches []string
+	var settings []string
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		switch {
+		case e.Name == "DRIFT_DETECTOR_ENABLED":
+			switches = append(switches, e.Value)
+		case strings.HasPrefix(e.Name, "DRIFT_DETECTOR_"):
+			settings = append(settings, e.Name+"="+e.Value)
+		}
+	}
+	if len(switches) != 1 || switches[0] != "false" {
+		t.Errorf("DRIFT_DETECTOR_ENABLED = %q, want exactly one \"false\"", switches)
+	}
+	if len(settings) != 0 {
+		t.Errorf("a detector that is off must carry no settings, got %q", settings)
+	}
+}
+
+// Same property as the watcher's switch, and the same failure mode if it breaks:
+// `containers[].env` is a listType=map keyed on name, so a duplicate makes the
+// Deployment unappliable and the operator stops reconciling altogether. The
+// operator appends these six after mergeCredentialProxyEnv runs, so the only
+// thing standing between a CR naming one of them and a frozen reconcile is the
+// reserved list.
+func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
+	names := []string{
+		"DRIFT_DETECTOR_ENABLED",
+		"DRIFT_DETECTOR_PROJECT_ID",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION",
+		"DRIFT_DETECTOR_CLUSTER_NAME",
+		"DRIFT_DETECTOR_SUBSCRIPTION",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS",
+	}
+
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+	for _, name := range names {
+		agent.Spec.Deployment.Env = append(agent.Spec.Deployment.Env, corev1.EnvVar{Name: name, Value: "cr-supplied"})
+	}
+
+	counts := map[string]int{}
+	values := map[string]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		counts[e.Name]++
+		values[e.Name] = e.Value
+	}
+	for _, name := range names {
+		if counts[name] != 1 {
+			t.Fatalf("want exactly one %s entry, got %d; server-side apply rejects a duplicate key in env", name, counts[name])
+		}
+		if values[name] == "cr-supplied" {
+			t.Errorf("%s took its value from spec.deployment.env; the operator's must win", name)
+		}
+	}
+}
+
 // A CR that already mounts /tmp must not collide with the operator's tmp-scratch mount.
 // Two VolumeMounts on one mountPath make the Deployment unappliable, so the failure is not
 // a redundant mount but a reconcile that stops on an upgrade.

@@ -120,8 +120,10 @@ What the drift branch does differently:
 
 The detector reaches this server the same way the watcher does — over loopback, with the
 `SESSION_KV_API_KEY` bearer token — which means it has to run inside this Pod's network namespace.
-No image builds or launches it today, so the inject has no in-cluster producer yet; the flag exists
-and the route accepts it.
+The agent images carry the detector and the credential proxy's entrypoint starts it, so the inject
+has an in-cluster producer — on an install that has applied the `drift-pubsub` Terraform module and
+set `spec.harness.driftDetector.enabled`. Absent either, the flag exists and the route accepts it,
+and nothing produces one.
 
 #### Asking whether the dispatch is there
 

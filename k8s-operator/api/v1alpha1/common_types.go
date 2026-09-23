@@ -383,6 +383,13 @@ type HarnessSpec struct {
 	// +optional
 	EventWatcher *EventWatcherSpec `json:"eventWatcher,omitempty"`
 
+	// DriftDetector configures out-of-band change detection — the drift-detector
+	// that reads GKE admin-activity audit records from a Pub/Sub subscription and
+	// turns the ones a person made outside git into triage cards. Off unless asked
+	// for, unlike EventWatcher above.
+	// +optional
+	DriftDetector *DriftDetectorSpec `json:"driftDetector,omitempty"`
+
 	// Tuning sets per-persona execution limits. Unset values keep the defaults
 	// baked into the agent image.
 	// +optional
@@ -513,6 +520,54 @@ type EventWatcherSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// DriftDetectorSpec configures the drift-detector, which runs as a peer service
+// inside the credential-proxy sidecar alongside Envoy, the credential runtime and
+// the k8s-event-watcher. It pulls GKE admin-activity audit records from a Pub/Sub
+// subscription, drops the ones no human made, joins each survivor against the live
+// object to see whether the change still stands, and posts what is left to the
+// pod-local Session KV server as a gitops-drift inject.
+//
+// It answers a different question from the watcher beside it. An event says
+// Kubernetes is unhappy; a drift record says a person changed a live object outside
+// git, and asks the reader which of the two states should win.
+type DriftDetectorSpec struct {
+	// Enabled controls whether the detector is started. Absent means not started,
+	// the opposite of EventWatcher, and the reason is a dependency rather than
+	// caution: the detector reads a Pub/Sub subscription that exists only where the
+	// drift-pubsub Terraform module was applied. An install without one that started
+	// the detector anyway would get a process that never exits and never reports a
+	// change — the subscription is not checked at startup, and a pull that fails
+	// because it does not exist is retried for the life of the pod. The pod stays
+	// Ready, so an install left on by accident is indistinguishable from a fleet
+	// nobody has touched.
+	//
+	// Setting it is necessary and not sufficient. The detector also needs
+	// spec.harness.projectId, .location and .clusterName, because it verifies the
+	// cluster name it is given against the cluster its credentials actually reach and
+	// stops on a disagreement — so a half-named harness would give a restart loop.
+	// The operator treats that combination as the detector staying off.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Subscription is the Pub/Sub subscription carrying the audit records. Empty
+	// takes the detector's own default, which is the name the drift-pubsub module
+	// creates; set it only for a subscription made by hand or renamed.
+	// +optional
+	Subscription string `json:"subscription,omitempty"`
+
+	// GitopsManagers names the managedFields managers that are the GitOps controller
+	// — `argocd-controller`, `flux`. Comma-separated and matched exactly.
+	//
+	// Empty is supported and degrades rather than fails. Ownership is still read and
+	// reported, but no record is ever marked as possibly reconciled, so every card
+	// asks its reader to check the live object without the hint that a controller may
+	// already have reverted the change. Naming a manager that does not write to these
+	// objects has the same effect as leaving it empty.
+	// +optional
+	GitopsManagers string `json:"gitopsManagers,omitempty"`
 }
 
 // TuningSpec carries execution limits per agent persona.

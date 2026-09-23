@@ -532,6 +532,21 @@
                 }
               }
             },
+            "driftDetector": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": ["boolean", "null"]
+                },
+                "subscription": {
+                  "type": "string"
+                },
+                "gitopsManagers": {
+                  "type": "string"
+                }
+              }
+            },
             "experimental": {
               "type": "object",
               "additionalProperties": false,

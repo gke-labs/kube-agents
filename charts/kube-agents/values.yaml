@@ -607,6 +607,23 @@ platformAgent:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
       userProfileEnabled: null # CRD default: false
+    # Out-of-band change detection. The drift-detector reads GKE
+    # admin-activity audit records from a Pub/Sub subscription and reports the
+    # ones a person made outside git, so it needs that subscription to exist:
+    # apply terraform/modules/drift-pubsub against this project before
+    # enabling it. Left off, the whole block is omitted and the detector is
+    # shipped in the image without being started.
+    driftDetector:
+      enabled: null # CRD default: false
+      # The subscription carrying the audit records. Empty takes the
+      # detector's own default, which is the name the drift-pubsub module
+      # creates; set it only for one made by hand or renamed.
+      subscription: ""
+      # Comma-separated managedFields managers that are the GitOps controller
+      # — "argocd-controller", "flux". Empty still reports who changed what,
+      # but never marks a change as one a controller may already have
+      # reverted.
+      gitopsManagers: ""
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every

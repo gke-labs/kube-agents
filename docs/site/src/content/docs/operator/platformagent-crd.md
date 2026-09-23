@@ -56,6 +56,9 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
 | `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
 | `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
+| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription no stock install creates. See below.                                                                                                         |
+| `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
+| `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                                        |
@@ -172,6 +175,54 @@ Three consequences before you press it:
 Unset means enabled. The watcher is how a fleet notices its own incidents, so an install that never
 mentions the field — which is every install today — keeps watching, and only an explicit `false`
 turns it off.
+
+### `spec.harness.driftDetector`
+
+The `drift-detector` runs beside the watcher in the gateway pod's `agent-api-auth` sidecar. It pulls
+GKE admin-activity audit records from a Pub/Sub subscription, drops every call that a person did not
+make or that changed nothing, and posts what is left to the same pod-local Session KV server the
+watcher posts to — so a change someone made to a cluster by hand arrives on the board as a card. The
+control plane, CI, and every service account are dropped alike; on a busy cluster that is the
+overwhelming majority of the stream.
+
+**It is off unless you ask for it, the opposite of the watcher.** The subscription it reads does not
+exist in a stock install: the audit log sink, topic, and subscription come from the
+`drift-pubsub` Terraform module, and an install that has not applied it has nothing for the detector
+to pull. Starting it anyway gives a process that retries a failing pull for the life of the pod
+without ever reporting a change, and the pod stays Ready throughout — so unset means off, and an
+install you switched on by mistake looks exactly like a fleet nobody has touched.
+
+```yaml
+spec:
+  harness:
+    driftDetector:
+      enabled: true
+```
+
+Enabling is necessary and not sufficient. The detector verifies the cluster name it was given
+against the cluster its credentials actually reach and exits on a mismatch, so the operator starts it
+only when `projectId`, `location`, and `clusterName` are all set on `spec.harness` as well. The API
+server already rejects a `PlatformAgent` that omits any of the three, so the case to watch for is one
+present but empty — that stays off however `enabled` reads, and unlike the watcher, nothing
+substitutes a placeholder name for it.
+
+`subscription` and `gitopsManagers` are the two knobs worth moving from a CR. Leave `subscription`
+unset unless you renamed the one the module creates.
+
+`gitopsManagers` is not what separates automation from people — the detector already does that by
+principal, and a controller's writes never reach a card. It names the **field managers** your GitOps
+controller writes under, as they appear in an object's `managedFields`: `argocd-controller`, `flux`,
+whatever your own controller sets. That is a field-manager string, not a service-account email, and
+the two are rarely the same.
+
+Matching one changes what a card says rather than whether it exists. When the detector finds a
+configured manager wrote the drifted fields after the change it is reporting, it marks the card as
+possibly already reconciled and names the manager. Unset is supported and simply loses that hint:
+ownership is still read and reported, and you get the same cards without the annotation.
+
+Nothing else about the detector is exposed here. Which principals count as human, and which calls
+are dropped as failed or non-declarative, are compiled into the binary; what reaches it at all is
+set by the Terraform module's log sink, not by the CR.
 
 ### `spec.harness.tuning`
 
