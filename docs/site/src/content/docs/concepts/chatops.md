@@ -100,8 +100,23 @@ Both jobs fire every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agent
 ## What's not here
 
 - **No web UI.** Chat is the primary surface.
-- **No CLI beyond the Hermes CLI inside the pod.** For debug, `kubectl exec` into the agent pod and run the Hermes CLI there — note the pod hosts several profiles, so a bare `hermes` command talks to the locked-down Planning Agent; use `hermes -p platform` to reach the Platform Agent (or `hermes -p <cluster-profile>` for a Cluster Agent). `kubectl port-forward` is not a way in on a GKE Sandbox (gVisor) node pool, which is the install default: the forward is established in the host-side netns and cannot see a listener inside the sandbox — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical on that. This isn't a user-facing pattern.
+- **No CLI beyond the Hermes CLI inside the pod.** `kubectl exec` into the agent pod and run the Hermes CLI there — note the pod hosts several profiles, so a bare `hermes` command talks to the locked-down Planning Agent; use `hermes -p platform` to reach the Platform Agent (or `hermes -p <cluster-profile>` for a Cluster Agent). `kubectl port-forward` is not a way in on a GKE Sandbox (gVisor) node pool, which is the install default: the forward is established in the host-side netns and cannot see a listener inside the sandbox — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical on that. `kubectl exec` has no such problem, because it enters the sandbox.
 - **No email, PagerDuty, or generic webhook ingress.** Chat channels only.
+
+## When no chat platform is enabled
+
+Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. The Hermes CLI above is the way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
+
+```bash
+gcloud container clusters get-credentials <cluster> --location <region> --project <project> --dns-endpoint
+kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes -p platform
+```
+
+Pass `--dns-endpoint` only on a cluster that publishes an externally reachable DNS endpoint; gcloud rejects the flag on one that does not. The installer resolves that per cluster and prints the flag only when it applies ([`scripts/installer/gke_dns_endpoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/gke_dns_endpoint.sh)). The `-c platform-agent` is the Hermes container; the gateway pod runs three, so omitting it works but makes kubectl warn about which one it picked.
+
+This reaches the Platform Agent directly, bypassing the front door: a request typed here is executed by the profile that receives it rather than being planned and filed as a kanban card. A bare `hermes` reaches the Planning Agent instead, which is where a chat message would have landed and which delegates as described above.
+
+Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays on the agent's volume at `/opt/data/INVENTORY.md`; read it with `kubectl exec` rather than waiting for it.
 
 ## Where to go next
 

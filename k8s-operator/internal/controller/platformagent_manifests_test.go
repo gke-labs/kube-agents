@@ -613,6 +613,12 @@ func TestBuildDeployment(t *testing.T) {
 		if !watcherToken {
 			t.Errorf("expected the default-audience token mounted where InClusterConfig reads it, got %#v", authC.VolumeMounts)
 		}
+		if authC.Resources.Requests.Cpu().String() != "150m" || authC.Resources.Requests.Memory().String() != "384Mi" {
+			t.Errorf("expected CPU 150m and Mem 384Mi requests on auth sidecar container, got %v", authC.Resources.Requests)
+		}
+		if authC.Resources.Limits.Cpu().String() != "1" || authC.Resources.Limits.Memory().String() != "2Gi" || authC.Resources.Limits.StorageEphemeral().String() != "2Gi" {
+			t.Errorf("expected CPU 1, Mem 2Gi, and Eph 2Gi limits on auth sidecar container, got %v", authC.Resources.Limits)
+		}
 
 		sidecarC := containerByName(t, dep.Spec.Template.Spec.Containers, "my-sidecar")
 		if sidecarC.Image != "sidecar-image:latest" {
@@ -3348,12 +3354,15 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// three unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, and the mode switch.
+	// five unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the scope path, and
+	// the empty management-project override.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
-		kubeagentsModeEnvKey + "=today\n"
+		kubeagentsModeEnvKey + "=today\n" +
+		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
+		reconcileProjectEnvKey + "=\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
@@ -5898,6 +5907,13 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 	if !reflect.DeepEqual(got, image.Kanban) {
 		t.Errorf("the front door's kanban block differs from the one the chat profile gets "+
 			"from %s:\n  overlay: %v\n  image:   %v", path, got, image.Kanban)
+	}
+
+	// Issue #1880: bound kanban stale running timeout to 30m (1800s) to prevent
+	// wedged workers from occupying dispatch slots until the 4h upstream default.
+	if got["dispatch_stale_timeout_seconds"] != 1800 {
+		t.Errorf("dispatch_stale_timeout_seconds = %v, want 1800 to bound kanban worker reclaim to 30m (#1880)",
+			got["dispatch_stale_timeout_seconds"])
 	}
 
 	// The CR field is the reason equality with the image is not enough on its own: it is

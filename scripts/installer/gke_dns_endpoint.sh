@@ -61,9 +61,10 @@ gke_supports_dns_endpoint() {
 # workload scripts loop over a map of them -- probes once rather than once per
 # cluster.
 #
-# Never fails the caller. A cluster that cannot be described -- no permission, no
-# network, a name that does not exist -- yields the empty string, which is the
-# command that ran before this helper existed. Reaching an ordinary public
+# Never fails the caller, and never reports a failure either. A cluster that
+# cannot be described -- no permission, no network, a name that does not exist,
+# or a cluster this run has not created yet -- yields the empty string, which is
+# the command that ran before this helper existed. Reaching an ordinary public
 # cluster must not become contingent on an extra API call succeeding.
 #
 # shellcheck disable=SC2034  # GKE_DNS_ENDPOINT_FLAG is read by the callers, not here.
@@ -73,8 +74,26 @@ gke_dns_endpoint_flag() {
   [ -n "$cluster" ] && [ -n "$location" ] && [ -n "$project" ] || return 0
   gke_supports_dns_endpoint || return 0
 
+  # `trap - ERR` inside the substitution: under bash 3.2 (macOS's default, and
+  # the `curl | bash` audience) the caller's inherited ERR trap fires in this
+  # subshell even though the failure is the tested condition of the `if`, and
+  # the `|| true` a caller adds outside it cannot reach that. install.sh's
+  # on_error then prints a fatal-looking abort banner and rewrites the install
+  # report as FAILED; its `exit` only leaves the subshell, so the run carries on
+  # having announced a death that did not happen, and any later failure is
+  # reported against this line.
+  #
+  # A describe that fails is the NORMAL path here, not an edge. install.sh
+  # resolves this flag in the chat interview to print a get-credentials command,
+  # which is step 6 -- the cluster is created by the apply at step 12, so on
+  # every fresh install, --dry-run and --generate-only run there is nothing to
+  # describe. That miss must stay what the contract above says it is: an empty
+  # flag, and a printed command without --dns-endpoint.
+  #
+  # Every other gcloud probe in install.sh and installer_common.sh clears the
+  # trap the same way.
   local described endpoint external
-  if ! described=$(gcloud container clusters describe "$cluster" \
+  if ! described=$(trap - ERR; gcloud container clusters describe "$cluster" \
       --location "$location" --project "$project" \
       --format="value(controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic)" \
       2>/dev/null); then
@@ -97,4 +116,10 @@ gke_dns_endpoint_flag() {
   if [ -n "$endpoint" ] && [ "$external" = "True" ]; then
     GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"
   fi
+  # Explicit, because the `if` satisfies "never fails the caller" only
+  # incidentally. Rewritten as the shorter
+  # `[ -n "$endpoint" ] && [ "$external" = "True" ] && GKE_DNS_ENDPOINT_FLAG=…`
+  # it would return 1 for every cluster without an externally reachable DNS
+  # endpoint, which under the callers' `set -Eeuo pipefail` is an aborted run.
+  return 0
 }
