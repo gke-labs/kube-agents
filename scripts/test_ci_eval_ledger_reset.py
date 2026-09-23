@@ -662,7 +662,11 @@ class CallSiteTest(unittest.TestCase):
         # pool repository. The grading mint therefore asks for its reads.
         mint = lifted("_ledger_token_mint")
         self.assertIn('os.environ.get("LEDGER_MINT_BODY", "")', mint)
-        self.assertIn("mint_data = None", mint)
+        # And an empty body is refused, never sent: the bodiless mint is the
+        # widening one, and nothing in the tree asks for it.
+        self.assertIn("if not mint_body:", mint)
+        self.assertIn("refusing to mint", mint)
+        self.assertNotIn("mint_data = None", mint)
         body_line = lifted_line(r"^LEDGER_GRADING_MINT_BODY=.*$")
         body = json.loads(body_line.split("=", 1)[1].strip().strip("'"))
         self.assertEqual(body, {"permissions": {"issues": "read", "pull_requests": "read", "metadata": "read"}})

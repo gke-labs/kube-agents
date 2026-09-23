@@ -1,7 +1,7 @@
 """The eval fan-out's scheduler is model-free shell, so it is testable here.
 
 `hack/ci-eval-pr.sh` launches one background unit per (task, repetition) and
-serializes the collisions with two mkdir mutexes. Three properties carry the
+serializes the collisions with three mkdir mutexes (task, stream, infra). Three properties carry the
 correctness of that scheme and each is exercised against the REAL text lifted
 out of the script, in the same style as test_ci_eval_trap.py:
 

@@ -261,7 +261,7 @@ class LedgerMintRequestTest(unittest.TestCase):
         (self.tmp / "sitecustomize.py").write_text(_FAKE_URLOPEN, encoding="utf-8")
         self.capture = self.tmp / "request.json"
 
-    def _mint(self, call):
+    def _mint(self, call, expect_rc=0):
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -292,7 +292,9 @@ class LedgerMintRequestTest(unittest.TestCase):
                 }
             ),
         )
-        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual(expect_rc, proc.returncode, proc.stderr)
+        if expect_rc != 0:
+            return None, proc
         self.assertTrue(self.capture.exists(), "the faked urlopen was never reached: " + proc.stderr)
         return json.loads(self.capture.read_text(encoding="utf-8")), proc
 
@@ -319,13 +321,14 @@ class LedgerMintRequestTest(unittest.TestCase):
         self.assertEqual("application/json", seen["content_type"])
         self.assertIn("RESET=ghs_minted", proc.stdout)
 
-    def test_no_body_means_no_data_which_is_why_every_caller_sends_one(self):
-        # The endpoint's contract: no body, the installation's whole grant.
-        # Documented by running it, so the two callers above are read as the
-        # deliberate narrowing they are.
-        seen, _ = self._mint("_ledger_token_mint >/dev/null")
-        self.assertIsNone(seen["data"])
-        self.assertIsNone(seen["content_type"])
+    def test_a_bodiless_mint_is_refused_rather_than_sent(self):
+        # The endpoint's contract: no body, the installation's whole grant --
+        # issues: write on every pool repository. A caller that forgets the
+        # body must fail to mint, terminally, and never reach GitHub.
+        _, proc = self._mint("_ledger_token_mint >/dev/null", expect_rc=_TERMINAL_RC)
+        self.assertIn("LEDGER_MINT_BODY is empty; refusing to mint", proc.stderr)
+        self.assertFalse(self.capture.exists(), "a bodiless mint reached the faked GitHub")
+        self.assertNotEqual(_retryable_rc(), proc.returncode, "an empty body is not a transient fault")
 
 
 class LedgerMintContractTest(unittest.TestCase):

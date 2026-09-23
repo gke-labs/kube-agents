@@ -907,12 +907,20 @@ def temporary(message):
 key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
 app_id = os.environ["EVAL_LEDGER_APP_ID"]
 installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
-# What the token may reach. Empty means the installation's whole grant, which
-# no caller sends: the grading mint asks for its three reads
+# What the token may reach. The grading mint asks for its three reads
 # (LEDGER_GRADING_MINT_BODY) and the ledger reset asks for one repository and
-# `issues: write` (ledger_reset_token). A token narrowed at mint cannot be
-# widened by whoever holds it afterwards.
+# `issues: write` (ledger_reset_token). An empty body would mean the
+# installation's whole grant -- issues: write on every pool repository -- so
+# it is refused here rather than sent: a caller that forgets the body fails
+# to mint instead of silently holding the widest token there is. A token
+# narrowed at mint cannot be widened by whoever holds it afterwards.
 mint_body = os.environ.get("LEDGER_MINT_BODY", "").strip()
+if not mint_body:
+    sys.exit(
+        "LEDGER_MINT_BODY is empty; refusing to mint for App %s: a mint without a body "
+        "receives the installation's whole grant, and every caller names what it asks for"
+        % app_id
+    )
 
 
 def b64(raw):
@@ -942,16 +950,12 @@ if signed.returncode != 0:
     )
 jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
 
-mint_headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json", "User-Agent": "kube-agents-ci-eval-pr"}
-mint_data = None
-if mint_body:
-    mint_data = mint_body.encode()
-    mint_headers["Content-Type"] = "application/json"
+mint_headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": "kube-agents-ci-eval-pr"}
 request = urllib.request.Request(
     "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
     method="POST",
     headers=mint_headers,
-    data=mint_data,
+    data=mint_body.encode(),
 )
 try:
     with urllib.request.urlopen(request, timeout=30) as response:
