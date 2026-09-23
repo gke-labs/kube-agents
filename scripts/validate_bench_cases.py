@@ -169,6 +169,18 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "upgrades-audit-reports-upgrade-blocked": (
+        "#1896: the readiness-drain-blocked role is declared in the catalogue but "
+        "the seeded-fleet stack has not been re-applied to the pool projects, so the "
+        "budget the audit's check 3.11 reports exists in none of them"
+    ),
+    "upgrades-preflight-unprompted-blocker": (
+        "#1896: the readiness-drain-blocked role is declared in the catalogue but "
+        "the seeded-fleet stack has not been re-applied to the pool projects, so the "
+        "PodDisruptionBudget this case discovers exists in none of them. Registering "
+        "it in the nightly before the sweep would fail every project for an unready "
+        "environment rather than for anything the agent did"
+    ),
     "obtainability-declared-intent-no-finding": (
         "#1341: needs a second multi-replica workload as a fixture role of its "
         "own in bench/tf/fleet/fixtures.json (a declaration for checkout-gateway "
