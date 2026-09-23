@@ -273,6 +273,18 @@ func (g *Gateway) lockSession(key string) *sync.Mutex {
 	return l
 }
 
+// backendFor names the backend a conversation belongs to. Conversation ids
+// are backend-qualified (discord:…, gchat:…, console:…); a prefix the
+// gateway does not know falls back to the configured backend, which is what
+// every conversation was before the mux.
+func (g *Gateway) backendFor(conversation string) string {
+	switch p := backendPrefix(conversation); p {
+	case "discord", gchatBackend, consoleBackend:
+		return p
+	}
+	return g.backend
+}
+
 // handleInbound is one user turn: verify the sender, resolve the session,
 // and route the message — status query by replay, stop, steer, or a new
 // task. Runs on the conversation's inbox worker, in arrival order.
@@ -285,10 +297,13 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// backend-asserted id — their own identity, in their own conversation,
 	// which is what the admin needs to add and is not an oracle over
 	// anything the sender does not already see.
-	principal := g.resolvePrincipal(msg.AuthorID)
+	// The backend is the conversation's, not the process's: since the mux
+	// one gateway serves discord or gchat and the console together.
+	backend := g.backendFor(msg.Conversation)
+	principal := g.resolvePrincipal(backend, msg.AuthorID)
 	if principal == "" {
 		g.log.Warn("dropping message from unverified sender",
-			"backend", g.backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
 		// Keyed case-folded (an asserted address that varies in case is one
 		// person) and bounded the way the adapters bound their own maps:
 		// wholesale eviction at the cap, which at worst repeats a notice.
@@ -301,9 +316,9 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		g.droppedNotices[key] = true
 		g.mu.Unlock()
 		if !notified {
-			g.post(msg.Conversation, "⛔ I can't verify who you are on "+g.backend+
+			g.post(msg.Conversation, "⛔ I can't verify who you are on "+backend+
 				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
-				unverifiedRemedyFor(g.backend)+".")
+				unverifiedRemedyFor(backend)+".")
 		}
 		return
 	}
@@ -341,8 +356,8 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if !slices.Contains(rosterIDs, msg.AuthorID) {
 		rosterIDs = append(rosterIDs, msg.AuthorID)
 	}
-	authority := BuildAuthority(g.ps, g.pm, principal, g.backend, msg.AuthorID,
-		verifiedByFor(g.backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
+	authority := BuildAuthority(g.ps, g.pm, principal, backend, msg.AuthorID,
+		verifiedByFor(backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
 	rec.Roster = hashRoster(g.ps, g.pm, rosterIDs)
 
 	// Heal a stale ActiveTask before routing: if the task is already

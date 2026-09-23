@@ -111,8 +111,11 @@ const (
 // verifiedByFor names the mechanism that checked the requester at ingress
 // for one backend (authority.requester.verifiedBy).
 func verifiedByFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return gchatVerifiedBy
+	case consoleBackend:
+		return consoleVerifiedBy
 	}
 	return "principal-map"
 }
@@ -120,8 +123,12 @@ func verifiedByFor(backend string) string {
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
 // allowlist on gchat, the mapping table everywhere else.
 func unverifiedRemedyFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return "the allowed users list"
+	case consoleBackend:
+		// Cannot happen from a real console frame; a spoofed author id can.
+		return "nothing - only the console credential's own frames are accepted here"
 	}
 	return "the principal map"
 }
@@ -753,23 +760,31 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 }
 
 // resolvePrincipal establishes the requester's principal from the backend's
-// identity mechanism. On gchat the Google-asserted email IS the principal —
-// resolution is the identity function gated by the allowlist (the mapping
-// table other backends need is exactly what this backend exists to not
-// have). Everything else goes through the principal map. Empty means drop.
-func (g *Gateway) resolvePrincipal(authorID string) string {
-	if g.backend != gchatBackend {
-		return g.pm.Resolve(authorID)
+// identity mechanism. On gchat the Google-asserted email IS the principal,
+// gated by the allowlist. On the console the NATS grant is the mechanism:
+// only the console credential can publish on the console subject, so the
+// author is the console principal - but only on a console conversation, so
+// the string "console" arriving on any other backend is just an unmapped id.
+// Everything else goes through the principal map. Empty means drop.
+func (g *Gateway) resolvePrincipal(backend, authorID string) string {
+	switch backend {
+	case consoleBackend:
+		if authorID == consoleAuthor {
+			return consolePrincipal
+		}
+		return ""
+	case gchatBackend:
+		if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
+			// Returned case-preserved, deliberately: the audit join requires
+			// hashing the SAME string the shipped attribution path hashes (the
+			// delivered sender email, un-normalized). If Google ever varies the
+			// asserted email's case across events, both surfaces fork the same
+			// way — lowercasing here would fix nothing and break the join.
+			return authorID
+		}
+		return ""
 	}
-	if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
-		// Returned case-preserved, deliberately: the audit join requires
-		// hashing the SAME string the shipped attribution path hashes (the
-		// delivered sender email, un-normalized). If Google ever varies the
-		// asserted email's case across events, both surfaces fork the same
-		// way — lowercasing here would fix nothing and break the join.
-		return authorID
-	}
-	return ""
+	return g.pm.Resolve(authorID)
 }
 
 // gchatConversationID mints the session key for one inbound message. space is
