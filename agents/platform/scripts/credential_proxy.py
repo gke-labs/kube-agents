@@ -1990,10 +1990,16 @@ def _kubectl_runs_long(argv: list[str]) -> bool:
     if verb in KUBECTL_LONG_RUNNING_VERBS:
         return True
     if verb == KUBECTL_FOLLOW_VERB and any(
-        arg in KUBECTL_FOLLOW_FLAGS for arg in argv[1:]
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_FOLLOW_FLAGS
     ):
         return True
-    if any(arg in KUBECTL_WATCH_FLAGS for arg in argv[1:]):
+    if any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_WATCH_FLAGS
+    ):
         return True
     return any(
         arg == flag or arg.startswith(f"{flag}=")
