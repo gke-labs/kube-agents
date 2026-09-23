@@ -21,7 +21,8 @@
 # rendering of it.
 #
 # scripts/validate_bench_cases.py reads this file and rejects a task.yaml whose
-# `fixtures:` list names a role that is in neither catalogue. docs/designs/
+# `fixtures:` list names a role that is in neither catalogue, unless the case
+# is parked in FIXTURE_NOT_READY on the issue that plants it. docs/designs/
 # bench-fleet-catalog.md is the prose contract; bench/tf/fleet/ is the
 # implementation and the source of every object name below.
 #

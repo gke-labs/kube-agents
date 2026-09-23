@@ -2797,9 +2797,10 @@ get-credentials` and `kubectl` behind it on every tick, and `github_token_refres
   running a script that has to live there. Inventing that layout inside a call site was
   the alternative, and it is how two layouts end up shipping.
 - **The bootstrap handoff is designed and unimplemented.** `no_agent` scripts stay in the
-  agent pod, and four of them (`kanban-workspace-gc`, `cluster-agent-reconcile`,
-  `stall-watch`, and `github_token_refresh.py`'s forward) reach the sandbox through
-  `sandbox_exec` from a shipped roster, so cron against a sandboxed agent is exercised.
+  agent pod, and six of them (`kanban-workspace-gc`, `cluster-agent-reconcile`,
+  `stall-watch`, `github-repo-watcher` and `chat-delivery-watch` through `forge.py`, and
+  `github_token_refresh.py`'s forward) reach the sandbox through `sandbox_exec` from a
+  shipped roster, so cron against a sandboxed agent is exercised.
   What is not is the bootstrap handoff the section above specifies. Onboarding is broken
   until it lands, and broken silently.
 - **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
