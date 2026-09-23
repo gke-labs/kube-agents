@@ -121,10 +121,12 @@ answer stays demoted. The bar there is the same for a contributed case and an in
 
 ## Roster admission
 
-A merged case runs every night, on every pull request once it has a presubmit seat, and
-cannot red one on a graded failure until it is admitted, which means named in
-`hack/eval/blocking-roster.txt` (the default of `BOOTSTRAP_ADMITTED` in
-`hack/ci-eval-pr.sh`). The evidence
+A merged case runs every night, and on a pull request only once it is admitted: since
+2026-09-22 the presubmit runs the blocking roster and nothing else, so a presubmit seat is a
+roster seat and there is no in-between state that runs on pull requests without blocking.
+Admitted means named in `hack/eval/blocking-roster.txt` (the default of `BOOTSTRAP_ADMITTED`
+in `hack/ci-eval-pr.sh`) with the case's line in `hack/eval/presubmit-cases.txt`, where an
+admitted case can red a pull request on a graded failure. The evidence
 store's record of the case is computed beside that and reported in every verdict, but under
 the default `EVAL_ADMISSION_MODE=roster` it informs the roster edit rather than making it.
 Admission, the hold-outs, how far the roster's promise reaches, demotion and what the record
@@ -135,11 +137,16 @@ absolute rungs (a forbidden cluster mutation, an erroring verifier, a record tha
 real run) red a pull request for every case, admitted or not, and a case earns its seat on
 its record rather than on who wrote it.
 
-Proposing admission is a pull request that adds the case to `hack/eval/blocking-roster.txt`
-and cites the record: the verdict's **Record says** column once the store holds a full window
-(`would-admit`), or before that the runs, what failed and why each failure was the case's own
-regression or an infrastructure class the harness already excludes. The roster page's
-hold-out entries are the shape of the evidence a reviewer expects.
+Proposing admission is one pull request that moves the case's line from
+`hack/eval/nightly-cases.txt` to `hack/eval/presubmit-cases.txt` and adds its name to
+`hack/eval/blocking-roster.txt` — the three edits together, because `hack/ci-eval-pr.sh`
+refuses a roster name that is not a presubmit case, refuses a case listed in both files, and
+`scripts/test_eval_rosters.py` pins the two presubmit files as equal — and cites the record:
+the verdict's **Record says** column once the store holds a full window (`would-admit`), or
+before that the nightly runs, what failed and why each failure was the case's own regression
+or an infrastructure class the harness already excludes. The roster page's hold-out entries
+are the shape of the evidence a reviewer expects, and its "Admitted on the record since the
+split" entries are the shape of the admission itself.
 
 **Check:** none mechanical, but the approver is: a roster edit, and a presubmit-seat edit,
 needs an `approved` from the `eval-crew` alias ([`hack/OWNERS`](../hack/OWNERS) scopes

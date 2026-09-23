@@ -439,6 +439,10 @@ class RosterPageTest(unittest.TestCase):
         self.assertEqual(status({"name": "a", "active": True}, frozenset(), {"a": "2026-09-02"}), ("demoted", "2026-09-02"))
         self.assertEqual(status({"name": "a", "active": True}, frozenset(), {}), ("held_out", None))
         self.assertEqual(status({"name": "a", "active": False, "nightly_active": True}, frozenset({"a"}), {}), ("nightly_only", None))
+        # Since 2026-09-22 a demoted case is a nightly case (#1023): the date
+        # on the roster page is read on the nightly branch too, or the two
+        # demotions on record would render as plain "nightly only".
+        self.assertEqual(status({"name": "a", "active": False, "nightly_active": True}, frozenset(), {"a": "2026-09-02"}), ("demoted", "2026-09-02"))
         self.assertEqual(status({"name": "a"}, frozenset({"a"}), {}), ("retired", None))
         self.assertEqual(status({"name": "a", "active": True}, None, {}), ("blocking", None), "no roster reads as blocking")
 

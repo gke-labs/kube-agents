@@ -1204,6 +1204,10 @@ class CasesAndGridPagesTest(unittest.TestCase):
                              "finished": "2026-08-20T11:00:00+00:00", "result": "FAILURE", "duration_s": 3600,
                              "tasks": [{"name": "old-failure-case", "result": "fail", "reps": [{"n": 1, "result": "fail", "reason": "check ancient: required phrases absent"}]}]})
         data["cases"].append({"name": "old-failure-case", "domain": "cost", "active": True})
+        # A case demoted under the 2026-09-22 protocol: off both presubmit
+        # files, in the nightly one, dated on the roster page. It is a
+        # held-out row with the demoted pill, not a "nightly only" one.
+        data["cases"].append({"name": "demoted-nightly-case", "domain": "cost", "active": False, "nightly_active": True})
         history = history_lines(
             dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
             dict(health_doc(since="2026-09-07T14:00:00+00:00"), tick="2026-09-07T14:00:00+00:00"),
@@ -1213,7 +1217,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         )
         admitted = frozenset(CRASHLOOP_TRIO[:2])
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=admitted), \
-                unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02"}), \
+                unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02", "demoted-nightly-case": "2026-09-02"}), \
                 unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
             cls.out = render_to(cls.tmp.name, data, health=health_doc(), history=history)
         cls.cases_page = cls.out / "cases.html"
@@ -1230,7 +1234,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('id="case-cluster-agent-crashloop-debug"', app)
         self.assertIn('<span class="st blocking">blocking</span>', app)
         self.assertIn('<span class="st demoted">demoted 09-02</span>', app)
-        self.assertIn("held out · 2 cases", app)
+        self.assertIn("held out · 3 cases", app, "the active demoted case, the active held-out one and the nightly demoted one")
+        self.assertEqual(app.count("demoted 09-02"), 2, "the nightly demoted case carries the dated pill too")
         self.assertIn("not in any matrix · 1 case", app)
         self.assertNotIn('id="case-retired-probe"', app, "retired cases are folded until asked for")
         self.assertIn('class="rate ', app)
@@ -1256,7 +1261,9 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('<span class="st blocking">blocking</span>', blocking)
         held = dom_text(self.cases_page, query="show=held")
         self.assertIn("demoted 09-02", held)
+        self.assertIn('id="case-demoted-nightly-case"', held, "a case demoted to the nightly is a held-out row")
         self.assertNotIn('class="st blocking"', held)
+        self.assertNotIn('id="case-demoted-nightly-case"', blocking)
         highlighted = dom_text(self.cases_page, fragment="#cluster-agent-crashloop-evidence-chain")
         self.assertIn('<tr id="case-cluster-agent-crashloop-evidence-chain" class="main hl">', highlighted)
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
