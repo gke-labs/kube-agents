@@ -50,6 +50,7 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -1484,51 +1485,41 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
     mid-sweep, or a second card for the same stream, wiped the first run's
     state out from under it and both `finish` calls rewrote one ledger.
 
-    The claim is the exclusive create of the note (O_EXCL), so two `start`s
-    racing for one stream cannot both pass: the loser sees the winner's
-    file, fresh, and is refused. A stale or taken-over note is unlinked and
-    the create raced for again, so that path is exclusive too.
+    The read, the decision and the write happen under an exclusive lock on
+    a sibling file (flock; every session's shell runs on the one sandbox
+    pod, against the one volume), so two `start`s racing for one stream
+    cannot both pass, and a stale or taken-over note is replaced by exactly
+    one of them: the other reads the fresh note and is refused.
     """
     path = Path(inflight_path_for(audit_id))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        lock = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
         log(f"WARNING: could not record the in-flight note at {path}: {exc}")
         return
-    for _attempt in range(3):
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            started, pid = _in_flight_since(path)
-            if started is None:
-                continue  # gone between the create and the read: race again
-            if not takeover and time.time() - started < INFLIGHT_TTL_SECONDS:
-                when = datetime.fromtimestamp(started, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M UTC"
-                )
-                raise ValidationError(
-                    f"{audit_id} has a run in flight since {when} (pid {pid}); a second "
-                    f"`start` would scrub its run record, workspace and findings document. "
-                    f"Wait for that run's `finish`, or pass --takeover if you know it is dead."
-                )
-            path.unlink(missing_ok=True)  # stale, or taken over: clear it and race again
-            continue
-        except OSError as exc:
-            log(f"WARNING: could not record the in-flight note at {path}: {exc}")
-            return
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps({"audit": audit_id, "started_at": time.time(), "pid": os.getpid()})
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started, pid = _in_flight_since(path)
+        if not takeover and started is not None and time.time() - started < INFLIGHT_TTL_SECONDS:
+            when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            raise ValidationError(
+                f"{audit_id} has a run in flight since {when} (pid {pid}); a second "
+                f"`start` would scrub its run record, workspace and findings document. "
+                f"Wait for that run's `finish`, or pass --takeover if you know it is dead."
             )
-        return
-    raise ValidationError(
-        f"{audit_id}: another `start` kept claiming the in-flight note at {path}; "
-        f"this one stops rather than share the stream."
-    )
+        path.write_text(
+            json.dumps({"audit": audit_id, "started_at": time.time(), "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log(f"WARNING: could not record the in-flight note at {path}: {exc}")
+    finally:
+        os.close(lock)  # closing the descriptor drops the lock
 
 
 def release_in_flight(audit_id: str) -> None:
-    """`finish` published or closed: the stream is free for its next run.
+    """`finish` is over, one way or the other: the stream is free for its next run.
 
     Unconditional on purpose, and that is a known limit: `start` and `finish`
     are separate processes, and every state they share is keyed by audit id,
@@ -10495,6 +10486,22 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    if getattr(args, "dry_run", False):
+        # A preview taken mid-run: the run is still in flight and keeps its note.
+        _finish(args, audit_id)
+        return
+    try:
+        _finish(args, audit_id)
+    finally:
+        # Every other exit frees the stream, the failed ones included. `finish`
+        # never reads the note, so a retry of `finish` after a `gh` failure or
+        # a rejected document loses nothing by this; what it buys is that the
+        # SOP's next `start --repo B`, or the requester's own retry, is not
+        # refused for two hours by an attempt that already died.
+        release_in_flight(audit_id)
+
+
+def _finish(args: argparse.Namespace, audit_id: str) -> None:
     data = load_findings(args.findings_file, audit_id)
     # The collector's side of the run, when there is one. Both flags are
     # optional: a stream whose SOP has no collector yet publishes on the
@@ -11117,7 +11124,6 @@ def handle_finish(args: argparse.Namespace) -> None:
                 }
             )
         )
-        release_in_flight(audit_id)
         return
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
@@ -11513,7 +11519,6 @@ def handle_finish(args: argparse.Namespace) -> None:
             }
         )
     )
-    release_in_flight(audit_id)
 
 
 # --------------------------------------------------------------------------- #

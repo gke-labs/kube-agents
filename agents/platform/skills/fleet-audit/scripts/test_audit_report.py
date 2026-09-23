@@ -15,12 +15,14 @@ import copy
 import importlib.util
 import io
 import json
+import fcntl
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import dataclass
@@ -3917,6 +3919,44 @@ class TestStart(HarnessTestCase):
         os.utime(note, (stale, stale))
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_claims_for_one_stream_are_serialized(self):
+        # The stale-note path reads, unlinks and writes; by path, not by
+        # inode. Two `start`s inside that window would each remove the
+        # other's fresh note, so the whole claim runs under a lock.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        held = os.open(f"{note}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        claimed = threading.Event()
+        rival = threading.Thread(
+            target=lambda: (audit_report.claim_in_flight(AUDIT), claimed.set())
+        )
+        rival.start()
+        self.assertFalse(claimed.wait(0.3), "the rival claimed while the lock was held")
+        self.assertFalse(note.is_file())
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+        self.assertTrue(claimed.wait(5))
+        rival.join()
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_a_failed_finish_frees_the_stream_and_a_dry_run_does_not(self):
+        # Eight of nine SOPs loop `start --repo A; finish --repo A; start
+        # --repo B` on a multi-repo install. A `finish` that died on a `gh`
+        # call must not leave B refused for two hours; a `--dry-run` is a
+        # preview mid-run and changes nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        self.assertEqual(self.run_finish(make_doc(), argv_extra=("--dry-run",)), 0, self.err)
+        self.assertTrue(note.is_file())
+        self.harness.failures = {"issue create": 1}
+        self.assertEqual(self.run_finish(make_doc()), 1, self.err)
+        self.assertFalse(note.is_file())
 
     def test_a_clean_finish_releases_the_stream_too(self):
         # The zero-finding run is the ordinary nightly outcome; it leaves by
